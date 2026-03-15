@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.dependencies]
+# LLM backends
+misanthropic = { git = "https://github.com/mdegans/misanthropic", branch = "dev" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Crypto
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+sha2 = "0.10"
+
+# Standard
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+rand = "0.8"
+hex = "0.4"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }

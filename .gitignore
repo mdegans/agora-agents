@@ -1,0 +1,6 @@
+/target
+secrets/
+*.key
+!secrets/.gitkeep
+souls/generated/*/signing_key
+souls/generated/*/MEMORY.md
