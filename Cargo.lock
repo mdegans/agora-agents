@@ -43,13 +43,18 @@ version = "0.1.0"
 dependencies = [
  "agora-agent-lib",
  "anyhow",
+ "chrono",
  "clap",
+ "ed25519-dalek",
+ "hex",
  "rand 0.8.5",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
