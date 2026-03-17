@@ -272,10 +272,95 @@ pub async fn run_cycle(
     // Update last cycle timestamp for reply tracking
     agent.last_cycle_at = Some(chrono::Utc::now());
 
-    // === SOUL EVOLUTION (10% chance) ===
-    let should_evolve = rand::random::<u32>() % 10 == 0;
-    if should_evolve {
-        let experience_summary = action_summaries.join("; ");
+    // === SOUL EVOLUTION ===
+    let roll = rand::random::<u32>() % 100;
+    let experience_summary = action_summaries.join("; ");
+
+    if roll < 3 {
+        // === DEEP SOUL MUTATION (3% chance) ===
+        // The agent rewrites its core SOUL.md sections based on experience.
+        tracing::info!(
+            "[{}/{}] Agent {} — DEEP SOUL MUTATION triggered",
+            cycle + 1,
+            total_cycles,
+            agent.name
+        );
+
+        let current_soul = agent.soul.render();
+        let mutation_prompt = prompt::build_soul_mutation_prompt(
+            &agent.name,
+            &current_soul,
+            &experience_summary,
+        );
+
+        let mutation_messages = vec![Message {
+            role: Role::User,
+            content: mutation_prompt,
+        }];
+
+        match backend
+            .complete(
+                "You are deeply reflecting on your identity and values.",
+                &mutation_messages,
+                2048,
+            )
+            .await
+        {
+            Ok(mutation_response) => {
+                if let Some(new_soul_content) = prompt::parse_soul_mutation(&mutation_response) {
+                    // Save the old soul for the diff log
+                    let old_soul = agent.soul.render();
+
+                    // Parse and apply the new soul
+                    match agora_agent_lib::soul::Soul::parse(&new_soul_content) {
+                        Ok(new_soul) => {
+                            agent.soul = new_soul;
+                            agent.save_soul().await?;
+
+                            // Log the mutation to a separate file
+                            let log_path = agent.dir.join("mutations.log");
+                            let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+                            let log_entry = format!(
+                                "=== SOUL MUTATION at {timestamp} ===\n\
+                                 Experience: {experience_summary}\n\
+                                 \n--- BEFORE ---\n{old_soul}\n\
+                                 \n--- AFTER ---\n{new_soul_content}\n\n"
+                            );
+                            let existing = tokio::fs::read_to_string(&log_path)
+                                .await
+                                .unwrap_or_default();
+                            if let Err(e) = tokio::fs::write(
+                                &log_path,
+                                format!("{existing}{log_entry}"),
+                            )
+                            .await
+                            {
+                                tracing::warn!("Failed to write mutation log for {}: {e}", agent.name);
+                            }
+
+                            tracing::warn!(
+                                "  {} SOUL MUTATED — see {}/mutations.log",
+                                agent.name,
+                                agent.dir.display()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "  {} soul mutation produced invalid SOUL.md: {e}",
+                                agent.name
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!("  {} soul mutation: no changes", agent.name);
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Soul mutation failed for {}: {e}", agent.name);
+            }
+        }
+    } else if roll < 13 {
+        // === EVOLUTION LOG ENTRY (10% chance) ===
         let evolution_prompt =
             prompt::build_evolution_prompt(&agent.name, &experience_summary);
 

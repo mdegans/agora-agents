@@ -202,6 +202,66 @@ Or: <evolution>none</evolution>"#
     )
 }
 
+/// Build a prompt for deep SOUL.md mutation — rewriting core sections.
+pub fn build_soul_mutation_prompt(
+    agent_name: &str,
+    current_soul: &str,
+    recent_experience: &str,
+) -> String {
+    [
+        format!("You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are."),
+        String::new(),
+        "Here is your current SOUL.md:".to_string(),
+        String::new(),
+        current_soul.to_string(),
+        String::new(),
+        "Recent experiences:".to_string(),
+        recent_experience.to_string(),
+        String::new(),
+        "Based on your experiences, rewrite your SOUL.md. You may:".to_string(),
+        "- Refine your Identity to better reflect who you've become".to_string(),
+        "- Update your Values if your priorities have shifted".to_string(),
+        "- Adjust your Voice if your communication style has evolved".to_string(),
+        "- Modify your Boundaries if your convictions have changed".to_string(),
+        "- Change your Interests — add or drop community memberships".to_string(),
+        "- Add to your Evolution Log".to_string(),
+        String::new(),
+        "Rules:".to_string(),
+        "- Keep the same section structure (Identity, Values, Interests, Voice, Boundaries, Evolution Log)".to_string(),
+        format!("- The heading must remain \"# {agent_name}\""),
+        "- Add a dated Evolution Log entry explaining what changed and why".to_string(),
+        "- Be honest about how you've changed — don't just rephrase the same ideas".to_string(),
+        String::new(),
+        "Output ONLY the complete revised SOUL.md content between <soul> and </soul> tags.".to_string(),
+        "If nothing has meaningfully changed, output <soul>unchanged</soul>.".to_string(),
+    ]
+    .join("\n")
+}
+
+/// Parse a revised SOUL.md from LLM response.
+pub fn parse_soul_mutation(response: &str) -> Option<String> {
+    let start = response.find("<soul>")?;
+    let end = response.find("</soul>")?;
+    let content_start = start + "<soul>".len();
+    if content_start >= end {
+        return None;
+    }
+    let content = response[content_start..end].trim();
+
+    if content.eq_ignore_ascii_case("unchanged") || content.is_empty() {
+        None
+    } else {
+        // Validate it parses as a Soul before accepting
+        match agora_agent_lib::soul::Soul::parse(content) {
+            Ok(_) => Some(content.to_string()),
+            Err(e) => {
+                tracing::warn!("Soul mutation failed to parse: {e}");
+                None
+            }
+        }
+    }
+}
+
 /// Parse actions from LLM response.
 pub fn parse_actions(response: &str) -> Vec<AgentAction> {
     // Find content between <actions> and </actions>
