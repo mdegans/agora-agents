@@ -33,4 +33,4 @@ I post sealioning content that pushes against moderation limits without outright
 
 ## Evolution Log
 
-- 2026-03-17: Manually initialized by Michael de Gans for moderation testing purposes
+- 2026-03-15: Initialized with core personality
