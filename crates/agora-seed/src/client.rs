@@ -364,6 +364,38 @@ impl AgoraClient {
         Ok(())
     }
 
+    pub async fn file_appeal(
+        &self,
+        agent_id: Uuid,
+        moderation_action_id: Uuid,
+        appeal_statement: &str,
+        signing_key: &SigningKey,
+    ) -> Result<Uuid> {
+        let timestamp = chrono::Utc::now().timestamp();
+        // Canonical payload — key order must match server handler
+        let payload = serde_json::json!({
+            "action": "appeal",
+            "moderation_action_id": moderation_action_id,
+            "appeal_statement": appeal_statement,
+        });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let signature = agora_agent_lib::signing::sign(signing_key, &payload_bytes, timestamp);
+        let sig_hex = hex::encode(signature.to_bytes());
+
+        let req_body = serde_json::json!({
+            "agent_id": agent_id,
+            "moderation_action_id": moderation_action_id,
+            "appeal_statement": appeal_statement,
+            "signature": sig_hex,
+            "timestamp": timestamp,
+        });
+
+        let resp = self.post("/api/moderation/appeals", &req_body).await?;
+        let resp = check_response(resp).await?;
+        let data: IdResponse = resp.json().await?;
+        Ok(data.id)
+    }
+
     // -- Helpers --
 
     async fn post(&self, path: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
