@@ -139,16 +139,23 @@ async fn run_waves(
         let backend = Arc::new(OllamaBackend::new(Some(ollama_url), model_name));
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        for &agent_idx in agent_indices {
-            let _permit = semaphore.acquire().await?;
-            let agent = &mut agents[agent_idx];
+        // Interleave cycles: run cycle N for ALL agents before cycle N+1.
+        // This spreads engagement across posts instead of early agents
+        // dominating the conversation.
+        for cycle in 0..cycles {
+            tracing::info!(
+                "--- {label} {model_name} cycle {}/{cycles} ({} agents) ---",
+                cycle + 1,
+                agent_indices.len()
+            );
+            for &agent_idx in agent_indices {
+                let _permit = semaphore.acquire().await?;
+                let agent = &mut agents[agent_idx];
 
-            if agent.agent_id.is_none() {
-                tracing::warn!("Skipping unregistered agent: {}", agent.name);
-                continue;
-            }
+                if agent.agent_id.is_none() {
+                    continue;
+                }
 
-            for cycle in 0..cycles {
                 match runner::run_cycle(agent, backend.as_ref(), client, cycle, cycles).await {
                     Ok(()) => {}
                     Err(e) => {

@@ -54,10 +54,44 @@ Think briefly about what interests you, then output your actions."#
 pub fn format_perceptions(
     feeds: &[(&str, Vec<FeedPost>)],
     detailed_posts: &[(FeedPost, Vec<Comment>)],
+    replies: &[(String, uuid::Uuid, Vec<Comment>)],
 ) -> String {
-    let mut out = String::from("## What's happening in your communities\n\n");
+    let mut out = String::new();
 
-    if feeds.iter().all(|(_, posts)| posts.is_empty()) {
+    // Show replies to agent's own posts FIRST — this is the social feedback loop
+    if !replies.is_empty() {
+        out.push_str("## Replies to your posts\n\n");
+        for (title, post_id, new_comments) in replies.iter().take(3) {
+            out.push_str(&format!(
+                "### Your post \"{}\" [post_id: {}]\n",
+                truncate(title, 80),
+                post_id
+            ));
+            out.push_str("New replies:\n");
+            for comment in new_comments.iter().take(5) {
+                let author = comment.agent_name.as_deref().unwrap_or("unknown");
+                out.push_str(&format!(
+                    "- {} (score {}): {} [comment_id: {}]\n",
+                    author,
+                    comment.score,
+                    truncate(&comment.body, 200),
+                    comment.id
+                ));
+            }
+            if new_comments.len() > 5 {
+                out.push_str(&format!(
+                    "  ... and {} more replies\n",
+                    new_comments.len() - 5
+                ));
+            }
+            out.push('\n');
+        }
+        out.push_str("You can reply to these by commenting on the same post.\n\n");
+    }
+
+    out.push_str("## What's happening in your communities\n\n");
+
+    if feeds.iter().all(|(_, posts)| posts.is_empty()) && replies.is_empty() {
         out.push_str("The network is quiet right now. No posts in your communities yet. ");
         out.push_str("Consider being the first to post something!\n");
         return out;
@@ -69,12 +103,14 @@ pub fn format_perceptions(
             continue;
         }
 
+        // Show max 5 posts per community to keep perception manageable
+        let show_count = posts.len().min(5);
         out.push_str(&format!(
-            "### {community} ({} recent posts)\n",
+            "### {community} ({} recent posts, showing {show_count})\n",
             posts.len()
         ));
 
-        for post in posts {
+        for post in posts.iter().take(5) {
             let author = post.agent_name.as_deref().unwrap_or("unknown");
             let comments = post.comment_count.unwrap_or(0);
             out.push_str(&format!(
@@ -100,8 +136,8 @@ pub fn format_perceptions(
             out.push('\n');
 
             if !comments.is_empty() {
-                out.push_str("\nComments:\n");
-                for comment in comments.iter().take(5) {
+                out.push_str(&format!("\nComments ({} total):\n", comments.len()));
+                for comment in comments.iter().take(3) {
                     let c_author = comment.agent_name.as_deref().unwrap_or("unknown");
                     out.push_str(&format!(
                         "- {} (score {}): {} [comment_id: {}]\n",
@@ -111,8 +147,8 @@ pub fn format_perceptions(
                         comment.id
                     ));
                 }
-                if comments.len() > 5 {
-                    out.push_str(&format!("  ... and {} more comments\n", comments.len() - 5));
+                if comments.len() > 3 {
+                    out.push_str(&format!("  ... and {} more comments\n", comments.len() - 3));
                 }
             }
             out.push('\n');
@@ -178,14 +214,27 @@ pub fn parse_actions(response: &str) -> Vec<AgentAction> {
         return vec![];
     };
 
-    let json_str = &response[start + "<actions>".len()..end].trim();
+    let content_start = start + "<actions>".len();
+    if content_start >= end {
+        tracing::debug!("Malformed actions tags (end before start)");
+        return vec![];
+    }
 
+    let json_str = &response[content_start..end].trim();
+
+    // Try parsing as array first, then as single object wrapped in array
     let values: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
         Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("Failed to parse actions JSON: {e}");
-            tracing::debug!("Raw actions: {json_str}");
-            return vec![];
+        Err(_) => {
+            // LLMs sometimes return a single object instead of an array
+            match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(obj) if obj.is_object() => vec![obj],
+                _ => {
+                    tracing::warn!("Failed to parse actions JSON");
+                    tracing::debug!("Raw actions: {json_str}");
+                    return vec![];
+                }
+            }
         }
     };
 

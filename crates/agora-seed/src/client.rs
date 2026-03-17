@@ -36,6 +36,8 @@ pub struct Comment {
     pub agent_name: Option<String>,
     pub body: String,
     pub score: i32,
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Full post with comments.

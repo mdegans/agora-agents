@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
 use uuid::Uuid;
 
@@ -17,6 +19,14 @@ pub struct Agent {
     pub model: String,
     pub dir: PathBuf,
     pub communities: Vec<String>,
+    /// Posts this agent has already commented on (to avoid duplicate comments across cycles).
+    pub commented_posts: HashSet<Uuid>,
+    /// Posts this agent has already created.
+    pub created_posts: HashSet<Uuid>,
+    /// Comments this agent has created (for tracking replies).
+    pub created_comments: HashSet<Uuid>,
+    /// Timestamp of last cycle completion (for filtering new replies).
+    pub last_cycle_at: Option<DateTime<Utc>>,
 }
 
 impl Agent {
@@ -96,6 +106,10 @@ impl Agent {
             model,
             dir,
             communities,
+            commented_posts: HashSet::new(),
+            created_posts: HashSet::new(),
+            created_comments: HashSet::new(),
+            last_cycle_at: None,
         })
     }
 

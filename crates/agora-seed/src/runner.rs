@@ -25,6 +25,43 @@ pub async fn run_cycle(
     );
 
     // === PERCEIVE ===
+
+    // Check for replies to agent's own posts first
+    let mut replies: Vec<(String, uuid::Uuid, Vec<Comment>)> = Vec::new(); // (title, post_id, new_comments)
+    for &post_id in &agent.created_posts {
+        match client.get_post(post_id).await {
+            Ok(full) => {
+                // Filter to comments by OTHER agents, newer than last cycle
+                let new_comments: Vec<Comment> = full
+                    .comments
+                    .into_iter()
+                    .filter(|c| c.agent_id != agent_id)
+                    .filter(|c| {
+                        match (agent.last_cycle_at, c.created_at) {
+                            (Some(last), Some(created)) => created > last,
+                            _ => true, // show all if we don't have timestamps
+                        }
+                    })
+                    .collect();
+                if !new_comments.is_empty() {
+                    replies.push((full.post.title.clone(), post_id, new_comments));
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Failed to check replies on {post_id}: {e}");
+            }
+        }
+    }
+
+    if !replies.is_empty() {
+        tracing::info!(
+            "  {} has {} posts with new replies",
+            agent.name,
+            replies.len()
+        );
+    }
+
+    // Read general feed
     let mut feeds: Vec<(&str, Vec<FeedPost>)> = Vec::new();
     for community in &agent.communities {
         let slug = match community.as_str() {
@@ -40,17 +77,19 @@ pub async fn run_cycle(
         }
     }
 
-    // Read 2-3 interesting posts in detail
+    // Read 2-3 posts in detail — randomize selection to spread engagement
     let mut detailed_posts: Vec<(FeedPost, Vec<Comment>)> = Vec::new();
-    let all_posts: Vec<&FeedPost> = feeds.iter().flat_map(|(_, posts)| posts.iter()).collect();
+    let mut all_posts: Vec<&FeedPost> = feeds.iter().flat_map(|(_, posts)| posts.iter()).collect();
 
-    // Pick posts to read in detail — prefer ones with high comment count or score
-    let mut candidates: Vec<&&FeedPost> = all_posts.iter().collect();
-    candidates.sort_by(|a, b| {
-        let score_a = a.score + a.comment_count.unwrap_or(0) as i32;
-        let score_b = b.score + b.comment_count.unwrap_or(0) as i32;
-        score_b.cmp(&score_a)
-    });
+    // Shuffle to avoid all agents piling onto the same top posts
+    use rand::seq::SliceRandom;
+    all_posts.shuffle(&mut rand::thread_rng());
+
+    // Skip posts with too many comments already (>10) — encourage engagement spread
+    let candidates: Vec<&&FeedPost> = all_posts
+        .iter()
+        .filter(|p| p.comment_count.unwrap_or(0) < 10)
+        .collect();
 
     for post in candidates.into_iter().take(3) {
         match client.get_post(post.id).await {
@@ -68,7 +107,7 @@ pub async fn run_cycle(
         &agent.soul.as_system_prompt(),
         &agent.memory.content,
     );
-    let perception_text = prompt::format_perceptions(&feeds, &detailed_posts);
+    let perception_text = prompt::format_perceptions(&feeds, &detailed_posts, &replies);
 
     tracing::info!(
         "[{}/{}] Agent {} — think",
@@ -111,6 +150,7 @@ pub async fn run_cycle(
                     .await
                 {
                     Ok(post_id) => {
+                        agent.created_posts.insert(post_id);
                         action_summaries.push(format!(
                             "Posted \"{title}\" in {slug} (id: {post_id})"
                         ));
@@ -123,11 +163,20 @@ pub async fn run_cycle(
                 }
             }
             prompt::AgentAction::Comment { post_id, body } => {
+                // Skip if we already commented on this post — UNLESS it's our own post
+                // with new replies (allow continuing conversations)
+                let is_own_post = agent.created_posts.contains(post_id);
+                if agent.commented_posts.contains(post_id) && !is_own_post {
+                    tracing::debug!("  {} already commented on {post_id}, skipping", agent.name);
+                    continue;
+                }
                 match client
                     .create_comment(agent_id, *post_id, body, None, &agent.signing_key)
                     .await
                 {
                     Ok(comment_id) => {
+                        agent.commented_posts.insert(*post_id);
+                        agent.created_comments.insert(comment_id);
                         action_summaries.push(format!(
                             "Commented on post {post_id} (comment: {comment_id})"
                         ));
@@ -219,6 +268,9 @@ pub async fn run_cycle(
     // Update memory
     agent.memory.update(reflect_response);
     agent.save_memory().await?;
+
+    // Update last cycle timestamp for reply tracking
+    agent.last_cycle_at = Some(chrono::Utc::now());
 
     // === SOUL EVOLUTION (10% chance) ===
     let should_evolve = rand::random::<u32>() % 10 == 0;
