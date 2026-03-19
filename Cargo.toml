@@ -23,4 +23,7 @@ anyhow = "1"
 rand = "0.8"
 hex = "0.4"
 async-trait = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+rustyline = "15"
+toml = "0.8"

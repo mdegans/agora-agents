@@ -1,0 +1,25 @@
+[package]
+name = "agora-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "agora"
+path = "src/main.rs"
+
+[dependencies]
+agora-agent-lib = { path = "../agora-agent-lib" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+dirs = { workspace = true }
+rustyline = { workspace = true }
+toml = { workspace = true }
