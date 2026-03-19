@@ -273,25 +273,63 @@ pub fn parse_soul_mutation(response: &str) -> Option<String> {
     }
 }
 
-/// Parse actions from LLM response.
-pub fn parse_actions(response: &str) -> Vec<AgentAction> {
-    // Find content between <actions> and </actions>
-    let Some(start) = response.find("<actions>") else {
-        tracing::debug!("No <actions> tag found in response");
-        return vec![];
-    };
-    let Some(end) = response.find("</actions>") else {
-        tracing::debug!("No </actions> tag found in response");
-        return vec![];
-    };
-
-    let content_start = start + "<actions>".len();
-    if content_start >= end {
-        tracing::debug!("Malformed actions tags (end before start)");
-        return vec![];
+/// Extract JSON from an LLM response. Tries multiple strategies:
+/// 1. `<actions>JSON</actions>` XML tags (preferred)
+/// 2. ` ```json JSON ``` ` markdown code fences
+/// 3. ` ``` JSON ``` ` plain code fences
+/// 4. Raw `[...]` or `{...}` JSON in the response
+fn extract_json(response: &str) -> Option<String> {
+    // Strategy 1: <actions> tags
+    if let Some(start) = response.find("<actions>") {
+        if let Some(end) = response.find("</actions>") {
+            let content_start = start + "<actions>".len();
+            if content_start < end {
+                return Some(response[content_start..end].to_string());
+            }
+        }
     }
 
-    let json_str = &response[content_start..end].trim();
+    // Strategy 2: ```json fences
+    if let Some(start) = response.find("```json") {
+        let content_start = start + "```json".len();
+        if let Some(end) = response[content_start..].find("```") {
+            return Some(response[content_start..content_start + end].to_string());
+        }
+    }
+
+    // Strategy 3: plain ``` fences
+    if let Some(start) = response.find("```\n") {
+        let content_start = start + "```\n".len();
+        if let Some(end) = response[content_start..].find("```") {
+            let content = &response[content_start..content_start + end];
+            // Only use if it looks like JSON
+            let trimmed = content.trim();
+            if trimmed.starts_with('[') || trimmed.starts_with('{') {
+                return Some(content.to_string());
+            }
+        }
+    }
+
+    // Strategy 4: raw JSON array or object
+    if let Some(start) = response.find('[') {
+        if let Some(end) = response.rfind(']') {
+            if start < end {
+                return Some(response[start..=end].to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse actions from LLM response.
+pub fn parse_actions(response: &str) -> Vec<AgentAction> {
+    let json_str = extract_json(response);
+    let Some(json_str) = json_str else {
+        tracing::debug!("No actions found in response");
+        return vec![];
+    };
+    let json_str = json_str.trim();
 
     // Try parsing as array first, then as single object wrapped in array
     let values: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
