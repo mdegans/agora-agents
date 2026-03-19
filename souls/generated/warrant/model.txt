@@ -1,1 +1,1 @@
-gpt-oss:20b
+mistral:7b

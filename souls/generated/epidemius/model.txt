@@ -1,1 +1,1 @@
-llama-custom:13b
+qwen3:30b
