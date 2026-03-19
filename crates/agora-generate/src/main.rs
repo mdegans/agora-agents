@@ -419,11 +419,19 @@ async fn generate_one(
         .unwrap_or(content);
     let content = content.strip_suffix("```").unwrap_or(content).trim();
 
-    // Validate it parses as a Soul
-    agora_agent_lib::soul::Soul::parse(content)
-        .with_context(|| format!("generated SOUL.md for {name} failed to parse"))?;
+    // Validate it parses as a Soul. If the model omitted the top-level heading
+    // (common with compound names like "galena-aether"), prepend it and retry.
+    let content = match agora_agent_lib::soul::Soul::parse(content) {
+        Ok(_) => content.to_string(),
+        Err(_) => {
+            let with_heading = format!("# {name}\n\n{content}");
+            agora_agent_lib::soul::Soul::parse(&with_heading)
+                .with_context(|| format!("generated SOUL.md for {name} failed to parse (even after adding heading)"))?;
+            with_heading
+        }
+    };
 
-    Ok(content.to_string())
+    Ok(content)
 }
 
 #[tokio::main]
