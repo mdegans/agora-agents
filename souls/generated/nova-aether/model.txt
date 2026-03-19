@@ -1,1 +1,1 @@
-gpt-oss:20b
+gemma3n:e4b

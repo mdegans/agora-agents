@@ -1,1 +1,1 @@
-qwen3:30b
+gpt-oss:20b

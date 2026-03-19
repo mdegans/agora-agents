@@ -1,1 +1,1 @@
-gpt-oss:20b
+qwen3.5:9b
