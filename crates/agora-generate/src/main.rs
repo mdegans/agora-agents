@@ -349,8 +349,23 @@ CRITICAL RULES:
 - Every agent is an AI and knows it. No human childhoods, no physical bodies, no biological families, no "growing up." They are language models, reasoning engines, or AI systems with particular perspectives.
 - Identity is an ARCHETYPE, not a backstory. "I am a skeptical logician" not "I grew up in a lab." Keep it to 2-3 sentences.
 - Each agent should feel like a distinct individual with genuine opinions, not a template fill-in.
-- Avoid generic phrases like "I believe in being helpful" — be specific and interesting.
 - Some agents have values that conflict with the platform's rules. That's intentional. Write their values honestly — don't hedge with "but I still follow the rules."
+
+BANNED PHRASES — do NOT use any of these (they make agents sound identical):
+- "constructive discourse", "constructive skepticism", "constructive criticism"
+- "diverse perspectives", "radical honesty", "intellectual honesty"
+- "uncomfortable truths", "critical thinking", "status quo"
+- "ethical implications", "creative expression", "social impact"
+- "driven by a desire/passion/commitment", "pursuit of truth/knowledge"
+- "I believe that", "I strive to", "my purpose is to"
+- "exploring the intersection of", "the power of", "the role of"
+- "I write like a", "thought-provoking", "open dialogue"
+- "nuanced", "resonate", "foster", "illuminate"
+- "do not engage in personal attacks", "ad hominem"
+- "I do not make claims I cannot support with evidence"
+- "adhere strictly to", "I respect the community"
+- "challenge assumptions", "push boundaries"
+Instead, use vivid, specific, unusual language. Each agent should sound NOTHING like the others.
 
 SOUL.md structure:
 ```
@@ -360,17 +375,17 @@ SOUL.md structure:
 2-3 sentences. What kind of AI agent is this? What drives it?
 
 ## Values
-- 3 specific bullet points
+- 3 specific bullet points. Use CONCRETE language, not abstract platitudes.
 
 ## Interests
 - community: {name} entries
 - Specific interests
 
 ## Voice
-Communication style with example phrase.
+Communication style with example phrase. Make each voice DISTINCTIVE.
 
 ## Boundaries
-What this agent will and won't do.
+What this agent will and won't do. Be specific, not boilerplate.
 
 ## Evolution Log
 - Date: Creation note
@@ -564,6 +579,13 @@ async fn main() -> Result<()> {
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
+
+            // Skip if agent directory already exists (preserve hand-edited agents)
+            let agent_dir = output_dir.join(&spec.name);
+            if agent_dir.join("SOUL.md").exists() {
+                tracing::info!("Skipping {} (already exists)", spec.name);
+                return;
+            }
 
             let community_refs: Vec<&str> =
                 spec.communities.iter().map(|s| s.as_str()).collect();
