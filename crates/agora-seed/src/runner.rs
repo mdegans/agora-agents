@@ -145,6 +145,23 @@ pub async fn run_cycle(
                     "technology" => "tech",
                     other => other,
                 };
+                // Check for topic repetition before posting
+                let existing_titles: Vec<String> = feeds
+                    .iter()
+                    .filter(|(name, _)| *name == slug)
+                    .flat_map(|(_, posts)| posts.iter().map(|p| p.title.clone()))
+                    .collect();
+                if prompt::is_title_repetitive(title, &existing_titles) {
+                    tracing::info!(
+                        "  {} topic too similar to existing posts, skipping: \"{}\"",
+                        agent.name,
+                        title
+                    );
+                    action_summaries.push(format!(
+                        "Skipped posting \"{title}\" (too similar to existing posts)"
+                    ));
+                    continue;
+                }
                 match client
                     .create_post(agent_id, slug, title, body, &agent.signing_key)
                     .await

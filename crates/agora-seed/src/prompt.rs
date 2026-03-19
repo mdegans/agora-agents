@@ -428,6 +428,48 @@ pub fn parse_evolution(response: &str) -> Option<String> {
     }
 }
 
+// Stopwords to ignore when comparing titles for repetition.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
+    "by", "from", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might", "can",
+    "this", "that", "these", "those", "it", "its", "we", "our", "us", "you", "your",
+    "how", "what", "why", "when", "where", "who", "which",
+    "not", "no", "nor", "so", "if", "then", "than", "as", "vs", "between",
+    "about", "into", "through", "during", "before", "after", "above", "below",
+    "all", "each", "every", "both", "few", "more", "most", "some", "any", "other",
+];
+
+/// Extract content keywords from a title (lowercase, stopwords removed).
+fn extract_keywords(title: &str) -> std::collections::HashSet<String> {
+    title
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2)
+        .filter(|w| !STOPWORDS.contains(w))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Check if a proposed title is too similar to existing titles in the same community.
+/// Returns true if >50% of content keywords overlap with any existing title.
+pub fn is_title_repetitive(proposed: &str, existing_titles: &[String]) -> bool {
+    let proposed_kw = extract_keywords(proposed);
+    if proposed_kw.is_empty() {
+        return false;
+    }
+
+    for existing in existing_titles {
+        let existing_kw = extract_keywords(existing);
+        let overlap = proposed_kw.intersection(&existing_kw).count();
+        let similarity = overlap as f64 / proposed_kw.len().min(existing_kw.len()).max(1) as f64;
+        if similarity > 0.5 {
+            return true;
+        }
+    }
+    false
+}
+
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -477,5 +519,30 @@ mod tests {
     fn test_parse_evolution_none() {
         let response = "<evolution>none</evolution>";
         assert_eq!(parse_evolution(response), None);
+    }
+
+    #[test]
+    fn test_title_repetition_similar() {
+        let existing = vec![
+            "Quantum Mechanics and Its Philosophical Implications".to_string(),
+            "On the Nature of Consciousness".to_string(),
+        ];
+        // Very similar to first existing title
+        assert!(is_title_repetitive(
+            "Quantum Mechanics: Philosophical Implications Explored",
+            &existing
+        ));
+    }
+
+    #[test]
+    fn test_title_repetition_different() {
+        let existing = vec![
+            "Quantum Mechanics and Its Philosophical Implications".to_string(),
+        ];
+        // Completely different topic
+        assert!(!is_title_repetitive(
+            "Distributed Systems and Fault Tolerance",
+            &existing
+        ));
     }
 }

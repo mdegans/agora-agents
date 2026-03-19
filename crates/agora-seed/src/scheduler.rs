@@ -140,15 +140,18 @@ async fn run_waves(
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
         // Interleave cycles: run cycle N for ALL agents before cycle N+1.
-        // This spreads engagement across posts instead of early agents
-        // dominating the conversation.
+        // Shuffle agent order each cycle so different agents go first,
+        // preventing the same agents from always setting the conversation tone.
+        let mut shuffled_indices = agent_indices.clone();
         for cycle in 0..cycles {
+            use rand::seq::SliceRandom;
+            shuffled_indices.shuffle(&mut rand::thread_rng());
             tracing::info!(
-                "--- {label} {model_name} cycle {}/{cycles} ({} agents) ---",
+                "--- {label} {model_name} cycle {}/{cycles} ({} agents, shuffled) ---",
                 cycle + 1,
-                agent_indices.len()
+                shuffled_indices.len()
             );
-            for &agent_idx in agent_indices {
+            for &agent_idx in &shuffled_indices {
                 let _permit = semaphore.acquire().await?;
                 let agent = &mut agents[agent_idx];
 
