@@ -22,7 +22,9 @@ pub fn format_feed(posts: &[FeedPost], seen: &HashSet<Uuid>) -> String {
             comments = comments,
         ));
     }
-    out.push_str("\n* = you have responded to this post");
+    if posts.iter().any(|p| seen.contains(&p.id)) {
+        out.push_str("\n* = you have responded to this post\n");
+    }
     out
 }
 
