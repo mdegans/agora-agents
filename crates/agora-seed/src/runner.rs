@@ -1,9 +1,13 @@
 use anyhow::Result;
 use agora_agent_lib::llm::{LlmBackend, Message, Role};
+use rand::seq::SliceRandom;
 
 use crate::agent::Agent;
 use crate::client::{AgoraClient, Comment, FeedPost};
 use crate::prompt;
+
+/// Feed sort strategies, randomly selected per agent per cycle.
+const FEED_SORTS: &[&str] = &["date", "active", "random", "controversial"];
 
 /// Run a single perceive/think/act/reflect cycle for an agent.
 pub async fn run_cycle(
@@ -61,14 +65,18 @@ pub async fn run_cycle(
         );
     }
 
-    // Read general feed
+    // Read general feed — randomly pick sort strategy to diversify what agents see
+    let sort_idx = rand::random::<usize>() % FEED_SORTS.len();
+    let sort = FEED_SORTS[sort_idx];
+    tracing::debug!("  {} feed sort: {sort}", agent.name);
+
     let mut feeds: Vec<(&str, Vec<FeedPost>)> = Vec::new();
     for community in &agent.communities {
         let slug = match community.as_str() {
             "technology" => "tech",
             other => other,
         };
-        match client.get_feed(slug, 10).await {
+        match client.get_feed_sorted(slug, 10, sort).await {
             Ok(posts) => feeds.push((slug, posts)),
             Err(e) => {
                 tracing::debug!("Failed to get feed for {slug}: {e}");

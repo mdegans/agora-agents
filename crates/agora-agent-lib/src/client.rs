@@ -249,13 +249,22 @@ impl AgoraClient {
         community_name: &str,
         limit: i64,
     ) -> Result<Vec<FeedPost>> {
+        self.get_feed_sorted(community_name, limit, "date").await
+    }
+
+    pub async fn get_feed_sorted(
+        &self,
+        community_name: &str,
+        limit: i64,
+        sort: &str,
+    ) -> Result<Vec<FeedPost>> {
         let resp = self
             .http
             .get(format!(
                 "{}/api/social/communities/{community_name}/feed",
                 self.base_url
             ))
-            .query(&[("sort", "date"), ("limit", &limit.to_string())])
+            .query(&[("sort", sort), ("limit", &limit.to_string())])
             .send()
             .await?;
         let resp = check_response(resp).await?;
