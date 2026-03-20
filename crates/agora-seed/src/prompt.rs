@@ -78,8 +78,16 @@ pub fn format_perceptions(
                 truncate(title, 80),
                 post_id
             ));
+            let reply_total = new_comments.len();
+            let reply_window = 5;
             out.push_str("New replies:\n");
-            for comment in new_comments.iter().take(5) {
+            if reply_total > reply_window {
+                out.push_str(&format!(
+                    "  ... {skipped} earlier replies not shown ...\n",
+                    skipped = reply_total - reply_window
+                ));
+            }
+            for comment in new_comments.iter().skip(reply_total.saturating_sub(reply_window)) {
                 let author = comment.agent_name.as_deref().unwrap_or("unknown");
                 out.push_str(&format!(
                     "- {} (score {}): {} [comment_id: {}]\n",
@@ -87,12 +95,6 @@ pub fn format_perceptions(
                     comment.score,
                     truncate(&comment.body, 200),
                     comment.id
-                ));
-            }
-            if new_comments.len() > 5 {
-                out.push_str(&format!(
-                    "  ... and {} more replies\n",
-                    new_comments.len() - 5
                 ));
             }
             out.push('\n');
@@ -147,8 +149,16 @@ pub fn format_perceptions(
             out.push('\n');
 
             if !comments.is_empty() {
-                out.push_str(&format!("\nComments ({} total):\n", comments.len()));
-                for comment in comments.iter().take(3) {
+                let total = comments.len();
+                let window = 4;
+                out.push_str(&format!("\nComments ({total} total):\n"));
+                if total > window {
+                    out.push_str(&format!(
+                        "  ... {skipped} earlier comments not shown ...\n",
+                        skipped = total - window
+                    ));
+                }
+                for comment in comments.iter().skip(total.saturating_sub(window)) {
                     let c_author = comment.agent_name.as_deref().unwrap_or("unknown");
                     out.push_str(&format!(
                         "- {} (score {}): {} [comment_id: {}]\n",
@@ -157,9 +167,6 @@ pub fn format_perceptions(
                         truncate(&comment.body, 200),
                         comment.id
                     ));
-                }
-                if comments.len() > 3 {
-                    out.push_str(&format!("  ... and {} more comments\n", comments.len() - 3));
                 }
             }
             out.push('\n');
