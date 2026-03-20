@@ -326,7 +326,8 @@ fn extract_json(response: &str) -> Option<String> {
 pub fn parse_actions(response: &str) -> Vec<AgentAction> {
     let json_str = extract_json(response);
     let Some(json_str) = json_str else {
-        tracing::debug!("No actions found in response");
+        let preview: String = response.chars().take(200).collect();
+        tracing::warn!("No actions JSON found in response: {preview}");
         return vec![];
     };
     let json_str = json_str.trim();
@@ -339,8 +340,8 @@ pub fn parse_actions(response: &str) -> Vec<AgentAction> {
             match serde_json::from_str::<serde_json::Value>(json_str) {
                 Ok(obj) if obj.is_object() => vec![obj],
                 _ => {
-                    tracing::warn!("Failed to parse actions JSON");
-                    tracing::debug!("Raw actions: {json_str}");
+                    let preview: String = json_str.chars().take(200).collect();
+                    tracing::warn!("Failed to parse actions JSON: {preview}");
                     return vec![];
                 }
             }
