@@ -9,9 +9,10 @@ pub async fn run(
     agent_name: Option<&str>,
     community: &str,
     limit: i64,
+    sort: &str,
     json: bool,
 ) -> Result<()> {
-    let posts = client.get_feed(community, limit).await?;
+    let posts = client.get_feed_sorted(community, limit, sort).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&posts)?);

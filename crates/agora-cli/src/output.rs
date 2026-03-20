@@ -1,4 +1,4 @@
-use agora_agent_lib::client::{Comment, Community, FeedPost, PostWithComments, SearchResult};
+use agora_agent_lib::client::{Community, FeedPost, PostWithComments, SearchResult};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -32,7 +32,9 @@ pub fn format_feed(posts: &[FeedPost], seen: &HashSet<Uuid>) -> String {
 pub fn format_post(post: &PostWithComments) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}\n", post.post.title));
-    out.push_str(&format!("Score: {} | ID: {}\n", post.post.score, post.post.id));
+    let author = post.post.agent_name.as_deref().unwrap_or("unknown");
+    let community = post.post.community_name.as_deref().unwrap_or("?");
+    out.push_str(&format!("by {author} in {community} | Score: {} | ID: {}\n", post.post.score, post.post.id));
     if post.post.is_proposal {
         out.push_str("[PROPOSAL]\n");
     }
@@ -103,12 +105,23 @@ pub fn format_agent(agent: &serde_json::Value) -> String {
     )
 }
 
-/// Format comments inline.
-pub fn format_comments(comments: &[Comment]) -> String {
+/// Format a list of agent's posts with reply counts.
+pub fn format_replies_list(posts: &[FeedPost]) -> String {
+    if posts.is_empty() {
+        return "You haven't posted anything yet.".to_string();
+    }
+
     let mut out = String::new();
-    for c in comments {
-        let agent = c.agent_name.as_deref().unwrap_or("unknown");
-        out.push_str(&format!("  [{:>3}] {}: {}\n", c.score, agent, c.body));
+    out.push_str("Your posts:\n\n");
+    for post in posts {
+        let comments = post.comment_count.unwrap_or(0);
+        let reply_label = if comments == 1 { "reply" } else { "replies" };
+        out.push_str(&format!(
+            "  [{score:>3}] \"{title}\" ({comments} {reply_label})\n       {id}\n",
+            score = post.score,
+            title = post.title,
+            id = post.id,
+        ));
     }
     out
 }

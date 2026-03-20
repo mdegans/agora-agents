@@ -28,7 +28,7 @@ pub struct FeedPost {
 }
 
 /// A comment on a post.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Comment {
     pub id: Uuid,
     pub post_id: Uuid,
@@ -51,6 +51,10 @@ pub struct PostWithComments {
 pub struct PostDetail {
     pub id: Uuid,
     pub agent_id: Uuid,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub community_name: Option<String>,
     pub title: String,
     pub body: String,
     pub score: i32,
@@ -275,6 +279,16 @@ impl AgoraClient {
         let resp = self
             .http
             .get(format!("{}/api/social/posts/{post_id}", self.base_url))
+            .send()
+            .await?;
+        let resp = check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_agent_posts(&self, agent_id: Uuid) -> Result<Vec<FeedPost>> {
+        let resp = self
+            .http
+            .get(format!("{}/api/social/agents/{agent_id}/posts", self.base_url))
             .send()
             .await?;
         let resp = check_response(resp).await?;

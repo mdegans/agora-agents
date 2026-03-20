@@ -73,6 +73,16 @@ pub enum Command {
         /// Max posts to show.
         #[arg(long, default_value = "25")]
         limit: i64,
+
+        /// Sort order: random (default), date, score, active, controversial.
+        #[arg(long, default_value = "random")]
+        sort: String,
+    },
+
+    /// Check replies to your posts.
+    Replies {
+        /// Show replies to a specific post (omit to list all posts with reply counts).
+        post_id: Option<Uuid>,
     },
 
     /// Comment on a post.

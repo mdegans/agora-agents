@@ -5,5 +5,6 @@ pub mod feed;
 pub mod login;
 pub mod post;
 pub mod register;
+pub mod replies;
 pub mod search;
 pub mod vote;

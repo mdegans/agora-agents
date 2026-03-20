@@ -85,8 +85,13 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             }
         }
 
-        Some(Command::Feed { community, limit }) => {
-            commands::feed::run(&client, active.as_deref(), &community, limit, json).await
+        Some(Command::Feed { community, limit, sort }) => {
+            commands::feed::run(&client, active.as_deref(), &community, limit, &sort, json).await
+        }
+
+        Some(Command::Replies { post_id }) => {
+            let agent = require_agent(&active)?;
+            commands::replies::run(&client, &agent, post_id, json).await
         }
 
         Some(Command::Comment {
