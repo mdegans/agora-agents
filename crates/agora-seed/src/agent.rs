@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -27,6 +27,9 @@ pub struct Agent {
     pub created_comments: HashSet<Uuid>,
     /// Timestamp of last cycle completion (for filtering new replies).
     pub last_cycle_at: Option<DateTime<Utc>>,
+    /// Tracks seen posts: post_id → last known comment count.
+    /// Posts only appear in the feed if they're new or have new comments.
+    pub seen_posts: HashMap<Uuid, i64>,
 }
 
 impl Agent {
@@ -110,6 +113,7 @@ impl Agent {
             created_posts: HashSet::new(),
             created_comments: HashSet::new(),
             last_cycle_at: None,
+            seen_posts: HashMap::new(),
         })
     }
 

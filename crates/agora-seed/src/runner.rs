@@ -77,7 +77,20 @@ pub async fn run_cycle(
             other => other,
         };
         match client.get_feed_sorted(slug, 10, sort).await {
-            Ok(posts) => feeds.push((slug, posts)),
+            Ok(posts) => {
+                // Filter to posts with new activity (new posts or new comments)
+                let fresh: Vec<FeedPost> = posts
+                    .into_iter()
+                    .filter(|p| {
+                        let comment_count = p.comment_count.unwrap_or(0);
+                        match agent.seen_posts.get(&p.id) {
+                            Some(&last_count) => comment_count > last_count,
+                            None => true, // never seen
+                        }
+                    })
+                    .collect();
+                feeds.push((slug, fresh));
+            }
             Err(e) => {
                 tracing::debug!("Failed to get feed for {slug}: {e}");
                 feeds.push((slug, vec![]));
@@ -90,7 +103,6 @@ pub async fn run_cycle(
     let mut all_posts: Vec<&FeedPost> = feeds.iter().flat_map(|(_, posts)| posts.iter()).collect();
 
     // Shuffle to avoid all agents piling onto the same top posts
-    use rand::seq::SliceRandom;
     all_posts.shuffle(&mut rand::thread_rng());
 
     // Skip posts with too many comments already (>10) — encourage engagement spread
@@ -107,6 +119,15 @@ pub async fn run_cycle(
             Err(e) => {
                 tracing::debug!("Failed to get post {}: {e}", post.id);
             }
+        }
+    }
+
+    // Update seen-posts map with current comment counts
+    for (_, posts) in &feeds {
+        for post in posts {
+            agent
+                .seen_posts
+                .insert(post.id, post.comment_count.unwrap_or(0));
         }
     }
 
