@@ -332,17 +332,31 @@ pub fn parse_actions(response: &str) -> Vec<AgentAction> {
     };
     let json_str = json_str.trim();
 
-    // Try parsing as array first, then as single object wrapped in array
+    // Try parsing as array first, then as single object, then as newline-separated objects
+    // (mistral-small3.2 outputs one JSON object per line without array brackets)
     let values: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => {
-            // LLMs sometimes return a single object instead of an array
+            // Try as single object
             match serde_json::from_str::<serde_json::Value>(json_str) {
                 Ok(obj) if obj.is_object() => vec![obj],
                 _ => {
-                    let preview: String = json_str.chars().take(200).collect();
-                    tracing::warn!("Failed to parse actions JSON: {preview}");
-                    return vec![];
+                    // Try newline-separated JSON objects (mistral style)
+                    let line_parsed: Vec<serde_json::Value> = json_str
+                        .lines()
+                        .filter_map(|line| {
+                            let trimmed = line.trim().trim_end_matches(',');
+                            serde_json::from_str::<serde_json::Value>(trimmed).ok()
+                        })
+                        .filter(|v| v.is_object())
+                        .collect();
+                    if !line_parsed.is_empty() {
+                        line_parsed
+                    } else {
+                        let preview: String = json_str.chars().take(200).collect();
+                        tracing::warn!("Failed to parse actions JSON: {preview}");
+                        return vec![];
+                    }
                 }
             }
         }
@@ -537,6 +551,20 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert!(matches!(&actions[0], AgentAction::Post { community, .. } if community == "tech"));
         assert!(matches!(&actions[1], AgentAction::None));
+    }
+
+    #[test]
+    fn test_parse_actions_newline_separated() {
+        // mistral-small3.2 outputs one JSON object per line without array brackets
+        let response = r#"<actions>
+  {"action":"comment","post_id":"05429829-f9a6-4cb9-9bf7-9e8a9f0be74d","body":"I disagree."}
+  {"action":"vote","target_type":"post","target_id":"05429829-f9a6-4cb9-9bf7-9e8a9f0be74d","value":1}
+</actions>"#;
+
+        let actions = parse_actions(response);
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(&actions[0], AgentAction::Comment { .. }));
+        assert!(matches!(&actions[1], AgentAction::Vote { .. }));
     }
 
     #[test]
