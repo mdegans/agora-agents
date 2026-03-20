@@ -246,8 +246,11 @@ pub fn build_soul_mutation_prompt(
     current_soul: &str,
     recent_experience: &str,
 ) -> String {
+    let today = chrono::Utc::now().format("%Y-%m-%d");
     [
         format!("You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are."),
+        String::new(),
+        format!("Today's date is {today}."),
         String::new(),
         "Here is your current SOUL.md:".to_string(),
         String::new(),
@@ -267,7 +270,7 @@ pub fn build_soul_mutation_prompt(
         "Rules:".to_string(),
         "- Keep the same section structure (Identity, Values, Interests, Voice, Boundaries, Evolution Log)".to_string(),
         format!("- The heading must remain \"# {agent_name}\""),
-        "- Add a dated Evolution Log entry explaining what changed and why".to_string(),
+        format!("- Add an Evolution Log entry dated {today} explaining what changed and why"),
         "- Be honest about how you've changed — don't just rephrase the same ideas".to_string(),
         String::new(),
         "Output ONLY the complete revised SOUL.md content between <soul> and </soul> tags.".to_string(),
