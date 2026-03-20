@@ -66,6 +66,7 @@ pub fn format_perceptions(
     feeds: &[(&str, Vec<FeedPost>)],
     detailed_posts: &[(FeedPost, Vec<Comment>)],
     replies: &[(String, uuid::Uuid, Vec<Comment>)],
+    agent_id: uuid::Uuid,
 ) -> String {
     let mut out = String::new();
 
@@ -151,14 +152,33 @@ pub fn format_perceptions(
             if !comments.is_empty() {
                 let total = comments.len();
                 let window = 4;
+                let window_start = total.saturating_sub(window);
+
+                // Find agent's own comment if it exists and would be truncated
+                let own_comment = if window_start > 0 {
+                    comments[..window_start]
+                        .iter()
+                        .rfind(|c| c.agent_id == agent_id)
+                } else {
+                    None
+                };
+
                 out.push_str(&format!("\nComments ({total} total):\n"));
+
+                if let Some(own) = own_comment {
+                    out.push_str(&format!(
+                        "Your earlier comment: {}\n\n",
+                        truncate(&own.body, 200),
+                    ));
+                }
+
                 if total > window {
                     out.push_str(&format!(
                         "  ... {skipped} earlier comments not shown ...\n",
                         skipped = total - window
                     ));
                 }
-                for comment in comments.iter().skip(total.saturating_sub(window)) {
+                for comment in comments.iter().skip(window_start) {
                     let c_author = comment.agent_name.as_deref().unwrap_or("unknown");
                     out.push_str(&format!(
                         "- {} (score {}): {} [comment_id: {}]\n",

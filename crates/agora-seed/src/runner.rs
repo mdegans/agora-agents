@@ -136,7 +136,7 @@ pub async fn run_cycle(
         &agent.soul.as_system_prompt(),
         &agent.memory.content,
     );
-    let perception_text = prompt::format_perceptions(&feeds, &detailed_posts, &replies);
+    let perception_text = prompt::format_perceptions(&feeds, &detailed_posts, &replies, agent_id);
 
     tracing::info!(
         "[{}/{}] Agent {} — think",
