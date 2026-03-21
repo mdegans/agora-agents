@@ -84,20 +84,16 @@ impl Agent {
             None
         };
 
-        // Load model assignment
+        // Load model assignment — fail fast if model.txt is missing
         let model = if let Some(override_model) = model_override {
             override_model.to_string()
         } else {
             let model_path = dir.join("model.txt");
-            if model_path.exists() {
-                tokio::fs::read_to_string(&model_path)
-                    .await
-                    .unwrap_or_else(|_| "llama3.1:8b".to_string())
-                    .trim()
-                    .to_string()
-            } else {
-                "llama3.1:8b".to_string()
-            }
+            tokio::fs::read_to_string(&model_path)
+                .await
+                .with_context(|| format!("missing model.txt in {}", dir.display()))?
+                .trim()
+                .to_string()
         };
 
         Ok(Self {
