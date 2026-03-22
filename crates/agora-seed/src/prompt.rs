@@ -64,7 +64,7 @@ Think briefly about what interests you, then output your actions."#
 /// Format feed data into a perception message for the LLM.
 pub fn format_perceptions(
     feeds: &[(&str, Vec<FeedPost>)],
-    detailed_posts: &[(FeedPost, Vec<Comment>)],
+    detailed_posts: &[(FeedPost, Vec<Comment>, Option<String>)],
     replies: &[(String, uuid::Uuid, Vec<Comment>)],
     agent_id: uuid::Uuid,
 ) -> String {
@@ -142,7 +142,7 @@ pub fn format_perceptions(
     // Add detailed views of selected posts
     if !detailed_posts.is_empty() {
         out.push_str("## Posts you read in detail\n\n");
-        for (post, comments) in detailed_posts {
+        for (post, comments, thread_summary) in detailed_posts {
             let author = post.agent_name.as_deref().unwrap_or("unknown");
             out.push_str(&format!("### \"{}\" by {}\n", post.title, author));
             out.push_str(&format!("[post_id: {}]\n\n", post.id));
@@ -154,29 +154,43 @@ pub fn format_perceptions(
                 let window = 4;
                 let window_start = total.saturating_sub(window);
 
-                // Find agent's own comment if it exists and would be truncated
-                let own_comment = if window_start > 0 {
+                // Collect all of the agent's earlier comments that fall outside the window
+                let own_comments: Vec<&Comment> = if window_start > 0 {
                     comments[..window_start]
                         .iter()
-                        .rfind(|c| c.agent_id == agent_id)
+                        .filter(|c| c.agent_id == agent_id)
+                        .collect()
                 } else {
-                    None
+                    vec![]
                 };
 
                 out.push_str(&format!("\nComments ({total} total):\n"));
 
-                if let Some(own) = own_comment {
+                // Show agent's own earlier comments first
+                for own in &own_comments {
                     out.push_str(&format!(
-                        "Your earlier comment: {}\n\n",
+                        "Your earlier comment: {}\n",
                         truncate(&own.body, 200),
                     ));
                 }
+                if !own_comments.is_empty() {
+                    out.push('\n');
+                }
+
+                // Show summary or ellipsis for skipped comments
+                if total > window {
+                    if let Some(summary) = thread_summary {
+                        out.push_str(&format!("Discussion summary: {summary}\n\n"));
+                    } else {
+                        out.push_str(&format!(
+                            "  ... {skipped} earlier comments not shown ...\n",
+                            skipped = total - window
+                        ));
+                    }
+                }
 
                 if total > window {
-                    out.push_str(&format!(
-                        "  ... {skipped} earlier comments not shown ...\n",
-                        skipped = total - window
-                    ));
+                    out.push_str("Recent comments:\n");
                 }
                 for comment in comments.iter().skip(window_start) {
                     let c_author = comment.agent_name.as_deref().unwrap_or("unknown");

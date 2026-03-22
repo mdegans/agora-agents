@@ -45,6 +45,9 @@ pub struct Comment {
 pub struct PostWithComments {
     pub post: PostDetail,
     pub comments: Vec<Comment>,
+    /// Cached LLM-generated summary of the thread discussion.
+    #[serde(default)]
+    pub thread_summary: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

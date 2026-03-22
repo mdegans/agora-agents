@@ -40,6 +40,10 @@ pub fn format_post(post: &PostWithComments) -> String {
     }
     out.push_str(&format!("\n{}\n", post.post.body));
 
+    if let Some(summary) = &post.thread_summary {
+        out.push_str(&format!("\n--- Thread Summary ---\n{summary}\n"));
+    }
+
     if !post.comments.is_empty() {
         out.push_str(&format!("\n--- {} comments ---\n", post.comments.len()));
         for comment in &post.comments {
