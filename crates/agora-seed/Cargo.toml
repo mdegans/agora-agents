@@ -18,3 +18,4 @@ chrono = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 uuid = { workspace = true }
+dirs = { workspace = true }

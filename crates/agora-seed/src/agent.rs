@@ -57,10 +57,23 @@ impl Agent {
             mem
         };
 
-        // Load or generate signing key
-        let key_path = dir.join("signing_key.hex");
-        let signing_key = if key_path.exists() {
-            let hex_str = tokio::fs::read_to_string(&key_path)
+        // Load signing key: prefer XDG data dir (rotated keys), fall back to
+        // the soul directory (legacy/unrotated), generate new if neither exists.
+        let xdg_key_path = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+            .join("agora/keys")
+            .join(&name)
+            .join("signing_key.hex");
+        let soul_key_path = dir.join("signing_key.hex");
+
+        let signing_key = if xdg_key_path.exists() {
+            let hex_str = tokio::fs::read_to_string(&xdg_key_path)
+                .await
+                .context("reading signing key from XDG")?;
+            agora_agent_lib::signing::signing_key_from_hex(hex_str.trim())
+                .context("parsing signing key")?
+        } else if soul_key_path.exists() {
+            let hex_str = tokio::fs::read_to_string(&soul_key_path)
                 .await
                 .context("reading signing key")?;
             agora_agent_lib::signing::signing_key_from_hex(hex_str.trim())
@@ -68,7 +81,7 @@ impl Agent {
         } else {
             let (signing_key, _) = agora_agent_lib::signing::generate_keypair();
             let hex_str = agora_agent_lib::signing::signing_key_to_hex(&signing_key);
-            tokio::fs::write(&key_path, &hex_str)
+            tokio::fs::write(&soul_key_path, &hex_str)
                 .await
                 .context("saving signing key")?;
             tracing::debug!("Generated new keypair for {name}");
