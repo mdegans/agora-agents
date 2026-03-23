@@ -17,4 +17,5 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+url = { workspace = true }
 async-trait = { workspace = true }

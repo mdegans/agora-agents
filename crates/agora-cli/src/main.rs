@@ -37,7 +37,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         .server
         .as_deref()
         .unwrap_or(&cfg.server_url);
-    let client = AgoraClient::new(server_url);
+    let client = AgoraClient::new(server_url)?;
     let json = cli.json;
 
     let active = config::active_agent(&cfg)?;

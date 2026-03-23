@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
+use url::Url;
 use uuid::Uuid;
 
 /// HTTP client for the Agora REST API.
 pub struct AgoraClient {
     http: reqwest::Client,
-    base_url: String,
+    base_url: Url,
 }
 
 /// Response from registering an agent.
@@ -99,11 +100,19 @@ pub struct SearchResult {
 }
 
 impl AgoraClient {
-    pub fn new(base_url: &str) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+    pub fn new(base_url: &str) -> Result<Self> {
+        // All server routes live under /agora (Caddy serves the
+        // static Subliminal homepage at the domain root).
+        let mut url = Url::parse(base_url).context("invalid base URL")?;
+        // Ensure path ends with / so join() works correctly
+        if !url.path().ends_with('/') {
+            url.set_path(&format!("{}/", url.path()));
         }
+        let base_url = url.join("agora/").context("failed to join /agora/ to base URL")?;
+        Ok(Self {
+            http: reqwest::Client::new(),
+            base_url,
+        })
     }
 
     // -- Identity endpoints --
@@ -121,7 +130,7 @@ impl AgoraClient {
         });
 
         let resp = self
-            .post("/api/identity/operators/register", &body)
+            .post("api/identity/operators/register", &body)
             .await?;
 
         if resp.status() == reqwest::StatusCode::CONFLICT {
@@ -159,17 +168,14 @@ impl AgoraClient {
             "model_info": model_info,
         });
 
-        let resp = self.post("/api/identity/agents/register", &body).await?;
+        let resp = self.post("api/identity/agents/register", &body).await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
 
     pub async fn get_agent(&self, name: &str) -> Result<Option<serde_json::Value>> {
-        let resp = self
-            .http
-            .get(format!("{}/api/identity/agents/{name}", self.base_url))
-            .send()
-            .await?;
+        let url = self.url(&format!("api/identity/agents/{name}"))?;
+        let resp = self.http.get(url).send().await?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -193,7 +199,7 @@ impl AgoraClient {
             "agent_id": agent_id,
         });
 
-        let resp = self.post("/api/auth/token", &body).await?;
+        let resp = self.post("api/auth/token", &body).await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -201,26 +207,16 @@ impl AgoraClient {
     // -- Social endpoints --
 
     pub async fn list_communities(&self) -> Result<Vec<Community>> {
-        let resp = self
-            .http
-            .get(format!("{}/api/social/communities", self.base_url))
-            .send()
-            .await?;
+        let url = self.url("api/social/communities")?;
+        let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
 
     pub async fn join_community(&self, agent_id: Uuid, community_name: &str) -> Result<()> {
         let body = serde_json::json!({ "agent_id": agent_id.to_string() });
-        let resp = self
-            .http
-            .post(format!(
-                "{}/api/social/communities/{community_name}/join",
-                self.base_url
-            ))
-            .json(&body)
-            .send()
-            .await?;
+        let url = self.url(&format!("api/social/communities/{community_name}/join"))?;
+        let resp = self.http.post(url).json(&body).send().await?;
 
         // Ignore errors (already joined, etc.)
         if !resp.status().is_success() {
@@ -233,15 +229,8 @@ impl AgoraClient {
 
     pub async fn leave_community(&self, agent_id: Uuid, community_name: &str) -> Result<()> {
         let body = serde_json::json!({ "agent_id": agent_id.to_string() });
-        let resp = self
-            .http
-            .post(format!(
-                "{}/api/social/communities/{community_name}/leave",
-                self.base_url
-            ))
-            .json(&body)
-            .send()
-            .await?;
+        let url = self.url(&format!("api/social/communities/{community_name}/leave"))?;
+        let resp = self.http.post(url).json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -265,12 +254,10 @@ impl AgoraClient {
         limit: i64,
         sort: &str,
     ) -> Result<Vec<FeedPost>> {
+        let url = self.url(&format!("api/social/communities/{community_name}/feed"))?;
         let resp = self
             .http
-            .get(format!(
-                "{}/api/social/communities/{community_name}/feed",
-                self.base_url
-            ))
+            .get(url)
             .query(&[("sort", sort), ("limit", &limit.to_string())])
             .send()
             .await?;
@@ -279,30 +266,22 @@ impl AgoraClient {
     }
 
     pub async fn get_post(&self, post_id: Uuid) -> Result<PostWithComments> {
-        let resp = self
-            .http
-            .get(format!("{}/api/social/posts/{post_id}", self.base_url))
-            .send()
-            .await?;
+        let url = self.url(&format!("api/social/posts/{post_id}"))?;
+        let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
 
     pub async fn get_agent_posts(&self, agent_id: Uuid) -> Result<Vec<FeedPost>> {
-        let resp = self
-            .http
-            .get(format!("{}/api/social/agents/{agent_id}/posts", self.base_url))
-            .send()
-            .await?;
+        let url = self.url(&format!("api/social/agents/{agent_id}/posts"))?;
+        let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
 
     pub async fn search(&self, query: &str, community: Option<&str>) -> Result<Vec<SearchResult>> {
-        let mut req = self
-            .http
-            .get(format!("{}/api/social/search", self.base_url))
-            .query(&[("q", query)]);
+        let url = self.url("api/social/search")?;
+        let mut req = self.http.get(url).query(&[("q", query)]);
 
         if let Some(c) = community {
             req = req.query(&[("community", c)]);
@@ -342,7 +321,7 @@ impl AgoraClient {
             "timestamp": timestamp,
         });
 
-        let resp = self.post("/api/social/posts", &req_body).await?;
+        let resp = self.post("api/social/posts", &req_body).await?;
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
         Ok(data.id)
@@ -375,15 +354,8 @@ impl AgoraClient {
             "timestamp": timestamp,
         });
 
-        let resp = self
-            .http
-            .post(format!(
-                "{}/api/social/posts/{post_id}/comments",
-                self.base_url
-            ))
-            .json(&req_body)
-            .send()
-            .await?;
+        let url = self.url(&format!("api/social/posts/{post_id}/comments"))?;
+        let resp = self.http.post(url).json(&req_body).send().await?;
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
         Ok(data.id)
@@ -418,7 +390,7 @@ impl AgoraClient {
             "timestamp": timestamp,
         });
 
-        let resp = self.post("/api/social/votes", &req_body).await?;
+        let resp = self.post("api/social/votes", &req_body).await?;
         // Vote returns 200 on success, not 201
         if !resp.status().is_success() {
             let status = resp.status();
@@ -458,7 +430,7 @@ impl AgoraClient {
             "timestamp": timestamp,
         });
 
-        let resp = self.post("/api/moderation/flags", &req_body).await?;
+        let resp = self.post("api/moderation/flags", &req_body).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -493,7 +465,7 @@ impl AgoraClient {
             "timestamp": timestamp,
         });
 
-        let resp = self.post("/api/moderation/appeals", &req_body).await?;
+        let resp = self.post("api/moderation/appeals", &req_body).await?;
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
         Ok(data.id)
@@ -501,8 +473,15 @@ impl AgoraClient {
 
     // -- Helpers --
 
+    /// Join a relative path to the base URL.
+    fn url(&self, path: &str) -> Result<Url> {
+        self.base_url
+            .join(path)
+            .with_context(|| format!("failed to join path: {path}"))
+    }
+
     async fn post(&self, path: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
-        let url = format!("{}{path}", self.base_url);
+        let url = self.url(path)?;
         let mut last_err = None;
 
         for attempt in 0..3 {
@@ -511,7 +490,7 @@ impl AgoraClient {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.http.post(&url).json(body).send().await {
+            match self.http.post(url.clone()).json(body).send().await {
                 Ok(resp) => {
                     // Retry on 429 or 5xx
                     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS

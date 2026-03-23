@@ -54,7 +54,10 @@ pub async fn run_all(
         let client_url = config.server_url.clone();
 
         Some(tokio::spawn(async move {
-            let client = AgoraClient::new(&client_url);
+            let client = match AgoraClient::new(&client_url) {
+                Ok(c) => c,
+                Err(e) => return (remote_agents, Err(e)),
+            };
             let result = run_waves(
                 &mut remote_agents,
                 &client,

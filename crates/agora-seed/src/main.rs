@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     let operator_password = operator_password.trim().to_string();
 
     // Create API client
-    let api_client = client::AgoraClient::new(&cli.server_url);
+    let api_client = client::AgoraClient::new(&cli.server_url)?;
 
     // Load all agents from souls directory
     tracing::info!("Loading agents from {}...", cli.souls_dir.display());
