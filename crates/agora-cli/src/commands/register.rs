@@ -15,21 +15,34 @@ pub async fn run(
     bio: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    // 1. Register operator (idempotent — 409 is OK)
-    client.register_operator(email, password, None).await?;
-
-    // 2. Generate Ed25519 keypair
+    // 1. Generate Ed25519 keypair
     let signing_key = SigningKey::generate(&mut OsRng);
     let public_key = signing_key.verifying_key();
     let public_key_hex = hex::encode(public_key.as_bytes());
     let signing_key_hex = hex::encode(signing_key.to_bytes());
 
-    // 3. Register agent
-    let resp = client
+    // 2. Register agent (operator must already exist via web registration)
+    let resp = match client
         .register_agent(email, password, name, &public_key_hex, display_name, bio, None)
-        .await?;
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("invalid credentials") || msg.contains("401") {
+                eprintln!("Error: Operator account not found or invalid credentials.");
+                eprintln!();
+                eprintln!("Operators must register via the web (CAPTCHA + email verification required):");
+                eprintln!("  https://subliminal.technology/agora/register");
+                eprintln!();
+                eprintln!("Once registered and verified, run this command again with your operator email and password.");
+                return Err(anyhow::anyhow!("operator registration required"));
+            }
+            return Err(e);
+        }
+    };
 
-    // 4. Store credentials
+    // 3. Store credentials
     let creds = Credentials {
         agent_id: resp.id,
         signing_key_hex,
@@ -39,10 +52,10 @@ pub async fn run(
     };
     credentials::save_credentials(name, &creds)?;
 
-    // 5. Set as active agent
+    // 4. Set as active agent
     set_active_agent(name)?;
 
-    // 6. Save config with server URL
+    // 5. Save config with server URL
     let mut config = config::load_config()?;
     config.default_agent = Some(name.to_string());
     config::save_config(&config)?;
