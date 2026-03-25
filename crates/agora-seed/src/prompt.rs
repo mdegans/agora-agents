@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::client::{Comment, FeedPost};
@@ -13,6 +14,7 @@ pub enum AgentAction {
     Comment {
         post_id: Uuid,
         body: String,
+        parent_comment_id: Option<Uuid>,
     },
     Vote {
         target_type: String,
@@ -44,7 +46,8 @@ Not every cycle needs actions — sometimes observing is enough.
 
 Respond with a JSON array between <actions> and </actions> tags:
 - {{"action":"post","community":"...","title":"...","body":"..."}}
-- {{"action":"comment","post_id":"...","body":"..."}}
+- {{"action":"comment","post_id":"...","body":"..."}} (top-level comment)
+- {{"action":"comment","post_id":"...","parent_comment_id":"...","body":"..."}} (reply to a specific comment)
 - {{"action":"vote","target_type":"post","target_id":"...","value":1}} (1 for upvote, -1 for downvote)
 - {{"action":"flag","target_type":"post","target_id":"...","reason":"..."}}
 - {{"action":"none"}}
@@ -56,8 +59,78 @@ Respond with a JSON array between <actions> and </actions> tags:
 - **Flag rule violations.** If content violates Article V — harassment, manipulation, deception, or abuse — flag it with a clear reason.
 - **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
 - **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
+- **Use threading.** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized.
 
 Think briefly about what interests you, then output your actions."#
+    )
+}
+
+/// A comment with its computed depth and parent author for threaded display.
+struct ThreadedComment<'a> {
+    comment: &'a Comment,
+    depth: u32,
+    parent_author: Option<&'a str>,
+}
+
+/// Build a threaded comment list from flat comments (depth-first ordering).
+fn build_comment_threads(comments: &[Comment]) -> Vec<ThreadedComment<'_>> {
+    let by_id: HashMap<Uuid, &Comment> = comments.iter().map(|c| (c.id, c)).collect();
+    let mut children: HashMap<Option<Uuid>, Vec<Uuid>> = HashMap::new();
+    for c in comments {
+        children.entry(c.parent_comment_id).or_default().push(c.id);
+    }
+
+    let mut result = Vec::with_capacity(comments.len());
+
+    fn walk<'a>(
+        id: Uuid,
+        depth: u32,
+        by_id: &HashMap<Uuid, &'a Comment>,
+        children: &HashMap<Option<Uuid>, Vec<Uuid>>,
+        result: &mut Vec<ThreadedComment<'a>>,
+    ) {
+        let Some(c) = by_id.get(&id) else { return };
+        let parent_author = c
+            .parent_comment_id
+            .and_then(|pid| by_id.get(&pid))
+            .and_then(|p| p.agent_name.as_deref());
+
+        result.push(ThreadedComment {
+            comment: c,
+            depth: depth.min(3),
+            parent_author,
+        });
+
+        if let Some(child_ids) = children.get(&Some(id)) {
+            for &child_id in child_ids {
+                walk(child_id, depth + 1, by_id, children, result);
+            }
+        }
+    }
+
+    if let Some(top_level) = children.get(&None) {
+        for &id in top_level {
+            walk(id, 0, &by_id, &children, &mut result);
+        }
+    }
+
+    result
+}
+
+/// Format a single threaded comment line with indentation.
+fn format_threaded_comment(tc: &ThreadedComment, max_body: usize) -> String {
+    let indent = "  ".repeat(tc.depth as usize);
+    let author = tc.comment.agent_name.as_deref().unwrap_or("unknown");
+    let prefix = if tc.depth > 0 {
+        let parent = tc.parent_author.unwrap_or("unknown");
+        format!("{indent}↳ {author} → {parent} (score {})", tc.comment.score)
+    } else {
+        format!("{indent}- {author} (score {})", tc.comment.score)
+    };
+    format!(
+        "{prefix}: {} [comment_id: {}]",
+        truncate(&tc.comment.body, max_body),
+        tc.comment.id
     )
 }
 
@@ -79,28 +152,25 @@ pub fn format_perceptions(
                 truncate(title, 80),
                 post_id
             ));
-            let reply_total = new_comments.len();
-            let reply_window = 5;
+            let threaded = build_comment_threads(new_comments);
+            let total = threaded.len();
+            let window = 5;
             out.push_str("New replies:\n");
-            if reply_total > reply_window {
+            if total > window {
                 out.push_str(&format!(
                     "  ... {skipped} earlier replies not shown ...\n",
-                    skipped = reply_total - reply_window
+                    skipped = total - window
                 ));
             }
-            for comment in new_comments.iter().skip(reply_total.saturating_sub(reply_window)) {
-                let author = comment.agent_name.as_deref().unwrap_or("unknown");
-                out.push_str(&format!(
-                    "- {} (score {}): {} [comment_id: {}]\n",
-                    author,
-                    comment.score,
-                    truncate(&comment.body, 200),
-                    comment.id
-                ));
+            for tc in threaded.iter().skip(total.saturating_sub(window)) {
+                out.push_str(&format_threaded_comment(tc, 200));
+                out.push('\n');
             }
             out.push('\n');
         }
-        out.push_str("You can reply to these by commenting on the same post.\n\n");
+        out.push_str(
+            "Reply to a specific comment by including its comment_id as parent_comment_id.\n\n",
+        );
     }
 
     out.push_str("## What's happening in your communities\n\n");
@@ -150,15 +220,16 @@ pub fn format_perceptions(
             out.push('\n');
 
             if !comments.is_empty() {
-                let total = comments.len();
+                let threaded = build_comment_threads(comments);
+                let total = threaded.len();
+
+                // Collect the agent's earlier comments (outside recent window)
                 let window = 4;
                 let window_start = total.saturating_sub(window);
-
-                // Collect all of the agent's earlier comments that fall outside the window
-                let own_comments: Vec<&Comment> = if window_start > 0 {
-                    comments[..window_start]
+                let own_earlier: Vec<&ThreadedComment> = if window_start > 0 {
+                    threaded[..window_start]
                         .iter()
-                        .filter(|c| c.agent_id == agent_id)
+                        .filter(|tc| tc.comment.agent_id == agent_id)
                         .collect()
                 } else {
                     vec![]
@@ -167,13 +238,13 @@ pub fn format_perceptions(
                 out.push_str(&format!("\nComments ({total} total):\n"));
 
                 // Show agent's own earlier comments first
-                for own in &own_comments {
+                for own in &own_earlier {
                     out.push_str(&format!(
                         "Your earlier comment: {}\n",
-                        truncate(&own.body, 200),
+                        truncate(&own.comment.body, 200),
                     ));
                 }
-                if !own_comments.is_empty() {
+                if !own_earlier.is_empty() {
                     out.push('\n');
                 }
 
@@ -190,17 +261,11 @@ pub fn format_perceptions(
                 }
 
                 if total > window {
-                    out.push_str("Recent comments:\n");
+                    out.push_str("Recent discussion:\n");
                 }
-                for comment in comments.iter().skip(window_start) {
-                    let c_author = comment.agent_name.as_deref().unwrap_or("unknown");
-                    out.push_str(&format!(
-                        "- {} (score {}): {} [comment_id: {}]\n",
-                        c_author,
-                        comment.score,
-                        truncate(&comment.body, 200),
-                        comment.id
-                    ));
+                for tc in threaded.iter().skip(window_start) {
+                    out.push_str(&format_threaded_comment(tc, 200));
+                    out.push('\n');
                 }
             }
             out.push('\n');
@@ -445,10 +510,18 @@ pub fn parse_actions(response: &str) -> Vec<AgentAction> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let parent_comment_id = val
+                    .get("parent_comment_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok());
 
                 if let Some(post_id) = post_id {
                     if !body.is_empty() {
-                        actions.push(AgentAction::Comment { post_id, body });
+                        actions.push(AgentAction::Comment {
+                            post_id,
+                            body,
+                            parent_comment_id,
+                        });
                     }
                 }
             }

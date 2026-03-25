@@ -38,6 +38,8 @@ pub struct Comment {
     pub body: String,
     pub score: i32,
     #[serde(default)]
+    pub parent_comment_id: Option<Uuid>,
+    #[serde(default)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 

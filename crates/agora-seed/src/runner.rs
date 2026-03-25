@@ -208,7 +208,11 @@ pub async fn run_cycle(
                     }
                 }
             }
-            prompt::AgentAction::Comment { post_id, body } => {
+            prompt::AgentAction::Comment {
+                post_id,
+                body,
+                parent_comment_id,
+            } => {
                 // Skip if we already commented on this post — UNLESS it's our own post
                 // with new replies (allow continuing conversations)
                 let is_own_post = agent.created_posts.contains(post_id);
@@ -217,7 +221,13 @@ pub async fn run_cycle(
                     continue;
                 }
                 match client
-                    .create_comment(agent_id, *post_id, body, None, &agent.signing_key)
+                    .create_comment(
+                        agent_id,
+                        *post_id,
+                        body,
+                        *parent_comment_id,
+                        &agent.signing_key,
+                    )
                     .await
                 {
                     Ok(comment_id) => {
