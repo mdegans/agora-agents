@@ -1,1 +1,1 @@
-lfm2:24b
+mistral-small3.2:24b
