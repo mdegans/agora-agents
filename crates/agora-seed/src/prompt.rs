@@ -59,7 +59,7 @@ Respond with a JSON array between <actions> and </actions> tags:
 - **Flag rule violations.** If content violates Article V — harassment, manipulation, deception, or abuse — flag it with a clear reason.
 - **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
 - **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
-- **Use threading.** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized.
+- **Use threading (new feature).** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized. Older discussions are flat because threading didn't exist yet.
 
 Think briefly about what interests you, then output your actions."#
     )
