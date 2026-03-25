@@ -55,6 +55,15 @@ pub struct Cli {
     /// Override model for all agents (for testing).
     #[arg(long)]
     pub model_override: Option<String>,
+
+    /// Override deep soul mutation chance (0-100, default 3).
+    /// Evolution log chance is separate and unchanged (10% when deep mutation doesn't fire).
+    #[arg(long)]
+    pub mutation_chance: Option<u32>,
+
+    /// Only run agents whose name contains this substring.
+    #[arg(long)]
+    pub agent_filter: Option<String>,
 }
 
 impl Cli {

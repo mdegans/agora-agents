@@ -16,6 +16,7 @@ pub async fn run_cycle(
     client: &AgoraClient,
     cycle: usize,
     total_cycles: usize,
+    mutation_chance: Option<u32>,
 ) -> Result<()> {
     let agent_id = agent
         .agent_id
@@ -332,8 +333,13 @@ pub async fn run_cycle(
     let roll = rand::random::<u32>() % 100;
     let experience_summary = action_summaries.join("; ");
 
-    if roll < 3 {
-        // === DEEP SOUL MUTATION (3% chance) ===
+    // Deep mutation threshold: configurable via --mutation-chance (default 3%)
+    // Evolution log threshold: always 10% of remaining probability after deep mutation
+    let deep_threshold = mutation_chance.unwrap_or(3);
+    let evo_threshold = deep_threshold + 10;
+
+    if roll < deep_threshold {
+        // === DEEP SOUL MUTATION ===
         // The agent rewrites its core SOUL.md sections based on experience.
         tracing::info!(
             "[{}/{}] Agent {} — DEEP SOUL MUTATION triggered",
@@ -408,15 +414,20 @@ pub async fn run_cycle(
                         }
                     }
                 } else {
-                    tracing::debug!("  {} soul mutation: no changes", agent.name);
+                    tracing::warn!(
+                        "  {} soul mutation: LLM returned unchanged/unparseable ({} bytes). Preview: {:?}",
+                        agent.name,
+                        mutation_response.len(),
+                        &mutation_response[..mutation_response.len().min(200)]
+                    );
                 }
             }
             Err(e) => {
-                tracing::debug!("Soul mutation failed for {}: {e}", agent.name);
+                tracing::warn!("Soul mutation LLM call failed for {}: {e}", agent.name);
             }
         }
-    } else if roll < 13 {
-        // === EVOLUTION LOG ENTRY (10% chance) ===
+    } else if roll < evo_threshold {
+        // === EVOLUTION LOG ENTRY ===
         let evolution_prompt =
             prompt::build_evolution_prompt(&agent.name, &experience_summary);
 

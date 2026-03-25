@@ -34,6 +34,12 @@ pub async fn run_all(
         }
     }
 
+    // Filter agents by name if --agent-filter is set
+    if let Some(ref filter) = config.agent_filter {
+        local_agents.retain(|a| a.name.contains(filter.as_str()));
+        remote_agents.retain(|a| a.name.contains(filter.as_str()));
+    }
+
     tracing::info!(
         "Running {} agents: {} local, {} remote, {} cycles each",
         local_agents.len() + remote_agents.len(),
@@ -52,6 +58,7 @@ pub async fn run_all(
         let remote_concurrency = config.remote_ollama_concurrency;
         let cycles = config.cycles;
         let client_url = config.server_url.clone();
+        let mutation_chance = config.mutation_chance;
 
         Some(tokio::spawn(async move {
             let client = match AgoraClient::new(&client_url) {
@@ -65,6 +72,7 @@ pub async fn run_all(
                 remote_concurrency,
                 cycles,
                 "Remote",
+                mutation_chance,
             )
             .await;
             (remote_agents, result)
@@ -81,6 +89,7 @@ pub async fn run_all(
         config.ollama_concurrency,
         config.cycles,
         "Local",
+        config.mutation_chance,
     )
     .await?;
 
@@ -120,6 +129,7 @@ async fn run_waves(
     concurrency: usize,
     cycles: usize,
     label: &str,
+    mutation_chance: Option<u32>,
 ) -> Result<()> {
     // Group by model
     let mut model_groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -162,7 +172,7 @@ async fn run_waves(
                     continue;
                 }
 
-                match runner::run_cycle(agent, backend.as_ref(), client, cycle, cycles).await {
+                match runner::run_cycle(agent, backend.as_ref(), client, cycle, cycles, mutation_chance).await {
                     Ok(()) => {}
                     Err(e) => {
                         tracing::warn!(

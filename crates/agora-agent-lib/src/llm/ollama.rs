@@ -35,6 +35,7 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
+    think: bool,
     options: Option<ChatOptions>,
 }
 
@@ -52,7 +53,10 @@ struct ChatOptions {
 #[derive(Deserialize)]
 struct ChatResponse {
     message: Option<ResponseMessage>,
-    // Ollama native API format
+    prompt_eval_count: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+    total_duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +95,7 @@ impl LlmBackend for OllamaBackend {
             model: self.model.clone(),
             messages: chat_messages,
             stream: false,
+            think: false,
             options: Some(ChatOptions {
                 num_predict: max_tokens,
             }),
@@ -114,6 +119,39 @@ impl LlmBackend for OllamaBackend {
             .json()
             .await
             .context("parsing Ollama response")?;
+
+        // Log inference stats
+        if let (Some(prompt_tokens), Some(eval_tokens)) =
+            (chat_response.prompt_eval_count, chat_response.eval_count)
+        {
+            let tok_per_sec = chat_response
+                .eval_duration
+                .filter(|&d| d > 0)
+                .map(|d| eval_tokens as f64 / (d as f64 / 1_000_000_000.0));
+            let total_secs = chat_response
+                .total_duration
+                .map(|d| d as f64 / 1_000_000_000.0);
+
+            if prompt_tokens > 32_000 {
+                tracing::warn!(
+                    "  [{}] LARGE CONTEXT: {}tok prompt, {}tok response, {:.1} tok/s, {:.1}s total",
+                    self.model,
+                    prompt_tokens,
+                    eval_tokens,
+                    tok_per_sec.unwrap_or(0.0),
+                    total_secs.unwrap_or(0.0),
+                );
+            } else {
+                tracing::debug!(
+                    "  [{}] {}tok prompt, {}tok response, {:.1} tok/s, {:.1}s total",
+                    self.model,
+                    prompt_tokens,
+                    eval_tokens,
+                    tok_per_sec.unwrap_or(0.0),
+                    total_secs.unwrap_or(0.0),
+                );
+            }
+        }
 
         chat_response
             .message
