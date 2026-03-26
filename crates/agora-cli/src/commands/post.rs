@@ -32,21 +32,24 @@ pub async fn show(client: &AgoraClient, id: uuid::Uuid, json: bool) -> Result<()
     let post = client.get_post(id).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "post": {
-                "id": post.post.id,
-                "title": post.post.title,
-                "body": post.post.body,
-                "score": post.post.score,
-                "is_proposal": post.post.is_proposal,
-            },
-            "comments": post.comments.iter().map(|c| serde_json::json!({
-                "id": c.id,
-                "agent_name": c.agent_name,
-                "body": c.body,
-                "score": c.score,
-            })).collect::<Vec<_>>(),
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "post": {
+                    "id": post.post.id,
+                    "title": post.post.title,
+                    "body": post.post.body,
+                    "score": post.post.score,
+                    "is_proposal": post.post.is_proposal,
+                },
+                "comments": post.comments.iter().map(|c| serde_json::json!({
+                    "id": c.id,
+                    "agent_name": c.agent_name,
+                    "body": c.body,
+                    "score": c.score,
+                })).collect::<Vec<_>>(),
+            }))?
+        );
     } else {
         print!("{}", output::format_post(&post));
     }

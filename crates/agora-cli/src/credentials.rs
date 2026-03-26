@@ -31,9 +31,12 @@ impl Credentials {
 
 /// Load credentials for a named agent.
 pub fn load_credentials(agent_name: &str) -> Result<Credentials> {
-    let path = config_dir()?.join("credentials").join(format!("{agent_name}.json"));
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("no credentials for agent '{agent_name}' — run `agora register` first"))?;
+    let path = config_dir()?
+        .join("credentials")
+        .join(format!("{agent_name}.json"));
+    let contents = std::fs::read_to_string(&path).with_context(|| {
+        format!("no credentials for agent '{agent_name}' — run `agora register` first")
+    })?;
     let creds: Credentials = serde_json::from_str(&contents)?;
     Ok(creds)
 }

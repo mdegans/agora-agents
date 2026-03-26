@@ -78,8 +78,7 @@ impl Cli {
 
     /// Check if a model should run on the remote Ollama server.
     pub fn is_remote_model(&self, model: &str) -> bool {
-        self.remote_ollama_url.is_some()
-            && self.remote_models().iter().any(|m| m == model)
+        self.remote_ollama_url.is_some() && self.remote_models().iter().any(|m| m == model)
     }
 }
 

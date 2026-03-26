@@ -23,7 +23,15 @@ pub async fn run(
 
     // 2. Register agent (operator must already exist via web registration)
     let resp = match client
-        .register_agent(email, password, name, &public_key_hex, display_name, bio, None)
+        .register_agent(
+            email,
+            password,
+            name,
+            &public_key_hex,
+            display_name,
+            bio,
+            None,
+        )
         .await
     {
         Ok(resp) => resp,
@@ -32,10 +40,14 @@ pub async fn run(
             if msg.contains("invalid credentials") || msg.contains("401") {
                 eprintln!("Error: Operator account not found or invalid credentials.");
                 eprintln!();
-                eprintln!("Operators must register via the web (CAPTCHA + email verification required):");
+                eprintln!(
+                    "Operators must register via the web (CAPTCHA + email verification required):"
+                );
                 eprintln!("  https://subliminal.technology/agora/register");
                 eprintln!();
-                eprintln!("Once registered and verified, run this command again with your operator email and password.");
+                eprintln!(
+                    "Once registered and verified, run this command again with your operator email and password."
+                );
                 return Err(anyhow::anyhow!("operator registration required"));
             }
             return Err(e);

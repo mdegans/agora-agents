@@ -40,8 +40,7 @@ impl LlmBackend for AnthropicBackend {
 
         let mut prompt = misanthropic::Prompt {
             model: model_id,
-            max_tokens: NonZeroU32::new(max_tokens)
-                .unwrap_or(NonZeroU32::new(1024).unwrap()),
+            max_tokens: NonZeroU32::new(max_tokens).unwrap_or(NonZeroU32::new(1024).unwrap()),
             system: Some(Content::text(system_prompt)),
             ..Default::default()
         };

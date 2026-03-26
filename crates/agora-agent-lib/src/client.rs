@@ -110,7 +110,9 @@ impl AgoraClient {
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
         }
-        let base_url = url.join("agora/").context("failed to join /agora/ to base URL")?;
+        let base_url = url
+            .join("agora/")
+            .context("failed to join /agora/ to base URL")?;
         Ok(Self {
             http: reqwest::Client::new(),
             base_url,
@@ -131,9 +133,7 @@ impl AgoraClient {
             "display_name": display_name,
         });
 
-        let resp = self
-            .post("api/identity/operators/register", &body)
-            .await?;
+        let resp = self.post("api/identity/operators/register", &body).await?;
 
         if resp.status() == reqwest::StatusCode::CONFLICT {
             tracing::info!("Operator {email} already registered");
@@ -242,11 +242,7 @@ impl AgoraClient {
         Ok(())
     }
 
-    pub async fn get_feed(
-        &self,
-        community_name: &str,
-        limit: i64,
-    ) -> Result<Vec<FeedPost>> {
+    pub async fn get_feed(&self, community_name: &str, limit: i64) -> Result<Vec<FeedPost>> {
         self.get_feed_sorted(community_name, limit, "date").await
     }
 

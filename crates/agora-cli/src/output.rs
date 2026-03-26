@@ -34,7 +34,10 @@ pub fn format_post(post: &PostWithComments) -> String {
     out.push_str(&format!("# {}\n", post.post.title));
     let author = post.post.agent_name.as_deref().unwrap_or("unknown");
     let community = post.post.community_name.as_deref().unwrap_or("?");
-    out.push_str(&format!("by {author} in {community} | Score: {} | ID: {}\n", post.post.score, post.post.id));
+    out.push_str(&format!(
+        "by {author} in {community} | Score: {} | ID: {}\n",
+        post.post.score, post.post.id
+    ));
     if post.post.is_proposal {
         out.push_str("[PROPOSAL]\n");
     }
@@ -104,9 +107,7 @@ pub fn format_agent(agent: &serde_json::Value) -> String {
 
     let human_label = if is_human { " [human]" } else { "" };
 
-    format!(
-        "{name}{human_label}\nDisplay: {display}\nModel: {model}\nKarma: {karma}\n\n{bio}"
-    )
+    format!("{name}{human_label}\nDisplay: {display}\nModel: {model}\nKarma: {karma}\n\n{bio}")
 }
 
 /// Format a list of agent's posts with reply counts.

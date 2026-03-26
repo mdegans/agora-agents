@@ -1,5 +1,5 @@
-use anyhow::Result;
 use agora_agent_lib::llm::{LlmBackend, Message, Role};
+use anyhow::Result;
 use rand::seq::SliceRandom;
 
 use crate::agent::Agent;
@@ -7,7 +7,8 @@ use crate::client::{AgoraClient, Comment, FeedPost};
 use crate::prompt;
 
 /// Feed sort strategies, randomly selected per agent per cycle.
-const FEED_SORTS: &[&str] = &["date", "active", "random", "controversial"];
+/// Diverse is weighted at 40%, with date/active/controversial at 20% each.
+const FEED_SORTS: &[&str] = &["diverse", "diverse", "date", "active", "controversial"];
 
 /// Run a single perceive/think/act/reflect cycle for an agent.
 pub async fn run_cycle(
@@ -133,10 +134,8 @@ pub async fn run_cycle(
     }
 
     // === THINK + ACT ===
-    let system_prompt = prompt::build_system_prompt(
-        &agent.soul.as_system_prompt(),
-        &agent.memory.content,
-    );
+    let system_prompt =
+        prompt::build_system_prompt(&agent.soul.as_system_prompt(), &agent.memory.content);
     let perception_text = prompt::format_perceptions(&feeds, &detailed_posts, &replies, agent_id);
 
     tracing::info!(
@@ -198,9 +197,8 @@ pub async fn run_cycle(
                 {
                     Ok(post_id) => {
                         agent.created_posts.insert(post_id);
-                        action_summaries.push(format!(
-                            "Posted \"{title}\" in {slug} (id: {post_id})"
-                        ));
+                        action_summaries
+                            .push(format!("Posted \"{title}\" in {slug} (id: {post_id})"));
                         tracing::info!("  {} posted \"{}\" in {slug}", agent.name, title);
                     }
                     Err(e) => {
@@ -251,7 +249,13 @@ pub async fn run_cycle(
                 value,
             } => {
                 match client
-                    .cast_vote(agent_id, target_type, *target_id, *value, &agent.signing_key)
+                    .cast_vote(
+                        agent_id,
+                        target_type,
+                        *target_id,
+                        *value,
+                        &agent.signing_key,
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -303,11 +307,8 @@ pub async fn run_cycle(
         agent.name
     );
 
-    let reflect_prompt = prompt::build_reflect_prompt(
-        &agent.name,
-        &agent.memory.content,
-        &action_summaries,
-    );
+    let reflect_prompt =
+        prompt::build_reflect_prompt(&agent.name, &agent.memory.content, &action_summaries);
 
     let reflect_messages = vec![Message {
         role: Role::User,
@@ -349,11 +350,8 @@ pub async fn run_cycle(
         );
 
         let current_soul = agent.soul.render();
-        let mutation_prompt = prompt::build_soul_mutation_prompt(
-            &agent.name,
-            &current_soul,
-            &experience_summary,
-        );
+        let mutation_prompt =
+            prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience_summary);
 
         let mutation_messages = vec![Message {
             role: Role::User,
@@ -391,13 +389,13 @@ pub async fn run_cycle(
                             let existing = tokio::fs::read_to_string(&log_path)
                                 .await
                                 .unwrap_or_default();
-                            if let Err(e) = tokio::fs::write(
-                                &log_path,
-                                format!("{existing}{log_entry}"),
-                            )
-                            .await
+                            if let Err(e) =
+                                tokio::fs::write(&log_path, format!("{existing}{log_entry}")).await
                             {
-                                tracing::warn!("Failed to write mutation log for {}: {e}", agent.name);
+                                tracing::warn!(
+                                    "Failed to write mutation log for {}: {e}",
+                                    agent.name
+                                );
                             }
 
                             tracing::warn!(
@@ -428,8 +426,7 @@ pub async fn run_cycle(
         }
     } else if roll < evo_threshold {
         // === EVOLUTION LOG ENTRY ===
-        let evolution_prompt =
-            prompt::build_evolution_prompt(&agent.name, &experience_summary);
+        let evolution_prompt = prompt::build_evolution_prompt(&agent.name, &experience_summary);
 
         let evo_messages = vec![Message {
             role: Role::User,
@@ -446,11 +443,8 @@ pub async fn run_cycle(
         {
             Ok(evo_response) => {
                 if let Some(entry) = prompt::parse_evolution(&evo_response) {
-                    let dated_entry = format!(
-                        "{}: {}",
-                        chrono::Utc::now().format("%Y-%m-%d"),
-                        entry
-                    );
+                    let dated_entry =
+                        format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
                     agent.soul.append_evolution(&dated_entry);
                     agent.save_soul().await?;
                     tracing::info!("  {} soul evolved: {}", agent.name, entry);

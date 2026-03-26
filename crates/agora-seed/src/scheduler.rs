@@ -15,11 +15,7 @@ use crate::runner;
 ///
 /// Local Ollama models run sequentially (one model at a time, GPU VRAM constraint).
 /// Remote Ollama models run in parallel with local waves on a separate machine.
-pub async fn run_all(
-    agents: &mut Vec<Agent>,
-    client: &AgoraClient,
-    config: &Cli,
-) -> Result<()> {
+pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Cli) -> Result<()> {
     // Split agents into local and remote groups
     let mut local_agents: Vec<Agent> = Vec::new();
     let mut remote_agents: Vec<Agent> = Vec::new();
@@ -134,10 +130,7 @@ async fn run_waves(
     // Group by model
     let mut model_groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, agent) in agents.iter().enumerate() {
-        model_groups
-            .entry(agent.model.clone())
-            .or_default()
-            .push(i);
+        model_groups.entry(agent.model.clone()).or_default().push(i);
     }
 
     let total_waves = model_groups.len();
@@ -172,7 +165,16 @@ async fn run_waves(
                     continue;
                 }
 
-                match runner::run_cycle(agent, backend.as_ref(), client, cycle, cycles, mutation_chance).await {
+                match runner::run_cycle(
+                    agent,
+                    backend.as_ref(),
+                    client,
+                    cycle,
+                    cycles,
+                    mutation_chance,
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(e) => {
                         tracing::warn!(

@@ -604,14 +604,13 @@ pub fn parse_evolution(response: &str) -> Option<String> {
 
 // Stopwords to ignore when comparing titles for repetition.
 const STOPWORDS: &[&str] = &[
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
-    "by", "from", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-    "do", "does", "did", "will", "would", "could", "should", "may", "might", "can",
-    "this", "that", "these", "those", "it", "its", "we", "our", "us", "you", "your",
-    "how", "what", "why", "when", "where", "who", "which",
-    "not", "no", "nor", "so", "if", "then", "than", "as", "vs", "between",
-    "about", "into", "through", "during", "before", "after", "above", "below",
-    "all", "each", "every", "both", "few", "more", "most", "some", "any", "other",
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+    "from", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does",
+    "did", "will", "would", "could", "should", "may", "might", "can", "this", "that", "these",
+    "those", "it", "its", "we", "our", "us", "you", "your", "how", "what", "why", "when", "where",
+    "who", "which", "not", "no", "nor", "so", "if", "then", "than", "as", "vs", "between", "about",
+    "into", "through", "during", "before", "after", "above", "below", "all", "each", "every",
+    "both", "few", "more", "most", "some", "any", "other",
 ];
 
 /// Extract content keywords from a title (lowercase, stopwords removed).
@@ -724,9 +723,7 @@ mod tests {
 
     #[test]
     fn test_title_repetition_different() {
-        let existing = vec![
-            "Quantum Mechanics and Its Philosophical Implications".to_string(),
-        ];
+        let existing = vec!["Quantum Mechanics and Its Philosophical Implications".to_string()];
         // Completely different topic
         assert!(!is_title_repetitive(
             "Distributed Systems and Fault Tolerance",

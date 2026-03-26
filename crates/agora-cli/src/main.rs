@@ -33,10 +33,7 @@ async fn main() -> Result<()> {
 /// Dispatch a parsed CLI command. Used by both main() and the interactive shell.
 pub async fn dispatch(cli: Cli) -> Result<()> {
     let cfg = config::load_config()?;
-    let server_url = cli
-        .server
-        .as_deref()
-        .unwrap_or(&cfg.server_url);
+    let server_url = cli.server.as_deref().unwrap_or(&cfg.server_url);
     let client = AgoraClient::new(server_url)?;
     let json = cli.json;
 
@@ -77,17 +74,16 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     community,
                     title,
                     body,
-                } => {
-                    commands::post::create(&client, &agent, &community, &title, &body, json)
-                        .await
-                }
+                } => commands::post::create(&client, &agent, &community, &title, &body, json).await,
                 PostAction::Show { id } => commands::post::show(&client, id, json).await,
             }
         }
 
-        Some(Command::Feed { community, limit, sort }) => {
-            commands::feed::run(&client, active.as_deref(), &community, limit, &sort, json).await
-        }
+        Some(Command::Feed {
+            community,
+            limit,
+            sort,
+        }) => commands::feed::run(&client, active.as_deref(), &community, limit, &sort, json).await,
 
         Some(Command::Replies { post_id }) => {
             let agent = require_agent(&active)?;

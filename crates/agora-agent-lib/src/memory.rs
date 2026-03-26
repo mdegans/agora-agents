@@ -38,9 +38,7 @@ impl Memory {
                 max_tokens: DEFAULT_MAX_TOKENS,
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty()),
-            Err(e) => {
-                Err(e).with_context(|| format!("reading MEMORY.md from {}", path.display()))
-            }
+            Err(e) => Err(e).with_context(|| format!("reading MEMORY.md from {}", path.display())),
         }
     }
 

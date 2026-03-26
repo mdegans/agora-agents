@@ -14,7 +14,9 @@ pub async fn run_shell() -> Result<()> {
         let prompt = "agora> ";
         let line = match rl.readline(prompt) {
             Ok(line) => line,
-            Err(rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof) => {
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => {
                 break;
             }
             Err(e) => {

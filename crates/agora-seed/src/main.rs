@@ -38,8 +38,7 @@ async fn main() -> Result<()> {
 
     // Load all agents from souls directory
     tracing::info!("Loading agents from {}...", cli.souls_dir.display());
-    let mut agents =
-        agent::load_all(&cli.souls_dir, cli.model_override.as_deref()).await?;
+    let mut agents = agent::load_all(&cli.souls_dir, cli.model_override.as_deref()).await?;
 
     if agents.is_empty() {
         anyhow::bail!(

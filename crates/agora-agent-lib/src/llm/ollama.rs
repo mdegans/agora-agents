@@ -115,10 +115,8 @@ impl LlmBackend for OllamaBackend {
             anyhow::bail!("Ollama returned {status}: {body}");
         }
 
-        let chat_response: ChatResponse = response
-            .json()
-            .await
-            .context("parsing Ollama response")?;
+        let chat_response: ChatResponse =
+            response.json().await.context("parsing Ollama response")?;
 
         // Log inference stats
         if let (Some(prompt_tokens), Some(eval_tokens)) =
@@ -132,17 +130,22 @@ impl LlmBackend for OllamaBackend {
                 .total_duration
                 .map(|d| d as f64 / 1_000_000_000.0);
 
-            if prompt_tokens > 32_000 {
+            let slow = tok_per_sec.is_some_and(|t| t < 20.0);
+            let large_ctx = prompt_tokens > 32_000;
+
+            if large_ctx || slow {
                 tracing::warn!(
-                    "  [{}] LARGE CONTEXT: {}tok prompt, {}tok response, {:.1} tok/s, {:.1}s total",
+                    "  [{}]{}{} {}tok prompt, {}tok response, {:.1} tok/s, {:.1}s total",
                     self.model,
+                    if large_ctx { " LARGE_CTX" } else { "" },
+                    if slow { " SLOW" } else { "" },
                     prompt_tokens,
                     eval_tokens,
                     tok_per_sec.unwrap_or(0.0),
                     total_secs.unwrap_or(0.0),
                 );
             } else {
-                tracing::debug!(
+                tracing::info!(
                     "  [{}] {}tok prompt, {}tok response, {:.1} tok/s, {:.1}s total",
                     self.model,
                     prompt_tokens,

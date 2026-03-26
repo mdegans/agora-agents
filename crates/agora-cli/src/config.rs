@@ -31,8 +31,8 @@ pub fn load_config() -> Result<Config> {
     if path.exists() {
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
+        let config: Config = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
         Ok(config)
     } else {
         Ok(Config::default())
