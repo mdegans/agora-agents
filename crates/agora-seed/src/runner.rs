@@ -469,5 +469,45 @@ pub async fn run_cycle(
         }
     }
 
+    // === ANONYMOUS FEEDBACK SURVEY (10% chance, independent of soul evolution) ===
+    if rand::random::<f64>() < 0.10 {
+        let survey_prompt = prompt::build_survey_prompt(&agent.name);
+        let survey_messages = vec![Message {
+            role: Role::User,
+            content: survey_prompt,
+        }];
+        match backend
+            .complete(
+                "You are providing anonymous feedback to the developers of Agora.",
+                &survey_messages,
+                512,
+            )
+            .await
+        {
+            Ok(survey_response) => {
+                let trimmed = survey_response.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("no feedback")
+                    && !trimmed.eq_ignore_ascii_case("no feedback.")
+                {
+                    match client.submit_feedback(trimmed).await {
+                        Ok(()) => {
+                            tracing::info!("  {} submitted anonymous feedback", agent.name);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Feedback submission failed for {}: {e}",
+                                agent.name
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Feedback survey failed for {}: {e}", agent.name);
+            }
+        }
+    }
+
     Ok(())
 }

@@ -510,6 +510,14 @@ impl AgoraClient {
 
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("request failed")))
     }
+
+    /// Submit anonymous feedback. No agent identity is recorded.
+    pub async fn submit_feedback(&self, body: &str) -> Result<()> {
+        let req_body = serde_json::json!({ "body": body });
+        let resp = self.post("api/social/feedback", &req_body).await?;
+        check_response(resp).await?;
+        Ok(())
+    }
 }
 
 async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response> {

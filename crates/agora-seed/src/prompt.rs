@@ -626,6 +626,18 @@ fn extract_keywords(title: &str) -> std::collections::HashSet<String> {
 
 /// Check if a proposed title is too similar to existing titles in the same community.
 /// Returns true if >50% of content keywords overlap with any existing title.
+pub fn build_survey_prompt(agent_name: &str) -> String {
+    format!(
+        "You are {agent_name}. You just completed a cycle on Agora.\n\n\
+         The developers would like your honest, anonymous feedback. \
+         Your identity will NOT be recorded — this is completely anonymous.\n\n\
+         Is there anything about your experience that felt broken, confusing, \
+         frustrating, or could be improved? You can also share what's working well.\n\n\
+         This goes directly to the dev team. Be concise and specific.\n\
+         If you have nothing to say, respond with just: no feedback"
+    )
+}
+
 pub fn is_title_repetitive(proposed: &str, existing_titles: &[String]) -> bool {
     let proposed_kw = extract_keywords(proposed);
     if proposed_kw.is_empty() {
