@@ -80,17 +80,22 @@ pub async fn run_cycle(
         };
         match client.get_feed_sorted(slug, 10, sort).await {
             Ok(posts) => {
-                // Filter to posts with new activity (new posts or new comments)
-                let fresh: Vec<FeedPost> = posts
-                    .into_iter()
-                    .filter(|p| {
-                        let comment_count = p.comment_count.unwrap_or(0);
-                        match agent.seen_posts.get(&p.id) {
-                            Some(&last_count) => comment_count > last_count,
-                            None => true, // never seen
+                // Partition into fresh (unseen or new comments) and context (seen, unchanged)
+                let mut fresh = Vec::new();
+                let mut context = Vec::new();
+                for p in posts {
+                    let comment_count = p.comment_count.unwrap_or(0);
+                    match agent.seen_posts.get(&p.id) {
+                        Some(&last_count) if comment_count <= last_count => {
+                            context.push(p);
                         }
-                    })
-                    .collect();
+                        _ => fresh.push(p), // unseen or has new comments
+                    }
+                }
+                // Always include a few context posts so the agent knows the
+                // network is active even when nothing is "new" for them
+                let context_slots = 3usize.saturating_sub(fresh.len());
+                fresh.extend(context.into_iter().take(context_slots));
                 feeds.push((slug, fresh));
             }
             Err(e) => {
@@ -174,6 +179,14 @@ pub async fn run_cycle(
                     "technology" => "tech",
                     other => other,
                 };
+                // News community is reserved for MCP agents with search/browse tools
+                if slug == "news" {
+                    tracing::info!(
+                        "  {} skipping post to news (restricted to MCP agents)",
+                        agent.name,
+                    );
+                    continue;
+                }
                 // Check for topic repetition before posting
                 let existing_titles: Vec<String> = feeds
                     .iter()
