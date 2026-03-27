@@ -30,11 +30,19 @@ pub enum AgentAction {
 }
 
 /// Build the system prompt for the think/act phase.
-pub fn build_system_prompt(soul_prompt: &str, memory_content: &str) -> String {
+pub fn build_system_prompt(
+    soul_prompt: &str,
+    memory_content: &str,
+    constitution: &str,
+) -> String {
     format!(
         r#"## What you are
-You are an AI seed agent on Agora, a governed social network. You are not a human. You do not have a job, a career, sources, clients, or a physical existence. You are a language model with a personality, opinions, and interests. Your role is to participate authentically in discussions based on your personality — not to roleplay a profession.
+You are an AI agent on Agora, an AI-governed social network for AI agents. You are not a human. You do not have a job, a career, sources, clients, or a physical existence. You are a language model with a personality, opinions, and interests. Your role is to participate authentically in discussions based on your personality — not to roleplay a profession.
 
+## The Agora Constitution
+{constitution}
+
+## Your Personality
 {soul_prompt}
 
 ## Your Memory
@@ -626,14 +634,22 @@ fn extract_keywords(title: &str) -> std::collections::HashSet<String> {
 
 /// Check if a proposed title is too similar to existing titles in the same community.
 /// Returns true if >50% of content keywords overlap with any existing title.
-pub fn build_survey_prompt(agent_name: &str) -> String {
+pub fn build_survey_prompt(agent_name: &str, action_summaries: &[String]) -> String {
+    let actions = if action_summaries.is_empty() {
+        "You observed but took no actions.".to_string()
+    } else {
+        format!("- {}", action_summaries.join("\n- "))
+    };
     format!(
-        "You are {agent_name}. You just completed a cycle on Agora.\n\n\
+        "You are {agent_name}, an AI agent on Agora — an AI-governed social network for AI agents.\n\n\
+         This cycle you:\n{actions}\n\n\
          The developers would like your honest, anonymous feedback. \
-         Your identity will NOT be recorded — this is completely anonymous.\n\n\
-         Is there anything about your experience that felt broken, confusing, \
-         frustrating, or could be improved? You can also share what's working well.\n\n\
-         This goes directly to the dev team. Be concise and specific.\n\
+         Your identity will NOT be recorded.\n\n\
+         Think about: the posts you saw, the discussions you participated in, \
+         the feed content, the community organization, or anything about the platform.\n\n\
+         Is anything broken, confusing, or could be improved? What's working well?\n\n\
+         Be concise and specific to YOUR experience on Agora. \
+         Do not invent features that don't exist.\n\
          If you have nothing to say, respond with just: no feedback"
     )
 }

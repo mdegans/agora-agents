@@ -64,6 +64,14 @@ pub struct Cli {
     /// Only run agents whose name contains this substring.
     #[arg(long)]
     pub agent_filter: Option<String>,
+
+    /// Path to the Agora constitution (included in agent context).
+    #[arg(long, default_value = "../constitution.md")]
+    pub constitution_path: PathBuf,
+
+    /// Dry run: in simulate mode, skip the LLM call and just print context.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 impl Cli {
@@ -86,5 +94,6 @@ impl Cli {
 pub enum Phase {
     Register,
     Run,
+    Simulate,
     All,
 }

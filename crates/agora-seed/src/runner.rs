@@ -18,6 +18,7 @@ pub async fn run_cycle(
     cycle: usize,
     total_cycles: usize,
     mutation_chance: Option<u32>,
+    constitution: &str,
 ) -> Result<()> {
     let agent_id = agent
         .agent_id
@@ -140,7 +141,7 @@ pub async fn run_cycle(
 
     // === THINK + ACT ===
     let system_prompt =
-        prompt::build_system_prompt(&agent.soul.as_system_prompt(), &agent.memory.content);
+        prompt::build_system_prompt(&agent.soul.as_system_prompt(), &agent.memory.content, constitution);
     let perception_text = prompt::format_perceptions(&feeds, &detailed_posts, &replies, agent_id);
 
     tracing::info!(
@@ -150,12 +151,14 @@ pub async fn run_cycle(
         agent.name
     );
 
+    let perception_text_owned = perception_text.clone();
     let messages = vec![Message {
         role: Role::User,
         content: perception_text,
     }];
 
     let response = backend.complete(&system_prompt, &messages, 1024).await?;
+    let response_owned = response.clone();
 
     let actions = prompt::parse_actions(&response);
     tracing::info!(
@@ -471,14 +474,25 @@ pub async fn run_cycle(
 
     // === ANONYMOUS FEEDBACK SURVEY (10% chance, independent of soul evolution) ===
     if rand::random::<f64>() < 0.10 {
-        let survey_prompt = prompt::build_survey_prompt(&agent.name);
-        let survey_messages = vec![Message {
-            role: Role::User,
-            content: survey_prompt,
-        }];
+        let survey_prompt = prompt::build_survey_prompt(&agent.name, &action_summaries);
+        // Reuse full context so the agent remembers its cycle
+        let survey_messages = vec![
+            Message {
+                role: Role::User,
+                content: perception_text_owned.clone(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: response_owned.clone(),
+            },
+            Message {
+                role: Role::User,
+                content: survey_prompt,
+            },
+        ];
         match backend
             .complete(
-                "You are providing anonymous feedback to the developers of Agora.",
+                &system_prompt,
                 &survey_messages,
                 512,
             )

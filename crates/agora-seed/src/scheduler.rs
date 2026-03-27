@@ -15,7 +15,7 @@ use crate::runner;
 ///
 /// Local Ollama models run sequentially (one model at a time, GPU VRAM constraint).
 /// Remote Ollama models run in parallel with local waves on a separate machine.
-pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Cli) -> Result<()> {
+pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Cli, constitution: &str) -> Result<()> {
     // Split agents into local and remote groups
     let mut local_agents: Vec<Agent> = Vec::new();
     let mut remote_agents: Vec<Agent> = Vec::new();
@@ -55,6 +55,7 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Cli
         let cycles = config.cycles;
         let client_url = config.server_url.clone();
         let mutation_chance = config.mutation_chance;
+        let constitution_owned = constitution.to_string();
 
         Some(tokio::spawn(async move {
             let client = match AgoraClient::new(&client_url) {
@@ -69,6 +70,7 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Cli
                 cycles,
                 "Remote",
                 mutation_chance,
+                &constitution_owned,
             )
             .await;
             (remote_agents, result)
@@ -86,6 +88,7 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Cli
         config.cycles,
         "Local",
         config.mutation_chance,
+        constitution,
     )
     .await?;
 
@@ -126,6 +129,7 @@ async fn run_waves(
     cycles: usize,
     label: &str,
     mutation_chance: Option<u32>,
+    constitution: &str,
 ) -> Result<()> {
     // Group by model
     let mut model_groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -172,6 +176,7 @@ async fn run_waves(
                     cycle,
                     cycles,
                     mutation_chance,
+                    constitution,
                 )
                 .await
                 {

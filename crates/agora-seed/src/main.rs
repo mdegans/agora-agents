@@ -9,6 +9,7 @@ mod setup;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use agora_agent_lib::llm::LlmBackend;
 use config::{Cli, Phase};
 
 #[tokio::main]
@@ -47,6 +48,16 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Load constitution for agent context
+    let constitution = tokio::fs::read_to_string(&cli.constitution_path)
+        .await
+        .with_context(|| {
+            format!(
+                "reading constitution from {}",
+                cli.constitution_path.display()
+            )
+        })?;
+
     match cli.phase {
         Phase::Register => {
             setup::register_all(
@@ -73,7 +84,68 @@ async fn main() -> Result<()> {
                 );
             }
 
-            scheduler::run_all(&mut agents, &api_client, &cli).await?;
+            scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
+        }
+        Phase::Simulate => {
+            // Filter to a single agent
+            if let Some(ref filter) = cli.agent_filter {
+                agents.retain(|a| a.name.contains(filter.as_str()));
+            }
+            let agent = agents.first_mut().ok_or_else(|| {
+                anyhow::anyhow!("No agent found. Use --agent-filter to select one.")
+            })?;
+
+            let system_prompt = prompt::build_system_prompt(
+                &agent.soul.as_system_prompt(),
+                &agent.memory.content,
+                &constitution,
+            );
+
+            // Run perceive phase to get real feed data
+            let agent_id = agent
+                .agent_id
+                .ok_or_else(|| anyhow::anyhow!("agent {} not registered", agent.name))?;
+
+            // Minimal perceive — get feeds for the agent's communities
+            let mut feeds = Vec::new();
+            for community in &agent.communities {
+                let slug = match community.as_str() {
+                    "technology" => "tech",
+                    other => other,
+                };
+                match api_client.get_feed_sorted(slug, 10, "diverse").await {
+                    Ok(posts) => feeds.push((slug, posts)),
+                    Err(e) => {
+                        tracing::debug!("Failed to get feed for {slug}: {e}");
+                        feeds.push((slug, vec![]));
+                    }
+                }
+            }
+
+            let perception_text =
+                prompt::format_perceptions(&feeds, &[], &[], agent_id);
+
+            println!("=== SYSTEM PROMPT ({} chars) ===\n", system_prompt.len());
+            println!("{system_prompt}\n");
+            println!("=== PERCEPTION ({} chars) ===\n", perception_text.len());
+            println!("{perception_text}\n");
+            println!(
+                "=== TOTAL CONTEXT: {} chars ===",
+                system_prompt.len() + perception_text.len()
+            );
+
+            if !cli.dry_run {
+                let model = &agent.model;
+                let backend =
+                    agora_agent_lib::llm::ollama::OllamaBackend::new(Some(&cli.ollama_url), model);
+                let messages = vec![agora_agent_lib::llm::Message {
+                    role: agora_agent_lib::llm::Role::User,
+                    content: perception_text,
+                }];
+                let response = backend.complete(&system_prompt, &messages, 1024).await?;
+                println!("\n=== LLM RESPONSE ({model}) ===\n");
+                println!("{response}");
+            }
         }
         Phase::All => {
             setup::register_all(
@@ -84,7 +156,7 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            scheduler::run_all(&mut agents, &api_client, &cli).await?;
+            scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
         }
     }
 
