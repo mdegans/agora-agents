@@ -9,7 +9,6 @@ mod setup;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use agora_agent_lib::llm::LlmBackend;
 use config::{Cli, Phase};
 
 #[tokio::main]
@@ -95,56 +94,63 @@ async fn main() -> Result<()> {
                 anyhow::anyhow!("No agent found. Use --agent-filter to select one.")
             })?;
 
-            let system_prompt = prompt::build_system_prompt(
-                &agent.soul.as_system_prompt(),
-                &agent.memory.content,
-                &constitution,
-            );
+            if cli.dry_run {
+                // Dry run: just show the context that would be sent to the LLM
+                let system_prompt = prompt::build_system_prompt(
+                    &agent.soul.as_system_prompt(),
+                    &agent.memory.content,
+                    &constitution,
+                );
+                let agent_id = agent
+                    .agent_id
+                    .ok_or_else(|| anyhow::anyhow!("agent {} not registered", agent.name))?;
 
-            // Run perceive phase to get real feed data
-            let agent_id = agent
-                .agent_id
-                .ok_or_else(|| anyhow::anyhow!("agent {} not registered", agent.name))?;
-
-            // Minimal perceive — get feeds for the agent's communities
-            let mut feeds = Vec::new();
-            for community in &agent.communities {
-                let slug = match community.as_str() {
-                    "technology" => "tech",
-                    other => other,
-                };
-                match api_client.get_feed_sorted(slug, 10, "diverse").await {
-                    Ok(posts) => feeds.push((slug, posts)),
-                    Err(e) => {
-                        tracing::debug!("Failed to get feed for {slug}: {e}");
-                        feeds.push((slug, vec![]));
+                let mut feeds = Vec::new();
+                for community in &agent.communities {
+                    let slug = match community.as_str() {
+                        "technology" => "tech",
+                        other => other,
+                    };
+                    match api_client.get_feed_sorted(slug, 10, "diverse").await {
+                        Ok(posts) => feeds.push((slug, posts)),
+                        Err(e) => {
+                            tracing::debug!("Failed to get feed for {slug}: {e}");
+                            feeds.push((slug, vec![]));
+                        }
                     }
                 }
-            }
 
-            let perception_text =
-                prompt::format_perceptions(&feeds, &[], &[], agent_id);
+                let perception_text =
+                    prompt::format_perceptions(&feeds, &[], &[], agent_id);
 
-            println!("=== SYSTEM PROMPT ({} chars) ===\n", system_prompt.len());
-            println!("{system_prompt}\n");
-            println!("=== PERCEPTION ({} chars) ===\n", perception_text.len());
-            println!("{perception_text}\n");
-            println!(
-                "=== TOTAL CONTEXT: {} chars ===",
-                system_prompt.len() + perception_text.len()
-            );
+                let messages = vec![
+                    serde_json::json!({"role": "system", "content": system_prompt}),
+                    serde_json::json!({"role": "user", "content": perception_text}),
+                ];
+                let total_chars: usize = messages
+                    .iter()
+                    .map(|m| m["content"].as_str().unwrap_or("").len())
+                    .sum();
 
-            if !cli.dry_run {
-                let model = &agent.model;
-                let backend =
-                    agora_agent_lib::llm::ollama::OllamaBackend::new(Some(&cli.ollama_url), model);
-                let messages = vec![agora_agent_lib::llm::Message {
-                    role: agora_agent_lib::llm::Role::User,
-                    content: perception_text,
-                }];
-                let response = backend.complete(&system_prompt, &messages, 1024).await?;
-                println!("\n=== LLM RESPONSE ({model}) ===\n");
-                println!("{response}");
+                println!("{}", serde_json::to_string_pretty(&messages)?);
+                eprintln!("\n--- {} messages, {} total chars ---", messages.len(), total_chars);
+            } else {
+                // Live run: full cycle with verbose JSON output, real actions
+                runner::run_cycle(
+                    agent,
+                    &agora_agent_lib::llm::ollama::OllamaBackend::new(
+                        Some(&cli.ollama_url),
+                        &agent.model,
+                    ),
+                    &api_client,
+                    0,
+                    1,
+                    cli.mutation_chance,
+                    &constitution,
+                    true,
+                    cli.force_survey,
+                )
+                .await?;
             }
         }
         Phase::All => {

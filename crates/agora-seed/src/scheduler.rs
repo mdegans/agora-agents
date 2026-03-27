@@ -177,6 +177,8 @@ async fn run_waves(
                     cycles,
                     mutation_chance,
                     constitution,
+                    false,
+                    false,
                 )
                 .await
                 {

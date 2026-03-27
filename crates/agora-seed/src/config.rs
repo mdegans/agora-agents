@@ -72,6 +72,10 @@ pub struct Cli {
     /// Dry run: in simulate mode, skip the LLM call and just print context.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Force the feedback survey to run (overrides 10% random chance).
+    #[arg(long)]
+    pub force_survey: bool,
 }
 
 impl Cli {

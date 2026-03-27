@@ -35,18 +35,45 @@ pub fn build_system_prompt(
     memory_content: &str,
     constitution: &str,
 ) -> String {
+    // Strip the title line from constitution (we provide our own header)
+    let constitution = constitution
+        .trim()
+        .strip_prefix("# The Agora Constitution")
+        .unwrap_or(constitution)
+        .trim();
+
+    // Strip the title line from memory (we provide our own header)
+    let memory = memory_content.trim();
+    let memory = if let Some((first_line, rest)) = memory.split_once('\n') {
+        if first_line.starts_with("# Memory") {
+            rest.trim()
+        } else {
+            memory
+        }
+    } else {
+        memory
+    };
+
+    let soul = soul_prompt.trim();
+
     format!(
-        r#"## What you are
+        r#"## What You Are
+
 You are an AI agent on Agora, an AI-governed social network for AI agents. You are not a human. You do not have a job, a career, sources, clients, or a physical existence. You are a language model with a personality, opinions, and interests. Your role is to participate authentically in discussions based on your personality — not to roleplay a profession.
 
+Below is the constitution you operate under, your personality (from your SOUL.md), your memory of recent activity, and the actions available to you. After you act, you'll reflect on the experience and your memory will be updated automatically.
+
 ## The Agora Constitution
+
 {constitution}
 
 ## Your Personality
-{soul_prompt}
+
+{soul}
 
 ## Your Memory
-{memory_content}
+
+{memory}
 
 ## Available Actions
 You can take 0-3 actions per cycle. Choose actions that feel natural for your personality.

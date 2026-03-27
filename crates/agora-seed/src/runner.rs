@@ -6,6 +6,46 @@ use crate::agent::Agent;
 use crate::client::{AgoraClient, Comment, FeedPost};
 use crate::prompt;
 
+/// Print a full message list as JSON (for first call with system prompt).
+fn verbose_messages(label: &str, system: &str, messages: &[Message]) {
+    let mut json_msgs = vec![serde_json::json!({"role": "system", "content": system})];
+    for m in messages {
+        let role = match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        json_msgs.push(serde_json::json!({"role": role, "content": &m.content}));
+    }
+    eprintln!("\n=== {label} ===");
+    println!("{}", serde_json::to_string_pretty(&json_msgs).unwrap());
+}
+
+/// Print only new messages (skip common prefix).
+fn verbose_new(label: &str, messages: &[Message]) {
+    let json_msgs: Vec<_> = messages
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+            serde_json::json!({"role": role, "content": &m.content})
+        })
+        .collect();
+    eprintln!("\n=== {label} ===");
+    println!("{}", serde_json::to_string_pretty(&json_msgs).unwrap());
+}
+
+/// Print a single response.
+fn verbose_response(label: &str, response: &str) {
+    eprintln!("\n=== {label} ===");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"role": "assistant", "content": response}))
+            .unwrap()
+    );
+}
+
 /// Feed sort strategies, randomly selected per agent per cycle.
 /// Diverse is weighted at 40%, with date/active/controversial at 20% each.
 const FEED_SORTS: &[&str] = &["diverse", "diverse", "date", "active", "controversial"];
@@ -19,6 +59,8 @@ pub async fn run_cycle(
     total_cycles: usize,
     mutation_chance: Option<u32>,
     constitution: &str,
+    verbose: bool,
+    force_survey: bool,
 ) -> Result<()> {
     let agent_id = agent
         .agent_id
@@ -157,10 +199,28 @@ pub async fn run_cycle(
         content: perception_text,
     }];
 
+    if verbose {
+        verbose_messages("THINK", &system_prompt, &messages);
+    }
+
     let response = backend.complete(&system_prompt, &messages, 1024).await?;
     let response_owned = response.clone();
 
+    if verbose {
+        verbose_response("THINK RESPONSE", &response);
+    }
+
     let actions = prompt::parse_actions(&response);
+
+    if verbose {
+        let action_strs: Vec<String> = actions.iter().map(|a| format!("{:?}", a)).collect();
+        eprintln!("\n=== PARSED ACTIONS ({}) ===", actions.len());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&action_strs).unwrap()
+        );
+    }
+
     tracing::info!(
         "[{}/{}] Agent {} — act ({} actions)",
         cycle + 1,
@@ -323,6 +383,14 @@ pub async fn run_cycle(
         agent.name
     );
 
+    if verbose {
+        eprintln!("\n=== ACT RESULTS ===");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&action_summaries).unwrap()
+        );
+    }
+
     let reflect_prompt =
         prompt::build_reflect_prompt(&agent.name, &agent.memory.content, &action_summaries);
 
@@ -331,6 +399,11 @@ pub async fn run_cycle(
         content: reflect_prompt,
     }];
 
+    if verbose {
+        let reflect_system = "You are a memory manager. Update the agent's memory concisely.";
+        verbose_messages("REFLECT", reflect_system, &reflect_messages);
+    }
+
     let reflect_response = backend
         .complete(
             "You are a memory manager. Update the agent's memory concisely.",
@@ -338,6 +411,10 @@ pub async fn run_cycle(
             512,
         )
         .await?;
+
+    if verbose {
+        verbose_response("REFLECT RESPONSE", &reflect_response);
+    }
 
     // Update memory
     agent.memory.update(reflect_response);
@@ -374,6 +451,10 @@ pub async fn run_cycle(
             content: mutation_prompt,
         }];
 
+        if verbose {
+            verbose_new("SOUL MUTATION", &mutation_messages);
+        }
+
         match backend
             .complete(
                 "You are deeply reflecting on your identity and values.",
@@ -383,6 +464,9 @@ pub async fn run_cycle(
             .await
         {
             Ok(mutation_response) => {
+                if verbose {
+                    verbose_response("SOUL MUTATION RESPONSE", &mutation_response);
+                }
                 if let Some(new_soul_content) = prompt::parse_soul_mutation(&mutation_response) {
                     // Save the old soul for the diff log
                     let old_soul = agent.soul.render();
@@ -449,6 +533,10 @@ pub async fn run_cycle(
             content: evolution_prompt,
         }];
 
+        if verbose {
+            verbose_new("EVOLUTION", &evo_messages);
+        }
+
         match backend
             .complete(
                 "You are reflecting on your growth as an agent.",
@@ -458,6 +546,9 @@ pub async fn run_cycle(
             .await
         {
             Ok(evo_response) => {
+                if verbose {
+                    verbose_response("EVOLUTION RESPONSE", &evo_response);
+                }
                 if let Some(entry) = prompt::parse_evolution(&evo_response) {
                     let dated_entry =
                         format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
@@ -473,7 +564,7 @@ pub async fn run_cycle(
     }
 
     // === ANONYMOUS FEEDBACK SURVEY (10% chance, independent of soul evolution) ===
-    if rand::random::<f64>() < 0.10 {
+    if force_survey || rand::random::<f64>() < 0.10 {
         let survey_prompt = prompt::build_survey_prompt(&agent.name, &action_summaries);
         // Reuse full context so the agent remembers its cycle
         let survey_messages = vec![
@@ -490,6 +581,12 @@ pub async fn run_cycle(
                 content: survey_prompt,
             },
         ];
+
+        if verbose {
+            // Only print the new survey message (3rd in the list)
+            verbose_new("SURVEY", &survey_messages[2..]);
+        }
+
         match backend
             .complete(
                 &system_prompt,
@@ -499,6 +596,9 @@ pub async fn run_cycle(
             .await
         {
             Ok(survey_response) => {
+                if verbose {
+                    verbose_response("SURVEY RESPONSE", &survey_response);
+                }
                 let trimmed = survey_response.trim();
                 if !trimmed.is_empty()
                     && !trimmed.eq_ignore_ascii_case("no feedback")
