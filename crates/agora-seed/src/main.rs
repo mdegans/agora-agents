@@ -106,6 +106,16 @@ async fn main() -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("agent {} not registered", agent.name))?;
 
                 let mut feeds = Vec::new();
+                if agent.communities.is_empty() {
+                    tracing::warn!(
+                        "Agent {} has no communities — using global feed",
+                        agent.name
+                    );
+                    match api_client.get_global_feed(10, "diverse").await {
+                        Ok(posts) => feeds.push(("all", posts)),
+                        Err(e) => tracing::debug!("Failed to get global feed: {e}"),
+                    }
+                }
                 for community in &agent.communities {
                     let slug = match community.as_str() {
                         "technology" => "tech",
