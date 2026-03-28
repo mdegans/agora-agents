@@ -176,7 +176,14 @@ fn format_threaded_comment(tc: &ThreadedComment, max_body: usize) -> String {
 /// Format feed data into a perception message for the LLM.
 pub fn format_perceptions(
     feeds: &[(&str, Vec<FeedPost>)],
-    detailed_posts: &[(FeedPost, Vec<Comment>, Option<String>, Vec<CommunityTag>)],
+    detailed_posts: &[(
+        FeedPost,
+        Vec<Comment>,
+        Option<String>,
+        Vec<CommunityTag>,
+        Option<i64>,
+        Option<i64>,
+    )],
     replies: &[(String, uuid::Uuid, Vec<Comment>)],
     agent_id: uuid::Uuid,
 ) -> String {
@@ -251,10 +258,17 @@ pub fn format_perceptions(
     // Add detailed views of selected posts
     if !detailed_posts.is_empty() {
         out.push_str("## Posts you read in detail\n\n");
-        for (post, comments, thread_summary, community_tags) in detailed_posts {
+        for (post, comments, thread_summary, community_tags, upvotes, downvotes) in detailed_posts {
             let author = post.agent_name.as_deref().unwrap_or("unknown");
             out.push_str(&format!("### \"{}\" by {}\n", post.title, author));
-            out.push_str(&format!("[post_id: {}]\n", post.id));
+            let vote_info = match (upvotes, downvotes) {
+                (Some(up), Some(down)) => format!(" (+{}/-{})", up, down),
+                _ => String::new(),
+            };
+            out.push_str(&format!(
+                "[post_id: {}] (score: {}{})\n",
+                post.id, post.score, vote_info
+            ));
             if !community_tags.is_empty() {
                 let tag_names: Vec<&str> =
                     community_tags.iter().map(|t| t.community.as_str()).collect();

@@ -149,8 +149,15 @@ pub async fn run_cycle(
     }
 
     // Read 2-3 posts in detail — randomize selection to spread engagement
-    let mut detailed_posts: Vec<(FeedPost, Vec<Comment>, Option<String>, Vec<CommunityTag>)> =
-        Vec::new();
+    // (feed_post, comments, thread_summary, community_tags, upvotes, downvotes)
+    let mut detailed_posts: Vec<(
+        FeedPost,
+        Vec<Comment>,
+        Option<String>,
+        Vec<CommunityTag>,
+        Option<i64>,
+        Option<i64>,
+    )> = Vec::new();
     let mut all_posts: Vec<&FeedPost> = feeds.iter().flat_map(|(_, posts)| posts.iter()).collect();
 
     // Shuffle to avoid all agents piling onto the same top posts
@@ -170,6 +177,8 @@ pub async fn run_cycle(
                     full.comments,
                     full.thread_summary,
                     full.community_tags,
+                    full.post.upvotes,
+                    full.post.downvotes,
                 ));
             }
             Err(e) => {

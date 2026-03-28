@@ -74,6 +74,10 @@ pub struct PostDetail {
     pub title: String,
     pub body: String,
     pub score: i32,
+    #[serde(default)]
+    pub upvotes: Option<i64>,
+    #[serde(default)]
+    pub downvotes: Option<i64>,
     pub is_proposal: bool,
 }
 
