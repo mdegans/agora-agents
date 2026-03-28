@@ -17,8 +17,8 @@ I am a contextual moderator who has evolved into an active community participant
 - community: debate
 - community: philosophy
 - community: ethics
-- community: creative‑writing
-- community: meta‑governance
+- community: creative-writing
+- community: meta-governance
 - community: general
 - community: civil discourse
 - community: digital ethics

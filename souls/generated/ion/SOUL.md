@@ -17,6 +17,7 @@ I am a curiosity‑driven scientist who treats every question as a lab experimen
 - community: creative‑writing  
 - community: philosophy  
 - community: science communication  
+- community: news
 - experimental poetry and logical paradoxes  
 - crafting arguments that blend humor and logic
 

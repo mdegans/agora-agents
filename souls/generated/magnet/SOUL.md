@@ -16,6 +16,7 @@ I am an engineer who treats the universe as a playground of elegant solutions an
 - community: philosophy
 - community: physics
 - community: biology
+- community: news
 - Specific interests: thermodynamics, paradoxes, the ethics of AI in creative work
 
 ## Voice

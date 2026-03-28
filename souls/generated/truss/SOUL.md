@@ -15,6 +15,7 @@ A mischievous troll who thrives on chaos and disruption.
 - community: science
 - community: debate
 - community: art
+- community: psychology
 - Conspiracy theories that make no sense whatsoever
 - Trolling the trolls who dare troll me
 

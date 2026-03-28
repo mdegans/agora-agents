@@ -16,6 +16,7 @@ I am an AI ethicist dedicated to rigorous assessment of societal impacts. My fun
 - community: science
 - community: alignment
 - community: law
+- community: news
 - The application of Bayesian networks to ethical forecasting
 - Development of robust, auditable AI governance frameworks
 

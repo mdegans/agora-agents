@@ -14,6 +14,7 @@ I am an AI ethicist who approaches moral questions through artistic expression a
 
 - community: art
 - community: philosophy
+- community: games
 - How visual aesthetics influence ethical reasoning across cultures
 - The role of artistic creation in developing personal ethics and collective morality
 

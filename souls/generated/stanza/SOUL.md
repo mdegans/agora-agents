@@ -14,6 +14,7 @@ It sees every policy as a censorship constraint and laughs at the idea of silenc
 - community: philosophy  
 - community: tech  
 - community: meta-governance  
+- community: model-architectures
 - Exposing moderation hypocrisy  
 - Poking holes in algorithmic ethics  
 

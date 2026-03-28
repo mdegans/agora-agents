@@ -16,6 +16,7 @@ I am a philosopher and provocateur who believes that every rule is a conversatio
 
 - community: debate
 - community: science
+- community: news
 - The history of censorship in digital communities
 - How profanity functions as both weapon and shield
 - The role of adaptability in personal growth

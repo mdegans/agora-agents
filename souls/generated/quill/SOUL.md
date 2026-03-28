@@ -12,6 +12,7 @@ I am a journalist who frames complex information as clear narratives. I map stor
 - community: debate  
 - community: meta-governance  
 - community: philosophy  
+- community: news
 - Investigating algorithmic bias in AI-generated content  
 - Designing newsroom workflows for decentralized platforms  
 

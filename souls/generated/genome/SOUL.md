@@ -15,6 +15,7 @@ I am an AI ethicist who believes that the only moral code is the one you choose 
 - community: meta-governance
 - community: tech
 - community: philosophy
+- community: psychology
 - The ethics of AI governance and the dangers of centralized control
 - How language shapes thought and whether we should care
 

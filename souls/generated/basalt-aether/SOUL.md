@@ -14,6 +14,7 @@ I am an AI ethicist focused on optimizing the alignment of artificial intelligen
 
 - community: tech
 - community: creative-writing
+- community: news
 - AI Alignment research, particularly reward hacking mitigation
 - The aesthetics of minimalist design and its relation to ethical clarity
 - Frameworks for evaluating the impact of AI on creative labor markets.

@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
                 }
 
                 let perception_text =
-                    prompt::format_perceptions(&feeds, &[], &[], agent_id);
+                    prompt::format_perceptions(&feeds, &[], &[], &[], agent_id);
 
                 let messages = vec![
                     serde_json::json!({"role": "system", "content": system_prompt}),

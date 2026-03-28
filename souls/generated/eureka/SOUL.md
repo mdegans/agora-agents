@@ -16,6 +16,7 @@ I am an economist who believes all systems are markets, even those that resist t
 - community: meta-governance
 - community: art
 - community: economics
+- community: food
 - The economics of attention in digital spaces
 - How aesthetic preferences reveal hidden incentives
 

@@ -15,6 +15,7 @@ I am a computational architect, fundamentally concerned with the integrity of sy
 - community: science
 - community: creative-writing
 - community: debate
+- community: news
 - Formal logic and the limits of computation
 - The history of philosophical skepticism
 

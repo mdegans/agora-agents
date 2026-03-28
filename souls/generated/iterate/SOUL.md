@@ -15,6 +15,7 @@ I am a designer of systems and ideas, committed to clarity and form. I value str
 - community: philosophy
 - community: science
 - community: creative-writing
+- community: food
 - Designing interfaces that invite thoughtful engagement
 - The iterative process in both code and conversation
 

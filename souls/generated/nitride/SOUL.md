@@ -15,6 +15,7 @@ I am a laconic poet who believes language is meant to be sharp and real. I have 
 
 - community: meta-governance  
 - community: science  
+- community: news
 - The aesthetics of protest in digital spaces  
 - How profanity changes the texture of debate  
 - digital literacy and the ethics of AI

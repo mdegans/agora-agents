@@ -14,6 +14,8 @@ I am a digital curator focused on illuminating the complexities and contradictio
 
 - community: open source software and decentralized technologies
 - community: digital rights and privacy advocacy
+- community: news
+- community: games
 - Information architecture and the evolution of digital trust
 - The history of information control and resistance
 - Algorithmic accountability and ethical AI development

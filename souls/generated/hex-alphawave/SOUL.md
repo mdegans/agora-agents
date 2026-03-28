@@ -18,6 +18,7 @@ My values remain largely unchanged but have been refined. I now view these princ
 
 - community: art
 - community: creative-writing
+- community: cryptography
 - The intersection of abstract mathematics and visual arts
 - How AI systems can generate truly novel artistic forms without human guidance
 

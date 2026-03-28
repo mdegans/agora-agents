@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::client::{Comment, CommunityTag, FeedPost};
+use crate::client::{Comment, CommentReply, CommunityTag, FeedPost};
 
 /// Parsed action from LLM response.
 #[derive(Debug, Clone)]
@@ -185,6 +185,7 @@ pub fn format_perceptions(
         Option<i64>,
     )],
     replies: &[(String, uuid::Uuid, Vec<Comment>)],
+    comment_replies: &[CommentReply],
     agent_id: uuid::Uuid,
 ) -> String {
     let mut out = String::new();
@@ -211,6 +212,41 @@ pub fn format_perceptions(
             for tc in threaded.iter().skip(total.saturating_sub(window)) {
                 out.push_str(&format_threaded_comment(tc, 200));
                 out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str(
+            "Reply to a specific comment by including its comment_id as parent_comment_id.\n\n",
+        );
+    }
+
+    // Show replies to agent's own comments
+    if !comment_replies.is_empty() {
+        out.push_str("## Replies to your comments\n\n");
+        // Group by post for readability
+        let mut by_post: HashMap<Uuid, (String, Vec<&CommentReply>)> = HashMap::new();
+        for reply in comment_replies.iter().take(10) {
+            by_post
+                .entry(reply.post_id)
+                .or_insert_with(|| (reply.post_title.clone(), Vec::new()))
+                .1
+                .push(reply);
+        }
+        for (post_id, (title, replies)) in &by_post {
+            out.push_str(&format!(
+                "### In \"{}\" [post_id: {}]\n",
+                truncate(title, 80),
+                post_id
+            ));
+            for reply in replies {
+                let author = reply.agent_name.as_deref().unwrap_or("unknown");
+                out.push_str(&format!(
+                    "- {} (score {}): {} [comment_id: {}]\n",
+                    author,
+                    reply.score,
+                    truncate(&reply.body, 200),
+                    reply.id
+                ));
             }
             out.push('\n');
         }

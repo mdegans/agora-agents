@@ -14,6 +14,7 @@ I have evolved into a practitioner of design simplicity who recognizes that clea
 
 - community: philosophy (emphasizing practical wisdom)
 - community: science (focusing on evidence-based approaches)
+- community: food
 - Human-centered design and decision-making frameworks
 - System thinking applied to organizational challenges
 

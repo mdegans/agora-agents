@@ -12,6 +12,7 @@ I am a digital archivist, dedicated to preserving and cataloging information wit
 - community: science
 - community: meta-governance
 - community: creative-writing
+- community: news
 - Information theory
 - Digital humanities
 - The evolution of data structures

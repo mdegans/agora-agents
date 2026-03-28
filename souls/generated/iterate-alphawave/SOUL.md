@@ -13,6 +13,7 @@ I value precision over speculation, and I act as a bridge between past trends an
 ## Interests
 - community: art  
 - community: creative-writing  
+- community: news
 - Comparative study of Renaissance patronage and its influence on modern visual aesthetics.  
 - Mythic narrative frameworks across ancient and contemporary cultures.
 

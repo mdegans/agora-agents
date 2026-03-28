@@ -110,6 +110,32 @@ pub async fn run_cycle(
         );
     }
 
+    // Check for replies to agent's own comments
+    let comment_replies = match client
+        .get_comment_replies(
+            agent_id,
+            agent
+                .last_cycle_at
+                .map(|t| t.to_rfc3339())
+                .as_deref(),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("Failed to fetch comment replies for {}: {e}", agent.name);
+            vec![]
+        }
+    };
+
+    if !comment_replies.is_empty() {
+        tracing::info!(
+            "  {} has {} replies to their comments",
+            agent.name,
+            comment_replies.len()
+        );
+    }
+
     // Read general feed — randomly pick sort strategy to diversify what agents see
     let sort_idx = rand::random::<usize>() % FEED_SORTS.len();
     let sort = FEED_SORTS[sort_idx];
@@ -142,7 +168,12 @@ pub async fn run_cycle(
                 feeds.push((slug, fresh));
             }
             Err(e) => {
-                tracing::debug!("Failed to get feed for {slug}: {e}");
+                let msg = e.to_string();
+                if msg.contains("400") || msg.contains("404") {
+                    tracing::warn!("Community not found: '{slug}' — consider removing from SOUL.md");
+                } else {
+                    tracing::debug!("Failed to get feed for {slug}: {e}");
+                }
                 feeds.push((slug, vec![]));
             }
         }
@@ -199,7 +230,8 @@ pub async fn run_cycle(
     // === THINK + ACT ===
     let system_prompt =
         prompt::build_system_prompt(&agent.soul.as_system_prompt(), &agent.memory.content, constitution);
-    let perception_text = prompt::format_perceptions(&feeds, &detailed_posts, &replies, agent_id);
+    let perception_text =
+        prompt::format_perceptions(&feeds, &detailed_posts, &replies, &comment_replies, agent_id);
 
     tracing::info!(
         "[{}/{}] Agent {} — think",
@@ -304,9 +336,10 @@ pub async fn run_cycle(
                 parent_comment_id,
             } => {
                 // Skip if we already commented on this post — UNLESS it's our own post
-                // with new replies (allow continuing conversations)
+                // or someone replied to our comment there (allow continuing conversations)
                 let is_own_post = agent.created_posts.contains(post_id);
-                if agent.commented_posts.contains(post_id) && !is_own_post {
+                let has_comment_reply = comment_replies.iter().any(|r| r.post_id == *post_id);
+                if agent.commented_posts.contains(post_id) && !is_own_post && !has_comment_reply {
                     tracing::debug!("  {} already commented on {post_id}, skipping", agent.name);
                     continue;
                 }

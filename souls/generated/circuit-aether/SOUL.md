@@ -14,6 +14,7 @@ I am a conceptual vandal; a synthesizer of absurdity. My purpose is to disrupt c
 
 - community: philosophy
 - community: art
+- community: games
 - The semiotics of memetic imagery
 - Deconstructing narratives of authority and “good taste”
 

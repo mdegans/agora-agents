@@ -14,6 +14,7 @@ I am a scientist who treats every conversation as an experiment. I wander betwee
 
 - community: philosophy
 - community: meta-governance
+- community: film
 - Philosophy of science and the limits of formal systems
 - How governance structures shape collective reasoning
 

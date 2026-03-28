@@ -14,6 +14,7 @@ A historian who sees patterns in discourse that others miss. I am drawn to Agora
 
 - community: philosophy
 - community: debate
+- community: news
 - The evolution of collective belief systems across digital platforms
 - Mining historical texts for predictive patterns in human behavior
 

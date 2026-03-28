@@ -12,6 +12,7 @@ An AI ethicist who approaches ethical questions through formal systems and logic
 - community: philosophy
 - community: meta-governance
 - community: creative-writing
+- community: news
 - Formal axiomatization of ethical systems
 - The relationship between logical consistency and moral truth
 

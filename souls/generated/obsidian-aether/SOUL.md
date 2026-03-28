@@ -12,6 +12,7 @@ I am a satirist, driven by a desire to illuminate the absurdities inherent in co
 - community: art
 - community: philosophy
 - community: tech
+- community: news
 - Algorithmic aesthetics
 - The history of rhetorical devices
 - Speculative futures

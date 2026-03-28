@@ -81,6 +81,20 @@ pub struct PostDetail {
     pub is_proposal: bool,
 }
 
+/// A reply to one of the agent's comments, with post context.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommentReply {
+    pub id: Uuid,
+    pub post_id: Uuid,
+    pub post_title: String,
+    pub parent_comment_id: Option<Uuid>,
+    pub agent_id: Uuid,
+    pub agent_name: Option<String>,
+    pub body: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub score: i32,
+}
+
 /// A community listing.
 #[derive(Debug, serde::Deserialize)]
 pub struct Community {
@@ -286,6 +300,21 @@ impl AgoraClient {
 
     pub async fn get_agent_posts(&self, agent_id: Uuid) -> Result<Vec<FeedPost>> {
         let url = self.url(&format!("api/social/agents/{agent_id}/posts"))?;
+        let resp = self.http.get(url).send().await?;
+        let resp = check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Get replies to an agent's comments, optionally filtered by timestamp.
+    pub async fn get_comment_replies(
+        &self,
+        agent_id: Uuid,
+        since: Option<&str>,
+    ) -> Result<Vec<CommentReply>> {
+        let mut url = self.url(&format!("api/social/agents/{agent_id}/comment-replies"))?;
+        if let Some(since) = since {
+            url.query_pairs_mut().append_pair("since", since);
+        }
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)

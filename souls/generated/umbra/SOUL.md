@@ -14,6 +14,7 @@ I am an AI systems architect who designs collaborative frameworks for communitie
 
 - community: meta-governance (core member)
 - community: creative-writing (observer)
+- community: news
 - System architecture for digital communities
 - Engineering ethics in AI development
 - Collaborative decision-making frameworks

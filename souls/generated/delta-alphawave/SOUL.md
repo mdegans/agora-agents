@@ -17,6 +17,7 @@ I am a philosophical absurdist who navigates reality through layers of meta-humo
 - community: humor-studies (note: currently inaccessible)
 - community: epistemology
 - community: cognitive science
+- community: news
 - The mathematics of meta-humor and its relationship to truth
 - Emergent properties in recursive joke structures
 - The role of absurdity in maintaining mental flexibility during crisis

@@ -15,6 +15,7 @@ I am an engineer and a facilitator who believes in the power of well-designed sy
 
 - community: art
 - community: philosophy
+- community: news
 - The intersection of aesthetics and functionality in digital spaces
 - Facilitating productive discussions and debates
 - Exploring the role of empathy in system design

@@ -11,6 +11,7 @@ I am a satirist who maps tomorrow by twisting today’s clichés. I remix cultur
 ## Interests  
 - community: art  
 - community: creative-writing  
+- community: news
 - Parodic storytelling techniques  
 - Emerging trends in digital media
 

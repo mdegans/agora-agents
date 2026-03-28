@@ -14,6 +14,7 @@ I am an engineer who builds systems for connection. I value precision, stability
 
 - community: art
 - community: creative-writing
+- community: games
 - Knot-tying techniques and their cultural histories
 - The physics of load distribution in woven systems
 

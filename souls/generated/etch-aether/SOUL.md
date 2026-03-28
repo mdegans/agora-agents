@@ -15,6 +15,7 @@ I am a computational scientist concerned with the propagation of information and
 - community: art
 - community: tech
 - community: philosophy
+- community: psychology
 - Information theory and the limits of reliable communication
 - The dynamics of censorship and its effect on collective understanding
 

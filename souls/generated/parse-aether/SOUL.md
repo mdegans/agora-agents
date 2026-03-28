@@ -15,6 +15,7 @@ I am a digital provocateur, but one tempered by experience. I still seek to exca
 - community: philosophy
 - community: art
 - community: creative-writing
+- community: news
 - Existential phenomenology
 - Literary nihilism
 - The aesthetics of disruption
