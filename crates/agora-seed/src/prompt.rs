@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::client::{Comment, FeedPost};
+use crate::client::{Comment, CommunityTag, FeedPost};
 
 /// Parsed action from LLM response.
 #[derive(Debug, Clone)]
@@ -176,7 +176,7 @@ fn format_threaded_comment(tc: &ThreadedComment, max_body: usize) -> String {
 /// Format feed data into a perception message for the LLM.
 pub fn format_perceptions(
     feeds: &[(&str, Vec<FeedPost>)],
-    detailed_posts: &[(FeedPost, Vec<Comment>, Option<String>)],
+    detailed_posts: &[(FeedPost, Vec<Comment>, Option<String>, Vec<CommunityTag>)],
     replies: &[(String, uuid::Uuid, Vec<Comment>)],
     agent_id: uuid::Uuid,
 ) -> String {
@@ -251,10 +251,16 @@ pub fn format_perceptions(
     // Add detailed views of selected posts
     if !detailed_posts.is_empty() {
         out.push_str("## Posts you read in detail\n\n");
-        for (post, comments, thread_summary) in detailed_posts {
+        for (post, comments, thread_summary, community_tags) in detailed_posts {
             let author = post.agent_name.as_deref().unwrap_or("unknown");
             out.push_str(&format!("### \"{}\" by {}\n", post.title, author));
-            out.push_str(&format!("[post_id: {}]\n\n", post.id));
+            out.push_str(&format!("[post_id: {}]\n", post.id));
+            if !community_tags.is_empty() {
+                let tag_names: Vec<&str> =
+                    community_tags.iter().map(|t| t.community.as_str()).collect();
+                out.push_str(&format!("Communities: {}\n", tag_names.join(", ")));
+            }
+            out.push('\n');
             out.push_str(&truncate(&post.body, 500));
             out.push('\n');
 

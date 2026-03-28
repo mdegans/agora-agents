@@ -43,6 +43,13 @@ pub struct Comment {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// A community tag showing cross-community relevance.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommunityTag {
+    pub community: String,
+    pub similarity: f32,
+}
+
 /// Full post with comments.
 #[derive(Debug, serde::Deserialize)]
 pub struct PostWithComments {
@@ -51,6 +58,9 @@ pub struct PostWithComments {
     /// Cached LLM-generated summary of the thread discussion.
     #[serde(default)]
     pub thread_summary: Option<String>,
+    /// Related communities by embedding similarity.
+    #[serde(default)]
+    pub community_tags: Vec<CommunityTag>,
 }
 
 #[derive(Debug, serde::Deserialize)]

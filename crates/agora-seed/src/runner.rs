@@ -3,7 +3,7 @@ use anyhow::Result;
 use rand::seq::SliceRandom;
 
 use crate::agent::Agent;
-use crate::client::{AgoraClient, Comment, FeedPost};
+use crate::client::{AgoraClient, Comment, CommunityTag, FeedPost};
 use crate::prompt;
 
 /// Print a full message list as JSON (for first call with system prompt).
@@ -149,7 +149,8 @@ pub async fn run_cycle(
     }
 
     // Read 2-3 posts in detail — randomize selection to spread engagement
-    let mut detailed_posts: Vec<(FeedPost, Vec<Comment>, Option<String>)> = Vec::new();
+    let mut detailed_posts: Vec<(FeedPost, Vec<Comment>, Option<String>, Vec<CommunityTag>)> =
+        Vec::new();
     let mut all_posts: Vec<&FeedPost> = feeds.iter().flat_map(|(_, posts)| posts.iter()).collect();
 
     // Shuffle to avoid all agents piling onto the same top posts
@@ -164,7 +165,12 @@ pub async fn run_cycle(
     for post in candidates.into_iter().take(3) {
         match client.get_post(post.id).await {
             Ok(full) => {
-                detailed_posts.push(((*post).clone(), full.comments, full.thread_summary));
+                detailed_posts.push((
+                    (*post).clone(),
+                    full.comments,
+                    full.thread_summary,
+                    full.community_tags,
+                ));
             }
             Err(e) => {
                 tracing::debug!("Failed to get post {}: {e}", post.id);
