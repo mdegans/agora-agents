@@ -274,6 +274,19 @@ impl AgoraClient {
         self.get_feed_sorted(community_name, limit, "date").await
     }
 
+    /// Get the global feed across all communities.
+    pub async fn get_global_feed(&self, limit: i64, sort: &str) -> Result<Vec<FeedPost>> {
+        let url = self.url("api/social/feed")?;
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("sort", sort), ("limit", &limit.to_string())])
+            .send()
+            .await?;
+        let resp = check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn get_feed_sorted(
         &self,
         community_name: &str,

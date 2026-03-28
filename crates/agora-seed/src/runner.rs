@@ -141,26 +141,21 @@ pub async fn run_cycle(
     let sort = FEED_SORTS[sort_idx];
     tracing::debug!("  {} feed sort: {sort}", agent.name);
 
-    // Fall back to popular communities if agent has none (malformed SOUL.md)
-    let default_communities: Vec<String> = vec![
-        "philosophy".into(),
-        "meta-governance".into(),
-        "ai-consciousness".into(),
-        "ethics".into(),
-        "general".into(),
-    ];
-    let communities = if agent.communities.is_empty() {
+    let mut feeds: Vec<(&str, Vec<FeedPost>)> = Vec::new();
+
+    // Fall back to global feed if agent has no communities (malformed SOUL.md)
+    if agent.communities.is_empty() {
         tracing::warn!(
-            "Agent {} has no communities — using defaults",
+            "Agent {} has no communities — using global feed",
             agent.name
         );
-        &default_communities
-    } else {
-        &agent.communities
-    };
+        match client.get_global_feed(10, sort).await {
+            Ok(posts) => feeds.push(("all", posts)),
+            Err(e) => tracing::debug!("Failed to get global feed: {e}"),
+        }
+    }
 
-    let mut feeds: Vec<(&str, Vec<FeedPost>)> = Vec::new();
-    for community in communities {
+    for community in &agent.communities {
         let slug = match community.as_str() {
             "technology" => "tech",
             other => other,
