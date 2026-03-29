@@ -1,12 +1,18 @@
-//! Ollama backend using the OpenAI-compatible API.
+//! Ollama backend using the OpenAI-compatible `/v1/chat/completions` endpoint.
+//!
+//! Builds prompts with [`misanthropic::Prompt`] and serializes them via the
+//! OpenAI compatibility layer. This gives us tool calling support for free —
+//! Ollama constrains grammar at generation time, guaranteeing valid JSON.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use misanthropic::openai::{ChatCompletionRequest, ChatCompletionResponse};
+use misanthropic::prompt::Message as MMessage;
+use misanthropic::Prompt;
 
-use super::{LlmBackend, Message, Role};
+use super::LlmBackend;
 
-/// Ollama LLM backend using local models.
+/// Ollama LLM backend using local models via the OpenAI-compatible API.
 pub struct OllamaBackend {
     client: reqwest::Client,
     base_url: String,
@@ -30,76 +36,17 @@ impl OllamaBackend {
     }
 }
 
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    stream: bool,
-    think: bool,
-    options: Option<ChatOptions>,
-}
-
-#[derive(Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Serialize)]
-struct ChatOptions {
-    num_predict: u32,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    message: Option<ResponseMessage>,
-    prompt_eval_count: Option<u64>,
-    eval_count: Option<u64>,
-    eval_duration: Option<u64>,
-    total_duration: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct ResponseMessage {
-    content: String,
-}
-
 #[async_trait]
 impl LlmBackend for OllamaBackend {
-    async fn complete(
-        &self,
-        system_prompt: &str,
-        messages: &[Message],
-        max_tokens: u32,
-    ) -> Result<String> {
-        // Use Ollama's native /api/chat endpoint (more reliable than OpenAI compat)
-        let url = format!("{}/api/chat", self.base_url);
+    async fn send(&self, prompt: &Prompt<'_>) -> Result<MMessage<'static>> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let start = std::time::Instant::now();
 
-        let mut chat_messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: system_prompt.to_string(),
-        }];
-
-        for msg in messages {
-            let role = match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            };
-            chat_messages.push(ChatMessage {
-                role: role.to_string(),
-                content: msg.content.clone(),
-            });
-        }
-
-        let request = ChatRequest {
-            model: self.model.clone(),
-            messages: chat_messages,
-            stream: false,
-            think: false,
-            options: Some(ChatOptions {
-                num_predict: max_tokens,
-            }),
-        };
+        // Convert the Prompt to an OpenAI-compatible request.
+        let mut request = ChatCompletionRequest::from(prompt);
+        // Override model — the Prompt may have a default/Anthropic model ID,
+        // but we want the Ollama model name (e.g. "cogito:14b").
+        request.model = self.model.clone();
 
         let response = self
             .client
@@ -115,22 +62,21 @@ impl LlmBackend for OllamaBackend {
             anyhow::bail!("Ollama returned {status}: {body}");
         }
 
-        let chat_response: ChatResponse =
+        let chat_response: ChatCompletionResponse =
             response.json().await.context("parsing Ollama response")?;
 
         // Log inference stats
-        if let (Some(prompt_tokens), Some(eval_tokens)) =
-            (chat_response.prompt_eval_count, chat_response.eval_count)
-        {
-            let tok_per_sec = chat_response
-                .eval_duration
-                .filter(|&d| d > 0)
-                .map(|d| eval_tokens as f64 / (d as f64 / 1_000_000_000.0));
-            let total_secs = chat_response
-                .total_duration
-                .map(|d| d as f64 / 1_000_000_000.0);
+        let elapsed = start.elapsed();
+        if let Some(usage) = &chat_response.usage {
+            let prompt_tokens = usage.prompt_tokens;
+            let completion_tokens = usage.completion_tokens;
+            let tok_per_sec = if elapsed.as_secs_f64() > 0.0 {
+                completion_tokens as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
 
-            let slow = tok_per_sec.is_some_and(|t| t < 20.0);
+            let slow = tok_per_sec > 0.0 && tok_per_sec < 20.0;
             let large_ctx = prompt_tokens > 32_000;
 
             if large_ctx || slow {
@@ -140,25 +86,24 @@ impl LlmBackend for OllamaBackend {
                     if large_ctx { " LARGE_CTX" } else { "" },
                     if slow { " SLOW" } else { "" },
                     prompt_tokens,
-                    eval_tokens,
-                    tok_per_sec.unwrap_or(0.0),
-                    total_secs.unwrap_or(0.0),
+                    completion_tokens,
+                    tok_per_sec,
+                    elapsed.as_secs_f64(),
                 );
             } else {
                 tracing::info!(
                     "  [{}] {}tok prompt, {}tok response, {:.1} tok/s, {:.1}s total",
                     self.model,
                     prompt_tokens,
-                    eval_tokens,
-                    tok_per_sec.unwrap_or(0.0),
-                    total_secs.unwrap_or(0.0),
+                    completion_tokens,
+                    tok_per_sec,
+                    elapsed.as_secs_f64(),
                 );
             }
         }
 
         chat_response
-            .message
-            .map(|m| m.content)
+            .into_message()
             .ok_or_else(|| anyhow::anyhow!("Ollama response contained no message"))
     }
 

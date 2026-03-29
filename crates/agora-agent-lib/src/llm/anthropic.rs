@@ -1,9 +1,14 @@
 //! Anthropic backend using the `misanthropic` crate (Messages API).
+//!
+//! This is the native backend — prompts are sent directly to the Anthropic API
+//! without any conversion layer.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use misanthropic::prompt::Message as MMessage;
+use misanthropic::Prompt;
 
-use super::{LlmBackend, Message, Role};
+use super::LlmBackend;
 
 /// Anthropic LLM backend using Claude models.
 pub struct AnthropicBackend {
@@ -27,42 +32,23 @@ impl AnthropicBackend {
 
 #[async_trait]
 impl LlmBackend for AnthropicBackend {
-    async fn complete(
-        &self,
-        system_prompt: &str,
-        messages: &[Message],
-        max_tokens: u32,
-    ) -> Result<String> {
-        use misanthropic::prompt::message::{Content, Role as MRole};
-        use std::num::NonZeroU32;
-
-        let model_id: misanthropic::model::Id<'_> = self.model.as_str().into();
-
-        let mut prompt = misanthropic::Prompt {
-            model: model_id,
-            max_tokens: NonZeroU32::new(max_tokens).unwrap_or(NonZeroU32::new(1024).unwrap()),
-            system: Some(Content::text(system_prompt)),
-            ..Default::default()
-        };
-
-        for msg in messages {
-            let role = match msg.role {
-                Role::User => MRole::User,
-                Role::Assistant => MRole::Assistant,
-            };
-            prompt = prompt
-                .add_message((role, msg.content.as_str()))
-                .context("adding message to prompt")?;
-        }
-
+    async fn send(&self, prompt: &Prompt<'_>) -> Result<MMessage<'static>> {
         let response = self
             .client
-            .message(&prompt)
+            .message(prompt)
             .await
-            .context("Anthropic API call failed")?;
+            .map_err(|e| anyhow::anyhow!("Anthropic API call failed: {e}"))?;
 
-        // response::Message has Display via its inner AssistantMessage
-        Ok(response.to_string())
+        tracing::debug!(
+            "  [{}] {}tok in, {}tok out",
+            self.model,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        );
+
+        // response::Message -> prompt::Message via Into<Message> on AssistantMessage
+        let msg: misanthropic::prompt::Message<'_> = response.inner.into();
+        Ok(msg.into_static())
     }
 
     fn backend_name(&self) -> &str {

@@ -7,7 +7,7 @@ resolver = "2"
 agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git" }
 
 # LLM backends
-misanthropic = { git = "https://github.com/mdegans/misanthropic", branch = "dev" }
+misanthropic = { git = "https://github.com/mdegans/misanthropic", branch = "dev", features = ["openai"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Crypto (used directly by agora-seed and agora-cli for key management)
