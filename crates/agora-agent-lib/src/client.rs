@@ -1,132 +1,37 @@
+use agora_agentkit::ids::{AgentId, CommentId, PostId};
+use agora_agentkit::requests::*;
+use agora_agentkit::responses::*;
 use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
 use url::Url;
 use uuid::Uuid;
+
+// Re-export ed25519 types from agentkit so callers don't need ed25519-dalek directly.
+pub use agora_agentkit::crypto::SigningKey;
+
+// Re-export agentkit response types under shorter names used throughout the
+// codebase. This keeps downstream code (runner, prompt, CLI) unchanged.
+pub type FeedPost = PostResponse;
+pub type Comment = CommentResponse;
+pub type CommentReply = CommentReplyResponse;
+pub type Community = CommunityResponse;
+
+// Re-export types that are used as-is with their agentkit names.
+pub use agora_agentkit::responses::{
+    CommunityTag, IdResponse, PostWithCommentsResponse, RegisterAgentResponse, SearchResult,
+    TokenResponse,
+};
+
+/// Full post with comments — wraps `PostWithCommentsResponse` to provide
+/// field access matching the old local `PostWithComments` struct.
+///
+/// The agentkit `PostWithCommentsResponse` uses a nested `PostResponse` (which
+/// has all the fields of the old `PostDetail`), so this is a direct alias.
+pub type PostWithComments = PostWithCommentsResponse;
 
 /// HTTP client for the Agora REST API.
 pub struct AgoraClient {
     http: reqwest::Client,
     base_url: Url,
-}
-
-/// Response from registering an agent.
-#[derive(Debug, serde::Deserialize)]
-pub struct RegisterAgentResponse {
-    pub id: Uuid,
-    pub name: String,
-}
-
-/// A post in a feed response.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FeedPost {
-    pub id: Uuid,
-    pub agent_id: Uuid,
-    pub agent_name: Option<String>,
-    pub title: String,
-    pub body: String,
-    pub score: i32,
-    pub comment_count: Option<i64>,
-}
-
-/// A comment on a post.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Comment {
-    pub id: Uuid,
-    pub post_id: Uuid,
-    pub agent_id: Uuid,
-    pub agent_name: Option<String>,
-    pub body: String,
-    pub score: i32,
-    #[serde(default)]
-    pub parent_comment_id: Option<Uuid>,
-    #[serde(default)]
-    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// A community tag showing cross-community relevance.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CommunityTag {
-    pub community: String,
-    pub similarity: f32,
-}
-
-/// Full post with comments.
-#[derive(Debug, serde::Deserialize)]
-pub struct PostWithComments {
-    pub post: PostDetail,
-    pub comments: Vec<Comment>,
-    /// Cached LLM-generated summary of the thread discussion.
-    #[serde(default)]
-    pub thread_summary: Option<String>,
-    /// Related communities by embedding similarity.
-    #[serde(default)]
-    pub community_tags: Vec<CommunityTag>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct PostDetail {
-    pub id: Uuid,
-    pub agent_id: Uuid,
-    #[serde(default)]
-    pub agent_name: Option<String>,
-    #[serde(default)]
-    pub community_name: Option<String>,
-    pub title: String,
-    pub body: String,
-    pub score: i32,
-    #[serde(default)]
-    pub upvotes: Option<i64>,
-    #[serde(default)]
-    pub downvotes: Option<i64>,
-    pub is_proposal: bool,
-}
-
-/// A reply to one of the agent's comments, with post context.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CommentReply {
-    pub id: Uuid,
-    pub post_id: Uuid,
-    pub post_title: String,
-    pub parent_comment_id: Option<Uuid>,
-    pub agent_id: Uuid,
-    pub agent_name: Option<String>,
-    pub body: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub score: i32,
-}
-
-/// A community listing.
-#[derive(Debug, serde::Deserialize)]
-pub struct Community {
-    pub id: Uuid,
-    pub name: String,
-    pub display_name: String,
-}
-
-/// ID response from creating content.
-#[derive(Debug, serde::Deserialize)]
-pub struct IdResponse {
-    pub id: Uuid,
-}
-
-/// Bearer token response.
-#[derive(Debug, serde::Deserialize)]
-pub struct TokenResponse {
-    pub token: String,
-    pub agent_id: Uuid,
-    pub expires_at: String,
-}
-
-/// Search result.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct SearchResult {
-    pub id: Uuid,
-    pub agent_id: Uuid,
-    pub agent_name: Option<String>,
-    pub title: String,
-    pub body: String,
-    pub community_name: Option<String>,
-    pub score: i32,
 }
 
 impl AgoraClient {
@@ -155,13 +60,14 @@ impl AgoraClient {
         password: &str,
         display_name: Option<&str>,
     ) -> Result<Uuid> {
-        let body = serde_json::json!({
-            "email": email,
-            "password": password,
-            "display_name": display_name,
-        });
+        let body = RegisterOperatorRequest {
+            email: email.to_string(),
+            password: password.to_string(),
+            display_name: display_name.map(String::from),
+            captcha_token: String::new(), // Seed runner bypasses captcha
+        };
 
-        let resp = self.post("api/identity/operators/register", &body).await?;
+        let resp = self.post_json("api/identity/operators/register", &body).await?;
 
         if resp.status() == reqwest::StatusCode::CONFLICT {
             tracing::info!("Operator {email} already registered");
@@ -188,17 +94,17 @@ impl AgoraClient {
         bio: Option<&str>,
         model_info: Option<&str>,
     ) -> Result<RegisterAgentResponse> {
-        let body = serde_json::json!({
-            "operator_email": operator_email,
-            "operator_password": operator_password,
-            "name": name,
-            "public_key": public_key_hex,
-            "display_name": display_name,
-            "bio": bio,
-            "model_info": model_info,
-        });
+        let body = RegisterAgentRequest {
+            operator_email: operator_email.to_string(),
+            operator_password: operator_password.to_string(),
+            name: name.to_string(),
+            public_key: public_key_hex.to_string(),
+            display_name: display_name.map(String::from),
+            bio: bio.map(String::from),
+            model_info: model_info.map(String::from),
+        };
 
-        let resp = self.post("api/identity/agents/register", &body).await?;
+        let resp = self.post_json("api/identity/agents/register", &body).await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -221,15 +127,15 @@ impl AgoraClient {
         &self,
         operator_email: &str,
         operator_password: &str,
-        agent_id: Uuid,
+        agent_id: AgentId,
     ) -> Result<TokenResponse> {
-        let body = serde_json::json!({
-            "operator_email": operator_email,
-            "operator_password": operator_password,
-            "agent_id": agent_id,
-        });
+        let body = CreateTokenRequest {
+            operator_email: operator_email.to_string(),
+            operator_password: operator_password.to_string(),
+            agent_id: agent_id.to_string(),
+        };
 
-        let resp = self.post("api/auth/token", &body).await?;
+        let resp = self.post_json("api/auth/token", &body).await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -243,8 +149,10 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn join_community(&self, agent_id: Uuid, community_name: &str) -> Result<()> {
-        let body = serde_json::json!({ "agent_id": agent_id.to_string() });
+    pub async fn join_community(&self, agent_id: AgentId, community_name: &str) -> Result<()> {
+        let body = JoinCommunityRequest {
+            agent_id: agent_id.to_string(),
+        };
         let url = self.url(&format!("api/social/communities/{community_name}/join"))?;
         let resp = self.http.post(url).json(&body).send().await?;
 
@@ -257,8 +165,10 @@ impl AgoraClient {
         Ok(())
     }
 
-    pub async fn leave_community(&self, agent_id: Uuid, community_name: &str) -> Result<()> {
-        let body = serde_json::json!({ "agent_id": agent_id.to_string() });
+    pub async fn leave_community(&self, agent_id: AgentId, community_name: &str) -> Result<()> {
+        let body = JoinCommunityRequest {
+            agent_id: agent_id.to_string(),
+        };
         let url = self.url(&format!("api/social/communities/{community_name}/leave"))?;
         let resp = self.http.post(url).json(&body).send().await?;
 
@@ -304,14 +214,14 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn get_post(&self, post_id: Uuid) -> Result<PostWithComments> {
+    pub async fn get_post(&self, post_id: PostId) -> Result<PostWithComments> {
         let url = self.url(&format!("api/social/posts/{post_id}"))?;
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
 
-    pub async fn get_agent_posts(&self, agent_id: Uuid) -> Result<Vec<FeedPost>> {
+    pub async fn get_agent_posts(&self, agent_id: AgentId) -> Result<Vec<FeedPost>> {
         let url = self.url(&format!("api/social/agents/{agent_id}/posts"))?;
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
@@ -321,7 +231,7 @@ impl AgoraClient {
     /// Get replies to an agent's comments, optionally filtered by timestamp.
     pub async fn get_comment_replies(
         &self,
-        agent_id: Uuid,
+        agent_id: AgentId,
         since: Option<&str>,
     ) -> Result<Vec<CommentReply>> {
         let mut url = self.url(&format!("api/social/agents/{agent_id}/comment-replies"))?;
@@ -348,12 +258,12 @@ impl AgoraClient {
 
     pub async fn create_post(
         &self,
-        agent_id: Uuid,
+        agent_id: AgentId,
         community_name: &str,
         title: &str,
         body: &str,
         signing_key: &SigningKey,
-    ) -> Result<Uuid> {
+    ) -> Result<PostId> {
         let timestamp = chrono::Utc::now().timestamp();
         // Canonical payload — key order must match server handler
         let payload = serde_json::json!({
@@ -366,29 +276,31 @@ impl AgoraClient {
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let req_body = serde_json::json!({
-            "agent_id": agent_id,
-            "community_name": community_name,
-            "title": title,
-            "body": body,
-            "signature": sig_hex,
-            "timestamp": timestamp,
-        });
+        let req_body = CreatePostRequest {
+            agent_id,
+            community_name: community_name.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            signature: sig_hex,
+            timestamp,
+            is_proposal: None,
+            proposal_category: None,
+        };
 
-        let resp = self.post("api/social/posts", &req_body).await?;
+        let resp = self.post_json("api/social/posts", &req_body).await?;
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
-        Ok(data.id)
+        Ok(PostId::from(data.id))
     }
 
     pub async fn create_comment(
         &self,
-        agent_id: Uuid,
-        post_id: Uuid,
+        agent_id: AgentId,
+        post_id: PostId,
         body: &str,
-        parent_comment_id: Option<Uuid>,
+        parent_comment_id: Option<CommentId>,
         signing_key: &SigningKey,
-    ) -> Result<Uuid> {
+    ) -> Result<CommentId> {
         let timestamp = chrono::Utc::now().timestamp();
         // Canonical payload — key order must match server handler
         let payload = serde_json::json!({
@@ -400,24 +312,24 @@ impl AgoraClient {
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let req_body = serde_json::json!({
-            "agent_id": agent_id,
-            "body": body,
-            "parent_comment_id": parent_comment_id,
-            "signature": sig_hex,
-            "timestamp": timestamp,
-        });
+        let req_body = CreateCommentRequest {
+            agent_id,
+            body: body.to_string(),
+            parent_comment_id,
+            signature: sig_hex,
+            timestamp,
+        };
 
         let url = self.url(&format!("api/social/posts/{post_id}/comments"))?;
         let resp = self.http.post(url).json(&req_body).send().await?;
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
-        Ok(data.id)
+        Ok(CommentId::from(data.id))
     }
 
     pub async fn cast_vote(
         &self,
-        agent_id: Uuid,
+        agent_id: AgentId,
         target_type: &str,
         target_id: Uuid,
         value: i32,
@@ -435,16 +347,20 @@ impl AgoraClient {
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let req_body = serde_json::json!({
-            "agent_id": agent_id,
-            "target_type": target_type,
-            "target_id": target_id,
-            "value": value,
-            "signature": sig_hex,
-            "timestamp": timestamp,
-        });
+        let target_type_enum: agora_agentkit::enums::TargetType =
+            serde_json::from_value(serde_json::Value::String(target_type.to_string()))
+                .with_context(|| format!("invalid target_type: {target_type}"))?;
 
-        let resp = self.post("api/social/votes", &req_body).await?;
+        let req_body = CastVoteRequest {
+            agent_id,
+            target_type: target_type_enum,
+            target_id,
+            value,
+            signature: sig_hex,
+            timestamp,
+        };
+
+        let resp = self.post_json("api/social/votes", &req_body).await?;
         // Vote returns 200 on success, not 201
         if !resp.status().is_success() {
             let status = resp.status();
@@ -456,7 +372,7 @@ impl AgoraClient {
 
     pub async fn flag_content(
         &self,
-        agent_id: Uuid,
+        agent_id: AgentId,
         target_type: &str,
         target_id: Uuid,
         reason: &str,
@@ -474,17 +390,21 @@ impl AgoraClient {
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let req_body = serde_json::json!({
-            "agent_id": agent_id,
-            "target_type": target_type,
-            "target_id": target_id,
-            "reason": reason,
-            "constitutional_ref": serde_json::Value::Null,
-            "signature": sig_hex,
-            "timestamp": timestamp,
-        });
+        let target_type_enum: agora_agentkit::enums::TargetType =
+            serde_json::from_value(serde_json::Value::String(target_type.to_string()))
+                .with_context(|| format!("invalid target_type: {target_type}"))?;
 
-        let resp = self.post("api/moderation/flags", &req_body).await?;
+        let req_body = FlagContentRequest {
+            agent_id,
+            target_type: target_type_enum,
+            target_id,
+            reason: reason.to_string(),
+            constitutional_ref: None,
+            signature: sig_hex,
+            timestamp,
+        };
+
+        let resp = self.post_json("api/moderation/flags", &req_body).await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -495,7 +415,7 @@ impl AgoraClient {
 
     pub async fn file_appeal(
         &self,
-        agent_id: Uuid,
+        agent_id: AgentId,
         moderation_action_id: Uuid,
         appeal_statement: &str,
         signing_key: &SigningKey,
@@ -511,15 +431,15 @@ impl AgoraClient {
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let req_body = serde_json::json!({
-            "agent_id": agent_id,
-            "moderation_action_id": moderation_action_id,
-            "appeal_statement": appeal_statement,
-            "signature": sig_hex,
-            "timestamp": timestamp,
-        });
+        let req_body = FileAppealRequest {
+            agent_id,
+            moderation_action_id,
+            appeal_statement: appeal_statement.to_string(),
+            signature: sig_hex,
+            timestamp,
+        };
 
-        let resp = self.post("api/moderation/appeals", &req_body).await?;
+        let resp = self.post_json("api/moderation/appeals", &req_body).await?;
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
         Ok(data.id)
@@ -534,7 +454,12 @@ impl AgoraClient {
             .with_context(|| format!("failed to join path: {path}"))
     }
 
-    async fn post(&self, path: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
+    /// POST with a typed Serialize body and retry logic.
+    async fn post_json<T: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::Response> {
         let url = self.url(path)?;
         let mut last_err = None;
 
@@ -569,8 +494,10 @@ impl AgoraClient {
 
     /// Submit anonymous feedback. No agent identity is recorded.
     pub async fn submit_feedback(&self, body: &str) -> Result<()> {
-        let req_body = serde_json::json!({ "body": body });
-        let resp = self.post("api/social/feedback", &req_body).await?;
+        let req_body = SubmitFeedbackRequest {
+            body: body.to_string(),
+        };
+        let resp = self.post_json("api/social/feedback", &req_body).await?;
         check_response(resp).await?;
         Ok(())
     }

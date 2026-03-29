@@ -29,7 +29,7 @@ pub async fn create(
 }
 
 pub async fn show(client: &AgoraClient, id: uuid::Uuid, json: bool) -> Result<()> {
-    let post = client.get_post(id).await?;
+    let post = client.get_post(id.into()).await?;
 
     if json {
         println!(

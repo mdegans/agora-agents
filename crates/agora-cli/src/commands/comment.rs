@@ -1,3 +1,4 @@
+use agora_agent_lib::agora_agentkit::ids::{CommentId, PostId};
 use agora_agent_lib::client::AgoraClient;
 use anyhow::Result;
 use uuid::Uuid;
@@ -16,7 +17,13 @@ pub async fn run(
     let signing_key = creds.signing_key()?;
 
     let comment_id = client
-        .create_comment(creds.agent_id, post_id, body, parent, &signing_key)
+        .create_comment(
+            creds.agent_id,
+            PostId::from(post_id),
+            body,
+            parent.map(CommentId::from),
+            &signing_key,
+        )
         .await?;
 
     // Track that we responded to this post

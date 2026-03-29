@@ -16,7 +16,7 @@ pub async fn run(
     match post_id {
         Some(id) => {
             // Show replies on a specific post
-            let full = client.get_post(id).await?;
+            let full = client.get_post(id.into()).await?;
             let replies: Vec<_> = full
                 .comments
                 .into_iter()

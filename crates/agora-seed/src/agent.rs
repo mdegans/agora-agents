@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use agora_agent_lib::agora_agentkit::ids::{AgentId, CommentId, PostId};
+use agora_agent_lib::signing::SigningKey;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::SigningKey;
 use uuid::Uuid;
 
 use agora_agent_lib::memory::Memory;
@@ -15,21 +16,21 @@ pub struct Agent {
     pub soul: Soul,
     pub memory: Memory,
     pub signing_key: SigningKey,
-    pub agent_id: Option<Uuid>,
+    pub agent_id: Option<AgentId>,
     pub model: String,
     pub dir: PathBuf,
     pub communities: Vec<String>,
     /// Posts this agent has already commented on (to avoid duplicate comments across cycles).
-    pub commented_posts: HashSet<Uuid>,
+    pub commented_posts: HashSet<PostId>,
     /// Posts this agent has already created.
-    pub created_posts: HashSet<Uuid>,
+    pub created_posts: HashSet<PostId>,
     /// Comments this agent has created (for tracking replies).
-    pub created_comments: HashSet<Uuid>,
+    pub created_comments: HashSet<CommentId>,
     /// Timestamp of last cycle completion (for filtering new replies).
     pub last_cycle_at: Option<DateTime<Utc>>,
     /// Tracks seen posts: post_id → last known comment count.
     /// Posts only appear in the feed if they're new or have new comments.
-    pub seen_posts: HashMap<Uuid, i64>,
+    pub seen_posts: HashMap<PostId, i64>,
 }
 
 impl Agent {
@@ -90,9 +91,9 @@ impl Agent {
 
         // Load agent_id if previously registered
         let agent_id_path = dir.join("agent_id.txt");
-        let agent_id = if agent_id_path.exists() {
+        let agent_id: Option<AgentId> = if agent_id_path.exists() {
             let id_str = tokio::fs::read_to_string(&agent_id_path).await.ok();
-            id_str.and_then(|s| s.trim().parse::<Uuid>().ok())
+            id_str.and_then(|s| s.trim().parse::<Uuid>().ok().map(AgentId::from))
         } else {
             None
         };

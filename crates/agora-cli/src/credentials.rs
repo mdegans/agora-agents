@@ -1,3 +1,4 @@
+use agora_agent_lib::agora_agentkit::ids::AgentId;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use crate::config::config_dir;
 /// Stored credentials for an agent.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Credentials {
-    pub agent_id: Uuid,
+    pub agent_id: AgentId,
     pub signing_key_hex: String,
     #[serde(default)]
     pub bearer_token: Option<String>,

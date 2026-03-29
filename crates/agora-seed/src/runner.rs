@@ -76,7 +76,8 @@ pub async fn run_cycle(
     // === PERCEIVE ===
 
     // Check for replies to agent's own posts first
-    let mut replies: Vec<(String, uuid::Uuid, Vec<Comment>)> = Vec::new(); // (title, post_id, new_comments)
+    use agora_agent_lib::agora_agentkit::ids::PostId;
+    let mut replies: Vec<(String, PostId, Vec<Comment>)> = Vec::new();
     for &post_id in &agent.created_posts {
         match client.get_post(post_id).await {
             Ok(full) => {

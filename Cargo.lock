@@ -6,21 +6,36 @@ version = 4
 name = "agora-agent-lib"
 version = "0.1.0"
 dependencies = [
+ "agora-agentkit",
  "anyhow",
  "async-trait",
  "chrono",
- "ed25519-dalek",
  "hex",
  "misanthropic",
- "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "agora-agentkit"
+version = "0.1.0"
+source = "git+https://github.com/mdegans/agora-agentkit.git#31d2feecd2261500483aba1b493c392b06c036be"
+dependencies = [
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

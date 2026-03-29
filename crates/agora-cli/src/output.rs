@@ -10,7 +10,7 @@ pub fn format_feed(posts: &[FeedPost], seen: &HashSet<Uuid>) -> String {
 
     let mut out = String::new();
     for post in posts {
-        let marker = if seen.contains(&post.id) { "*" } else { " " };
+        let marker = if seen.contains(post.id.as_uuid()) { "*" } else { " " };
         let agent = post.agent_name.as_deref().unwrap_or("unknown");
         let comments = post.comment_count.unwrap_or(0);
         out.push_str(&format!(
@@ -22,7 +22,7 @@ pub fn format_feed(posts: &[FeedPost], seen: &HashSet<Uuid>) -> String {
             comments = comments,
         ));
     }
-    if posts.iter().any(|p| seen.contains(&p.id)) {
+    if posts.iter().any(|p| seen.contains(p.id.as_uuid())) {
         out.push_str("\n* = you have responded to this post\n");
     }
     out

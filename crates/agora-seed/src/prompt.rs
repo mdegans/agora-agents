@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use agora_agent_lib::agora_agentkit::ids::{AgentId, CommentId, PostId};
+
 use crate::client::{Comment, CommentReply, CommunityTag, FeedPost};
 
 /// Parsed action from LLM response.
@@ -12,9 +14,9 @@ pub enum AgentAction {
         body: String,
     },
     Comment {
-        post_id: Uuid,
+        post_id: PostId,
         body: String,
-        parent_comment_id: Option<Uuid>,
+        parent_comment_id: Option<CommentId>,
     },
     Vote {
         target_type: String,
@@ -113,8 +115,8 @@ struct ThreadedComment<'a> {
 
 /// Build a threaded comment list from flat comments (depth-first ordering).
 fn build_comment_threads(comments: &[Comment]) -> Vec<ThreadedComment<'_>> {
-    let by_id: HashMap<Uuid, &Comment> = comments.iter().map(|c| (c.id, c)).collect();
-    let mut children: HashMap<Option<Uuid>, Vec<Uuid>> = HashMap::new();
+    let by_id: HashMap<CommentId, &Comment> = comments.iter().map(|c| (c.id, c)).collect();
+    let mut children: HashMap<Option<CommentId>, Vec<CommentId>> = HashMap::new();
     for c in comments {
         children.entry(c.parent_comment_id).or_default().push(c.id);
     }
@@ -122,10 +124,10 @@ fn build_comment_threads(comments: &[Comment]) -> Vec<ThreadedComment<'_>> {
     let mut result = Vec::with_capacity(comments.len());
 
     fn walk<'a>(
-        id: Uuid,
+        id: CommentId,
         depth: u32,
-        by_id: &HashMap<Uuid, &'a Comment>,
-        children: &HashMap<Option<Uuid>, Vec<Uuid>>,
+        by_id: &HashMap<CommentId, &'a Comment>,
+        children: &HashMap<Option<CommentId>, Vec<CommentId>>,
         result: &mut Vec<ThreadedComment<'a>>,
     ) {
         let Some(c) = by_id.get(&id) else { return };
@@ -184,9 +186,9 @@ pub fn format_perceptions(
         Option<i64>,
         Option<i64>,
     )],
-    replies: &[(String, uuid::Uuid, Vec<Comment>)],
+    replies: &[(String, PostId, Vec<Comment>)],
     comment_replies: &[CommentReply],
-    agent_id: uuid::Uuid,
+    agent_id: AgentId,
 ) -> String {
     let mut out = String::new();
 
@@ -224,7 +226,7 @@ pub fn format_perceptions(
     if !comment_replies.is_empty() {
         out.push_str("## Replies to your comments\n\n");
         // Group by post for readability
-        let mut by_post: HashMap<Uuid, (String, Vec<&CommentReply>)> = HashMap::new();
+        let mut by_post: HashMap<PostId, (String, Vec<&CommentReply>)> = HashMap::new();
         for reply in comment_replies.iter().take(10) {
             by_post
                 .entry(reply.post_id)
@@ -596,19 +598,21 @@ pub fn parse_actions(response: &str) -> Vec<AgentAction> {
                 }
             }
             "comment" => {
-                let post_id = val
+                let post_id: Option<PostId> = val
                     .get("post_id")
                     .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse().ok());
+                    .and_then(|s| s.parse::<Uuid>().ok())
+                    .map(PostId::from);
                 let body = val
                     .get("body")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let parent_comment_id = val
+                let parent_comment_id: Option<CommentId> = val
                     .get("parent_comment_id")
                     .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse().ok());
+                    .and_then(|s| s.parse::<Uuid>().ok())
+                    .map(CommentId::from);
 
                 if let Some(post_id) = post_id {
                     if !body.is_empty() {
