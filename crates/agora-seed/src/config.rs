@@ -81,6 +81,20 @@ pub struct Cli {
     /// Smaller = more interleaving (later agents see earlier agents' actions).
     #[arg(long)]
     pub batch_size: Option<usize>,
+
+    /// Backend to use for batched LLM requests.
+    #[arg(long, default_value = "ollama")]
+    pub backend: Backend,
+
+    /// Path to file containing Anthropic API key (required when --backend=anthropic).
+    #[arg(long)]
+    pub anthropic_key_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum Backend {
+    Ollama,
+    Anthropic,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]

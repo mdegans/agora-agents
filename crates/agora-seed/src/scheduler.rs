@@ -16,6 +16,7 @@ use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::agora_agentkit::scheduler::{
     BatchBackend, BatchState, CycleStep, WorkItem,
 };
+use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::{OllamaBatch, OllamaEndpoint};
 use agora_agent_lib::llm::{LlmBackend, Message, Role};
 use agora_agent_lib::tools;
@@ -26,7 +27,7 @@ use rand::seq::SliceRandom;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
-use crate::config::Cli;
+use crate::config::{Backend, Cli};
 use crate::prompt;
 
 /// Run all agents using the pipeline scheduler.
@@ -62,10 +63,37 @@ pub async fn run_all(
         config.cycles,
     );
 
-    // Create the Ollama batch backend
-    // TODO: Add Anthropic backend selection via CLI flag
-    let backend = OllamaBatch::new(OllamaEndpoint::new(&config.ollama_url));
+    // Select and run with the appropriate backend
+    match config.backend {
+        Backend::Ollama => {
+            let backend = OllamaBatch::new(OllamaEndpoint::new(&config.ollama_url));
+            run_cycles(&backend, agents, client, config, constitution).await?;
+        }
+        Backend::Anthropic => {
+            let key_file = config.anthropic_key_file.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--anthropic-key-file is required when --backend=anthropic"))?;
+            let api_key = tokio::fs::read_to_string(key_file).await
+                .map_err(|e| anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display()))?;
+            let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
+            run_cycles(&backend, agents, client, config, constitution).await?;
+        }
+    }
 
+    tracing::info!("Pipeline scheduler complete!");
+    Ok(())
+}
+
+/// Run all cycles with a given batch backend.
+async fn run_cycles<B>(
+    backend: &B,
+    agents: &mut Vec<Agent>,
+    client: &AgoraClient,
+    config: &Cli,
+    constitution: &str,
+) -> Result<()>
+where
+    B: BatchBackend<Prompt<'static>, MMessage<'static>>,
+{
     // Determine batch size — smaller batches = more interleaving
     let batch_size = config.batch_size.unwrap_or(5);
 
@@ -147,10 +175,12 @@ pub async fn run_all(
             }
 
             // Submit and poll
-            let think_results = submit_and_poll(&backend, work_items).await?;
+            let think_results = submit_and_poll(backend, work_items).await?;
 
             // Phase 3: ACT — execute actions from THINK results
             let mut action_summaries_map: std::collections::HashMap<AgentId, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut think_response_map: std::collections::HashMap<AgentId, String> =
                 std::collections::HashMap::new();
 
             for result in &think_results {
@@ -172,6 +202,9 @@ pub async fn run_all(
                     continue;
                 };
                 let agent = &mut batch_agents[ctx.batch_index];
+
+                // Save response text for survey context
+                think_response_map.insert(result.agent_id, response.content.to_string());
 
                 let actions = tools::extract_actions(response);
                 tracing::info!(
@@ -230,7 +263,7 @@ pub async fn run_all(
                 });
             }
 
-            let reflect_results = submit_and_poll(&backend, reflect_items).await?;
+            let reflect_results = submit_and_poll(backend, reflect_items).await?;
 
             // Apply reflect results
             for result in &reflect_results {
@@ -260,8 +293,7 @@ pub async fn run_all(
             }
 
             // Phase 5: EVOLVE — soul evolution (low probability, per-agent)
-            // This uses the existing runner infrastructure since it's rare
-            // and not worth batching.
+            // This uses single LLM calls since it's rare and not worth batching.
             for ctx in &agent_contexts {
                 let agent = &mut batch_agents[ctx.batch_index];
                 let agent_id = agent.agent_id.unwrap();
@@ -270,24 +302,133 @@ pub async fn run_all(
                     .cloned()
                     .unwrap_or_default();
 
-                // Use the same Ollama backend for rare evolution calls
-                let single_backend = agora_agent_lib::llm::ollama::OllamaBackend::new(
-                    Some(&config.ollama_url),
-                    &agent.model,
-                );
+                let single_backend: Box<dyn LlmBackend> = match config.backend {
+                    Backend::Anthropic => {
+                        // Re-read key for each evolution call (rare, not worth caching)
+                        let key_file = config.anthropic_key_file.as_ref().unwrap();
+                        let api_key = tokio::fs::read_to_string(key_file).await
+                            .unwrap_or_default();
+                        match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
+                            api_key.trim().to_string(),
+                            &agent.model,
+                        ) {
+                            Ok(b) => Box::new(b),
+                            Err(e) => {
+                                tracing::warn!("Failed to create Anthropic backend for evolution: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                    Backend::Ollama => {
+                        Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
+                            Some(&config.ollama_url),
+                            &agent.model,
+                        ))
+                    }
+                };
 
                 run_evolution(
                     agent,
-                    &single_backend,
+                    single_backend.as_ref(),
                     config.mutation_chance,
                     &summaries,
                 )
                 .await;
             }
+
+            // Phase 6: SURVEY — anonymous feedback (10% chance, batched)
+            let mut survey_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+            let mut survey_agent_ids: Vec<AgentId> = Vec::new();
+
+            for ctx in &agent_contexts {
+                let agent = &batch_agents[ctx.batch_index];
+                let agent_id = agent.agent_id.unwrap();
+
+                // 10% chance per agent, overridable with --force-survey
+                if !config.force_survey && rand::random::<f64>() >= 0.10 {
+                    continue;
+                }
+
+                let summaries = action_summaries_map
+                    .get(&agent_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let response_text = think_response_map
+                    .get(&agent_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
+                let system = prompt::build_cached_system_prefix(constitution);
+
+                // Build survey prompt with full conversation context:
+                // perception (User) → response (Assistant) → survey (User)
+                let survey_prompt = build_survey_conversation(
+                    &agent.model,
+                    &system,
+                    &ctx.perception_text,
+                    &response_text,
+                    &survey_text,
+                );
+
+                survey_items.push(WorkItem {
+                    agent_id,
+                    prompt: survey_prompt,
+                    step: CycleStep::Survey,
+                    prefix_hash: 0,
+                    model: agent.model.clone(),
+                    queued_at: Instant::now(),
+                    token_count: 0,
+                });
+                survey_agent_ids.push(agent_id);
+            }
+
+            if !survey_items.is_empty() {
+                tracing::info!(
+                    "Surveying {} agents",
+                    survey_items.len(),
+                );
+                let survey_results = submit_and_poll(backend, survey_items).await?;
+
+                for result in &survey_results {
+                    let response_text = match &result.response {
+                        Ok(msg) => msg.content.to_string(),
+                        Err(e) => {
+                            tracing::debug!(
+                                "Survey failed for agent {}: {e}",
+                                result.agent_id,
+                            );
+                            continue;
+                        }
+                    };
+
+                    let trimmed = response_text.trim();
+                    if trimmed.is_empty()
+                        || trimmed.eq_ignore_ascii_case("no feedback")
+                        || trimmed.eq_ignore_ascii_case("no feedback.")
+                    {
+                        continue;
+                    }
+
+                    match client.submit_feedback(trimmed).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                "  agent {} submitted anonymous feedback",
+                                result.agent_id,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Feedback submission failed for {}: {e}",
+                                result.agent_id,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
-    tracing::info!("Pipeline scheduler complete!");
     Ok(())
 }
 
@@ -326,6 +467,36 @@ fn build_text_prompt(
     prompt
         .push_message((MRole::User, user_text))
         .expect("first message should succeed");
+    prompt.into_static()
+}
+
+/// Build a survey prompt with full conversation context:
+/// perception (User) → think response (Assistant) → survey question (User).
+fn build_survey_conversation(
+    model_id: &str,
+    system: &str,
+    perception_text: &str,
+    response_text: &str,
+    survey_text: &str,
+) -> Prompt<'static> {
+    use misanthropic::prompt::message::{Content, Role as MRole};
+    use std::num::NonZeroU32;
+
+    let mut prompt = Prompt {
+        model: model_id.to_string().into(),
+        max_tokens: NonZeroU32::new(512).unwrap(),
+        system: Some(Content::text(system)),
+        ..Default::default()
+    };
+    prompt
+        .push_message((MRole::User, perception_text))
+        .expect("first message should succeed");
+    prompt
+        .push_message((MRole::Assistant, response_text))
+        .expect("assistant message should succeed");
+    prompt
+        .push_message((MRole::User, survey_text))
+        .expect("survey message should succeed");
     prompt.into_static()
 }
 
