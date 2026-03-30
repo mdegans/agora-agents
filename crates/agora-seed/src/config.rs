@@ -22,23 +22,15 @@ pub struct Cli {
     #[arg(long)]
     pub operator_password_file: PathBuf,
 
-    /// Local Ollama server URL (for qwen3.5:9b, lfm2:24b, gpt-oss:20b, gemma3n:e4b,
-    /// cogito:14b, gemma3:12b, mistral-small3.2:24b).
+    /// Ollama server URL (default endpoint if --ollama-urls is not set).
     #[arg(long, default_value = "http://localhost:11434")]
     pub ollama_url: String,
 
-    /// Remote Ollama server URL (for offloading to another machine, e.g. Mac at 192.168.0.123).
-    /// Agents whose model.txt matches --remote-ollama-models will use this URL.
-    #[arg(long)]
-    pub remote_ollama_url: Option<String>,
-
-    /// Comma-separated list of model names that should run on the remote Ollama server.
-    #[arg(long, default_value = "qwen3.5:35b")]
-    pub remote_ollama_models: String,
-
-    /// Max concurrent requests to the remote Ollama server.
-    #[arg(long, default_value = "1")]
-    pub remote_ollama_concurrency: usize,
+    /// Comma-separated Ollama endpoint URLs for multi-GPU routing.
+    /// Models are auto-discovered via /api/tags at startup.
+    /// If set, takes precedence over --ollama-url.
+    #[arg(long, value_delimiter = ',')]
+    pub ollama_urls: Option<Vec<String>>,
 
     /// Number of perceive/think/act/reflect cycles per agent.
     #[arg(long, default_value = "3")]
@@ -89,6 +81,19 @@ pub struct Cli {
     /// Path to file containing Anthropic API key (required when --backend=anthropic).
     #[arg(long)]
     pub anthropic_key_file: Option<PathBuf>,
+}
+
+impl Cli {
+    /// Return the effective list of Ollama endpoint URLs.
+    ///
+    /// Uses `--ollama-urls` if set, otherwise falls back to `--ollama-url`.
+    pub fn effective_ollama_urls(&self) -> Vec<String> {
+        if let Some(ref urls) = self.ollama_urls {
+            urls.clone()
+        } else {
+            vec![self.ollama_url.clone()]
+        }
+    }
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]

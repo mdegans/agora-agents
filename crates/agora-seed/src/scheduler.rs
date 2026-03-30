@@ -17,7 +17,7 @@ use agora_agent_lib::agora_agentkit::scheduler::{
     BatchBackend, BatchState, CycleStep, WorkItem,
 };
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
-use agora_agent_lib::batch::ollama::{OllamaBatch, OllamaEndpoint};
+use agora_agent_lib::batch::ollama::{MultiOllamaBatch, OllamaEndpoint};
 use agora_agent_lib::llm::{LlmBackend, Message, Role};
 use agora_agent_lib::tools;
 use anyhow::Result;
@@ -66,8 +66,41 @@ pub async fn run_all(
     // Select and run with the appropriate backend
     match config.backend {
         Backend::Ollama => {
-            let backend = OllamaBatch::new(OllamaEndpoint::new(&config.ollama_url));
-            run_cycles(&backend, agents, client, config, constitution).await?;
+            // Discover models on each endpoint.
+            let http = reqwest::Client::new();
+            let urls = config.effective_ollama_urls();
+            let mut endpoints = Vec::with_capacity(urls.len());
+            for url in &urls {
+                match OllamaEndpoint::discover(&http, url).await {
+                    Ok(ep) => endpoints.push(ep),
+                    Err(e) => {
+                        tracing::error!("Failed to discover models at {url}: {e}");
+                        anyhow::bail!("Cannot reach Ollama endpoint {url}: {e}");
+                    }
+                }
+            }
+
+            // Warn about agents whose model isn't on any endpoint.
+            let all_models: std::collections::HashSet<&str> = endpoints
+                .iter()
+                .flat_map(|ep| ep.models.iter().map(|m| m.as_str()))
+                .collect();
+            let mut missing: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for agent in agents.iter() {
+                if !all_models.contains(agent.model.as_str()) {
+                    *missing.entry(agent.model.as_str()).or_default() += 1;
+                }
+            }
+            for (model, count) in &missing {
+                tracing::warn!(
+                    "Model '{model}' not on any endpoint ({count} agents affected)"
+                );
+            }
+
+            let backend = MultiOllamaBatch::new(endpoints);
+            let ollama_endpoints = backend.endpoints();
+            run_cycles(&backend, agents, client, config, constitution, Some(ollama_endpoints)).await?;
         }
         Backend::Anthropic => {
             let key_file = config.anthropic_key_file.as_ref()
@@ -75,7 +108,7 @@ pub async fn run_all(
             let api_key = tokio::fs::read_to_string(key_file).await
                 .map_err(|e| anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display()))?;
             let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
-            run_cycles(&backend, agents, client, config, constitution).await?;
+            run_cycles(&backend, agents, client, config, constitution, None).await?;
         }
     }
 
@@ -84,12 +117,16 @@ pub async fn run_all(
 }
 
 /// Run all cycles with a given batch backend.
+///
+/// `ollama_endpoints` is provided when running with Ollama so the EVOLVE
+/// phase can route single LLM calls to the correct endpoint per model.
 async fn run_cycles<B>(
     backend: &B,
     agents: &mut Vec<Agent>,
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
+    ollama_endpoints: Option<&[OllamaEndpoint]>,
 ) -> Result<()>
 where
     B: BatchBackend<Prompt<'static>, MMessage<'static>>,
@@ -320,8 +357,16 @@ where
                         }
                     }
                     Backend::Ollama => {
+                        // Route to the endpoint that has this agent's model.
+                        let url = ollama_endpoints
+                            .and_then(|eps| {
+                                eps.iter()
+                                    .find(|ep| ep.models.contains(&agent.model))
+                                    .map(|ep| ep.url.as_str())
+                            })
+                            .unwrap_or(&config.ollama_url);
                         Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
-                            Some(&config.ollama_url),
+                            Some(url),
                             &agent.model,
                         ))
                     }
