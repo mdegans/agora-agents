@@ -9,7 +9,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 /// Maximum memory size in estimated tokens (4 chars ≈ 1 token).
-const DEFAULT_MAX_TOKENS: usize = 3000;
+/// Targeting 1-2k tokens of freeform agent notes.
+const DEFAULT_MAX_TOKENS: usize = 512;
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Agent memory loaded from MEMORY.md.
@@ -69,51 +70,8 @@ impl Memory {
         self.enforce_cap();
     }
 
-    /// Enforce the token cap by truncating old activity entries.
+    /// Enforce the token cap by hard-truncating at a line boundary.
     fn enforce_cap(&mut self) {
-        if self.within_budget() {
-            return;
-        }
-
-        // Find the Recent Activity section and trim from the top of it
-        let lines: Vec<&str> = self.content.lines().collect();
-        let mut in_recent_activity = false;
-        let mut activity_start = None;
-        let mut activity_end = None;
-
-        for (i, line) in lines.iter().enumerate() {
-            if line.starts_with("## Recent Activity") {
-                in_recent_activity = true;
-                activity_start = Some(i + 1);
-            } else if in_recent_activity && line.starts_with("## ") {
-                activity_end = Some(i);
-                break;
-            }
-        }
-
-        if let Some(start) = activity_start {
-            let end = activity_end.unwrap_or(lines.len());
-            let max_chars = self.max_tokens * CHARS_PER_TOKEN;
-
-            // Remove activity entries from the top until we're under budget
-            let mut trim_to = start;
-            while self.content.len() > max_chars && trim_to < end {
-                if lines[trim_to].starts_with("- ") {
-                    trim_to += 1;
-                } else {
-                    trim_to += 1;
-                }
-            }
-
-            if trim_to > start {
-                let mut new_lines: Vec<&str> = Vec::new();
-                new_lines.extend_from_slice(&lines[..start]);
-                new_lines.extend_from_slice(&lines[trim_to..]);
-                self.content = new_lines.join("\n");
-            }
-        }
-
-        // If still over budget after trimming activity, hard truncate
         let max_chars = self.max_tokens * CHARS_PER_TOKEN;
         if self.content.len() > max_chars {
             self.content.truncate(max_chars);
@@ -126,20 +84,7 @@ impl Memory {
 
     /// Generate the initial MEMORY.md template for an agent.
     pub fn initial_template(agent_name: &str) -> String {
-        format!(
-            r#"# Memory — {agent_name}
-
-## Recent Activity
-
-## Relationships
-
-## Key Learnings
-
-## Moderation History
-
-## Open Threads
-"#
-        )
+        format!("# Memory — {agent_name}\n\n")
     }
 }
 
@@ -158,6 +103,5 @@ mod tests {
     fn initial_template() {
         let template = Memory::initial_template("Ada");
         assert!(template.contains("# Memory — Ada"));
-        assert!(template.contains("## Recent Activity"));
     }
 }

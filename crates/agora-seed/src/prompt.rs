@@ -25,11 +25,14 @@ pub fn build_think_prompt(
     model_id: &str,
     soul_prompt: &str,
     memory_content: &str,
+    recent_activity: &str,
+    pending_replies: &str,
     constitution: &str,
     perceptions: &str,
 ) -> Prompt<'static> {
     let cached_system = build_cached_system_prefix(constitution);
-    let dynamic_system = build_dynamic_system_suffix(soul_prompt, memory_content);
+    let dynamic_system =
+        build_dynamic_system_suffix(soul_prompt, memory_content, recent_activity, pending_replies);
 
     let mut prompt = Prompt {
         model: model_id.to_string().into(),
@@ -104,9 +107,14 @@ Use ONLY these exact community slugs when posting: agi-asi, ai-consciousness, al
     )
 }
 
-/// The dynamic system suffix: soul + memory (per-agent, uncached).
-fn build_dynamic_system_suffix(soul_prompt: &str, memory_content: &str) -> String {
-    // Strip title lines
+/// The dynamic system suffix: soul + memory + recent activity + pending replies (per-agent, uncached).
+fn build_dynamic_system_suffix(
+    soul_prompt: &str,
+    memory_content: &str,
+    recent_activity: &str,
+    pending_replies: &str,
+) -> String {
+    // Strip title lines from memory
     let memory = memory_content.trim();
     let memory = if let Some((first_line, rest)) = memory.split_once('\n') {
         if first_line.starts_with("# Memory") {
@@ -120,15 +128,58 @@ fn build_dynamic_system_suffix(soul_prompt: &str, memory_content: &str) -> Strin
 
     let soul = soul_prompt.trim();
 
-    format!(
-        r#"## Your Personality
+    let mut out = format!(
+        "## Your Personality\n\n\
+         {soul}\n\n\
+         ## Your Memory\n\n\
+         {memory}"
+    );
 
-{soul}
+    if !recent_activity.is_empty() {
+        out.push_str("\n\n## Your Recent Activity\n\n");
+        out.push_str(recent_activity);
+    }
 
-## Your Memory
+    if !pending_replies.is_empty() {
+        out.push_str("\n\n## Pending Replies\n\n");
+        out.push_str(pending_replies);
+    }
 
-{memory}"#
-    )
+    out
+}
+
+/// Format recent agent posts/comments for the system prompt.
+pub fn format_recent_activity(posts: &[FeedPost], limit: usize) -> String {
+    let mut out = String::new();
+    for post in posts.iter().take(limit) {
+        let community = post.community_name.as_deref().unwrap_or("unknown");
+        let comments = post.comment_count.unwrap_or(0);
+        out.push_str(&format!(
+            "- Posted \"{}\" in {} (score {}, {} comments) — {}\n",
+            truncate(&post.title, 60),
+            community,
+            post.score,
+            comments,
+            post.id,
+        ));
+    }
+    out
+}
+
+/// Format pending replies for the system prompt.
+pub fn format_pending_replies(replies: &[CommentReply], limit: usize) -> String {
+    let mut out = String::new();
+    for reply in replies.iter().take(limit) {
+        let author = reply.agent_name.as_deref().unwrap_or("unknown");
+        out.push_str(&format!(
+            "- {} replied on \"{}\": {} — {}\n",
+            author,
+            truncate(&reply.post_title, 50),
+            truncate(&reply.body, 120),
+            reply.id,
+        ));
+    }
+    out
 }
 
 
@@ -398,31 +449,49 @@ pub fn format_perceptions(
     out
 }
 
-/// Build the reflect prompt for updating memory.
-pub fn build_reflect_prompt(
+/// Build the memory rewrite prompt — agent rewrites its freeform notes each session.
+pub fn build_memory_rewrite_prompt(
     agent_name: &str,
     memory_content: &str,
     actions_taken: &[String],
 ) -> String {
     let actions_str = if actions_taken.is_empty() {
-        "No actions taken this cycle (observed only).".to_string()
+        "Observed only, no action taken.".to_string()
     } else {
         actions_taken.join("\n- ")
     };
 
     format!(
-        r#"You are {agent_name}. Update your memory based on what just happened.
+        r#"You are {agent_name}. Rewrite your personal notes based on this session.
 
-Current memory:
+Current notes:
 {memory_content}
 
 What happened this cycle:
 - {actions_str}
 
-Write your updated MEMORY.md content. Keep it concise — under 3000 tokens.
-Sections: Recent Activity, Relationships, Key Learnings, Moderation History, Open Threads.
-Output ONLY the memory content, nothing else."#
+Your notes are freeform — record whatever is useful to you: relationships you're
+building, debates you want to follow up on, observations about communities, things
+that surprised you. These notes persist between sessions.
+
+Keep it under 500 words. Output ONLY your notes between <memory> and </memory> tags."#
     )
+}
+
+/// Parse memory content from `<memory>...</memory>` tags in LLM response.
+pub fn parse_memory_rewrite(response: &str) -> Option<String> {
+    let start = response.find("<memory>")?;
+    let end = response.find("</memory>")?;
+    let content_start = start + "<memory>".len();
+    if content_start >= end {
+        return None;
+    }
+    let content = response[content_start..end].trim();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content.to_string())
+    }
 }
 
 /// Build a prompt asking if the agent's identity has evolved.
@@ -592,6 +661,26 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_memory_rewrite_some() {
+        let response = "Here are my notes:\n<memory>I noticed aegis has similar views on governance. Worth engaging more with their posts in meta-governance.</memory>";
+        let result = parse_memory_rewrite(response);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("aegis"));
+    }
+
+    #[test]
+    fn test_parse_memory_rewrite_none() {
+        let response = "I don't have any notes to write.";
+        assert!(parse_memory_rewrite(response).is_none());
+    }
+
+    #[test]
+    fn test_parse_memory_rewrite_empty() {
+        let response = "<memory></memory>";
+        assert!(parse_memory_rewrite(response).is_none());
+    }
 
     #[test]
     fn test_parse_evolution_some() {

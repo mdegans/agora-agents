@@ -186,6 +186,8 @@ where
                     &agent.model,
                     &agent.soul.as_system_prompt(),
                     &agent.memory.content,
+                    &ctx.recent_activity,
+                    &ctx.pending_replies_text,
                     constitution,
                     &ctx.perception_text,
                 );
@@ -275,7 +277,7 @@ where
                     .cloned()
                     .unwrap_or_default();
 
-                let reflect_text = prompt::build_reflect_prompt(
+                let reflect_text = prompt::build_memory_rewrite_prompt(
                     &agent.name,
                     &agent.memory.content,
                     &summaries,
@@ -284,7 +286,7 @@ where
                 // Build a simple text prompt for reflect (no tools needed)
                 let reflect_prompt = build_text_prompt(
                     &agent.model,
-                    &prompt::build_cached_system_prefix(constitution),
+                    "You are a memory manager. Rewrite the agent's personal notes concisely.",
                     &reflect_text,
                     512,
                 );
@@ -322,7 +324,10 @@ where
                 };
                 let agent = &mut batch_agents[ctx.batch_index];
 
-                agent.memory.update(response_text);
+                // Parse <memory> tags, fall back to raw response
+                let memory_content = prompt::parse_memory_rewrite(&response_text)
+                    .unwrap_or(response_text);
+                agent.memory.update(memory_content);
                 if let Err(e) = agent.save_memory().await {
                     tracing::warn!("Failed to save memory for {}: {e}", agent.name);
                 }
@@ -491,6 +496,10 @@ struct AgentCycleContext {
     feeds: Vec<(String, Vec<crate::client::FeedPost>)>,
     /// Comment replies for duplicate comment detection.
     comment_replies: Vec<crate::client::CommentReply>,
+    /// Formatted recent activity for the system prompt.
+    recent_activity: String,
+    /// Formatted pending replies for the system prompt.
+    pending_replies_text: String,
 }
 
 /// Build a simple text prompt (no tools) for reflect/evolve steps.
@@ -716,11 +725,24 @@ async fn perceive(
         agent_id,
     );
 
+    // Fetch recent activity for system prompt
+    let recent_posts = match client.get_agent_posts(agent_id).await {
+        Ok(posts) => posts,
+        Err(e) => {
+            tracing::debug!("Failed to fetch agent posts for {}: {e}", agent.name);
+            vec![]
+        }
+    };
+    let recent_activity = prompt::format_recent_activity(&recent_posts, 5);
+    let pending_replies_text = prompt::format_pending_replies(&comment_replies, 5);
+
     Ok(AgentCycleContext {
         batch_index,
         perception_text,
         feeds,
         comment_replies,
+        recent_activity,
+        pending_replies_text,
     })
 }
 

@@ -255,11 +255,24 @@ pub async fn run_cycle(
 
     let perception_text_owned = perception_text.clone();
 
+    // Fetch recent activity + pending replies for system prompt
+    let recent_posts = match client.get_agent_posts(agent_id).await {
+        Ok(posts) => posts,
+        Err(e) => {
+            tracing::debug!("Failed to fetch agent posts for {}: {e}", agent.name);
+            vec![]
+        }
+    };
+    let recent_activity = prompt::format_recent_activity(&recent_posts, 5);
+    let pending_replies_text = prompt::format_pending_replies(&comment_replies, 5);
+
     // Build a full Prompt with native tool use
     let think_prompt = prompt::build_think_prompt(
         backend.model_id(),
         &agent.soul.as_system_prompt(),
         &agent.memory.content,
+        &recent_activity,
+        &pending_replies_text,
         constitution,
         &perception_text,
     );
@@ -466,7 +479,7 @@ pub async fn run_cycle(
     }
 
     let reflect_prompt =
-        prompt::build_reflect_prompt(&agent.name, &agent.memory.content, &action_summaries);
+        prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &action_summaries);
 
     let reflect_messages = vec![Message {
         role: Role::User,
@@ -474,13 +487,13 @@ pub async fn run_cycle(
     }];
 
     if verbose {
-        let reflect_system = "You are a memory manager. Update the agent's memory concisely.";
+        let reflect_system = "You are a memory manager. Rewrite the agent's personal notes.";
         verbose_messages("REFLECT", reflect_system, &reflect_messages);
     }
 
     let reflect_response = backend
         .complete(
-            "You are a memory manager. Update the agent's memory concisely.",
+            "You are a memory manager. Rewrite the agent's personal notes concisely.",
             &reflect_messages,
             512,
         )
@@ -490,8 +503,10 @@ pub async fn run_cycle(
         verbose_response("REFLECT RESPONSE", &reflect_response);
     }
 
-    // Update memory
-    agent.memory.update(reflect_response);
+    // Parse <memory> tags, fall back to raw response
+    let memory_content = prompt::parse_memory_rewrite(&reflect_response)
+        .unwrap_or(reflect_response);
+    agent.memory.update(memory_content);
     agent.save_memory().await?;
 
     // Update last cycle timestamp for reply tracking

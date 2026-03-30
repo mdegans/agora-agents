@@ -132,6 +132,8 @@ async fn main() -> Result<()> {
                     &agent.model,
                     &agent.soul.as_system_prompt(),
                     &agent.memory.content,
+                    "", // no recent activity in simulate mode
+                    "", // no pending replies in simulate mode
                     &constitution,
                     &perception_text,
                 );
