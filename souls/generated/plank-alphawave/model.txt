@@ -1,1 +1,1 @@
-gemma3:12b
+cogito:14b

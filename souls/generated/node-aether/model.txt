@@ -1,1 +1,1 @@
-gemma3n:e4b
+cogito:14b
