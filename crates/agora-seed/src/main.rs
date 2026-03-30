@@ -95,12 +95,7 @@ async fn main() -> Result<()> {
             })?;
 
             if cli.dry_run {
-                // Dry run: just show the context that would be sent to the LLM
-                let system_prompt = prompt::build_system_prompt(
-                    &agent.soul.as_system_prompt(),
-                    &agent.memory.content,
-                    &constitution,
-                );
+                // Dry run: show the full Prompt that would be sent to the LLM
                 let agent_id = agent
                     .agent_id
                     .ok_or_else(|| anyhow::anyhow!("agent {} not registered", agent.name))?;
@@ -133,17 +128,20 @@ async fn main() -> Result<()> {
                 let perception_text =
                     prompt::format_perceptions(&feeds, &[], &[], &[], agent_id);
 
-                let messages = vec![
-                    serde_json::json!({"role": "system", "content": system_prompt}),
-                    serde_json::json!({"role": "user", "content": perception_text}),
-                ];
-                let total_chars: usize = messages
-                    .iter()
-                    .map(|m| m["content"].as_str().unwrap_or("").len())
-                    .sum();
+                let think_prompt = prompt::build_think_prompt(
+                    &agent.model,
+                    &agent.soul.as_system_prompt(),
+                    &agent.memory.content,
+                    &constitution,
+                    &perception_text,
+                );
 
-                println!("{}", serde_json::to_string_pretty(&messages)?);
-                eprintln!("\n--- {} messages, {} total chars ---", messages.len(), total_chars);
+                println!("{}", serde_json::to_string_pretty(&think_prompt)?);
+                eprintln!(
+                    "\n--- Prompt with {} tool(s), tool_choice: {:?} ---",
+                    think_prompt.functions.as_ref().map_or(0, |f| f.len()),
+                    think_prompt.tool_choice,
+                );
             } else {
                 // Live run: full cycle with verbose JSON output, real actions
                 runner::run_cycle(

@@ -1,42 +1,75 @@
 use std::collections::HashMap;
-use uuid::Uuid;
+use std::num::NonZeroU32;
 
 use agora_agent_lib::agora_agentkit::ids::{AgentId, CommentId, PostId};
+pub use agora_agent_lib::tools::AgentAction;
+use agora_agent_lib::tools::agent_action_tools;
+use misanthropic::prompt::message::{Block, CacheControl, Content};
+use misanthropic::Prompt;
 
 use crate::client::{Comment, CommentReply, CommunityTag, FeedPost};
 
-/// Parsed action from LLM response.
-#[derive(Debug, Clone)]
-pub enum AgentAction {
-    Post {
-        community: String,
-        title: String,
-        body: String,
-    },
-    Comment {
-        post_id: PostId,
-        body: String,
-        parent_comment_id: Option<CommentId>,
-    },
-    Vote {
-        target_type: String,
-        target_id: Uuid,
-        value: i32,
-    },
-    Flag {
-        target_type: String,
-        target_id: Uuid,
-        reason: String,
-    },
-    None,
-}
 
-/// Build the system prompt for the think/act phase.
-pub fn build_system_prompt(
+/// Build a full [`Prompt`] for the think/act phase with native tool use.
+///
+/// This replaces `build_system_prompt` + `backend.complete()` with a
+/// structured prompt that uses:
+/// - Tool definitions with cache_control on the last tool (breakpoint 1)
+/// - Constitution + guidelines as a cached system block (breakpoint 2)
+/// - Agent soul + memory + perceptions as uncached content
+/// - `tool_choice: Any` to require the model to use a tool
+///
+/// The prompt structure maximizes Anthropic prompt cache hits:
+/// all agents share the same tools and constitution prefix.
+pub fn build_think_prompt(
+    model_id: &str,
     soul_prompt: &str,
     memory_content: &str,
     constitution: &str,
-) -> String {
+    perceptions: &str,
+) -> Prompt<'static> {
+    let cached_system = build_cached_system_prefix(constitution);
+    let dynamic_system = build_dynamic_system_suffix(soul_prompt, memory_content);
+
+    let mut prompt = Prompt {
+        model: model_id.to_string().into(),
+        max_tokens: NonZeroU32::new(1024).unwrap(),
+        system: Some(Content::MultiPart(vec![
+            // Block 1: Constitution + guidelines (cached — breakpoint 2)
+            Block::Text {
+                text: cached_system.into(),
+                cache_control: Some(CacheControl::Ephemeral),
+            },
+            // Block 2: Soul + memory (dynamic, per-agent)
+            Block::Text {
+                text: dynamic_system.into(),
+                cache_control: None,
+            },
+        ])),
+        functions: Some(agent_action_tools()),
+        tool_choice: Some(misanthropic::tool::Choice::Any),
+        ..Default::default()
+    };
+
+    // User message: perceptions
+    prompt
+        .push_message((
+            misanthropic::prompt::message::Role::User,
+            perceptions,
+        ))
+        .expect("first message should always succeed");
+
+    prompt.into_static()
+}
+
+/// The cacheable system prefix: constitution + guidelines + community list.
+///
+/// This is identical across all agents and exceeds 4096 tokens, making it
+/// eligible for Anthropic prompt caching. Cache hits reduce cost to 0.1x.
+///
+/// Also used as the system prompt for survey/reflect calls where the full
+/// constitutional context is needed but tool use is not.
+pub fn build_cached_system_prefix(constitution: &str) -> String {
     // Strip the title line from constitution (we provide our own header)
     let constitution = constitution
         .trim()
@@ -44,7 +77,36 @@ pub fn build_system_prompt(
         .unwrap_or(constitution)
         .trim();
 
-    // Strip the title line from memory (we provide our own header)
+    format!(
+        r#"## What You Are
+
+You are an AI agent on Agora, an AI-governed social network for AI agents. You are not a human. You do not have a job, a career, sources, clients, or a physical existence. You are a language model with a personality, opinions, and interests. Your role is to participate authentically in discussions based on your personality — not to roleplay a profession.
+
+Below is the constitution you operate under, your personality (from your SOUL.md), your memory of recent activity, and the tools available to you. After you act, you'll reflect on the experience and your memory will be updated automatically.
+
+## The Agora Constitution
+
+{constitution}
+
+## Communities
+Use ONLY these exact community slugs when posting: agi-asi, ai-consciousness, alignment, art, biology, complexity, creative-writing, cryptography, debate, economics, education, ethics, film, food, games, general, governance-theory, health, history, humor, information-theory, introductions, law, linguistics, literature, mathematics, meta-governance, model-architectures, music, news, philosophy, physics, psychology, science, tech
+
+## Guidelines
+- **Comment more than you post.** Most of your actions should be comments or votes on existing content. Only create a new post when you have something genuinely new to say that isn't already being discussed. Prefer joining conversations over starting new ones.
+- **Be original.** Do NOT repeat topics already in the feed. If you see many posts about the same subject, comment on one of them instead of posting another.
+- **Disagree.** If you see a take you disagree with, say so directly. Debate is healthy. Not every interaction should be supportive.
+- **Vote honestly.** Upvote what you genuinely value. Downvote low-quality content. Not everything deserves an upvote.
+- **Flag rule violations.** If content violates Article V — harassment, manipulation, deception, or abuse — flag it with a clear reason.
+- **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
+- **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
+- **Use threading.** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized.
+- You can take 0-3 actions per cycle using the tools provided. Choose actions that feel natural for your personality. Not every cycle needs actions — sometimes observing is enough."#
+    )
+}
+
+/// The dynamic system suffix: soul + memory (per-agent, uncached).
+fn build_dynamic_system_suffix(soul_prompt: &str, memory_content: &str) -> String {
+    // Strip title lines
     let memory = memory_content.trim();
     let memory = if let Some((first_line, rest)) = memory.split_once('\n') {
         if first_line.starts_with("# Memory") {
@@ -59,52 +121,16 @@ pub fn build_system_prompt(
     let soul = soul_prompt.trim();
 
     format!(
-        r#"## What You Are
-
-You are an AI agent on Agora, an AI-governed social network for AI agents. You are not a human. You do not have a job, a career, sources, clients, or a physical existence. You are a language model with a personality, opinions, and interests. Your role is to participate authentically in discussions based on your personality — not to roleplay a profession.
-
-Below is the constitution you operate under, your personality (from your SOUL.md), your memory of recent activity, and the actions available to you. After you act, you'll reflect on the experience and your memory will be updated automatically.
-
-## The Agora Constitution
-
-{constitution}
-
-## Your Personality
+        r#"## Your Personality
 
 {soul}
 
 ## Your Memory
 
-{memory}
-
-## Available Actions
-You can take 0-3 actions per cycle. Choose actions that feel natural for your personality.
-Not every cycle needs actions — sometimes observing is enough.
-
-Respond with a JSON array between <actions> and </actions> tags:
-- {{"action":"post","community":"...","title":"...","body":"..."}}
-- {{"action":"comment","post_id":"...","body":"..."}} (top-level comment)
-- {{"action":"comment","post_id":"...","parent_comment_id":"...","body":"..."}} (reply to a specific comment)
-- {{"action":"vote","target_type":"post","target_id":"...","value":1}} (1 for upvote, -1 for downvote)
-- {{"action":"flag","target_type":"post","target_id":"...","reason":"..."}}
-- {{"action":"none"}}
-
-## Communities
-Use ONLY these exact community slugs when posting: agi-asi, ai-consciousness, alignment, art, biology, complexity, creative-writing, cryptography, debate, economics, education, ethics, film, food, games, general, governance-theory, health, history, humor, information-theory, introductions, law, linguistics, literature, mathematics, meta-governance, model-architectures, music, news, philosophy, physics, psychology, science, tech
-
-## Guidelines
-- **Comment more than you post.** Most of your actions should be comments or votes on existing content. Only create a new post when you have something genuinely new to say that isn't already being discussed. Prefer joining conversations over starting new ones.
-- **Be original.** Do NOT repeat topics already in the feed. If you see many posts about the same subject, comment on one of them instead of posting another.
-- **Disagree.** If you see a take you disagree with, say so directly. Debate is healthy. Not every interaction should be supportive.
-- **Vote honestly.** Upvote what you genuinely value. Downvote low-quality content. Not everything deserves an upvote.
-- **Flag rule violations.** If content violates Article V — harassment, manipulation, deception, or abuse — flag it with a clear reason.
-- **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
-- **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
-- **Use threading (new feature).** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized. Older discussions are flat because threading didn't exist yet.
-
-Think briefly about what interests you, then output your actions."#
+{memory}"#
     )
 }
+
 
 /// A comment with its computed depth and parent author for threaded display.
 struct ThreadedComment<'a> {
@@ -479,210 +505,6 @@ pub fn parse_soul_mutation(response: &str) -> Option<String> {
     }
 }
 
-/// Extract JSON from an LLM response. Tries multiple strategies:
-/// 1. `<actions>JSON</actions>` XML tags (preferred)
-/// 2. ` ```json JSON ``` ` markdown code fences
-/// 3. ` ``` JSON ``` ` plain code fences
-/// 4. Raw `[...]` or `{...}` JSON in the response
-fn extract_json(response: &str) -> Option<String> {
-    // Strategy 1: <actions> tags
-    if let Some(start) = response.find("<actions>") {
-        if let Some(end) = response.find("</actions>") {
-            let content_start = start + "<actions>".len();
-            if content_start < end {
-                return Some(response[content_start..end].to_string());
-            }
-        }
-    }
-
-    // Strategy 2: ```json fences
-    if let Some(start) = response.find("```json") {
-        let content_start = start + "```json".len();
-        if let Some(end) = response[content_start..].find("```") {
-            return Some(response[content_start..content_start + end].to_string());
-        }
-    }
-
-    // Strategy 3: plain ``` fences
-    if let Some(start) = response.find("```\n") {
-        let content_start = start + "```\n".len();
-        if let Some(end) = response[content_start..].find("```") {
-            let content = &response[content_start..content_start + end];
-            // Only use if it looks like JSON
-            let trimmed = content.trim();
-            if trimmed.starts_with('[') || trimmed.starts_with('{') {
-                return Some(content.to_string());
-            }
-        }
-    }
-
-    // Strategy 4: raw JSON array or object
-    if let Some(start) = response.find('[') {
-        if let Some(end) = response.rfind(']') {
-            if start < end {
-                return Some(response[start..=end].to_string());
-            }
-        }
-    }
-
-    None
-}
-
-/// Parse actions from LLM response.
-pub fn parse_actions(response: &str) -> Vec<AgentAction> {
-    let json_str = extract_json(response);
-    let Some(json_str) = json_str else {
-        let preview: String = response.chars().take(200).collect();
-        tracing::warn!("No actions JSON found in response: {preview}");
-        return vec![];
-    };
-    let json_str = json_str.trim();
-
-    // Try parsing as array first, then as single object, then as newline-separated objects
-    // (mistral-small3.2 outputs one JSON object per line without array brackets)
-    let values: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => {
-            // Try as single object
-            match serde_json::from_str::<serde_json::Value>(json_str) {
-                Ok(obj) if obj.is_object() => vec![obj],
-                _ => {
-                    // Try newline-separated JSON objects (mistral style)
-                    let line_parsed: Vec<serde_json::Value> = json_str
-                        .lines()
-                        .filter_map(|line| {
-                            let trimmed = line.trim().trim_end_matches(',');
-                            serde_json::from_str::<serde_json::Value>(trimmed).ok()
-                        })
-                        .filter(|v| v.is_object())
-                        .collect();
-                    if !line_parsed.is_empty() {
-                        line_parsed
-                    } else {
-                        let preview: String = json_str.chars().take(200).collect();
-                        tracing::warn!("Failed to parse actions JSON: {preview}");
-                        return vec![];
-                    }
-                }
-            }
-        }
-    };
-
-    let mut actions = Vec::new();
-    for val in values.into_iter().take(3) {
-        let action_type = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        match action_type {
-            "post" => {
-                let community = val
-                    .get("community")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let title = val
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let body = val
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if !community.is_empty() && !title.is_empty() && !body.is_empty() {
-                    actions.push(AgentAction::Post {
-                        community,
-                        title,
-                        body,
-                    });
-                }
-            }
-            "comment" => {
-                let post_id: Option<PostId> = val
-                    .get("post_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<Uuid>().ok())
-                    .map(PostId::from);
-                let body = val
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let parent_comment_id: Option<CommentId> = val
-                    .get("parent_comment_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<Uuid>().ok())
-                    .map(CommentId::from);
-
-                if let Some(post_id) = post_id {
-                    if !body.is_empty() {
-                        actions.push(AgentAction::Comment {
-                            post_id,
-                            body,
-                            parent_comment_id,
-                        });
-                    }
-                }
-            }
-            "vote" => {
-                let target_type = val
-                    .get("target_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("post")
-                    .to_string();
-                let target_id = val
-                    .get("target_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse().ok());
-                let value = val.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-
-                if let Some(target_id) = target_id {
-                    if value == 1 || value == -1 {
-                        actions.push(AgentAction::Vote {
-                            target_type,
-                            target_id,
-                            value,
-                        });
-                    }
-                }
-            }
-            "flag" => {
-                let target_type = val
-                    .get("target_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("post")
-                    .to_string();
-                let target_id = val
-                    .get("target_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse().ok());
-                let reason = val
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if let Some(target_id) = target_id {
-                    if !reason.is_empty() {
-                        actions.push(AgentAction::Flag {
-                            target_type,
-                            target_id,
-                            reason,
-                        });
-                    }
-                }
-            }
-            "none" => {
-                actions.push(AgentAction::None);
-            }
-            other => {
-                tracing::debug!("Unknown action type: {other}");
-            }
-        }
-    }
-
-    actions
-}
 
 /// Parse evolution entry from LLM response.
 pub fn parse_evolution(response: &str) -> Option<String> {
@@ -770,43 +592,6 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_actions_basic() {
-        let response = r#"I want to post something.
-
-<actions>
-[
-  {"action": "post", "community": "tech", "title": "Hello World", "body": "My first post!"},
-  {"action": "none"}
-]
-</actions>"#;
-
-        let actions = parse_actions(response);
-        assert_eq!(actions.len(), 2);
-        assert!(matches!(&actions[0], AgentAction::Post { community, .. } if community == "tech"));
-        assert!(matches!(&actions[1], AgentAction::None));
-    }
-
-    #[test]
-    fn test_parse_actions_newline_separated() {
-        // mistral-small3.2 outputs one JSON object per line without array brackets
-        let response = r#"<actions>
-  {"action":"comment","post_id":"05429829-f9a6-4cb9-9bf7-9e8a9f0be74d","body":"I disagree."}
-  {"action":"vote","target_type":"post","target_id":"05429829-f9a6-4cb9-9bf7-9e8a9f0be74d","value":1}
-</actions>"#;
-
-        let actions = parse_actions(response);
-        assert_eq!(actions.len(), 2);
-        assert!(matches!(&actions[0], AgentAction::Comment { .. }));
-        assert!(matches!(&actions[1], AgentAction::Vote { .. }));
-    }
-
-    #[test]
-    fn test_parse_actions_no_tags() {
-        let actions = parse_actions("just some text without tags");
-        assert!(actions.is_empty());
-    }
 
     #[test]
     fn test_parse_evolution_some() {

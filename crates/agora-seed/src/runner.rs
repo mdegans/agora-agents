@@ -1,4 +1,5 @@
-use agora_agent_lib::llm::{LlmBackend, Message, Role};
+use agora_agent_lib::llm::{LlmBackend, MMessage, Message, Role};
+use agora_agent_lib::tools;
 use anyhow::Result;
 use rand::seq::SliceRandom;
 
@@ -242,8 +243,6 @@ pub async fn run_cycle(
     }
 
     // === THINK + ACT ===
-    let system_prompt =
-        prompt::build_system_prompt(&agent.soul.as_system_prompt(), &agent.memory.content, constitution);
     let perception_text =
         prompt::format_perceptions(&feeds, &detailed_posts, &replies, &comment_replies, agent_id);
 
@@ -255,23 +254,36 @@ pub async fn run_cycle(
     );
 
     let perception_text_owned = perception_text.clone();
-    let messages = vec![Message {
-        role: Role::User,
-        content: perception_text,
-    }];
+
+    // Build a full Prompt with native tool use
+    let think_prompt = prompt::build_think_prompt(
+        backend.model_id(),
+        &agent.soul.as_system_prompt(),
+        &agent.memory.content,
+        constitution,
+        &perception_text,
+    );
 
     if verbose {
-        verbose_messages("THINK", &system_prompt, &messages);
+        // Show the prompt as JSON for debugging
+        eprintln!("\n=== THINK (native tool use) ===");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&think_prompt).unwrap_or_else(|_| "serialization error".into())
+        );
     }
 
-    let response = backend.complete(&system_prompt, &messages, 1024).await?;
-    let response_owned = response.clone();
+    let response_message: MMessage<'static> = backend.send(&think_prompt).await?;
+
+    // Extract text content for logging and survey context
+    let response_text = response_message.content.to_string();
 
     if verbose {
-        verbose_response("THINK RESPONSE", &response);
+        verbose_response("THINK RESPONSE", &response_text);
     }
 
-    let actions = prompt::parse_actions(&response);
+    // Extract typed actions from tool calls
+    let actions = tools::extract_actions(&response_message);
 
     if verbose {
         let action_strs: Vec<String> = actions.iter().map(|a| format!("{:?}", a)).collect();
@@ -628,7 +640,10 @@ pub async fn run_cycle(
     // === ANONYMOUS FEEDBACK SURVEY (10% chance, independent of soul evolution) ===
     if force_survey || rand::random::<f64>() < 0.10 {
         let survey_prompt = prompt::build_survey_prompt(&agent.name, &action_summaries);
-        // Reuse full context so the agent remembers its cycle
+        // Reuse full context so the agent remembers its cycle.
+        // Survey uses the simple complete() path (no tool use needed)
+        // but shares the cached system prefix for context.
+        let survey_system = prompt::build_cached_system_prefix(constitution);
         let survey_messages = vec![
             Message {
                 role: Role::User,
@@ -636,7 +651,7 @@ pub async fn run_cycle(
             },
             Message {
                 role: Role::Assistant,
-                content: response_owned.clone(),
+                content: response_text.clone(),
             },
             Message {
                 role: Role::User,
@@ -651,7 +666,7 @@ pub async fn run_cycle(
 
         match backend
             .complete(
-                &system_prompt,
+                &survey_system,
                 &survey_messages,
                 512,
             )

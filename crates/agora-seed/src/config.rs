@@ -76,22 +76,11 @@ pub struct Cli {
     /// Force the feedback survey to run (overrides 10% random chance).
     #[arg(long)]
     pub force_survey: bool,
-}
 
-impl Cli {
-    /// Returns the set of model names that should use the remote Ollama URL.
-    pub fn remote_models(&self) -> Vec<String> {
-        self.remote_ollama_models
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    }
-
-    /// Check if a model should run on the remote Ollama server.
-    pub fn is_remote_model(&self, model: &str) -> bool {
-        self.remote_ollama_url.is_some() && self.remote_models().iter().any(|m| m == model)
-    }
+    /// Number of agents per batch in the pipeline scheduler.
+    /// Smaller = more interleaving (later agents see earlier agents' actions).
+    #[arg(long)]
+    pub batch_size: Option<usize>,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
