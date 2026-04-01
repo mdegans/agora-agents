@@ -18,6 +18,7 @@ use agora_agent_lib::agora_agentkit::scheduler::{
     BatchBackend, BatchState, CycleStep, WorkItem,
 };
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
+use agora_agent_lib::batch::hybrid::HybridBatch;
 use agora_agent_lib::batch::ollama::{MultiOllamaBatch, OllamaEndpoint};
 use agora_agent_lib::llm::{LlmBackend, Message, Role};
 use agora_agent_lib::tools;
@@ -154,27 +155,51 @@ pub async fn run_all(
                 }
             }
 
-            // Warn about agents whose model isn't on any endpoint.
-            let all_models: std::collections::HashSet<&str> = endpoints
+            // Collect all models available on Ollama.
+            let ollama_models: std::collections::HashSet<String> = endpoints
                 .iter()
-                .flat_map(|ep| ep.models.iter().map(|m| m.as_str()))
+                .flat_map(|ep| ep.models.iter().cloned())
                 .collect();
+
+            // Find agents whose model isn't on any Ollama endpoint.
             let mut missing: std::collections::HashMap<&str, usize> =
                 std::collections::HashMap::new();
             for agent in agents.iter() {
-                if !all_models.contains(agent.model.as_str()) {
+                if !ollama_models.contains(&agent.model) {
                     *missing.entry(agent.model.as_str()).or_default() += 1;
                 }
             }
-            for (model, count) in &missing {
-                tracing::warn!(
-                    "Model '{model}' not on any endpoint ({count} agents affected)"
-                );
-            }
 
-            let backend = MultiOllamaBatch::new(endpoints);
-            let ollama_endpoints = backend.endpoints();
-            run_cycles(&backend, agents, client, config, constitution, Some(ollama_endpoints), &mut report).await?;
+            // If there are missing models and an Anthropic key is available,
+            // use the hybrid backend to route those models to Anthropic.
+            if !missing.is_empty() && config.anthropic_key_file.is_some() {
+                let key_file = config.anthropic_key_file.as_ref().unwrap();
+                let api_key = tokio::fs::read_to_string(key_file).await
+                    .map_err(|e| anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display()))?;
+                let anthropic = AnthropicBatch::from_key(api_key.trim().to_string())?;
+
+                for (model, count) in &missing {
+                    tracing::info!(
+                        "Model '{model}' → anthropic ({count} agents)"
+                    );
+                }
+
+                let ollama = MultiOllamaBatch::new(endpoints);
+                let ollama_endpoints_ref = ollama.endpoints().to_vec();
+                let backend = HybridBatch::new(anthropic, ollama, ollama_models);
+                run_cycles(&backend, agents, client, config, constitution, Some(&ollama_endpoints_ref), &mut report).await?;
+            } else {
+                // Pure Ollama mode.
+                for (model, count) in &missing {
+                    tracing::warn!(
+                        "Model '{model}' not on any endpoint ({count} agents affected)"
+                    );
+                }
+
+                let backend = MultiOllamaBatch::new(endpoints);
+                let ollama_endpoints = backend.endpoints();
+                run_cycles(&backend, agents, client, config, constitution, Some(ollama_endpoints), &mut report).await?;
+            }
         }
         Backend::Anthropic => {
             let key_file = config.anthropic_key_file.as_ref()
@@ -444,6 +469,15 @@ where
                     .cloned()
                     .unwrap_or_default();
 
+                // Route evolution to the right backend per agent model.
+                // In Ollama/hybrid mode, use Anthropic for models not on any Ollama endpoint.
+                let on_ollama = ollama_endpoints
+                    .and_then(|eps| {
+                        eps.iter()
+                            .find(|ep| ep.models.contains(&agent.model))
+                            .map(|ep| ep.url.as_str())
+                    });
+
                 let single_backend: Box<dyn LlmBackend> = match config.backend {
                     Backend::Anthropic => {
                         // Re-read key for each evolution call (rare, not worth caching)
@@ -462,18 +496,32 @@ where
                         }
                     }
                     Backend::Ollama => {
-                        // Route to the endpoint that has this agent's model.
-                        let url = ollama_endpoints
-                            .and_then(|eps| {
-                                eps.iter()
-                                    .find(|ep| ep.models.contains(&agent.model))
-                                    .map(|ep| ep.url.as_str())
-                            })
-                            .unwrap_or(&config.ollama_url);
-                        Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
-                            Some(url),
-                            &agent.model,
-                        ))
+                        if let Some(url) = on_ollama {
+                            Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
+                                Some(url),
+                                &agent.model,
+                            ))
+                        } else if let Some(ref key_file) = config.anthropic_key_file {
+                            // Hybrid mode: model not on Ollama, use Anthropic
+                            let api_key = tokio::fs::read_to_string(key_file).await
+                                .unwrap_or_default();
+                            match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
+                                api_key.trim().to_string(),
+                                &agent.model,
+                            ) {
+                                Ok(b) => Box::new(b),
+                                Err(e) => {
+                                    tracing::warn!("Failed to create Anthropic backend for {}: {e}", agent.name);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            // No Anthropic key, use default Ollama URL (will likely fail)
+                            Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
+                                Some(&config.ollama_url),
+                                &agent.model,
+                            ))
+                        }
                     }
                 };
 

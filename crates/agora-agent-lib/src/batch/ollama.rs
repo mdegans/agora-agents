@@ -31,6 +31,15 @@ pub struct OllamaPendingHandle {
     results: Vec<WorkResult<MMessage<'static>>>,
 }
 
+impl OllamaPendingHandle {
+    /// Create an empty handle (no items to process).
+    pub fn empty() -> Self {
+        Self {
+            results: Vec::new(),
+        }
+    }
+}
+
 /// Response from Ollama's `GET /api/tags` endpoint.
 #[derive(Debug, serde::Deserialize)]
 struct OllamaTagsResponse {

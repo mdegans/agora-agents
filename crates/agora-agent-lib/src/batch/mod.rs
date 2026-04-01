@@ -5,4 +5,5 @@
 //! - [`ollama::OllamaBatch`] — Sequential per model, parallel across models
 
 pub mod anthropic;
+pub mod hybrid;
 pub mod ollama;
