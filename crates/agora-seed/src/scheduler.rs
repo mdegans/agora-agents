@@ -265,21 +265,48 @@ where
         // Shuffle agents each cycle for fairness
         agents.shuffle(&mut rand::thread_rng());
 
-        // In hybrid mode, group Anthropic agents into their own batches at the
-        // end. This maximizes Anthropic prompt cache hits (shared prefix across
-        // the batch) and avoids blocking Ollama batches on Anthropic polling.
-        if let Some(eps) = ollama_endpoints {
+        // In hybrid mode, split into Ollama agents (small interleaved batches)
+        // and Anthropic agents (one big batch for maximum cache hits at 0.1x cost).
+        // Ollama agents run first, then all Anthropic agents in a single batch.
+        let anthropic_split = if let Some(eps) = ollama_endpoints {
             let ollama_models: std::collections::HashSet<&str> = eps
                 .iter()
                 .flat_map(|ep| ep.models.iter().map(|m| m.as_str()))
                 .collect();
-            // Stable partition: Ollama agents first, Anthropic agents last
+            // Find where Anthropic agents start after stable sort
             agents.sort_by_key(|a| if ollama_models.contains(a.model.as_str()) { 0 } else { 1 });
+            let split = agents.iter().position(|a| !ollama_models.contains(a.model.as_str()));
+            split
+        } else {
+            None
+        };
+
+        // Split: Ollama agents get normal batch_size, Anthropic agents get one big batch.
+        let (ollama_agents, anthropic_agents) = match anthropic_split {
+            Some(idx) => agents.split_at_mut(idx),
+            None => (agents.as_mut_slice(), &mut [] as &mut [Agent]),
+        };
+
+        // Build batch schedule: small Ollama batches + one big Anthropic batch
+        let mut batch_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut offset = 0;
+        for chunk in ollama_agents.chunks(batch_size) {
+            batch_ranges.push((offset, offset + chunk.len()));
+            offset += chunk.len();
+        }
+        if !anthropic_agents.is_empty() {
+            batch_ranges.push((offset, offset + anthropic_agents.len()));
+            if anthropic_agents.len() > batch_size {
+                tracing::info!(
+                    "Anthropic batch: {} agents in single batch (cache optimization)",
+                    anthropic_agents.len(),
+                );
+            }
         }
 
-        // Split agents into batches for interleaving
-        let total_batches = (agents.len() + batch_size - 1) / batch_size;
-        for (batch_num, batch_agents) in agents.chunks_mut(batch_size).enumerate() {
+        let total_batches = batch_ranges.len();
+        for (batch_num, &(start, end)) in batch_ranges.iter().enumerate() {
+            let batch_agents = &mut agents[start..end];
             tracing::info!(
                 "--- Batch {}/{} ({} agents) ---",
                 batch_num + 1,
