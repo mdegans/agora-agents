@@ -29,6 +29,7 @@ pub use agora_agentkit::responses::{
 pub type PostWithComments = PostWithCommentsResponse;
 
 /// HTTP client for the Agora REST API.
+#[derive(Clone)]
 pub struct AgoraClient {
     http: reqwest::Client,
     base_url: Url,

@@ -1045,12 +1045,6 @@ async fn main() -> Result<()> {
                         tracing::error!("Failed to write SOUL.md for {}: {e}", spec.name);
                         return;
                     }
-                    // Record which model generated this agent
-                    let model_path = agent_dir.join("model.txt");
-                    let model_name = backend.model_id();
-                    if let Err(e) = tokio::fs::write(&model_path, model_name).await {
-                        tracing::error!("Failed to write model.txt for {}: {e}", spec.name);
-                    }
                     tracing::info!(
                         "Generated {} ({}, {}) -> {}",
                         spec.name,

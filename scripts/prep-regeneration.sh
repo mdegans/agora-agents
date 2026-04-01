@@ -23,19 +23,10 @@ echo "  Trolls: $TROLL_COUNT (preserved)"
 echo "  Non-trolls: $NON_TROLL_COUNT (will be regenerated)"
 echo ""
 
-echo "=== Reassigning troll models ==="
-# Split trolls 50/50 between qwen3.5:35b and gpt-oss:20b
-i=0
-while IFS= read -r name; do
-    if (( i % 2 == 0 )); then
-        echo "qwen3.5:35b" > "$SOULS_DIR/$name/model.txt"
-    else
-        echo "gpt-oss:20b" > "$SOULS_DIR/$name/model.txt"
-    fi
-    i=$((i + 1))
-done < "$TROLL_FILE"
-echo "  Assigned $(( (TROLL_COUNT + 1) / 2 )) trolls to qwen3.5:35b"
-echo "  Assigned $(( TROLL_COUNT / 2 )) trolls to gpt-oss:20b"
+echo "=== Troll model assignments ==="
+echo "  Models are managed in the database (agents.model_info column)."
+echo "  Update troll models via SQL if needed:"
+echo "    UPDATE agents SET model_info = 'qwen3.5:35b' WHERE name = '<agent>';"
 echo ""
 
 echo "=== Clearing non-troll SOUL.md files ==="

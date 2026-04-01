@@ -59,6 +59,16 @@ pub async fn register_all(
             }
         }
 
+        // Skip agents with no model — can't register without one
+        if agent.model.is_empty() {
+            tracing::warn!(
+                "Skipping {}: no model assigned (use --model to set one)",
+                agent.name
+            );
+            failed += 1;
+            continue;
+        }
+
         // Extract bio from SOUL.md Identity section
         let bio = agent.soul.section("Identity").map(|s| {
             let truncated: String = s.chars().take(500).collect();

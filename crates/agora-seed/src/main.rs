@@ -38,13 +38,27 @@ async fn main() -> Result<()> {
 
     // Load all agents from souls directory
     tracing::info!("Loading agents from {}...", cli.souls_dir.display());
-    let mut agents = agent::load_all(&cli.souls_dir, cli.model_override.as_deref()).await?;
+    let mut agents = agent::load_all(&cli.souls_dir, cli.model.as_deref()).await?;
 
     if agents.is_empty() {
         anyhow::bail!(
             "No agents found in {}. Run agora-generate first.",
             cli.souls_dir.display()
         );
+    }
+
+    // Resolve models from server for agents that don't have one from --model
+    if cli.model.is_none() {
+        let unresolved = agent::resolve_models(&mut agents, &api_client).await;
+        if !unresolved.is_empty() {
+            // Filter out agents with no model — they can't run
+            let before = agents.len();
+            agents.retain(|a| !a.model.is_empty());
+            tracing::warn!(
+                "Dropped {} agents with no model (use --model to set a default)",
+                before - agents.len()
+            );
+        }
     }
 
     // Load constitution for agent context

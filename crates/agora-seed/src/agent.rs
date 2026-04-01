@@ -34,8 +34,11 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Load an agent from its directory (containing SOUL.md, model.txt, etc.)
-    pub async fn load(dir: PathBuf, model_override: Option<&str>) -> Result<Self> {
+    /// Load an agent from its directory (containing SOUL.md, etc.)
+    ///
+    /// If `model` is Some, it is used for all agents. Otherwise the model field
+    /// is left empty and must be resolved from the server before running.
+    pub async fn load(dir: PathBuf, model: Option<&str>) -> Result<Self> {
         let soul_path = dir.join("SOUL.md");
         let soul = Soul::from_file(&soul_path)
             .await
@@ -98,17 +101,8 @@ impl Agent {
             None
         };
 
-        // Load model assignment — fail fast if model.txt is missing
-        let model = if let Some(override_model) = model_override {
-            override_model.to_string()
-        } else {
-            let model_path = dir.join("model.txt");
-            tokio::fs::read_to_string(&model_path)
-                .await
-                .with_context(|| format!("missing model.txt in {}", dir.display()))?
-                .trim()
-                .to_string()
-        };
+        // Model assignment: from CLI flag or resolved later from server
+        let model = model.unwrap_or_default().to_string();
 
         Ok(Self {
             name,
@@ -159,7 +153,7 @@ impl Agent {
 /// Load all agents from the souls directory.
 pub async fn load_all(
     souls_dir: &std::path::Path,
-    model_override: Option<&str>,
+    model: Option<&str>,
 ) -> Result<Vec<Agent>> {
     let mut agents = Vec::new();
     let mut entries = tokio::fs::read_dir(souls_dir)
@@ -176,7 +170,7 @@ pub async fn load_all(
             continue;
         }
 
-        match Agent::load(path.clone(), model_override).await {
+        match Agent::load(path.clone(), model).await {
             Ok(agent) => agents.push(agent),
             Err(e) => {
                 tracing::warn!("Failed to load agent from {}: {e:#}", path.display());
@@ -191,4 +185,71 @@ pub async fn load_all(
         souls_dir.display()
     );
     Ok(agents)
+}
+
+/// Resolve model assignments from the server for agents that don't have one.
+///
+/// Fetches each agent's profile and reads the `model_info` field. Agents whose
+/// model can't be resolved are collected into the returned error list.
+pub async fn resolve_models(
+    agents: &mut [Agent],
+    client: &crate::client::AgoraClient,
+) -> Vec<String> {
+    let unresolved: Vec<usize> = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.model.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+
+    if unresolved.is_empty() {
+        return Vec::new();
+    }
+
+    tracing::info!(
+        "Resolving models from server for {} agents...",
+        unresolved.len()
+    );
+
+    let mut failed = Vec::new();
+    let mut resolved = 0;
+
+    for &idx in &unresolved {
+        let name = agents[idx].name.clone();
+        match client.get_agent(&name).await {
+            Ok(Some(data)) => {
+                if let Some(model) = data["model_info"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                {
+                    agents[idx].model = model.to_string();
+                    resolved += 1;
+                } else {
+                    failed.push(name);
+                }
+            }
+            _ => {
+                failed.push(name);
+            }
+        }
+    }
+
+    tracing::info!("Resolved {resolved} agent models from server");
+    if !failed.is_empty() {
+        tracing::warn!(
+            "{} agents have no model assignment: {}",
+            failed.len(),
+            if failed.len() <= 10 {
+                failed.join(", ")
+            } else {
+                format!(
+                    "{}, ... and {} more",
+                    failed[..10].join(", "),
+                    failed.len() - 10
+                )
+            }
+        );
+    }
+
+    failed
 }

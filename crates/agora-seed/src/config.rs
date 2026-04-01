@@ -44,9 +44,11 @@ pub struct Cli {
     #[arg(long, default_value = "all")]
     pub phase: Phase,
 
-    /// Override model for all agents (for testing).
+    /// Model to use for all agents. If not set, models are fetched from the
+    /// server's agent profile (model_info field). Required for unregistered agents
+    /// when no server profile exists yet.
     #[arg(long)]
-    pub model_override: Option<String>,
+    pub model: Option<String>,
 
     /// Override deep soul mutation chance (0-100, default 3).
     /// Evolution log chance is separate and unchanged (10% when deep mutation doesn't fire).
