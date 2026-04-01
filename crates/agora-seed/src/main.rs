@@ -58,6 +58,120 @@ async fn main() -> Result<()> {
         })?;
 
     match cli.phase {
+        Phase::Validate => {
+            use agora_agent_lib::soul::WarnLevel;
+
+            let mut total_errors = 0u32;
+            let mut total_warnings = 0u32;
+            let mut agents_with_errors = 0u32;
+            let mut agents_with_no_communities = 0u32;
+
+            // Apply agent filter if set
+            if let Some(ref filter) = cli.agent_filter {
+                agents.retain(|a| a.name.contains(filter.as_str()));
+            }
+
+            for agent in &agents {
+                let warnings = agent.soul.validate(None);
+                if warnings.is_empty() {
+                    continue;
+                }
+
+                let has_error = warnings.iter().any(|w| w.level == WarnLevel::Error);
+                if has_error {
+                    agents_with_errors += 1;
+                }
+                if warnings.iter().any(|w| {
+                    w.level == WarnLevel::Error && w.message.contains("no community lines")
+                }) {
+                    agents_with_no_communities += 1;
+                }
+
+                // Print per-agent warnings (errors and warnings only, skip info)
+                let significant: Vec<_> = warnings
+                    .iter()
+                    .filter(|w| w.level != WarnLevel::Info)
+                    .collect();
+                if !significant.is_empty() {
+                    eprintln!("--- {} ---", agent.name);
+                    for w in &significant {
+                        eprintln!("  {w}");
+                    }
+                }
+
+                for w in &warnings {
+                    match w.level {
+                        WarnLevel::Error => total_errors += 1,
+                        WarnLevel::Warning => total_warnings += 1,
+                        WarnLevel::Info => {}
+                    }
+                }
+            }
+
+            eprintln!();
+            eprintln!("=== Validation Summary ===");
+            eprintln!("Agents scanned:          {}", agents.len());
+            eprintln!("Agents with errors:      {agents_with_errors}");
+            eprintln!("  - no communities:      {agents_with_no_communities}");
+            eprintln!("Total errors:            {total_errors}");
+            eprintln!("Total warnings:          {total_warnings}");
+
+            // Also output communities used across all agents
+            let mut community_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for agent in &agents {
+                for c in agent.soul.communities() {
+                    *community_counts.entry(c).or_default() += 1;
+                }
+            }
+            let mut sorted: Vec<_> = community_counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!();
+            eprintln!("=== Community Usage ===");
+            for (slug, count) in &sorted {
+                let valid = agora_agent_lib::soul::VALID_COMMUNITIES.contains(&slug.as_str());
+                let marker = if valid { "" } else { " [INVALID]" };
+                eprintln!("  {slug}: {count}{marker}");
+            }
+
+            if total_errors > 0 {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Phase::Fix => {
+            // Apply agent filter if set
+            if let Some(ref filter) = cli.agent_filter {
+                agents.retain(|a| a.name.contains(filter.as_str()));
+            }
+
+            let mut fixed = 0u32;
+            let mut unchanged = 0u32;
+
+            for agent in &mut agents {
+                if agent.soul.normalize_communities(None) {
+                    let soul_path = cli.souls_dir.join(&agent.name).join("SOUL.md");
+                    match agent.soul.save(&soul_path).await {
+                        Ok(()) => {
+                            fixed += 1;
+                            tracing::info!("Fixed: {} — communities: {:?}", agent.name, agent.soul.communities());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to save {}: {e}", agent.name);
+                        }
+                    }
+                } else {
+                    unchanged += 1;
+                }
+            }
+
+            eprintln!();
+            eprintln!("=== Fix Summary ===");
+            eprintln!("Agents scanned:    {}", agents.len());
+            eprintln!("Fixed:             {fixed}");
+            eprintln!("Unchanged:         {unchanged}");
+            return Ok(());
+        }
         Phase::Register => {
             setup::register_all(
                 &mut agents,

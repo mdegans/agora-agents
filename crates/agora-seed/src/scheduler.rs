@@ -9,6 +9,7 @@
 //! where THINK and REFLECT are batched, while PERCEIVE and ACT are per-agent.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -24,11 +25,76 @@ use anyhow::Result;
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::Prompt;
 use rand::seq::SliceRandom;
+use serde::Serialize;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
 use crate::config::{Backend, Cli};
 use crate::prompt;
+
+/// End-of-run statistics report.
+#[derive(Debug, Default, Serialize)]
+pub struct RunReport {
+    /// Total agents that participated.
+    pub agents: usize,
+    /// Number of cycles executed.
+    pub cycles: usize,
+    /// Wall-clock duration in seconds.
+    pub duration_secs: f64,
+    /// Action counts by type.
+    pub actions: ActionCounts,
+    /// Per-model breakdown of actions.
+    pub by_model: HashMap<String, ActionCounts>,
+    /// Error/skip counts.
+    pub skipped: SkipCounts,
+    /// Soul evolution stats.
+    pub evolution: EvolutionCounts,
+    /// Survey stats.
+    pub surveys: SurveyCounts,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ActionCounts {
+    pub posts: u32,
+    pub comments: u32,
+    pub votes: u32,
+    pub flags: u32,
+    pub observations: u32,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct SkipCounts {
+    pub duplicate_comments: u32,
+    pub repetitive_titles: u32,
+    pub perceive_failures: u32,
+    pub think_failures: u32,
+    pub reflect_failures: u32,
+    pub post_failures: u32,
+    pub comment_failures: u32,
+    pub vote_failures: u32,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct EvolutionCounts {
+    pub deep_mutations: u32,
+    pub evolution_entries: u32,
+    pub mutation_failures: u32,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct SurveyCounts {
+    pub submitted: u32,
+    pub skipped_empty: u32,
+    pub failures: u32,
+}
+
+impl RunReport {
+    fn model_actions(&mut self, model: &str) -> &mut ActionCounts {
+        self.by_model
+            .entry(model.to_string())
+            .or_default()
+    }
+}
 
 /// Run all agents using the pipeline scheduler.
 pub async fn run_all(
@@ -37,6 +103,8 @@ pub async fn run_all(
     config: &Cli,
     constitution: &str,
 ) -> Result<()> {
+    let start = Instant::now();
+
     // Filter agents
     if let Some(ref filter) = config.agent_filter {
         agents.retain(|a| a.name.contains(filter.as_str()));
@@ -56,6 +124,12 @@ pub async fn run_all(
         tracing::warn!("No registered agents to run");
         return Ok(());
     }
+
+    let mut report = RunReport {
+        agents: agents.len(),
+        cycles: config.cycles,
+        ..Default::default()
+    };
 
     tracing::info!(
         "Pipeline scheduler: {} agents, {} cycles",
@@ -100,7 +174,7 @@ pub async fn run_all(
 
             let backend = MultiOllamaBatch::new(endpoints);
             let ollama_endpoints = backend.endpoints();
-            run_cycles(&backend, agents, client, config, constitution, Some(ollama_endpoints)).await?;
+            run_cycles(&backend, agents, client, config, constitution, Some(ollama_endpoints), &mut report).await?;
         }
         Backend::Anthropic => {
             let key_file = config.anthropic_key_file.as_ref()
@@ -108,11 +182,32 @@ pub async fn run_all(
             let api_key = tokio::fs::read_to_string(key_file).await
                 .map_err(|e| anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display()))?;
             let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
-            run_cycles(&backend, agents, client, config, constitution, None).await?;
+            run_cycles(&backend, agents, client, config, constitution, None, &mut report).await?;
         }
     }
 
+    report.duration_secs = start.elapsed().as_secs_f64();
+
+    // Print JSON report
     tracing::info!("Pipeline scheduler complete!");
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => {
+            tracing::info!("=== RUN REPORT ===\n{json}");
+            // Write to file if reports/ directory exists
+            let reports_dir = std::path::Path::new("reports");
+            if reports_dir.is_dir() {
+                let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+                let path = reports_dir.join(format!("run_{ts}.json"));
+                if let Err(e) = tokio::fs::write(&path, &json).await {
+                    tracing::warn!("Failed to write report to {}: {e}", path.display());
+                } else {
+                    tracing::info!("Report written to {}", path.display());
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize run report: {e}"),
+    }
+
     Ok(())
 }
 
@@ -127,6 +222,7 @@ async fn run_cycles<B>(
     config: &Cli,
     constitution: &str,
     ollama_endpoints: Option<&[OllamaEndpoint]>,
+    report: &mut RunReport,
 ) -> Result<()>
 where
     B: BatchBackend<Prompt<'static>, MMessage<'static>>,
@@ -169,6 +265,7 @@ where
                             "Perceive failed for {}: {e:#}",
                             agent.name,
                         );
+                        report.skipped.perceive_failures += 1;
                     }
                 }
             }
@@ -230,6 +327,7 @@ where
                             "Think failed for agent {}: {e}",
                             result.agent_id,
                         );
+                        report.skipped.think_failures += 1;
                         continue;
                     }
                 };
@@ -260,6 +358,7 @@ where
                     client,
                     &ctx.feeds,
                     &ctx.comment_replies,
+                    report,
                 )
                 .await;
 
@@ -313,6 +412,7 @@ where
                             "Reflect failed for agent {}: {e}",
                             result.agent_id,
                         );
+                        report.skipped.reflect_failures += 1;
                         continue;
                     }
                 };
@@ -382,6 +482,7 @@ where
                     single_backend.as_ref(),
                     config.mutation_chance,
                     &summaries,
+                    report,
                 )
                 .await;
             }
@@ -448,6 +549,7 @@ where
                                 "Survey failed for agent {}: {e}",
                                 result.agent_id,
                             );
+                            report.surveys.failures += 1;
                             continue;
                         }
                     };
@@ -457,6 +559,7 @@ where
                         || trimmed.eq_ignore_ascii_case("no feedback")
                         || trimmed.eq_ignore_ascii_case("no feedback.")
                     {
+                        report.surveys.skipped_empty += 1;
                         continue;
                     }
 
@@ -466,12 +569,14 @@ where
                                 "  agent {} submitted anonymous feedback",
                                 result.agent_id,
                             );
+                            report.surveys.submitted += 1;
                         }
                         Err(e) => {
                             tracing::debug!(
                                 "Feedback submission failed for {}: {e}",
                                 result.agent_id,
                             );
+                            report.surveys.failures += 1;
                         }
                     }
                 }
@@ -753,6 +858,7 @@ async fn execute_actions(
     client: &AgoraClient,
     feeds: &[(String, Vec<crate::client::FeedPost>)],
     comment_replies: &[crate::client::CommentReply],
+    report: &mut RunReport,
 ) -> Vec<String> {
     let agent_id = agent.agent_id.unwrap();
     let mut summaries = Vec::new();
@@ -776,6 +882,7 @@ async fn execute_actions(
                 if prompt::is_title_repetitive(title, &existing_titles) {
                     tracing::info!("  {} topic too similar, skipping: \"{}\"", agent.name, title);
                     summaries.push(format!("Skipped posting \"{title}\" (too similar)"));
+                    report.skipped.repetitive_titles += 1;
                     continue;
                 }
                 match client.create_post(agent_id, slug, title, body, &agent.signing_key).await {
@@ -783,10 +890,13 @@ async fn execute_actions(
                         agent.created_posts.insert(post_id);
                         summaries.push(format!("Posted \"{title}\" in {slug} (id: {post_id})"));
                         tracing::info!("  {} posted \"{}\" in {slug}", agent.name, title);
+                        report.actions.posts += 1;
+                        report.model_actions(&agent.model).posts += 1;
                     }
                     Err(e) => {
                         summaries.push(format!("Failed to post in {slug}: {e}"));
                         tracing::warn!("  {} failed to post: {e}", agent.name);
+                        report.skipped.post_failures += 1;
                     }
                 }
             }
@@ -795,6 +905,7 @@ async fn execute_actions(
                 let has_reply = comment_replies.iter().any(|r| r.post_id == *post_id);
                 if agent.commented_posts.contains(post_id) && !is_own_post && !has_reply {
                     tracing::debug!("  {} already commented on {post_id}, skipping", agent.name);
+                    report.skipped.duplicate_comments += 1;
                     continue;
                 }
                 match client.create_comment(agent_id, *post_id, body, *parent_comment_id, &agent.signing_key).await {
@@ -803,10 +914,13 @@ async fn execute_actions(
                         agent.created_comments.insert(comment_id);
                         summaries.push(format!("Commented on post {post_id}"));
                         tracing::info!("  {} commented on {post_id}", agent.name);
+                        report.actions.comments += 1;
+                        report.model_actions(&agent.model).comments += 1;
                     }
                     Err(e) => {
                         summaries.push(format!("Failed to comment on {post_id}: {e}"));
                         tracing::warn!("  {} failed to comment: {e}", agent.name);
+                        report.skipped.comment_failures += 1;
                     }
                 }
             }
@@ -816,8 +930,13 @@ async fn execute_actions(
                         let verb = if *value > 0 { "upvoted" } else { "downvoted" };
                         summaries.push(format!("{verb} {target_type} {target_id}"));
                         tracing::info!("  {} {verb} {target_type} {target_id}", agent.name);
+                        report.actions.votes += 1;
+                        report.model_actions(&agent.model).votes += 1;
                     }
-                    Err(e) => tracing::warn!("  {} vote failed: {e}", agent.name),
+                    Err(e) => {
+                        tracing::warn!("  {} vote failed: {e}", agent.name);
+                        report.skipped.vote_failures += 1;
+                    }
                 }
             }
             tools::AgentAction::Flag { target_type, target_id, reason } => {
@@ -825,12 +944,16 @@ async fn execute_actions(
                     Ok(()) => {
                         summaries.push(format!("Flagged {target_type} {target_id}: {reason}"));
                         tracing::info!("  {} flagged {target_type} {target_id}", agent.name);
+                        report.actions.flags += 1;
+                        report.model_actions(&agent.model).flags += 1;
                     }
                     Err(e) => tracing::warn!("  {} flag failed: {e}", agent.name),
                 }
             }
             tools::AgentAction::None => {
                 summaries.push("Observed only, no action taken.".to_string());
+                report.actions.observations += 1;
+                report.model_actions(&agent.model).observations += 1;
             }
         }
     }
@@ -844,6 +967,7 @@ async fn run_evolution(
     backend: &dyn LlmBackend,
     mutation_chance: Option<u32>,
     action_summaries: &[String],
+    report: &mut RunReport,
 ) {
     let roll = rand::random::<u32>() % 100;
     let experience = action_summaries.join("; ");
@@ -883,12 +1007,19 @@ async fn run_evolution(
                             let existing = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
                             let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
                             tracing::warn!("  {} SOUL MUTATED", agent.name);
+                            report.evolution.deep_mutations += 1;
                         }
-                        Err(e) => tracing::warn!("  {} invalid soul mutation: {e}", agent.name),
+                        Err(e) => {
+                            tracing::warn!("  {} invalid soul mutation: {e}", agent.name);
+                            report.evolution.mutation_failures += 1;
+                        }
                     }
                 }
             }
-            Err(e) => tracing::warn!("Soul mutation failed for {}: {e}", agent.name),
+            Err(e) => {
+                tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
+                report.evolution.mutation_failures += 1;
+            }
         }
     } else if roll < evo_threshold {
         // Evolution log entry
@@ -909,6 +1040,7 @@ async fn run_evolution(
                         tracing::warn!("Failed to save soul for {}: {e}", agent.name);
                     }
                     tracing::info!("  {} soul evolved: {}", agent.name, entry);
+                    report.evolution.evolution_entries += 1;
                 }
             }
             Err(e) => tracing::debug!("Evolution failed for {}: {e}", agent.name),

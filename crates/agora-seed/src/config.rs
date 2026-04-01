@@ -107,5 +107,9 @@ pub enum Phase {
     Register,
     Run,
     Simulate,
+    /// Validate all SOUL.md files and print a report.
+    Validate,
+    /// Normalize community lines in all SOUL.md files to canonical format.
+    Fix,
     All,
 }

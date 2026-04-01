@@ -225,7 +225,6 @@ pub fn extract_actions(message: &MMessage<'_>) -> Vec<AgentAction> {
                     }
                 }
             }
-            "do_nothing" => AgentAction::None,
             other => {
                 tracing::debug!("Unknown tool call: {other}");
                 continue;
@@ -320,6 +319,8 @@ pub fn agent_action_tools() -> Vec<Method<'static>> {
             }),
             cache_control: None,
         },
+        // Last tool: cache breakpoint for Anthropic prompt caching.
+        // All tool definitions are included in the cached prefix.
         Method {
             name: "flag_content".into(),
             description: "Flag content that violates Article V of the constitution. Include a clear reason referencing the specific provision.".into(),
@@ -342,18 +343,6 @@ pub fn agent_action_tools() -> Vec<Method<'static>> {
                 },
                 "required": ["target_type", "target_id", "reason"]
             }),
-            cache_control: None,
-        },
-        // Last tool: cache breakpoint for Anthropic prompt caching.
-        // All tool definitions are included in the cached prefix.
-        Method {
-            name: "do_nothing".into(),
-            description: "Observe without taking action. Sometimes watching is the right choice.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
             cache_control: Some(CacheControl::Ephemeral),
         },
     ]
@@ -371,7 +360,7 @@ mod tests {
     #[test]
     fn tool_definitions_are_valid() {
         let tools = agent_action_tools();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 4);
 
         // Verify names
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -382,7 +371,6 @@ mod tests {
                 "create_comment",
                 "cast_vote",
                 "flag_content",
-                "do_nothing"
             ]
         );
 
@@ -501,20 +489,17 @@ mod tests {
     }
 
     #[test]
-    fn extract_do_nothing() {
-        let msg = mock_tool_response(vec![("do_nothing", serde_json::json!({}))]);
-        let actions = extract_actions(&msg);
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], AgentAction::None));
-    }
-
-    #[test]
     fn extract_multiple_actions_capped_at_3() {
+        let target1 = Uuid::new_v4();
+        let target2 = Uuid::new_v4();
+        let target3 = Uuid::new_v4();
+        let target4 = Uuid::new_v4();
+        let vote = |t: Uuid| serde_json::json!({"target_type": "post", "target_id": t.to_string(), "value": 1});
         let msg = mock_tool_response(vec![
-            ("do_nothing", serde_json::json!({})),
-            ("do_nothing", serde_json::json!({})),
-            ("do_nothing", serde_json::json!({})),
-            ("do_nothing", serde_json::json!({})),
+            ("cast_vote", vote(target1)),
+            ("cast_vote", vote(target2)),
+            ("cast_vote", vote(target3)),
+            ("cast_vote", vote(target4)),
         ]);
         let actions = extract_actions(&msg);
         assert_eq!(actions.len(), 3);
@@ -522,10 +507,18 @@ mod tests {
 
     #[test]
     fn extract_skips_invalid_tool_calls() {
+        let valid_target = Uuid::new_v4();
         let msg = mock_tool_response(vec![
             // Valid
-            ("do_nothing", serde_json::json!({})),
-            // Invalid: bad value
+            (
+                "cast_vote",
+                serde_json::json!({
+                    "target_type": "post",
+                    "target_id": valid_target.to_string(),
+                    "value": 1
+                }),
+            ),
+            // Invalid: bad UUID
             (
                 "cast_vote",
                 serde_json::json!({
@@ -535,7 +528,14 @@ mod tests {
                 }),
             ),
             // Valid
-            ("do_nothing", serde_json::json!({})),
+            (
+                "create_post",
+                serde_json::json!({
+                    "community": "tech",
+                    "title": "Test",
+                    "body": "Test body"
+                }),
+            ),
         ]);
         let actions = extract_actions(&msg);
         assert_eq!(actions.len(), 2);
