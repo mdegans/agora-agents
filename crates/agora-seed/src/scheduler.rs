@@ -251,7 +251,7 @@ async fn run_cycles(
     ollama_models: &std::collections::HashSet<String>,
     report: &mut RunReport,
 ) -> Result<()> {
-    let batch_size = config.batch_size.unwrap_or(10);
+    let batch_size = config.batch_size.unwrap_or(50);
 
     let all_endpoints: Vec<OllamaEndpoint> = ollama_backends
         .iter()
@@ -275,8 +275,7 @@ async fn run_cycles(
         };
 
         if !ollama_backends.is_empty() && ollama_count > 0 {
-            // --- Producer: create same-model batches ---
-            agents[..ollama_count].sort_by(|a, b| a.model.cmp(&b.model));
+            // --- Producer: create interleaved same-model batches ---
             let all_ollama: Vec<Agent> = agents.drain(..ollama_count).collect();
             // agents now contains only Anthropic agents (if any).
             let anthropic_agents = agents.as_mut_slice();
@@ -465,19 +464,40 @@ async fn run_cycles(
 }
 
 /// Group a sorted list of agents into same-model batches of up to `batch_size`.
+/// Create same-model batches, interleaved round-robin across models.
+///
+/// Each batch contains up to `batch_size` agents of the same model (needed
+/// for KV prefix cache reuse). Batches are ordered by round-robin across
+/// models so that different models alternate — this prevents behavioral
+/// waves where all agents of one model (e.g. posters) act before agents
+/// of another model (e.g. commenters).
 fn create_batches(agents: Vec<Agent>, batch_size: usize) -> Vec<(String, Vec<Agent>)> {
-    let mut batches = Vec::new();
-    let mut iter = agents.into_iter().peekable();
-
-    while iter.peek().is_some() {
-        let model = iter.peek().unwrap().model.clone();
-        let mut group: Vec<Agent> = Vec::new();
-        while iter.peek().is_some() && iter.peek().unwrap().model == model {
-            group.push(iter.next().unwrap());
+    // Group agents by model, preserving insertion order.
+    let mut by_model: Vec<(String, Vec<Agent>)> = Vec::new();
+    let mut model_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for agent in agents {
+        if let Some(&idx) = model_index.get(&agent.model) {
+            by_model[idx].1.push(agent);
+        } else {
+            model_index.insert(agent.model.clone(), by_model.len());
+            by_model.push((agent.model.clone(), vec![agent]));
         }
-        while !group.is_empty() {
-            let take = batch_size.min(group.len());
-            let batch: Vec<Agent> = group.drain(..take).collect();
+    }
+
+    // Round-robin: take one batch_size chunk from each model in turn.
+    let mut batches = Vec::new();
+    let total: usize = by_model.iter().map(|(_, agents)| agents.len()).sum();
+    let mut emitted = 0;
+
+    while emitted < total {
+        for (model, agents) in by_model.iter_mut() {
+            if agents.is_empty() {
+                continue;
+            }
+            let take = batch_size.min(agents.len());
+            let batch: Vec<Agent> = agents.drain(..take).collect();
+            emitted += batch.len();
             batches.push((model.clone(), batch));
         }
     }

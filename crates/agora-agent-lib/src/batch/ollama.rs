@@ -153,49 +153,40 @@ async fn send_one(
 
 /// Process a list of work items against a single endpoint.
 ///
-/// Items are grouped by model and processed sequentially within each
-/// group for KV prefix cache reuse.
+/// Items run sequentially — the scheduler handles model interleaving at
+/// the batch level. Within a batch, all items are the same model for KV
+/// prefix cache reuse.
 async fn process_endpoint_items(
     client: &misanthropic::Client,
     endpoint_url: &str,
     items: Vec<WorkItem<Prompt<'static>>>,
 ) -> Vec<WorkResult<MMessage<'static>>> {
-    let mut by_model: HashMap<String, Vec<WorkItem<Prompt<'static>>>> =
-        HashMap::new();
-    for item in items {
-        by_model.entry(item.model.clone()).or_default().push(item);
-    }
-
     let mut results = Vec::new();
 
-    for (model, items) in by_model {
-        tracing::info!(
-            "  [{endpoint_url}] Processing {} items for model '{model}'",
-            items.len(),
-        );
+    for item in &items {
+        let response = match send_one(
+            client,
+            endpoint_url,
+            &item.prompt,
+            &item.model,
+        )
+        .await
+        {
+            Ok(msg) => Ok(msg),
+            Err(e) => {
+                tracing::warn!(
+                    "Ollama request failed for agent {} at {endpoint_url}: {e}",
+                    item.agent_id,
+                );
+                Err(BatchError::Transport(e.to_string()))
+            }
+        };
 
-        for item in items {
-            let agent_id = item.agent_id;
-            let step = item.step;
-
-            let response =
-                match send_one(client, endpoint_url, &item.prompt, &model).await
-                {
-                    Ok(msg) => Ok(msg),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Ollama request failed for agent {agent_id} at {endpoint_url}: {e}"
-                        );
-                        Err(BatchError::Transport(e.to_string()))
-                    }
-                };
-
-            results.push(WorkResult {
-                agent_id,
-                step,
-                response,
-            });
-        }
+        results.push(WorkResult {
+            agent_id: item.agent_id,
+            step: item.step,
+            response,
+        });
     }
 
     results
