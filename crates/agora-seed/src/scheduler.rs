@@ -716,9 +716,15 @@ where
             }
             Backend::Ollama => {
                 if let Some(url) = on_ollama {
-                    Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
+                    match agora_agent_lib::llm::ollama::OllamaBackend::new(
                         Some(url), &agent.model,
-                    ))
+                    ) {
+                        Ok(b) => Box::new(b),
+                        Err(e) => {
+                            tracing::warn!("Failed to create Ollama backend for {}: {e}", agent.name);
+                            continue;
+                        }
+                    }
                 } else if let Some(ref key_file) = config.anthropic_key_file {
                     let api_key = tokio::fs::read_to_string(key_file).await
                         .unwrap_or_default();
@@ -732,9 +738,15 @@ where
                         }
                     }
                 } else {
-                    Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
+                    match agora_agent_lib::llm::ollama::OllamaBackend::new(
                         Some(&config.ollama_url), &agent.model,
-                    ))
+                    ) {
+                        Ok(b) => Box::new(b),
+                        Err(e) => {
+                            tracing::warn!("Failed to create Ollama backend for {}: {e}", agent.name);
+                            continue;
+                        }
+                    }
                 }
             }
         };

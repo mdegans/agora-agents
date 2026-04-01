@@ -908,7 +908,7 @@ async fn main() -> Result<()> {
             Box::new(llm::ollama::OllamaBackend::new(
                 Some(&cli.ollama_url),
                 model,
-            ))
+            )?)
         }
         "anthropic" => {
             let key_file = cli

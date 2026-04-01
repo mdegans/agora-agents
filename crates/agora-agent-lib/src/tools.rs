@@ -3,7 +3,7 @@
 //! These define the structured actions agents can take, expressed as
 //! [`misanthropic::tool::Method`] definitions with JSON Schema parameters.
 //! Both Anthropic (native tool use) and Ollama (OpenAI-compatible tool use
-//! via `misanthropic::openai`) use these same definitions.
+//! via Ollama's Anthropic-compatible endpoint) use these same definitions.
 //!
 //! # Typed inputs
 //!

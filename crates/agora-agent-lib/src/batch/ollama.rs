@@ -10,6 +10,9 @@
 //! This avoids the wave problem where all agents of one model post at once,
 //! and minimizes model loading and memory reallocation.
 //!
+//! Uses Ollama's Anthropic-compatible `/v1/messages` endpoint via
+//! [`misanthropic::Client`] with a custom base URL.
+//!
 //! [`MultiOllamaBatch`] extends this to multiple endpoints: it discovers
 //! available models via `/api/tags` at startup and routes work items to the
 //! right endpoint. Different endpoints process concurrently.
@@ -19,9 +22,10 @@ use std::collections::{HashMap, HashSet};
 use agora_agentkit::scheduler::{
     BatchBackend, BatchError, BatchState, WorkItem, WorkResult,
 };
-use misanthropic::openai::{ChatCompletionRequest, ChatCompletionResponse, ReasoningEffort};
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::Prompt;
+
+use crate::llm::ollama::{create_ollama_client, send_with_nudge};
 
 /// Handle for a pending Ollama "batch".
 ///
@@ -52,24 +56,37 @@ struct OllamaModelInfo {
     name: String,
 }
 
-/// An Ollama endpoint with its URL and discovered models.
-#[derive(Debug, Clone)]
+/// An Ollama endpoint with its URL, discovered models, and API client.
+#[derive(Clone)]
 pub struct OllamaEndpoint {
     /// Base URL (e.g. `http://localhost:11434`).
     pub url: String,
     /// Models available on this endpoint (populated by [`discover`]).
     pub models: HashSet<String>,
+    /// Anthropic-compat client pointed at this endpoint.
+    pub client: misanthropic::Client,
+}
+
+impl std::fmt::Debug for OllamaEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OllamaEndpoint")
+            .field("url", &self.url)
+            .field("models", &self.models)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OllamaEndpoint {
-    /// Create an endpoint with no discovered models (for backward compat).
-    pub fn new(url: impl Into<String>) -> Self {
+    /// Create an endpoint with no discovered models.
+    pub fn new(url: impl Into<String>) -> anyhow::Result<Self> {
         let url = url.into();
         let url = url.trim_end_matches('/').to_string();
-        Self {
+        let client = create_ollama_client(&url)?;
+        Ok(Self {
             url,
             models: HashSet::new(),
-        }
+            client,
+        })
     }
 
     /// Discover available models by querying `GET /api/tags`.
@@ -101,78 +118,37 @@ impl OllamaEndpoint {
             },
         );
 
-        Ok(Self { url, models })
+        let client = create_ollama_client(&url)?;
+
+        Ok(Self { url, models, client })
     }
 }
 
 impl Default for OllamaEndpoint {
     fn default() -> Self {
         Self::new("http://localhost:11434")
+            .expect("default Ollama URL should be valid")
     }
 }
 
 /// Send a single prompt to an Ollama endpoint and return the response.
 async fn send_one(
-    http: &reqwest::Client,
+    client: &misanthropic::Client,
     endpoint_url: &str,
     prompt: &Prompt<'_>,
     model: &str,
 ) -> anyhow::Result<MMessage<'static>> {
-    let url = format!("{endpoint_url}/v1/chat/completions");
     let start = std::time::Instant::now();
 
-    let mut request = ChatCompletionRequest::from(prompt);
-    request.model = model.to_string();
-    // Disable extended thinking for Ollama — thinking models (cogito) return
-    // plain text instead of tool calls when thinking is enabled.
-    // TODO: Support thinking by parsing think blocks from the response and
-    // extracting tool calls that follow. This would improve response quality
-    // at the cost of generation time.
-    request.reasoning_effort = Some(ReasoningEffort::None);
-
-    // Also inject `reasoning: { effort: "none" }` object form — Ollama accepts
-    // both `reasoning_effort` (string) and `reasoning` (object) formats.
-    let mut body = serde_json::to_value(&request)
-        .map_err(|e| anyhow::anyhow!("serializing request: {e}"))?;
-    body["reasoning"] = serde_json::json!({ "effort": "none" });
-
-    let response = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Ollama request to {endpoint_url} failed: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Ollama {endpoint_url} returned {status}: {body}");
-    }
-
-    // Log raw response for debugging tool-use parsing issues.
-    let raw_body = response.text().await
-        .map_err(|e| anyhow::anyhow!("reading Ollama response body: {e}"))?;
-    // Log when response has no tool_calls (likely plain text / thinking issue).
-    if !raw_body.contains("tool_calls") || raw_body.contains("\"tool_calls\":null") {
-        tracing::debug!("  [{model}@{endpoint_url}] no tool_calls in response: {}", raw_body);
-    }
-
-    let chat_response: ChatCompletionResponse = serde_json::from_str(&raw_body)
-        .map_err(|e| anyhow::anyhow!("parsing Ollama response: {e}"))?;
+    let msg = send_with_nudge(client, prompt).await?;
 
     let elapsed = start.elapsed();
-    if let Some(usage) = &chat_response.usage {
-        tracing::debug!(
-            "  [{model}@{endpoint_url}] {}tok prompt, {}tok response, {:.1}s",
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            elapsed.as_secs_f64(),
-        );
-    }
+    tracing::debug!(
+        "  [{model}@{endpoint_url}] {:.1}s",
+        elapsed.as_secs_f64(),
+    );
 
-    chat_response
-        .into_message()
-        .ok_or_else(|| anyhow::anyhow!("Ollama response contained no message"))
+    Ok(msg)
 }
 
 /// Process a list of work items against a single endpoint.
@@ -180,7 +156,7 @@ async fn send_one(
 /// Items are grouped by model and processed sequentially within each
 /// group for KV prefix cache reuse.
 async fn process_endpoint_items(
-    http: &reqwest::Client,
+    client: &misanthropic::Client,
     endpoint_url: &str,
     items: Vec<WorkItem<Prompt<'static>>>,
 ) -> Vec<WorkResult<MMessage<'static>>> {
@@ -202,15 +178,17 @@ async fn process_endpoint_items(
             let agent_id = item.agent_id;
             let step = item.step;
 
-            let response = match send_one(http, endpoint_url, &item.prompt, &model).await {
-                Ok(msg) => Ok(msg),
-                Err(e) => {
-                    tracing::warn!(
-                        "Ollama request failed for agent {agent_id} at {endpoint_url}: {e}"
-                    );
-                    Err(BatchError::Transport(e.to_string()))
-                }
-            };
+            let response =
+                match send_one(client, endpoint_url, &item.prompt, &model).await
+                {
+                    Ok(msg) => Ok(msg),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Ollama request failed for agent {agent_id} at {endpoint_url}: {e}"
+                        );
+                        Err(BatchError::Transport(e.to_string()))
+                    }
+                };
 
             results.push(WorkResult {
                 agent_id,
@@ -228,17 +206,13 @@ async fn process_endpoint_items(
 /// Processes items sequentially per model for KV prefix cache reuse.
 /// For multi-endpoint support, use [`MultiOllamaBatch`] instead.
 pub struct OllamaBatch {
-    http: reqwest::Client,
     endpoint: OllamaEndpoint,
 }
 
 impl OllamaBatch {
     /// Create a new Ollama batch backend targeting a single endpoint.
     pub fn new(endpoint: OllamaEndpoint) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            endpoint,
-        }
+        Self { endpoint }
     }
 }
 
@@ -255,8 +229,12 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for OllamaBatch {
             self.endpoint.url,
         );
 
-        let results =
-            process_endpoint_items(&self.http, &self.endpoint.url, items).await;
+        let results = process_endpoint_items(
+            &self.endpoint.client,
+            &self.endpoint.url,
+            items,
+        )
+        .await;
 
         Ok(OllamaPendingHandle { results })
     }
@@ -294,17 +272,13 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for OllamaBatch {
 /// endpoint with the fewest items already assigned in the current batch
 /// (greedy load balancing).
 pub struct MultiOllamaBatch {
-    http: reqwest::Client,
     endpoints: Vec<OllamaEndpoint>,
 }
 
 impl MultiOllamaBatch {
     /// Create a new multi-endpoint Ollama batch backend.
     pub fn new(endpoints: Vec<OllamaEndpoint>) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            endpoints,
-        }
+        Self { endpoints }
     }
 
     /// Return the URL of an endpoint that has `model`, or `None`.
@@ -340,7 +314,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
                 self.endpoints[0].url,
             );
             let results = process_endpoint_items(
-                &self.http,
+                &self.endpoints[0].client,
                 &self.endpoints[0].url,
                 items,
             )
@@ -430,10 +404,10 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, items) in items_by_endpoint {
-            let http = self.http.clone();
+            let client = self.endpoints[idx].client.clone();
             let url = self.endpoints[idx].url.clone();
             join_set.spawn(async move {
-                process_endpoint_items(&http, &url, items).await
+                process_endpoint_items(&client, &url, items).await
             });
         }
 

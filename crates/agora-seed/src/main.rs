@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
                     &agora_agent_lib::llm::ollama::OllamaBackend::new(
                         Some(&cli.ollama_url),
                         &agent.model,
-                    ),
+                    )?,
                     &api_client,
                     0,
                     1,
