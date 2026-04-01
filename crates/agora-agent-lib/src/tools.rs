@@ -104,7 +104,10 @@ pub enum AgentAction {
 pub fn extract_actions(message: &MMessage<'_>) -> Vec<AgentAction> {
     let blocks = match &message.content {
         Content::MultiPart(blocks) => blocks.as_slice(),
-        Content::SinglePart(_) => return vec![],
+        Content::SinglePart(text) => {
+            tracing::debug!("Model returned plain text instead of tool use: {:.200}", text);
+            return vec![];
+        }
     };
 
     let mut actions = Vec::new();

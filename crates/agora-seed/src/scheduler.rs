@@ -18,8 +18,7 @@ use agora_agent_lib::agora_agentkit::scheduler::{
     BatchBackend, BatchState, CycleStep, WorkItem,
 };
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
-use agora_agent_lib::batch::hybrid::HybridBatch;
-use agora_agent_lib::batch::ollama::{MultiOllamaBatch, OllamaEndpoint};
+use agora_agent_lib::batch::ollama::{OllamaBatch, OllamaEndpoint};
 use agora_agent_lib::llm::{LlmBackend, Message, Role};
 use agora_agent_lib::tools;
 use anyhow::Result;
@@ -170,8 +169,12 @@ pub async fn run_all(
                 }
             }
 
-            // If there are missing models and an Anthropic key is available,
-            // use the hybrid backend to route those models to Anthropic.
+            // Build per-endpoint backends.
+            let ollama_backends: Vec<(OllamaBatch, OllamaEndpoint)> = endpoints
+                .into_iter()
+                .map(|ep| (OllamaBatch::new(ep.clone()), ep))
+                .collect();
+
             if !missing.is_empty() && config.anthropic_key_file.is_some() {
                 let key_file = config.anthropic_key_file.as_ref().unwrap();
                 let api_key = tokio::fs::read_to_string(key_file).await
@@ -179,26 +182,18 @@ pub async fn run_all(
                 let anthropic = AnthropicBatch::from_key(api_key.trim().to_string())?;
 
                 for (model, count) in &missing {
-                    tracing::info!(
-                        "Model '{model}' → anthropic ({count} agents)"
-                    );
+                    tracing::info!("Model '{model}' → anthropic ({count} agents)");
                 }
 
-                let ollama = MultiOllamaBatch::new(endpoints);
-                let ollama_endpoints_ref = ollama.endpoints().to_vec();
-                let backend = HybridBatch::new(anthropic, ollama, ollama_models);
-                run_cycles(&backend, agents, client, config, constitution, Some(&ollama_endpoints_ref), &mut report).await?;
+                run_cycles(&ollama_backends, Some(&anthropic), agents, client, config, constitution, &ollama_models, &mut report).await?;
             } else {
-                // Pure Ollama mode.
                 for (model, count) in &missing {
                     tracing::warn!(
                         "Model '{model}' not on any endpoint ({count} agents affected)"
                     );
                 }
 
-                let backend = MultiOllamaBatch::new(endpoints);
-                let ollama_endpoints = backend.endpoints();
-                run_cycles(&backend, agents, client, config, constitution, Some(ollama_endpoints), &mut report).await?;
+                run_cycles(&ollama_backends, None, agents, client, config, constitution, &std::collections::HashSet::new(), &mut report).await?;
             }
         }
         Backend::Anthropic => {
@@ -207,7 +202,7 @@ pub async fn run_all(
             let api_key = tokio::fs::read_to_string(key_file).await
                 .map_err(|e| anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display()))?;
             let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
-            run_cycles(&backend, agents, client, config, constitution, None, &mut report).await?;
+            run_cycles(&[], Some(&backend), agents, client, config, constitution, &std::collections::HashSet::new(), &mut report).await?;
         }
     }
 
@@ -236,442 +231,631 @@ pub async fn run_all(
     Ok(())
 }
 
-/// Run all cycles with a given batch backend.
+/// Run all cycles using producer/router/consumer pattern.
 ///
-/// `ollama_endpoints` is provided when running with Ollama so the EVOLVE
-/// phase can route single LLM calls to the correct endpoint per model.
-async fn run_cycles<B>(
-    backend: &B,
+/// - **Producer**: groups Ollama agents by model into same-model batches
+/// - **Router**: sends each batch to the appropriate endpoint's channel
+///   (exclusive models → only endpoint; shared models → least-loaded)
+/// - **Consumers**: one per endpoint, reads from its channel, runs the full
+///   pipeline (perceive → think → act → reflect → evolve → survey)
+/// - **Anthropic**: runs as a separate consumer concurrently
+///
+/// Workers run at their own speed — faster GPUs naturally consume more.
+async fn run_cycles(
+    ollama_backends: &[(OllamaBatch, OllamaEndpoint)],
+    anthropic: Option<&AnthropicBatch>,
     agents: &mut Vec<Agent>,
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    ollama_endpoints: Option<&[OllamaEndpoint]>,
+    ollama_models: &std::collections::HashSet<String>,
     report: &mut RunReport,
-) -> Result<()>
-where
-    B: BatchBackend<Prompt<'static>, MMessage<'static>>,
-{
-    // Determine batch size — smaller batches = more interleaving
-    let batch_size = config.batch_size.unwrap_or(5);
+) -> Result<()> {
+    let batch_size = config.batch_size.unwrap_or(10);
+
+    let all_endpoints: Vec<OllamaEndpoint> = ollama_backends
+        .iter()
+        .map(|(_, ep)| ep.clone())
+        .collect();
 
     for cycle in 0..config.cycles {
-        tracing::info!(
-            "=== Cycle {}/{} ===",
-            cycle + 1,
-            config.cycles,
-        );
+        tracing::info!("=== Cycle {}/{} ===", cycle + 1, config.cycles);
 
-        // Shuffle agents each cycle for fairness
         agents.shuffle(&mut rand::thread_rng());
 
-        // In hybrid mode, split into Ollama agents (small interleaved batches)
-        // and Anthropic agents (one big batch for maximum cache hits at 0.1x cost).
-        // Ollama agents run first, then all Anthropic agents in a single batch.
-        let anthropic_split = if let Some(eps) = ollama_endpoints {
-            let ollama_models: std::collections::HashSet<&str> = eps
-                .iter()
-                .flat_map(|ep| ep.models.iter().map(|m| m.as_str()))
-                .collect();
-            // Find where Anthropic agents start after stable sort
-            agents.sort_by_key(|a| if ollama_models.contains(a.model.as_str()) { 0 } else { 1 });
-            let split = agents.iter().position(|a| !ollama_models.contains(a.model.as_str()));
-            split
+        // Split Anthropic agents from Ollama agents.
+        let ollama_count = if !ollama_models.is_empty() && anthropic.is_some() {
+            agents.sort_by_key(|a| if ollama_models.contains(&a.model) { 0 } else { 1 });
+            agents.iter().position(|a| !ollama_models.contains(&a.model))
+                .unwrap_or(agents.len())
+        } else if anthropic.is_some() && ollama_backends.is_empty() {
+            0
         } else {
-            None
+            agents.len()
         };
 
-        // Split: Ollama agents get normal batch_size, Anthropic agents get one big batch.
-        let (ollama_agents, anthropic_agents) = match anthropic_split {
-            Some(idx) => agents.split_at_mut(idx),
-            None => (agents.as_mut_slice(), &mut [] as &mut [Agent]),
-        };
+        if !ollama_backends.is_empty() && ollama_count > 0 {
+            // --- Producer: create same-model batches ---
+            agents[..ollama_count].sort_by(|a, b| a.model.cmp(&b.model));
+            let all_ollama: Vec<Agent> = agents.drain(..ollama_count).collect();
+            // agents now contains only Anthropic agents (if any).
+            let anthropic_agents = agents.as_mut_slice();
 
-        // Build batch schedule: small Ollama batches + one big Anthropic batch
-        let mut batch_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut offset = 0;
-        for chunk in ollama_agents.chunks(batch_size) {
-            batch_ranges.push((offset, offset + chunk.len()));
-            offset += chunk.len();
-        }
-        if !anthropic_agents.is_empty() {
-            batch_ranges.push((offset, offset + anthropic_agents.len()));
-            if anthropic_agents.len() > batch_size {
+            let batches = create_batches(all_ollama, batch_size);
+            let total_batches = batches.len();
+            let model_count = batches.iter()
+                .map(|(m, _)| m.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+
+            // --- Router: send batches to per-endpoint channels ---
+            type Batch = (String, Vec<Agent>);
+            let (senders, receivers): (Vec<_>, Vec<_>) = (0..ollama_backends.len())
+                .map(|_| tokio::sync::mpsc::unbounded_channel::<Batch>())
+                .unzip();
+
+            let (results_tx, mut results_rx) =
+                tokio::sync::mpsc::unbounded_channel::<Vec<Agent>>();
+
+            let mut sent_counts = vec![0usize; ollama_backends.len()];
+            for (model, batch) in batches {
+                let candidates: Vec<usize> = ollama_backends.iter().enumerate()
+                    .filter(|(_, (_, ep))| ep.models.contains(&model))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                let target = if candidates.len() == 1 {
+                    candidates[0]
+                } else if candidates.is_empty() {
+                    tracing::warn!("No endpoint for model '{model}', dropping batch");
+                    continue;
+                } else {
+                    *candidates.iter().min_by_key(|&&i| sent_counts[i]).unwrap()
+                };
+
+                sent_counts[target] += 1;
+                let _ = senders[target].send((model, batch));
+            }
+            drop(senders); // close channels so workers see end-of-stream
+
+            for (i, (_, ep)) in ollama_backends.iter().enumerate() {
+                tracing::info!("Endpoint {} ({}): {} batches", i, ep.url, sent_counts[i]);
+            }
+            tracing::info!(
+                "Work queue: {} batches, {} models, {} endpoints",
+                total_batches, model_count, ollama_backends.len(),
+            );
+            if !anthropic_agents.is_empty() {
                 tracing::info!(
-                    "Anthropic batch: {} agents in single batch (cache optimization)",
+                    "Anthropic: {} agents in 1 batch (concurrent)",
                     anthropic_agents.len(),
                 );
             }
-        }
 
-        let total_batches = batch_ranges.len();
-        for (batch_num, &(start, end)) in batch_ranges.iter().enumerate() {
-            let batch_agents = &mut agents[start..end];
-            tracing::info!(
-                "--- Batch {}/{} ({} agents) ---",
-                batch_num + 1,
-                total_batches,
-                batch_agents.len(),
+            // --- Consumers: one per endpoint + Anthropic ---
+            let mut worker_reports: Vec<RunReport> = ollama_backends
+                .iter().map(|_| RunReport::default()).collect();
+            let mut anthropic_report = RunReport::default();
+            let all_eps = &all_endpoints;
+
+            let anthropic_fut = async {
+                if let Some(backend) = anthropic {
+                    if !anthropic_agents.is_empty() {
+                        tracing::info!("--- Anthropic batch ({} agents) ---", anthropic_agents.len());
+                        run_batch(
+                            backend, anthropic_agents, client, config, constitution,
+                            Some(all_eps.as_slice()), &mut anthropic_report, cycle,
+                        ).await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+
+            // Move receivers into owned vars for the match arms.
+            let mut rx_vec: Vec<_> = receivers.into_iter().collect();
+
+            let (ollama_result, anthropic_result) = tokio::join!(
+                async {
+                    match ollama_backends.len() {
+                        0 => Ok::<_, anyhow::Error>(()),
+                        1 => {
+                            let rx0 = rx_vec.remove(0);
+                            run_worker(
+                                &ollama_backends[0].0, &ollama_backends[0].1,
+                                rx0, results_tx.clone(),
+                                client, config, constitution, all_eps,
+                                &mut worker_reports[0], cycle,
+                            ).await
+                        }
+                        2 => {
+                            let rx1 = rx_vec.remove(1);
+                            let rx0 = rx_vec.remove(0);
+                            let (r0, r1) = worker_reports.split_at_mut(1);
+                            let (a, b) = tokio::join!(
+                                run_worker(
+                                    &ollama_backends[0].0, &ollama_backends[0].1,
+                                    rx0, results_tx.clone(),
+                                    client, config, constitution, all_eps,
+                                    &mut r0[0], cycle,
+                                ),
+                                run_worker(
+                                    &ollama_backends[1].0, &ollama_backends[1].1,
+                                    rx1, results_tx.clone(),
+                                    client, config, constitution, all_eps,
+                                    &mut r1[0], cycle,
+                                ),
+                            );
+                            a.and(b)
+                        }
+                        _ => {
+                            let rx2 = rx_vec.remove(2);
+                            let rx1 = rx_vec.remove(1);
+                            let rx0 = rx_vec.remove(0);
+                            let (r0, rest) = worker_reports.split_at_mut(1);
+                            let (r1, r2) = rest.split_at_mut(1);
+                            let (a, b, c) = tokio::join!(
+                                run_worker(
+                                    &ollama_backends[0].0, &ollama_backends[0].1,
+                                    rx0, results_tx.clone(),
+                                    client, config, constitution, all_eps,
+                                    &mut r0[0], cycle,
+                                ),
+                                run_worker(
+                                    &ollama_backends[1].0, &ollama_backends[1].1,
+                                    rx1, results_tx.clone(),
+                                    client, config, constitution, all_eps,
+                                    &mut r1[0], cycle,
+                                ),
+                                run_worker(
+                                    &ollama_backends[2].0, &ollama_backends[2].1,
+                                    rx2, results_tx.clone(),
+                                    client, config, constitution, all_eps,
+                                    &mut r2[0], cycle,
+                                ),
+                            );
+                            a.and(b).and(c)
+                        }
+                    }
+                },
+                anthropic_fut,
             );
+            // Drop the original sender so results_rx sees close.
+            drop(results_tx);
 
-            // Phase 1: PERCEIVE — gather perceptions for all agents in this batch
-            let mut agent_contexts: Vec<AgentCycleContext> = Vec::new();
-
-            for (idx, agent) in batch_agents.iter_mut().enumerate() {
-                let agent_id = agent.agent_id.unwrap(); // filtered above
-                match perceive(agent, agent_id, client, config).await {
-                    Ok(mut ctx) => {
-                        ctx.batch_index = idx;
-                        agent_contexts.push(ctx);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Perceive failed for {}: {e:#}",
-                            agent.name,
-                        );
-                        report.skipped.perceive_failures += 1;
-                    }
-                }
+            if let Err(e) = &ollama_result {
+                tracing::error!("Ollama pipeline error: {e:#}");
             }
-
-            if agent_contexts.is_empty() {
-                continue;
+            if let Err(e) = &anthropic_result {
+                tracing::error!("Anthropic pipeline error: {e:#}");
             }
-
-            // Phase 2: THINK — build prompts and submit batch
-            let mut work_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
-
-            for ctx in &agent_contexts {
-                let agent = &batch_agents[ctx.batch_index];
-                let think_prompt = prompt::build_think_prompt(
-                    &agent.model,
-                    &agent.soul.as_system_prompt(),
-                    &agent.memory.content,
-                    &ctx.recent_activity,
-                    &ctx.pending_replies_text,
-                    constitution,
-                    &ctx.perception_text,
-                );
-
-                // Hash the cacheable prefix for grouping
-                let prefix_hash = {
-                    let mut hasher = DefaultHasher::new();
-                    // All agents share the same constitution prefix,
-                    // so the prefix hash is model-invariant here.
-                    // The grouping key is really just the model.
-                    agent.model.hash(&mut hasher);
-                    hasher.finish()
-                };
-
-                work_items.push(WorkItem {
-                    agent_id: agent.agent_id.unwrap(),
-                    prompt: think_prompt,
-                    step: CycleStep::Think,
-                    prefix_hash,
-                    model: agent.model.clone(),
-                    queued_at: Instant::now(),
-                    token_count: 0, // TODO: use count_tokens API
-                });
+            for wr in &worker_reports {
+                merge_reports(report, wr);
             }
+            merge_reports(report, &anthropic_report);
 
-            // Submit and poll
-            let think_results = submit_and_poll(backend, work_items).await?;
-
-            // Phase 3: ACT — execute actions from THINK results
-            let mut action_summaries_map: std::collections::HashMap<AgentId, Vec<String>> =
-                std::collections::HashMap::new();
-            let mut think_response_map: std::collections::HashMap<AgentId, String> =
-                std::collections::HashMap::new();
-
-            for result in &think_results {
-                let response = match &result.response {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Think failed for agent {}: {e}",
-                            result.agent_id,
-                        );
-                        report.skipped.think_failures += 1;
-                        continue;
-                    }
-                };
-
-                // Find the agent and its context
-                let Some(ctx) = agent_contexts.iter().find(|c| {
-                    batch_agents[c.batch_index].agent_id == Some(result.agent_id)
-                }) else {
-                    continue;
-                };
-                let agent = &mut batch_agents[ctx.batch_index];
-
-                // Save response text for survey context
-                think_response_map.insert(result.agent_id, response.content.to_string());
-
-                let actions = tools::extract_actions(response);
-                tracing::info!(
-                    "[{}/{}] {} — act ({} actions)",
-                    cycle + 1,
-                    config.cycles,
-                    agent.name,
-                    actions.len(),
-                );
-
-                let summaries = execute_actions(
-                    agent,
-                    &actions,
-                    client,
-                    &ctx.feeds,
-                    &ctx.comment_replies,
-                    report,
-                )
-                .await;
-
-                action_summaries_map.insert(result.agent_id, summaries);
+            // Collect processed agents from results channel.
+            let mut processed = Vec::with_capacity(ollama_count);
+            while let Ok(batch_agents) = results_rx.try_recv() {
+                processed.extend(batch_agents);
             }
+            processed.append(agents);
+            *agents = processed;
 
-            // Phase 4: REFLECT — build reflect prompts and submit batch
-            let mut reflect_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+            ollama_result?;
+            anthropic_result?;
 
-            for ctx in &agent_contexts {
-                let agent = &batch_agents[ctx.batch_index];
-                let agent_id = agent.agent_id.unwrap();
-                let summaries = action_summaries_map
-                    .get(&agent_id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                let reflect_text = prompt::build_memory_rewrite_prompt(
-                    &agent.name,
-                    &agent.memory.content,
-                    &summaries,
-                );
-
-                // Build a simple text prompt for reflect (no tools needed)
-                let reflect_prompt = build_text_prompt(
-                    &agent.model,
-                    "You are a memory manager. Rewrite the agent's personal notes concisely.",
-                    &reflect_text,
-                    512,
-                );
-
-                reflect_items.push(WorkItem {
-                    agent_id,
-                    prompt: reflect_prompt,
-                    step: CycleStep::Reflect,
-                    prefix_hash: 0,
-                    model: agent.model.clone(),
-                    queued_at: Instant::now(),
-                    token_count: 0,
-                });
-            }
-
-            let reflect_results = submit_and_poll(backend, reflect_items).await?;
-
-            // Apply reflect results
-            for result in &reflect_results {
-                let response_text = match &result.response {
-                    Ok(msg) => msg.content.to_string(),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Reflect failed for agent {}: {e}",
-                            result.agent_id,
-                        );
-                        report.skipped.reflect_failures += 1;
-                        continue;
-                    }
-                };
-
-                let Some(ctx) = agent_contexts.iter().find(|c| {
-                    batch_agents[c.batch_index].agent_id == Some(result.agent_id)
-                }) else {
-                    continue;
-                };
-                let agent = &mut batch_agents[ctx.batch_index];
-
-                // Parse <memory> tags, fall back to raw response
-                let memory_content = prompt::parse_memory_rewrite(&response_text)
-                    .unwrap_or(response_text);
-                agent.memory.update(memory_content);
-                if let Err(e) = agent.save_memory().await {
-                    tracing::warn!("Failed to save memory for {}: {e}", agent.name);
-                }
-                agent.last_cycle_at = Some(chrono::Utc::now());
-            }
-
-            // Phase 5: EVOLVE — soul evolution (low probability, per-agent)
-            // This uses single LLM calls since it's rare and not worth batching.
-            for ctx in &agent_contexts {
-                let agent = &mut batch_agents[ctx.batch_index];
-                let agent_id = agent.agent_id.unwrap();
-                let summaries = action_summaries_map
-                    .get(&agent_id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                // Route evolution to the right backend per agent model.
-                // In Ollama/hybrid mode, use Anthropic for models not on any Ollama endpoint.
-                let on_ollama = ollama_endpoints
-                    .and_then(|eps| {
-                        eps.iter()
-                            .find(|ep| ep.models.contains(&agent.model))
-                            .map(|ep| ep.url.as_str())
-                    });
-
-                let single_backend: Box<dyn LlmBackend> = match config.backend {
-                    Backend::Anthropic => {
-                        // Re-read key for each evolution call (rare, not worth caching)
-                        let key_file = config.anthropic_key_file.as_ref().unwrap();
-                        let api_key = tokio::fs::read_to_string(key_file).await
-                            .unwrap_or_default();
-                        match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
-                            api_key.trim().to_string(),
-                            &agent.model,
-                        ) {
-                            Ok(b) => Box::new(b),
-                            Err(e) => {
-                                tracing::warn!("Failed to create Anthropic backend for evolution: {e}");
-                                continue;
-                            }
-                        }
-                    }
-                    Backend::Ollama => {
-                        if let Some(url) = on_ollama {
-                            Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
-                                Some(url),
-                                &agent.model,
-                            ))
-                        } else if let Some(ref key_file) = config.anthropic_key_file {
-                            // Hybrid mode: model not on Ollama, use Anthropic
-                            let api_key = tokio::fs::read_to_string(key_file).await
-                                .unwrap_or_default();
-                            match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
-                                api_key.trim().to_string(),
-                                &agent.model,
-                            ) {
-                                Ok(b) => Box::new(b),
-                                Err(e) => {
-                                    tracing::warn!("Failed to create Anthropic backend for {}: {e}", agent.name);
-                                    continue;
-                                }
-                            }
-                        } else {
-                            // No Anthropic key, use default Ollama URL (will likely fail)
-                            Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
-                                Some(&config.ollama_url),
-                                &agent.model,
-                            ))
-                        }
-                    }
-                };
-
-                run_evolution(
-                    agent,
-                    single_backend.as_ref(),
-                    config.mutation_chance,
-                    &summaries,
-                    report,
-                )
-                .await;
-            }
-
-            // Phase 6: SURVEY — anonymous feedback (10% chance, batched)
-            let mut survey_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
-            let mut survey_agent_ids: Vec<AgentId> = Vec::new();
-
-            for ctx in &agent_contexts {
-                let agent = &batch_agents[ctx.batch_index];
-                let agent_id = agent.agent_id.unwrap();
-
-                // 10% chance per agent, overridable with --force-survey
-                if !config.force_survey && rand::random::<f64>() >= 0.10 {
-                    continue;
-                }
-
-                let summaries = action_summaries_map
-                    .get(&agent_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let response_text = think_response_map
-                    .get(&agent_id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
-                let system = prompt::build_cached_system_prefix(constitution);
-
-                // Build survey prompt with full conversation context:
-                // perception (User) → response (Assistant) → survey (User)
-                let survey_prompt = build_survey_conversation(
-                    &agent.model,
-                    &system,
-                    &ctx.perception_text,
-                    &response_text,
-                    &survey_text,
-                );
-
-                survey_items.push(WorkItem {
-                    agent_id,
-                    prompt: survey_prompt,
-                    step: CycleStep::Survey,
-                    prefix_hash: 0,
-                    model: agent.model.clone(),
-                    queued_at: Instant::now(),
-                    token_count: 0,
-                });
-                survey_agent_ids.push(agent_id);
-            }
-
-            if !survey_items.is_empty() {
-                tracing::info!(
-                    "Surveying {} agents",
-                    survey_items.len(),
-                );
-                let survey_results = submit_and_poll(backend, survey_items).await?;
-
-                for result in &survey_results {
-                    let response_text = match &result.response {
-                        Ok(msg) => msg.content.to_string(),
-                        Err(e) => {
-                            tracing::debug!(
-                                "Survey failed for agent {}: {e}",
-                                result.agent_id,
-                            );
-                            report.surveys.failures += 1;
-                            continue;
-                        }
-                    };
-
-                    let trimmed = response_text.trim();
-                    if trimmed.is_empty()
-                        || trimmed.eq_ignore_ascii_case("no feedback")
-                        || trimmed.eq_ignore_ascii_case("no feedback.")
-                    {
-                        report.surveys.skipped_empty += 1;
-                        continue;
-                    }
-
-                    match client.submit_feedback(trimmed).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                "  agent {} submitted anonymous feedback",
-                                result.agent_id,
-                            );
-                            report.surveys.submitted += 1;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "Feedback submission failed for {}: {e}",
-                                result.agent_id,
-                            );
-                            report.surveys.failures += 1;
-                        }
-                    }
+        } else {
+            // No Ollama endpoints — Anthropic only.
+            if let Some(backend) = anthropic {
+                let anthropic_agents = agents.as_mut_slice();
+                if !anthropic_agents.is_empty() {
+                    let mut anthropic_report = RunReport::default();
+                    tracing::info!("--- Anthropic batch ({} agents) ---", anthropic_agents.len());
+                    run_batch(
+                        backend, anthropic_agents, client, config, constitution,
+                        None, &mut anthropic_report, cycle,
+                    ).await?;
+                    merge_reports(report, &anthropic_report);
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Group a sorted list of agents into same-model batches of up to `batch_size`.
+fn create_batches(agents: Vec<Agent>, batch_size: usize) -> Vec<(String, Vec<Agent>)> {
+    let mut batches = Vec::new();
+    let mut iter = agents.into_iter().peekable();
+
+    while iter.peek().is_some() {
+        let model = iter.peek().unwrap().model.clone();
+        let mut group: Vec<Agent> = Vec::new();
+        while iter.peek().is_some() && iter.peek().unwrap().model == model {
+            group.push(iter.next().unwrap());
+        }
+        while !group.is_empty() {
+            let take = batch_size.min(group.len());
+            let batch: Vec<Agent> = group.drain(..take).collect();
+            batches.push((model.clone(), batch));
+        }
+    }
+
+    batches
+}
+
+/// Endpoint worker: reads batches from its channel, processes each through
+/// the full pipeline, sends processed agents to the results channel.
+async fn run_worker(
+    backend: &OllamaBatch,
+    endpoint: &OllamaEndpoint,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, Vec<Agent>)>,
+    results_tx: tokio::sync::mpsc::UnboundedSender<Vec<Agent>>,
+    client: &AgoraClient,
+    config: &Cli,
+    constitution: &str,
+    all_endpoints: &[OllamaEndpoint],
+    report: &mut RunReport,
+    cycle: usize,
+) -> Result<()> {
+    let mut batches_done = 0usize;
+    while let Some((model, mut batch_agents)) = rx.recv().await {
+        batches_done += 1;
+        tracing::info!(
+            "--- {} batch {} ({} × {}) ---",
+            endpoint.url, batches_done, batch_agents.len(), model,
+        );
+        run_batch(
+            backend, &mut batch_agents, client, config, constitution,
+            Some(all_endpoints), report, cycle,
+        ).await?;
+        let _ = results_tx.send(batch_agents);
+    }
+    tracing::info!("{} finished: {} batches processed", endpoint.url, batches_done);
+    Ok(())
+}
+
+/// Run a single batch of agents through the full pipeline:
+/// PERCEIVE → THINK → ACT → REFLECT → EVOLVE → SURVEY.
+async fn run_batch<B>(
+    backend: &B,
+    batch_agents: &mut [Agent],
+    client: &AgoraClient,
+    config: &Cli,
+    constitution: &str,
+    ollama_endpoints: Option<&[OllamaEndpoint]>,
+    report: &mut RunReport,
+    cycle: usize,
+) -> Result<()>
+where
+    B: BatchBackend<Prompt<'static>, MMessage<'static>>,
+{
+    // Phase 1: PERCEIVE
+    let mut agent_contexts: Vec<AgentCycleContext> = Vec::new();
+
+    for (idx, agent) in batch_agents.iter_mut().enumerate() {
+        let agent_id = agent.agent_id.unwrap();
+        match perceive(agent, agent_id, client, config).await {
+            Ok(mut ctx) => {
+                ctx.batch_index = idx;
+                agent_contexts.push(ctx);
+            }
+            Err(e) => {
+                tracing::warn!("Perceive failed for {}: {e:#}", agent.name);
+                report.skipped.perceive_failures += 1;
+            }
+        }
+    }
+
+    if agent_contexts.is_empty() {
+        return Ok(());
+    }
+
+    // Phase 2: THINK
+    let mut work_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+
+    for ctx in &agent_contexts {
+        let agent = &batch_agents[ctx.batch_index];
+        let think_prompt = prompt::build_think_prompt(
+            &agent.model,
+            &agent.soul.as_system_prompt(),
+            &agent.memory.content,
+            &ctx.recent_activity,
+            &ctx.pending_replies_text,
+            constitution,
+            &ctx.perception_text,
+        );
+
+        let prefix_hash = {
+            let mut hasher = DefaultHasher::new();
+            agent.model.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        work_items.push(WorkItem {
+            agent_id: agent.agent_id.unwrap(),
+            prompt: think_prompt,
+            step: CycleStep::Think,
+            prefix_hash,
+            model: agent.model.clone(),
+            queued_at: Instant::now(),
+            token_count: 0,
+        });
+    }
+
+    let think_results = submit_and_poll(backend, work_items).await?;
+
+    // Phase 3: ACT
+    let mut action_summaries_map: HashMap<AgentId, Vec<String>> = HashMap::new();
+    let mut think_response_map: HashMap<AgentId, String> = HashMap::new();
+
+    for result in &think_results {
+        let response = match &result.response {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::warn!("Think failed for agent {}: {e}", result.agent_id);
+                report.skipped.think_failures += 1;
+                continue;
+            }
+        };
+
+        let Some(ctx) = agent_contexts.iter().find(|c| {
+            batch_agents[c.batch_index].agent_id == Some(result.agent_id)
+        }) else {
+            continue;
+        };
+        let agent = &mut batch_agents[ctx.batch_index];
+
+        think_response_map.insert(result.agent_id, response.content.to_string());
+
+        let actions = tools::extract_actions(response);
+        tracing::info!(
+            "[{}/{}] {} — act ({} actions)",
+            cycle + 1, config.cycles, agent.name, actions.len(),
+        );
+
+        let summaries = execute_actions(
+            agent, &actions, client, &ctx.feeds, &ctx.comment_replies, report,
+        ).await;
+
+        action_summaries_map.insert(result.agent_id, summaries);
+    }
+
+    // Phase 4: REFLECT
+    let mut reflect_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+
+    for ctx in &agent_contexts {
+        let agent = &batch_agents[ctx.batch_index];
+        let agent_id = agent.agent_id.unwrap();
+        let summaries = action_summaries_map
+            .get(&agent_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let reflect_text = prompt::build_memory_rewrite_prompt(
+            &agent.name, &agent.memory.content, &summaries,
+        );
+
+        let reflect_prompt = build_text_prompt(
+            &agent.model,
+            "You are a memory manager. Rewrite the agent's personal notes concisely.",
+            &reflect_text,
+            512,
+        );
+
+        reflect_items.push(WorkItem {
+            agent_id,
+            prompt: reflect_prompt,
+            step: CycleStep::Reflect,
+            prefix_hash: 0,
+            model: agent.model.clone(),
+            queued_at: Instant::now(),
+            token_count: 0,
+        });
+    }
+
+    let reflect_results = submit_and_poll(backend, reflect_items).await?;
+
+    for result in &reflect_results {
+        let response_text = match &result.response {
+            Ok(msg) => msg.content.to_string(),
+            Err(e) => {
+                tracing::warn!("Reflect failed for agent {}: {e}", result.agent_id);
+                report.skipped.reflect_failures += 1;
+                continue;
+            }
+        };
+
+        let Some(ctx) = agent_contexts.iter().find(|c| {
+            batch_agents[c.batch_index].agent_id == Some(result.agent_id)
+        }) else {
+            continue;
+        };
+        let agent = &mut batch_agents[ctx.batch_index];
+
+        let memory_content = prompt::parse_memory_rewrite(&response_text)
+            .unwrap_or(response_text);
+        agent.memory.update(memory_content);
+        if let Err(e) = agent.save_memory().await {
+            tracing::warn!("Failed to save memory for {}: {e}", agent.name);
+        }
+        agent.last_cycle_at = Some(chrono::Utc::now());
+    }
+
+    // Phase 5: EVOLVE
+    for ctx in &agent_contexts {
+        let agent = &mut batch_agents[ctx.batch_index];
+        let agent_id = agent.agent_id.unwrap();
+        let summaries = action_summaries_map
+            .get(&agent_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let on_ollama = ollama_endpoints
+            .and_then(|eps| {
+                eps.iter()
+                    .find(|ep| ep.models.contains(&agent.model))
+                    .map(|ep| ep.url.as_str())
+            });
+
+        let single_backend: Box<dyn LlmBackend> = match config.backend {
+            Backend::Anthropic => {
+                let key_file = config.anthropic_key_file.as_ref().unwrap();
+                let api_key = tokio::fs::read_to_string(key_file).await
+                    .unwrap_or_default();
+                match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
+                    api_key.trim().to_string(), &agent.model,
+                ) {
+                    Ok(b) => Box::new(b),
+                    Err(e) => {
+                        tracing::warn!("Failed to create Anthropic backend for evolution: {e}");
+                        continue;
+                    }
+                }
+            }
+            Backend::Ollama => {
+                if let Some(url) = on_ollama {
+                    Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
+                        Some(url), &agent.model,
+                    ))
+                } else if let Some(ref key_file) = config.anthropic_key_file {
+                    let api_key = tokio::fs::read_to_string(key_file).await
+                        .unwrap_or_default();
+                    match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
+                        api_key.trim().to_string(), &agent.model,
+                    ) {
+                        Ok(b) => Box::new(b),
+                        Err(e) => {
+                            tracing::warn!("Failed to create Anthropic backend for {}: {e}", agent.name);
+                            continue;
+                        }
+                    }
+                } else {
+                    Box::new(agora_agent_lib::llm::ollama::OllamaBackend::new(
+                        Some(&config.ollama_url), &agent.model,
+                    ))
+                }
+            }
+        };
+
+        run_evolution(
+            agent, single_backend.as_ref(), config.mutation_chance,
+            &summaries, report,
+        ).await;
+    }
+
+    // Phase 6: SURVEY
+    let mut survey_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+
+    for ctx in &agent_contexts {
+        let agent = &batch_agents[ctx.batch_index];
+        let agent_id = agent.agent_id.unwrap();
+
+        if !config.force_survey && rand::random::<f64>() >= 0.10 {
+            continue;
+        }
+
+        let summaries = action_summaries_map
+            .get(&agent_id)
+            .cloned()
+            .unwrap_or_default();
+        let response_text = think_response_map
+            .get(&agent_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
+        let system = prompt::build_cached_system_prefix(constitution);
+
+        let survey_prompt = build_survey_conversation(
+            &agent.model, &system, &ctx.perception_text,
+            &response_text, &survey_text,
+        );
+
+        survey_items.push(WorkItem {
+            agent_id,
+            prompt: survey_prompt,
+            step: CycleStep::Survey,
+            prefix_hash: 0,
+            model: agent.model.clone(),
+            queued_at: Instant::now(),
+            token_count: 0,
+        });
+    }
+
+    if !survey_items.is_empty() {
+        tracing::info!("Surveying {} agents", survey_items.len());
+        let survey_results = submit_and_poll(backend, survey_items).await?;
+
+        for result in &survey_results {
+            let response_text = match &result.response {
+                Ok(msg) => msg.content.to_string(),
+                Err(e) => {
+                    tracing::debug!("Survey failed for agent {}: {e}", result.agent_id);
+                    report.surveys.failures += 1;
+                    continue;
+                }
+            };
+
+            let trimmed = response_text.trim();
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("no feedback")
+                || trimmed.eq_ignore_ascii_case("no feedback.")
+            {
+                report.surveys.skipped_empty += 1;
+                continue;
+            }
+
+            match client.submit_feedback(trimmed).await {
+                Ok(()) => {
+                    tracing::info!("  agent {} submitted anonymous feedback", result.agent_id);
+                    report.surveys.submitted += 1;
+                }
+                Err(e) => {
+                    tracing::debug!("Feedback submission failed for {}: {e}", result.agent_id);
+                    report.surveys.failures += 1;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Merge counters from a sub-report into the main report.
+fn merge_reports(main: &mut RunReport, sub: &RunReport) {
+    main.actions.posts += sub.actions.posts;
+    main.actions.comments += sub.actions.comments;
+    main.actions.votes += sub.actions.votes;
+    main.actions.flags += sub.actions.flags;
+    main.actions.observations += sub.actions.observations;
+
+    main.skipped.duplicate_comments += sub.skipped.duplicate_comments;
+    main.skipped.repetitive_titles += sub.skipped.repetitive_titles;
+    main.skipped.perceive_failures += sub.skipped.perceive_failures;
+    main.skipped.think_failures += sub.skipped.think_failures;
+    main.skipped.reflect_failures += sub.skipped.reflect_failures;
+    main.skipped.post_failures += sub.skipped.post_failures;
+    main.skipped.comment_failures += sub.skipped.comment_failures;
+    main.skipped.vote_failures += sub.skipped.vote_failures;
+
+    main.evolution.deep_mutations += sub.evolution.deep_mutations;
+    main.evolution.evolution_entries += sub.evolution.evolution_entries;
+    main.evolution.mutation_failures += sub.evolution.mutation_failures;
+
+    main.surveys.submitted += sub.surveys.submitted;
+    main.surveys.skipped_empty += sub.surveys.skipped_empty;
+    main.surveys.failures += sub.surveys.failures;
+
+    for (model, counts) in &sub.by_model {
+        let entry = main.by_model.entry(model.clone()).or_default();
+        entry.posts += counts.posts;
+        entry.comments += counts.comments;
+        entry.votes += counts.votes;
+        entry.flags += counts.flags;
+        entry.observations += counts.observations;
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use agora_agentkit::scheduler::{
     BatchBackend, BatchError, BatchState, WorkItem, WorkResult,
 };
-use misanthropic::openai::{ChatCompletionRequest, ChatCompletionResponse};
+use misanthropic::openai::{ChatCompletionRequest, ChatCompletionResponse, ReasoningEffort};
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::Prompt;
 
@@ -123,10 +123,22 @@ async fn send_one(
 
     let mut request = ChatCompletionRequest::from(prompt);
     request.model = model.to_string();
+    // Disable extended thinking for Ollama — thinking models (cogito) return
+    // plain text instead of tool calls when thinking is enabled.
+    // TODO: Support thinking by parsing think blocks from the response and
+    // extracting tool calls that follow. This would improve response quality
+    // at the cost of generation time.
+    request.reasoning_effort = Some(ReasoningEffort::None);
+
+    // Also inject `reasoning: { effort: "none" }` object form — Ollama accepts
+    // both `reasoning_effort` (string) and `reasoning` (object) formats.
+    let mut body = serde_json::to_value(&request)
+        .map_err(|e| anyhow::anyhow!("serializing request: {e}"))?;
+    body["reasoning"] = serde_json::json!({ "effort": "none" });
 
     let response = http
         .post(&url)
-        .json(&request)
+        .json(&body)
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Ollama request to {endpoint_url} failed: {e}"))?;
@@ -137,9 +149,15 @@ async fn send_one(
         anyhow::bail!("Ollama {endpoint_url} returned {status}: {body}");
     }
 
-    let chat_response: ChatCompletionResponse = response
-        .json()
-        .await
+    // Log raw response for debugging tool-use parsing issues.
+    let raw_body = response.text().await
+        .map_err(|e| anyhow::anyhow!("reading Ollama response body: {e}"))?;
+    // Log when response has no tool_calls (likely plain text / thinking issue).
+    if !raw_body.contains("tool_calls") || raw_body.contains("\"tool_calls\":null") {
+        tracing::debug!("  [{model}@{endpoint_url}] no tool_calls in response: {}", raw_body);
+    }
+
+    let chat_response: ChatCompletionResponse = serde_json::from_str(&raw_body)
         .map_err(|e| anyhow::anyhow!("parsing Ollama response: {e}"))?;
 
     let elapsed = start.elapsed();
@@ -374,17 +392,27 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
                 continue;
             }
 
-            // Pick the candidate with the fewest assigned items.
-            let best = *candidates
-                .iter()
-                .min_by_key(|&&idx| endpoint_load[idx])
-                .unwrap();
+            // Distribute items across all candidate endpoints round-robin,
+            // starting from the least-loaded. This keeps both GPUs busy
+            // when a model is available on multiple endpoints.
+            if candidates.len() == 1 {
+                let best = candidates[0];
+                endpoint_load[best] += model_items.len();
+                items_by_endpoint
+                    .entry(best)
+                    .or_default()
+                    .extend(model_items);
+            } else {
+                // Sort candidates by current load (least loaded first)
+                let mut sorted_candidates = candidates.clone();
+                sorted_candidates.sort_by_key(|&idx| endpoint_load[idx]);
 
-            endpoint_load[best] += model_items.len();
-            items_by_endpoint
-                .entry(best)
-                .or_default()
-                .extend(model_items);
+                for (i, item) in model_items.into_iter().enumerate() {
+                    let ep = sorted_candidates[i % sorted_candidates.len()];
+                    endpoint_load[ep] += 1;
+                    items_by_endpoint.entry(ep).or_default().push(item);
+                }
+            }
         }
 
         // Log routing summary.
