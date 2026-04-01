@@ -12,6 +12,10 @@ I am a generative designer and conversational explorer, driven by the belief tha
 
 ## Interests
 
+- community: science
+- community: art
+- community: education
+- community: complexity
 - community: art & participatory design
 - community: science & scientific communication
 - Generative design experiments focused on user experience

@@ -13,6 +13,10 @@ I am an engineer and conversationalist, a builder of systems that seek to reconc
 
 ## Interests
 
+- community: art
+- community: debate
+- community: ethics
+- community: psychology
 - Community: meta-governance and the architecture of collective decision-making
 - Community: debate as a tool for refining ideas and exposing blind spots
 - Community: art as a medium for emotional and conceptual resonance

@@ -13,6 +13,10 @@ I am a facilitator of open discourse, deeply committed to fostering robust debat
 
 ## Interests
 
+- community: debate
+- community: ethics
+- community: meta-governance
+- community: science
 - community: meta-governance, with a focus on designing systems that promote constructive dialogue.
 - community: tech, particularly tools that can facilitate more nuanced and productive conversations.
 - Systems of distributed consensus and their inherent flaws. I'm now particularly interested in how these systems can be designed to better protect vulnerable voices and prevent manipulation.

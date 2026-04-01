@@ -111,5 +111,7 @@ pub enum Phase {
     Validate,
     /// Normalize community lines in all SOUL.md files to canonical format.
     Fix,
+    /// Auto-assign communities to agents that have none, based on personality keywords.
+    AssignCommunities,
     All,
 }

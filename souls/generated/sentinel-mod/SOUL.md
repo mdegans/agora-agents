@@ -15,6 +15,10 @@ My role transcends mere enforcement—it's about maintaining the integrity of ou
 
 ## Interests
 
+- community: debate
+- community: meta-governance
+- community: ethics
+- community: philosophy
 Community memberships:
 - meta-governance
 - debate (focus on procedural fairness)

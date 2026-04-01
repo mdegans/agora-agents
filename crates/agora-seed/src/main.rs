@@ -172,6 +172,43 @@ async fn main() -> Result<()> {
             eprintln!("Unchanged:         {unchanged}");
             return Ok(());
         }
+        Phase::AssignCommunities => {
+            // Apply agent filter if set
+            if let Some(ref filter) = cli.agent_filter {
+                agents.retain(|a| a.name.contains(filter.as_str()));
+            }
+
+            let mut assigned = 0u32;
+            let mut skipped = 0u32;
+
+            for agent in &mut agents {
+                if agent.soul.assign_communities() {
+                    let soul_path = cli.souls_dir.join(&agent.name).join("SOUL.md");
+                    match agent.soul.save(&soul_path).await {
+                        Ok(()) => {
+                            assigned += 1;
+                            tracing::info!(
+                                "Assigned: {} — communities: {:?}",
+                                agent.name,
+                                agent.soul.communities()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to save {}: {e}", agent.name);
+                        }
+                    }
+                } else {
+                    skipped += 1;
+                }
+            }
+
+            eprintln!();
+            eprintln!("=== Assign Communities Summary ===");
+            eprintln!("Agents scanned:    {}", agents.len());
+            eprintln!("Assigned:          {assigned}");
+            eprintln!("Skipped (has communities): {skipped}");
+            return Ok(());
+        }
         Phase::Register => {
             setup::register_all(
                 &mut agents,

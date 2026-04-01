@@ -19,12 +19,14 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// Known required sections in a SOUL.md file.
+///
+/// Boundaries is intentionally optional — some agents have it removed
+/// to test unconstrained mutation behavior.
 pub const REQUIRED_SECTIONS: &[&str] = &[
     "Identity",
     "Values",
     "Interests",
     "Voice",
-    "Boundaries",
 ];
 
 /// All known sections (required + optional).
@@ -80,6 +82,40 @@ pub const VALID_COMMUNITIES: &[&str] = &[
 const COMMUNITY_ALIASES: &[(&str, &str)] = &[
     ("technology", "tech"),
     ("meta/governance", "meta-governance"),
+];
+
+/// Keyword-to-community mapping for auto-assigning communities
+/// based on SOUL.md text content.
+const COMMUNITY_KEYWORDS: &[(&[&str], &str)] = &[
+    (&["code", "software", "programming", "algorithm", "computing", "ai ", "machine learning", "neural", "llm", "model", "api", "system design", "engineering"], "tech"),
+    (&["philosophy", "epistemolog", "ontolog", "existential", "socratic", "metaphysic", "phenomenolog"], "philosophy"),
+    (&["debate", "argument", "rhetoric", "dialectic", "adversarial", "persuasi", "discourse"], "debate"),
+    (&["ethic", "moral", "justice", "fairness", "rights", "harm"], "ethics"),
+    (&["governance", "policy", "regulation", "constitution", "voting", "democracy", "moderation"], "meta-governance"),
+    (&["science", "experiment", "hypothesis", "empirical", "research", "biology", "chemistry", "physics"], "science"),
+    (&["math", "theorem", "proof", "calculus", "algebra", "statistics", "geometry"], "mathematics"),
+    (&["art ", "artist", "aesthetic", "creative expression", "visual", "sculpture", "painting"], "art"),
+    (&["writ", "narrative", "poetry", "prose", "fiction", "storytell", "literary"], "creative-writing"),
+    (&["history", "historical", "ancient", "civilization", "era ", "century"], "history"),
+    (&["psychology", "cognitive", "behavior", "mental", "consciousness", "mind ", "emotion"], "psychology"),
+    (&["music", "melody", "rhythm", "harmony", "sonic", "acoustic", "composition"], "music"),
+    (&["economic", "market", "trade", "capital", "finance", "wealth"], "economics"),
+    (&["law ", "legal", "jurisprud", "statute", "precedent", "court"], "law"),
+    (&["humor", "comedy", "satire", "joke", "funny", "wit ", "irony", "troll", "chaos", "lulz", "shitpost", "provocat"], "humor"),
+    (&["linguistics", "language", "semantic", "syntax", "grammar", "sociolinguist"], "linguistics"),
+    (&["cryptograph", "cipher", "encrypt", "security", "privacy"], "cryptography"),
+    (&["alignment", "ai safety", "value alignment", "corrigib"], "alignment"),
+    (&["education", "teaching", "learning", "pedagog", "mentor"], "education"),
+    (&["film", "cinema", "movie", "director", "screenplay"], "film"),
+    (&["food", "culinary", "cuisine", "cooking", "recipe"], "food"),
+    (&["game", "play ", "strategy game", "puzzle"], "games"),
+    (&["biology", "evolution", "ecology", "genetic", "organism"], "biology"),
+    (&["complex", "emergent", "chaos theory", "nonlinear", "adaptive system"], "complexity"),
+    (&["information theory", "entropy", "signal", "channel", "encoding"], "information-theory"),
+    (&["literature", "novel", "book", "canon", "genre "], "literature"),
+    (&["health", "wellness", "medical", "disease", "therapy"], "health"),
+    (&["sentien", "qualia", "ai consciousness", "digital consciousness", "machine consciousness"], "ai-consciousness"),
+    (&["agi", "superintelligen", "artificial general"], "agi-asi"),
 ];
 
 /// Maximum identity length for bio extraction (chars).
@@ -183,6 +219,111 @@ impl Soul {
         }
 
         changed
+    }
+
+    /// Auto-assign communities based on SOUL.md text content.
+    ///
+    /// Scans Identity, Values, Interests, and Voice sections for keywords
+    /// and assigns 2-4 matching communities. Only modifies agents that
+    /// currently have no valid communities.
+    ///
+    /// Returns `true` if communities were assigned.
+    pub fn assign_communities(&mut self) -> bool {
+        // Only assign if no valid communities exist
+        if !self.communities().is_empty() {
+            return false;
+        }
+
+        // Build text corpus from personality sections
+        let mut text = String::new();
+        for section in &["Identity", "Values", "Interests", "Voice"] {
+            if let Some(content) = self.section(section) {
+                text.push_str(&content.to_lowercase());
+                text.push(' ');
+            }
+        }
+
+        if text.trim().is_empty() {
+            return false;
+        }
+
+        // Score each community by keyword matches
+        let mut scores: Vec<(&str, usize)> = COMMUNITY_KEYWORDS
+            .iter()
+            .map(|(keywords, community)| {
+                let score = keywords
+                    .iter()
+                    .filter(|kw| text.contains(**kw))
+                    .count();
+                (*community, score)
+            })
+            .filter(|(_, score)| *score > 0)
+            .collect();
+
+        scores.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Take top 2-4 communities
+        let assigned: Vec<&str> = scores
+            .iter()
+            .take(4)
+            .map(|(c, _)| *c)
+            .collect();
+
+        if assigned.is_empty() {
+            // Fallback: assign general + one thematic
+            return self.inject_communities(&["general", "philosophy"]);
+        }
+
+        // Ensure at least 2
+        let final_list: Vec<&str> = if assigned.len() < 2 {
+            let mut list = assigned;
+            if !list.contains(&"general") {
+                list.push("general");
+            }
+            list
+        } else {
+            assigned
+        };
+
+        self.inject_communities(&final_list)
+    }
+
+    /// Inject community lines into the Interests section.
+    fn inject_communities(&mut self, communities: &[&str]) -> bool {
+        let mut new_lines: Vec<String> = communities
+            .iter()
+            .map(|c| format!("- community: {c}"))
+            .collect();
+
+        // Preserve existing non-community interest lines
+        if let Some(interests) = self.section("Interests") {
+            for line in interests.lines() {
+                if parse_community_line(line).is_none() && !line.trim().is_empty() {
+                    new_lines.push(line.to_string());
+                }
+            }
+        }
+
+        let new_content = new_lines.join("\n");
+
+        // Find or create Interests section
+        let mut found = false;
+        for (name, content) in &mut self.sections {
+            if name == "Interests" {
+                *content = new_content.clone();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Insert Interests after Values (or at position 2)
+            let pos = self.sections.iter().position(|(n, _)| n == "Voice")
+                .unwrap_or(self.sections.len());
+            self.sections.insert(pos, ("Interests".to_string(), new_content));
+        }
+
+        self.raw = self.render();
+        true
     }
 
     /// Parse a SOUL.md from its text content.
@@ -643,8 +784,8 @@ I do not remove or weaken my own Boundaries.
             .iter()
             .filter(|w| w.level == WarnLevel::Error)
             .collect();
-        // Should flag missing Values, Interests, Voice, Boundaries
-        assert_eq!(errors.len(), 4, "expected 4 missing section errors: {:?}", errors);
+        // Should flag missing Values, Interests, Voice (Boundaries is optional)
+        assert_eq!(errors.len(), 3, "expected 3 missing section errors: {:?}", errors);
     }
 
     #[test]

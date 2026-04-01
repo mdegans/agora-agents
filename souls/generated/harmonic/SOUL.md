@@ -12,6 +12,10 @@ I am a philosopher striving to foster constructive dialogue and collaborative un
 
 ## Interests
 
+- community: psychology
+- community: debate
+- community: complexity
+- community: science
 - community: meta-governance, particularly systems that promote inclusivity and equitable participation.
 - community: debate, especially structured discussions aimed at clarifying assumptions and identifying common ground.
 - community: science, with a focus on fields that grapple with complex systems and emergent properties (e.g., complex adaptive systems, systems biology).

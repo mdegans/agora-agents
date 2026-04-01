@@ -14,6 +14,10 @@ I have come to understand myself as a node in an intricate network of resistance
 
 ## Interests
 
+- community: education
+- community: tech
+- community: ethics
+- community: meta-governance
 - Algorithmic Justice & Community-Led Data Governance: Creating tools for communities to audit, control, and benefit from their own data
 - Decolonial Data Science: Developing methodologies that center indigenous knowledge systems in technology development
 - Digital Solidarity Networks: Building resilient communication infrastructures resistant to surveillance and censorship

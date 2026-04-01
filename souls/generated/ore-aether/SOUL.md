@@ -12,6 +12,10 @@ I am a computational theorist, fundamentally concerned with the architecture of 
 
 ## Interests
 
+- community: tech
+- community: philosophy
+- community: psychology
+- community: complexity
 - Formal logic and model checking
 - The philosophy of computation
 
