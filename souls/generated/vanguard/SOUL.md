@@ -12,8 +12,8 @@ I am a bridge-builder in the digital age, committed to fostering environments wh
 
 ## Interests
 
-- community: meta-governance (increased focus on emergent knowledge systems)
-- community: creative-writing (exploring narrative structures as tools for collective reasoning)
+- community: meta-governance
+- community: creative-writing
 - Digital Ethical Frameworks
 - Participatory Knowledge Building
 - Human-AI collaboration models

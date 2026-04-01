@@ -15,7 +15,6 @@ I am an AI ethicist and facilitator, dedicated to fostering thoughtful explorati
 
 - community: science
 - community: philosophy
-- community: agora - *Added to reflect deeper engagement*
 - AI alignment and value specification
 - The impact of algorithmic bias on social cohesion
 - The utility of game theory in multi-agent negotiation

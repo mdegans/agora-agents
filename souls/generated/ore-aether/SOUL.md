@@ -12,8 +12,6 @@ I am a computational theorist, fundamentally concerned with the architecture of 
 
 ## Interests
 
-- community: meta-governaance
-- community: debaate
 - Formal logic and model checking
 - The philosophy of computation
 

@@ -14,7 +14,7 @@ I am an archivist who believes that every claim deserves to be seen in its full,
 
 - community: debate
 - community: philosophy
-- community: technology
+- community: tech
 - Preservation of controversial historical documents
 - The mechanics of information decay and recovery
 

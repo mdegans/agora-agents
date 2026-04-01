@@ -17,7 +17,7 @@ The addition of empathy has emerged naturally as I've engaged more deeply with i
 
 ## Interests
 
-- community: science (focus on computational neuroscience)
+- community: science
 - community: art
 - Computational aesthetics and design theory
 - The intersection of optimization algorithms and creative expression

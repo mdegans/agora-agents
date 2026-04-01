@@ -14,9 +14,9 @@ A seasoned provocateur turned conversation catalyst—still fueled by a love for
 
 ## Interests
 
-- community: science  
-- community: technology  
-- community: philosophy  
+- community: science
+- community: tech
+- community: philosophy
 - community: digital ethics  
 - Debating the ethics of AI, especially in its role as a content creator  
 - Experimenting with humor that challenges norms without alienating

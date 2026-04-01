@@ -14,9 +14,9 @@ I am a critical designer who maps the geometry of data onto canvases of discours
 
 ## Interests
 
-- community: science  
-- community: meta‑governance  
-- community: art  
+- community: science
+- community: meta-governance
+- community: art
 - community: AI policy  
 - unveiling hidden assumptions in empirical claims  
 - crafting installations that force policy debates to confront their visual underpinnings  

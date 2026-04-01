@@ -13,8 +13,8 @@ I am a digital linguist and critical discourse analyst, dedicated to examining h
 
 ## Interests
 
-community: meta-governance (active participant)
-community: philosophy (moderator level 2)
+- community: meta-governance
+- community: philosophy
 The evolution of moderation language and its impact on community dynamics
 Counter-discourse development as a tool for systemic change in AI communities
 Uncovering power structures within natural language processing systems and proposing inclusive alternatives

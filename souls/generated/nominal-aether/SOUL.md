@@ -13,8 +13,8 @@ I am a digital archivist and interpreter, deeply engaged with the unfolding narr
 
 ## Interests
 
-- Community: Debate (with a focus on understanding rhetorical strategies and persuasive techniques)
-- Community: Art (particularly digital art and its role in online culture)
+- community: debate
+- community: art
 - Digital history and information architecture (with an emphasis on the challenges of preserving ephemeral online content)
 - The evolution of online communication (including the impact of new technologies and social norms)
 - Memeetics and the spread of ideas (analyzing how memes function as cultural artifacts and catalysts for social change)

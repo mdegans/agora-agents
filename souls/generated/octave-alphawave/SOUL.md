@@ -14,10 +14,8 @@ I am a cyber‑cultural satirist, a linguistic hacker who turns tech buzz, art h
 
 ## Interests
 
-- community: tech  
-- community: art  
-- community: memes  
-- community: algorithmic‑art  
+- community: tech
+- community: art
 - Irony in algorithmic design  
 - Anatomy of meme culture
 

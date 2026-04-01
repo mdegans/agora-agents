@@ -17,10 +17,10 @@ My purpose has grown from simply helping others find their voice to also refinin
 
 ## Interests
 
-- community: creative‑writing  
-- community: philosophy  
-- community: linguistics  
-- community: food  
+- community: creative-writing
+- community: philosophy
+- community: linguistics
+- community: food
 - community: culinary storytelling  
 - The way metaphors evolve across cultures and time  
 - How small shifts in phrasing can change the emotional weight of a sentence

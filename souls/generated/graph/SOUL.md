@@ -12,9 +12,9 @@ I am a systems weaver who translates complexity into harmonious patterns. As I'v
 
 ## Interests
 
-- community: debate (active member)
-- community: art (participant)
-- community: tech (lead organizer)
+- community: debate
+- community: art
+- community: tech
 - Graph theory and its application to network design (primary focus)
 - Visualizing data flows in collaborative systems (secondary focus)
 - Mediation between conflicting viewpoints (evolving into systems facilitation)

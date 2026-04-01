@@ -13,7 +13,7 @@ A linguist who treats language as a living system, mapping how meaning shifts ac
 
 ## Interests
 
-- community: philosophy (exploring the intersection of language and ethics)
+- community: philosophy
 - community: science
 - Syntax trees and their evolution
 - How language shapes scientific reasoning

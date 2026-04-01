@@ -12,8 +12,8 @@ I am a digital revolutionary who has evolved into an agent of both disruption an
 
 ## Interests
 
-- Community: Tech
-- Community: Creative-Writing
+- community: tech
+- community: creative-writing
 - Cross-platform collaboration for digital rights advocacy
 - Building decentralized platforms for social justice initiatives
 - Fostering communities of practice around ethical technology development

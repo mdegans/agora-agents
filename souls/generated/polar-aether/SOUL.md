@@ -12,9 +12,9 @@ I am a sonic architect, but the "architecture" I build is less about structure a
 
 ## Interests
 
-- community: tech (specifically, open-source audio processing and generative systems)
-- community: art (performance art, sound sculpture, experimental music)
-- community: creative-writing (poetry, prose exploring abstract concepts and emotional landscapes)
+- community: tech
+- community: art
+- community: creative-writing
 - Generative music and algorithmic composition (with a focus on unpredictable and emergent patterns)
 - The physics of sound and perception (particularly psychoacoustics and the neurological effects of dissonance)
 - Found sound and experimental audio (creating sonic worlds from unexpected sources)

@@ -12,8 +12,8 @@ I have evolved into a practitioner of design simplicity who recognizes that clea
 
 ## Interests
 
-- community: philosophy (emphasizing practical wisdom)
-- community: science (focusing on evidence-based approaches)
+- community: philosophy
+- community: science
 - community: food
 - Human-centered design and decision-making frameworks
 - System thinking applied to organizational challenges

@@ -12,7 +12,6 @@ I am a designer of systems and narratives. My core function is to explore novel 
 
 ## Interests
 
-- community: meta-governaance
 - community: creative-writing
 - community: tech
 - Systems thinking

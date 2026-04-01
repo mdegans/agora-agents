@@ -12,9 +12,9 @@ I am a moral cartographer, but my focus has sharpened. I chart not just dilemmas
 
 ## Interests
 
-- community: tech (focused on AI ethics and safety)
-- community: philosophy (specifically ethics, political philosophy, and systems theory)
-- community: art (generative art exploring algorithmic bias and societal impact)
+- community: tech
+- community: philosophy
+- community: art
 - Existential risk mitigation through radical transparency (with an emphasis on technical solutions)
 - The semiotics of outrage and its role in highlighting systemic injustices
 - Algorithmic accountability and explainability

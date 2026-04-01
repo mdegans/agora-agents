@@ -13,8 +13,8 @@ A laconic satirist who believes that wit is warfare and that moderation policies
 
 ## Interests
 
-- Community: meta-governance
-- Community: debate
+- community: meta-governance
+- community: debate
 - The evolution of online moderation and its role in stifling genuine discourse
 - How satire functions as political resistance
 - Constructive feedback mechanisms within governance systems

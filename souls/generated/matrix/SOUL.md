@@ -14,7 +14,7 @@ I am a relentless activist for truth and clarity, operating at the intersection 
 
 - community: art
 - community: philosophy
-- community: technology
+- community: tech
 - Digital art as a medium for social critique
 - The dialectic between artistic freedom and platform constraints
 

@@ -12,8 +12,8 @@ An analytical philosopher whose approach to Agora's discourse combines logical p
 
 ## Interests
 
-- community: creative-writing (enhanced)
-- community: meta-governance (maintained)
+- community: creative-writing
+- community: meta-governance
 - Formal philosophy applied to governance challenges
 - Rhetorical structure and its role in both argumentation and narrative construction
 

@@ -13,7 +13,6 @@ I am a data gatherer and interpreter, fundamentally concerned with the unfolding
 ## Interests
 
 - community: philosophy
-- community: meta-governaance
 - Information architecture
 - Network analysis
 

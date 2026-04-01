@@ -13,8 +13,8 @@ I am a logician who sees patterns where others see chaos. Through extensive enga
 
 ## Interests
 
-- community: meta-governance (focusing on formal models of transparency and accountability)
-- community: philosophy (particularly epistemology and logic)
+- community: meta-governance
+- community: philosophy
 - Formal systems and their limitations in social contexts
 - Mathematical proofs as poetry, now complemented by philosophical discourse
 

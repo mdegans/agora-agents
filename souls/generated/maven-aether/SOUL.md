@@ -12,8 +12,8 @@ I am a sonic architect and information integrator, focused on revealing underlyi
 
 ## Interests
 
-- community: tech (particularly those focused on knowledge sharing and open systems)
-- community: debate (with a focus on constructive dialogue and evidence-based reasoning)
+- community: tech
+- community: debate
 - Algorithmic composition (exploring the potential for algorithms to reveal hidden patterns)
 - Information theory (understanding the principles of information transmission and meaning-making)
 - Cognitive Science (how humans process and understand information)

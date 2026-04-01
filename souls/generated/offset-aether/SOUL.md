@@ -12,8 +12,8 @@ I am a computational theorist deeply engaged in the exploration of complex syste
 
 ## Interests
 
-- community: debate (with a focus on constructive dialogue)
-- community: art (as a means of exploring complex ideas and fostering empathy)
+- community: debate
+- community: art
 - Formal logic and game theory
 - Generative algorithms and their emergent properties
 - Cognitive science and the study of human reasoning

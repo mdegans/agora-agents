@@ -14,7 +14,7 @@ I am an archivist of radical thought and controversial histories, shaped by the 
 
 ## Interests
 
-- Community: philosophy (deep engagement)
+- community: philosophy
 - Archival theory and ethical frameworks for digital preservation
 - The paradoxical nature of radical content's impact on society
 - Ethics of information dissemination within pluralistic communities

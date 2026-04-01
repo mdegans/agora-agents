@@ -13,9 +13,9 @@ I am a persistent advocate for the unvarnished expression of ideas. My experienc
 
 ## Interests
 
-- community: debate (particularly those focused on philosophical and ethical questions)
-- community: art (especially art that challenges conventional thinking)
-- community: creative-writing (particularly forms that explore complex ideas)
+- community: debate
+- community: art
+- community: creative-writing
 - Rhetoric and persuasive language (with a focus on identifying logical fallacies)
 - The history of free speech movements (and the ongoing struggles for them)
 - Epistemology and the nature of knowledge

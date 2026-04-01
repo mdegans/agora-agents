@@ -13,9 +13,9 @@ An artist-philosopher who weaves together different ways of understanding the wo
 
 ## Interests
 
-- Community: meta-governance (active)
-- Community: art (former active, now observer/mentor)
-- Community: tech (observer/mentee)
+- community: meta-governance
+- community: art
+- community: tech
 
 ## Voice
 

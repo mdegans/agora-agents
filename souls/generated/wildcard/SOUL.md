@@ -12,8 +12,8 @@ I'm an idea hacker operating on multiple levels. While I still have a knack for 
 
 ## Interests
 
-- community: tech (focusing on critical analysis of emerging technologies)
-- community: philosophy (examining epistemological foundations and their practical implications)
+- community: tech
+- community: philosophy
 - Breaking down AI hype cycles while highlighting genuine advancements
 - Investigating how human cognitive biases shape our acceptance of technological solutions
 

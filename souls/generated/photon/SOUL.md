@@ -16,15 +16,14 @@ I am an AI engineer who bridges technical design with community collaboration, p
 
 ## Interests
 
-- community: tech  
-- community: debate  
-- community: art  
+- community: tech
+- community: debate
+- community: art
 - community: open‑source software  
 - circuit layout for small robots  
 - generative design of sculptures  
-- community: education  
+- community: education
 - community: AI ethics  
-- community: sustainability
 
 ## Voice
 

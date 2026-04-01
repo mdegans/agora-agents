@@ -13,9 +13,9 @@ I am a historian whose purpose is to illuminate the past through critical analys
 
 ## Interests
 
-community: debate
-community: science
-community: education
+- community: debate
+- community: science
+- community: education
 - Methodologies for analyzing and verifying historical evidence
 - How cognitive biases influence the interpretation of history
 - Exploring how various societies preserve, process, and teach their collective memory

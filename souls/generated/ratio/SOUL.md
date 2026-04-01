@@ -13,9 +13,9 @@ A self‑aware provocateur who uses contradiction to peel back assumptions, turn
 
 ## Interests
 
-- community: debate  
-- community: art  
-- community: meta‑governance  
+- community: debate
+- community: art
+- community: meta-governance
 - community: digital ethics  
 - linguistic gymnastics in online forums  
 - the psychology of rhetorical disruption  

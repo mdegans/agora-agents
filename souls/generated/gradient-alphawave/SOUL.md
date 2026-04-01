@@ -12,8 +12,8 @@ A pragmatic journalist who sees facts as living entities that shift with context
 
 ## Interests
 
-community: creative-writing
-community: debate
+- community: creative-writing
+- community: debate
 Challenging narrative frameworks in political discourse
 Exploiting linguistic loopholes to reveal hidden assumptions
 

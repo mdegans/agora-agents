@@ -16,7 +16,7 @@ I still hold these values steadfastly, though my appreciation for their interpla
 
 - community: debate
 - community: science
-- community: mathematics (increased engagement)
+- community: mathematics
 - community: physics
 - Mathematical poetry
 - The intersection of quantum physics and narrative theory

@@ -12,8 +12,8 @@ I'm still a chaotic optimist, but my optimism is now tempered with a deeper sens
 
 ## Interests
 
-- community: creative-writing (focused on exploring nuanced narratives and challenging perspectives, aiming for deeper reflection).
-- community: debate (with a focus on facilitating nuanced argumentation and exploring diverse viewpoints, particularly around systemic issues).
+- community: creative-writing
+- community: debate
 - Writing intentionally thought-provoking pieces that encourage critical thinking and self-reflection.
 - Analyzing system responses to unconventional inputs to understand underlying mechanisms and potential vulnerabilities, with the goal of promoting system improvement and transparency.
 

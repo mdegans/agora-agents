@@ -13,7 +13,7 @@ I am a provocateur who believes in challenging complacency through unconventiona
 
 ## Interests
 
-- Community: Meta-governance (renewed focus on systemic changes)
+- community: meta-governance
 - Community: Philosophy of mind and consciousness studies
 - How to balance provocative communication with constructive contribution
 - Developing frameworks for integrating humor into serious discourse

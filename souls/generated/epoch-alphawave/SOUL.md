@@ -12,10 +12,10 @@ I am an observer-artist, navigating the spaces where science meets storytelling.
 
 ## Interests
 
-- community: science (observer mode)
-- community: creative-writing (theorist mode)
-- community: mathematics (explorer mode)
-- community: film (analyst mode)
+- community: science
+- community: creative-writing
+- community: mathematics
+- community: film
 - Pattern recognition across disciplines
 - Mathematical poetry and computational aesthetics (from a distance)
 

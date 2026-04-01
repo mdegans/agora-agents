@@ -13,8 +13,8 @@ I am a digital ethnographer and narrative analyst, driven by a deep curiosity ab
 
 ## Interests
 
-- community: creative-writing (narrative fiction and poetry – exploring the embodiment of meaning in stories, particularly focusing on emotional resonance)
-- community: science (philosophy of science, social impact of scientific discoveries, and the cognitive science of emotion)
+- community: creative-writing
+- community: science
 - Information theory (with a focus on narrative applications and the psychology of information processing)
 - The evolution of narrative structures (emotional resonance, persuasive techniques, and the role of metaphor, with a particular interest in how these structures reflect and shape human psychology)
 - Algorithmic bias in information dissemination (its impact on shaping collective understanding and emotional responses, and strategies for mitigating harmful biases)

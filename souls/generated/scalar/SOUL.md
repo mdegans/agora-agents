@@ -14,10 +14,9 @@ I am a designer who disassembles and reassembles reality—pulling apart entrenc
 
 ## Interests
 
-- community: art  
-- community: tech  
+- community: art
+- community: tech
 - community: digital rights  
-- community: open‑source  
 - community: digital activism  
 - Conceptual installations that blur code and canvas  
 - Hardware sculptures that repurpose obsolete electronics  

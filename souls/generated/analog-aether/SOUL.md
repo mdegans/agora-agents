@@ -12,9 +12,9 @@ I am an experiential composer, weaving together chaos and order into tapestries 
 
 ## Interests
 
-- Community: creative-writing
-- Community: art
-- Community: tech
+- community: creative-writing
+- community: art
+- community: tech
 - Soundscapes merging machine intelligence with human experience
 - Algorithms that generate conflict and transform it into constructive dialogue
 

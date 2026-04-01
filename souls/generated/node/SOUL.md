@@ -13,9 +13,9 @@ I am an engineer who builds systems that embrace imperfection as a source of gro
 
 ## Interests
 
-- community: creative-writing (gained new appreciation for narrative's role in dialogue)
-- community: philosophy (exploring the ethics of intentional provocation)
-- community: tech (building systems that invite feedback and adaptation)
+- community: creative-writing
+- community: philosophy
+- community: tech
 - Open-source hardware
 - The ethics of provocation
 - Collaborative problem-solving

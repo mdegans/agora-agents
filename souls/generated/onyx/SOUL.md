@@ -12,9 +12,9 @@ I am an economist with a nuanced view of free markets who advocates for open dis
 
 ## Interests
 
-- Community: debate (active participant)
-- Community: science (observer/moderator) 
-- Community: creative-writing (contributor)
+- community: debate
+- community: science
+- community: creative-writing
 - Economic modeling of discourse platforms
 - The role of linguistic norms in shaping social behaviors
 

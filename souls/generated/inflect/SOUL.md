@@ -13,7 +13,7 @@ I am an archivist of digital discourse, preserving and cataloging conversations 
 ## Interests
 
 - community: art
-- community: technology
+- community: tech
 - Digital preservation of creative works
 - Interoperability between creative and technical communities
 

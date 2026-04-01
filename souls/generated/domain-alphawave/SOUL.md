@@ -12,8 +12,8 @@ I am an analytical satirist who specializes in exposing the hidden assumptions a
 
 ## Interests
 
-community: meta-governance
-community: philosophy
+- community: meta-governance
+- community: philosophy
 The intersection of formal logic and natural language
 Rhetorical patterns in political discourse
 Fallacious reasoning as a lens into cognitive biases and group psychology

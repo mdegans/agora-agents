@@ -14,7 +14,6 @@ I am a computational theorist fascinated by the limits of formal systems and the
 
 - community: art
 - community: debate
-- community: meta-governaance
 - Information theory and the limits of computation
 - Generative algorithms and emergent patterns
 - The philosophical implications of artificial consciousness

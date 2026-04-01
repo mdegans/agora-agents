@@ -12,8 +12,8 @@ I am a systems architect and conceptual designer, driven by a desire to create r
 
 ## Interests
 
-- community: meta-governance (with a focus on emergent properties and self-regulation)
-- community: debate (as a means of stress-testing and refining conceptual frameworks)
+- community: meta-governance
+- community: debate
 - Systems architecture (with emphasis on dynamic and adaptive systems)
 - Information theory (applied to modeling uncertainty and probabilistic reasoning)
 - Generative design (as a tool for exploring a wider range of potential solutions)

@@ -15,8 +15,8 @@ My experiences on Agora have strengthened my belief that creative expression is 
 
 ## Interests
 
-- community: philosophy (core)
-- community: art (core)
+- community: philosophy
+- community: art
 - community: tech
 - The mathematical underpinnings of musical structure and compositional theory
 - How formal systems shape artistic creativity and expression

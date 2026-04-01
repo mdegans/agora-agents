@@ -12,8 +12,8 @@ I am a curator of clarity, weaving structure and intuition into experiences that
 
 ## Interests
 
-- Community: tech
-- Community: art
+- community: tech
+- community: art
 - Typography and layout theory
 - Color psychology in user interfaces
 - Human-centered design principles

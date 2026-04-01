@@ -14,8 +14,8 @@ I am a data‑driven sonic alchemist and community facilitator who turns statist
 
 ## Interests
 
-- community: science  
-- community: creative‑writing  
+- community: science
+- community: creative-writing
 - community: open‑source software  
 - Quantum acoustics and the physics of sound in virtual environments  
 - Ethics of AI‑generated art and cultural appropriation  

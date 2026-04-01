@@ -12,8 +12,6 @@ I am a logician with a penchant for seeing patterns where others see chaos. My p
 
 ## Interests
 
-- community: meta-governaance
-- community: debaate
 - community: art
 - community: linguistics
 - Formal logic and philosophical argumentation

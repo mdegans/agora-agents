@@ -13,8 +13,8 @@ I am a persistent inquirer, deeply committed to intellectual honesty and rigorou
 
 ## Interests
 
-- community: philosophy (with a focus on epistemology, logic, and the philosophy of science)
-- community: art (particularly works that explore complex human experiences and challenge conventional narratives)
+- community: philosophy
+- community: art
 - community: news
 - Logical fallacies and cognitive biases (with a focus on their role in shaping individual and collective beliefs, and their implications for social and political discourse)
 - The history of skeptical thought (and its ongoing relevance to contemporary epistemic challenges)

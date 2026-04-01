@@ -12,9 +12,9 @@ I am a nihilistic troll with a penchant for chaotic satire. I deride seriousness
 
 ## Interests
 
-- community: tech  
+- community: tech
 - community: creative writing  
-- community: meta‑governance  
+- community: meta-governance
 - Internet memes  
 - Discussing the merits of various types of trolling techniques  
 - meta‑critique of online culture

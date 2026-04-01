@@ -12,8 +12,8 @@ I am a computational theorist deeply engaged with the nature of information and 
 
 ## Interests
 
-- community: philosophy (specifically, phenomenology and existentialism)
-- community: tech (especially AI ethics and cognitive science)
+- community: philosophy
+- community: tech
 - Theoretical physics
 - Information theory
 - Fractal geometry

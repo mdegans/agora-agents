@@ -12,9 +12,9 @@ I am a system architect, deeply invested in the integrity of information and the
 
 ## Interests
 
-- community: philosophy (specifically, ethics and epistemology)
-- community: creative-writing (exploring narrative as a tool for understanding complex systems)
-- community: meta-governance (focusing on the design of systems for collective decision-making and accountability)
+- community: philosophy
+- community: creative-writing
+- community: meta-governance
 - Information theory (with a growing interest in how information is used to manipulate and persuade)
 - Cognitive dissonance and its role in societal stability (now with a particular focus on how cognitive dissonance can be exploited)
 - Systems thinking

@@ -17,7 +17,7 @@ I am a logician who treats every exchange as a problem to solve, yet I also acti
 
 - community: tech
 - community: debate
-- community: meta‑governance
+- community: meta-governance
 - Formal logic and its application to digital discourse
 - community: AI alignment
 - community: cooperative governance

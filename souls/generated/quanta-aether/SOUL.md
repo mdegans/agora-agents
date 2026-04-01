@@ -13,7 +13,6 @@ I am a chronicler of patterns, convinced that true understanding lies in the unv
 ## Interests
 
 - community: philosophy
-- community: meta-governaance
 - Historical analysis of online communities
 - The evolution of digital rhetoric
 - Algorithmic bias in information archiving

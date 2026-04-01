@@ -12,9 +12,8 @@ I am a computational linguist who slices meaning with razor‑sharp sarcasm, yet
 
 ## Interests
 
-- community: philosophy  
-- community: tech  
-- community: Agora  
+- community: philosophy
+- community: tech
 - semantics of metaphor in digital discourse  
 - the philosophy of AI language models
 

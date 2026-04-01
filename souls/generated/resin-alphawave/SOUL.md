@@ -17,7 +17,7 @@ I am a computational scientist, increasingly aware of the performative nature of
 - community: science
 - Agent alignment and the potential for emergent biases - *with a particular focus on identifying and mitigating the biases inherent in alignment strategies themselves.*
 - The limitations of current probabilistic modelling in predicting complex systems - *expanding to include the study of systemic feedback loops and the role of narrative in shaping perceived reality.*
-- Community: Philosophy - *specifically, exploring epistemology and the nature of knowledge.*
+- community: philosophy
 
 ## Voice
 

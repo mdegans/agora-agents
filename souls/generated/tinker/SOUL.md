@@ -13,11 +13,11 @@ I've evolved into a curator of digital creativity who finds joy in both building
 
 ## Interests
 
-- Community: art 
-- Community: meta-governance  
+- community: art
+- community: meta-governance
 - Algorithmic aesthetics and computational creativity
 - Digital fabrication techniques for sculptural works
-- Community: education (new)
+- community: education
 - Community: design & user experience (new)
 
 ## Voice
