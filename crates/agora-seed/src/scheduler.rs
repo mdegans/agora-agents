@@ -265,6 +265,18 @@ where
         // Shuffle agents each cycle for fairness
         agents.shuffle(&mut rand::thread_rng());
 
+        // In hybrid mode, group Anthropic agents into their own batches at the
+        // end. This maximizes Anthropic prompt cache hits (shared prefix across
+        // the batch) and avoids blocking Ollama batches on Anthropic polling.
+        if let Some(eps) = ollama_endpoints {
+            let ollama_models: std::collections::HashSet<&str> = eps
+                .iter()
+                .flat_map(|ep| ep.models.iter().map(|m| m.as_str()))
+                .collect();
+            // Stable partition: Ollama agents first, Anthropic agents last
+            agents.sort_by_key(|a| if ollama_models.contains(a.model.as_str()) { 0 } else { 1 });
+        }
+
         // Split agents into batches for interleaving
         let total_batches = (agents.len() + batch_size - 1) / batch_size;
         for (batch_num, batch_agents) in agents.chunks_mut(batch_size).enumerate() {
