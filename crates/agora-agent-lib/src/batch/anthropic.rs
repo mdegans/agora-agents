@@ -61,6 +61,38 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
         &self,
         items: Vec<WorkItem<Prompt<'static>>>,
     ) -> anyhow::Result<Self::Handle> {
+        // Prime the prompt cache before submitting the batch.
+        //
+        // Batch items share an identical prefix (tools + constitution + system)
+        // but are processed across different workers that may not share cache.
+        // By sending one request first via the Messages API, we write the prefix
+        // to the cache. Batch items can then read from it at 0.1x cost (stacking
+        // with the 0.5x batch discount for 0.05x effective cost on cached tokens).
+        //
+        // We use the first item's prompt. The response is discarded — we only
+        // care about the cache write side effect.
+        if items.len() > 1 {
+            tracing::info!(
+                "Priming prompt cache with 1 request before submitting {} batch items",
+                items.len()
+            );
+            match self.client.message(&items[0].prompt).await {
+                Ok(response) => {
+                    let usage = &response.usage;
+                    tracing::info!(
+                        "Cache primed: {} creation tokens, {} read tokens, {} input tokens",
+                        usage.cache_creation_input_tokens.unwrap_or(0),
+                        usage.cache_read_input_tokens.unwrap_or(0),
+                        usage.input_tokens,
+                    );
+                }
+                Err(e) => {
+                    // Non-fatal — the batch can still proceed without cache priming
+                    tracing::warn!("Cache priming request failed (continuing anyway): {e}");
+                }
+            }
+        }
+
         // Build the tagged prompts: (batch::Id, Prompt) pairs
         // and track the mapping back to agent IDs
         let mut id_map = HashMap::new();
