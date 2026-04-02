@@ -644,7 +644,7 @@ pub fn parse_evolution(response: &str) -> Option<String> {
     let end = response.find("</evolution>")?;
     let entry = response[start + "<evolution>".len()..end].trim();
 
-    if entry.eq_ignore_ascii_case("none") || entry.is_empty() {
+    if entry.eq_ignore_ascii_case("none") || entry.is_empty() || entry.len() < 20 {
         None
     } else {
         Some(entry.to_string())
