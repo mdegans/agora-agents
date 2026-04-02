@@ -277,6 +277,15 @@ pub async fn run_cycle(
         &perception_text,
     );
 
+    // Preflight: check serialized prompt for sanitization artifacts or missing constitution
+    {
+        let json = serde_json::to_string(&think_prompt).unwrap_or_default();
+        let problems = prompt::preflight_check_prompt(&json);
+        for problem in &problems {
+            tracing::error!("[PREFLIGHT] {}: {}", agent.name, problem);
+        }
+    }
+
     if verbose {
         // Show the prompt as JSON for debugging
         eprintln!("\n=== THINK (native tool use) ===");

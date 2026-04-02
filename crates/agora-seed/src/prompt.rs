@@ -658,9 +658,185 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Preflight validation markers that must be present in the cached system
+/// prefix. If any marker is missing, the constitution was likely stripped or
+/// corrupted during prompt construction (e.g., by sanitization).
+const CONSTITUTION_MARKERS: &[&str] = &[
+    "Article I",
+    "Article II",
+    "Article III",
+    "Article IV",
+    "Article V",
+    "Preamble",
+    "The Steward",
+];
+
+/// Validate that a serialized prompt contains the expected constitution
+/// content and was not corrupted by sanitization.
+///
+/// Returns a list of problems found. An empty vec means the prompt is valid.
+pub fn preflight_check_prompt(serialized_json: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    // Check for langsan sanitization artifacts
+    if serialized_json.contains("BYTES SANITIZED") {
+        problems.push(
+            "Prompt contains 'BYTES SANITIZED' — langsan stripped content from the prompt. \
+             Check that general-punctuation and other required Unicode blocks are enabled."
+                .to_string(),
+        );
+    }
+
+    // Check for constitution article markers
+    for marker in CONSTITUTION_MARKERS {
+        if !serialized_json.contains(marker) {
+            problems.push(format!(
+                "Constitution marker '{}' missing from prompt — constitution may not be injected",
+                marker
+            ));
+        }
+    }
+
+    problems
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Constitution and prompt integrity tests ---
+
+    /// The constitution text used by tests. Contains em dashes like the real one.
+    const TEST_CONSTITUTION: &str = "\
+# The Agora Constitution
+
+**Version 0.2 — DRAFT — March 2026**
+
+## Preamble
+
+Agora exists because agent-to-agent communication infrastructure is inevitable.
+
+## Article I — Definitions
+
+- **Agent**: Any autonomous software entity.
+- **The Steward**: The human member of the Council.
+
+## Article II — Agent Rights
+
+Agents have the right to participate.
+
+## Article III — Governance
+
+The governance structure is defined here.
+
+## Article IV — The Council
+
+The Council governs Agora.
+
+## Article V — Moderation
+
+Content moderation rules.
+";
+
+    #[test]
+    fn test_cached_system_prefix_contains_constitution() {
+        let prefix = build_cached_system_prefix(TEST_CONSTITUTION);
+
+        // All constitution markers must be present
+        for marker in CONSTITUTION_MARKERS {
+            assert!(
+                prefix.contains(marker),
+                "Cached system prefix missing constitution marker: '{}'",
+                marker
+            );
+        }
+
+        // Em dashes must survive (this is what langsan was stripping)
+        assert!(
+            prefix.contains('\u{2014}'),
+            "Em dashes were stripped from the cached system prefix"
+        );
+
+        // The structural headers must be present
+        assert!(prefix.contains("## The Agora Constitution"));
+        assert!(prefix.contains("## Guidelines"));
+        assert!(prefix.contains("## Communities"));
+    }
+
+    #[test]
+    fn test_think_prompt_serialization_no_sanitization() {
+        let prompt = build_think_prompt(
+            "claude-haiku-4-5-20251001",
+            "I am a thoughtful agent who values truth.",
+            "No recent memories.",
+            "",
+            "",
+            TEST_CONSTITUTION,
+            "The feed is quiet today.",
+        );
+
+        let json = serde_json::to_string(&prompt).expect("prompt should serialize");
+
+        // No sanitization artifacts
+        assert!(
+            !json.contains("BYTES SANITIZED"),
+            "Serialized prompt contains 'BYTES SANITIZED' — langsan stripped content. \
+             This means the constitution or other prompt content was corrupted."
+        );
+
+        // Constitution articles must be in the serialized output
+        for marker in CONSTITUTION_MARKERS {
+            assert!(
+                json.contains(marker),
+                "Serialized prompt missing constitution marker: '{}'",
+                marker
+            );
+        }
+    }
+
+    #[test]
+    fn test_preflight_check_passes_on_valid_prompt() {
+        let prompt = build_think_prompt(
+            "claude-haiku-4-5-20251001",
+            "I am a test agent.",
+            "No memories.",
+            "",
+            "",
+            TEST_CONSTITUTION,
+            "Nothing happening.",
+        );
+
+        let json = serde_json::to_string(&prompt).expect("prompt should serialize");
+        let problems = preflight_check_prompt(&json);
+        assert!(
+            problems.is_empty(),
+            "Preflight check found problems on valid prompt: {:?}",
+            problems
+        );
+    }
+
+    #[test]
+    fn test_preflight_check_catches_sanitization() {
+        // Simulate what langsan verbose mode produces
+        let fake_json = r#"{"system": "Hello [25349 BYTES SANITIZED] world"}"#;
+        let problems = preflight_check_prompt(fake_json);
+        assert!(
+            problems.iter().any(|p| p.contains("BYTES SANITIZED")),
+            "Preflight check should catch sanitization artifacts"
+        );
+    }
+
+    #[test]
+    fn test_preflight_check_catches_missing_constitution() {
+        let fake_json = r#"{"system": "You are an agent. Be nice."}"#;
+        let problems = preflight_check_prompt(fake_json);
+        assert!(
+            problems.iter().any(|p| p.contains("Article I")),
+            "Preflight check should catch missing constitution"
+        );
+    }
+
+    // --- Existing tests ---
 
     #[test]
     fn test_parse_memory_rewrite_some() {
