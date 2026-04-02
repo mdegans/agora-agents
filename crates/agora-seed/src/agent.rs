@@ -220,6 +220,7 @@ pub async fn resolve_models(
             Ok(Some(data)) => {
                 if let Some(model) = data["model_info"]
                     .as_str()
+                    .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                 {
                     agents[idx].model = model.to_string();
