@@ -390,7 +390,7 @@ pub fn format_perceptions(
                 out.push_str(&format!("Communities: {}\n", tag_names.join(", ")));
             }
             out.push('\n');
-            out.push_str(&truncate(&post.body, 500));
+            out.push_str(&post.body);
             out.push('\n');
 
             if !comments.is_empty() {
