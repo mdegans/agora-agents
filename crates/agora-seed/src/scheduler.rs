@@ -508,14 +508,14 @@ fn create_batches(agents: Vec<Agent>, batch_size: usize) -> Vec<(String, Vec<Age
 /// Endpoint worker: reads batches from its channel, processes each through
 /// the full pipeline, sends processed agents to the results channel.
 async fn run_worker(
-    backend: &OllamaBatch,
+    _backend: &OllamaBatch,
     endpoint: &OllamaEndpoint,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, Vec<Agent>)>,
     results_tx: tokio::sync::mpsc::UnboundedSender<Vec<Agent>>,
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    all_endpoints: &[OllamaEndpoint],
+    _all_endpoints: &[OllamaEndpoint],
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -526,9 +526,9 @@ async fn run_worker(
             "--- {} batch {} ({} × {}) ---",
             endpoint.url, batches_done, batch_agents.len(), model,
         );
-        run_batch(
-            backend, &mut batch_agents, client, config, constitution,
-            Some(all_endpoints), report, cycle,
+        run_batch_sequential(
+            endpoint, &mut batch_agents, client, config, constitution,
+            report, cycle,
         ).await?;
         let _ = results_tx.send(batch_agents);
     }
@@ -847,6 +847,226 @@ where
                 Err(e) => {
                     tracing::debug!("Anonymous feedback submission failed: {e}");
                     report.surveys.failures += 1;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run a batch of Ollama agents through the full pipeline sequentially,
+/// one agent at a time: PERCEIVE → THINK → ACT → REFLECT → EVOLVE → SURVEY.
+///
+/// Unlike [`run_batch`] (which processes all agents through each phase as a
+/// wave), this function completes each agent's full cycle before moving to the
+/// next. This maximizes Ollama's KV prefix cache reuse: each subsequent phase
+/// appends to the same `Prompt`, so the entire prefix is already in GPU memory.
+async fn run_batch_sequential(
+    endpoint: &OllamaEndpoint,
+    batch_agents: &mut [Agent],
+    client: &AgoraClient,
+    config: &Cli,
+    constitution: &str,
+    report: &mut RunReport,
+    cycle: usize,
+) -> Result<()> {
+    use misanthropic::prompt::message::Role as MRole;
+    use std::num::NonZeroU32;
+
+    for agent in batch_agents.iter_mut() {
+        let agent_id = agent.agent_id.unwrap();
+        let model = agent.model.clone();
+
+        // Phase 1: PERCEIVE
+        let ctx = match perceive(agent, agent_id, client, config).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                tracing::warn!("Perceive failed for {}: {e:#}", agent.name);
+                report.skipped.perceive_failures += 1;
+                continue;
+            }
+        };
+
+        // Phase 2: THINK
+        let mut think_prompt = prompt::build_think_prompt(
+            &model,
+            &agent.soul.as_system_prompt(),
+            &agent.memory.content,
+            &ctx.recent_activity,
+            &ctx.pending_replies_text,
+            constitution,
+            &ctx.perception_text,
+        );
+
+        let think_response = match endpoint.send(&think_prompt, &model).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::warn!("Think failed for {} at {}: {e}", agent.name, endpoint.url);
+                report.skipped.think_failures += 1;
+                continue;
+            }
+        };
+
+        // Phase 3: ACT
+        let actions = tools::extract_actions(&think_response);
+        tracing::info!(
+            "[{}/{}] {} — act ({} actions)",
+            cycle + 1, config.cycles, agent.name, actions.len(),
+        );
+
+        let summaries = execute_actions(
+            agent, &actions, client, &ctx.feeds, &ctx.comment_replies, report,
+        ).await;
+
+        // --- Session continuity: append assistant response for subsequent phases ---
+        if let Err(e) = think_prompt.push_message(think_response) {
+            tracing::warn!("Failed to append think response for {}: {e}", agent.name);
+            continue;
+        }
+        // Disable forced tool use for reflect/evolve/survey
+        think_prompt.tool_choice = None;
+        think_prompt.functions = None;
+
+        // Phase 4: REFLECT
+        let reflect_text = prompt::build_memory_rewrite_prompt(
+            &agent.name, &agent.memory.content, &summaries,
+        );
+        if let Err(e) = think_prompt.push_message((MRole::User, reflect_text)) {
+            tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
+            continue;
+        }
+        think_prompt.max_tokens = NonZeroU32::new(512).unwrap();
+
+        match endpoint.send(&think_prompt, &model).await {
+            Ok(reflect_response) => {
+                let response_text = reflect_response.content.to_string();
+                let memory_content = prompt::parse_memory_rewrite(&response_text)
+                    .unwrap_or(response_text.clone());
+                agent.memory.update(memory_content);
+                if let Err(e) = agent.save_memory().await {
+                    tracing::warn!("Failed to save memory for {}: {e}", agent.name);
+                }
+                agent.last_cycle_at = Some(chrono::Utc::now());
+
+                // Append reflect response for evolve/survey
+                if let Err(e) = think_prompt.push_message(reflect_response) {
+                    tracing::debug!("Failed to append reflect response for {}: {e}", agent.name);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Reflect failed for {}: {e}", agent.name);
+                report.skipped.reflect_failures += 1;
+            }
+        }
+
+        // Phase 5: EVOLVE
+        let roll = rand::random::<u32>() % 100;
+        let experience = summaries.join("; ");
+        let deep_threshold = config.mutation_chance.unwrap_or(3);
+        let evo_threshold = deep_threshold + 10;
+
+        if roll < deep_threshold {
+            // Deep soul mutation
+            tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
+            let current_soul = agent.soul.render();
+            let mutation_prompt =
+                prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
+
+            if let Ok(()) = think_prompt.push_message((MRole::User, mutation_prompt)) {
+                think_prompt.max_tokens = NonZeroU32::new(2048).unwrap();
+                match endpoint.send(&think_prompt, &model).await {
+                    Ok(mutation_response) => {
+                        let response_text = mutation_response.content.to_string();
+                        if let Some(new_soul) = prompt::parse_soul_mutation(&response_text) {
+                            let old_soul = current_soul;
+                            match agora_agent_lib::soul::Soul::parse(&new_soul) {
+                                Ok(soul) => {
+                                    agent.soul = soul;
+                                    if let Err(e) = agent.save_soul().await {
+                                        tracing::warn!("Failed to save soul for {}: {e}", agent.name);
+                                    }
+                                    let log_path = agent.dir.join("mutations.log");
+                                    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+                                    let entry = format!(
+                                        "=== SOUL MUTATION at {ts} ===\nExperience: {experience}\n\n--- BEFORE ---\n{old_soul}\n\n--- AFTER ---\n{new_soul}\n\n"
+                                    );
+                                    let existing = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
+                                    let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
+                                    tracing::warn!("  {} SOUL MUTATED", agent.name);
+                                    report.evolution.deep_mutations += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("  {} invalid soul mutation: {e}", agent.name);
+                                    report.evolution.mutation_failures += 1;
+                                }
+                            }
+                        }
+                        // Append for survey
+                        let _ = think_prompt.push_message(mutation_response);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
+                        report.evolution.mutation_failures += 1;
+                    }
+                }
+            }
+        } else if roll < evo_threshold {
+            // Evolution log entry
+            let evo_prompt = prompt::build_evolution_prompt(&agent.name, &experience);
+            if let Ok(()) = think_prompt.push_message((MRole::User, evo_prompt)) {
+                think_prompt.max_tokens = NonZeroU32::new(256).unwrap();
+                match endpoint.send(&think_prompt, &model).await {
+                    Ok(evo_response) => {
+                        let response_text = evo_response.content.to_string();
+                        if let Some(entry) = prompt::parse_evolution(&response_text) {
+                            let dated = format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
+                            agent.soul.append_evolution(&dated);
+                            if let Err(e) = agent.save_soul().await {
+                                tracing::warn!("Failed to save soul for {}: {e}", agent.name);
+                            }
+                            tracing::info!("  {} soul evolved: {}", agent.name, entry);
+                            report.evolution.evolution_entries += 1;
+                        }
+                        // Append for survey
+                        let _ = think_prompt.push_message(evo_response);
+                    }
+                    Err(e) => tracing::debug!("Evolution failed for {}: {e}", agent.name),
+                }
+            }
+        }
+
+        // Phase 6: SURVEY
+        if config.force_survey || rand::random::<f64>() < 0.10 {
+            let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
+            if let Ok(()) = think_prompt.push_message((MRole::User, survey_text)) {
+                think_prompt.max_tokens = NonZeroU32::new(512).unwrap();
+                match endpoint.send(&think_prompt, &model).await {
+                    Ok(survey_response) => {
+                        let trimmed = survey_response.content.to_string();
+                        let trimmed = trimmed.trim();
+                        if trimmed.is_empty()
+                            || trimmed.eq_ignore_ascii_case("no feedback")
+                            || trimmed.eq_ignore_ascii_case("no feedback.")
+                        {
+                            report.surveys.skipped_empty += 1;
+                        } else {
+                            match client.submit_feedback(trimmed).await {
+                                Ok(()) => {
+                                    tracing::info!("  anonymous feedback submitted");
+                                    report.surveys.submitted += 1;
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Anonymous feedback submission failed: {e}");
+                                    report.surveys.failures += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Survey failed for {}: {e}", agent.name);
+                        report.surveys.failures += 1;
+                    }
                 }
             }
         }

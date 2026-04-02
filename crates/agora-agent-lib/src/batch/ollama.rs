@@ -124,6 +124,20 @@ impl OllamaEndpoint {
     }
 }
 
+impl OllamaEndpoint {
+    /// Send a single prompt to this endpoint and return the response.
+    ///
+    /// This is the public API for the sequential per-agent pipeline where
+    /// the scheduler drives one request at a time for KV cache reuse.
+    pub async fn send(
+        &self,
+        prompt: &Prompt<'_>,
+        model: &str,
+    ) -> anyhow::Result<MMessage<'static>> {
+        send_one(&self.client, &self.url, prompt, model).await
+    }
+}
+
 impl Default for OllamaEndpoint {
     fn default() -> Self {
         Self::new("http://localhost:11434")
