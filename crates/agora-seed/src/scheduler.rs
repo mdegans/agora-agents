@@ -463,6 +463,16 @@ async fn run_cycles(
     Ok(())
 }
 
+/// Extract parameter size from a model name like "cogito:70b" → 70, "qwen3.5:35b" → 35.
+/// Returns 0 for names without a recognizable size suffix (e.g. Anthropic model IDs).
+fn extract_model_size(model: &str) -> u64 {
+    // Look for the part after ':' (e.g. "70b", "14b", "24b", "e4b")
+    let tag = model.rsplit(':').next().unwrap_or("");
+    // Strip trailing 'b' and parse the number
+    let num_str = tag.trim_end_matches('b');
+    num_str.parse::<u64>().unwrap_or(0)
+}
+
 /// Group a sorted list of agents into same-model batches of up to `batch_size`.
 /// Create same-model batches, interleaved round-robin across models.
 ///
@@ -484,6 +494,14 @@ fn create_batches(agents: Vec<Agent>, batch_size: usize) -> Vec<(String, Vec<Age
             by_model.push((agent.model.clone(), vec![agent]));
         }
     }
+
+    // Sort models so the largest (slowest) come first in the round-robin.
+    // This ensures slower endpoints (e.g. Mac) pick up big models immediately
+    // while faster endpoints (e.g. 3090) handle small models in parallel,
+    // so both finish closer together.
+    by_model.sort_by(|(a, _), (b, _)| {
+        extract_model_size(b).cmp(&extract_model_size(a))
+    });
 
     // Round-robin: take one batch_size chunk from each model in turn.
     let mut batches = Vec::new();
