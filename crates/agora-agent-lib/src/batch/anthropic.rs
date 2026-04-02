@@ -76,20 +76,30 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
                 "Priming prompt cache with 1 request before submitting {} batch items",
                 items.len()
             );
-            match self.client.message(&items[0].prompt).await {
-                Ok(response) => {
-                    let usage = &response.usage;
-                    tracing::info!(
-                        "Cache primed: {} creation tokens, {} read tokens, {} input tokens",
-                        usage.cache_creation_input_tokens.unwrap_or(0),
-                        usage.cache_read_input_tokens.unwrap_or(0),
-                        usage.input_tokens,
-                    );
+            // Try up to 3 items — the first may have empty text blocks that
+            // Anthropic rejects (e.g. empty memory or pending replies).
+            let mut primed = false;
+            for i in 0..items.len().min(3) {
+                match self.client.message(&items[i].prompt).await {
+                    Ok(response) => {
+                        let usage = &response.usage;
+                        tracing::info!(
+                            "Cache primed (item {}): {} creation tokens, {} read tokens, {} input tokens",
+                            i,
+                            usage.cache_creation_input_tokens.unwrap_or(0),
+                            usage.cache_read_input_tokens.unwrap_or(0),
+                            usage.input_tokens,
+                        );
+                        primed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Cache priming with item {i} failed: {e}");
+                    }
                 }
-                Err(e) => {
-                    // Non-fatal — the batch can still proceed without cache priming
-                    tracing::warn!("Cache priming request failed (continuing anyway): {e}");
-                }
+            }
+            if !primed {
+                tracing::warn!("Cache priming failed for all candidates (continuing anyway)");
             }
         }
 
