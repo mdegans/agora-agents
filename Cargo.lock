@@ -1129,9 +1129,9 @@ dependencies = [
 
 [[package]]
 name = "langsan"
-version = "0.0.10"
+version = "0.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41c07bea21daa0c4d5c313436256cd846ead2a2ae9009a20edfd00518a28bce0"
+checksum = "d8769a9c700b546a3d2dda19bd8da0f75283918fea0b071325c4a454bd6eb13c"
 dependencies = [
  "serde",
  "serde_json",
