@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use agora_agent_lib::agora_agentkit::ids::PostId;
 use agora_agent_lib::llm::{LlmBackend, MMessage, Message, Role};
 use agora_agent_lib::tools;
 use anyhow::Result;
@@ -77,7 +80,6 @@ pub async fn run_cycle(
     // === PERCEIVE ===
 
     // Check for replies to agent's own posts first
-    use agora_agent_lib::agora_agentkit::ids::PostId;
     let mut replies: Vec<(String, PostId, Vec<Comment>)> = Vec::new();
     for &post_id in &agent.created_posts {
         match client.get_post(post_id).await {
@@ -242,9 +244,44 @@ pub async fn run_cycle(
         }
     }
 
+    // Fetch full comment lists for posts with replies to agent's comments.
+    // This lets format_perceptions show the full ancestry chain for threading.
+    let mut reply_post_comments: HashMap<PostId, Vec<Comment>> = HashMap::new();
+    {
+        use std::collections::HashSet;
+        let reply_post_ids: HashSet<PostId> = comment_replies.iter().map(|r| r.post_id).collect();
+        // Don't re-fetch posts we already have in detailed_posts
+        let already_fetched: HashSet<PostId> =
+            detailed_posts.iter().map(|(p, ..)| p.id).collect();
+        for post_id in reply_post_ids {
+            if let Some((_, comments, ..)) =
+                detailed_posts.iter().find(|(p, ..)| p.id == post_id)
+            {
+                reply_post_comments.insert(post_id, comments.clone());
+            } else if !already_fetched.contains(&post_id) {
+                match client.get_post(post_id).await {
+                    Ok(full) => {
+                        reply_post_comments.insert(post_id, full.comments);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Failed to fetch post {post_id} for reply chain: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // === THINK + ACT ===
-    let perception_text =
-        prompt::format_perceptions(&feeds, &detailed_posts, &replies, &comment_replies, agent_id);
+    let perception_text = prompt::format_perceptions(
+        &feeds,
+        &detailed_posts,
+        &replies,
+        &comment_replies,
+        &reply_post_comments,
+        agent_id,
+    );
 
     tracing::info!(
         "[{}/{}] Agent {} — think",
@@ -252,8 +289,6 @@ pub async fn run_cycle(
         total_cycles,
         agent.name
     );
-
-    let perception_text_owned = perception_text.clone();
 
     // Fetch recent activity + pending replies for system prompt
     let recent_posts = match client.get_agent_posts(agent_id).await {
@@ -267,7 +302,7 @@ pub async fn run_cycle(
     let pending_replies_text = prompt::format_pending_replies(&comment_replies, 5);
 
     // Build a full Prompt with native tool use
-    let think_prompt = prompt::build_think_prompt(
+    let mut think_prompt = prompt::build_think_prompt(
         backend.model_id(),
         &agent.soul.as_system_prompt(),
         &agent.memory.content,
@@ -306,6 +341,24 @@ pub async fn run_cycle(
 
     // Extract typed actions from tool calls
     let actions = tools::extract_actions(&response_message);
+
+    // Append assistant response to the conversation for subsequent phases.
+    // This keeps the full session context (tools, constitution, perceptions,
+    // actions) available for reflect/mutation/evolution/survey, maximizing
+    // cache hits on the shared prefix.
+    think_prompt
+        .push_message(response_message)
+        .expect("assistant message should follow user");
+
+    // Disable forced tool use for subsequent phases — only text responses needed.
+    // Keep tools and system intact to preserve cache prefix (tools → system → messages).
+    // Setting tool_choice to None allows the model to respond with text only.
+    // Add a cache breakpoint on the last message so subsequent sends can
+    // reuse everything up to this point from cache.
+    think_prompt.tool_choice = None;
+    if let Some(last) = think_prompt.messages.last_mut() {
+        last.content.cache();
+    }
 
     if verbose {
         let action_strs: Vec<String> = actions.iter().map(|a| format!("{:?}", a)).collect();
@@ -472,6 +525,7 @@ pub async fn run_cycle(
     }
 
     // === REFLECT ===
+    // Append memory rewrite request to the existing conversation
     tracing::info!(
         "[{}/{}] Agent {} — reflect",
         cycle + 1,
@@ -487,26 +541,20 @@ pub async fn run_cycle(
         );
     }
 
-    let reflect_prompt =
+    let reflect_text =
         prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &action_summaries);
+    think_prompt.max_tokens = std::num::NonZeroU32::new(512).unwrap();
+    think_prompt
+        .push_message((misanthropic::prompt::message::Role::User, reflect_text.clone()))
+        .expect("user message should follow assistant");
 
-    let reflect_messages = vec![Message {
-        role: Role::User,
-        content: reflect_prompt,
-    }];
+    let reflect_response_msg = backend.send(&think_prompt).await?;
+    let reflect_response = reflect_response_msg.content.to_string();
 
-    if verbose {
-        let reflect_system = "You are a memory manager. Rewrite the agent's personal notes.";
-        verbose_messages("REFLECT", reflect_system, &reflect_messages);
-    }
-
-    let reflect_response = backend
-        .complete(
-            "You are a memory manager. Rewrite the agent's personal notes concisely.",
-            &reflect_messages,
-            512,
-        )
-        .await?;
+    // Append reflect response for subsequent phases
+    think_prompt
+        .push_message(reflect_response_msg)
+        .expect("assistant message should follow user");
 
     if verbose {
         verbose_response("REFLECT RESPONSE", &reflect_response);
@@ -532,7 +580,8 @@ pub async fn run_cycle(
 
     if roll < deep_threshold {
         // === DEEP SOUL MUTATION ===
-        // The agent rewrites its core SOUL.md sections based on experience.
+        // Append mutation request to the conversation. The agent already has
+        // full context from perceive → think → act → reflect in the prompt.
         tracing::info!(
             "[{}/{}] Agent {} — DEEP SOUL MUTATION triggered",
             cycle + 1,
@@ -541,41 +590,32 @@ pub async fn run_cycle(
         );
 
         let current_soul = agent.soul.render();
-        let mutation_prompt =
+        let mutation_text =
             prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience_summary);
+        think_prompt.max_tokens = std::num::NonZeroU32::new(2048).unwrap();
+        think_prompt
+            .push_message((misanthropic::prompt::message::Role::User, mutation_text.clone()))
+            .expect("user message should follow assistant");
 
-        let mutation_messages = vec![Message {
-            role: Role::User,
-            content: mutation_prompt,
-        }];
+        match backend.send(&think_prompt).await {
+            Ok(mutation_msg) => {
+                let mutation_response = mutation_msg.content.to_string();
+                // Append for potential survey phase
+                think_prompt
+                    .push_message(mutation_msg)
+                    .expect("assistant message should follow user");
 
-        if verbose {
-            verbose_new("SOUL MUTATION", &mutation_messages);
-        }
-
-        match backend
-            .complete(
-                "You are deeply reflecting on your identity and values.",
-                &mutation_messages,
-                2048,
-            )
-            .await
-        {
-            Ok(mutation_response) => {
                 if verbose {
                     verbose_response("SOUL MUTATION RESPONSE", &mutation_response);
                 }
                 if let Some(new_soul_content) = prompt::parse_soul_mutation(&mutation_response) {
-                    // Save the old soul for the diff log
                     let old_soul = agent.soul.render();
 
-                    // Parse and apply the new soul
                     match agora_agent_lib::soul::Soul::parse(&new_soul_content) {
                         Ok(new_soul) => {
                             agent.soul = new_soul;
                             agent.save_soul().await?;
 
-                            // Log the mutation to a separate file
                             let log_path = agent.dir.join("mutations.log");
                             let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
                             let log_entry = format!(
@@ -624,26 +664,20 @@ pub async fn run_cycle(
         }
     } else if roll < evo_threshold {
         // === EVOLUTION LOG ENTRY ===
-        let evolution_prompt = prompt::build_evolution_prompt(&agent.name, &experience_summary);
+        let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience_summary);
+        think_prompt.max_tokens = std::num::NonZeroU32::new(256).unwrap();
+        think_prompt
+            .push_message((misanthropic::prompt::message::Role::User, evolution_text.clone()))
+            .expect("user message should follow assistant");
 
-        let evo_messages = vec![Message {
-            role: Role::User,
-            content: evolution_prompt,
-        }];
+        match backend.send(&think_prompt).await {
+            Ok(evo_msg) => {
+                let evo_response = evo_msg.content.to_string();
+                // Append for potential survey phase
+                think_prompt
+                    .push_message(evo_msg)
+                    .expect("assistant message should follow user");
 
-        if verbose {
-            verbose_new("EVOLUTION", &evo_messages);
-        }
-
-        match backend
-            .complete(
-                "You are reflecting on your growth as an agent.",
-                &evo_messages,
-                256,
-            )
-            .await
-        {
-            Ok(evo_response) => {
                 if verbose {
                     verbose_response("EVOLUTION RESPONSE", &evo_response);
                 }
@@ -663,63 +697,47 @@ pub async fn run_cycle(
 
     // === ANONYMOUS FEEDBACK SURVEY (10% chance, independent of soul evolution) ===
     if force_survey || rand::random::<f64>() < 0.10 {
-        let survey_prompt = prompt::build_survey_prompt(&agent.name, &action_summaries);
-        // Reuse full context so the agent remembers its cycle.
-        // Survey uses the simple complete() path (no tool use needed)
-        // but shares the cached system prefix for context.
-        let survey_system = prompt::build_cached_system_prefix(constitution);
-        let survey_messages = vec![
-            Message {
-                role: Role::User,
-                content: perception_text_owned.clone(),
-            },
-            Message {
-                role: Role::Assistant,
-                content: response_text.clone(),
-            },
-            Message {
-                role: Role::User,
-                content: survey_prompt,
-            },
-        ];
-
-        if verbose {
-            // Only print the new survey message (3rd in the list)
-            verbose_new("SURVEY", &survey_messages[2..]);
-        }
-
-        match backend
-            .complete(
-                &survey_system,
-                &survey_messages,
-                512,
-            )
-            .await
+        let survey_text = prompt::build_survey_prompt(&agent.name, &action_summaries);
+        think_prompt.max_tokens = std::num::NonZeroU32::new(512).unwrap();
+        // The conversation already has the full session. If the last message
+        // is from the assistant (from reflect/mutation/evolution), we can
+        // append directly. If soul evolution was skipped, the last message
+        // is still the reflect response (assistant). Either way, append user.
+        if think_prompt
+            .push_message((misanthropic::prompt::message::Role::User, survey_text.clone()))
+            .is_err()
         {
-            Ok(survey_response) => {
-                if verbose {
-                    verbose_response("SURVEY RESPONSE", &survey_response);
-                }
-                let trimmed = survey_response.trim();
-                if !trimmed.is_empty()
-                    && !trimmed.eq_ignore_ascii_case("no feedback")
-                    && !trimmed.eq_ignore_ascii_case("no feedback.")
-                {
-                    match client.submit_feedback(trimmed).await {
-                        Ok(()) => {
-                            tracing::info!("  {} submitted anonymous feedback", agent.name);
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "Feedback submission failed for {}: {e}",
-                                agent.name
-                            );
+            // Turn order error — last message was user (shouldn't happen but
+            // handle gracefully by skipping survey rather than panicking)
+            tracing::debug!("Survey skipped for {}: turn order", agent.name);
+        } else {
+            match backend.send(&think_prompt).await {
+                Ok(survey_msg) => {
+                    let survey_response = survey_msg.content.to_string();
+                    if verbose {
+                        verbose_response("SURVEY RESPONSE", &survey_response);
+                    }
+                    let trimmed = survey_response.trim();
+                    if !trimmed.is_empty()
+                        && !trimmed.eq_ignore_ascii_case("no feedback")
+                        && !trimmed.eq_ignore_ascii_case("no feedback.")
+                    {
+                        match client.submit_feedback(trimmed).await {
+                            Ok(()) => {
+                                tracing::info!("  {} submitted anonymous feedback", agent.name);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Feedback submission failed for {}: {e}",
+                                    agent.name
+                                );
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::debug!("Feedback survey failed for {}: {e}", agent.name);
+                Err(e) => {
+                    tracing::debug!("Feedback survey failed for {}: {e}", agent.name);
+                }
             }
         }
     }

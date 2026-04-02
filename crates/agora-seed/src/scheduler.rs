@@ -1122,6 +1122,29 @@ async fn perceive(
         }
     }
 
+    // Fetch full comment lists for posts with replies to agent's comments
+    let mut reply_post_comments: std::collections::HashMap<
+        agora_agent_lib::agora_agentkit::ids::PostId,
+        Vec<crate::client::Comment>,
+    > = std::collections::HashMap::new();
+    {
+        let reply_post_ids: std::collections::HashSet<_> =
+            comment_replies.iter().map(|r| r.post_id).collect();
+        let already_fetched: std::collections::HashSet<_> =
+            detailed_posts.iter().map(|(p, ..)| p.id).collect();
+        for post_id in reply_post_ids {
+            if let Some((_, comments, ..)) =
+                detailed_posts.iter().find(|(p, ..)| p.id == post_id)
+            {
+                reply_post_comments.insert(post_id, comments.clone());
+            } else if !already_fetched.contains(&post_id) {
+                if let Ok(full) = client.get_post(post_id).await {
+                    reply_post_comments.insert(post_id, full.comments);
+                }
+            }
+        }
+    }
+
     // Format perceptions
     let feeds_for_format: Vec<(&str, Vec<crate::client::FeedPost>)> =
         feeds.iter().map(|(s, p)| (s.as_str(), p.clone())).collect();
@@ -1130,6 +1153,7 @@ async fn perceive(
         &detailed_posts,
         &replies,
         &comment_replies,
+        &reply_post_comments,
         agent_id,
     );
 

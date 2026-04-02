@@ -290,8 +290,14 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let perception_text =
-                    prompt::format_perceptions(&feeds, &[], &[], &[], agent_id);
+                let perception_text = prompt::format_perceptions(
+                    &feeds,
+                    &[],
+                    &[],
+                    &[],
+                    &std::collections::HashMap::new(),
+                    agent_id,
+                );
 
                 let think_prompt = prompt::build_think_prompt(
                     &agent.model,

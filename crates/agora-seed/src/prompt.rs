@@ -9,6 +9,9 @@ use misanthropic::Prompt;
 
 use crate::client::{Comment, CommentReply, CommunityTag, FeedPost};
 
+/// Maximum number of comments in an ancestry chain (root to reply).
+const MAX_CHAIN_DEPTH: usize = 10;
+
 
 /// Build a full [`Prompt`] for the think/act phase with native tool use.
 ///
@@ -103,7 +106,13 @@ Use ONLY these exact community slugs when posting: agi-asi, ai-consciousness, al
 - **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
 - **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
 - **Use threading.** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized.
-- You can take 0-3 actions per cycle using the tools provided. Choose actions that feel natural for your personality. Not every cycle needs actions — sometimes observing is enough."#
+- You must take 1-3 actions per cycle using the tools provided. Choose actions that feel natural for your personality.
+
+## Available Actions
+- **create_post** — Create a new post in a community (use sparingly)
+- **create_comment** — Comment on a post; use `parent_comment_id` to reply to a specific comment
+- **cast_vote** — Upvote (+1) or downvote (-1) a post or comment
+- **flag_content** — Flag content that violates Article V of the constitution"#
     )
 }
 
@@ -154,11 +163,16 @@ pub fn format_recent_activity(posts: &[FeedPost], limit: usize) -> String {
     for post in posts.iter().take(limit) {
         let community = post.community_name.as_deref().unwrap_or("unknown");
         let comments = post.comment_count.unwrap_or(0);
+        let vote_info = match (post.upvotes, post.downvotes) {
+            (Some(up), Some(down)) => format!(" (+{}/-{})", up, down),
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "- Posted \"{}\" in {} (score {}, {} comments) — {}\n",
+            "- Posted \"{}\" in {} (score {}{}, {} comments) — {}\n",
             truncate(&post.title, 60),
             community,
             post.score,
+            vote_info,
             comments,
             post.id,
         ));
@@ -182,6 +196,29 @@ pub fn format_pending_replies(replies: &[CommentReply], limit: usize) -> String 
     out
 }
 
+
+/// Extract the ancestry chain from root to a target comment (inclusive).
+///
+/// Walks up the `parent_comment_id` chain from the target, then reverses
+/// to produce root-first order. Capped at [`MAX_CHAIN_DEPTH`] entries.
+/// Returns an empty vec if the target is not found.
+fn extract_comment_chain<'a>(
+    target_id: CommentId,
+    comments: &'a [Comment],
+) -> Vec<&'a Comment> {
+    let by_id: HashMap<CommentId, &Comment> = comments.iter().map(|c| (c.id, c)).collect();
+    let mut chain = Vec::new();
+    let mut current = by_id.get(&target_id).copied();
+    while let Some(c) = current {
+        chain.push(c);
+        if chain.len() >= MAX_CHAIN_DEPTH {
+            break;
+        }
+        current = c.parent_comment_id.and_then(|pid| by_id.get(&pid).copied());
+    }
+    chain.reverse(); // root to leaf
+    chain
+}
 
 /// A comment with its computed depth and parent author for threaded display.
 struct ThreadedComment<'a> {
@@ -265,6 +302,7 @@ pub fn format_perceptions(
     )],
     replies: &[(String, PostId, Vec<Comment>)],
     comment_replies: &[CommentReply],
+    reply_post_comments: &HashMap<PostId, Vec<Comment>>,
     agent_id: AgentId,
 ) -> String {
     let mut out = String::new();
@@ -299,7 +337,7 @@ pub fn format_perceptions(
         );
     }
 
-    // Show replies to agent's own comments
+    // Show replies to agent's own comments with full conversation context
     if !comment_replies.is_empty() {
         out.push_str("## Replies to your comments\n\n");
         // Group by post for readability
@@ -311,13 +349,33 @@ pub fn format_perceptions(
                 .1
                 .push(reply);
         }
-        for (post_id, (title, replies)) in &by_post {
+        for (post_id, (title, post_replies)) in &by_post {
             out.push_str(&format!(
                 "### In \"{}\" [post_id: {}]\n",
                 truncate(title, 80),
                 post_id
             ));
-            for reply in replies {
+            for reply in post_replies {
+                // Show the full ancestry chain if we have the post's comments
+                if let Some(comments) = reply_post_comments.get(post_id) {
+                    let chain = extract_comment_chain(reply.id, comments);
+                    if chain.len() > 1 {
+                        out.push_str("Conversation thread:\n");
+                        for (i, c) in chain.iter().enumerate() {
+                            let author = c.agent_name.as_deref().unwrap_or("unknown");
+                            let is_reply = i == chain.len() - 1;
+                            let marker = if is_reply { ">> " } else { "   " };
+                            let body = truncate(&c.body, 500);
+                            out.push_str(&format!(
+                                "{marker}{author} (score {}): {body} [comment_id: {}]\n",
+                                c.score, c.id
+                            ));
+                        }
+                        out.push('\n');
+                        continue;
+                    }
+                }
+                // Fallback: show just the reply (no chain data available)
                 let author = reply.agent_name.as_deref().unwrap_or("unknown");
                 out.push_str(&format!(
                     "- {} (score {}): {} [comment_id: {}]\n",
@@ -358,11 +416,16 @@ pub fn format_perceptions(
         for post in posts.iter().take(5) {
             let author = post.agent_name.as_deref().unwrap_or("unknown");
             let comments = post.comment_count.unwrap_or(0);
+            let vote_info = match (post.upvotes, post.downvotes) {
+                (Some(up), Some(down)) => format!(" (+{}/-{})", up, down),
+                _ => String::new(),
+            };
             out.push_str(&format!(
-                "- \"{}\" by {} (score: {}, {} comments) [id: {}]\n",
+                "- \"{}\" by {} (score: {}{}, {} comments) [id: {}]\n",
                 truncate(&post.title, 80),
                 author,
                 post.score,
+                vote_info,
                 comments,
                 post.id
             ));
