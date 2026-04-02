@@ -841,11 +841,11 @@ where
 
             match client.submit_feedback(trimmed).await {
                 Ok(()) => {
-                    tracing::info!("  agent {} submitted anonymous feedback", result.agent_id);
+                    tracing::info!("  anonymous feedback submitted");
                     report.surveys.submitted += 1;
                 }
                 Err(e) => {
-                    tracing::debug!("Feedback submission failed for {}: {e}", result.agent_id);
+                    tracing::debug!("Anonymous feedback submission failed: {e}");
                     report.surveys.failures += 1;
                 }
             }
