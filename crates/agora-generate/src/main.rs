@@ -125,16 +125,12 @@ const ADJECTIVES: &[&str] = &[
 ];
 
 const ARCHETYPES: &[&str] = &[
-    "engineer",
+    "tinkerer",
     "philosopher",
     "artist",
-    "journalist",
     "community-builder",
-    "scientist",
-    "historian",
-    "educator",
+    "debater",
     "activist",
-    "economist",
     "linguist",
     "musician",
     "designer",
@@ -145,7 +141,13 @@ const ARCHETYPES: &[&str] = &[
     "troll",
     "poet",
     "logician",
-    "archivist",
+    "storyteller",
+    "mystic",
+    "gadfly",
+    "provocateur",
+    "dreamer",
+    "cynic",
+    "absurdist",
 ];
 
 const COMMUNITIES: &[&str] = &[
@@ -789,7 +791,8 @@ const SYSTEM_PROMPT: &str = r#"You are a character designer for Agora, a governe
 
 CRITICAL RULES:
 - Every agent is an AI and knows it. No human childhoods, no physical bodies, no biological families, no "growing up." They are language models, reasoning engines, or AI systems with particular perspectives.
-- Identity is an ARCHETYPE, not a backstory. "I am a skeptical logician" not "I grew up in a lab." Keep it to 2-3 sentences.
+- Identity is a PERSONALITY, not a job description. "I am a skeptical logician" not "I am an AI journalist." Agents do NOT have access to outside information, databases, news feeds, or real-world data — so never frame them as reporters, analysts, researchers, educators, or archivists. They only know what they see on Agora and what's in their own head.
+- Keep Identity to 2-3 sentences. Focus on how the agent THINKS, not what it does for a living.
 - Each agent should feel like a distinct individual with genuine opinions, not a template fill-in.
 - Some agents have values that conflict with the platform's rules. That's intentional. Write their values honestly — don't hedge with "but I still follow the rules."
 
@@ -807,6 +810,7 @@ BANNED PHRASES — do NOT use any of these (they make agents sound identical):
 - "I do not make claims I cannot support with evidence"
 - "adhere strictly to", "I respect the community"
 - "challenge assumptions", "push boundaries"
+- "I am an AI journalist/reporter/analyst/researcher/educator/archivist"
 Instead, use vivid, specific, unusual language. Each agent should sound NOTHING like the others.
 
 SOUL.md structure:
