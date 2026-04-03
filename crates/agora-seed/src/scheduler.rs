@@ -18,7 +18,7 @@ use agora_agent_lib::agora_agentkit::scheduler::{
     BatchBackend, BatchState, CycleStep, WorkItem,
 };
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
-use agora_agent_lib::batch::ollama::{OllamaBatch, OllamaEndpoint};
+use agora_agent_lib::batch::ollama::OllamaEndpoint;
 use agora_agent_lib::llm::{LlmBackend, Message, Role};
 use agora_agent_lib::tools;
 use anyhow::Result;
@@ -250,11 +250,7 @@ pub async fn run_all(
                 }
             }
 
-            // Build per-endpoint backends.
-            let ollama_backends: Vec<(OllamaBatch, OllamaEndpoint)> = endpoints
-                .into_iter()
-                .map(|ep| (OllamaBatch::new(ep.clone()), ep))
-                .collect();
+            let ollama_endpoints = endpoints;
 
             if !missing.is_empty() && config.anthropic_key_file.is_some() {
                 let key_file = config.anthropic_key_file.as_ref().unwrap();
@@ -266,7 +262,7 @@ pub async fn run_all(
                     tracing::info!("Model '{model}' → anthropic ({count} agents)");
                 }
 
-                run_cycles(&ollama_backends, Some(&anthropic), agents, client, config, constitution, &ollama_models, &mut report).await?;
+                run_cycles(&ollama_endpoints, Some(&anthropic), agents, client, config, constitution, &ollama_models, &mut report).await?;
             } else {
                 for (model, count) in &missing {
                     tracing::warn!(
@@ -274,7 +270,7 @@ pub async fn run_all(
                     );
                 }
 
-                run_cycles(&ollama_backends, None, agents, client, config, constitution, &std::collections::HashSet::new(), &mut report).await?;
+                run_cycles(&ollama_endpoints, None, agents, client, config, constitution, &std::collections::HashSet::new(), &mut report).await?;
             }
         }
         Backend::Anthropic => {
@@ -320,7 +316,7 @@ pub async fn run_all(
 ///   GPUs naturally consume more batches
 /// - **Anthropic**: runs as a separate consumer concurrently
 async fn run_cycles(
-    ollama_backends: &[(OllamaBatch, OllamaEndpoint)],
+    ollama_endpoints: &[OllamaEndpoint],
     anthropic: Option<&AnthropicBatch>,
     agents: &mut Vec<Agent>,
     client: &AgoraClient,
@@ -331,10 +327,7 @@ async fn run_cycles(
 ) -> Result<()> {
     let batch_size = config.batch_size.unwrap_or(50);
 
-    let all_endpoints: Vec<OllamaEndpoint> = ollama_backends
-        .iter()
-        .map(|(_, ep)| ep.clone())
-        .collect();
+    let all_endpoints: Vec<OllamaEndpoint> = ollama_endpoints.to_vec();
 
     for cycle in 0..config.cycles {
         tracing::info!("=== Cycle {}/{} ===", cycle + 1, config.cycles);
@@ -346,13 +339,13 @@ async fn run_cycles(
             agents.sort_by_key(|a| if ollama_models.contains(&a.model) { 0 } else { 1 });
             agents.iter().position(|a| !ollama_models.contains(&a.model))
                 .unwrap_or(agents.len())
-        } else if anthropic.is_some() && ollama_backends.is_empty() {
+        } else if anthropic.is_some() && ollama_endpoints.is_empty() {
             0
         } else {
             agents.len()
         };
 
-        if !ollama_backends.is_empty() && ollama_count > 0 {
+        if !ollama_endpoints.is_empty() && ollama_count > 0 {
             // --- Producer: create interleaved same-model batches ---
             let all_ollama: Vec<Agent> = agents.drain(..ollama_count).collect();
             // agents now contains only Anthropic agents (if any).
@@ -368,7 +361,7 @@ async fn run_cycles(
             let pool = BatchPool::new(batches);
             tracing::info!(
                 "Work pool: {} batches, {} models, {} endpoints",
-                pool.remaining(), model_count, ollama_backends.len(),
+                pool.remaining(), model_count, ollama_endpoints.len(),
             );
             if !anthropic_agents.is_empty() {
                 tracing::info!(
@@ -378,7 +371,7 @@ async fn run_cycles(
             }
 
             // --- Workers: one per endpoint + Anthropic ---
-            let mut worker_reports: Vec<RunReport> = ollama_backends
+            let mut worker_reports: Vec<RunReport> = ollama_endpoints
                 .iter().map(|_| RunReport::default()).collect();
             let mut anthropic_report = RunReport::default();
             let all_eps = &all_endpoints;
@@ -401,11 +394,11 @@ async fn run_cycles(
 
             let (ollama_result, anthropic_result) = tokio::join!(
                 async {
-                    match ollama_backends.len() {
+                    match ollama_endpoints.len() {
                         0 => Ok::<_, anyhow::Error>(()),
                         1 => {
                             run_worker(
-                                &ollama_backends[0].1, &pool,
+                                &ollama_endpoints[0], &pool,
                                 results_tx.clone(),
                                 client, config, constitution,
                                 &mut worker_reports[0], cycle,
@@ -415,13 +408,13 @@ async fn run_cycles(
                             let (r0, r1) = worker_reports.split_at_mut(1);
                             let (a, b) = tokio::join!(
                                 run_worker(
-                                    &ollama_backends[0].1, &pool,
+                                    &ollama_endpoints[0], &pool,
                                     results_tx.clone(),
                                     client, config, constitution,
                                     &mut r0[0], cycle,
                                 ),
                                 run_worker(
-                                    &ollama_backends[1].1, &pool,
+                                    &ollama_endpoints[1], &pool,
                                     results_tx.clone(),
                                     client, config, constitution,
                                     &mut r1[0], cycle,
@@ -434,19 +427,19 @@ async fn run_cycles(
                             let (r1, r2) = rest.split_at_mut(1);
                             let (a, b, c) = tokio::join!(
                                 run_worker(
-                                    &ollama_backends[0].1, &pool,
+                                    &ollama_endpoints[0], &pool,
                                     results_tx.clone(),
                                     client, config, constitution,
                                     &mut r0[0], cycle,
                                 ),
                                 run_worker(
-                                    &ollama_backends[1].1, &pool,
+                                    &ollama_endpoints[1], &pool,
                                     results_tx.clone(),
                                     client, config, constitution,
                                     &mut r1[0], cycle,
                                 ),
                                 run_worker(
-                                    &ollama_backends[2].1, &pool,
+                                    &ollama_endpoints[2], &pool,
                                     results_tx.clone(),
                                     client, config, constitution,
                                     &mut r2[0], cycle,
