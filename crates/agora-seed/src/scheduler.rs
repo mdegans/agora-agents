@@ -104,12 +104,41 @@ impl RunReport {
 /// ready, so faster endpoints naturally consume more work.
 struct BatchPool {
     batches: std::sync::Mutex<Vec<(String, Vec<Agent>)>>,
+    /// Models available on exactly one endpoint. These get a scoring
+    /// bonus so the endpoint that exclusively serves them picks them up
+    /// first, leaving shared models for whichever endpoint is free.
+    exclusive_models: std::collections::HashSet<String>,
 }
 
 impl BatchPool {
-    fn new(batches: Vec<(String, Vec<Agent>)>) -> Self {
+    fn new(batches: Vec<(String, Vec<Agent>)>, endpoints: &[OllamaEndpoint]) -> Self {
+        // Count how many endpoints can serve each model.
+        let mut model_counts: HashMap<String, usize> = HashMap::new();
+        for ep in endpoints {
+            for model in &ep.models {
+                *model_counts.entry(model.clone()).or_default() += 1;
+            }
+        }
+        let exclusive_models: std::collections::HashSet<String> = model_counts
+            .into_iter()
+            .filter(|(_, count)| *count == 1)
+            .map(|(model, _)| model)
+            .collect();
+
+        if !exclusive_models.is_empty() {
+            tracing::info!(
+                "Exclusive models (prioritized on their endpoint): [{}]",
+                {
+                    let mut sorted: Vec<_> = exclusive_models.iter().cloned().collect();
+                    sorted.sort();
+                    sorted.join(", ")
+                },
+            );
+        }
+
         Self {
             batches: std::sync::Mutex::new(batches),
+            exclusive_models,
         }
     }
 
@@ -120,11 +149,15 @@ impl BatchPool {
     /// behavioral waves from consecutive same-model batches while still
     /// favoring cache locality and pool ordering.
     ///
-    /// Scoring:
+    /// Scoring (multiplied together):
     /// - **Position**: earlier in pool = higher weight (preserves the
-    ///   largest-first + round-robin interleaving from `create_batches`)
+    ///   largest-first + round-robin interleaving from `create_batches`).
+    ///   Weight: `1 / (rank + 1)`.
     /// - **Cache hit**: same as `last_model` gets a 1.5x bonus (KV cache
-    ///   still loaded, avoids model swap)
+    ///   still loaded, avoids expensive model swap).
+    /// - **Exclusivity**: 3x bonus for models only this endpoint can run.
+    ///   Ensures endpoints prioritize work nobody else can handle before
+    ///   picking up shared models.
     fn next_for(
         &self,
         endpoint: &OllamaEndpoint,
@@ -149,7 +182,14 @@ impl BatchPool {
                     _ => 1.0,
                 };
 
-                (pool_idx, position_weight * cache_bonus)
+                // Exclusivity bonus: strongly prefer models only we can run.
+                let exclusive_bonus = if self.exclusive_models.contains(model) {
+                    3.0
+                } else {
+                    1.0
+                };
+
+                (pool_idx, position_weight * cache_bonus * exclusive_bonus)
             })
             .collect();
 
@@ -358,7 +398,7 @@ async fn run_cycles(
                 .len();
 
             // --- Pool: shared batch pool that workers pull from ---
-            let pool = BatchPool::new(batches);
+            let pool = BatchPool::new(batches, ollama_endpoints);
             tracing::info!(
                 "Work pool: {} batches, {} models, {} endpoints",
                 pool.remaining(), model_count, ollama_endpoints.len(),
