@@ -83,7 +83,17 @@ pub trait LlmBackend: Send + Sync {
         }
 
         let response = self.send(&prompt).await?;
-        Ok(response.content.to_string())
+        // Filter out Block::Thought and <think>/<thinking> XML tags.
+        // Ollama models (especially qwen) may return chain-of-thought
+        // in various forms depending on the backend.
+        use misanthropic::cot::Thinkable;
+        let text = response
+            .content
+            .speech()
+            .map(|s| s.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Ok(text)
     }
 }
 
