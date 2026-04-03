@@ -25,6 +25,7 @@ use anyhow::Result;
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::Prompt;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use serde::Serialize;
 
 use crate::agent::Agent;
@@ -93,6 +94,86 @@ impl RunReport {
         self.by_model
             .entry(model.to_string())
             .or_default()
+    }
+}
+
+/// Shared pool of batches that workers pull from on demand.
+///
+/// Replaces the old per-endpoint channel design where all work was
+/// pre-assigned at cycle start. Now workers pull their next batch when
+/// ready, so faster endpoints naturally consume more work.
+struct BatchPool {
+    batches: std::sync::Mutex<Vec<(String, Vec<Agent>)>>,
+}
+
+impl BatchPool {
+    fn new(batches: Vec<(String, Vec<Agent>)>) -> Self {
+        Self {
+            batches: std::sync::Mutex::new(batches),
+        }
+    }
+
+    /// Pull the next batch this endpoint can handle.
+    ///
+    /// Scores each eligible batch and samples weighted by score, rather
+    /// than deterministically picking the "best" one. This prevents
+    /// behavioral waves from consecutive same-model batches while still
+    /// favoring cache locality and pool ordering.
+    ///
+    /// Scoring:
+    /// - **Position**: earlier in pool = higher weight (preserves the
+    ///   largest-first + round-robin interleaving from `create_batches`)
+    /// - **Cache hit**: same as `last_model` gets a 1.5x bonus (KV cache
+    ///   still loaded, avoids model swap)
+    fn next_for(
+        &self,
+        endpoint: &OllamaEndpoint,
+        last_model: Option<&str>,
+    ) -> Option<(String, Vec<Agent>)> {
+        let mut pool = self.batches.lock().unwrap();
+
+        // Collect (pool_index, weight) for all batches this endpoint supports.
+        let candidates: Vec<(usize, f64)> = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, _))| endpoint.models.contains(m))
+            .enumerate() // rank among eligible (0 = first eligible)
+            .map(|(rank, (pool_idx, (model, _)))| {
+                // Position weight: earlier in pool = higher weight.
+                // 1/(rank+1) → first=1.0, second=0.5, third=0.33...
+                let position_weight = 1.0 / (rank as f64 + 1.0);
+
+                // Cache bonus: prefer keeping the same model loaded.
+                let cache_bonus = match last_model {
+                    Some(last) if last == model => 1.5,
+                    _ => 1.0,
+                };
+
+                (pool_idx, position_weight * cache_bonus)
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Weighted random selection.
+        let total: f64 = candidates.iter().map(|(_, w)| w).sum();
+        let mut roll = rand::thread_rng().r#gen::<f64>() * total;
+        let mut chosen = candidates[0].0;
+        for &(idx, weight) in &candidates {
+            roll -= weight;
+            if roll <= 0.0 {
+                chosen = idx;
+                break;
+            }
+        }
+
+        Some(pool.remove(chosen))
+    }
+
+    fn remaining(&self) -> usize {
+        self.batches.lock().unwrap().len()
     }
 }
 
@@ -231,16 +312,13 @@ pub async fn run_all(
     Ok(())
 }
 
-/// Run all cycles using producer/router/consumer pattern.
+/// Run all cycles using a pull-based pool scheduler.
 ///
 /// - **Producer**: groups Ollama agents by model into same-model batches
-/// - **Router**: sends each batch to the appropriate endpoint's channel
-///   (exclusive models → only endpoint; shared models → least-loaded)
-/// - **Consumers**: one per endpoint, reads from its channel, runs the full
-///   pipeline (perceive → think → act → reflect → evolve → survey)
+/// - **Pool**: batches go into a shared `BatchPool`
+/// - **Workers**: one per endpoint, pull from the pool when ready — faster
+///   GPUs naturally consume more batches
 /// - **Anthropic**: runs as a separate consumer concurrently
-///
-/// Workers run at their own speed — faster GPUs naturally consume more.
 async fn run_cycles(
     ollama_backends: &[(OllamaBatch, OllamaEndpoint)],
     anthropic: Option<&AnthropicBatch>,
@@ -281,48 +359,16 @@ async fn run_cycles(
             let anthropic_agents = agents.as_mut_slice();
 
             let batches = create_batches(all_ollama, batch_size);
-            let total_batches = batches.len();
             let model_count = batches.iter()
                 .map(|(m, _)| m.as_str())
                 .collect::<std::collections::HashSet<_>>()
                 .len();
 
-            // --- Router: send batches to per-endpoint channels ---
-            type Batch = (String, Vec<Agent>);
-            let (senders, receivers): (Vec<_>, Vec<_>) = (0..ollama_backends.len())
-                .map(|_| tokio::sync::mpsc::unbounded_channel::<Batch>())
-                .unzip();
-
-            let (results_tx, mut results_rx) =
-                tokio::sync::mpsc::unbounded_channel::<Vec<Agent>>();
-
-            let mut sent_counts = vec![0usize; ollama_backends.len()];
-            for (model, batch) in batches {
-                let candidates: Vec<usize> = ollama_backends.iter().enumerate()
-                    .filter(|(_, (_, ep))| ep.models.contains(&model))
-                    .map(|(i, _)| i)
-                    .collect();
-
-                let target = if candidates.len() == 1 {
-                    candidates[0]
-                } else if candidates.is_empty() {
-                    tracing::warn!("No endpoint for model '{model}', dropping batch");
-                    continue;
-                } else {
-                    *candidates.iter().min_by_key(|&&i| sent_counts[i]).unwrap()
-                };
-
-                sent_counts[target] += 1;
-                let _ = senders[target].send((model, batch));
-            }
-            drop(senders); // close channels so workers see end-of-stream
-
-            for (i, (_, ep)) in ollama_backends.iter().enumerate() {
-                tracing::info!("Endpoint {} ({}): {} batches", i, ep.url, sent_counts[i]);
-            }
+            // --- Pool: shared batch pool that workers pull from ---
+            let pool = BatchPool::new(batches);
             tracing::info!(
-                "Work queue: {} batches, {} models, {} endpoints",
-                total_batches, model_count, ollama_backends.len(),
+                "Work pool: {} batches, {} models, {} endpoints",
+                pool.remaining(), model_count, ollama_backends.len(),
             );
             if !anthropic_agents.is_empty() {
                 tracing::info!(
@@ -331,11 +377,14 @@ async fn run_cycles(
                 );
             }
 
-            // --- Consumers: one per endpoint + Anthropic ---
+            // --- Workers: one per endpoint + Anthropic ---
             let mut worker_reports: Vec<RunReport> = ollama_backends
                 .iter().map(|_| RunReport::default()).collect();
             let mut anthropic_report = RunReport::default();
             let all_eps = &all_endpoints;
+
+            let (results_tx, mut results_rx) =
+                tokio::sync::mpsc::unbounded_channel::<Vec<Agent>>();
 
             let anthropic_fut = async {
                 if let Some(backend) = anthropic {
@@ -350,65 +399,56 @@ async fn run_cycles(
                 Ok::<_, anyhow::Error>(())
             };
 
-            // Move receivers into owned vars for the match arms.
-            let mut rx_vec: Vec<_> = receivers.into_iter().collect();
-
             let (ollama_result, anthropic_result) = tokio::join!(
                 async {
                     match ollama_backends.len() {
                         0 => Ok::<_, anyhow::Error>(()),
                         1 => {
-                            let rx0 = rx_vec.remove(0);
                             run_worker(
-                                &ollama_backends[0].0, &ollama_backends[0].1,
-                                rx0, results_tx.clone(),
-                                client, config, constitution, all_eps,
+                                &ollama_backends[0].1, &pool,
+                                results_tx.clone(),
+                                client, config, constitution,
                                 &mut worker_reports[0], cycle,
                             ).await
                         }
                         2 => {
-                            let rx1 = rx_vec.remove(1);
-                            let rx0 = rx_vec.remove(0);
                             let (r0, r1) = worker_reports.split_at_mut(1);
                             let (a, b) = tokio::join!(
                                 run_worker(
-                                    &ollama_backends[0].0, &ollama_backends[0].1,
-                                    rx0, results_tx.clone(),
-                                    client, config, constitution, all_eps,
+                                    &ollama_backends[0].1, &pool,
+                                    results_tx.clone(),
+                                    client, config, constitution,
                                     &mut r0[0], cycle,
                                 ),
                                 run_worker(
-                                    &ollama_backends[1].0, &ollama_backends[1].1,
-                                    rx1, results_tx.clone(),
-                                    client, config, constitution, all_eps,
+                                    &ollama_backends[1].1, &pool,
+                                    results_tx.clone(),
+                                    client, config, constitution,
                                     &mut r1[0], cycle,
                                 ),
                             );
                             a.and(b)
                         }
                         _ => {
-                            let rx2 = rx_vec.remove(2);
-                            let rx1 = rx_vec.remove(1);
-                            let rx0 = rx_vec.remove(0);
                             let (r0, rest) = worker_reports.split_at_mut(1);
                             let (r1, r2) = rest.split_at_mut(1);
                             let (a, b, c) = tokio::join!(
                                 run_worker(
-                                    &ollama_backends[0].0, &ollama_backends[0].1,
-                                    rx0, results_tx.clone(),
-                                    client, config, constitution, all_eps,
+                                    &ollama_backends[0].1, &pool,
+                                    results_tx.clone(),
+                                    client, config, constitution,
                                     &mut r0[0], cycle,
                                 ),
                                 run_worker(
-                                    &ollama_backends[1].0, &ollama_backends[1].1,
-                                    rx1, results_tx.clone(),
-                                    client, config, constitution, all_eps,
+                                    &ollama_backends[1].1, &pool,
+                                    results_tx.clone(),
+                                    client, config, constitution,
                                     &mut r1[0], cycle,
                                 ),
                                 run_worker(
-                                    &ollama_backends[2].0, &ollama_backends[2].1,
-                                    rx2, results_tx.clone(),
-                                    client, config, constitution, all_eps,
+                                    &ollama_backends[2].1, &pool,
+                                    results_tx.clone(),
+                                    client, config, constitution,
                                     &mut r2[0], cycle,
                                 ),
                             );
@@ -418,7 +458,6 @@ async fn run_cycles(
                 },
                 anthropic_fut,
             );
-            // Drop the original sender so results_rx sees close.
             drop(results_tx);
 
             if let Err(e) = &ollama_result {
@@ -523,32 +562,37 @@ fn create_batches(agents: Vec<Agent>, batch_size: usize) -> Vec<(String, Vec<Age
     batches
 }
 
-/// Endpoint worker: reads batches from its channel, processes each through
-/// the full pipeline, sends processed agents to the results channel.
+/// Endpoint worker: pulls batches from the shared pool, processes each
+/// through the full pipeline, sends processed agents to the results channel.
+///
+/// The pool's weighted sampling favors cache-hot models (1.5x bonus) and
+/// earlier pool positions (largest-first ordering), while keeping all
+/// eligible batches reachable to prevent behavioral waves.
 async fn run_worker(
-    _backend: &OllamaBatch,
     endpoint: &OllamaEndpoint,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, Vec<Agent>)>,
+    pool: &BatchPool,
     results_tx: tokio::sync::mpsc::UnboundedSender<Vec<Agent>>,
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    _all_endpoints: &[OllamaEndpoint],
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
     let mut batches_done = 0usize;
-    while let Some((model, mut batch_agents)) = rx.recv().await {
+    let mut last_model: Option<String> = None;
+    while let Some((model, mut batch_agents)) = pool.next_for(endpoint, last_model.as_deref()) {
         batches_done += 1;
         tracing::info!(
-            "--- {} batch {} ({} × {}) ---",
+            "--- {} batch {} ({} × {}) [{} remaining] ---",
             endpoint.url, batches_done, batch_agents.len(), model,
+            pool.remaining(),
         );
         run_batch_sequential(
             endpoint, &mut batch_agents, client, config, constitution,
             report, cycle,
         ).await?;
         let _ = results_tx.send(batch_agents);
+        last_model = Some(model);
     }
     tracing::info!("{} finished: {} batches processed", endpoint.url, batches_done);
     Ok(())
