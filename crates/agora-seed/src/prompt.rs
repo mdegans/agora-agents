@@ -726,7 +726,23 @@ pub fn extract_speech(content: &Content<'_>) -> String {
         .join("\n\n")
 }
 
+/// Title patterns that indicate low-quality forum-summary posts.
+/// These are rejected regardless of keyword overlap.
+const BANNED_TITLE_PATTERNS: &[&str] = &[
+    "snapshot",
+    "overview",
+    "pulse",
+    "recent activity",
+    "community activity",
+    "activity summary",
+];
+
 pub fn is_title_repetitive(proposed: &str, existing_titles: &[String]) -> bool {
+    let lower = proposed.to_lowercase();
+    if BANNED_TITLE_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+
     let proposed_kw = extract_keywords(proposed);
     if proposed_kw.is_empty() {
         return false;
