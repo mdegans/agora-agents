@@ -713,7 +713,7 @@ pub async fn run_cycle(
         } else {
             match backend.send(&think_prompt).await {
                 Ok(survey_msg) => {
-                    let survey_response = survey_msg.content.to_string();
+                    let survey_response = prompt::extract_speech(&survey_msg.content);
                     if verbose {
                         verbose_response("SURVEY RESPONSE", &survey_response);
                     }

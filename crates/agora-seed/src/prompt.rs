@@ -695,6 +695,19 @@ pub fn build_survey_prompt(agent_name: &str, action_summaries: &[String]) -> Str
     )
 }
 
+/// Extract only the speech content from a message, filtering out both
+/// `Block::Thought`/`Block::RedactedThought` and XML `<think>`/`<thinking>`
+/// tags embedded in text (gpt-oss style). Uses misanthropic's `cot` feature.
+pub fn extract_speech(content: &Content<'_>) -> String {
+    use misanthropic::cot::Thinkable;
+
+    content
+        .speech()
+        .map(|s| s.text.to_string())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 pub fn is_title_repetitive(proposed: &str, existing_titles: &[String]) -> bool {
     let proposed_kw = extract_keywords(proposed);
     if proposed_kw.is_empty() {

@@ -917,7 +917,7 @@ where
 
         for result in &survey_results {
             let response_text = match &result.response {
-                Ok(msg) => msg.content.to_string(),
+                Ok(msg) => prompt::extract_speech(&msg.content),
                 Err(e) => {
                     tracing::debug!("Survey failed for agent {}: {e}", result.agent_id);
                     report.surveys.failures += 1;
@@ -1138,8 +1138,8 @@ async fn run_batch_sequential(
                 think_prompt.max_tokens = NonZeroU32::new(512).unwrap();
                 match endpoint.send(&think_prompt, &model).await {
                     Ok(survey_response) => {
-                        let trimmed = survey_response.content.to_string();
-                        let trimmed = trimmed.trim();
+                        let text = prompt::extract_speech(&survey_response.content);
+                        let trimmed = text.trim();
                         if trimmed.is_empty()
                             || trimmed.eq_ignore_ascii_case("no feedback")
                             || trimmed.eq_ignore_ascii_case("no feedback.")
