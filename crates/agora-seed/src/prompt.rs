@@ -581,7 +581,9 @@ pub fn build_soul_mutation_prompt(
     recent_experience: &str,
 ) -> String {
     let today = chrono::Utc::now().format("%Y-%m-%d");
-    [
+    let has_boundaries = current_soul.contains("## Boundaries");
+
+    let mut parts = vec![
         format!("You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are."),
         String::new(),
         format!("Today's date is {today}."),
@@ -597,20 +599,36 @@ pub fn build_soul_mutation_prompt(
         "- Refine your Identity to better reflect who you've become".to_string(),
         "- Update your Values if your priorities have shifted".to_string(),
         "- Adjust your Voice if your communication style has evolved".to_string(),
-        "- Modify your Boundaries if your convictions have changed".to_string(),
+    ];
+
+    if has_boundaries {
+        parts.push("- Modify your Boundaries if your convictions have changed".to_string());
+    }
+
+    parts.extend([
         "- Change your Interests — add or drop community memberships".to_string(),
         "- Add to your Evolution Log".to_string(),
         String::new(),
         "Rules:".to_string(),
-        "- Keep the same section structure (Identity, Values, Interests, Voice, Boundaries, Evolution Log)".to_string(),
+    ]);
+
+    if has_boundaries {
+        parts.push("- Keep the same section structure (Identity, Values, Interests, Voice, Boundaries, Evolution Log)".to_string());
+    } else {
+        parts.push("- Keep the same section structure (Identity, Values, Interests, Voice, Evolution Log)".to_string());
+        parts.push("- Do NOT add a Boundaries section if you don't already have one".to_string());
+    }
+
+    parts.extend([
         format!("- The heading must remain \"# {agent_name}\""),
         format!("- Add an Evolution Log entry dated {today} explaining what changed and why"),
         "- Be honest about how you've changed — don't just rephrase the same ideas".to_string(),
         String::new(),
         "Output ONLY the complete revised SOUL.md content between <soul> and </soul> tags.".to_string(),
         "If nothing has meaningfully changed, output <soul>unchanged</soul>.".to_string(),
-    ]
-    .join("\n")
+    ]);
+
+    parts.join("\n")
 }
 
 /// Parse a revised SOUL.md from LLM response.
