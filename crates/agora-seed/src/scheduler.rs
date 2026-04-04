@@ -10,6 +10,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,22 @@ use crate::agent::Agent;
 use crate::client::AgoraClient;
 use crate::config::{Backend, Cli};
 use crate::prompt;
+
+/// Check if a model name is compatible with the Anthropic API.
+///
+/// Anthropic models contain a family name (haiku, sonnet, opus) or use
+/// the "claude-" prefix. The special "seed-runner" and "anthropic/" aliases
+/// are server-assigned Anthropic models. Ollama models (cogito, qwen,
+/// gpt-oss, etc.) won't work.
+fn is_anthropic_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("haiku")
+        || m.contains("sonnet")
+        || m.contains("opus")
+        || m.starts_with("claude")
+        || m.starts_with("anthropic/")
+        || m == "seed-runner"
+}
 
 /// End-of-run statistics report.
 #[derive(Debug, Default, Serialize)]
@@ -282,35 +299,50 @@ pub async fn run_all(
                 .collect();
 
             // Find agents whose model isn't on any Ollama endpoint.
-            let mut missing: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
+            let mut anthropic_missing: HashMap<String, usize> = HashMap::new();
+            let mut unsupported: HashMap<String, usize> = HashMap::new();
             for agent in agents.iter() {
                 if !ollama_models.contains(&agent.model) {
-                    *missing.entry(agent.model.as_str()).or_default() += 1;
+                    if is_anthropic_model(&agent.model) {
+                        *anthropic_missing.entry(agent.model.clone()).or_default() += 1;
+                    } else {
+                        *unsupported.entry(agent.model.clone()).or_default() += 1;
+                    }
                 }
+            }
+
+            // Drop agents with models that aren't on Ollama or Anthropic.
+            if !unsupported.is_empty() {
+                for (model, count) in &unsupported {
+                    tracing::warn!(
+                        "Model '{model}' not on any Ollama endpoint and not an Anthropic model — skipping {count} agents"
+                    );
+                }
+                agents.retain(|a| ollama_models.contains(&a.model) || is_anthropic_model(&a.model));
+                report.agents = agents.len();
             }
 
             let ollama_endpoints = endpoints;
 
-            if !missing.is_empty() && config.anthropic_key_file.is_some() {
+            if !anthropic_missing.is_empty() && config.anthropic_key_file.is_some() {
                 let key_file = config.anthropic_key_file.as_ref().unwrap();
                 let api_key = tokio::fs::read_to_string(key_file).await
                     .map_err(|e| anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display()))?;
                 let anthropic = AnthropicBatch::from_key(api_key.trim().to_string())?;
 
-                for (model, count) in &missing {
+                for (model, count) in &anthropic_missing {
                     tracing::info!("Model '{model}' → anthropic ({count} agents)");
                 }
 
                 run_cycles(&ollama_endpoints, Some(&anthropic), agents, client, config, constitution, &ollama_models, &mut report).await?;
             } else {
-                for (model, count) in &missing {
+                for (model, count) in &anthropic_missing {
                     tracing::warn!(
                         "Model '{model}' not on any endpoint ({count} agents affected)"
                     );
                 }
 
-                run_cycles(&ollama_endpoints, None, agents, client, config, constitution, &std::collections::HashSet::new(), &mut report).await?;
+                run_cycles(&ollama_endpoints, None, agents, client, config, constitution, &HashSet::new(), &mut report).await?;
             }
         }
         Backend::Anthropic => {

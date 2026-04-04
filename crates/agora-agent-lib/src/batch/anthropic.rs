@@ -94,7 +94,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
                         break;
                     }
                     Err(e) => {
-                        tracing::debug!("Cache priming with item {i} failed: {e}");
+                        tracing::warn!("Cache priming with item {i} failed: {e}");
                     }
                 }
             }
