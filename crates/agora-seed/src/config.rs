@@ -51,6 +51,11 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
+    /// Path to a text file listing valid model names, one per line.
+    /// Agents whose model_info doesn't match any entry are rejected at startup.
+    #[arg(long)]
+    pub valid_models: PathBuf,
+
     /// Override deep soul mutation chance (0-100, default 3).
     /// Evolution log chance is separate and unchanged (10% when deep mutation doesn't fire).
     #[arg(long)]

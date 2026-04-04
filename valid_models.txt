@@ -1,0 +1,13 @@
+# Valid model assignments for seed runner agents.
+# One model per line. Lines starting with # are comments.
+#
+# Anthropic (batch API)
+claude-haiku-4-5-20251001
+claude-opus-4-6
+
+# Ollama (local inference)
+cogito:14b
+cogito:70b
+gpt-oss:20b
+qwen3.5:35b
+mistral-small3.2:24b

@@ -35,11 +35,6 @@ use crate::config::{Backend, Cli};
 use crate::prompt;
 
 /// Check if a model name is compatible with the Anthropic API.
-///
-/// Anthropic models contain a family name (haiku, sonnet, opus) or use
-/// the "claude-" prefix. Ollama models (cogito, qwen, gpt-oss, etc.)
-/// and aliases like "seed-runner" won't work — they need to be resolved
-/// to real Anthropic model IDs first.
 fn is_anthropic_model(model: &str) -> bool {
     let m = model.to_lowercase();
     m.contains("haiku")
@@ -48,12 +43,21 @@ fn is_anthropic_model(model: &str) -> bool {
         || m.starts_with("claude")
 }
 
-/// Check if a model name looks like a real model (not a placeholder or alias).
-///
-/// Valid models are either Anthropic models or Ollama model IDs (which contain
-/// a colon separating name from size, e.g. "cogito:14b").
-fn is_valid_model(model: &str) -> bool {
-    is_anthropic_model(model) || model.contains(':')
+/// Load valid model names from a text file (one per line, # comments, blank lines ignored).
+fn load_valid_models(path: &std::path::Path) -> Result<HashSet<String>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading valid models from {}: {e}", path.display()))?;
+    let models: HashSet<String> = content
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    if models.is_empty() {
+        anyhow::bail!("--valid-models file {} is empty", path.display());
+    }
+    tracing::info!("Loaded {} valid models from {}", models.len(), path.display());
+    Ok(models)
 }
 
 /// End-of-run statistics report.
@@ -264,16 +268,22 @@ pub async fn run_all(
         }
     });
 
-    // Validate model assignments — fail fast on bad data.
+    // Validate model assignments against whitelist — fail fast on bad data.
+    let valid_models = load_valid_models(&config.valid_models)?;
     let invalid: Vec<_> = agents.iter()
-        .filter(|a| !is_valid_model(&a.model))
+        .filter(|a| !valid_models.contains(&a.model))
         .map(|a| format!("{} (model_info='{}')", a.name, a.model))
         .collect();
     if !invalid.is_empty() {
+        let unique_bad: HashSet<_> = agents.iter()
+            .filter(|a| !valid_models.contains(&a.model))
+            .map(|a| a.model.as_str())
+            .collect();
         anyhow::bail!(
-            "{} agent(s) have invalid model assignments (not an Anthropic model or Ollama model:size):\n  {}",
+            "{} agent(s) have model assignments not in --valid-models: {:?}\n  First 10: {}",
             invalid.len(),
-            invalid.join("\n  ")
+            unique_bad,
+            invalid.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ")
         );
     }
 

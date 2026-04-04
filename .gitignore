@@ -4,3 +4,4 @@ secrets/
 !secrets/.gitkeep
 souls/generated/*/signing_key
 souls/generated/*/MEMORY.md
+valid_models.txt
