@@ -23,7 +23,7 @@ use agora_agent_lib::llm::{LlmBackend, Message, Role};
 use agora_agent_lib::tools;
 use anyhow::Result;
 use misanthropic::prompt::Message as MMessage;
-use misanthropic::Prompt;
+use misanthropic::{CachedPrompt, Prompt};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::Serialize;
@@ -984,7 +984,7 @@ async fn run_batch_sequential(
         };
 
         // Phase 2: THINK
-        let mut think_prompt = prompt::build_think_prompt(
+        let mut think_prompt = CachedPrompt::uncached(prompt::build_think_prompt(
             &model,
             &agent.soul.as_system_prompt(),
             &agent.memory.content,
@@ -992,7 +992,7 @@ async fn run_batch_sequential(
             &ctx.pending_replies_text,
             constitution,
             &ctx.perception_text,
-        );
+        ));
 
         let think_response = match endpoint.send(&think_prompt, &model).await {
             Ok(msg) => msg,
@@ -1019,9 +1019,6 @@ async fn run_batch_sequential(
             tracing::warn!("Failed to append think response for {}: {e}", agent.name);
             continue;
         }
-        // Disable forced tool use for reflect/evolve/survey
-        think_prompt.tool_choice = None;
-        think_prompt.functions = None;
 
         // Phase 4: REFLECT
         let reflect_text = prompt::build_memory_rewrite_prompt(
@@ -1031,7 +1028,7 @@ async fn run_batch_sequential(
             tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
             continue;
         }
-        think_prompt.max_tokens = NonZeroU32::new(512).unwrap();
+        think_prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
 
         match endpoint.send(&think_prompt, &model).await {
             Ok(reflect_response) => {
@@ -1069,7 +1066,7 @@ async fn run_batch_sequential(
                 prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
 
             if let Ok(()) = think_prompt.push_message((MRole::User, mutation_prompt)) {
-                think_prompt.max_tokens = NonZeroU32::new(2048).unwrap();
+                think_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
                 match endpoint.send(&think_prompt, &model).await {
                     Ok(mutation_response) => {
                         let response_text = mutation_response.content.to_string();
@@ -1110,7 +1107,7 @@ async fn run_batch_sequential(
             // Evolution log entry
             let evo_prompt = prompt::build_evolution_prompt(&agent.name, &experience);
             if let Ok(()) = think_prompt.push_message((MRole::User, evo_prompt)) {
-                think_prompt.max_tokens = NonZeroU32::new(256).unwrap();
+                think_prompt.set_max_tokens(NonZeroU32::new(256).unwrap());
                 match endpoint.send(&think_prompt, &model).await {
                     Ok(evo_response) => {
                         let response_text = evo_response.content.to_string();
@@ -1135,7 +1132,7 @@ async fn run_batch_sequential(
         if config.force_survey || rand::random::<f64>() < 0.10 {
             let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
             if let Ok(()) = think_prompt.push_message((MRole::User, survey_text)) {
-                think_prompt.max_tokens = NonZeroU32::new(512).unwrap();
+                think_prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
                 match endpoint.send(&think_prompt, &model).await {
                     Ok(survey_response) => {
                         let text = prompt::extract_speech(&survey_response.content);

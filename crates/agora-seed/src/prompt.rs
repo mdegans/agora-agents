@@ -44,7 +44,7 @@ pub fn build_think_prompt(
             // Block 1: Constitution + guidelines (cached — breakpoint 2)
             Block::Text {
                 text: cached_system.into(),
-                cache_control: Some(CacheControl::Ephemeral),
+                cache_control: Some(CacheControl::ephemeral()),
             },
             // Block 2: Soul + memory (dynamic, per-agent)
             Block::Text {
@@ -53,7 +53,7 @@ pub fn build_think_prompt(
             },
         ])),
         functions: Some(agent_action_tools()),
-        tool_choice: Some(misanthropic::tool::Choice::Any),
+        tool_choice: Some(misanthropic::tool::Choice::Auto),
         ..Default::default()
     };
 

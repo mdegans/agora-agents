@@ -346,7 +346,7 @@ pub fn agent_action_tools() -> Vec<Method<'static>> {
                 },
                 "required": ["target_type", "target_id", "reason"]
             }),
-            cache_control: Some(CacheControl::Ephemeral),
+            cache_control: Some(CacheControl::ephemeral()),
         },
     ]
 }
