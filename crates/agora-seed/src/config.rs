@@ -22,9 +22,10 @@ pub struct Cli {
     #[arg(long)]
     pub operator_password_file: PathBuf,
 
-    /// Ollama server URL (default endpoint if --ollama-urls is not set).
-    #[arg(long, default_value = "http://localhost:11434")]
-    pub ollama_url: String,
+    /// Ollama server URL (single endpoint).
+    /// If neither --ollama-url nor --ollama-urls is set, Ollama is skipped.
+    #[arg(long)]
+    pub ollama_url: Option<String>,
 
     /// Comma-separated Ollama endpoint URLs for multi-GPU routing.
     /// Models are auto-discovered via /api/tags at startup.
@@ -92,8 +93,10 @@ impl Cli {
     pub fn effective_ollama_urls(&self) -> Vec<String> {
         if let Some(ref urls) = self.ollama_urls {
             urls.clone()
+        } else if let Some(ref url) = self.ollama_url {
+            vec![url.clone()]
         } else {
-            vec![self.ollama_url.clone()]
+            vec![]
         }
     }
 }

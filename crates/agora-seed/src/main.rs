@@ -320,7 +320,7 @@ async fn main() -> Result<()> {
                 runner::run_cycle(
                     agent,
                     &agora_agent_lib::llm::ollama::OllamaBackend::new(
-                        Some(&cli.ollama_url),
+                        cli.ollama_url.as_deref(),
                         &agent.model,
                     )?,
                     &api_client,

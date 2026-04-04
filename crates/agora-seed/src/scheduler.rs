@@ -854,7 +854,7 @@ where
                     }
                 } else {
                     match agora_agent_lib::llm::ollama::OllamaBackend::new(
-                        Some(&config.ollama_url), &agent.model,
+                        config.ollama_url.as_deref(), &agent.model,
                     ) {
                         Ok(b) => Box::new(b),
                         Err(e) => {
