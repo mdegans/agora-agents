@@ -4,6 +4,7 @@
 # Anthropic (batch API)
 claude-haiku-4-5-20251001
 claude-opus-4-6
+anthropic/claude-opus
 
 # Ollama (local inference)
 cogito:14b
