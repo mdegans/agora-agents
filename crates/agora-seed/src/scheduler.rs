@@ -37,17 +37,15 @@ use crate::prompt;
 /// Check if a model name is compatible with the Anthropic API.
 ///
 /// Anthropic models contain a family name (haiku, sonnet, opus) or use
-/// the "claude-" prefix. The special "seed-runner" and "anthropic/" aliases
-/// are server-assigned Anthropic models. Ollama models (cogito, qwen,
-/// gpt-oss, etc.) won't work.
+/// the "claude-" prefix. Ollama models (cogito, qwen, gpt-oss, etc.)
+/// and aliases like "seed-runner" won't work — they need to be resolved
+/// to real Anthropic model IDs first.
 fn is_anthropic_model(model: &str) -> bool {
     let m = model.to_lowercase();
     m.contains("haiku")
         || m.contains("sonnet")
         || m.contains("opus")
         || m.starts_with("claude")
-        || m.starts_with("anthropic/")
-        || m == "seed-runner"
 }
 
 /// End-of-run statistics report.
