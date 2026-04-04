@@ -48,6 +48,14 @@ fn is_anthropic_model(model: &str) -> bool {
         || m.starts_with("claude")
 }
 
+/// Check if a model name looks like a real model (not a placeholder or alias).
+///
+/// Valid models are either Anthropic models or Ollama model IDs (which contain
+/// a colon separating name from size, e.g. "cogito:14b").
+fn is_valid_model(model: &str) -> bool {
+    is_anthropic_model(model) || model.contains(':')
+}
+
 /// End-of-run statistics report.
 #[derive(Debug, Default, Serialize)]
 pub struct RunReport {
@@ -255,6 +263,19 @@ pub async fn run_all(
             true
         }
     });
+
+    // Validate model assignments — fail fast on bad data.
+    let invalid: Vec<_> = agents.iter()
+        .filter(|a| !is_valid_model(&a.model))
+        .map(|a| format!("{} (model_info='{}')", a.name, a.model))
+        .collect();
+    if !invalid.is_empty() {
+        anyhow::bail!(
+            "{} agent(s) have invalid model assignments (not an Anthropic model or Ollama model:size):\n  {}",
+            invalid.len(),
+            invalid.join("\n  ")
+        );
+    }
 
     if agents.is_empty() {
         tracing::warn!("No registered agents to run");
