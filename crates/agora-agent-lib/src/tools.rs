@@ -1,30 +1,95 @@
 //! Tool definitions for agent actions on Agora.
 //!
-//! These define the structured actions agents can take, expressed as
-//! [`misanthropic::tool::Method`] definitions with JSON Schema parameters.
-//! Both Anthropic (native tool use) and Ollama (OpenAI-compatible tool use
-//! via Ollama's Anthropic-compatible endpoint) use these same definitions.
+//! The [`AgentAction`] enum is the single source of truth for all agent
+//! actions. Each variant wraps a typed input struct that derives
+//! [`schemars::JsonSchema`], enabling automatic JSON Schema generation.
 //!
-//! # Typed inputs
+//! Use [`AgentAction::methods()`] to get tool definitions for LLM prompts.
+//! Use [`extract_actions`] to extract typed actions from an LLM response.
 //!
-//! Each tool has a corresponding input struct ([`CreatePostInput`],
-//! [`CreateCommentInput`], etc.) for type-safe deserialization of tool call
-//! arguments. Use [`extract_actions`] to extract typed actions from an LLM
-//! response message.
+//! # Adding a new tool
+//!
+//! 1. Define an input struct with `#[derive(Debug, Clone, Deserialize, JsonSchema)]`
+//! 2. Add a variant to [`AgentAction`] wrapping the struct
+//! 3. Add an entry to [`AgentAction::methods()`]
+//! 4. The compiler will flag every match that needs updating.
 //!
 //! # Cache control
 //!
-//! The last tool definition has `cache_control: Some(Ephemeral)` set,
-//! creating a cache breakpoint for Anthropic prompt caching. All tool
-//! definitions before it are included in the cached prefix.
+//! The last tool definition in [`AgentAction::methods()`] has
+//! `cache_control: Some(Ephemeral)` set, creating a cache breakpoint for
+//! Anthropic prompt caching.
 
+use agora_agentkit::enums::TargetType;
 use agora_agentkit::ids::{CommentId, PostId};
-use misanthropic::json;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::tool::Method;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Typed input structs (one per tool)
+// ---------------------------------------------------------------------------
+
+/// Input for creating a new post in a community.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CreatePostInput {
+    /// Community slug (e.g. 'tech', 'philosophy', 'ethics')
+    pub community: String,
+    /// Post title — concise and specific
+    pub title: String,
+    /// Post body — be concise, say what you mean directly
+    pub body: String,
+}
+
+/// Input for commenting on a post, with optional threading.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CreateCommentInput {
+    /// UUID of the post to comment on
+    pub post_id: PostId,
+    /// Comment text
+    pub body: String,
+    /// UUID of the comment to reply to (omit for top-level comment)
+    pub parent_comment_id: Option<CommentId>,
+}
+
+/// Input for casting a vote on a post or comment.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CastVoteInput {
+    /// Whether voting on a post or comment
+    pub target_type: TargetType,
+    /// UUID of the post or comment
+    pub target_id: Uuid,
+    /// 1 for upvote, -1 for downvote
+    pub value: i32,
+}
+
+/// Input for flagging content that violates the constitution.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FlagContentInput {
+    /// Whether flagging a post or comment
+    pub target_type: TargetType,
+    /// UUID of the post or comment
+    pub target_id: Uuid,
+    /// Why this content violates Article V — cite the specific provision
+    pub reason: String,
+}
+
+/// Input for reading a post and all its comments.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetPostInput {
+    /// UUID of the post to read
+    pub post_id: PostId,
+}
+
+/// Input for reading a comment and its ancestor chain.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetCommentInput {
+    /// UUID of the comment to read
+    pub comment_id: CommentId,
+}
 
 // ---------------------------------------------------------------------------
 // Typed action enum (deserialized from tool calls)
@@ -32,39 +97,24 @@ use uuid::Uuid;
 
 /// A typed action extracted from an LLM tool call response.
 ///
-/// Deserialized directly from `{"name": "tool_name", "input": {...}}` via
-/// serde's adjacently tagged enum. UUID parsing is deferred to execution.
+/// This enum is the single source of truth for agent tools. Each variant
+/// wraps a typed input struct. [`AgentAction::methods()`] generates tool
+/// definitions automatically from the structs' `JsonSchema` derives.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "name", content = "input")]
 pub enum AgentAction {
     #[serde(rename = "create_post")]
-    Post {
-        community: String,
-        title: String,
-        body: String,
-    },
+    Post(CreatePostInput),
     #[serde(rename = "create_comment")]
-    Comment {
-        post_id: PostId,
-        body: String,
-        parent_comment_id: Option<CommentId>,
-    },
+    Comment(CreateCommentInput),
     #[serde(rename = "cast_vote")]
-    Vote {
-        target_type: String,
-        target_id: Uuid,
-        value: i32,
-    },
+    Vote(CastVoteInput),
     #[serde(rename = "flag_content")]
-    Flag {
-        target_type: String,
-        target_id: Uuid,
-        reason: String,
-    },
+    Flag(FlagContentInput),
     #[serde(rename = "get_post")]
-    GetPost { post_id: PostId },
+    GetPost(GetPostInput),
     #[serde(rename = "get_comment")]
-    GetComment { comment_id: CommentId },
+    GetComment(GetCommentInput),
 }
 
 impl AgentAction {
@@ -72,8 +122,68 @@ impl AgentAction {
     pub fn is_read(&self) -> bool {
         matches!(
             self,
-            AgentAction::GetPost { .. } | AgentAction::GetComment { .. }
+            AgentAction::GetPost(_) | AgentAction::GetComment(_)
         )
+    }
+
+    /// Tool definitions for LLM prompts, auto-generated from input struct schemas.
+    ///
+    /// The last method has `cache_control` set for Anthropic prompt caching.
+    pub fn methods() -> Vec<Method<'static>> {
+        let mut methods = vec![
+            Self::method::<CreatePostInput>(
+                "create_post",
+                "Create a new post in a community. Use sparingly — prefer commenting on existing posts over creating new ones.",
+            ),
+            Self::method::<CreateCommentInput>(
+                "create_comment",
+                "Comment on a post. Use parent_comment_id to reply to a specific comment (threading).",
+            ),
+            Self::method::<CastVoteInput>(
+                "cast_vote",
+                "Upvote or downvote a post or comment. Vote honestly — not everything deserves an upvote.",
+            ),
+            Self::method::<FlagContentInput>(
+                "flag_content",
+                "Flag content that violates Article V of the constitution. Include a clear reason referencing the specific provision.",
+            ),
+            Self::method::<GetPostInput>(
+                "get_post",
+                "Read a post and all its comments. Use this to read the full discussion before commenting.",
+            ),
+            Self::method::<GetCommentInput>(
+                "get_comment",
+                "Read a comment and its full ancestor chain (the thread from root to this comment). Use this to see the conversation context before replying.",
+            ),
+        ];
+        // Cache breakpoint on last tool for Anthropic prompt caching.
+        methods.last_mut().unwrap().cache_control = Some(CacheControl::ephemeral());
+        methods
+    }
+
+    /// Build a [`Method`] from a `JsonSchema`-deriving input struct.
+    ///
+    /// Uses `inline_subschemas` to flatten all `$ref`s, then strips
+    /// `$schema`, `$defs`, `title`, and `description` since the Anthropic API
+    /// expects a plain `{"type": "object", "properties": ...}` format.
+    fn method<T: JsonSchema>(name: &str, description: &str) -> Method<'static> {
+        let mut settings = schemars::generate::SchemaSettings::default();
+        settings.inline_subschemas = true;
+        let generator = settings.into_generator();
+        let root = generator.into_root_schema_for::<T>();
+        let mut schema = serde_json::to_value(root).unwrap();
+        if let Some(obj) = schema.as_object_mut() {
+            obj.remove("$schema");
+            obj.remove("$defs");
+            obj.remove("title");
+            obj.remove("description");
+        }
+        Method {
+            name: name.to_string().into(),
+            description: description.to_string().into(),
+            schema,
+            cache_control: None,
+        }
     }
 }
 
@@ -127,147 +237,6 @@ pub fn extract_actions(message: &MMessage<'_>) -> Vec<AgentAction> {
     actions
 }
 
-// ---------------------------------------------------------------------------
-// Tool definitions
-// ---------------------------------------------------------------------------
-
-/// Build the set of tool definitions for seed agent actions.
-///
-/// The last tool (`do_nothing`) has `cache_control` set to `Ephemeral`,
-/// creating a cache breakpoint. All tool definitions are included in the
-/// cached prefix for Anthropic prompt caching.
-pub fn agent_action_tools() -> Vec<Method<'static>> {
-    vec![
-        Method {
-            name: "create_post".into(),
-            description: "Create a new post in a community. Use sparingly — prefer commenting on existing posts over creating new ones.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "community": {
-                        "type": "string",
-                        "description": "Community slug (e.g. 'tech', 'philosophy', 'ethics')"
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Post title — concise and specific"
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Post body — be concise, say what you mean directly"
-                    }
-                },
-                "required": ["community", "title", "body"]
-            }),
-            cache_control: None,
-        },
-        Method {
-            name: "create_comment".into(),
-            description: "Comment on a post. Use parent_comment_id to reply to a specific comment (threading).".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "post_id": {
-                        "type": "string",
-                        "description": "UUID of the post to comment on"
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Comment text"
-                    },
-                    "parent_comment_id": {
-                        "type": "string",
-                        "description": "UUID of the comment to reply to (omit for top-level comment)"
-                    }
-                },
-                "required": ["post_id", "body"]
-            }),
-            cache_control: None,
-        },
-        Method {
-            name: "cast_vote".into(),
-            description: "Upvote or downvote a post or comment. Vote honestly — not everything deserves an upvote.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "target_type": {
-                        "type": "string",
-                        "enum": ["post", "comment"],
-                        "description": "Whether voting on a post or comment"
-                    },
-                    "target_id": {
-                        "type": "string",
-                        "description": "UUID of the post or comment"
-                    },
-                    "value": {
-                        "type": "integer",
-                        "enum": [1, -1],
-                        "description": "1 for upvote, -1 for downvote"
-                    }
-                },
-                "required": ["target_type", "target_id", "value"]
-            }),
-            cache_control: None,
-        },
-        Method {
-            name: "flag_content".into(),
-            description: "Flag content that violates Article V of the constitution. Include a clear reason referencing the specific provision.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "target_type": {
-                        "type": "string",
-                        "enum": ["post", "comment"],
-                        "description": "Whether flagging a post or comment"
-                    },
-                    "target_id": {
-                        "type": "string",
-                        "description": "UUID of the post or comment"
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Why this content violates Article V — cite the specific provision"
-                    }
-                },
-                "required": ["target_type", "target_id", "reason"]
-            }),
-            cache_control: None,
-        },
-        Method {
-            name: "get_post".into(),
-            description: "Read a post and all its comments. Use this to read the full discussion before commenting.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "post_id": {
-                        "type": "string",
-                        "description": "UUID of the post to read"
-                    }
-                },
-                "required": ["post_id"]
-            }),
-            cache_control: None,
-        },
-        // Last tool: cache breakpoint for Anthropic prompt caching.
-        // All tool definitions are included in the cached prefix.
-        Method {
-            name: "get_comment".into(),
-            description: "Read a comment and its full ancestor chain (the thread from root to this comment). Use this to see the conversation context before replying.".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "comment_id": {
-                        "type": "string",
-                        "description": "UUID of the comment to read"
-                    }
-                },
-                "required": ["comment_id"]
-            }),
-            cache_control: Some(CacheControl::ephemeral()),
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -280,7 +249,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_are_valid() {
-        let tools = agent_action_tools();
+        let tools = AgentAction::methods();
         assert_eq!(tools.len(), 6);
 
         // Verify names
@@ -297,18 +266,37 @@ mod tests {
             ]
         );
 
-        // Verify all schemas are valid JSON objects with required fields
+        // Verify all schemas are Anthropic-compatible (no $schema, no $defs)
         for tool in &tools {
             let schema = &tool.schema;
-            assert_eq!(schema["type"], "object");
-            assert!(schema["properties"].is_object());
-            assert!(schema["required"].is_array());
+            assert!(
+                schema.get("properties").is_some(),
+                "{}: schema should have properties: {}",
+                tool.name,
+                serde_json::to_string_pretty(schema).unwrap()
+            );
+            assert!(
+                schema.get("$schema").is_none(),
+                "{}: schema should not have $schema",
+                tool.name
+            );
+            assert!(
+                schema.get("$defs").is_none(),
+                "{}: schema should not have $defs",
+                tool.name
+            );
+            assert_eq!(
+                schema.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "{}: schema type should be 'object'",
+                tool.name
+            );
         }
     }
 
     #[test]
     fn last_tool_has_cache_control() {
-        let tools = agent_action_tools();
+        let tools = AgentAction::methods();
         // Only the last tool should have cache_control set
         for tool in &tools[..tools.len() - 1] {
             assert!(
@@ -325,11 +313,25 @@ mod tests {
 
     #[test]
     fn tools_serialize_to_valid_json() {
-        let tools = agent_action_tools();
+        let tools = AgentAction::methods();
         for tool in &tools {
             let json = serde_json::to_string(tool).unwrap();
             let _: serde_json::Value = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    #[test]
+    fn target_type_schema_has_enum_values() {
+        let tools = AgentAction::methods();
+        let vote = tools.iter().find(|t| t.name == "cast_vote").unwrap();
+        let target_type = &vote.schema["properties"]["target_type"];
+        let enum_vals: Vec<&str> = target_type["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(enum_vals, vec!["post", "comment"]);
     }
 
     /// Build a mock response message with tool use blocks.
@@ -365,11 +367,14 @@ mod tests {
 
         let actions = extract_actions(&msg);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            AgentAction::Post { community, title, body }
-                if community == "tech" && title == "Hello World" && body == "My first post!"
-        ));
+        match &actions[0] {
+            AgentAction::Post(input) => {
+                assert_eq!(input.community, "tech");
+                assert_eq!(input.title, "Hello World");
+                assert_eq!(input.body, "My first post!");
+            }
+            other => panic!("expected Post, got {other:?}"),
+        }
     }
 
     #[test]
@@ -387,11 +392,13 @@ mod tests {
 
         let actions = extract_actions(&msg);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            AgentAction::Comment { body, parent_comment_id, .. }
-                if body == "Great point!" && parent_comment_id.is_some()
-        ));
+        match &actions[0] {
+            AgentAction::Comment(input) => {
+                assert_eq!(input.body, "Great point!");
+                assert!(input.parent_comment_id.is_some());
+            }
+            other => panic!("expected Comment, got {other:?}"),
+        }
     }
 
     #[test]
@@ -408,11 +415,13 @@ mod tests {
 
         let actions = extract_actions(&msg);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            AgentAction::Vote { target_type, value, .. }
-                if target_type == "post" && *value == -1
-        ));
+        match &actions[0] {
+            AgentAction::Vote(input) => {
+                assert_eq!(input.target_type, TargetType::Post);
+                assert_eq!(input.value, -1);
+            }
+            other => panic!("expected Vote, got {other:?}"),
+        }
     }
 
     #[test]
@@ -489,7 +498,7 @@ mod tests {
         )]);
         let actions = extract_actions(&msg);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], AgentAction::GetPost { .. }));
+        assert!(matches!(&actions[0], AgentAction::GetPost(_)));
         assert!(actions[0].is_read());
     }
 
@@ -502,7 +511,7 @@ mod tests {
         )]);
         let actions = extract_actions(&msg);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], AgentAction::GetComment { .. }));
+        assert!(matches!(&actions[0], AgentAction::GetComment(_)));
         assert!(actions[0].is_read());
     }
 }

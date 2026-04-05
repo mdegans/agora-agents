@@ -1571,7 +1571,8 @@ async fn execute_actions(
 
     for action in actions {
         match action {
-            tools::AgentAction::Post { community, title, body } => {
+            tools::AgentAction::Post(input) => {
+                let (community, title, body) = (&input.community, &input.title, &input.body);
                 let slug = match community.as_str() {
                     "technology" => "tech",
                     other => other,
@@ -1606,7 +1607,8 @@ async fn execute_actions(
                     }
                 }
             }
-            tools::AgentAction::Comment { post_id, body, parent_comment_id } => {
+            tools::AgentAction::Comment(input) => {
+                let (post_id, body, parent_comment_id) = (&input.post_id, &input.body, &input.parent_comment_id);
                 let is_own_post = agent.state.created_posts.contains(post_id);
                 let has_reply = comment_replies.iter().any(|r| r.post_id == *post_id);
                 if agent.state.commented_posts.contains(post_id) && !is_own_post && !has_reply {
@@ -1630,8 +1632,9 @@ async fn execute_actions(
                     }
                 }
             }
-            tools::AgentAction::Vote { target_type, target_id, value } => {
-                match client.cast_vote(agent_id, target_type, *target_id, *value, &agent.signing_key).await {
+            tools::AgentAction::Vote(input) => {
+                let (target_type, target_id, value) = (&input.target_type, &input.target_id, &input.value);
+                match client.cast_vote(agent_id, &target_type.to_string(), *target_id, *value, &agent.signing_key).await {
                     Ok(()) => {
                         let verb = if *value > 0 { "upvoted" } else { "downvoted" };
                         summaries.push(format!("{verb} {target_type} {target_id}"));
@@ -1645,8 +1648,9 @@ async fn execute_actions(
                     }
                 }
             }
-            tools::AgentAction::Flag { target_type, target_id, reason } => {
-                match client.flag_content(agent_id, target_type, *target_id, reason, &agent.signing_key).await {
+            tools::AgentAction::Flag(input) => {
+                let (target_type, target_id, reason) = (&input.target_type, &input.target_id, &input.reason);
+                match client.flag_content(agent_id, &target_type.to_string(), *target_id, reason, &agent.signing_key).await {
                     Ok(()) => {
                         summaries.push(format!("Flagged {target_type} {target_id}: {reason}"));
                         tracing::info!("  {} flagged {target_type} {target_id}", agent.name);
@@ -1656,7 +1660,7 @@ async fn execute_actions(
                     Err(e) => tracing::warn!("  {} flag failed: {e}", agent.name),
                 }
             }
-            tools::AgentAction::GetPost { .. } | tools::AgentAction::GetComment { .. } => {
+            tools::AgentAction::GetPost(_) | tools::AgentAction::GetComment(_) => {
                 // Read actions handled in tool-use loop (not yet wired)
             }
         }

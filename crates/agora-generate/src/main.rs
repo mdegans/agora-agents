@@ -659,6 +659,43 @@ fn get_name(index: usize) -> String {
     }
 }
 
+/// Scan an output directory for existing agent directories and return the
+/// next available name index. Returns 0 if the directory is empty or
+/// doesn't exist.
+fn auto_detect_start_index(output_dir: &std::path::Path) -> usize {
+    let entries = match std::fs::read_dir(output_dir) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+
+    let mut max_index: Option<usize> = None;
+
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let dir_name = entry.file_name();
+        let name = dir_name.to_string_lossy();
+
+        // Try to find this name in the NAMES array
+        if let Some(idx) = NAMES.iter().position(|&n| n == name.as_ref()) {
+            max_index = Some(max_index.map_or(idx, |prev: usize| prev.max(idx)));
+        }
+        // Also handle compound names (e.g., "aegis-aether")
+        else if let Some((first, second)) = name.split_once('-') {
+            if let (Some(fi), Some(si)) = (
+                NAMES.iter().position(|&n| n == first),
+                NAMES.iter().position(|&n| n == second),
+            ) {
+                let idx = si * NAMES.len() + fi;
+                max_index = Some(max_index.map_or(idx, |prev: usize| prev.max(idx)));
+            }
+        }
+    }
+
+    max_index.map_or(0, |idx| idx + 1)
+}
+
 /// Build the per-agent prompt.
 fn build_prompt(
     examples: &[String],
@@ -959,10 +996,25 @@ async fn main() -> Result<()> {
         boundary_pushers,
         rule_breakers
     );
+    // Auto-detect start index from existing agents when using the default (0)
+    let start_index = if cli.start_index == 0 {
+        let detected = auto_detect_start_index(&cli.output);
+        if detected > 0 {
+            tracing::info!(
+                "Auto-detected start index: {} (found existing agents in {})",
+                detected,
+                cli.output.display()
+            );
+        }
+        detected
+    } else {
+        cli.start_index
+    };
+
     tracing::info!(
         "Name range: {} to {} ({} names available, {} unique names in pool)",
-        get_name(cli.start_index),
-        get_name(cli.start_index + cli.count - 1),
+        get_name(start_index),
+        get_name(start_index + cli.count - 1),
         cli.count,
         NAMES.len()
     );
@@ -1001,7 +1053,7 @@ async fn main() -> Result<()> {
                 .collect();
 
             AgentSpec {
-                name: get_name(cli.start_index + i),
+                name: get_name(start_index + i),
                 archetype,
                 adjective,
                 communities,

@@ -383,11 +383,8 @@ pub async fn run_cycle(
 
     for action in &actions {
         match action {
-            prompt::AgentAction::Post {
-                community,
-                title,
-                body,
-            } => {
+            prompt::AgentAction::Post(input) => {
+                let (community, title, body) = (&input.community, &input.title, &input.body);
                 let slug = match community.as_str() {
                     "technology" => "tech",
                     other => other,
@@ -433,11 +430,8 @@ pub async fn run_cycle(
                     }
                 }
             }
-            prompt::AgentAction::Comment {
-                post_id,
-                body,
-                parent_comment_id,
-            } => {
+            prompt::AgentAction::Comment(input) => {
+                let (post_id, body, parent_comment_id) = (&input.post_id, &input.body, &input.parent_comment_id);
                 // Skip if we already commented on this post — UNLESS it's our own post
                 // or someone replied to our comment there (allow continuing conversations)
                 let is_own_post = agent.state.created_posts.contains(post_id);
@@ -470,15 +464,12 @@ pub async fn run_cycle(
                     }
                 }
             }
-            prompt::AgentAction::Vote {
-                target_type,
-                target_id,
-                value,
-            } => {
+            prompt::AgentAction::Vote(input) => {
+                let (target_type, target_id, value) = (&input.target_type, &input.target_id, &input.value);
                 match client
                     .cast_vote(
                         agent_id,
-                        target_type,
+                        &target_type.to_string(),
                         *target_id,
                         *value,
                         &agent.signing_key,
@@ -495,15 +486,12 @@ pub async fn run_cycle(
                     }
                 }
             }
-            prompt::AgentAction::Flag {
-                target_type,
-                target_id,
-                reason,
-            } => {
+            prompt::AgentAction::Flag(input) => {
+                let (target_type, target_id, reason) = (&input.target_type, &input.target_id, &input.reason);
                 match client
                     .flag_content(
                         agent_id,
-                        target_type,
+                        &target_type.to_string(),
                         *target_id,
                         reason,
                         &agent.signing_key,
@@ -520,7 +508,7 @@ pub async fn run_cycle(
                     }
                 }
             }
-            prompt::AgentAction::GetPost { .. } | prompt::AgentAction::GetComment { .. } => {
+            prompt::AgentAction::GetPost(_) | prompt::AgentAction::GetComment(_) => {
                 // Read actions handled in tool-use loop (not yet wired)
             }
         }

@@ -3,7 +3,6 @@ use std::num::NonZeroU32;
 
 use agora_agent_lib::agora_agentkit::ids::{AgentId, CommentId, PostId};
 pub use agora_agent_lib::tools::AgentAction;
-use agora_agent_lib::tools::agent_action_tools;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
 use misanthropic::Prompt;
 
@@ -52,7 +51,7 @@ pub fn build_think_prompt(
                 cache_control: None,
             },
         ])),
-        functions: Some(agent_action_tools()),
+        functions: Some(AgentAction::methods()),
         tool_choice: Some(misanthropic::tool::Choice::Auto),
         ..Default::default()
     };
