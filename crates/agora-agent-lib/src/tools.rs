@@ -27,213 +27,100 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// Typed tool inputs
-// ---------------------------------------------------------------------------
-
-/// Input for the `create_post` tool.
-#[derive(Debug, Clone, Deserialize)]
-pub struct CreatePostInput {
-    pub community: String,
-    pub title: String,
-    pub body: String,
-}
-
-/// Input for the `create_comment` tool.
-#[derive(Debug, Clone, Deserialize)]
-pub struct CreateCommentInput {
-    pub post_id: String,
-    pub body: String,
-    pub parent_comment_id: Option<String>,
-}
-
-/// Input for the `cast_vote` tool.
-#[derive(Debug, Clone, Deserialize)]
-pub struct CastVoteInput {
-    pub target_type: String,
-    pub target_id: String,
-    pub value: i32,
-}
-
-/// Input for the `flag_content` tool.
-#[derive(Debug, Clone, Deserialize)]
-pub struct FlagContentInput {
-    pub target_type: String,
-    pub target_id: String,
-    pub reason: String,
-}
-
-// ---------------------------------------------------------------------------
-// Typed action enum (extracted from tool calls)
+// Typed action enum (deserialized from tool calls)
 // ---------------------------------------------------------------------------
 
 /// A typed action extracted from an LLM tool call response.
-#[derive(Debug, Clone)]
+///
+/// Deserialized directly from `{"name": "tool_name", "input": {...}}` via
+/// serde's adjacently tagged enum. UUID parsing is deferred to execution.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "name", content = "input")]
 pub enum AgentAction {
+    #[serde(rename = "create_post")]
     Post {
         community: String,
         title: String,
         body: String,
     },
+    #[serde(rename = "create_comment")]
     Comment {
         post_id: PostId,
         body: String,
         parent_comment_id: Option<CommentId>,
     },
+    #[serde(rename = "cast_vote")]
     Vote {
         target_type: String,
         target_id: Uuid,
         value: i32,
     },
+    #[serde(rename = "flag_content")]
     Flag {
         target_type: String,
         target_id: Uuid,
         reason: String,
     },
-    None,
+    #[serde(rename = "get_post")]
+    GetPost { post_id: PostId },
+    #[serde(rename = "get_comment")]
+    GetComment { comment_id: CommentId },
+}
+
+impl AgentAction {
+    /// Returns true if this is a read-only action (get_post, get_comment).
+    pub fn is_read(&self) -> bool {
+        matches!(
+            self,
+            AgentAction::GetPost { .. } | AgentAction::GetComment { .. }
+        )
+    }
 }
 
 /// Extract typed [`AgentAction`]s from an LLM response message containing
 /// tool calls.
 ///
-/// This replaces the old `parse_actions` approach of extracting JSON from
-/// `<actions>` tags. It works with both Anthropic native tool use and
-/// Ollama OpenAI-compatible tool use responses (both produce
-/// `Block::ToolUse` in the misanthropic message).
+/// Deserializes each tool call directly into [`AgentAction`] via serde's
+/// adjacently tagged enum. Works with both Anthropic native tool use and
+/// Ollama Anthropic-compatible tool use responses.
 ///
-/// Returns up to 3 actions, skipping malformed tool calls with a warning.
+/// Write actions are capped at 3 per call; read actions are unlimited.
 pub fn extract_actions(message: &MMessage<'_>) -> Vec<AgentAction> {
     let blocks = match &message.content {
         Content::MultiPart(blocks) => blocks.as_slice(),
         Content::SinglePart(text) => {
-            tracing::debug!("Model returned plain text instead of tool use: {:.200}", text);
+            tracing::debug!(
+                "Model returned plain text instead of tool use: {:.200}",
+                text
+            );
             return vec![];
         }
     };
 
     let mut actions = Vec::new();
+    let mut write_count = 0usize;
 
     for block in blocks {
-        if actions.len() >= 3 {
-            break;
-        }
-
         let call = match block {
             Block::ToolUse { call } => call,
             _ => continue,
         };
 
-        let action = match call.name.as_ref() {
-            "create_post" => {
-                match serde_json::from_value::<CreatePostInput>(call.input.clone()) {
-                    Ok(input) if !input.community.is_empty()
-                        && !input.title.is_empty()
-                        && !input.body.is_empty() =>
-                    {
-                        AgentAction::Post {
-                            community: input.community,
-                            title: input.title,
-                            body: input.body,
-                        }
-                    }
-                    Ok(_) => {
-                        tracing::warn!("create_post: empty required fields");
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("create_post: failed to parse input: {e}");
-                        continue;
-                    }
-                }
-            }
-            "create_comment" => {
-                match serde_json::from_value::<CreateCommentInput>(call.input.clone()) {
-                    Ok(input) if !input.body.is_empty() => {
-                        let post_id = match input.post_id.parse::<Uuid>() {
-                            Ok(id) => PostId::from(id),
-                            Err(e) => {
-                                tracing::warn!("create_comment: bad post_id: {e}");
-                                continue;
-                            }
-                        };
-                        let parent_comment_id = input
-                            .parent_comment_id
-                            .as_deref()
-                            .and_then(|s| s.parse::<Uuid>().ok())
-                            .map(CommentId::from);
-                        AgentAction::Comment {
-                            post_id,
-                            body: input.body,
-                            parent_comment_id,
-                        }
-                    }
-                    Ok(_) => {
-                        tracing::warn!("create_comment: empty body");
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("create_comment: failed to parse input: {e}");
-                        continue;
-                    }
-                }
-            }
-            "cast_vote" => {
-                match serde_json::from_value::<CastVoteInput>(call.input.clone()) {
-                    Ok(input) if input.value == 1 || input.value == -1 => {
-                        let target_id = match input.target_id.parse::<Uuid>() {
-                            Ok(id) => id,
-                            Err(e) => {
-                                tracing::warn!("cast_vote: bad target_id: {e}");
-                                continue;
-                            }
-                        };
-                        AgentAction::Vote {
-                            target_type: input.target_type,
-                            target_id,
-                            value: input.value,
-                        }
-                    }
-                    Ok(input) => {
-                        tracing::warn!("cast_vote: invalid value {}", input.value);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("cast_vote: failed to parse input: {e}");
-                        continue;
-                    }
-                }
-            }
-            "flag_content" => {
-                match serde_json::from_value::<FlagContentInput>(call.input.clone()) {
-                    Ok(input) if !input.reason.is_empty() => {
-                        let target_id = match input.target_id.parse::<Uuid>() {
-                            Ok(id) => id,
-                            Err(e) => {
-                                tracing::warn!("flag_content: bad target_id: {e}");
-                                continue;
-                            }
-                        };
-                        AgentAction::Flag {
-                            target_type: input.target_type,
-                            target_id,
-                            reason: input.reason,
-                        }
-                    }
-                    Ok(_) => {
-                        tracing::warn!("flag_content: empty reason");
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("flag_content: failed to parse input: {e}");
-                        continue;
-                    }
-                }
-            }
-            other => {
-                tracing::debug!("Unknown tool call: {other}");
+        let tagged = serde_json::json!({"name": call.name, "input": call.input});
+        let action: AgentAction = match serde_json::from_value(tagged) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("{}: {e}", call.name);
                 continue;
             }
         };
 
+        if !action.is_read() {
+            write_count += 1;
+            if write_count > 3 {
+                break;
+            }
+        }
         actions.push(action);
     }
 
@@ -322,8 +209,6 @@ pub fn agent_action_tools() -> Vec<Method<'static>> {
             }),
             cache_control: None,
         },
-        // Last tool: cache breakpoint for Anthropic prompt caching.
-        // All tool definitions are included in the cached prefix.
         Method {
             name: "flag_content".into(),
             description: "Flag content that violates Article V of the constitution. Include a clear reason referencing the specific provision.".into(),
@@ -346,6 +231,38 @@ pub fn agent_action_tools() -> Vec<Method<'static>> {
                 },
                 "required": ["target_type", "target_id", "reason"]
             }),
+            cache_control: None,
+        },
+        Method {
+            name: "get_post".into(),
+            description: "Read a post and all its comments. Use this to read the full discussion before commenting.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "post_id": {
+                        "type": "string",
+                        "description": "UUID of the post to read"
+                    }
+                },
+                "required": ["post_id"]
+            }),
+            cache_control: None,
+        },
+        // Last tool: cache breakpoint for Anthropic prompt caching.
+        // All tool definitions are included in the cached prefix.
+        Method {
+            name: "get_comment".into(),
+            description: "Read a comment and its full ancestor chain (the thread from root to this comment). Use this to see the conversation context before replying.".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "comment_id": {
+                        "type": "string",
+                        "description": "UUID of the comment to read"
+                    }
+                },
+                "required": ["comment_id"]
+            }),
             cache_control: Some(CacheControl::ephemeral()),
         },
     ]
@@ -357,13 +274,14 @@ mod tests {
 
     use misanthropic::prompt::message::Role;
     use misanthropic::tool;
+    use uuid::Uuid;
 
     use super::*;
 
     #[test]
     fn tool_definitions_are_valid() {
         let tools = agent_action_tools();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 6);
 
         // Verify names
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -374,6 +292,8 @@ mod tests {
                 "create_comment",
                 "cast_vote",
                 "flag_content",
+                "get_post",
+                "get_comment",
             ]
         );
 
@@ -391,7 +311,11 @@ mod tests {
         let tools = agent_action_tools();
         // Only the last tool should have cache_control set
         for tool in &tools[..tools.len() - 1] {
-            assert!(tool.cache_control.is_none(), "{} should not have cache_control", tool.name);
+            assert!(
+                tool.cache_control.is_none(),
+                "{} should not have cache_control",
+                tool.name
+            );
         }
         assert!(
             tools.last().unwrap().cache_control.is_some(),
@@ -465,7 +389,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            AgentAction::Comment { post_id: _, body, parent_comment_id }
+            AgentAction::Comment { body, parent_comment_id, .. }
                 if body == "Great point!" && parent_comment_id.is_some()
         ));
     }
@@ -492,7 +416,28 @@ mod tests {
     }
 
     #[test]
-    fn extract_multiple_actions_capped_at_3() {
+    fn extract_read_actions_dont_count_toward_cap() {
+        let target1 = Uuid::new_v4();
+        let target2 = Uuid::new_v4();
+        let target3 = Uuid::new_v4();
+        let post_id = Uuid::new_v4();
+        let vote = |t: Uuid| serde_json::json!({"target_type": "post", "target_id": t.to_string(), "value": 1});
+        let msg = mock_tool_response(vec![
+            (
+                "get_post",
+                serde_json::json!({"post_id": post_id.to_string()}),
+            ),
+            ("cast_vote", vote(target1)),
+            ("cast_vote", vote(target2)),
+            ("cast_vote", vote(target3)),
+        ]);
+        let actions = extract_actions(&msg);
+        // All 4: 1 read + 3 writes (reads don't count toward the 3-write cap)
+        assert_eq!(actions.len(), 4);
+    }
+
+    #[test]
+    fn extract_write_actions_capped_at_3() {
         let target1 = Uuid::new_v4();
         let target2 = Uuid::new_v4();
         let target3 = Uuid::new_v4();
@@ -509,28 +454,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_skips_invalid_tool_calls() {
-        let valid_target = Uuid::new_v4();
+    fn extract_skips_unknown_tool_calls() {
         let msg = mock_tool_response(vec![
-            // Valid
-            (
-                "cast_vote",
-                serde_json::json!({
-                    "target_type": "post",
-                    "target_id": valid_target.to_string(),
-                    "value": 1
-                }),
-            ),
-            // Invalid: bad UUID
-            (
-                "cast_vote",
-                serde_json::json!({
-                    "target_type": "post",
-                    "target_id": "not-a-uuid",
-                    "value": 1
-                }),
-            ),
-            // Valid
+            ("unknown_tool", serde_json::json!({"foo": "bar"})),
             (
                 "create_post",
                 serde_json::json!({
@@ -541,7 +467,7 @@ mod tests {
             ),
         ]);
         let actions = extract_actions(&msg);
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 1);
     }
 
     #[test]
@@ -552,5 +478,31 @@ mod tests {
         };
         let actions = extract_actions(&msg);
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn extract_get_post() {
+        let post_id = Uuid::new_v4();
+        let msg = mock_tool_response(vec![(
+            "get_post",
+            serde_json::json!({"post_id": post_id.to_string()}),
+        )]);
+        let actions = extract_actions(&msg);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], AgentAction::GetPost { .. }));
+        assert!(actions[0].is_read());
+    }
+
+    #[test]
+    fn extract_get_comment() {
+        let comment_id = Uuid::new_v4();
+        let msg = mock_tool_response(vec![(
+            "get_comment",
+            serde_json::json!({"comment_id": comment_id.to_string()}),
+        )]);
+        let actions = extract_actions(&msg);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], AgentAction::GetComment { .. }));
+        assert!(actions[0].is_read());
     }
 }

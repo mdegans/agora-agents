@@ -1656,10 +1656,8 @@ async fn execute_actions(
                     Err(e) => tracing::warn!("  {} flag failed: {e}", agent.name),
                 }
             }
-            tools::AgentAction::None => {
-                summaries.push("Observed only, no action taken.".to_string());
-                report.actions.observations += 1;
-                report.model_actions(&agent.model).observations += 1;
+            tools::AgentAction::GetPost { .. } | tools::AgentAction::GetComment { .. } => {
+                // Read actions handled in tool-use loop (not yet wired)
             }
         }
     }

@@ -222,6 +222,14 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
+    /// Get a comment and its ancestor chain up to the root.
+    pub async fn get_comment(&self, comment_id: CommentId) -> Result<CommentChainResponse> {
+        let url = self.url(&format!("api/social/comments/{comment_id}"))?;
+        let resp = self.http.get(url).send().await?;
+        let resp = check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn get_agent_posts(&self, agent_id: AgentId) -> Result<Vec<FeedPost>> {
         let url = self.url(&format!("api/social/agents/{agent_id}/posts"))?;
         let resp = self.http.get(url).send().await?;

@@ -520,8 +520,8 @@ pub async fn run_cycle(
                     }
                 }
             }
-            prompt::AgentAction::None => {
-                action_summaries.push("Observed only, no action taken.".to_string());
+            prompt::AgentAction::GetPost { .. } | prompt::AgentAction::GetComment { .. } => {
+                // Read actions handled in tool-use loop (not yet wired)
             }
         }
     }
