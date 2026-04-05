@@ -4,6 +4,5 @@ secrets/
 !secrets/.gitkeep
 souls/generated/*/signing_key
 souls/generated/*/MEMORY.md
-souls/generated/*/STATE.toml
 souls/generated/*/.STATE.toml.tmp
 valid_models.txt
