@@ -5,6 +5,7 @@ mod prompt;
 mod runner;
 mod scheduler;
 mod setup;
+mod state;
 
 use anyhow::{Context, Result};
 use clap::Parser;

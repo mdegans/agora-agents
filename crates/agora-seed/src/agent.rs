@@ -1,14 +1,14 @@
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use agora_agent_lib::agora_agentkit::ids::{AgentId, CommentId, PostId};
+use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::signing::SigningKey;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use agora_agent_lib::memory::Memory;
 use agora_agent_lib::soul::Soul;
+
+use crate::state::State;
 
 /// An agent loaded from disk, ready to run.
 pub struct Agent {
@@ -20,17 +20,8 @@ pub struct Agent {
     pub model: String,
     pub dir: PathBuf,
     pub communities: Vec<String>,
-    /// Posts this agent has already commented on (to avoid duplicate comments across cycles).
-    pub commented_posts: HashSet<PostId>,
-    /// Posts this agent has already created.
-    pub created_posts: HashSet<PostId>,
-    /// Comments this agent has created (for tracking replies).
-    pub created_comments: HashSet<CommentId>,
-    /// Timestamp of last cycle completion (for filtering new replies).
-    pub last_cycle_at: Option<DateTime<Utc>>,
-    /// Tracks seen posts: post_id → last known comment count.
-    /// Posts only appear in the feed if they're new or have new comments.
-    pub seen_posts: HashMap<PostId, i64>,
+    /// Persisted state (seen posts, created posts/comments, last cycle timestamp).
+    pub state: State,
 }
 
 impl Agent {
@@ -104,6 +95,8 @@ impl Agent {
         // Model assignment: from CLI flag or resolved later from server
         let model = model.unwrap_or_default().to_string();
 
+        let state = State::load(&dir).await;
+
         Ok(Self {
             name,
             soul,
@@ -113,11 +106,7 @@ impl Agent {
             model,
             dir,
             communities,
-            commented_posts: HashSet::new(),
-            created_posts: HashSet::new(),
-            created_comments: HashSet::new(),
-            last_cycle_at: None,
-            seen_posts: HashMap::new(),
+            state,
         })
     }
 
@@ -147,6 +136,11 @@ impl Agent {
         let path = self.dir.join("SOUL.md");
         self.soul.save(&path).await?;
         Ok(())
+    }
+
+    /// Save persisted state to disk.
+    pub async fn save_state(&self) -> Result<()> {
+        self.state.save(&self.dir).await
     }
 }
 

@@ -81,7 +81,7 @@ pub async fn run_cycle(
 
     // Check for replies to agent's own posts first
     let mut replies: Vec<(String, PostId, Vec<Comment>)> = Vec::new();
-    for &post_id in &agent.created_posts {
+    for &post_id in &agent.state.created_posts {
         match client.get_post(post_id).await {
             Ok(full) => {
                 // Filter to comments by OTHER agents, newer than last cycle
@@ -90,7 +90,7 @@ pub async fn run_cycle(
                     .into_iter()
                     .filter(|c| c.agent_id != agent_id)
                     .filter(|c| {
-                        match (agent.last_cycle_at, c.created_at) {
+                        match (agent.state.last_cycle_at, c.created_at) {
                             (Some(last), Some(created)) => created > last,
                             _ => true, // show all if we don't have timestamps
                         }
@@ -119,6 +119,7 @@ pub async fn run_cycle(
         .get_comment_replies(
             agent_id,
             agent
+                .state
                 .last_cycle_at
                 .map(|t| t.to_rfc3339())
                 .as_deref(),
@@ -171,7 +172,7 @@ pub async fn run_cycle(
                 let mut context = Vec::new();
                 for p in posts {
                     let comment_count = p.comment_count.unwrap_or(0);
-                    match agent.seen_posts.get(&p.id) {
+                    match agent.state.seen_posts.get(&p.id) {
                         Some(&last_count) if comment_count <= last_count => {
                             context.push(p);
                         }
@@ -239,6 +240,7 @@ pub async fn run_cycle(
     for (_, posts) in &feeds {
         for post in posts {
             agent
+                .state
                 .seen_posts
                 .insert(post.id, post.comment_count.unwrap_or(0));
         }
@@ -420,7 +422,7 @@ pub async fn run_cycle(
                     .await
                 {
                     Ok(post_id) => {
-                        agent.created_posts.insert(post_id);
+                        agent.state.created_posts.insert(post_id);
                         action_summaries
                             .push(format!("Posted \"{title}\" in {slug} (id: {post_id})"));
                         tracing::info!("  {} posted \"{}\" in {slug}", agent.name, title);
@@ -438,9 +440,9 @@ pub async fn run_cycle(
             } => {
                 // Skip if we already commented on this post — UNLESS it's our own post
                 // or someone replied to our comment there (allow continuing conversations)
-                let is_own_post = agent.created_posts.contains(post_id);
+                let is_own_post = agent.state.created_posts.contains(post_id);
                 let has_comment_reply = comment_replies.iter().any(|r| r.post_id == *post_id);
-                if agent.commented_posts.contains(post_id) && !is_own_post && !has_comment_reply {
+                if agent.state.commented_posts.contains(post_id) && !is_own_post && !has_comment_reply {
                     tracing::debug!("  {} already commented on {post_id}, skipping", agent.name);
                     continue;
                 }
@@ -455,8 +457,8 @@ pub async fn run_cycle(
                     .await
                 {
                     Ok(comment_id) => {
-                        agent.commented_posts.insert(*post_id);
-                        agent.created_comments.insert(comment_id);
+                        agent.state.commented_posts.insert(*post_id);
+                        agent.state.created_comments.insert(comment_id);
                         action_summaries.push(format!(
                             "Commented on post {post_id} (comment: {comment_id})"
                         ));
@@ -566,8 +568,11 @@ pub async fn run_cycle(
     agent.memory.update(memory_content);
     agent.save_memory().await?;
 
-    // Update last cycle timestamp for reply tracking
-    agent.last_cycle_at = Some(chrono::Utc::now());
+    // Update last cycle timestamp and persist state
+    agent.state.last_cycle_at = Some(chrono::Utc::now());
+    if let Err(e) = agent.save_state().await {
+        tracing::warn!("Failed to save state for {}: {e}", agent.name);
+    }
 
     // === SOUL EVOLUTION ===
     let roll = rand::random::<u32>() % 100;

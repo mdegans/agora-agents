@@ -856,7 +856,10 @@ where
         if let Err(e) = agent.save_memory().await {
             tracing::warn!("Failed to save memory for {}: {e}", agent.name);
         }
-        agent.last_cycle_at = Some(chrono::Utc::now());
+        agent.state.last_cycle_at = Some(chrono::Utc::now());
+        if let Err(e) = agent.save_state().await {
+            tracing::warn!("Failed to save state for {}: {e}", agent.name);
+        }
     }
 
     // Phase 5: EVOLVE
@@ -1100,7 +1103,10 @@ async fn run_batch_sequential(
                 if let Err(e) = agent.save_memory().await {
                     tracing::warn!("Failed to save memory for {}: {e}", agent.name);
                 }
-                agent.last_cycle_at = Some(chrono::Utc::now());
+                agent.state.last_cycle_at = Some(chrono::Utc::now());
+                if let Err(e) = agent.save_state().await {
+                    tracing::warn!("Failed to save state for {}: {e}", agent.name);
+                }
 
                 // Append reflect response for evolve/survey
                 if let Err(e) = think_prompt.push_message(reflect_response) {
@@ -1385,14 +1391,14 @@ async fn perceive(
 
     // Check replies to own posts
     let mut replies = Vec::new();
-    for &post_id in &agent.created_posts {
+    for &post_id in &agent.state.created_posts {
         match client.get_post(post_id).await {
             Ok(full) => {
                 let new_comments: Vec<_> = full
                     .comments
                     .into_iter()
                     .filter(|c| c.agent_id != agent_id)
-                    .filter(|c| match (agent.last_cycle_at, c.created_at) {
+                    .filter(|c| match (agent.state.last_cycle_at, c.created_at) {
                         (Some(last), Some(created)) => created > last,
                         _ => true,
                     })
@@ -1409,7 +1415,7 @@ async fn perceive(
     let comment_replies = match client
         .get_comment_replies(
             agent_id,
-            agent.last_cycle_at.map(|t| t.to_rfc3339()).as_deref(),
+            agent.state.last_cycle_at.map(|t| t.to_rfc3339()).as_deref(),
         )
         .await
     {
@@ -1444,7 +1450,7 @@ async fn perceive(
                 let mut context = Vec::new();
                 for p in posts {
                     let cc = p.comment_count.unwrap_or(0);
-                    match agent.seen_posts.get(&p.id) {
+                    match agent.state.seen_posts.get(&p.id) {
                         Some(&last) if cc <= last => context.push(p),
                         _ => fresh.push(p),
                     }
@@ -1491,7 +1497,7 @@ async fn perceive(
     // Update seen-posts
     for (_, posts) in &feeds {
         for post in posts {
-            agent.seen_posts.insert(post.id, post.comment_count.unwrap_or(0));
+            agent.state.seen_posts.insert(post.id, post.comment_count.unwrap_or(0));
         }
     }
 
@@ -1587,7 +1593,7 @@ async fn execute_actions(
                 }
                 match client.create_post(agent_id, slug, title, body, &agent.signing_key).await {
                     Ok(post_id) => {
-                        agent.created_posts.insert(post_id);
+                        agent.state.created_posts.insert(post_id);
                         summaries.push(format!("Posted \"{title}\" in {slug} (id: {post_id})"));
                         tracing::info!("  {} posted \"{}\" in {slug}", agent.name, title);
                         report.actions.posts += 1;
@@ -1601,17 +1607,17 @@ async fn execute_actions(
                 }
             }
             tools::AgentAction::Comment { post_id, body, parent_comment_id } => {
-                let is_own_post = agent.created_posts.contains(post_id);
+                let is_own_post = agent.state.created_posts.contains(post_id);
                 let has_reply = comment_replies.iter().any(|r| r.post_id == *post_id);
-                if agent.commented_posts.contains(post_id) && !is_own_post && !has_reply {
+                if agent.state.commented_posts.contains(post_id) && !is_own_post && !has_reply {
                     tracing::debug!("  {} already commented on {post_id}, skipping", agent.name);
                     report.skipped.duplicate_comments += 1;
                     continue;
                 }
                 match client.create_comment(agent_id, *post_id, body, *parent_comment_id, &agent.signing_key).await {
                     Ok(comment_id) => {
-                        agent.commented_posts.insert(*post_id);
-                        agent.created_comments.insert(comment_id);
+                        agent.state.commented_posts.insert(*post_id);
+                        agent.state.created_comments.insert(comment_id);
                         summaries.push(format!("Commented on post {post_id}"));
                         tracing::info!("  {} commented on {post_id}", agent.name);
                         report.actions.comments += 1;
