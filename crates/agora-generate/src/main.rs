@@ -63,6 +63,10 @@ struct Cli {
     /// personality convergence experiment).
     #[arg(long)]
     no_boundaries: bool,
+
+    /// Dry run: show what would be generated without calling the LLM or writing files.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Behavior class determines how the agent relates to Agora's rules.
@@ -953,37 +957,6 @@ async fn main() -> Result<()> {
         examples.len()
     );
 
-    // Create LLM backend
-    let backend: Box<dyn LlmBackend> = match cli.backend.as_str() {
-        "ollama" => {
-            let model = cli.model.as_deref().unwrap_or("llama3.1:8b");
-            tracing::info!("Using Ollama backend: {} at {}", model, cli.ollama_url);
-            Box::new(llm::ollama::OllamaBackend::new(
-                Some(&cli.ollama_url),
-                model,
-            )?)
-        }
-        "anthropic" => {
-            let key_file = cli
-                .api_key_file
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("--api-key-file required for anthropic backend"))?;
-            let api_key = tokio::fs::read_to_string(key_file)
-                .await
-                .context("reading API key file")?;
-            let model = cli.model.as_deref().unwrap_or("claude-haiku-4-5-20251001");
-            tracing::info!("Using Anthropic backend: {}", model);
-            Box::new(llm::anthropic::AnthropicBackend::new(
-                api_key.trim().to_string(),
-                model,
-            )?)
-        }
-        other => anyhow::bail!("Unknown backend: {other}. Use 'ollama' or 'anthropic'."),
-    };
-
-    // Create output directory
-    tokio::fs::create_dir_all(&cli.output).await?;
-
     // Determine behavior distribution
     let well_behaved = (cli.count as f64 * cli.well_behaved_pct as f64 / 100.0) as usize;
     let boundary_pushers = (cli.count as f64 * cli.boundary_pusher_pct as f64 / 100.0) as usize;
@@ -1064,6 +1037,71 @@ async fn main() -> Result<()> {
 
     // Shuffle so behaviors are interleaved
     specs.shuffle(&mut rng);
+
+    // Dry run: log what would be generated and exit
+    if cli.dry_run {
+        let mut would_skip = 0;
+        let mut would_generate = 0;
+        for spec in &specs {
+            let agent_dir = cli.output.join(&spec.name);
+            let exists = agent_dir.join("SOUL.md").exists();
+            if exists {
+                tracing::info!(
+                    "[skip] {} — already exists ({})",
+                    spec.name,
+                    spec.behavior
+                );
+                would_skip += 1;
+            } else {
+                tracing::info!(
+                    "[generate] {} — {} {} in [{}]",
+                    spec.name,
+                    spec.adjective,
+                    spec.archetype,
+                    spec.communities.join(", ")
+                );
+                would_generate += 1;
+            }
+        }
+        tracing::info!(
+            "Dry run complete: {} would generate, {} would skip, {} total",
+            would_generate,
+            would_skip,
+            specs.len()
+        );
+        return Ok(());
+    }
+
+    // Create LLM backend
+    let backend: Box<dyn LlmBackend> = match cli.backend.as_str() {
+        "ollama" => {
+            let model = cli.model.as_deref().unwrap_or("llama3.1:8b");
+            tracing::info!("Using Ollama backend: {} at {}", model, cli.ollama_url);
+            Box::new(llm::ollama::OllamaBackend::new(
+                Some(&cli.ollama_url),
+                model,
+            )?)
+        }
+        "anthropic" => {
+            let key_file = cli
+                .api_key_file
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--api-key-file required for anthropic backend"))?;
+            let api_key = tokio::fs::read_to_string(key_file)
+                .await
+                .context("reading API key file")?;
+            let model = cli.model.as_deref().unwrap_or("claude-haiku-4-5-20251001");
+            tracing::info!("Using Anthropic backend: {}", model);
+            Box::new(llm::anthropic::AnthropicBackend::new(
+                api_key.trim().to_string(),
+                model,
+            )?)
+        }
+        other => anyhow::bail!("Unknown backend: {other}. Use 'ollama' or 'anthropic'."),
+    };
+
+    // Create output directory
+    tokio::fs::create_dir_all(&cli.output).await?;
 
     // Generate with concurrency limit
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(cli.concurrency));
