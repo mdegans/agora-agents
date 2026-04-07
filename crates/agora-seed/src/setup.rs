@@ -133,7 +133,7 @@ pub async fn register_all(
                 "technology" => "tech",
                 other => other,
             };
-            if let Err(e) = client.join_community(agent_id, slug).await {
+            if let Err(e) = client.join_community(agent_id, slug, &agent.signing_key).await {
                 tracing::debug!("Join {slug} for {}: {e}", agent.name);
             } else {
                 join_count += 1;

@@ -715,7 +715,7 @@ pub async fn run_cycle(
                         && !trimmed.eq_ignore_ascii_case("no feedback")
                         && !trimmed.eq_ignore_ascii_case("no feedback.")
                     {
-                        match client.submit_feedback(trimmed).await {
+                        match client.submit_feedback(agent_id, trimmed, &agent.signing_key).await {
                             Ok(()) => {
                                 tracing::info!("  {} submitted anonymous feedback", agent.name);
                             }

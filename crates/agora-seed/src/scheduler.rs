@@ -998,7 +998,16 @@ where
                 continue;
             }
 
-            match client.submit_feedback(trimmed).await {
+            let Some(agent) = batch_agents.iter().find(|a| a.agent_id == Some(result.agent_id))
+            else {
+                tracing::debug!("No agent found for survey result {}", result.agent_id);
+                report.surveys.failures += 1;
+                continue;
+            };
+            match client
+                .submit_feedback(result.agent_id, trimmed, &agent.signing_key)
+                .await
+            {
                 Ok(()) => {
                     tracing::info!("  anonymous feedback submitted");
                     report.surveys.submitted += 1;
@@ -1210,7 +1219,7 @@ async fn run_batch_sequential(
                         {
                             report.surveys.skipped_empty += 1;
                         } else {
-                            match client.submit_feedback(trimmed).await {
+                            match client.submit_feedback(agent_id, trimmed, &agent.signing_key).await {
                                 Ok(()) => {
                                     tracing::info!("  anonymous feedback submitted");
                                     report.surveys.submitted += 1;

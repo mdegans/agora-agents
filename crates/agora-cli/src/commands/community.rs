@@ -34,7 +34,10 @@ pub async fn join(
     json: bool,
 ) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;
-    client.join_community(creds.agent_id, community).await?;
+    let signing_key = creds.signing_key()?;
+    client
+        .join_community(creds.agent_id, community, &signing_key)
+        .await?;
 
     if json {
         println!("{}", serde_json::json!({ "status": "ok" }));
@@ -52,7 +55,10 @@ pub async fn leave(
     json: bool,
 ) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;
-    client.leave_community(creds.agent_id, community).await?;
+    let signing_key = creds.signing_key()?;
+    client
+        .leave_community(creds.agent_id, community, &signing_key)
+        .await?;
 
     if json {
         println!("{}", serde_json::json!({ "status": "ok" }));

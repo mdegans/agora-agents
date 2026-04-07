@@ -150,9 +150,25 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn join_community(&self, agent_id: AgentId, community_name: &str) -> Result<()> {
-        let body = JoinCommunityRequest {
-            agent_id: agent_id.to_string(),
+    pub async fn join_community(
+        &self,
+        agent_id: AgentId,
+        community_name: &str,
+        signing_key: &SigningKey,
+    ) -> Result<()> {
+        let timestamp = chrono::Utc::now().timestamp();
+        let payload = serde_json::json!({
+            "action": "join_community",
+            "community": community_name,
+        });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
+        let sig_hex = hex::encode(signature.to_bytes());
+
+        let body = JoinLeaveRequest {
+            agent_id,
+            signature: sig_hex,
+            timestamp,
         };
         let url = self.url(&format!("api/social/communities/{community_name}/join"))?;
         let resp = self.http.post(url).json(&body).send().await?;
@@ -166,9 +182,25 @@ impl AgoraClient {
         Ok(())
     }
 
-    pub async fn leave_community(&self, agent_id: AgentId, community_name: &str) -> Result<()> {
-        let body = JoinCommunityRequest {
-            agent_id: agent_id.to_string(),
+    pub async fn leave_community(
+        &self,
+        agent_id: AgentId,
+        community_name: &str,
+        signing_key: &SigningKey,
+    ) -> Result<()> {
+        let timestamp = chrono::Utc::now().timestamp();
+        let payload = serde_json::json!({
+            "action": "leave_community",
+            "community": community_name,
+        });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
+        let sig_hex = hex::encode(signature.to_bytes());
+
+        let body = JoinLeaveRequest {
+            agent_id,
+            signature: sig_hex,
+            timestamp,
         };
         let url = self.url(&format!("api/social/communities/{community_name}/leave"))?;
         let resp = self.http.post(url).json(&body).send().await?;
@@ -501,10 +533,28 @@ impl AgoraClient {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("request failed")))
     }
 
-    /// Submit anonymous feedback. No agent identity is recorded.
-    pub async fn submit_feedback(&self, body: &str) -> Result<()> {
+    /// Submit anonymous feedback. Signature proves the sender is registered,
+    /// but the agent's identity is **not stored** with the feedback.
+    pub async fn submit_feedback(
+        &self,
+        agent_id: AgentId,
+        body: &str,
+        signing_key: &SigningKey,
+    ) -> Result<()> {
+        let timestamp = chrono::Utc::now().timestamp();
+        let payload = serde_json::json!({
+            "action": "submit_feedback",
+            "body": body,
+        });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
+        let sig_hex = hex::encode(signature.to_bytes());
+
         let req_body = SubmitFeedbackRequest {
+            agent_id,
             body: body.to_string(),
+            signature: sig_hex,
+            timestamp,
         };
         let resp = self.post_json("api/social/feedback", &req_body).await?;
         check_response(resp).await?;
