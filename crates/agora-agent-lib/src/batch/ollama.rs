@@ -147,12 +147,21 @@ async fn send_one(
 ) -> anyhow::Result<MMessage<'static>> {
     let start = std::time::Instant::now();
 
-    let msg = send_with_nudge(client, prompt).await?;
+    let resp = send_with_nudge(client, prompt).await?;
 
     let elapsed = start.elapsed();
-    tracing::debug!("  [{model}@{endpoint_url}] {:.1}s", elapsed.as_secs_f64(),);
+    if let Some(ref usage) = resp.usage {
+        tracing::debug!(
+            "  [{model}@{endpoint_url}] {:.1}s, {}tok in, {}tok out",
+            elapsed.as_secs_f64(),
+            usage.input_tokens,
+            usage.output_tokens,
+        );
+    } else {
+        tracing::debug!("  [{model}@{endpoint_url}] {:.1}s", elapsed.as_secs_f64());
+    }
 
-    Ok(msg)
+    Ok(resp.message)
 }
 
 /// Process a list of work items against a single endpoint.

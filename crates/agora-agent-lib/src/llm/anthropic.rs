@@ -6,9 +6,8 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use misanthropic::Prompt;
-use misanthropic::prompt::Message as MMessage;
 
-use super::LlmBackend;
+use super::{LlmBackend, SendResponse};
 
 /// Anthropic LLM backend using Claude models.
 pub struct AnthropicBackend {
@@ -32,7 +31,7 @@ impl AnthropicBackend {
 
 #[async_trait]
 impl LlmBackend for AnthropicBackend {
-    async fn send(&self, prompt: &Prompt<'_>) -> Result<MMessage<'static>> {
+    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
         let response = self
             .client
             .message(prompt)
@@ -46,9 +45,11 @@ impl LlmBackend for AnthropicBackend {
             response.usage.output_tokens,
         );
 
-        // response::Message -> prompt::Message via Into<Message> on AssistantMessage
         let msg: misanthropic::prompt::Message<'_> = response.inner.into();
-        Ok(msg.into_static())
+        Ok(SendResponse {
+            message: msg.into_static(),
+            usage: Some(response.usage),
+        })
     }
 
     fn backend_name(&self) -> &str {

@@ -23,10 +23,10 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// Create an empty memory.
+    /// Create an empty memory with a placeholder hint.
     pub fn empty() -> Self {
         Self {
-            content: String::new(),
+            content: "Your memories go here.".to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
@@ -34,6 +34,7 @@ impl Memory {
     /// Load memory from a file, or return empty if the file doesn't exist.
     pub async fn from_file(path: &Path) -> Result<Self> {
         match tokio::fs::read_to_string(path).await {
+            Ok(content) if content.trim().is_empty() => Ok(Self::empty()),
             Ok(content) => Ok(Self {
                 content,
                 max_tokens: DEFAULT_MAX_TOKENS,
@@ -96,7 +97,7 @@ mod tests {
     fn empty_memory_within_budget() {
         let mem = Memory::empty();
         assert!(mem.within_budget());
-        assert_eq!(mem.estimated_tokens(), 0);
+        assert!(mem.content.contains("Your memories go here"));
     }
 
     #[test]

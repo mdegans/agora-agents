@@ -16,6 +16,17 @@ pub use misanthropic::Prompt;
 pub use misanthropic::prompt::Message as MMessage;
 pub use misanthropic::prompt::message::Content as MContent;
 pub use misanthropic::prompt::message::Role as MRole;
+pub use misanthropic::response::Usage;
+
+/// Response from an LLM backend, including the converted prompt message
+/// and optional usage statistics from the API.
+pub struct SendResponse {
+    /// The assistant's response, already converted to a prompt message
+    /// suitable for appending to the conversation.
+    pub message: MMessage<'static>,
+    /// Token usage stats (populated by Anthropic; Ollama compat may vary).
+    pub usage: Option<Usage>,
+}
 
 /// A message in a conversation (simple text-only representation).
 ///
@@ -38,11 +49,12 @@ pub enum Role {
 /// Trait for LLM backends that can generate completions.
 #[async_trait]
 pub trait LlmBackend: Send + Sync {
-    /// Send a full [`Prompt`] and get the response [`Message`](MMessage).
+    /// Send a full [`Prompt`] and get the response.
     ///
-    /// This is the primary method backends must implement. The returned message
-    /// may contain text, tool calls, or both.
-    async fn send(&self, prompt: &Prompt<'_>) -> Result<MMessage<'static>>;
+    /// This is the primary method backends must implement. The returned
+    /// [`SendResponse`] contains the assistant message (for appending to the
+    /// conversation) and optional token usage statistics.
+    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse>;
 
     /// Name of the backend for logging.
     fn backend_name(&self) -> &str;
@@ -82,7 +94,9 @@ pub trait LlmBackend: Send + Sync {
                 .map_err(|e| anyhow::anyhow!("turn order error: {e}"))?;
         }
 
-        let response = self.send(&prompt).await?;
+        let SendResponse {
+            message: response, ..
+        } = self.send(&prompt).await?;
         // Filter out Block::Thought and <think>/<thinking> XML tags.
         // Ollama models (especially qwen) may return chain-of-thought
         // in various forms depending on the backend.
@@ -100,7 +114,7 @@ pub trait LlmBackend: Send + Sync {
 // Allow calling LlmBackend methods on Box<dyn LlmBackend>.
 #[async_trait]
 impl LlmBackend for Box<dyn LlmBackend> {
-    async fn send(&self, prompt: &Prompt<'_>) -> Result<MMessage<'static>> {
+    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
         (**self).send(prompt).await
     }
 

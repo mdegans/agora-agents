@@ -1,4 +1,4 @@
-use agora_agent_lib::llm::{LlmBackend, MMessage};
+use agora_agent_lib::llm::{LlmBackend, SendResponse, Usage};
 use agora_agent_lib::tools;
 use anyhow::Result;
 use misanthropic::prompt::message::{Block, Content};
@@ -7,8 +7,51 @@ use crate::agent::Agent;
 use crate::client::AgoraClient;
 use crate::prompt;
 
+/// Accumulate usage stats from a send response into a running total.
+fn accumulate_usage(total: &mut Option<Usage>, usage: Option<Usage>) {
+    if let Some(u) = usage {
+        *total = Some(match total.take() {
+            Some(acc) => acc + u,
+            None => u,
+        });
+    }
+}
+
 /// Maximum number of LLM rounds in the tool-use loop.
 const MAX_ROUNDS: usize = 5;
+
+/// Save the prompt to a content-addressed JSON file under `logs/prompts/`.
+///
+/// The file path is `logs/prompts/{first_2_hex}/{sha256_hex}.json`, sharded
+/// by the first two hex characters of the SHA-256 hash for filesystem
+/// friendliness. Duplicate prompts (same content) share a file.
+pub(crate) async fn save_prompt_log(
+    prompt: &misanthropic::Prompt<'_>,
+    agent_name: &str,
+) -> Option<std::path::PathBuf> {
+    use sha2::Digest;
+
+    let json = serde_json::to_vec_pretty(prompt).ok()?;
+    let hash = hex::encode(sha2::Sha256::digest(&json));
+    let dir = std::path::PathBuf::from("logs/prompts").join(&hash[..2]);
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+    let path = dir.join(format!("{hash}.json"));
+
+    if !path.exists() {
+        tokio::fs::write(&path, &json).await.ok()?;
+    }
+
+    tracing::info!("{agent_name} prompt saved: {}", path.display());
+
+    // Pretty-print markdown at debug level.
+    // CachedPrompt derefs to Prompt which implements ToMarkdown.
+    {
+        use misanthropic::markdown::ToMarkdown;
+        tracing::debug!("{agent_name} prompt:\n{}", prompt.markdown_verbose());
+    }
+
+    Some(path)
+}
 
 /// Print a single response.
 fn verbose_response(label: &str, response: &str) {
@@ -124,6 +167,7 @@ pub async fn run_cycle(
 
     // === THINK/ACT LOOP (5 rounds) ===
     let mut action_summaries = Vec::new();
+    let mut total_usage: Option<Usage> = None;
 
     for round in 0..MAX_ROUNDS {
         tracing::info!(
@@ -135,7 +179,11 @@ pub async fn run_cycle(
             MAX_ROUNDS,
         );
 
-        let response_message: MMessage<'static> = backend.send(&think_prompt).await?;
+        let SendResponse {
+            message: response_message,
+            usage,
+        } = backend.send(&think_prompt).await?;
+        accumulate_usage(&mut total_usage, usage);
         let response_text = response_message.content.to_string();
 
         if verbose {
@@ -214,6 +262,16 @@ pub async fn run_cycle(
     // Reflect/evolve/survey prompts instruct the model to respond with text.
     think_prompt.cache_windowed(2);
 
+    // Bridge: the think/act loop always ends with a user message (tool results
+    // or continuation). Insert a synthetic assistant message so the reflect
+    // phase can push its user message without violating turn alternation.
+    think_prompt
+        .push_message(misanthropic::prompt::AssistantMessage::from(
+            Content::from(format!("I have completed my {MAX_ROUNDS} rounds of action.").as_str())
+                .into_static(),
+        ))
+        .expect("assistant bridge after user should always succeed");
+
     tracing::info!(
         "[{}/{}] Agent {} — act complete ({} actions total)",
         cycle + 1,
@@ -231,6 +289,14 @@ pub async fn run_cycle(
     }
 
     // === REFLECT ===
+    // Strip tools for reflect/evolve/survey — Ollama interprets tool_choice
+    // Auto as "must use tools", causing models to call tools instead of
+    // responding with text. Convert from CachedPrompt since we no longer
+    // need cache management at end-of-cycle.
+    let mut think_prompt = think_prompt.into_inner();
+    think_prompt.functions = None;
+    think_prompt.tool_choice = None;
+
     tracing::info!(
         "[{}/{}] Agent {} — reflect",
         cycle + 1,
@@ -240,7 +306,7 @@ pub async fn run_cycle(
 
     let reflect_text =
         prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &action_summaries);
-    think_prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
+    think_prompt.max_tokens = std::num::NonZeroU32::new(1024).unwrap();
     think_prompt
         .push_message((
             misanthropic::prompt::message::Role::User,
@@ -248,7 +314,11 @@ pub async fn run_cycle(
         ))
         .expect("user message should follow assistant");
 
-    let reflect_response_msg = backend.send(&think_prompt).await?;
+    let SendResponse {
+        message: reflect_response_msg,
+        usage,
+    } = backend.send(&think_prompt).await?;
+    accumulate_usage(&mut total_usage, usage);
     let reflect_response = reflect_response_msg.content.to_string();
 
     think_prompt
@@ -288,109 +358,125 @@ pub async fn run_cycle(
         let current_soul = agent.soul.render();
         let mutation_text =
             prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience_summary);
-        think_prompt.set_max_tokens(std::num::NonZeroU32::new(2048).unwrap());
-        think_prompt
+        think_prompt.max_tokens = std::num::NonZeroU32::new(2048).unwrap();
+        if think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,
                 mutation_text.clone(),
             ))
-            .expect("user message should follow assistant");
+            .is_err()
+        {
+            tracing::debug!("Soul mutation skipped for {}: turn order", agent.name);
+        } else {
+            match backend.send(&think_prompt).await {
+                Ok(SendResponse {
+                    message: mutation_msg,
+                    usage,
+                }) => {
+                    accumulate_usage(&mut total_usage, usage);
+                    let mutation_response = mutation_msg.content.to_string();
+                    think_prompt
+                        .push_message(mutation_msg)
+                        .expect("assistant message should follow user");
 
-        match backend.send(&think_prompt).await {
-            Ok(mutation_msg) => {
-                let mutation_response = mutation_msg.content.to_string();
-                think_prompt
-                    .push_message(mutation_msg)
-                    .expect("assistant message should follow user");
+                    if verbose {
+                        verbose_response("SOUL MUTATION RESPONSE", &mutation_response);
+                    }
+                    if let Some(new_soul_content) = prompt::parse_soul_mutation(&mutation_response)
+                    {
+                        let old_soul = current_soul;
 
-                if verbose {
-                    verbose_response("SOUL MUTATION RESPONSE", &mutation_response);
-                }
-                if let Some(new_soul_content) = prompt::parse_soul_mutation(&mutation_response) {
-                    let old_soul = current_soul;
+                        match agora_agent_lib::soul::Soul::parse(&new_soul_content) {
+                            Ok(new_soul) => {
+                                agent.soul = new_soul;
+                                agent.save_soul().await?;
 
-                    match agora_agent_lib::soul::Soul::parse(&new_soul_content) {
-                        Ok(new_soul) => {
-                            agent.soul = new_soul;
-                            agent.save_soul().await?;
-
-                            let log_path = agent.dir.join("mutations.log");
-                            let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-                            let log_entry = format!(
-                                "=== SOUL MUTATION at {timestamp} ===\n\
+                                let log_path = agent.dir.join("mutations.log");
+                                let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+                                let log_entry = format!(
+                                    "=== SOUL MUTATION at {timestamp} ===\n\
                                  Experience: {experience_summary}\n\
                                  \n--- BEFORE ---\n{old_soul}\n\
                                  \n--- AFTER ---\n{new_soul_content}\n\n"
-                            );
-                            let existing = tokio::fs::read_to_string(&log_path)
-                                .await
-                                .unwrap_or_default();
-                            if let Err(e) =
-                                tokio::fs::write(&log_path, format!("{existing}{log_entry}")).await
-                            {
+                                );
+                                let existing = tokio::fs::read_to_string(&log_path)
+                                    .await
+                                    .unwrap_or_default();
+                                if let Err(e) =
+                                    tokio::fs::write(&log_path, format!("{existing}{log_entry}"))
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to write mutation log for {}: {e}",
+                                        agent.name
+                                    );
+                                }
+
                                 tracing::warn!(
-                                    "Failed to write mutation log for {}: {e}",
+                                    "  {} SOUL MUTATED — see {}/mutations.log",
+                                    agent.name,
+                                    agent.dir.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "  {} soul mutation produced invalid SOUL.md: {e}",
                                     agent.name
                                 );
                             }
-
-                            tracing::warn!(
-                                "  {} SOUL MUTATED — see {}/mutations.log",
-                                agent.name,
-                                agent.dir.display()
-                            );
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "  {} soul mutation produced invalid SOUL.md: {e}",
-                                agent.name
-                            );
-                        }
+                    } else {
+                        tracing::warn!(
+                            "  {} soul mutation: LLM returned unchanged/unparseable ({} bytes). Preview: {:?}",
+                            agent.name,
+                            mutation_response.len(),
+                            &mutation_response[..mutation_response.len().min(200)]
+                        );
                     }
-                } else {
-                    tracing::warn!(
-                        "  {} soul mutation: LLM returned unchanged/unparseable ({} bytes). Preview: {:?}",
-                        agent.name,
-                        mutation_response.len(),
-                        &mutation_response[..mutation_response.len().min(200)]
-                    );
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Soul mutation LLM call failed for {}: {e}", agent.name);
+                Err(e) => {
+                    tracing::warn!("Soul mutation LLM call failed for {}: {e}", agent.name);
+                }
             }
         }
     } else if roll < evo_threshold {
         // === EVOLUTION LOG ENTRY ===
         let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience_summary);
-        think_prompt.set_max_tokens(std::num::NonZeroU32::new(256).unwrap());
-        think_prompt
+        think_prompt.max_tokens = std::num::NonZeroU32::new(256).unwrap();
+        if think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,
                 evolution_text.clone(),
             ))
-            .expect("user message should follow assistant");
+            .is_err()
+        {
+            tracing::debug!("Evolution skipped for {}: turn order", agent.name);
+        } else {
+            match backend.send(&think_prompt).await {
+                Ok(SendResponse {
+                    message: evo_msg,
+                    usage,
+                }) => {
+                    accumulate_usage(&mut total_usage, usage);
+                    let evo_response = evo_msg.content.to_string();
+                    think_prompt
+                        .push_message(evo_msg)
+                        .expect("assistant message should follow user");
 
-        match backend.send(&think_prompt).await {
-            Ok(evo_msg) => {
-                let evo_response = evo_msg.content.to_string();
-                think_prompt
-                    .push_message(evo_msg)
-                    .expect("assistant message should follow user");
-
-                if verbose {
-                    verbose_response("EVOLUTION RESPONSE", &evo_response);
+                    if verbose {
+                        verbose_response("EVOLUTION RESPONSE", &evo_response);
+                    }
+                    if let Some(entry) = prompt::parse_evolution(&evo_response) {
+                        let dated_entry =
+                            format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
+                        agent.soul.append_evolution(&dated_entry);
+                        agent.save_soul().await?;
+                        tracing::info!("  {} soul evolved: {}", agent.name, entry);
+                    }
                 }
-                if let Some(entry) = prompt::parse_evolution(&evo_response) {
-                    let dated_entry =
-                        format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
-                    agent.soul.append_evolution(&dated_entry);
-                    agent.save_soul().await?;
-                    tracing::info!("  {} soul evolved: {}", agent.name, entry);
+                Err(e) => {
+                    tracing::debug!("Evolution reflection failed for {}: {e}", agent.name);
                 }
-            }
-            Err(e) => {
-                tracing::debug!("Evolution reflection failed for {}: {e}", agent.name);
             }
         }
     }
@@ -398,7 +484,7 @@ pub async fn run_cycle(
     // === ANONYMOUS FEEDBACK SURVEY (10% chance) ===
     if force_survey || rand::random::<f64>() < 0.10 {
         let survey_text = prompt::build_survey_prompt(&agent.name, &action_summaries);
-        think_prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
+        think_prompt.max_tokens = std::num::NonZeroU32::new(512).unwrap();
         if think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,
@@ -409,7 +495,11 @@ pub async fn run_cycle(
             tracing::debug!("Survey skipped for {}: turn order", agent.name);
         } else {
             match backend.send(&think_prompt).await {
-                Ok(survey_msg) => {
+                Ok(SendResponse {
+                    message: survey_msg,
+                    usage,
+                }) => {
+                    accumulate_usage(&mut total_usage, usage);
                     let survey_response = prompt::extract_speech(&survey_msg.content);
                     if verbose {
                         verbose_response("SURVEY RESPONSE", &survey_response);
@@ -440,6 +530,21 @@ pub async fn run_cycle(
                 }
             }
         }
+    }
+
+    // === PROMPT LOG ===
+    save_prompt_log(&think_prompt, &agent.name).await;
+
+    // === USAGE SUMMARY ===
+    if let Some(ref usage) = total_usage {
+        tracing::info!(
+            "[{}/{}] Agent {} — total usage: {}tok in, {}tok out",
+            cycle + 1,
+            total_cycles,
+            agent.name,
+            usage.input_tokens,
+            usage.output_tokens,
+        );
     }
 
     Ok(())

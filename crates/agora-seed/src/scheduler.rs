@@ -1358,6 +1358,16 @@ async fn run_batch_sequential(
         // Reflect/evolve/survey prompts instruct the model to respond with text.
         think_prompt.cache_windowed(2);
 
+        // Bridge: think/act loop always ends with a user message (tool results
+        // or continuation). Insert a synthetic assistant message so reflect
+        // can push its user message without violating turn alternation.
+        if let Err(e) = think_prompt.push_message(misanthropic::prompt::AssistantMessage::from(
+            misanthropic::prompt::message::Content::from("I have completed my rounds of action.")
+                .into_static(),
+        )) {
+            tracing::debug!("Failed to insert bridge message for {}: {e}", agent.name);
+        }
+
         tracing::info!(
             "[{}/{}] {} — act complete ({} actions total)",
             cycle + 1,
@@ -1367,13 +1377,20 @@ async fn run_batch_sequential(
         );
 
         // Phase 4: REFLECT
+        // Strip tools for reflect/evolve/survey — Ollama interprets tool_choice
+        // Auto as "must use tools", causing models to call tools instead of
+        // responding with text. Cache miss is acceptable at end-of-cycle.
+        let mut think_prompt = think_prompt.into_inner();
+        think_prompt.functions = None;
+        think_prompt.tool_choice = None;
+
         let reflect_text =
             prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &summaries);
         if let Err(e) = think_prompt.push_message((MRole::User, reflect_text)) {
             tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
             continue;
         }
-        think_prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
+        think_prompt.max_tokens = NonZeroU32::new(1024).unwrap();
 
         match endpoint.send(&think_prompt, &model).await {
             Ok(reflect_response) => {
@@ -1414,7 +1431,7 @@ async fn run_batch_sequential(
                 prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
 
             if let Ok(()) = think_prompt.push_message((MRole::User, mutation_prompt)) {
-                think_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
+                think_prompt.max_tokens = NonZeroU32::new(2048).unwrap();
                 match endpoint.send(&think_prompt, &model).await {
                     Ok(mutation_response) => {
                         let response_text = mutation_response.content.to_string();
@@ -1462,7 +1479,7 @@ async fn run_batch_sequential(
             // Evolution log entry
             let evo_prompt = prompt::build_evolution_prompt(&agent.name, &experience);
             if let Ok(()) = think_prompt.push_message((MRole::User, evo_prompt)) {
-                think_prompt.set_max_tokens(NonZeroU32::new(256).unwrap());
+                think_prompt.max_tokens = NonZeroU32::new(256).unwrap();
                 match endpoint.send(&think_prompt, &model).await {
                     Ok(evo_response) => {
                         let response_text = evo_response.content.to_string();
@@ -1488,7 +1505,7 @@ async fn run_batch_sequential(
         if config.force_survey || rand::random::<f64>() < 0.10 {
             let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
             if let Ok(()) = think_prompt.push_message((MRole::User, survey_text)) {
-                think_prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
+                think_prompt.max_tokens = NonZeroU32::new(512).unwrap();
                 match endpoint.send(&think_prompt, &model).await {
                     Ok(survey_response) => {
                         let text = prompt::extract_speech(&survey_response.content);
@@ -1521,6 +1538,9 @@ async fn run_batch_sequential(
                 }
             }
         }
+
+        // Save prompt log after each agent's full cycle
+        crate::runner::save_prompt_log(&think_prompt, &agent.name).await;
     }
 
     Ok(())

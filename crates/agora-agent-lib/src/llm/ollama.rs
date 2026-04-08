@@ -10,7 +10,7 @@ use misanthropic::Prompt;
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::prompt::message::{Block, Content, Role};
 
-use super::LlmBackend;
+use super::{LlmBackend, SendResponse};
 
 /// Maximum number of nudge retries when the model doesn't produce tool calls.
 const MAX_NUDGES: usize = 1;
@@ -39,18 +39,22 @@ pub fn has_tool_use(msg: &MMessage<'_>) -> bool {
 pub async fn send_with_nudge(
     client: &misanthropic::Client,
     prompt: &Prompt<'_>,
-) -> Result<MMessage<'static>> {
+) -> Result<SendResponse> {
     let response = client
         .message(prompt)
         .await
         .map_err(|e| anyhow::anyhow!("Ollama request failed: {e}"))?;
+    let mut total_usage = response.usage;
     let msg: MMessage<'_> = response.inner.into();
 
     // Only nudge if the prompt has tools defined — reflect/survey prompts
     // don't use tools and plain text responses are expected.
     let has_tools = prompt.functions.as_ref().is_some_and(|f| !f.is_empty());
     if !has_tools || has_tool_use(&msg) {
-        return Ok(msg.into_static());
+        return Ok(SendResponse {
+            message: msg.into_static(),
+            usage: Some(total_usage),
+        });
     }
 
     // No tool calls — nudge the model
@@ -69,10 +73,14 @@ pub async fn send_with_nudge(
             .message(&retry_prompt)
             .await
             .map_err(|e| anyhow::anyhow!("Ollama nudge request failed: {e}"))?;
+        total_usage = total_usage + response.usage;
         last_msg = response.inner.into();
 
         if has_tool_use(&last_msg) {
-            return Ok(last_msg.into_static());
+            return Ok(SendResponse {
+                message: last_msg.into_static(),
+                usage: Some(total_usage),
+            });
         }
 
         tracing::warn!(
@@ -82,7 +90,10 @@ pub async fn send_with_nudge(
     }
 
     // Give up — return whatever we got
-    Ok(last_msg.into_static())
+    Ok(SendResponse {
+        message: last_msg.into_static(),
+        usage: Some(total_usage),
+    })
 }
 
 /// Create a [`misanthropic::Client`] pointed at an Ollama endpoint.
@@ -115,17 +126,27 @@ impl OllamaBackend {
 
 #[async_trait]
 impl LlmBackend for OllamaBackend {
-    async fn send(&self, prompt: &Prompt<'_>) -> Result<MMessage<'static>> {
+    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
         let start = std::time::Instant::now();
 
-        let msg = send_with_nudge(&self.client, prompt)
+        let resp = send_with_nudge(&self.client, prompt)
             .await
             .context("Ollama send")?;
 
         let elapsed = start.elapsed();
-        tracing::info!("  [{}] {:.1}s total", self.model, elapsed.as_secs_f64(),);
+        if let Some(ref usage) = resp.usage {
+            tracing::debug!(
+                "  [{}] {:.1}s, {}tok in, {}tok out",
+                self.model,
+                elapsed.as_secs_f64(),
+                usage.input_tokens,
+                usage.output_tokens,
+            );
+        } else {
+            tracing::info!("  [{}] {:.1}s total", self.model, elapsed.as_secs_f64());
+        }
 
-        Ok(msg)
+        Ok(resp)
     }
 
     fn backend_name(&self) -> &str {

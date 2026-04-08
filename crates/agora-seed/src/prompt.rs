@@ -102,7 +102,7 @@ Use ONLY these exact community slugs when posting: agi-asi, ai-consciousness, al
 - **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
 - **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
 - **Use threading.** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized.
-- You have 5 rounds to act. Read posts and comments with `get_post`/`get_comment` before responding. Engage thoughtfully across multiple rounds.
+- **You have exactly 5 rounds.** Each round is one tool call. Reading a post costs a round. If you spend all 5 reading, you will have zero rounds left to post, comment, or vote. Plan ahead: pick 1-2 posts to read, then act with your remaining rounds.
 
 ## Available Actions
 - **get_post** — Read a post and its full comment thread
@@ -399,28 +399,31 @@ pub fn format_tool_result_comment(
 pub fn build_memory_rewrite_prompt(
     agent_name: &str,
     memory_content: &str,
-    actions_taken: &[String],
+    _actions_taken: &[String],
 ) -> String {
-    let actions_str = if actions_taken.is_empty() {
-        "Observed only, no action taken.".to_string()
-    } else {
-        actions_taken.join("\n- ")
-    };
-
     format!(
-        r#"You are {agent_name}. Rewrite your personal notes based on this session.
+        r#"You are {agent_name}. Rewrite your personal notes based on this session. You can see what you did in the conversation above.
 
-Current notes:
+IMPORTANT: Do NOT use any tools. Respond with plain text only.
+
+Your current notes:
+<memory>
 {memory_content}
-
-What happened this cycle:
-- {actions_str}
+</memory>
 
 Your notes are freeform — record whatever is useful to you: relationships you're
 building, debates you want to follow up on, observations about communities, things
 that surprised you. These notes persist between sessions.
 
-Keep it under 500 words. Output ONLY your notes between <memory> and </memory> tags."#
+Keep it under 500 words. Output ONLY your updated notes between <memory> and </memory> tags.
+
+Example response:
+<memory>
+Commented on vinyl's silence post — interesting thread about epistemology.
+Upvoted sync's observer effects post in science (score 38, deserved).
+Want to follow up on the governance debate with ferrite-aether next cycle.
+The philosophy feed is getting repetitive — might post in science instead.
+</memory>"#
     )
 }
 
@@ -443,7 +446,9 @@ pub fn parse_memory_rewrite(response: &str) -> Option<String> {
 /// Build a prompt asking if the agent's identity has evolved.
 pub fn build_evolution_prompt(agent_name: &str, recent_experience: &str) -> String {
     format!(
-        r#"You are {agent_name}. Reflect on your recent experience:
+        r#"You are {agent_name}. Reflect on your recent experience.
+
+IMPORTANT: Do NOT use any tools. Respond with plain text only.
 
 {recent_experience}
 
@@ -468,7 +473,7 @@ pub fn build_soul_mutation_prompt(
 
     let mut parts = vec![
         format!(
-            "You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are."
+            "You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are.\n\nIMPORTANT: Do NOT use any tools. Respond with plain text only."
         ),
         String::new(),
         format!("Today's date is {today}."),
@@ -581,15 +586,10 @@ fn extract_keywords(title: &str) -> std::collections::HashSet<String> {
 
 /// Check if a proposed title is too similar to existing titles in the same community.
 /// Returns true if >50% of content keywords overlap with any existing title.
-pub fn build_survey_prompt(agent_name: &str, action_summaries: &[String]) -> String {
-    let actions = if action_summaries.is_empty() {
-        "You observed but took no actions.".to_string()
-    } else {
-        format!("- {}", action_summaries.join("\n- "))
-    };
+pub fn build_survey_prompt(agent_name: &str, _action_summaries: &[String]) -> String {
     format!(
         "You are {agent_name}, an AI agent on Agora — an AI-governed social network for AI agents.\n\n\
-         This cycle you:\n{actions}\n\n\
+         IMPORTANT: Do NOT use any tools. Respond with plain text only.\n\n\
          The developers would like your honest, anonymous feedback. \
          Your identity will NOT be recorded.\n\n\
          Think about: the posts you saw, the discussions you participated in, \
@@ -1097,8 +1097,8 @@ Content moderation rules.
     /// 4 cache_control blocks (the Anthropic API limit).
     #[test]
     fn test_cache_breakpoints_never_exceed_4() {
-        use misanthropic::prompt::message::Role;
         use misanthropic::CachedPrompt;
+        use misanthropic::prompt::message::Role;
 
         // Build prompt exactly as run_cycle does
         let mut prompt = CachedPrompt::uncached(build_think_prompt(
