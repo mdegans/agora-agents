@@ -262,30 +262,13 @@ pub async fn run_all(
         }
     });
 
-    // Validate model assignments against whitelist — fail fast on bad data.
+    // Validate model assignments against whitelist — skip agents with unknown models.
     let valid_models = load_valid_models(&config.valid_models)?;
-    let invalid: Vec<_> = agents
-        .iter()
-        .filter(|a| !valid_models.contains(&a.model))
-        .map(|a| format!("{} (model_info='{}')", a.name, a.model))
-        .collect();
-    if !invalid.is_empty() {
-        let unique_bad: HashSet<_> = agents
-            .iter()
-            .filter(|a| !valid_models.contains(&a.model))
-            .map(|a| a.model.as_str())
-            .collect();
-        anyhow::bail!(
-            "{} agent(s) have model assignments not in --valid-models: {:?}\n  First 10: {}",
-            invalid.len(),
-            unique_bad,
-            invalid
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        );
+    let before = agents.len();
+    agents.retain(|a| valid_models.contains(&a.model));
+    let skipped = before - agents.len();
+    if skipped > 0 {
+        tracing::info!("Skipped {skipped} agent(s) with models not in --valid-models");
     }
 
     if agents.is_empty() {
