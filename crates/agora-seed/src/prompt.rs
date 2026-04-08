@@ -1,15 +1,12 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use agora_agent_lib::agora_agentkit::ids::{AgentId, CommentId, PostId};
+use agora_agent_lib::agora_agentkit::ids::CommentId;
 pub use agora_agent_lib::tools::AgentAction;
 use misanthropic::Prompt;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
 
 use crate::client::{Comment, FeedPost};
-
-/// Maximum number of comments in an ancestry chain (root to reply).
-const MAX_CHAIN_DEPTH: usize = 10;
 
 /// Build a full [`Prompt`] for the think/act phase with native tool use.
 ///
@@ -179,26 +176,6 @@ pub fn format_recent_activity(posts: &[FeedPost], limit: usize) -> String {
         ));
     }
     out
-}
-
-/// Extract the ancestry chain from root to a target comment (inclusive).
-///
-/// Walks up the `parent_comment_id` chain from the target, then reverses
-/// to produce root-first order. Capped at [`MAX_CHAIN_DEPTH`] entries.
-/// Returns an empty vec if the target is not found.
-fn extract_comment_chain<'a>(target_id: CommentId, comments: &'a [Comment]) -> Vec<&'a Comment> {
-    let by_id: HashMap<CommentId, &Comment> = comments.iter().map(|c| (c.id, c)).collect();
-    let mut chain = Vec::new();
-    let mut current = by_id.get(&target_id).copied();
-    while let Some(c) = current {
-        chain.push(c);
-        if chain.len() >= MAX_CHAIN_DEPTH {
-            break;
-        }
-        current = c.parent_comment_id.and_then(|pid| by_id.get(&pid).copied());
-    }
-    chain.reverse(); // root to leaf
-    chain
 }
 
 /// A comment with its computed depth and parent author for threaded display.
@@ -724,6 +701,7 @@ pub fn preflight_check_prompt(serialized_json: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agora_agent_lib::agora_agentkit::ids::{AgentId, PostId};
 
     // --- Constitution and prompt integrity tests ---
 

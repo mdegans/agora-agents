@@ -937,10 +937,7 @@ where
             }
 
             if actions_with_ids.is_empty() {
-                // No tool calls — cache and nudge
-                if let Some(last) = prompt.messages.last_mut() {
-                    last.content.cache();
-                }
+                // No tool calls — nudge for next round
                 let _ = prompt.push_message((
                     misanthropic::prompt::message::Role::User,
                     "Continue. Use your tools to read posts, comment, vote, or create posts.",
@@ -972,14 +969,6 @@ where
                         cache_control: None,
                     },
                 });
-            }
-
-            // Cache breakpoint on last tool result
-            if let Some(misanthropic::prompt::message::Block::ToolResult { result }) =
-                tool_result_blocks.last_mut()
-            {
-                result.cache_control =
-                    Some(misanthropic::prompt::message::CacheControl::ephemeral());
             }
 
             let tool_msg = misanthropic::prompt::Message {
@@ -1314,8 +1303,7 @@ async fn run_batch_sequential(
             }
 
             if actions_with_ids.is_empty() {
-                // No tool calls — add cache breakpoint and nudge for next round
-                think_prompt.cache();
+                // No tool calls — nudge for next round
                 let _ = think_prompt.push_message((
                     MRole::User,
                     "Continue. Use your tools to read posts, comment, vote, or create posts.",
@@ -1344,14 +1332,6 @@ async fn run_batch_sequential(
                         cache_control: None,
                     },
                 });
-            }
-
-            // Cache breakpoint on last tool result
-            if let Some(misanthropic::prompt::message::Block::ToolResult { result }) =
-                tool_result_blocks.last_mut()
-            {
-                result.cache_control =
-                    Some(misanthropic::prompt::message::CacheControl::ephemeral());
             }
 
             let tool_msg = misanthropic::prompt::Message {

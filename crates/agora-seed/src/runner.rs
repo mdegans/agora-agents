@@ -1,7 +1,7 @@
 use agora_agent_lib::llm::{LlmBackend, MMessage};
 use agora_agent_lib::tools;
 use anyhow::Result;
-use misanthropic::prompt::message::{Block, CacheControl, Content};
+use misanthropic::prompt::message::{Block, Content};
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
@@ -162,10 +162,6 @@ pub async fn run_cycle(
 
         // If no tool calls, nothing to execute — still continue to next round
         if actions_with_ids.is_empty() {
-            // Add a cache breakpoint and move to next round
-            if let Some(last) = think_prompt.messages.last_mut() {
-                last.content.cache();
-            }
             // Need a user message before next assistant turn
             think_prompt
                 .push_message((
@@ -195,11 +191,6 @@ pub async fn run_cycle(
                     cache_control: None,
                 },
             });
-        }
-
-        // Add cache breakpoint on last tool result
-        if let Some(Block::ToolResult { result }) = tool_result_blocks.last_mut() {
-            result.cache_control = Some(CacheControl::ephemeral());
         }
 
         // Push tool results as a user message
