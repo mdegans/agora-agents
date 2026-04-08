@@ -61,9 +61,9 @@ pub struct Cli {
     #[arg(long)]
     pub mutation_chance: Option<u32>,
 
-    /// Only run agents whose name contains this substring.
-    #[arg(long)]
-    pub agent_filter: Option<String>,
+    /// Only run agents with these exact names (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub agent_filter: Vec<String>,
 
     /// Path to the Agora constitution (included in agent context).
     #[arg(long, default_value = "../constitution.md")]

@@ -248,8 +248,8 @@ pub async fn run_all(
     let start = Instant::now();
 
     // Filter agents
-    if let Some(ref filter) = config.agent_filter {
-        agents.retain(|a| a.name.contains(filter.as_str()));
+    if !config.agent_filter.is_empty() {
+        agents.retain(|a| config.agent_filter.iter().any(|f| f == &a.name));
     }
 
     // Remove unregistered agents

@@ -82,8 +82,8 @@ async fn main() -> Result<()> {
             let mut agents_with_no_communities = 0u32;
 
             // Apply agent filter if set
-            if let Some(ref filter) = cli.agent_filter {
-                agents.retain(|a| a.name.contains(filter.as_str()));
+            if !cli.agent_filter.is_empty() {
+                agents.retain(|a| cli.agent_filter.iter().any(|f| f == &a.name));
             }
 
             for agent in &agents {
@@ -156,8 +156,8 @@ async fn main() -> Result<()> {
         }
         Phase::Fix => {
             // Apply agent filter if set
-            if let Some(ref filter) = cli.agent_filter {
-                agents.retain(|a| a.name.contains(filter.as_str()));
+            if !cli.agent_filter.is_empty() {
+                agents.retain(|a| cli.agent_filter.iter().any(|f| f == &a.name));
             }
 
             let mut fixed = 0u32;
@@ -193,8 +193,8 @@ async fn main() -> Result<()> {
         }
         Phase::AssignCommunities => {
             // Apply agent filter if set
-            if let Some(ref filter) = cli.agent_filter {
-                agents.retain(|a| a.name.contains(filter.as_str()));
+            if !cli.agent_filter.is_empty() {
+                agents.retain(|a| cli.agent_filter.iter().any(|f| f == &a.name));
             }
 
             let mut assigned = 0u32;
@@ -257,8 +257,8 @@ async fn main() -> Result<()> {
         }
         Phase::Simulate => {
             // Filter to a single agent
-            if let Some(ref filter) = cli.agent_filter {
-                agents.retain(|a| a.name.contains(filter.as_str()));
+            if !cli.agent_filter.is_empty() {
+                agents.retain(|a| cli.agent_filter.iter().any(|f| f == &a.name));
             }
             let agent = agents.first_mut().ok_or_else(|| {
                 anyhow::anyhow!("No agent found. Use --agent-filter to select one.")
