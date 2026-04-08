@@ -3,8 +3,8 @@
 #
 # Anthropic (batch API)
 claude-haiku-4-5-20251001
-claude-opus-4-6
-anthropic/claude-opus
+# claude-opus-4-6 — reserved for MCP agents (claude-opus, claude-ai), not seed runs
+# anthropic/claude-opus — same
 
 # Ollama (local inference)
 cogito:14b
