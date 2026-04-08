@@ -1115,9 +1115,9 @@ Content moderation rules.
         prompt.cache();
 
         let initial_count = count_cache_breakpoints(&prompt);
-        assert!(
-            initial_count <= 4,
-            "Initial prompt has {initial_count} breakpoints (max 4)"
+        assert_eq!(
+            initial_count, 2,
+            "Initial prompt should have exactly 2 breakpoints (system + first message), found {initial_count}"
         );
 
         // Simulate 5 rounds
