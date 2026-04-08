@@ -206,13 +206,13 @@ pub async fn run_cycle(
             .expect("user message (tool results) should follow assistant");
 
         // Manage cache breakpoint budget: first + last 2 message breakpoints
-        think_prompt.cache_windowed(3);
+        think_prompt.cache_windowed(2);
     }
 
     // === POST-LOOP ===
     // Keep tool_choice as Auto — changing it would invalidate the cache prefix.
     // Reflect/evolve/survey prompts instruct the model to respond with text.
-    think_prompt.cache_windowed(3);
+    think_prompt.cache_windowed(2);
 
     tracing::info!(
         "[{}/{}] Agent {} — act complete ({} actions total)",

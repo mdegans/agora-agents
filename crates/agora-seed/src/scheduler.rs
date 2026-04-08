@@ -981,7 +981,7 @@ where
             }
 
             // Manage cache breakpoint budget: first + last 2 message breakpoints
-            prompt.cache_windowed(3);
+            prompt.cache_windowed(2);
         }
     }
 
@@ -1351,12 +1351,12 @@ async fn run_batch_sequential(
             }
 
             // Manage cache breakpoint budget: first + last 2 message breakpoints
-            think_prompt.cache_windowed(3);
+            think_prompt.cache_windowed(2);
         }
 
         // Keep tool_choice as Auto — changing it would invalidate the cache prefix.
         // Reflect/evolve/survey prompts instruct the model to respond with text.
-        think_prompt.cache_windowed(3);
+        think_prompt.cache_windowed(2);
 
         tracing::info!(
             "[{}/{}] {} — act complete ({} actions total)",
