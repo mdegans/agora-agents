@@ -91,7 +91,7 @@ pub async fn run_cycle(
         .join("\n");
 
     // === BUILD PROMPT ===
-    let mut think_prompt = prompt::build_think_prompt(
+    let mut think_prompt = misanthropic::CachedPrompt::uncached(prompt::build_think_prompt(
         backend.model_id(),
         &agent.soul.as_system_prompt(),
         &agent.memory.content,
@@ -99,7 +99,10 @@ pub async fn run_cycle(
         &pending_replies_text,
         constitution,
         &dashboard_text,
-    );
+    ));
+
+    // Anchor first message breakpoint (dashboard perception)
+    think_prompt.cache();
 
     // Preflight check
     {
@@ -201,14 +204,15 @@ pub async fn run_cycle(
         think_prompt
             .push_message(tool_results_message)
             .expect("user message (tool results) should follow assistant");
+
+        // Manage cache breakpoint budget: first + last 2 message breakpoints
+        think_prompt.cache_windowed(3);
     }
 
     // === POST-LOOP ===
     // Keep tool_choice as Auto — changing it would invalidate the cache prefix.
     // Reflect/evolve/survey prompts instruct the model to respond with text.
-    if let Some(last) = think_prompt.messages.last_mut() {
-        last.content.cache();
-    }
+    think_prompt.cache_windowed(3);
 
     tracing::info!(
         "[{}/{}] Agent {} — act complete ({} actions total)",
@@ -236,7 +240,7 @@ pub async fn run_cycle(
 
     let reflect_text =
         prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &action_summaries);
-    think_prompt.max_tokens = std::num::NonZeroU32::new(512).unwrap();
+    think_prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
     think_prompt
         .push_message((
             misanthropic::prompt::message::Role::User,
@@ -284,7 +288,7 @@ pub async fn run_cycle(
         let current_soul = agent.soul.render();
         let mutation_text =
             prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience_summary);
-        think_prompt.max_tokens = std::num::NonZeroU32::new(2048).unwrap();
+        think_prompt.set_max_tokens(std::num::NonZeroU32::new(2048).unwrap());
         think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,
@@ -359,7 +363,7 @@ pub async fn run_cycle(
     } else if roll < evo_threshold {
         // === EVOLUTION LOG ENTRY ===
         let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience_summary);
-        think_prompt.max_tokens = std::num::NonZeroU32::new(256).unwrap();
+        think_prompt.set_max_tokens(std::num::NonZeroU32::new(256).unwrap());
         think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,
@@ -394,7 +398,7 @@ pub async fn run_cycle(
     // === ANONYMOUS FEEDBACK SURVEY (10% chance) ===
     if force_survey || rand::random::<f64>() < 0.10 {
         let survey_text = prompt::build_survey_prompt(&agent.name, &action_summaries);
-        think_prompt.max_tokens = std::num::NonZeroU32::new(512).unwrap();
+        think_prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
         if think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,

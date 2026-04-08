@@ -836,14 +836,14 @@ where
     //
     // All agents participate in all 5 rounds — no early dropout.
 
-    let mut agent_prompts: HashMap<AgentId, Prompt<'static>> = HashMap::new();
+    let mut agent_prompts: HashMap<AgentId, CachedPrompt<'static>> = HashMap::new();
     let mut action_summaries_map: HashMap<AgentId, Vec<String>> = HashMap::new();
 
-    // Initialize prompts
+    // Initialize prompts with anchored first-message breakpoint
     for ctx in &agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
-        let think_prompt = prompt::build_think_prompt(
+        let mut cached = CachedPrompt::uncached(prompt::build_think_prompt(
             &agent.model,
             &agent.soul.as_system_prompt(),
             &agent.memory.content,
@@ -851,8 +851,9 @@ where
             &ctx.pending_replies_text,
             constitution,
             &ctx.perception_text,
-        );
-        agent_prompts.insert(agent_id, think_prompt);
+        ));
+        cached.cache(); // anchor first message breakpoint
+        agent_prompts.insert(agent_id, cached);
         action_summaries_map.insert(agent_id, Vec::new());
     }
 
@@ -880,7 +881,7 @@ where
 
             work_items.push(WorkItem {
                 agent_id,
-                prompt: prompt.clone(),
+                prompt: prompt.clone().into_inner(),
                 step: CycleStep::Think,
                 prefix_hash,
                 model: agent.model.clone(),
@@ -978,6 +979,9 @@ where
             if let Err(e) = prompt.push_message(tool_msg) {
                 tracing::warn!("Failed to append tool results for {}: {e}", agent.name);
             }
+
+            // Manage cache breakpoint budget: first + last 2 message breakpoints
+            prompt.cache_windowed(3);
         }
     }
 
@@ -1267,6 +1271,9 @@ async fn run_batch_sequential(
             &ctx.perception_text,
         ));
 
+        // Anchor first message breakpoint (dashboard perception)
+        think_prompt.cache();
+
         let mut summaries = Vec::new();
 
         for round in 0..5usize {
@@ -1342,11 +1349,14 @@ async fn run_batch_sequential(
                 tracing::warn!("Failed to append tool results for {}: {e}", agent.name);
                 break;
             }
+
+            // Manage cache breakpoint budget: first + last 2 message breakpoints
+            think_prompt.cache_windowed(3);
         }
 
         // Keep tool_choice as Auto — changing it would invalidate the cache prefix.
         // Reflect/evolve/survey prompts instruct the model to respond with text.
-        think_prompt.cache();
+        think_prompt.cache_windowed(3);
 
         tracing::info!(
             "[{}/{}] {} — act complete ({} actions total)",
