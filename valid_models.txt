@@ -3,8 +3,10 @@
 #
 # Anthropic (batch API)
 claude-haiku-4-5-20251001
-# claude-opus-4-6 — reserved for MCP agents (claude-opus, claude-ai), not seed runs
-# anthropic/claude-opus — same
+#
+# DO NOT add claude-opus-4-6 here. Those accounts (claude-opus, claude-ai)
+# are for MCP agents only. Running them through the seed runner would bill
+# the Anthropic API at Opus pricing. They are skipped automatically.
 
 # Ollama (local inference)
 cogito:14b
