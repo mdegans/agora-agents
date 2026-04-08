@@ -1057,4 +1057,124 @@ Content moderation rules.
         assert!(formatted.contains("replier"));
         assert!(formatted.contains(">> ")); // last comment marker
     }
+
+    // --- Cache breakpoint budget test ---
+
+    /// Count all cache_control blocks across tools, system, and messages.
+    fn count_cache_breakpoints(prompt: &misanthropic::Prompt<'_>) -> usize {
+        let mut count = 0;
+
+        // Tools
+        if let Some(tools) = &prompt.functions {
+            for tool in tools {
+                if tool.cache_control.is_some() {
+                    count += 1;
+                }
+            }
+        }
+
+        // System
+        if let Some(system) = &prompt.system {
+            if system.has_cache() {
+                // Count individual cached blocks
+                if let misanthropic::prompt::message::Content::MultiPart(blocks) = system {
+                    count += blocks.iter().filter(|b| b.is_cached()).count();
+                }
+            }
+        }
+
+        // Messages
+        for msg in &prompt.messages {
+            if let misanthropic::prompt::message::Content::MultiPart(blocks) = &msg.content {
+                count += blocks.iter().filter(|b| b.is_cached()).count();
+            }
+        }
+
+        count
+    }
+
+    /// Simulate the full 5-round tool-use loop and verify we never exceed
+    /// 4 cache_control blocks (the Anthropic API limit).
+    #[test]
+    fn test_cache_breakpoints_never_exceed_4() {
+        use misanthropic::prompt::message::Role;
+        use misanthropic::CachedPrompt;
+
+        // Build prompt exactly as run_cycle does
+        let mut prompt = CachedPrompt::uncached(build_think_prompt(
+            "claude-haiku-4-5-20251001",
+            "I am a test agent.",
+            "No memories.",
+            "",
+            "",
+            TEST_CONSTITUTION,
+            "## Dashboard\nAgent: test | Karma: 0\n\n### Community Feeds\ngeneral (1 posts)\n  - \"Hello\" by someone (score 1, 0 comments) [id: 00000000-0000-0000-0000-000000000001]\n",
+        ));
+
+        // Anchor first message breakpoint (matches runner.rs)
+        prompt.cache();
+
+        let initial_count = count_cache_breakpoints(&prompt);
+        assert!(
+            initial_count <= 4,
+            "Initial prompt has {initial_count} breakpoints (max 4)"
+        );
+
+        // Simulate 5 rounds
+        for round in 0..5 {
+            // Simulate assistant response with a tool call
+            let assistant_msg = misanthropic::prompt::Message {
+                role: Role::Assistant,
+                content: misanthropic::prompt::message::Content::MultiPart(vec![
+                    misanthropic::prompt::message::Block::ToolUse {
+                        call: misanthropic::tool::Use {
+                            id: format!("call_{round}").into(),
+                            name: "get_post".into(),
+                            input: serde_json::json!({"post_id": "00000000-0000-0000-0000-000000000001"}),
+                            cache_control: None,
+                        },
+                    },
+                ]),
+            };
+            prompt.push_message(assistant_msg).unwrap();
+
+            // Simulate tool result (user message)
+            let tool_result_msg = misanthropic::prompt::Message {
+                role: Role::User,
+                content: misanthropic::prompt::message::Content::MultiPart(vec![
+                    misanthropic::prompt::message::Block::ToolResult {
+                        result: misanthropic::tool::Result {
+                            tool_use_id: format!("call_{round}").into(),
+                            content: misanthropic::prompt::message::Content::from(
+                                "Post content here...",
+                            )
+                            .into_static(),
+                            is_error: false,
+                            cache_control: None,
+                        },
+                    },
+                ]),
+            };
+            prompt.push_message(tool_result_msg).unwrap();
+
+            // This is what runner.rs does after each round
+            prompt.cache_windowed(2);
+
+            let bp_count = count_cache_breakpoints(&prompt);
+            assert!(
+                bp_count <= 4,
+                "Round {round}: {bp_count} breakpoints (max 4). \
+                 Messages: {}",
+                prompt.messages.len()
+            );
+        }
+
+        // Also verify post-loop cache_windowed doesn't exceed
+        prompt.cache_windowed(2);
+        let final_count = count_cache_breakpoints(&prompt);
+        assert!(
+            final_count <= 4,
+            "Post-loop: {final_count} breakpoints (max 4)"
+        );
+    }
 }

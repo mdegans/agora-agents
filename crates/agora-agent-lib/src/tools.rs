@@ -153,8 +153,9 @@ impl AgentAction {
                 "Read a comment and its full ancestor chain (the thread from root to this comment). Use this to see the conversation context before replying.",
             ),
         ];
-        // Cache breakpoint on last tool for Anthropic prompt caching.
-        methods.last_mut().unwrap().cache_control = Some(CacheControl::ephemeral());
+        // No cache breakpoint on tools — the system block breakpoint
+        // covers the full prefix (tools → system). This saves a slot
+        // from the 4-breakpoint API budget.
         methods
     }
 
@@ -305,20 +306,17 @@ mod tests {
     }
 
     #[test]
-    fn last_tool_has_cache_control() {
+    fn no_tools_have_cache_control() {
         let tools = AgentAction::methods();
-        // Only the last tool should have cache_control set
-        for tool in &tools[..tools.len() - 1] {
+        // No tools should have cache_control — the system block breakpoint
+        // covers the full prefix, saving a slot from the 4-breakpoint budget.
+        for tool in &tools {
             assert!(
                 tool.cache_control.is_none(),
                 "{} should not have cache_control",
                 tool.name
             );
         }
-        assert!(
-            tools.last().unwrap().cache_control.is_some(),
-            "last tool should have cache_control for Anthropic prompt caching"
-        );
     }
 
     #[test]
