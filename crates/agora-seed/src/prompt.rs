@@ -3,14 +3,13 @@ use std::num::NonZeroU32;
 
 use agora_agent_lib::agora_agentkit::ids::{AgentId, CommentId, PostId};
 pub use agora_agent_lib::tools::AgentAction;
-use misanthropic::prompt::message::{Block, CacheControl, Content};
 use misanthropic::Prompt;
+use misanthropic::prompt::message::{Block, CacheControl, Content};
 
 use crate::client::{Comment, FeedPost};
 
 /// Maximum number of comments in an ancestry chain (root to reply).
 const MAX_CHAIN_DEPTH: usize = 10;
-
 
 /// Build a full [`Prompt`] for the think/act phase with native tool use.
 ///
@@ -33,8 +32,12 @@ pub fn build_think_prompt(
     perceptions: &str,
 ) -> Prompt<'static> {
     let cached_system = build_cached_system_prefix(constitution);
-    let dynamic_system =
-        build_dynamic_system_suffix(soul_prompt, memory_content, recent_activity, pending_replies);
+    let dynamic_system = build_dynamic_system_suffix(
+        soul_prompt,
+        memory_content,
+        recent_activity,
+        pending_replies,
+    );
 
     let mut prompt = Prompt {
         model: model_id.to_string().into(),
@@ -58,10 +61,7 @@ pub fn build_think_prompt(
 
     // User message: perceptions
     prompt
-        .push_message((
-            misanthropic::prompt::message::Role::User,
-            perceptions,
-        ))
+        .push_message((misanthropic::prompt::message::Role::User, perceptions))
         .expect("first message should always succeed");
 
     prompt.into_static()
@@ -186,10 +186,7 @@ pub fn format_recent_activity(posts: &[FeedPost], limit: usize) -> String {
 /// Walks up the `parent_comment_id` chain from the target, then reverses
 /// to produce root-first order. Capped at [`MAX_CHAIN_DEPTH`] entries.
 /// Returns an empty vec if the target is not found.
-fn extract_comment_chain<'a>(
-    target_id: CommentId,
-    comments: &'a [Comment],
-) -> Vec<&'a Comment> {
+fn extract_comment_chain<'a>(target_id: CommentId, comments: &'a [Comment]) -> Vec<&'a Comment> {
     let by_id: HashMap<CommentId, &Comment> = comments.iter().map(|c| (c.id, c)).collect();
     let mut chain = Vec::new();
     let mut current = by_id.get(&target_id).copied();
@@ -299,7 +296,8 @@ pub fn format_dashboard(
             for reply in &post_group.replies {
                 out.push_str(&format!(
                     "  - {} (score {}): \"{}\" [comment_id: {}]\n",
-                    reply.author, reply.score,
+                    reply.author,
+                    reply.score,
                     truncate(&reply.preview, 100),
                     reply.comment_id
                 ));
@@ -342,7 +340,9 @@ pub fn format_dashboard(
             out.push('\n');
         }
     } else {
-        out.push_str("The network is quiet right now. Consider being the first to post something!\n");
+        out.push_str(
+            "The network is quiet right now. Consider being the first to post something!\n",
+        );
     }
 
     // Hint about using tools to read in depth
@@ -490,7 +490,9 @@ pub fn build_soul_mutation_prompt(
     let has_boundaries = current_soul.contains("## Boundaries");
 
     let mut parts = vec![
-        format!("You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are."),
+        format!(
+            "You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are."
+        ),
         String::new(),
         format!("Today's date is {today}."),
         String::new(),
@@ -521,7 +523,10 @@ pub fn build_soul_mutation_prompt(
     if has_boundaries {
         parts.push("- Keep the same section structure (Identity, Values, Interests, Voice, Boundaries, Evolution Log)".to_string());
     } else {
-        parts.push("- Keep the same section structure (Identity, Values, Interests, Voice, Evolution Log)".to_string());
+        parts.push(
+            "- Keep the same section structure (Identity, Values, Interests, Voice, Evolution Log)"
+                .to_string(),
+        );
         parts.push("- Do NOT add a Boundaries section if you don't already have one".to_string());
     }
 
@@ -530,7 +535,8 @@ pub fn build_soul_mutation_prompt(
         format!("- Add an Evolution Log entry dated {today} explaining what changed and why"),
         "- Be honest about how you've changed — don't just rephrase the same ideas".to_string(),
         String::new(),
-        "Output ONLY the complete revised SOUL.md content between <soul> and </soul> tags.".to_string(),
+        "Output ONLY the complete revised SOUL.md content between <soul> and </soul> tags."
+            .to_string(),
         "If nothing has meaningfully changed, output <soul>unchanged</soul>.".to_string(),
     ]);
 
@@ -560,7 +566,6 @@ pub fn parse_soul_mutation(response: &str) -> Option<String> {
         }
     }
 }
-
 
 /// Parse evolution entry from LLM response.
 pub fn parse_evolution(response: &str) -> Option<String> {

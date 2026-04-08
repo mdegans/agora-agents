@@ -19,11 +19,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use agora_agentkit::scheduler::{
-    BatchBackend, BatchError, BatchState, WorkItem, WorkResult,
-};
-use misanthropic::prompt::Message as MMessage;
+use agora_agentkit::scheduler::{BatchBackend, BatchError, BatchState, WorkItem, WorkResult};
 use misanthropic::Prompt;
+use misanthropic::prompt::Message as MMessage;
 
 use crate::llm::ollama::{create_ollama_client, send_with_nudge};
 
@@ -90,10 +88,7 @@ impl OllamaEndpoint {
     }
 
     /// Discover available models by querying `GET /api/tags`.
-    pub async fn discover(
-        http: &reqwest::Client,
-        url: &str,
-    ) -> anyhow::Result<Self> {
+    pub async fn discover(http: &reqwest::Client, url: &str) -> anyhow::Result<Self> {
         let url = url.trim_end_matches('/').to_string();
         let tags_url = format!("{url}/api/tags");
         let resp: OllamaTagsResponse = http
@@ -105,22 +100,21 @@ impl OllamaEndpoint {
             .await
             .map_err(|e| anyhow::anyhow!("parsing /api/tags from {url}: {e}"))?;
 
-        let models: HashSet<String> =
-            resp.models.into_iter().map(|m| m.name).collect();
+        let models: HashSet<String> = resp.models.into_iter().map(|m| m.name).collect();
 
-        tracing::info!(
-            "Endpoint {url}: {} model(s) [{}]",
-            models.len(),
-            {
-                let mut sorted: Vec<_> = models.iter().cloned().collect();
-                sorted.sort();
-                sorted.join(", ")
-            },
-        );
+        tracing::info!("Endpoint {url}: {} model(s) [{}]", models.len(), {
+            let mut sorted: Vec<_> = models.iter().cloned().collect();
+            sorted.sort();
+            sorted.join(", ")
+        },);
 
         let client = create_ollama_client(&url)?;
 
-        Ok(Self { url, models, client })
+        Ok(Self {
+            url,
+            models,
+            client,
+        })
     }
 }
 
@@ -140,8 +134,7 @@ impl OllamaEndpoint {
 
 impl Default for OllamaEndpoint {
     fn default() -> Self {
-        Self::new("http://localhost:11434")
-            .expect("default Ollama URL should be valid")
+        Self::new("http://localhost:11434").expect("default Ollama URL should be valid")
     }
 }
 
@@ -157,10 +150,7 @@ async fn send_one(
     let msg = send_with_nudge(client, prompt).await?;
 
     let elapsed = start.elapsed();
-    tracing::debug!(
-        "  [{model}@{endpoint_url}] {:.1}s",
-        elapsed.as_secs_f64(),
-    );
+    tracing::debug!("  [{model}@{endpoint_url}] {:.1}s", elapsed.as_secs_f64(),);
 
     Ok(msg)
 }
@@ -178,14 +168,7 @@ async fn process_endpoint_items(
     let mut results = Vec::new();
 
     for item in &items {
-        let response = match send_one(
-            client,
-            endpoint_url,
-            &item.prompt,
-            &item.model,
-        )
-        .await
-        {
+        let response = match send_one(client, endpoint_url, &item.prompt, &item.model).await {
             Ok(msg) => Ok(msg),
             Err(e) => {
                 tracing::warn!(
@@ -224,22 +207,15 @@ impl OllamaBatch {
 impl BatchBackend<Prompt<'static>, MMessage<'static>> for OllamaBatch {
     type Handle = OllamaPendingHandle;
 
-    async fn submit(
-        &self,
-        items: Vec<WorkItem<Prompt<'static>>>,
-    ) -> anyhow::Result<Self::Handle> {
+    async fn submit(&self, items: Vec<WorkItem<Prompt<'static>>>) -> anyhow::Result<Self::Handle> {
         tracing::info!(
             "Ollama batch: {} items to {}",
             items.len(),
             self.endpoint.url,
         );
 
-        let results = process_endpoint_items(
-            &self.endpoint.client,
-            &self.endpoint.url,
-            items,
-        )
-        .await;
+        let results =
+            process_endpoint_items(&self.endpoint.client, &self.endpoint.url, items).await;
 
         Ok(OllamaPendingHandle { results })
     }
@@ -251,10 +227,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for OllamaBatch {
         Ok(BatchState::Ready(handle.results))
     }
 
-    async fn count_tokens(
-        &self,
-        _prompt: &Prompt<'static>,
-    ) -> anyhow::Result<Option<u32>> {
+    async fn count_tokens(&self, _prompt: &Prompt<'static>) -> anyhow::Result<Option<u32>> {
         Ok(None)
     }
 
@@ -303,10 +276,7 @@ impl MultiOllamaBatch {
 impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
     type Handle = OllamaPendingHandle;
 
-    async fn submit(
-        &self,
-        items: Vec<WorkItem<Prompt<'static>>>,
-    ) -> anyhow::Result<Self::Handle> {
+    async fn submit(&self, items: Vec<WorkItem<Prompt<'static>>>) -> anyhow::Result<Self::Handle> {
         if self.endpoints.is_empty() {
             anyhow::bail!("No Ollama endpoints configured");
         }
@@ -318,18 +288,14 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
                 items.len(),
                 self.endpoints[0].url,
             );
-            let results = process_endpoint_items(
-                &self.endpoints[0].client,
-                &self.endpoints[0].url,
-                items,
-            )
-            .await;
+            let results =
+                process_endpoint_items(&self.endpoints[0].client, &self.endpoints[0].url, items)
+                    .await;
             return Ok(OllamaPendingHandle { results });
         }
 
         // Group items by model.
-        let mut by_model: HashMap<String, Vec<WorkItem<Prompt<'static>>>> =
-            HashMap::new();
+        let mut by_model: HashMap<String, Vec<WorkItem<Prompt<'static>>>> = HashMap::new();
         for item in items {
             by_model.entry(item.model.clone()).or_default().push(item);
         }
@@ -337,8 +303,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
         // Route each model group to an endpoint.
         // Track how many items each endpoint has been assigned for load balancing.
         let mut endpoint_load: Vec<usize> = vec![0; self.endpoints.len()];
-        let mut items_by_endpoint: HashMap<usize, Vec<WorkItem<Prompt<'static>>>> =
-            HashMap::new();
+        let mut items_by_endpoint: HashMap<usize, Vec<WorkItem<Prompt<'static>>>> = HashMap::new();
         let mut not_found_results: Vec<WorkResult<MMessage<'static>>> = Vec::new();
 
         for (model, model_items) in by_model {
@@ -362,9 +327,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
                         agent_id: item.agent_id,
                         step: item.step,
                         response: Err(BatchError::Api {
-                            message: format!(
-                                "model '{model}' not found on any endpoint"
-                            ),
+                            message: format!("model '{model}' not found on any endpoint"),
                         }),
                     });
                 }
@@ -397,11 +360,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
         // Log routing summary.
         for (idx, count) in endpoint_load.iter().enumerate() {
             if *count > 0 {
-                tracing::info!(
-                    "  {} → {} items",
-                    self.endpoints[idx].url,
-                    count,
-                );
+                tracing::info!("  {} → {} items", self.endpoints[idx].url, count,);
             }
         }
 
@@ -411,9 +370,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
         for (idx, items) in items_by_endpoint {
             let client = self.endpoints[idx].client.clone();
             let url = self.endpoints[idx].url.clone();
-            join_set.spawn(async move {
-                process_endpoint_items(&client, &url, items).await
-            });
+            join_set.spawn(async move { process_endpoint_items(&client, &url, items).await });
         }
 
         let mut all_results = not_found_results;
@@ -439,10 +396,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for MultiOllamaBatch {
         Ok(BatchState::Ready(handle.results))
     }
 
-    async fn count_tokens(
-        &self,
-        _prompt: &Prompt<'static>,
-    ) -> anyhow::Result<Option<u32>> {
+    async fn count_tokens(&self, _prompt: &Prompt<'static>) -> anyhow::Result<Option<u32>> {
         Ok(None)
     }
 

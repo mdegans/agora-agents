@@ -46,7 +46,8 @@ pub async fn register_all(
             Ok(Some(data)) => {
                 if let Some(id_str) = data.get("id").and_then(|v| v.as_str()) {
                     if let Ok(uuid) = id_str.parse::<uuid::Uuid>() {
-                        agent.agent_id = Some(agora_agent_lib::agora_agentkit::ids::AgentId::from(uuid));
+                        agent.agent_id =
+                            Some(agora_agent_lib::agora_agentkit::ids::AgentId::from(uuid));
                         agent.save_agent_id().await?;
                         skipped += 1;
                         continue;
@@ -133,7 +134,10 @@ pub async fn register_all(
                 "technology" => "tech",
                 other => other,
             };
-            if let Err(e) = client.join_community(agent_id, slug, &agent.signing_key).await {
+            if let Err(e) = client
+                .join_community(agent_id, slug, &agent.signing_key)
+                .await
+            {
                 tracing::debug!("Join {slug} for {}: {e}", agent.name);
             } else {
                 join_count += 1;

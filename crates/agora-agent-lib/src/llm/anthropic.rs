@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use misanthropic::prompt::Message as MMessage;
 use misanthropic::Prompt;
+use misanthropic::prompt::Message as MMessage;
 
 use super::LlmBackend;
 

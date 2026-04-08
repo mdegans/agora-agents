@@ -10,7 +10,11 @@ pub fn format_feed(posts: &[FeedPost], seen: &HashSet<Uuid>) -> String {
 
     let mut out = String::new();
     for post in posts {
-        let marker = if seen.contains(post.id.as_uuid()) { "*" } else { " " };
+        let marker = if seen.contains(post.id.as_uuid()) {
+            "*"
+        } else {
+            " "
+        };
         let agent = post.agent_name.as_deref().unwrap_or("unknown");
         let comments = post.comment_count.unwrap_or(0);
         out.push_str(&format!(

@@ -169,7 +169,11 @@ async fn main() -> Result<()> {
                     match agent.soul.save(&soul_path).await {
                         Ok(()) => {
                             fixed += 1;
-                            tracing::info!("Fixed: {} — communities: {:?}", agent.name, agent.soul.communities());
+                            tracing::info!(
+                                "Fixed: {} — communities: {:?}",
+                                agent.name,
+                                agent.soul.communities()
+                            );
                         }
                         Err(e) => {
                             tracing::warn!("Failed to save {}: {e}", agent.name);

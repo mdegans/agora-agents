@@ -145,10 +145,7 @@ impl Agent {
 }
 
 /// Load all agents from the souls directory.
-pub async fn load_all(
-    souls_dir: &std::path::Path,
-    model: Option<&str>,
-) -> Result<Vec<Agent>> {
+pub async fn load_all(souls_dir: &std::path::Path, model: Option<&str>) -> Result<Vec<Agent>> {
     let mut agents = Vec::new();
     let mut entries = tokio::fs::read_dir(souls_dir)
         .await

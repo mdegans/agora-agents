@@ -22,8 +22,8 @@
 
 use agora_agentkit::enums::TargetType;
 use agora_agentkit::ids::{CommentId, PostId};
-use misanthropic::prompt::message::{Block, CacheControl, Content};
 use misanthropic::prompt::Message as MMessage;
+use misanthropic::prompt::message::{Block, CacheControl, Content};
 use misanthropic::tool::Method;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -120,10 +120,7 @@ pub enum AgentAction {
 impl AgentAction {
     /// Returns true if this is a read-only action (get_post, get_comment).
     pub fn is_read(&self) -> bool {
-        matches!(
-            self,
-            AgentAction::GetPost(_) | AgentAction::GetComment(_)
-        )
+        matches!(self, AgentAction::GetPost(_) | AgentAction::GetComment(_))
     }
 
     /// Tool definitions for LLM prompts, auto-generated from input struct schemas.

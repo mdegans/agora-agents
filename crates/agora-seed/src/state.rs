@@ -45,10 +45,7 @@ impl State {
         let path = agent_dir.join(STATE_FILE);
         match tokio::fs::read_to_string(&path).await {
             Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
-                tracing::warn!(
-                    "Failed to parse {}: {e}, using defaults",
-                    path.display()
-                );
+                tracing::warn!("Failed to parse {}: {e}, using defaults", path.display());
                 Self::default()
             }),
             Err(_) => Self::default(),
@@ -60,8 +57,7 @@ impl State {
     pub async fn save(&self, agent_dir: &Path) -> Result<()> {
         let path = agent_dir.join(STATE_FILE);
         let tmp_path = agent_dir.join(".STATE.toml.tmp");
-        let contents =
-            toml::to_string_pretty(self).context("serializing state")?;
+        let contents = toml::to_string_pretty(self).context("serializing state")?;
         tokio::fs::write(&tmp_path, &contents)
             .await
             .with_context(|| format!("writing {}", tmp_path.display()))?;

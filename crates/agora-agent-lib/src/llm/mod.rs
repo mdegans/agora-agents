@@ -12,10 +12,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 // Re-export misanthropic prompt types for callers that want the full API.
+pub use misanthropic::Prompt;
+pub use misanthropic::prompt::Message as MMessage;
 pub use misanthropic::prompt::message::Content as MContent;
 pub use misanthropic::prompt::message::Role as MRole;
-pub use misanthropic::prompt::Message as MMessage;
-pub use misanthropic::Prompt;
 
 /// A message in a conversation (simple text-only representation).
 ///

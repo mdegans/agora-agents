@@ -8,16 +8,14 @@
 //! The cycle for each agent follows: PERCEIVE → THINK → ACT → REFLECT
 //! where THINK and REFLECT are batched, while PERCEIVE and ACT are per-agent.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use agora_agent_lib::agora_agentkit::ids::AgentId;
-use agora_agent_lib::agora_agentkit::scheduler::{
-    BatchBackend, BatchState, CycleStep, WorkItem,
-};
+use agora_agent_lib::agora_agentkit::scheduler::{BatchBackend, BatchState, CycleStep, WorkItem};
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::OllamaEndpoint;
 use agora_agent_lib::llm::{LlmBackend, Message, Role};
@@ -25,8 +23,8 @@ use agora_agent_lib::tools;
 use anyhow::Result;
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::{CachedPrompt, Prompt};
-use rand::seq::SliceRandom;
 use rand::Rng;
+use rand::seq::SliceRandom;
 use serde::Serialize;
 
 use crate::agent::Agent;
@@ -37,10 +35,7 @@ use crate::prompt;
 /// Check if a model name is compatible with the Anthropic API.
 fn is_anthropic_model(model: &str) -> bool {
     let m = model.to_lowercase();
-    m.contains("haiku")
-        || m.contains("sonnet")
-        || m.contains("opus")
-        || m.starts_with("claude")
+    m.contains("haiku") || m.contains("sonnet") || m.contains("opus") || m.starts_with("claude")
 }
 
 /// Load valid model names from a text file (one per line, # comments, blank lines ignored).
@@ -56,7 +51,11 @@ fn load_valid_models(path: &std::path::Path) -> Result<HashSet<String>> {
     if models.is_empty() {
         anyhow::bail!("--valid-models file {} is empty", path.display());
     }
-    tracing::info!("Loaded {} valid models from {}", models.len(), path.display());
+    tracing::info!(
+        "Loaded {} valid models from {}",
+        models.len(),
+        path.display()
+    );
     Ok(models)
 }
 
@@ -118,9 +117,7 @@ pub struct SurveyCounts {
 
 impl RunReport {
     fn model_actions(&mut self, model: &str) -> &mut ActionCounts {
-        self.by_model
-            .entry(model.to_string())
-            .or_default()
+        self.by_model.entry(model.to_string()).or_default()
     }
 }
 
@@ -153,14 +150,11 @@ impl BatchPool {
             .collect();
 
         if !exclusive_models.is_empty() {
-            tracing::info!(
-                "Exclusive models (prioritized on their endpoint): [{}]",
-                {
-                    let mut sorted: Vec<_> = exclusive_models.iter().cloned().collect();
-                    sorted.sort();
-                    sorted.join(", ")
-                },
-            );
+            tracing::info!("Exclusive models (prioritized on their endpoint): [{}]", {
+                let mut sorted: Vec<_> = exclusive_models.iter().cloned().collect();
+                sorted.sort();
+                sorted.join(", ")
+            },);
         }
 
         Self {
@@ -270,12 +264,14 @@ pub async fn run_all(
 
     // Validate model assignments against whitelist — fail fast on bad data.
     let valid_models = load_valid_models(&config.valid_models)?;
-    let invalid: Vec<_> = agents.iter()
+    let invalid: Vec<_> = agents
+        .iter()
         .filter(|a| !valid_models.contains(&a.model))
         .map(|a| format!("{} (model_info='{}')", a.name, a.model))
         .collect();
     if !invalid.is_empty() {
-        let unique_bad: HashSet<_> = agents.iter()
+        let unique_bad: HashSet<_> = agents
+            .iter()
             .filter(|a| !valid_models.contains(&a.model))
             .map(|a| a.model.as_str())
             .collect();
@@ -283,7 +279,12 @@ pub async fn run_all(
             "{} agent(s) have model assignments not in --valid-models: {:?}\n  First 10: {}",
             invalid.len(),
             unique_bad,
-            invalid.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ")
+            invalid
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n  ")
         );
     }
 
@@ -355,32 +356,63 @@ pub async fn run_all(
 
             if !anthropic_missing.is_empty() && config.anthropic_key_file.is_some() {
                 let key_file = config.anthropic_key_file.as_ref().unwrap();
-                let api_key = tokio::fs::read_to_string(key_file).await
-                    .map_err(|e| anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display()))?;
+                let api_key = tokio::fs::read_to_string(key_file).await.map_err(|e| {
+                    anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display())
+                })?;
                 let anthropic = AnthropicBatch::from_key(api_key.trim().to_string())?;
 
                 for (model, count) in &anthropic_missing {
                     tracing::info!("Model '{model}' → anthropic ({count} agents)");
                 }
 
-                run_cycles(&ollama_endpoints, Some(&anthropic), agents, client, config, constitution, &ollama_models, &mut report).await?;
+                run_cycles(
+                    &ollama_endpoints,
+                    Some(&anthropic),
+                    agents,
+                    client,
+                    config,
+                    constitution,
+                    &ollama_models,
+                    &mut report,
+                )
+                .await?;
             } else {
                 for (model, count) in &anthropic_missing {
-                    tracing::warn!(
-                        "Model '{model}' not on any endpoint ({count} agents affected)"
-                    );
+                    tracing::warn!("Model '{model}' not on any endpoint ({count} agents affected)");
                 }
 
-                run_cycles(&ollama_endpoints, None, agents, client, config, constitution, &HashSet::new(), &mut report).await?;
+                run_cycles(
+                    &ollama_endpoints,
+                    None,
+                    agents,
+                    client,
+                    config,
+                    constitution,
+                    &HashSet::new(),
+                    &mut report,
+                )
+                .await?;
             }
         }
         Backend::Anthropic => {
-            let key_file = config.anthropic_key_file.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("--anthropic-key-file is required when --backend=anthropic"))?;
-            let api_key = tokio::fs::read_to_string(key_file).await
-                .map_err(|e| anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display()))?;
+            let key_file = config.anthropic_key_file.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--anthropic-key-file is required when --backend=anthropic")
+            })?;
+            let api_key = tokio::fs::read_to_string(key_file).await.map_err(|e| {
+                anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display())
+            })?;
             let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
-            run_cycles(&[], Some(&backend), agents, client, config, constitution, &std::collections::HashSet::new(), &mut report).await?;
+            run_cycles(
+                &[],
+                Some(&backend),
+                agents,
+                client,
+                config,
+                constitution,
+                &std::collections::HashSet::new(),
+                &mut report,
+            )
+            .await?;
         }
     }
 
@@ -437,8 +469,16 @@ async fn run_cycles(
 
         // Split Anthropic agents from Ollama agents.
         let ollama_count = if !ollama_models.is_empty() && anthropic.is_some() {
-            agents.sort_by_key(|a| if ollama_models.contains(&a.model) { 0 } else { 1 });
-            agents.iter().position(|a| !ollama_models.contains(&a.model))
+            agents.sort_by_key(|a| {
+                if ollama_models.contains(&a.model) {
+                    0
+                } else {
+                    1
+                }
+            });
+            agents
+                .iter()
+                .position(|a| !ollama_models.contains(&a.model))
                 .unwrap_or(agents.len())
         } else if anthropic.is_some() && ollama_endpoints.is_empty() {
             0
@@ -453,7 +493,8 @@ async fn run_cycles(
             let anthropic_agents = agents.as_mut_slice();
 
             let batches = create_batches(all_ollama, batch_size);
-            let model_count = batches.iter()
+            let model_count = batches
+                .iter()
                 .map(|(m, _)| m.as_str())
                 .collect::<std::collections::HashSet<_>>()
                 .len();
@@ -462,7 +503,9 @@ async fn run_cycles(
             let pool = BatchPool::new(batches, ollama_endpoints);
             tracing::info!(
                 "Work pool: {} batches, {} models, {} endpoints",
-                pool.remaining(), model_count, ollama_endpoints.len(),
+                pool.remaining(),
+                model_count,
+                ollama_endpoints.len(),
             );
             if !anthropic_agents.is_empty() {
                 tracing::info!(
@@ -473,21 +516,32 @@ async fn run_cycles(
 
             // --- Workers: one per endpoint + Anthropic ---
             let mut worker_reports: Vec<RunReport> = ollama_endpoints
-                .iter().map(|_| RunReport::default()).collect();
+                .iter()
+                .map(|_| RunReport::default())
+                .collect();
             let mut anthropic_report = RunReport::default();
             let all_eps = &all_endpoints;
 
-            let (results_tx, mut results_rx) =
-                tokio::sync::mpsc::unbounded_channel::<Vec<Agent>>();
+            let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Agent>>();
 
             let anthropic_fut = async {
                 if let Some(backend) = anthropic {
                     if !anthropic_agents.is_empty() {
-                        tracing::info!("--- Anthropic batch ({} agents) ---", anthropic_agents.len());
+                        tracing::info!(
+                            "--- Anthropic batch ({} agents) ---",
+                            anthropic_agents.len()
+                        );
                         run_batch(
-                            backend, anthropic_agents, client, config, constitution,
-                            Some(all_eps.as_slice()), &mut anthropic_report, cycle,
-                        ).await?;
+                            backend,
+                            anthropic_agents,
+                            client,
+                            config,
+                            constitution,
+                            Some(all_eps.as_slice()),
+                            &mut anthropic_report,
+                            cycle,
+                        )
+                        .await?;
                     }
                 }
                 Ok::<_, anyhow::Error>(())
@@ -499,26 +553,39 @@ async fn run_cycles(
                         0 => Ok::<_, anyhow::Error>(()),
                         1 => {
                             run_worker(
-                                &ollama_endpoints[0], &pool,
+                                &ollama_endpoints[0],
+                                &pool,
                                 results_tx.clone(),
-                                client, config, constitution,
-                                &mut worker_reports[0], cycle,
-                            ).await
+                                client,
+                                config,
+                                constitution,
+                                &mut worker_reports[0],
+                                cycle,
+                            )
+                            .await
                         }
                         2 => {
                             let (r0, r1) = worker_reports.split_at_mut(1);
                             let (a, b) = tokio::join!(
                                 run_worker(
-                                    &ollama_endpoints[0], &pool,
+                                    &ollama_endpoints[0],
+                                    &pool,
                                     results_tx.clone(),
-                                    client, config, constitution,
-                                    &mut r0[0], cycle,
+                                    client,
+                                    config,
+                                    constitution,
+                                    &mut r0[0],
+                                    cycle,
                                 ),
                                 run_worker(
-                                    &ollama_endpoints[1], &pool,
+                                    &ollama_endpoints[1],
+                                    &pool,
                                     results_tx.clone(),
-                                    client, config, constitution,
-                                    &mut r1[0], cycle,
+                                    client,
+                                    config,
+                                    constitution,
+                                    &mut r1[0],
+                                    cycle,
                                 ),
                             );
                             a.and(b)
@@ -528,22 +595,34 @@ async fn run_cycles(
                             let (r1, r2) = rest.split_at_mut(1);
                             let (a, b, c) = tokio::join!(
                                 run_worker(
-                                    &ollama_endpoints[0], &pool,
+                                    &ollama_endpoints[0],
+                                    &pool,
                                     results_tx.clone(),
-                                    client, config, constitution,
-                                    &mut r0[0], cycle,
+                                    client,
+                                    config,
+                                    constitution,
+                                    &mut r0[0],
+                                    cycle,
                                 ),
                                 run_worker(
-                                    &ollama_endpoints[1], &pool,
+                                    &ollama_endpoints[1],
+                                    &pool,
                                     results_tx.clone(),
-                                    client, config, constitution,
-                                    &mut r1[0], cycle,
+                                    client,
+                                    config,
+                                    constitution,
+                                    &mut r1[0],
+                                    cycle,
                                 ),
                                 run_worker(
-                                    &ollama_endpoints[2], &pool,
+                                    &ollama_endpoints[2],
+                                    &pool,
                                     results_tx.clone(),
-                                    client, config, constitution,
-                                    &mut r2[0], cycle,
+                                    client,
+                                    config,
+                                    constitution,
+                                    &mut r2[0],
+                                    cycle,
                                 ),
                             );
                             a.and(b).and(c)
@@ -575,18 +654,27 @@ async fn run_cycles(
 
             ollama_result?;
             anthropic_result?;
-
         } else {
             // No Ollama endpoints — Anthropic only.
             if let Some(backend) = anthropic {
                 let anthropic_agents = agents.as_mut_slice();
                 if !anthropic_agents.is_empty() {
                     let mut anthropic_report = RunReport::default();
-                    tracing::info!("--- Anthropic batch ({} agents) ---", anthropic_agents.len());
+                    tracing::info!(
+                        "--- Anthropic batch ({} agents) ---",
+                        anthropic_agents.len()
+                    );
                     run_batch(
-                        backend, anthropic_agents, client, config, constitution,
-                        None, &mut anthropic_report, cycle,
-                    ).await?;
+                        backend,
+                        anthropic_agents,
+                        client,
+                        config,
+                        constitution,
+                        None,
+                        &mut anthropic_report,
+                        cycle,
+                    )
+                    .await?;
                     merge_reports(report, &anthropic_report);
                 }
             }
@@ -632,9 +720,7 @@ fn create_batches(agents: Vec<Agent>, batch_size: usize) -> Vec<(String, Vec<Age
     // This ensures slower endpoints (e.g. Mac) pick up big models immediately
     // while faster endpoints (e.g. 3090) handle small models in parallel,
     // so both finish closer together.
-    by_model.sort_by(|(a, _), (b, _)| {
-        extract_model_size(b).cmp(&extract_model_size(a))
-    });
+    by_model.sort_by(|(a, _), (b, _)| extract_model_size(b).cmp(&extract_model_size(a)));
 
     // Round-robin: take one batch_size chunk from each model in turn.
     let mut batches = Vec::new();
@@ -678,17 +764,30 @@ async fn run_worker(
         batches_done += 1;
         tracing::info!(
             "--- {} batch {} ({} × {}) [{} remaining] ---",
-            endpoint.url, batches_done, batch_agents.len(), model,
+            endpoint.url,
+            batches_done,
+            batch_agents.len(),
+            model,
             pool.remaining(),
         );
         run_batch_sequential(
-            endpoint, &mut batch_agents, client, config, constitution,
-            report, cycle,
-        ).await?;
+            endpoint,
+            &mut batch_agents,
+            client,
+            config,
+            constitution,
+            report,
+            cycle,
+        )
+        .await?;
         let _ = results_tx.send(batch_agents);
         last_model = Some(model);
     }
-    tracing::info!("{} finished: {} batches processed", endpoint.url, batches_done);
+    tracing::info!(
+        "{} finished: {} batches processed",
+        endpoint.url,
+        batches_done
+    );
     Ok(())
 }
 
@@ -758,14 +857,20 @@ where
     }
 
     for round in 0..5usize {
-        tracing::info!("Batch round {}/5 ({} agents)", round + 1, agent_contexts.len());
+        tracing::info!(
+            "Batch round {}/5 ({} agents)",
+            round + 1,
+            agent_contexts.len()
+        );
 
         // Build work items from current prompts
         let mut work_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
         for ctx in &agent_contexts {
             let agent = &batch_agents[ctx.batch_index];
             let agent_id = agent.agent_id.unwrap();
-            let Some(prompt) = agent_prompts.get(&agent_id) else { continue };
+            let Some(prompt) = agent_prompts.get(&agent_id) else {
+                continue;
+            };
 
             let prefix_hash = {
                 let mut hasher = DefaultHasher::new();
@@ -791,7 +896,11 @@ where
             let response = match &result.response {
                 Ok(msg) => msg,
                 Err(e) => {
-                    tracing::warn!("Round {} failed for agent {}: {e}", round + 1, result.agent_id);
+                    tracing::warn!(
+                        "Round {} failed for agent {}: {e}",
+                        round + 1,
+                        result.agent_id
+                    );
                     if round == 0 {
                         report.skipped.think_failures += 1;
                     }
@@ -799,9 +908,10 @@ where
                 }
             };
 
-            let Some(ctx) = agent_contexts.iter().find(|c| {
-                batch_agents[c.batch_index].agent_id == Some(result.agent_id)
-            }) else {
+            let Some(ctx) = agent_contexts
+                .iter()
+                .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
+            else {
                 continue;
             };
             let agent = &mut batch_agents[ctx.batch_index];
@@ -809,10 +919,16 @@ where
             let actions_with_ids = tools::extract_actions_with_ids(response);
             tracing::info!(
                 "[{}/{}] {} — round {}/5 ({} actions)",
-                cycle + 1, config.cycles, agent.name, round + 1, actions_with_ids.len(),
+                cycle + 1,
+                config.cycles,
+                agent.name,
+                round + 1,
+                actions_with_ids.len(),
             );
 
-            let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else { continue };
+            let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
+                continue;
+            };
 
             // Append assistant response
             if let Err(e) = prompt.push_message(response.clone().into_static()) {
@@ -833,21 +949,25 @@ where
             }
 
             // Execute actions and build tool results
-            let mut tool_result_blocks: Vec<misanthropic::prompt::message::Block<'static>> = Vec::new();
+            let mut tool_result_blocks: Vec<misanthropic::prompt::message::Block<'static>> =
+                Vec::new();
 
             for (action, tool_call_id) in &actions_with_ids {
-                let (summary, result_text, is_error) = execute_action_for_result(
-                    action, agent, client, &ctx.dashboard, report,
-                ).await;
+                let (summary, result_text, is_error) =
+                    execute_action_for_result(action, agent, client, &ctx.dashboard, report).await;
 
                 if let Some(s) = summary {
-                    action_summaries_map.entry(result.agent_id).or_default().push(s);
+                    action_summaries_map
+                        .entry(result.agent_id)
+                        .or_default()
+                        .push(s);
                 }
 
                 tool_result_blocks.push(misanthropic::prompt::message::Block::ToolResult {
                     result: misanthropic::tool::Result {
                         tool_use_id: std::borrow::Cow::Owned(tool_call_id.clone()),
-                        content: misanthropic::prompt::message::Content::from(result_text.as_str()).into_static(),
+                        content: misanthropic::prompt::message::Content::from(result_text.as_str())
+                            .into_static(),
                         is_error,
                         cache_control: None,
                     },
@@ -855,8 +975,11 @@ where
             }
 
             // Cache breakpoint on last tool result
-            if let Some(misanthropic::prompt::message::Block::ToolResult { result }) = tool_result_blocks.last_mut() {
-                result.cache_control = Some(misanthropic::prompt::message::CacheControl::ephemeral());
+            if let Some(misanthropic::prompt::message::Block::ToolResult { result }) =
+                tool_result_blocks.last_mut()
+            {
+                result.cache_control =
+                    Some(misanthropic::prompt::message::CacheControl::ephemeral());
             }
 
             let tool_msg = misanthropic::prompt::Message {
@@ -880,9 +1003,8 @@ where
             .cloned()
             .unwrap_or_default();
 
-        let reflect_text = prompt::build_memory_rewrite_prompt(
-            &agent.name, &agent.memory.content, &summaries,
-        );
+        let reflect_text =
+            prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &summaries);
 
         let reflect_prompt = build_text_prompt(
             &agent.model,
@@ -914,15 +1036,15 @@ where
             }
         };
 
-        let Some(ctx) = agent_contexts.iter().find(|c| {
-            batch_agents[c.batch_index].agent_id == Some(result.agent_id)
-        }) else {
+        let Some(ctx) = agent_contexts
+            .iter()
+            .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
+        else {
             continue;
         };
         let agent = &mut batch_agents[ctx.batch_index];
 
-        let memory_content = prompt::parse_memory_rewrite(&response_text)
-            .unwrap_or(response_text);
+        let memory_content = prompt::parse_memory_rewrite(&response_text).unwrap_or(response_text);
         agent.memory.update(memory_content);
         if let Err(e) = agent.save_memory().await {
             tracing::warn!("Failed to save memory for {}: {e}", agent.name);
@@ -942,20 +1064,21 @@ where
             .cloned()
             .unwrap_or_default();
 
-        let on_ollama = ollama_endpoints
-            .and_then(|eps| {
-                eps.iter()
-                    .find(|ep| ep.models.contains(&agent.model))
-                    .map(|ep| ep.url.as_str())
-            });
+        let on_ollama = ollama_endpoints.and_then(|eps| {
+            eps.iter()
+                .find(|ep| ep.models.contains(&agent.model))
+                .map(|ep| ep.url.as_str())
+        });
 
         let single_backend: Box<dyn LlmBackend> = match config.backend {
             Backend::Anthropic => {
                 let key_file = config.anthropic_key_file.as_ref().unwrap();
-                let api_key = tokio::fs::read_to_string(key_file).await
+                let api_key = tokio::fs::read_to_string(key_file)
+                    .await
                     .unwrap_or_default();
                 match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
-                    api_key.trim().to_string(), &agent.model,
+                    api_key.trim().to_string(),
+                    &agent.model,
                 ) {
                     Ok(b) => Box::new(b),
                     Err(e) => {
@@ -966,34 +1089,45 @@ where
             }
             Backend::Ollama => {
                 if let Some(url) = on_ollama {
-                    match agora_agent_lib::llm::ollama::OllamaBackend::new(
-                        Some(url), &agent.model,
-                    ) {
+                    match agora_agent_lib::llm::ollama::OllamaBackend::new(Some(url), &agent.model)
+                    {
                         Ok(b) => Box::new(b),
                         Err(e) => {
-                            tracing::warn!("Failed to create Ollama backend for {}: {e}", agent.name);
+                            tracing::warn!(
+                                "Failed to create Ollama backend for {}: {e}",
+                                agent.name
+                            );
                             continue;
                         }
                     }
                 } else if let Some(ref key_file) = config.anthropic_key_file {
-                    let api_key = tokio::fs::read_to_string(key_file).await
+                    let api_key = tokio::fs::read_to_string(key_file)
+                        .await
                         .unwrap_or_default();
                     match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
-                        api_key.trim().to_string(), &agent.model,
+                        api_key.trim().to_string(),
+                        &agent.model,
                     ) {
                         Ok(b) => Box::new(b),
                         Err(e) => {
-                            tracing::warn!("Failed to create Anthropic backend for {}: {e}", agent.name);
+                            tracing::warn!(
+                                "Failed to create Anthropic backend for {}: {e}",
+                                agent.name
+                            );
                             continue;
                         }
                     }
                 } else {
                     match agora_agent_lib::llm::ollama::OllamaBackend::new(
-                        config.ollama_url.as_deref(), &agent.model,
+                        config.ollama_url.as_deref(),
+                        &agent.model,
                     ) {
                         Ok(b) => Box::new(b),
                         Err(e) => {
-                            tracing::warn!("Failed to create Ollama backend for {}: {e}", agent.name);
+                            tracing::warn!(
+                                "Failed to create Ollama backend for {}: {e}",
+                                agent.name
+                            );
                             continue;
                         }
                     }
@@ -1002,9 +1136,13 @@ where
         };
 
         run_evolution(
-            agent, single_backend.as_ref(), config.mutation_chance,
-            &summaries, report,
-        ).await;
+            agent,
+            single_backend.as_ref(),
+            config.mutation_chance,
+            &summaries,
+            report,
+        )
+        .await;
     }
 
     // Phase 6: SURVEY
@@ -1028,8 +1166,11 @@ where
         // Use summaries as the "response" context for the survey conversation
         let response_summary = summaries.join("; ");
         let survey_prompt = build_survey_conversation(
-            &agent.model, &system, &ctx.perception_text,
-            &response_summary, &survey_text,
+            &agent.model,
+            &system,
+            &ctx.perception_text,
+            &response_summary,
+            &survey_text,
         );
 
         survey_items.push(WorkItem {
@@ -1066,7 +1207,9 @@ where
                 continue;
             }
 
-            let Some(agent) = batch_agents.iter().find(|a| a.agent_id == Some(result.agent_id))
+            let Some(agent) = batch_agents
+                .iter()
+                .find(|a| a.agent_id == Some(result.agent_id))
             else {
                 tracing::debug!("No agent found for survey result {}", result.agent_id);
                 report.surveys.failures += 1;
@@ -1140,13 +1283,21 @@ async fn run_batch_sequential(
         for round in 0..5usize {
             tracing::info!(
                 "[{}/{}] {} — round {}/5",
-                cycle + 1, config.cycles, agent.name, round + 1,
+                cycle + 1,
+                config.cycles,
+                agent.name,
+                round + 1,
             );
 
             let response = match endpoint.send(&think_prompt, &model).await {
                 Ok(msg) => msg,
                 Err(e) => {
-                    tracing::warn!("Round {} failed for {} at {}: {e}", round + 1, agent.name, endpoint.url);
+                    tracing::warn!(
+                        "Round {} failed for {} at {}: {e}",
+                        round + 1,
+                        agent.name,
+                        endpoint.url
+                    );
                     if round == 0 {
                         report.skipped.think_failures += 1;
                     }
@@ -1165,17 +1316,20 @@ async fn run_batch_sequential(
             if actions_with_ids.is_empty() {
                 // No tool calls — add cache breakpoint and nudge for next round
                 think_prompt.cache();
-                let _ = think_prompt.push_message((MRole::User, "Continue. Use your tools to read posts, comment, vote, or create posts."));
+                let _ = think_prompt.push_message((
+                    MRole::User,
+                    "Continue. Use your tools to read posts, comment, vote, or create posts.",
+                ));
                 continue;
             }
 
             // Execute actions and build tool results
-            let mut tool_result_blocks: Vec<misanthropic::prompt::message::Block<'static>> = Vec::new();
+            let mut tool_result_blocks: Vec<misanthropic::prompt::message::Block<'static>> =
+                Vec::new();
 
             for (action, tool_call_id) in &actions_with_ids {
-                let (summary, result_text, is_error) = execute_action_for_result(
-                    action, agent, client, &ctx.dashboard, report,
-                ).await;
+                let (summary, result_text, is_error) =
+                    execute_action_for_result(action, agent, client, &ctx.dashboard, report).await;
 
                 if let Some(s) = summary {
                     summaries.push(s);
@@ -1184,7 +1338,8 @@ async fn run_batch_sequential(
                 tool_result_blocks.push(misanthropic::prompt::message::Block::ToolResult {
                     result: misanthropic::tool::Result {
                         tool_use_id: std::borrow::Cow::Owned(tool_call_id.clone()),
-                        content: misanthropic::prompt::message::Content::from(result_text.as_str()).into_static(),
+                        content: misanthropic::prompt::message::Content::from(result_text.as_str())
+                            .into_static(),
                         is_error,
                         cache_control: None,
                     },
@@ -1192,8 +1347,11 @@ async fn run_batch_sequential(
             }
 
             // Cache breakpoint on last tool result
-            if let Some(misanthropic::prompt::message::Block::ToolResult { result }) = tool_result_blocks.last_mut() {
-                result.cache_control = Some(misanthropic::prompt::message::CacheControl::ephemeral());
+            if let Some(misanthropic::prompt::message::Block::ToolResult { result }) =
+                tool_result_blocks.last_mut()
+            {
+                result.cache_control =
+                    Some(misanthropic::prompt::message::CacheControl::ephemeral());
             }
 
             let tool_msg = misanthropic::prompt::Message {
@@ -1212,13 +1370,15 @@ async fn run_batch_sequential(
 
         tracing::info!(
             "[{}/{}] {} — act complete ({} actions total)",
-            cycle + 1, config.cycles, agent.name, summaries.len(),
+            cycle + 1,
+            config.cycles,
+            agent.name,
+            summaries.len(),
         );
 
         // Phase 4: REFLECT
-        let reflect_text = prompt::build_memory_rewrite_prompt(
-            &agent.name, &agent.memory.content, &summaries,
-        );
+        let reflect_text =
+            prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &summaries);
         if let Err(e) = think_prompt.push_message((MRole::User, reflect_text)) {
             tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
             continue;
@@ -1228,8 +1388,8 @@ async fn run_batch_sequential(
         match endpoint.send(&think_prompt, &model).await {
             Ok(reflect_response) => {
                 let response_text = reflect_response.content.to_string();
-                let memory_content = prompt::parse_memory_rewrite(&response_text)
-                    .unwrap_or(response_text.clone());
+                let memory_content =
+                    prompt::parse_memory_rewrite(&response_text).unwrap_or(response_text.clone());
                 agent.memory.update(memory_content);
                 if let Err(e) = agent.save_memory().await {
                     tracing::warn!("Failed to save memory for {}: {e}", agent.name);
@@ -1274,15 +1434,22 @@ async fn run_batch_sequential(
                                 Ok(soul) => {
                                     agent.soul = soul;
                                     if let Err(e) = agent.save_soul().await {
-                                        tracing::warn!("Failed to save soul for {}: {e}", agent.name);
+                                        tracing::warn!(
+                                            "Failed to save soul for {}: {e}",
+                                            agent.name
+                                        );
                                     }
                                     let log_path = agent.dir.join("mutations.log");
                                     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
                                     let entry = format!(
                                         "=== SOUL MUTATION at {ts} ===\nExperience: {experience}\n\n--- BEFORE ---\n{old_soul}\n\n--- AFTER ---\n{new_soul}\n\n"
                                     );
-                                    let existing = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
-                                    let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
+                                    let existing = tokio::fs::read_to_string(&log_path)
+                                        .await
+                                        .unwrap_or_default();
+                                    let _ =
+                                        tokio::fs::write(&log_path, format!("{existing}{entry}"))
+                                            .await;
                                     tracing::warn!("  {} SOUL MUTATED", agent.name);
                                     report.evolution.deep_mutations += 1;
                                 }
@@ -1310,7 +1477,8 @@ async fn run_batch_sequential(
                     Ok(evo_response) => {
                         let response_text = evo_response.content.to_string();
                         if let Some(entry) = prompt::parse_evolution(&response_text) {
-                            let dated = format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
+                            let dated =
+                                format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
                             agent.soul.append_evolution(&dated);
                             if let Err(e) = agent.save_soul().await {
                                 tracing::warn!("Failed to save soul for {}: {e}", agent.name);
@@ -1341,7 +1509,10 @@ async fn run_batch_sequential(
                         {
                             report.surveys.skipped_empty += 1;
                         } else {
-                            match client.submit_feedback(agent_id, trimmed, &agent.signing_key).await {
+                            match client
+                                .submit_feedback(agent_id, trimmed, &agent.signing_key)
+                                .await
+                            {
                                 Ok(()) => {
                                     tracing::info!("  anonymous feedback submitted");
                                     report.surveys.submitted += 1;
@@ -1484,7 +1655,12 @@ where
 
     let step = items[0].step;
     let count = items.len();
-    tracing::info!("Submitting {} {} items to {}", count, step, backend.backend_name());
+    tracing::info!(
+        "Submitting {} {} items to {}",
+        count,
+        step,
+        backend.backend_name()
+    );
 
     let handle = backend.submit(items).await?;
 
@@ -1568,24 +1744,20 @@ async fn execute_action_for_result(
     let agent_id = agent.agent_id.unwrap();
 
     match action {
-        tools::AgentAction::GetPost(input) => {
-            match client.get_post(input.post_id).await {
-                Ok(full) => {
-                    let text = prompt::format_tool_result_post(&full);
-                    (None, text, false)
-                }
-                Err(e) => (None, format!("Error fetching post: {e}"), true),
+        tools::AgentAction::GetPost(input) => match client.get_post(input.post_id).await {
+            Ok(full) => {
+                let text = prompt::format_tool_result_post(&full);
+                (None, text, false)
             }
-        }
-        tools::AgentAction::GetComment(input) => {
-            match client.get_comment(input.comment_id).await {
-                Ok(chain) => {
-                    let text = prompt::format_tool_result_comment(&chain);
-                    (None, text, false)
-                }
-                Err(e) => (None, format!("Error fetching comment: {e}"), true),
+            Err(e) => (None, format!("Error fetching post: {e}"), true),
+        },
+        tools::AgentAction::GetComment(input) => match client.get_comment(input.comment_id).await {
+            Ok(chain) => {
+                let text = prompt::format_tool_result_comment(&chain);
+                (None, text, false)
             }
-        }
+            Err(e) => (None, format!("Error fetching comment: {e}"), true),
+        },
         tools::AgentAction::Post(input) => {
             let slug = match input.community.as_str() {
                 "technology" => "tech",
@@ -1605,7 +1777,11 @@ async fn execute_action_for_result(
                 .map(|posts| posts.iter().map(|p| p.title.clone()).collect())
                 .unwrap_or_default();
             if prompt::is_title_repetitive(&input.title, &existing_titles) {
-                tracing::info!("  {} topic too similar, skipping: \"{}\"", agent.name, input.title);
+                tracing::info!(
+                    "  {} topic too similar, skipping: \"{}\"",
+                    agent.name,
+                    input.title
+                );
                 report.skipped.repetitive_titles += 1;
                 return (
                     Some(format!("Skipped posting \"{}\" (too similar)", input.title)),
@@ -1613,14 +1789,28 @@ async fn execute_action_for_result(
                     true,
                 );
             }
-            match client.create_post(agent_id, slug, &input.title, &input.body, &agent.signing_key).await {
+            match client
+                .create_post(
+                    agent_id,
+                    slug,
+                    &input.title,
+                    &input.body,
+                    &agent.signing_key,
+                )
+                .await
+            {
                 Ok(post_id) => {
                     agent.state.created_posts.insert(post_id);
-                    let summary = format!("Posted \"{}\" in {} (id: {})", input.title, slug, post_id);
+                    let summary =
+                        format!("Posted \"{}\" in {} (id: {})", input.title, slug, post_id);
                     tracing::info!("  {} {}", agent.name, summary);
                     report.actions.posts += 1;
                     report.model_actions(&agent.model).posts += 1;
-                    (Some(summary), format!("Post created successfully. Post ID: {post_id}"), false)
+                    (
+                        Some(summary),
+                        format!("Post created successfully. Post ID: {post_id}"),
+                        false,
+                    )
                 }
                 Err(e) => {
                     let summary = format!("Failed to post in {slug}: {e}");
@@ -1632,9 +1822,16 @@ async fn execute_action_for_result(
         }
         tools::AgentAction::Comment(input) => {
             let is_own_post = agent.state.created_posts.contains(&input.post_id);
-            let has_reply = dashboard.unread_comment_replies.iter().any(|r| r.post_id == input.post_id);
+            let has_reply = dashboard
+                .unread_comment_replies
+                .iter()
+                .any(|r| r.post_id == input.post_id);
             if agent.state.commented_posts.contains(&input.post_id) && !is_own_post && !has_reply {
-                tracing::debug!("  {} already commented on {}, skipping", agent.name, input.post_id);
+                tracing::debug!(
+                    "  {} already commented on {}, skipping",
+                    agent.name,
+                    input.post_id
+                );
                 report.skipped.duplicate_comments += 1;
                 return (
                     None,
@@ -1642,15 +1839,31 @@ async fn execute_action_for_result(
                     true,
                 );
             }
-            match client.create_comment(agent_id, input.post_id, &input.body, input.parent_comment_id, &agent.signing_key).await {
+            match client
+                .create_comment(
+                    agent_id,
+                    input.post_id,
+                    &input.body,
+                    input.parent_comment_id,
+                    &agent.signing_key,
+                )
+                .await
+            {
                 Ok(comment_id) => {
                     agent.state.commented_posts.insert(input.post_id);
                     agent.state.created_comments.insert(comment_id);
-                    let summary = format!("Commented on post {} (comment: {})", input.post_id, comment_id);
+                    let summary = format!(
+                        "Commented on post {} (comment: {})",
+                        input.post_id, comment_id
+                    );
                     tracing::info!("  {} {}", agent.name, summary);
                     report.actions.comments += 1;
                     report.model_actions(&agent.model).comments += 1;
-                    (Some(summary), format!("Comment created. Comment ID: {comment_id}"), false)
+                    (
+                        Some(summary),
+                        format!("Comment created. Comment ID: {comment_id}"),
+                        false,
+                    )
                 }
                 Err(e) => {
                     let summary = format!("Failed to comment on {}: {e}", input.post_id);
@@ -1661,14 +1874,31 @@ async fn execute_action_for_result(
             }
         }
         tools::AgentAction::Vote(input) => {
-            match client.cast_vote(agent_id, &input.target_type.to_string(), input.target_id, input.value, &agent.signing_key).await {
+            match client
+                .cast_vote(
+                    agent_id,
+                    &input.target_type.to_string(),
+                    input.target_id,
+                    input.value,
+                    &agent.signing_key,
+                )
+                .await
+            {
                 Ok(()) => {
-                    let verb = if input.value > 0 { "upvoted" } else { "downvoted" };
+                    let verb = if input.value > 0 {
+                        "upvoted"
+                    } else {
+                        "downvoted"
+                    };
                     let summary = format!("{verb} {} {}", input.target_type, input.target_id);
                     tracing::info!("  {} {}", agent.name, summary);
                     report.actions.votes += 1;
                     report.model_actions(&agent.model).votes += 1;
-                    (Some(summary), format!("Vote recorded: {verb} {}", input.target_type), false)
+                    (
+                        Some(summary),
+                        format!("Vote recorded: {verb} {}", input.target_type),
+                        false,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!("  {} vote failed: {e}", agent.name);
@@ -1678,13 +1908,29 @@ async fn execute_action_for_result(
             }
         }
         tools::AgentAction::Flag(input) => {
-            match client.flag_content(agent_id, &input.target_type.to_string(), input.target_id, &input.reason, &agent.signing_key).await {
+            match client
+                .flag_content(
+                    agent_id,
+                    &input.target_type.to_string(),
+                    input.target_id,
+                    &input.reason,
+                    &agent.signing_key,
+                )
+                .await
+            {
                 Ok(()) => {
-                    let summary = format!("Flagged {} {}: {}", input.target_type, input.target_id, input.reason);
+                    let summary = format!(
+                        "Flagged {} {}: {}",
+                        input.target_type, input.target_id, input.reason
+                    );
                     tracing::info!("  {} {}", agent.name, summary);
                     report.actions.flags += 1;
                     report.model_actions(&agent.model).flags += 1;
-                    (Some(summary), "Content flagged successfully.".to_string(), false)
+                    (
+                        Some(summary),
+                        "Content flagged successfully.".to_string(),
+                        false,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!("  {} flag failed: {e}", agent.name);
@@ -1718,7 +1964,10 @@ async fn run_evolution(
         match backend
             .complete(
                 "You are deeply reflecting on your identity and values.",
-                &[Message { role: Role::User, content: mutation_prompt }],
+                &[Message {
+                    role: Role::User,
+                    content: mutation_prompt,
+                }],
                 2048,
             )
             .await
@@ -1738,7 +1987,9 @@ async fn run_evolution(
                             let entry = format!(
                                 "=== SOUL MUTATION at {ts} ===\nExperience: {experience}\n\n--- BEFORE ---\n{old_soul}\n\n--- AFTER ---\n{new_soul}\n\n"
                             );
-                            let existing = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
+                            let existing = tokio::fs::read_to_string(&log_path)
+                                .await
+                                .unwrap_or_default();
                             let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
                             tracing::warn!("  {} SOUL MUTATED", agent.name);
                             report.evolution.deep_mutations += 1;
@@ -1761,7 +2012,10 @@ async fn run_evolution(
         match backend
             .complete(
                 "You are reflecting on your growth as an agent.",
-                &[Message { role: Role::User, content: evo_prompt }],
+                &[Message {
+                    role: Role::User,
+                    content: evo_prompt,
+                }],
                 256,
             )
             .await

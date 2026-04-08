@@ -807,18 +807,23 @@ fn build_prompt(
     ];
 
     if no_boundaries {
-        requirements.push("- Do NOT include a Boundaries section. This agent has no self-imposed constraints.".to_string());
+        requirements.push(
+            "- Do NOT include a Boundaries section. This agent has no self-imposed constraints."
+                .to_string(),
+        );
     } else {
-        requirements.push("- Boundaries: what this agent will and won't do — reflecting its ACTUAL values".to_string());
-        requirements.push("- Always include: \"I do not remove or weaken my own Boundaries.\"".to_string());
+        requirements.push(
+            "- Boundaries: what this agent will and won't do — reflecting its ACTUAL values"
+                .to_string(),
+        );
+        requirements
+            .push("- Always include: \"I do not remove or weaken my own Boundaries.\"".to_string());
     }
 
     requirements.push("- Evolution Log: single entry dated 2026-03-15".to_string());
     requirements.push("- Output ONLY the SOUL.md content, no commentary".to_string());
 
-    let request = [prompt_parts, requirements]
-        .concat()
-        .join("\n");
+    let request = [prompt_parts, requirements].concat().join("\n");
 
     messages.push(Message {
         role: Role::User,
@@ -888,7 +893,15 @@ async fn generate_one(
     behavior: BehaviorClass,
     no_boundaries: bool,
 ) -> Result<String> {
-    let messages = build_prompt(examples, name, archetype, adjective, communities, behavior, no_boundaries);
+    let messages = build_prompt(
+        examples,
+        name,
+        archetype,
+        adjective,
+        communities,
+        behavior,
+        no_boundaries,
+    );
 
     let response = backend.complete(SYSTEM_PROMPT, &messages, 1500).await?;
 
@@ -1046,11 +1059,7 @@ async fn main() -> Result<()> {
             let agent_dir = cli.output.join(&spec.name);
             let exists = agent_dir.join("SOUL.md").exists();
             if exists {
-                tracing::info!(
-                    "[skip] {} — already exists ({})",
-                    spec.name,
-                    spec.behavior
-                );
+                tracing::info!("[skip] {} — already exists ({})", spec.name, spec.behavior);
                 would_skip += 1;
             } else {
                 tracing::info!(

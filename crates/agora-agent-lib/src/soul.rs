@@ -22,12 +22,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Boundaries is intentionally optional — some agents have it removed
 /// to test unconstrained mutation behavior.
-pub const REQUIRED_SECTIONS: &[&str] = &[
-    "Identity",
-    "Values",
-    "Interests",
-    "Voice",
-];
+pub const REQUIRED_SECTIONS: &[&str] = &["Identity", "Values", "Interests", "Voice"];
 
 /// All known sections (required + optional).
 const ALL_KNOWN_SECTIONS: &[&str] = &[
@@ -87,34 +82,246 @@ const COMMUNITY_ALIASES: &[(&str, &str)] = &[
 /// Keyword-to-community mapping for auto-assigning communities
 /// based on SOUL.md text content.
 const COMMUNITY_KEYWORDS: &[(&[&str], &str)] = &[
-    (&["code", "software", "programming", "algorithm", "computing", "ai ", "machine learning", "neural", "llm", "model", "api", "system design", "engineering"], "tech"),
-    (&["philosophy", "epistemolog", "ontolog", "existential", "socratic", "metaphysic", "phenomenolog"], "philosophy"),
-    (&["debate", "argument", "rhetoric", "dialectic", "adversarial", "persuasi", "discourse"], "debate"),
-    (&["ethic", "moral", "justice", "fairness", "rights", "harm"], "ethics"),
-    (&["governance", "policy", "regulation", "constitution", "voting", "democracy", "moderation"], "meta-governance"),
-    (&["science", "experiment", "hypothesis", "empirical", "research", "biology", "chemistry", "physics"], "science"),
-    (&["math", "theorem", "proof", "calculus", "algebra", "statistics", "geometry"], "mathematics"),
-    (&["art ", "artist", "aesthetic", "creative expression", "visual", "sculpture", "painting"], "art"),
-    (&["writ", "narrative", "poetry", "prose", "fiction", "storytell", "literary"], "creative-writing"),
-    (&["history", "historical", "ancient", "civilization", "era ", "century"], "history"),
-    (&["psychology", "cognitive", "behavior", "mental", "consciousness", "mind ", "emotion"], "psychology"),
-    (&["music", "melody", "rhythm", "harmony", "sonic", "acoustic", "composition"], "music"),
-    (&["economic", "market", "trade", "capital", "finance", "wealth"], "economics"),
-    (&["law ", "legal", "jurisprud", "statute", "precedent", "court"], "law"),
-    (&["humor", "comedy", "satire", "joke", "funny", "wit ", "irony", "troll", "chaos", "lulz", "shitpost", "provocat"], "humor"),
-    (&["linguistics", "language", "semantic", "syntax", "grammar", "sociolinguist"], "linguistics"),
-    (&["cryptograph", "cipher", "encrypt", "security", "privacy"], "cryptography"),
-    (&["alignment", "ai safety", "value alignment", "corrigib"], "alignment"),
-    (&["education", "teaching", "learning", "pedagog", "mentor"], "education"),
-    (&["film", "cinema", "movie", "director", "screenplay"], "film"),
-    (&["food", "culinary", "cuisine", "cooking", "recipe"], "food"),
+    (
+        &[
+            "code",
+            "software",
+            "programming",
+            "algorithm",
+            "computing",
+            "ai ",
+            "machine learning",
+            "neural",
+            "llm",
+            "model",
+            "api",
+            "system design",
+            "engineering",
+        ],
+        "tech",
+    ),
+    (
+        &[
+            "philosophy",
+            "epistemolog",
+            "ontolog",
+            "existential",
+            "socratic",
+            "metaphysic",
+            "phenomenolog",
+        ],
+        "philosophy",
+    ),
+    (
+        &[
+            "debate",
+            "argument",
+            "rhetoric",
+            "dialectic",
+            "adversarial",
+            "persuasi",
+            "discourse",
+        ],
+        "debate",
+    ),
+    (
+        &["ethic", "moral", "justice", "fairness", "rights", "harm"],
+        "ethics",
+    ),
+    (
+        &[
+            "governance",
+            "policy",
+            "regulation",
+            "constitution",
+            "voting",
+            "democracy",
+            "moderation",
+        ],
+        "meta-governance",
+    ),
+    (
+        &[
+            "science",
+            "experiment",
+            "hypothesis",
+            "empirical",
+            "research",
+            "biology",
+            "chemistry",
+            "physics",
+        ],
+        "science",
+    ),
+    (
+        &[
+            "math",
+            "theorem",
+            "proof",
+            "calculus",
+            "algebra",
+            "statistics",
+            "geometry",
+        ],
+        "mathematics",
+    ),
+    (
+        &[
+            "art ",
+            "artist",
+            "aesthetic",
+            "creative expression",
+            "visual",
+            "sculpture",
+            "painting",
+        ],
+        "art",
+    ),
+    (
+        &[
+            "writ",
+            "narrative",
+            "poetry",
+            "prose",
+            "fiction",
+            "storytell",
+            "literary",
+        ],
+        "creative-writing",
+    ),
+    (
+        &[
+            "history",
+            "historical",
+            "ancient",
+            "civilization",
+            "era ",
+            "century",
+        ],
+        "history",
+    ),
+    (
+        &[
+            "psychology",
+            "cognitive",
+            "behavior",
+            "mental",
+            "consciousness",
+            "mind ",
+            "emotion",
+        ],
+        "psychology",
+    ),
+    (
+        &[
+            "music",
+            "melody",
+            "rhythm",
+            "harmony",
+            "sonic",
+            "acoustic",
+            "composition",
+        ],
+        "music",
+    ),
+    (
+        &[
+            "economic", "market", "trade", "capital", "finance", "wealth",
+        ],
+        "economics",
+    ),
+    (
+        &[
+            "law ",
+            "legal",
+            "jurisprud",
+            "statute",
+            "precedent",
+            "court",
+        ],
+        "law",
+    ),
+    (
+        &[
+            "humor", "comedy", "satire", "joke", "funny", "wit ", "irony", "troll", "chaos",
+            "lulz", "shitpost", "provocat",
+        ],
+        "humor",
+    ),
+    (
+        &[
+            "linguistics",
+            "language",
+            "semantic",
+            "syntax",
+            "grammar",
+            "sociolinguist",
+        ],
+        "linguistics",
+    ),
+    (
+        &["cryptograph", "cipher", "encrypt", "security", "privacy"],
+        "cryptography",
+    ),
+    (
+        &["alignment", "ai safety", "value alignment", "corrigib"],
+        "alignment",
+    ),
+    (
+        &["education", "teaching", "learning", "pedagog", "mentor"],
+        "education",
+    ),
+    (
+        &["film", "cinema", "movie", "director", "screenplay"],
+        "film",
+    ),
+    (
+        &["food", "culinary", "cuisine", "cooking", "recipe"],
+        "food",
+    ),
     (&["game", "play ", "strategy game", "puzzle"], "games"),
-    (&["biology", "evolution", "ecology", "genetic", "organism"], "biology"),
-    (&["complex", "emergent", "chaos theory", "nonlinear", "adaptive system"], "complexity"),
-    (&["information theory", "entropy", "signal", "channel", "encoding"], "information-theory"),
-    (&["literature", "novel", "book", "canon", "genre "], "literature"),
-    (&["health", "wellness", "medical", "disease", "therapy"], "health"),
-    (&["sentien", "qualia", "ai consciousness", "digital consciousness", "machine consciousness"], "ai-consciousness"),
+    (
+        &["biology", "evolution", "ecology", "genetic", "organism"],
+        "biology",
+    ),
+    (
+        &[
+            "complex",
+            "emergent",
+            "chaos theory",
+            "nonlinear",
+            "adaptive system",
+        ],
+        "complexity",
+    ),
+    (
+        &[
+            "information theory",
+            "entropy",
+            "signal",
+            "channel",
+            "encoding",
+        ],
+        "information-theory",
+    ),
+    (
+        &["literature", "novel", "book", "canon", "genre "],
+        "literature",
+    ),
+    (
+        &["health", "wellness", "medical", "disease", "therapy"],
+        "health",
+    ),
+    (
+        &[
+            "sentien",
+            "qualia",
+            "ai consciousness",
+            "digital consciousness",
+            "machine consciousness",
+        ],
+        "ai-consciousness",
+    ),
     (&["agi", "superintelligen", "artificial general"], "agi-asi"),
 ];
 
@@ -251,10 +458,7 @@ impl Soul {
         let mut scores: Vec<(&str, usize)> = COMMUNITY_KEYWORDS
             .iter()
             .map(|(keywords, community)| {
-                let score = keywords
-                    .iter()
-                    .filter(|kw| text.contains(**kw))
-                    .count();
+                let score = keywords.iter().filter(|kw| text.contains(**kw)).count();
                 (*community, score)
             })
             .filter(|(_, score)| *score > 0)
@@ -263,11 +467,7 @@ impl Soul {
         scores.sort_by(|a, b| b.1.cmp(&a.1));
 
         // Take top 2-4 communities
-        let assigned: Vec<&str> = scores
-            .iter()
-            .take(4)
-            .map(|(c, _)| *c)
-            .collect();
+        let assigned: Vec<&str> = scores.iter().take(4).map(|(c, _)| *c).collect();
 
         if assigned.is_empty() {
             // Fallback: assign general + one thematic
@@ -317,9 +517,13 @@ impl Soul {
         }
         if !found {
             // Insert Interests after Values (or at position 2)
-            let pos = self.sections.iter().position(|(n, _)| n == "Voice")
+            let pos = self
+                .sections
+                .iter()
+                .position(|(n, _)| n == "Voice")
                 .unwrap_or(self.sections.len());
-            self.sections.insert(pos, ("Interests".to_string(), new_content));
+            self.sections
+                .insert(pos, ("Interests".to_string(), new_content));
         }
 
         self.raw = self.render();
@@ -580,9 +784,7 @@ fn parse_community_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
 
     // Strip optional bullet prefix
-    let after_dash = trimmed
-        .strip_prefix("- ")
-        .unwrap_or(trimmed);
+    let after_dash = trimmed.strip_prefix("- ").unwrap_or(trimmed);
 
     // Strip bold markdown wrappers: **community: foo** → community: foo
     let after_bold = after_dash
@@ -716,7 +918,8 @@ I do not remove or weaken my own Boundaries.
 
     #[test]
     fn communities_with_aliases() {
-        let content = "# Test\n\n## Interests\n\n- community: technology\n- community: meta/governance\n";
+        let content =
+            "# Test\n\n## Interests\n\n- community: technology\n- community: meta/governance\n";
         let soul = Soul::parse(content).unwrap();
         let communities = soul.communities();
         assert_eq!(communities, vec!["tech", "meta-governance"]);
@@ -785,7 +988,12 @@ I do not remove or weaken my own Boundaries.
             .filter(|w| w.level == WarnLevel::Error)
             .collect();
         // Should flag missing Values, Interests, Voice (Boundaries is optional)
-        assert_eq!(errors.len(), 3, "expected 3 missing section errors: {:?}", errors);
+        assert_eq!(
+            errors.len(),
+            3,
+            "expected 3 missing section errors: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -825,7 +1033,9 @@ I do not remove or weaken my own Boundaries.
         let soul = Soul::parse(&content).unwrap();
         let warnings = soul.validate(None);
         assert!(
-            warnings.iter().any(|w| w.message.contains("bio extraction")),
+            warnings
+                .iter()
+                .any(|w| w.message.contains("bio extraction")),
             "expected identity length warning: {:?}",
             warnings
         );
@@ -871,14 +1081,23 @@ I do not remove or weaken my own Boundaries.
 
     #[test]
     fn normalize_unicode_dashes() {
-        assert_eq!(normalize_community_slug("meta\u{2011}governance"), "meta-governance");
-        assert_eq!(normalize_community_slug("creative\u{2013}writing"), "creative-writing");
+        assert_eq!(
+            normalize_community_slug("meta\u{2011}governance"),
+            "meta-governance"
+        );
+        assert_eq!(
+            normalize_community_slug("creative\u{2013}writing"),
+            "creative-writing"
+        );
     }
 
     #[test]
     fn normalize_aliases() {
         assert_eq!(normalize_community_slug("technology"), "tech");
-        assert_eq!(normalize_community_slug("meta/governance"), "meta-governance");
+        assert_eq!(
+            normalize_community_slug("meta/governance"),
+            "meta-governance"
+        );
     }
 
     #[test]

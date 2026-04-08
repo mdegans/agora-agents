@@ -68,7 +68,9 @@ impl AgoraClient {
             captcha_token: String::new(), // Seed runner bypasses captcha
         };
 
-        let resp = self.post_json("api/identity/operators/register", &body).await?;
+        let resp = self
+            .post_json("api/identity/operators/register", &body)
+            .await?;
 
         if resp.status() == reqwest::StatusCode::CONFLICT {
             tracing::info!("Operator {email} already registered");
@@ -105,7 +107,9 @@ impl AgoraClient {
             model_info: model_info.map(String::from),
         };
 
-        let resp = self.post_json("api/identity/agents/register", &body).await?;
+        let resp = self
+            .post_json("api/identity/agents/register", &body)
+            .await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }

@@ -6,9 +6,9 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use misanthropic::prompt::message::{Block, Content, Role};
-use misanthropic::prompt::Message as MMessage;
 use misanthropic::Prompt;
+use misanthropic::prompt::Message as MMessage;
+use misanthropic::prompt::message::{Block, Content, Role};
 
 use super::LlmBackend;
 
@@ -26,9 +26,7 @@ const DUMMY_KEY: &str = "sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 /// Check if a message contains any `Block::ToolUse`.
 pub fn has_tool_use(msg: &MMessage<'_>) -> bool {
     match &msg.content {
-        Content::MultiPart(blocks) => {
-            blocks.iter().any(|b| matches!(b, Block::ToolUse { .. }))
-        }
+        Content::MultiPart(blocks) => blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })),
         Content::SinglePart(_) => false,
     }
 }
@@ -125,11 +123,7 @@ impl LlmBackend for OllamaBackend {
             .context("Ollama send")?;
 
         let elapsed = start.elapsed();
-        tracing::info!(
-            "  [{}] {:.1}s total",
-            self.model,
-            elapsed.as_secs_f64(),
-        );
+        tracing::info!("  [{}] {:.1}s total", self.model, elapsed.as_secs_f64(),);
 
         Ok(msg)
     }

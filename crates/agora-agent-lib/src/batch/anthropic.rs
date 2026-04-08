@@ -17,9 +17,9 @@ use agora_agentkit::ids::AgentId;
 use agora_agentkit::scheduler::{
     BatchBackend, BatchError, BatchState, CycleStep, WorkItem, WorkResult,
 };
+use misanthropic::Prompt;
 use misanthropic::batch;
 use misanthropic::prompt::Message as MMessage;
-use misanthropic::Prompt;
 
 /// Handle for a pending Anthropic batch.
 ///
@@ -57,10 +57,7 @@ impl AnthropicBatch {
 impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
     type Handle = AnthropicPendingHandle;
 
-    async fn submit(
-        &self,
-        items: Vec<WorkItem<Prompt<'static>>>,
-    ) -> anyhow::Result<Self::Handle> {
+    async fn submit(&self, items: Vec<WorkItem<Prompt<'static>>>) -> anyhow::Result<Self::Handle> {
         // Prime the prompt cache before submitting the batch.
         //
         // Batch items share an identical prefix (tools + constitution + system)
@@ -121,10 +118,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
 
         let pending = self.client.tagged_batch(tagged_prompts).await?;
 
-        tracing::info!(
-            "Batch submitted: id={}",
-            pending.meta().id,
-        );
+        tracing::info!("Batch submitted: id={}", pending.meta().id,);
 
         Ok(AnthropicPendingHandle { pending, id_map })
     }
@@ -174,9 +168,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
                             Ok(msg.into_static())
                         }
                         batch::BatchResult::Error(err) => {
-                            tracing::warn!(
-                                "Batch item error for agent {agent_id}: {err}"
-                            );
+                            tracing::warn!("Batch item error for agent {agent_id}: {err}");
                             Err(BatchError::Api {
                                 message: err.to_string(),
                             })
@@ -203,10 +195,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
         }
     }
 
-    async fn count_tokens(
-        &self,
-        _prompt: &Prompt<'static>,
-    ) -> anyhow::Result<Option<u32>> {
+    async fn count_tokens(&self, _prompt: &Prompt<'static>) -> anyhow::Result<Option<u32>> {
         // TODO: Use misanthropic::Client::count_tokens once it's on the dev branch.
         // For now, return None — the scheduler will skip token-based grouping.
         Ok(None)

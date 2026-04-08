@@ -6,11 +6,9 @@
 
 use std::collections::HashSet;
 
-use agora_agentkit::scheduler::{
-    BatchBackend, BatchState, WorkItem, WorkResult,
-};
-use misanthropic::prompt::Message as MMessage;
+use agora_agentkit::scheduler::{BatchBackend, BatchState, WorkItem, WorkResult};
 use misanthropic::Prompt;
+use misanthropic::prompt::Message as MMessage;
 
 use super::anthropic::{AnthropicBatch, AnthropicPendingHandle};
 use super::ollama::{MultiOllamaBatch, OllamaPendingHandle};
@@ -65,10 +63,7 @@ impl HybridBatch {
 impl BatchBackend<Prompt<'static>, MMessage<'static>> for HybridBatch {
     type Handle = HybridPendingHandle;
 
-    async fn submit(
-        &self,
-        items: Vec<WorkItem<Prompt<'static>>>,
-    ) -> anyhow::Result<Self::Handle> {
+    async fn submit(&self, items: Vec<WorkItem<Prompt<'static>>>) -> anyhow::Result<Self::Handle> {
         // Partition items by backend.
         let mut ollama_items = Vec::new();
         let mut anthropic_items = Vec::new();
@@ -85,9 +80,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for HybridBatch {
         let anthropic_count = anthropic_items.len();
 
         if ollama_count > 0 && anthropic_count > 0 {
-            tracing::info!(
-                "Hybrid batch: {ollama_count} → ollama, {anthropic_count} → anthropic"
-            );
+            tracing::info!("Hybrid batch: {ollama_count} → ollama, {anthropic_count} → anthropic");
         }
 
         // Submit to both backends in parallel.
@@ -103,10 +96,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for HybridBatch {
                 if anthropic_items.is_empty() {
                     Ok(None)
                 } else {
-                    self.anthropic
-                        .submit(anthropic_items)
-                        .await
-                        .map(Some)
+                    self.anthropic.submit(anthropic_items).await.map(Some)
                 }
             },
         );
@@ -153,22 +143,17 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for HybridBatch {
                         all.extend(anthropic_results);
                         Ok(BatchState::Ready(all))
                     }
-                    BatchState::Pending(next) => {
-                        Ok(BatchState::Pending(HybridPendingHandle {
-                            anthropic: Some(next),
-                            ollama_results,
-                            anthropic_results,
-                        }))
-                    }
+                    BatchState::Pending(next) => Ok(BatchState::Pending(HybridPendingHandle {
+                        anthropic: Some(next),
+                        ollama_results,
+                        anthropic_results,
+                    })),
                 }
             }
         }
     }
 
-    async fn count_tokens(
-        &self,
-        _prompt: &Prompt<'static>,
-    ) -> anyhow::Result<Option<u32>> {
+    async fn count_tokens(&self, _prompt: &Prompt<'static>) -> anyhow::Result<Option<u32>> {
         Ok(None)
     }
 

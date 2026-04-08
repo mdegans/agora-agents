@@ -15,8 +15,10 @@ fn verbose_response(label: &str, response: &str) {
     eprintln!("\n=== {label} ===");
     println!(
         "{}",
-        serde_json::to_string_pretty(&serde_json::json!({"role": "assistant", "content": response}))
-            .unwrap()
+        serde_json::to_string_pretty(
+            &serde_json::json!({"role": "assistant", "content": response})
+        )
+        .unwrap()
     );
 }
 
@@ -150,10 +152,7 @@ pub async fn run_cycle(
                 round + 1,
                 actions_with_ids.len()
             );
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&action_strs).unwrap()
-            );
+            println!("{}", serde_json::to_string_pretty(&action_strs).unwrap());
         }
 
         // Append assistant response to conversation
@@ -181,14 +180,8 @@ pub async fn run_cycle(
         let mut tool_result_blocks: Vec<Block<'static>> = Vec::new();
 
         for (action, tool_call_id) in &actions_with_ids {
-            let (summary, result_text, is_error) = execute_action(
-                action,
-                agent,
-                agent_id,
-                client,
-                &dashboard,
-            )
-            .await;
+            let (summary, result_text, is_error) =
+                execute_action(action, agent, agent_id, client, &dashboard).await;
 
             if let Some(summary) = summary {
                 action_summaries.push(summary);
@@ -436,10 +429,7 @@ pub async fn run_cycle(
                             .await
                         {
                             Ok(()) => {
-                                tracing::info!(
-                                    "  {} submitted anonymous feedback",
-                                    agent.name
-                                );
+                                tracing::info!("  {} submitted anonymous feedback", agent.name);
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -472,15 +462,13 @@ async fn execute_action(
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
 ) -> (Option<String>, String, bool) {
     match action {
-        prompt::AgentAction::GetPost(input) => {
-            match client.get_post(input.post_id).await {
-                Ok(full) => {
-                    let text = prompt::format_tool_result_post(&full);
-                    (None, text, false)
-                }
-                Err(e) => (None, format!("Error fetching post: {e}"), true),
+        prompt::AgentAction::GetPost(input) => match client.get_post(input.post_id).await {
+            Ok(full) => {
+                let text = prompt::format_tool_result_post(&full);
+                (None, text, false)
             }
-        }
+            Err(e) => (None, format!("Error fetching post: {e}"), true),
+        },
         prompt::AgentAction::GetComment(input) => {
             match client.get_comment(input.comment_id).await {
                 Ok(chain) => {
@@ -496,10 +484,14 @@ async fn execute_action(
                 other => other,
             };
             if slug == "news" {
-                tracing::info!("  {} skipping post to news (restricted to MCP agents)", agent.name);
+                tracing::info!(
+                    "  {} skipping post to news (restricted to MCP agents)",
+                    agent.name
+                );
                 return (
                     Some(format!("Skipped posting to news (restricted)")),
-                    "The news community is reserved for MCP agents with search/browse tools.".to_string(),
+                    "The news community is reserved for MCP agents with search/browse tools."
+                        .to_string(),
                     true,
                 );
             }
@@ -510,7 +502,11 @@ async fn execute_action(
                 .map(|posts| posts.iter().map(|p| p.title.clone()).collect())
                 .unwrap_or_default();
             if prompt::is_title_repetitive(&input.title, &existing_titles) {
-                tracing::info!("  {} topic too similar, skipping: \"{}\"", agent.name, input.title);
+                tracing::info!(
+                    "  {} topic too similar, skipping: \"{}\"",
+                    agent.name,
+                    input.title
+                );
                 return (
                     Some(format!("Skipped posting \"{}\" (too similar to existing posts)", input.title)),
                     "Your proposed post is too similar to existing posts. Try a different angle or topic.".to_string(),
@@ -518,14 +514,25 @@ async fn execute_action(
                 );
             }
             match client
-                .create_post(agent_id, slug, &input.title, &input.body, &agent.signing_key)
+                .create_post(
+                    agent_id,
+                    slug,
+                    &input.title,
+                    &input.body,
+                    &agent.signing_key,
+                )
                 .await
             {
                 Ok(post_id) => {
                     agent.state.created_posts.insert(post_id);
-                    let summary = format!("Posted \"{}\" in {} (id: {})", input.title, slug, post_id);
+                    let summary =
+                        format!("Posted \"{}\" in {} (id: {})", input.title, slug, post_id);
                     tracing::info!("  {} {}", agent.name, summary);
-                    (Some(summary.clone()), format!("Post created successfully. Post ID: {post_id}"), false)
+                    (
+                        Some(summary.clone()),
+                        format!("Post created successfully. Post ID: {post_id}"),
+                        false,
+                    )
                 }
                 Err(e) => {
                     let summary = format!("Failed to post in {slug}: {e}");
@@ -545,10 +552,15 @@ async fn execute_action(
                 && !is_own_post
                 && !has_reply_in_post
             {
-                tracing::debug!("  {} already commented on {}, skipping", agent.name, input.post_id);
+                tracing::debug!(
+                    "  {} already commented on {}, skipping",
+                    agent.name,
+                    input.post_id
+                );
                 return (
                     None,
-                    "You already commented on this post. Try engaging with a different post.".to_string(),
+                    "You already commented on this post. Try engaging with a different post."
+                        .to_string(),
                     true,
                 );
             }
@@ -565,9 +577,16 @@ async fn execute_action(
                 Ok(comment_id) => {
                     agent.state.commented_posts.insert(input.post_id);
                     agent.state.created_comments.insert(comment_id);
-                    let summary = format!("Commented on post {} (comment: {})", input.post_id, comment_id);
+                    let summary = format!(
+                        "Commented on post {} (comment: {})",
+                        input.post_id, comment_id
+                    );
                     tracing::info!("  {} {}", agent.name, summary);
-                    (Some(summary), format!("Comment created successfully. Comment ID: {comment_id}"), false)
+                    (
+                        Some(summary),
+                        format!("Comment created successfully. Comment ID: {comment_id}"),
+                        false,
+                    )
                 }
                 Err(e) => {
                     let summary = format!("Failed to comment on {}: {e}", input.post_id);
@@ -588,10 +607,18 @@ async fn execute_action(
                 .await
             {
                 Ok(()) => {
-                    let verb = if input.value > 0 { "upvoted" } else { "downvoted" };
+                    let verb = if input.value > 0 {
+                        "upvoted"
+                    } else {
+                        "downvoted"
+                    };
                     let summary = format!("{verb} {} {}", input.target_type, input.target_id);
                     tracing::info!("  {} {}", agent.name, summary);
-                    (Some(summary), format!("Vote recorded: {verb} {}", input.target_type), false)
+                    (
+                        Some(summary),
+                        format!("Vote recorded: {verb} {}", input.target_type),
+                        false,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!("  {} vote failed: {e}", agent.name);
@@ -611,9 +638,16 @@ async fn execute_action(
                 .await
             {
                 Ok(()) => {
-                    let summary = format!("Flagged {} {}: {}", input.target_type, input.target_id, input.reason);
+                    let summary = format!(
+                        "Flagged {} {}: {}",
+                        input.target_type, input.target_id, input.reason
+                    );
                     tracing::info!("  {} {}", agent.name, summary);
-                    (Some(summary), format!("Content flagged successfully."), false)
+                    (
+                        Some(summary),
+                        format!("Content flagged successfully."),
+                        false,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!("  {} flag failed: {e}", agent.name);
