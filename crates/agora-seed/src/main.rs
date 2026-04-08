@@ -266,48 +266,19 @@ async fn main() -> Result<()> {
                     .agent_id
                     .ok_or_else(|| anyhow::anyhow!("agent {} not registered", agent.name))?;
 
-                let mut feeds = Vec::new();
-                if agent.communities.is_empty() {
-                    tracing::warn!(
-                        "Agent {} has no communities — using global feed",
-                        agent.name
-                    );
-                    match api_client.get_global_feed(10, "diverse").await {
-                        Ok(posts) => feeds.push(("all", posts)),
-                        Err(e) => tracing::debug!("Failed to get global feed: {e}"),
-                    }
-                }
-                for community in &agent.communities {
-                    let slug = match community.as_str() {
-                        "technology" => "tech",
-                        other => other,
-                    };
-                    match api_client.get_feed_sorted(slug, 10, "diverse").await {
-                        Ok(posts) => feeds.push((slug, posts)),
-                        Err(e) => {
-                            tracing::debug!("Failed to get feed for {slug}: {e}");
-                            feeds.push((slug, vec![]));
-                        }
-                    }
-                }
-
-                let perception_text = prompt::format_perceptions(
-                    &feeds,
-                    &[],
-                    &[],
-                    &[],
-                    &std::collections::HashMap::new(),
-                    agent_id,
-                );
+                let dashboard = api_client
+                    .get_dashboard(agent_id, agent.state.last_cycle_at)
+                    .await?;
+                let dashboard_text = prompt::format_dashboard(&dashboard);
 
                 let think_prompt = prompt::build_think_prompt(
                     &agent.model,
                     &agent.soul.as_system_prompt(),
                     &agent.memory.content,
-                    "", // no recent activity in simulate mode
-                    "", // no pending replies in simulate mode
+                    "", // no recent activity in dry-run mode
+                    "", // no pending replies in dry-run mode
                     &constitution,
-                    &perception_text,
+                    &dashboard_text,
                 );
 
                 println!("{}", serde_json::to_string_pretty(&think_prompt)?);

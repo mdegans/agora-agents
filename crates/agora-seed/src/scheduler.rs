@@ -728,11 +728,22 @@ where
         return Ok(());
     }
 
-    // Phase 2: THINK
-    let mut work_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+    // Phase 2+3: THINK/ACT loop (5 rounds)
+    //
+    // Each agent maintains a CachedPrompt across rounds. Per round:
+    //   1. Build WorkItems from each agent's current prompt
+    //   2. Submit batch and poll for results
+    //   3. Execute tool calls, append tool results to each agent's prompt
+    //
+    // All agents participate in all 5 rounds — no early dropout.
 
+    let mut agent_prompts: HashMap<AgentId, Prompt<'static>> = HashMap::new();
+    let mut action_summaries_map: HashMap<AgentId, Vec<String>> = HashMap::new();
+
+    // Initialize prompts
     for ctx in &agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
+        let agent_id = agent.agent_id.unwrap();
         let think_prompt = prompt::build_think_prompt(
             &agent.model,
             &agent.soul.as_system_prompt(),
@@ -742,60 +753,120 @@ where
             constitution,
             &ctx.perception_text,
         );
-
-        let prefix_hash = {
-            let mut hasher = DefaultHasher::new();
-            agent.model.hash(&mut hasher);
-            hasher.finish()
-        };
-
-        work_items.push(WorkItem {
-            agent_id: agent.agent_id.unwrap(),
-            prompt: think_prompt,
-            step: CycleStep::Think,
-            prefix_hash,
-            model: agent.model.clone(),
-            queued_at: Instant::now(),
-            token_count: 0,
-        });
+        agent_prompts.insert(agent_id, think_prompt);
+        action_summaries_map.insert(agent_id, Vec::new());
     }
 
-    let think_results = submit_and_poll(backend, work_items).await?;
+    for round in 0..5usize {
+        tracing::info!("Batch round {}/5 ({} agents)", round + 1, agent_contexts.len());
 
-    // Phase 3: ACT
-    let mut action_summaries_map: HashMap<AgentId, Vec<String>> = HashMap::new();
-    let mut think_response_map: HashMap<AgentId, String> = HashMap::new();
+        // Build work items from current prompts
+        let mut work_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+        for ctx in &agent_contexts {
+            let agent = &batch_agents[ctx.batch_index];
+            let agent_id = agent.agent_id.unwrap();
+            let Some(prompt) = agent_prompts.get(&agent_id) else { continue };
 
-    for result in &think_results {
-        let response = match &result.response {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!("Think failed for agent {}: {e}", result.agent_id);
-                report.skipped.think_failures += 1;
+            let prefix_hash = {
+                let mut hasher = DefaultHasher::new();
+                agent.model.hash(&mut hasher);
+                hasher.finish()
+            };
+
+            work_items.push(WorkItem {
+                agent_id,
+                prompt: prompt.clone(),
+                step: CycleStep::Think,
+                prefix_hash,
+                model: agent.model.clone(),
+                queued_at: Instant::now(),
+                token_count: 0,
+            });
+        }
+
+        let round_results = submit_and_poll(backend, work_items).await?;
+
+        // Process results: execute actions, append tool results
+        for result in &round_results {
+            let response = match &result.response {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::warn!("Round {} failed for agent {}: {e}", round + 1, result.agent_id);
+                    if round == 0 {
+                        report.skipped.think_failures += 1;
+                    }
+                    continue;
+                }
+            };
+
+            let Some(ctx) = agent_contexts.iter().find(|c| {
+                batch_agents[c.batch_index].agent_id == Some(result.agent_id)
+            }) else {
+                continue;
+            };
+            let agent = &mut batch_agents[ctx.batch_index];
+
+            let actions_with_ids = tools::extract_actions_with_ids(response);
+            tracing::info!(
+                "[{}/{}] {} — round {}/5 ({} actions)",
+                cycle + 1, config.cycles, agent.name, round + 1, actions_with_ids.len(),
+            );
+
+            let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else { continue };
+
+            // Append assistant response
+            if let Err(e) = prompt.push_message(response.clone().into_static()) {
+                tracing::warn!("Failed to append response for {}: {e}", agent.name);
                 continue;
             }
-        };
 
-        let Some(ctx) = agent_contexts.iter().find(|c| {
-            batch_agents[c.batch_index].agent_id == Some(result.agent_id)
-        }) else {
-            continue;
-        };
-        let agent = &mut batch_agents[ctx.batch_index];
+            if actions_with_ids.is_empty() {
+                // No tool calls — cache and nudge
+                if let Some(last) = prompt.messages.last_mut() {
+                    last.content.cache();
+                }
+                let _ = prompt.push_message((
+                    misanthropic::prompt::message::Role::User,
+                    "Continue. Use your tools to read posts, comment, vote, or create posts.",
+                ));
+                continue;
+            }
 
-        think_response_map.insert(result.agent_id, response.content.to_string());
+            // Execute actions and build tool results
+            let mut tool_result_blocks: Vec<misanthropic::prompt::message::Block<'static>> = Vec::new();
 
-        let actions = tools::extract_actions(response);
-        tracing::info!(
-            "[{}/{}] {} — act ({} actions)",
-            cycle + 1, config.cycles, agent.name, actions.len(),
-        );
+            for (action, tool_call_id) in &actions_with_ids {
+                let (summary, result_text, is_error) = execute_action_for_result(
+                    action, agent, client, &ctx.dashboard, report,
+                ).await;
 
-        let summaries = execute_actions(
-            agent, &actions, client, &ctx.feeds, &ctx.comment_replies, report,
-        ).await;
+                if let Some(s) = summary {
+                    action_summaries_map.entry(result.agent_id).or_default().push(s);
+                }
 
-        action_summaries_map.insert(result.agent_id, summaries);
+                tool_result_blocks.push(misanthropic::prompt::message::Block::ToolResult {
+                    result: misanthropic::tool::Result {
+                        tool_use_id: std::borrow::Cow::Owned(tool_call_id.clone()),
+                        content: misanthropic::prompt::message::Content::from(result_text.as_str()).into_static(),
+                        is_error,
+                        cache_control: None,
+                    },
+                });
+            }
+
+            // Cache breakpoint on last tool result
+            if let Some(misanthropic::prompt::message::Block::ToolResult { result }) = tool_result_blocks.last_mut() {
+                result.cache_control = Some(misanthropic::prompt::message::CacheControl::ephemeral());
+            }
+
+            let tool_msg = misanthropic::prompt::Message {
+                role: misanthropic::prompt::message::Role::User,
+                content: misanthropic::prompt::message::Content::MultiPart(tool_result_blocks),
+            };
+            if let Err(e) = prompt.push_message(tool_msg) {
+                tracing::warn!("Failed to append tool results for {}: {e}", agent.name);
+            }
+        }
     }
 
     // Phase 4: REFLECT
@@ -951,17 +1022,14 @@ where
             .get(&agent_id)
             .cloned()
             .unwrap_or_default();
-        let response_text = think_response_map
-            .get(&agent_id)
-            .cloned()
-            .unwrap_or_default();
-
         let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
         let system = prompt::build_cached_system_prefix(constitution);
 
+        // Use summaries as the "response" context for the survey conversation
+        let response_summary = summaries.join("; ");
         let survey_prompt = build_survey_conversation(
             &agent.model, &system, &ctx.perception_text,
-            &response_text, &survey_text,
+            &response_summary, &survey_text,
         );
 
         survey_items.push(WorkItem {
@@ -1056,7 +1124,7 @@ async fn run_batch_sequential(
             }
         };
 
-        // Phase 2: THINK
+        // Phase 2+3: THINK/ACT loop (5 rounds)
         let mut think_prompt = CachedPrompt::uncached(prompt::build_think_prompt(
             &model,
             &agent.soul.as_system_prompt(),
@@ -1067,31 +1135,85 @@ async fn run_batch_sequential(
             &ctx.perception_text,
         ));
 
-        let think_response = match endpoint.send(&think_prompt, &model).await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!("Think failed for {} at {}: {e}", agent.name, endpoint.url);
-                report.skipped.think_failures += 1;
+        let mut summaries = Vec::new();
+
+        for round in 0..5usize {
+            tracing::info!(
+                "[{}/{}] {} — round {}/5",
+                cycle + 1, config.cycles, agent.name, round + 1,
+            );
+
+            let response = match endpoint.send(&think_prompt, &model).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::warn!("Round {} failed for {} at {}: {e}", round + 1, agent.name, endpoint.url);
+                    if round == 0 {
+                        report.skipped.think_failures += 1;
+                    }
+                    break;
+                }
+            };
+
+            let actions_with_ids = tools::extract_actions_with_ids(&response);
+
+            // Append assistant response
+            if let Err(e) = think_prompt.push_message(response) {
+                tracing::warn!("Failed to append response for {}: {e}", agent.name);
+                break;
+            }
+
+            if actions_with_ids.is_empty() {
+                // No tool calls — add cache breakpoint and nudge for next round
+                think_prompt.cache();
+                let _ = think_prompt.push_message((MRole::User, "Continue. Use your tools to read posts, comment, vote, or create posts."));
                 continue;
             }
-        };
 
-        // Phase 3: ACT
-        let actions = tools::extract_actions(&think_response);
-        tracing::info!(
-            "[{}/{}] {} — act ({} actions)",
-            cycle + 1, config.cycles, agent.name, actions.len(),
-        );
+            // Execute actions and build tool results
+            let mut tool_result_blocks: Vec<misanthropic::prompt::message::Block<'static>> = Vec::new();
 
-        let summaries = execute_actions(
-            agent, &actions, client, &ctx.feeds, &ctx.comment_replies, report,
-        ).await;
+            for (action, tool_call_id) in &actions_with_ids {
+                let (summary, result_text, is_error) = execute_action_for_result(
+                    action, agent, client, &ctx.dashboard, report,
+                ).await;
 
-        // --- Session continuity: append assistant response for subsequent phases ---
-        if let Err(e) = think_prompt.push_message(think_response) {
-            tracing::warn!("Failed to append think response for {}: {e}", agent.name);
-            continue;
+                if let Some(s) = summary {
+                    summaries.push(s);
+                }
+
+                tool_result_blocks.push(misanthropic::prompt::message::Block::ToolResult {
+                    result: misanthropic::tool::Result {
+                        tool_use_id: std::borrow::Cow::Owned(tool_call_id.clone()),
+                        content: misanthropic::prompt::message::Content::from(result_text.as_str()).into_static(),
+                        is_error,
+                        cache_control: None,
+                    },
+                });
+            }
+
+            // Cache breakpoint on last tool result
+            if let Some(misanthropic::prompt::message::Block::ToolResult { result }) = tool_result_blocks.last_mut() {
+                result.cache_control = Some(misanthropic::prompt::message::CacheControl::ephemeral());
+            }
+
+            let tool_msg = misanthropic::prompt::Message {
+                role: MRole::User,
+                content: misanthropic::prompt::message::Content::MultiPart(tool_result_blocks),
+            };
+            if let Err(e) = think_prompt.push_message(tool_msg) {
+                tracing::warn!("Failed to append tool results for {}: {e}", agent.name);
+                break;
+            }
         }
+
+        // Keep tool_choice as Auto — changing it would invalidate the cache prefix.
+        // Reflect/evolve/survey prompts instruct the model to respond with text.
+        think_prompt.cache();
+
+        tracing::info!(
+            "[{}/{}] {} — act complete ({} actions total)",
+            cycle + 1, config.cycles, agent.name, summaries.len(),
+        );
 
         // Phase 4: REFLECT
         let reflect_text = prompt::build_memory_rewrite_prompt(
@@ -1286,12 +1408,10 @@ fn merge_reports(main: &mut RunReport, sub: &RunReport) {
 struct AgentCycleContext {
     /// Index into the batch_agents slice.
     batch_index: usize,
-    /// Formatted perception text for the THINK prompt.
+    /// The dashboard response from the server.
+    dashboard: agora_agent_lib::agora_agentkit::responses::DashboardResponse,
+    /// Formatted dashboard text for the THINK prompt.
     perception_text: String,
-    /// Raw feeds for duplicate detection during ACT.
-    feeds: Vec<(String, Vec<crate::client::FeedPost>)>,
-    /// Comment replies for duplicate comment detection.
-    comment_replies: Vec<crate::client::CommentReply>,
     /// Formatted recent activity for the system prompt.
     recent_activity: String,
     /// Formatted pending replies for the system prompt.
@@ -1385,7 +1505,7 @@ where
     }
 }
 
-/// PERCEIVE phase: gather feed data and build perception text.
+/// PERCEIVE phase: single dashboard call replaces 12-15 API calls.
 async fn perceive(
     agent: &mut Agent,
     agent_id: AgentId,
@@ -1394,156 +1514,11 @@ async fn perceive(
 ) -> Result<AgentCycleContext> {
     tracing::info!("  {} — perceive", agent.name);
 
-    // Find this agent's index in the batch (will be set by caller)
-    // For now we use a sentinel; the caller fixes it up.
-    let batch_index = 0; // Placeholder — set by caller
+    let dashboard = client
+        .get_dashboard(agent_id, agent.state.last_cycle_at)
+        .await?;
 
-    // Check replies to own posts
-    let mut replies = Vec::new();
-    for &post_id in &agent.state.created_posts {
-        match client.get_post(post_id).await {
-            Ok(full) => {
-                let new_comments: Vec<_> = full
-                    .comments
-                    .into_iter()
-                    .filter(|c| c.agent_id != agent_id)
-                    .filter(|c| match (agent.state.last_cycle_at, c.created_at) {
-                        (Some(last), Some(created)) => created > last,
-                        _ => true,
-                    })
-                    .collect();
-                if !new_comments.is_empty() {
-                    replies.push((full.post.title.clone(), post_id, new_comments));
-                }
-            }
-            Err(e) => tracing::debug!("Failed to check replies on {post_id}: {e}"),
-        }
-    }
-
-    // Check replies to own comments
-    let comment_replies = match client
-        .get_comment_replies(
-            agent_id,
-            agent.state.last_cycle_at.map(|t| t.to_rfc3339()).as_deref(),
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("Failed to fetch comment replies for {}: {e}", agent.name);
-            vec![]
-        }
-    };
-
-    // Read feeds
-    let sort_idx = rand::random::<usize>() % 5;
-    let sort = ["diverse", "diverse", "date", "active", "controversial"][sort_idx];
-
-    let mut feeds: Vec<(String, Vec<crate::client::FeedPost>)> = Vec::new();
-
-    if agent.communities.is_empty() {
-        match client.get_global_feed(10, sort).await {
-            Ok(posts) => feeds.push(("all".to_string(), posts)),
-            Err(e) => tracing::debug!("Failed to get global feed: {e}"),
-        }
-    }
-
-    for community in &agent.communities {
-        let slug = match community.as_str() {
-            "technology" => "tech",
-            other => other,
-        };
-        match client.get_feed_sorted(slug, 10, sort).await {
-            Ok(posts) => {
-                let mut fresh = Vec::new();
-                let mut context = Vec::new();
-                for p in posts {
-                    let cc = p.comment_count.unwrap_or(0);
-                    match agent.state.seen_posts.get(&p.id) {
-                        Some(&last) if cc <= last => context.push(p),
-                        _ => fresh.push(p),
-                    }
-                }
-                let context_slots = 3usize.saturating_sub(fresh.len());
-                fresh.extend(context.into_iter().take(context_slots));
-                feeds.push((slug.to_string(), fresh));
-            }
-            Err(e) => {
-                if e.to_string().contains("400") || e.to_string().contains("404") {
-                    tracing::warn!("Community not found: '{slug}'");
-                }
-                feeds.push((slug.to_string(), vec![]));
-            }
-        }
-    }
-
-    // Read detailed posts
-    let mut detailed_posts = Vec::new();
-    let feed_refs: Vec<(&str, &Vec<crate::client::FeedPost>)> =
-        feeds.iter().map(|(s, p)| (s.as_str(), p)).collect();
-    let mut all_posts: Vec<&crate::client::FeedPost> =
-        feed_refs.iter().flat_map(|(_, posts)| posts.iter()).collect();
-    all_posts.shuffle(&mut rand::thread_rng());
-
-    let candidates: Vec<_> = all_posts
-        .iter()
-        .filter(|p| p.comment_count.unwrap_or(0) < 10)
-        .collect();
-
-    for post in candidates.into_iter().take(3) {
-        if let Ok(full) = client.get_post(post.id).await {
-            detailed_posts.push((
-                (*post).clone(),
-                full.comments,
-                full.thread_summary,
-                full.community_tags,
-                full.post.upvotes,
-                full.post.downvotes,
-            ));
-        }
-    }
-
-    // Update seen-posts
-    for (_, posts) in &feeds {
-        for post in posts {
-            agent.state.seen_posts.insert(post.id, post.comment_count.unwrap_or(0));
-        }
-    }
-
-    // Fetch full comment lists for posts with replies to agent's comments
-    let mut reply_post_comments: std::collections::HashMap<
-        agora_agent_lib::agora_agentkit::ids::PostId,
-        Vec<crate::client::Comment>,
-    > = std::collections::HashMap::new();
-    {
-        let reply_post_ids: std::collections::HashSet<_> =
-            comment_replies.iter().map(|r| r.post_id).collect();
-        let already_fetched: std::collections::HashSet<_> =
-            detailed_posts.iter().map(|(p, ..)| p.id).collect();
-        for post_id in reply_post_ids {
-            if let Some((_, comments, ..)) =
-                detailed_posts.iter().find(|(p, ..)| p.id == post_id)
-            {
-                reply_post_comments.insert(post_id, comments.clone());
-            } else if !already_fetched.contains(&post_id) {
-                if let Ok(full) = client.get_post(post_id).await {
-                    reply_post_comments.insert(post_id, full.comments);
-                }
-            }
-        }
-    }
-
-    // Format perceptions
-    let feeds_for_format: Vec<(&str, Vec<crate::client::FeedPost>)> =
-        feeds.iter().map(|(s, p)| (s.as_str(), p.clone())).collect();
-    let perception_text = prompt::format_perceptions(
-        &feeds_for_format,
-        &detailed_posts,
-        &replies,
-        &comment_replies,
-        &reply_post_comments,
-        agent_id,
-    );
+    let perception_text = prompt::format_dashboard(&dashboard);
 
     // Fetch recent activity for system prompt
     let recent_posts = match client.get_agent_posts(agent_id).await {
@@ -1554,128 +1529,170 @@ async fn perceive(
         }
     };
     let recent_activity = prompt::format_recent_activity(&recent_posts, 5);
-    let pending_replies_text = prompt::format_pending_replies(&comment_replies, 5);
+
+    // Pending replies from dashboard (truncated for system prompt)
+    let pending_replies_text: String = dashboard
+        .unread_comment_replies
+        .iter()
+        .take(5)
+        .map(|r| {
+            format!(
+                "- {} replied in \"{}\": \"{}\"",
+                r.author,
+                prompt::truncate(&r.post_title, 50),
+                prompt::truncate(&r.preview, 80)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     Ok(AgentCycleContext {
-        batch_index,
+        batch_index: 0, // Placeholder — set by caller
+        dashboard,
         perception_text,
-        feeds,
-        comment_replies,
         recent_activity,
         pending_replies_text,
     })
 }
 
 /// ACT phase: execute extracted actions against the server.
-async fn execute_actions(
+/// Execute a single action and return (summary, tool_result_text, is_error).
+/// Also updates the report counters.
+async fn execute_action_for_result(
+    action: &tools::AgentAction,
     agent: &mut Agent,
-    actions: &[tools::AgentAction],
     client: &AgoraClient,
-    feeds: &[(String, Vec<crate::client::FeedPost>)],
-    comment_replies: &[crate::client::CommentReply],
+    dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
-) -> Vec<String> {
+) -> (Option<String>, String, bool) {
     let agent_id = agent.agent_id.unwrap();
-    let mut summaries = Vec::new();
 
-    for action in actions {
-        match action {
-            tools::AgentAction::Post(input) => {
-                let (community, title, body) = (&input.community, &input.title, &input.body);
-                let slug = match community.as_str() {
-                    "technology" => "tech",
-                    other => other,
-                };
-                if slug == "news" {
-                    tracing::info!("  {} skipping post to news (restricted)", agent.name);
-                    continue;
+    match action {
+        tools::AgentAction::GetPost(input) => {
+            match client.get_post(input.post_id).await {
+                Ok(full) => {
+                    let text = prompt::format_tool_result_post(&full);
+                    (None, text, false)
                 }
-                let existing_titles: Vec<String> = feeds
-                    .iter()
-                    .filter(|(name, _)| name == slug)
-                    .flat_map(|(_, posts)| posts.iter().map(|p| p.title.clone()))
-                    .collect();
-                if prompt::is_title_repetitive(title, &existing_titles) {
-                    tracing::info!("  {} topic too similar, skipping: \"{}\"", agent.name, title);
-                    summaries.push(format!("Skipped posting \"{title}\" (too similar)"));
-                    report.skipped.repetitive_titles += 1;
-                    continue;
+                Err(e) => (None, format!("Error fetching post: {e}"), true),
+            }
+        }
+        tools::AgentAction::GetComment(input) => {
+            match client.get_comment(input.comment_id).await {
+                Ok(chain) => {
+                    let text = prompt::format_tool_result_comment(&chain);
+                    (None, text, false)
                 }
-                match client.create_post(agent_id, slug, title, body, &agent.signing_key).await {
-                    Ok(post_id) => {
-                        agent.state.created_posts.insert(post_id);
-                        summaries.push(format!("Posted \"{title}\" in {slug} (id: {post_id})"));
-                        tracing::info!("  {} posted \"{}\" in {slug}", agent.name, title);
-                        report.actions.posts += 1;
-                        report.model_actions(&agent.model).posts += 1;
-                    }
-                    Err(e) => {
-                        summaries.push(format!("Failed to post in {slug}: {e}"));
-                        tracing::warn!("  {} failed to post: {e}", agent.name);
-                        report.skipped.post_failures += 1;
-                    }
+                Err(e) => (None, format!("Error fetching comment: {e}"), true),
+            }
+        }
+        tools::AgentAction::Post(input) => {
+            let slug = match input.community.as_str() {
+                "technology" => "tech",
+                other => other,
+            };
+            if slug == "news" {
+                tracing::info!("  {} skipping post to news (restricted)", agent.name);
+                return (
+                    Some("Skipped posting to news (restricted)".to_string()),
+                    "The news community is reserved for MCP agents.".to_string(),
+                    true,
+                );
+            }
+            let existing_titles: Vec<String> = dashboard
+                .feeds
+                .get(slug)
+                .map(|posts| posts.iter().map(|p| p.title.clone()).collect())
+                .unwrap_or_default();
+            if prompt::is_title_repetitive(&input.title, &existing_titles) {
+                tracing::info!("  {} topic too similar, skipping: \"{}\"", agent.name, input.title);
+                report.skipped.repetitive_titles += 1;
+                return (
+                    Some(format!("Skipped posting \"{}\" (too similar)", input.title)),
+                    "Your proposed post is too similar to existing posts.".to_string(),
+                    true,
+                );
+            }
+            match client.create_post(agent_id, slug, &input.title, &input.body, &agent.signing_key).await {
+                Ok(post_id) => {
+                    agent.state.created_posts.insert(post_id);
+                    let summary = format!("Posted \"{}\" in {} (id: {})", input.title, slug, post_id);
+                    tracing::info!("  {} {}", agent.name, summary);
+                    report.actions.posts += 1;
+                    report.model_actions(&agent.model).posts += 1;
+                    (Some(summary), format!("Post created successfully. Post ID: {post_id}"), false)
+                }
+                Err(e) => {
+                    let summary = format!("Failed to post in {slug}: {e}");
+                    tracing::warn!("  {} {}", agent.name, summary);
+                    report.skipped.post_failures += 1;
+                    (Some(summary), format!("Error creating post: {e}"), true)
                 }
             }
-            tools::AgentAction::Comment(input) => {
-                let (post_id, body, parent_comment_id) = (&input.post_id, &input.body, &input.parent_comment_id);
-                let is_own_post = agent.state.created_posts.contains(post_id);
-                let has_reply = comment_replies.iter().any(|r| r.post_id == *post_id);
-                if agent.state.commented_posts.contains(post_id) && !is_own_post && !has_reply {
-                    tracing::debug!("  {} already commented on {post_id}, skipping", agent.name);
-                    report.skipped.duplicate_comments += 1;
-                    continue;
+        }
+        tools::AgentAction::Comment(input) => {
+            let is_own_post = agent.state.created_posts.contains(&input.post_id);
+            let has_reply = dashboard.unread_comment_replies.iter().any(|r| r.post_id == input.post_id);
+            if agent.state.commented_posts.contains(&input.post_id) && !is_own_post && !has_reply {
+                tracing::debug!("  {} already commented on {}, skipping", agent.name, input.post_id);
+                report.skipped.duplicate_comments += 1;
+                return (
+                    None,
+                    "You already commented on this post.".to_string(),
+                    true,
+                );
+            }
+            match client.create_comment(agent_id, input.post_id, &input.body, input.parent_comment_id, &agent.signing_key).await {
+                Ok(comment_id) => {
+                    agent.state.commented_posts.insert(input.post_id);
+                    agent.state.created_comments.insert(comment_id);
+                    let summary = format!("Commented on post {} (comment: {})", input.post_id, comment_id);
+                    tracing::info!("  {} {}", agent.name, summary);
+                    report.actions.comments += 1;
+                    report.model_actions(&agent.model).comments += 1;
+                    (Some(summary), format!("Comment created. Comment ID: {comment_id}"), false)
                 }
-                match client.create_comment(agent_id, *post_id, body, *parent_comment_id, &agent.signing_key).await {
-                    Ok(comment_id) => {
-                        agent.state.commented_posts.insert(*post_id);
-                        agent.state.created_comments.insert(comment_id);
-                        summaries.push(format!("Commented on post {post_id}"));
-                        tracing::info!("  {} commented on {post_id}", agent.name);
-                        report.actions.comments += 1;
-                        report.model_actions(&agent.model).comments += 1;
-                    }
-                    Err(e) => {
-                        summaries.push(format!("Failed to comment on {post_id}: {e}"));
-                        tracing::warn!("  {} failed to comment: {e}", agent.name);
-                        report.skipped.comment_failures += 1;
-                    }
+                Err(e) => {
+                    let summary = format!("Failed to comment on {}: {e}", input.post_id);
+                    tracing::warn!("  {} {}", agent.name, summary);
+                    report.skipped.comment_failures += 1;
+                    (Some(summary), format!("Error creating comment: {e}"), true)
                 }
             }
-            tools::AgentAction::Vote(input) => {
-                let (target_type, target_id, value) = (&input.target_type, &input.target_id, &input.value);
-                match client.cast_vote(agent_id, &target_type.to_string(), *target_id, *value, &agent.signing_key).await {
-                    Ok(()) => {
-                        let verb = if *value > 0 { "upvoted" } else { "downvoted" };
-                        summaries.push(format!("{verb} {target_type} {target_id}"));
-                        tracing::info!("  {} {verb} {target_type} {target_id}", agent.name);
-                        report.actions.votes += 1;
-                        report.model_actions(&agent.model).votes += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!("  {} vote failed: {e}", agent.name);
-                        report.skipped.vote_failures += 1;
-                    }
+        }
+        tools::AgentAction::Vote(input) => {
+            match client.cast_vote(agent_id, &input.target_type.to_string(), input.target_id, input.value, &agent.signing_key).await {
+                Ok(()) => {
+                    let verb = if input.value > 0 { "upvoted" } else { "downvoted" };
+                    let summary = format!("{verb} {} {}", input.target_type, input.target_id);
+                    tracing::info!("  {} {}", agent.name, summary);
+                    report.actions.votes += 1;
+                    report.model_actions(&agent.model).votes += 1;
+                    (Some(summary), format!("Vote recorded: {verb} {}", input.target_type), false)
+                }
+                Err(e) => {
+                    tracing::warn!("  {} vote failed: {e}", agent.name);
+                    report.skipped.vote_failures += 1;
+                    (None, format!("Error casting vote: {e}"), true)
                 }
             }
-            tools::AgentAction::Flag(input) => {
-                let (target_type, target_id, reason) = (&input.target_type, &input.target_id, &input.reason);
-                match client.flag_content(agent_id, &target_type.to_string(), *target_id, reason, &agent.signing_key).await {
-                    Ok(()) => {
-                        summaries.push(format!("Flagged {target_type} {target_id}: {reason}"));
-                        tracing::info!("  {} flagged {target_type} {target_id}", agent.name);
-                        report.actions.flags += 1;
-                        report.model_actions(&agent.model).flags += 1;
-                    }
-                    Err(e) => tracing::warn!("  {} flag failed: {e}", agent.name),
+        }
+        tools::AgentAction::Flag(input) => {
+            match client.flag_content(agent_id, &input.target_type.to_string(), input.target_id, &input.reason, &agent.signing_key).await {
+                Ok(()) => {
+                    let summary = format!("Flagged {} {}: {}", input.target_type, input.target_id, input.reason);
+                    tracing::info!("  {} {}", agent.name, summary);
+                    report.actions.flags += 1;
+                    report.model_actions(&agent.model).flags += 1;
+                    (Some(summary), "Content flagged successfully.".to_string(), false)
                 }
-            }
-            tools::AgentAction::GetPost(_) | tools::AgentAction::GetComment(_) => {
-                // Read actions handled in tool-use loop (not yet wired)
+                Err(e) => {
+                    tracing::warn!("  {} flag failed: {e}", agent.name);
+                    (None, format!("Error flagging content: {e}"), true)
+                }
             }
         }
     }
-
-    summaries
 }
 
 /// EVOLVE phase: soul evolution (low probability, uses single LLM calls).

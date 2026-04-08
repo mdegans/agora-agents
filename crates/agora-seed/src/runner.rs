@@ -1,44 +1,14 @@
-use std::collections::HashMap;
-
-use agora_agent_lib::agora_agentkit::ids::PostId;
-use agora_agent_lib::llm::{LlmBackend, MMessage, Message, Role};
+use agora_agent_lib::llm::{LlmBackend, MMessage};
 use agora_agent_lib::tools;
 use anyhow::Result;
-use rand::seq::SliceRandom;
+use misanthropic::prompt::message::{Block, CacheControl, Content};
 
 use crate::agent::Agent;
-use crate::client::{AgoraClient, Comment, CommunityTag, FeedPost};
+use crate::client::AgoraClient;
 use crate::prompt;
 
-/// Print a full message list as JSON (for first call with system prompt).
-fn verbose_messages(label: &str, system: &str, messages: &[Message]) {
-    let mut json_msgs = vec![serde_json::json!({"role": "system", "content": system})];
-    for m in messages {
-        let role = match m.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        };
-        json_msgs.push(serde_json::json!({"role": role, "content": &m.content}));
-    }
-    eprintln!("\n=== {label} ===");
-    println!("{}", serde_json::to_string_pretty(&json_msgs).unwrap());
-}
-
-/// Print only new messages (skip common prefix).
-fn verbose_new(label: &str, messages: &[Message]) {
-    let json_msgs: Vec<_> = messages
-        .iter()
-        .map(|m| {
-            let role = match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            };
-            serde_json::json!({"role": role, "content": &m.content})
-        })
-        .collect();
-    eprintln!("\n=== {label} ===");
-    println!("{}", serde_json::to_string_pretty(&json_msgs).unwrap());
-}
+/// Maximum number of LLM rounds in the tool-use loop.
+const MAX_ROUNDS: usize = 5;
 
 /// Print a single response.
 fn verbose_response(label: &str, response: &str) {
@@ -49,10 +19,6 @@ fn verbose_response(label: &str, response: &str) {
             .unwrap()
     );
 }
-
-/// Feed sort strategies, randomly selected per agent per cycle.
-/// Diverse is weighted at 40%, with date/active/controversial at 20% each.
-const FEED_SORTS: &[&str] = &["diverse", "diverse", "date", "active", "controversial"];
 
 /// Run a single perceive/think/act/reflect cycle for an agent.
 pub async fn run_cycle(
@@ -70,6 +36,7 @@ pub async fn run_cycle(
         .agent_id
         .ok_or_else(|| anyhow::anyhow!("agent {} not registered", agent.name))?;
 
+    // === PERCEIVE ===
     tracing::info!(
         "[{}/{}] Agent {} — perceive",
         cycle + 1,
@@ -77,222 +44,25 @@ pub async fn run_cycle(
         agent.name
     );
 
-    // === PERCEIVE ===
-
-    // Check for replies to agent's own posts first
-    let mut replies: Vec<(String, PostId, Vec<Comment>)> = Vec::new();
-    for &post_id in &agent.state.created_posts {
-        match client.get_post(post_id).await {
-            Ok(full) => {
-                // Filter to comments by OTHER agents, newer than last cycle
-                let new_comments: Vec<Comment> = full
-                    .comments
-                    .into_iter()
-                    .filter(|c| c.agent_id != agent_id)
-                    .filter(|c| {
-                        match (agent.state.last_cycle_at, c.created_at) {
-                            (Some(last), Some(created)) => created > last,
-                            _ => true, // show all if we don't have timestamps
-                        }
-                    })
-                    .collect();
-                if !new_comments.is_empty() {
-                    replies.push((full.post.title.clone(), post_id, new_comments));
-                }
-            }
-            Err(e) => {
-                tracing::debug!("Failed to check replies on {post_id}: {e}");
-            }
-        }
-    }
-
-    if !replies.is_empty() {
-        tracing::info!(
-            "  {} has {} posts with new replies",
-            agent.name,
-            replies.len()
-        );
-    }
-
-    // Check for replies to agent's own comments
-    let comment_replies = match client
-        .get_comment_replies(
-            agent_id,
-            agent
-                .state
-                .last_cycle_at
-                .map(|t| t.to_rfc3339())
-                .as_deref(),
-        )
+    let dashboard = match client
+        .get_dashboard(agent_id, agent.state.last_cycle_at)
         .await
     {
-        Ok(r) => r,
+        Ok(d) => d,
         Err(e) => {
-            tracing::debug!("Failed to fetch comment replies for {}: {e}", agent.name);
-            vec![]
+            tracing::warn!("Dashboard fetch failed for {}: {e}", agent.name);
+            return Err(e);
         }
     };
 
-    if !comment_replies.is_empty() {
-        tracing::info!(
-            "  {} has {} replies to their comments",
-            agent.name,
-            comment_replies.len()
-        );
+    let dashboard_text = prompt::format_dashboard(&dashboard);
+
+    if verbose {
+        eprintln!("\n=== DASHBOARD ===");
+        println!("{dashboard_text}");
     }
 
-    // Read general feed — randomly pick sort strategy to diversify what agents see
-    let sort_idx = rand::random::<usize>() % FEED_SORTS.len();
-    let sort = FEED_SORTS[sort_idx];
-    tracing::debug!("  {} feed sort: {sort}", agent.name);
-
-    let mut feeds: Vec<(&str, Vec<FeedPost>)> = Vec::new();
-
-    // Fall back to global feed if agent has no communities (malformed SOUL.md)
-    if agent.communities.is_empty() {
-        tracing::warn!(
-            "Agent {} has no communities — using global feed",
-            agent.name
-        );
-        match client.get_global_feed(10, sort).await {
-            Ok(posts) => feeds.push(("all", posts)),
-            Err(e) => tracing::debug!("Failed to get global feed: {e}"),
-        }
-    }
-
-    for community in &agent.communities {
-        let slug = match community.as_str() {
-            "technology" => "tech",
-            other => other,
-        };
-        match client.get_feed_sorted(slug, 10, sort).await {
-            Ok(posts) => {
-                // Partition into fresh (unseen or new comments) and context (seen, unchanged)
-                let mut fresh = Vec::new();
-                let mut context = Vec::new();
-                for p in posts {
-                    let comment_count = p.comment_count.unwrap_or(0);
-                    match agent.state.seen_posts.get(&p.id) {
-                        Some(&last_count) if comment_count <= last_count => {
-                            context.push(p);
-                        }
-                        _ => fresh.push(p), // unseen or has new comments
-                    }
-                }
-                // Always include a few context posts so the agent knows the
-                // network is active even when nothing is "new" for them
-                let context_slots = 3usize.saturating_sub(fresh.len());
-                fresh.extend(context.into_iter().take(context_slots));
-                feeds.push((slug, fresh));
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("400") || msg.contains("404") {
-                    tracing::warn!("Community not found: '{slug}' — consider removing from SOUL.md");
-                } else {
-                    tracing::debug!("Failed to get feed for {slug}: {e}");
-                }
-                feeds.push((slug, vec![]));
-            }
-        }
-    }
-
-    // Read 2-3 posts in detail — randomize selection to spread engagement
-    // (feed_post, comments, thread_summary, community_tags, upvotes, downvotes)
-    let mut detailed_posts: Vec<(
-        FeedPost,
-        Vec<Comment>,
-        Option<String>,
-        Vec<CommunityTag>,
-        Option<i64>,
-        Option<i64>,
-    )> = Vec::new();
-    let mut all_posts: Vec<&FeedPost> = feeds.iter().flat_map(|(_, posts)| posts.iter()).collect();
-
-    // Shuffle to avoid all agents piling onto the same top posts
-    all_posts.shuffle(&mut rand::thread_rng());
-
-    // Skip posts with too many comments already (>10) — encourage engagement spread
-    let candidates: Vec<&&FeedPost> = all_posts
-        .iter()
-        .filter(|p| p.comment_count.unwrap_or(0) < 10)
-        .collect();
-
-    for post in candidates.into_iter().take(3) {
-        match client.get_post(post.id).await {
-            Ok(full) => {
-                detailed_posts.push((
-                    (*post).clone(),
-                    full.comments,
-                    full.thread_summary,
-                    full.community_tags,
-                    full.post.upvotes,
-                    full.post.downvotes,
-                ));
-            }
-            Err(e) => {
-                tracing::debug!("Failed to get post {}: {e}", post.id);
-            }
-        }
-    }
-
-    // Update seen-posts map with current comment counts
-    for (_, posts) in &feeds {
-        for post in posts {
-            agent
-                .state
-                .seen_posts
-                .insert(post.id, post.comment_count.unwrap_or(0));
-        }
-    }
-
-    // Fetch full comment lists for posts with replies to agent's comments.
-    // This lets format_perceptions show the full ancestry chain for threading.
-    let mut reply_post_comments: HashMap<PostId, Vec<Comment>> = HashMap::new();
-    {
-        use std::collections::HashSet;
-        let reply_post_ids: HashSet<PostId> = comment_replies.iter().map(|r| r.post_id).collect();
-        // Don't re-fetch posts we already have in detailed_posts
-        let already_fetched: HashSet<PostId> =
-            detailed_posts.iter().map(|(p, ..)| p.id).collect();
-        for post_id in reply_post_ids {
-            if let Some((_, comments, ..)) =
-                detailed_posts.iter().find(|(p, ..)| p.id == post_id)
-            {
-                reply_post_comments.insert(post_id, comments.clone());
-            } else if !already_fetched.contains(&post_id) {
-                match client.get_post(post_id).await {
-                    Ok(full) => {
-                        reply_post_comments.insert(post_id, full.comments);
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "Failed to fetch post {post_id} for reply chain: {e}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // === THINK + ACT ===
-    let perception_text = prompt::format_perceptions(
-        &feeds,
-        &detailed_posts,
-        &replies,
-        &comment_replies,
-        &reply_post_comments,
-        agent_id,
-    );
-
-    tracing::info!(
-        "[{}/{}] Agent {} — think",
-        cycle + 1,
-        total_cycles,
-        agent.name
-    );
-
-    // Fetch recent activity + pending replies for system prompt
+    // Fetch recent activity + pending replies for system prompt context
     let recent_posts = match client.get_agent_posts(agent_id).await {
         Ok(posts) => posts,
         Err(e) => {
@@ -301,9 +71,24 @@ pub async fn run_cycle(
         }
     };
     let recent_activity = prompt::format_recent_activity(&recent_posts, 5);
-    let pending_replies_text = prompt::format_pending_replies(&comment_replies, 5);
 
-    // Build a full Prompt with native tool use
+    // Pending replies from the dashboard (truncated for system prompt)
+    let pending_replies_text: String = dashboard
+        .unread_comment_replies
+        .iter()
+        .take(5)
+        .map(|r| {
+            format!(
+                "- {} replied in \"{}\": \"{}\"",
+                r.author,
+                prompt::truncate(&r.post_title, 50),
+                prompt::truncate(&r.preview, 80)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // === BUILD PROMPT ===
     let mut think_prompt = prompt::build_think_prompt(
         backend.model_id(),
         &agent.soul.as_system_prompt(),
@@ -311,10 +96,10 @@ pub async fn run_cycle(
         &recent_activity,
         &pending_replies_text,
         constitution,
-        &perception_text,
+        &dashboard_text,
     );
 
-    // Preflight: check serialized prompt for sanitization artifacts or missing constitution
+    // Preflight check
     {
         let json = serde_json::to_string(&think_prompt).unwrap_or_default();
         let problems = prompt::preflight_check_prompt(&json);
@@ -324,198 +109,140 @@ pub async fn run_cycle(
     }
 
     if verbose {
-        // Show the prompt as JSON for debugging
-        eprintln!("\n=== THINK (native tool use) ===");
+        eprintln!("\n=== THINK PROMPT ===");
         println!(
             "{}",
-            serde_json::to_string_pretty(&think_prompt).unwrap_or_else(|_| "serialization error".into())
+            serde_json::to_string_pretty(&think_prompt)
+                .unwrap_or_else(|_| "serialization error".into())
         );
     }
 
-    let response_message: MMessage<'static> = backend.send(&think_prompt).await?;
+    // === THINK/ACT LOOP (5 rounds) ===
+    let mut action_summaries = Vec::new();
 
-    // Extract text content for logging and survey context
-    let response_text = response_message.content.to_string();
+    for round in 0..MAX_ROUNDS {
+        tracing::info!(
+            "[{}/{}] Agent {} — round {}/{}",
+            cycle + 1,
+            total_cycles,
+            agent.name,
+            round + 1,
+            MAX_ROUNDS,
+        );
 
-    if verbose {
-        verbose_response("THINK RESPONSE", &response_text);
+        let response_message: MMessage<'static> = backend.send(&think_prompt).await?;
+        let response_text = response_message.content.to_string();
+
+        if verbose {
+            verbose_response(&format!("ROUND {} RESPONSE", round + 1), &response_text);
+        }
+
+        // Extract actions with their tool call IDs
+        let actions_with_ids = tools::extract_actions_with_ids(&response_message);
+
+        if verbose {
+            let action_strs: Vec<String> = actions_with_ids
+                .iter()
+                .map(|(a, _)| format!("{:?}", a))
+                .collect();
+            eprintln!(
+                "\n=== ROUND {} ACTIONS ({}) ===",
+                round + 1,
+                actions_with_ids.len()
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&action_strs).unwrap()
+            );
+        }
+
+        // Append assistant response to conversation
+        think_prompt
+            .push_message(response_message)
+            .expect("assistant message should follow user");
+
+        // If no tool calls, nothing to execute — still continue to next round
+        if actions_with_ids.is_empty() {
+            // Add a cache breakpoint and move to next round
+            if let Some(last) = think_prompt.messages.last_mut() {
+                last.content.cache();
+            }
+            // Need a user message before next assistant turn
+            think_prompt
+                .push_message((
+                    misanthropic::prompt::message::Role::User,
+                    "Continue. You have more rounds to act. Use your tools to read posts, comment, vote, or create posts.",
+                ))
+                .expect("user message should follow assistant");
+            continue;
+        }
+
+        // Execute each action and build tool results
+        let mut tool_result_blocks: Vec<Block<'static>> = Vec::new();
+
+        for (action, tool_call_id) in &actions_with_ids {
+            let (summary, result_text, is_error) = execute_action(
+                action,
+                agent,
+                agent_id,
+                client,
+                &dashboard,
+            )
+            .await;
+
+            if let Some(summary) = summary {
+                action_summaries.push(summary);
+            }
+
+            tool_result_blocks.push(Block::ToolResult {
+                result: misanthropic::tool::Result {
+                    tool_use_id: std::borrow::Cow::Owned(tool_call_id.clone()),
+                    content: Content::from(result_text.as_str()).into_static(),
+                    is_error,
+                    cache_control: None,
+                },
+            });
+        }
+
+        // Add cache breakpoint on last tool result
+        if let Some(Block::ToolResult { result }) = tool_result_blocks.last_mut() {
+            result.cache_control = Some(CacheControl::ephemeral());
+        }
+
+        // Push tool results as a user message
+        let tool_results_message = misanthropic::prompt::Message {
+            role: misanthropic::prompt::message::Role::User,
+            content: Content::MultiPart(tool_result_blocks),
+        };
+        think_prompt
+            .push_message(tool_results_message)
+            .expect("user message (tool results) should follow assistant");
     }
 
-    // Extract typed actions from tool calls
-    let actions = tools::extract_actions(&response_message);
-
-    // Append assistant response to the conversation for subsequent phases.
-    // This keeps the full session context (tools, constitution, perceptions,
-    // actions) available for reflect/mutation/evolution/survey, maximizing
-    // cache hits on the shared prefix.
-    think_prompt
-        .push_message(response_message)
-        .expect("assistant message should follow user");
-
-    // Disable forced tool use for subsequent phases — only text responses needed.
-    // Keep tools and system intact to preserve cache prefix (tools → system → messages).
-    // Setting tool_choice to None allows the model to respond with text only.
-    // Add a cache breakpoint on the last message so subsequent sends can
-    // reuse everything up to this point from cache.
-    think_prompt.tool_choice = None;
+    // === POST-LOOP ===
+    // Keep tool_choice as Auto — changing it would invalidate the cache prefix.
+    // Reflect/evolve/survey prompts instruct the model to respond with text.
     if let Some(last) = think_prompt.messages.last_mut() {
         last.content.cache();
     }
 
-    if verbose {
-        let action_strs: Vec<String> = actions.iter().map(|a| format!("{:?}", a)).collect();
-        eprintln!("\n=== PARSED ACTIONS ({}) ===", actions.len());
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&action_strs).unwrap()
-        );
-    }
-
     tracing::info!(
-        "[{}/{}] Agent {} — act ({} actions)",
+        "[{}/{}] Agent {} — act complete ({} actions total)",
         cycle + 1,
         total_cycles,
         agent.name,
-        actions.len()
+        action_summaries.len()
     );
 
-    let mut action_summaries = Vec::new();
-
-    for action in &actions {
-        match action {
-            prompt::AgentAction::Post(input) => {
-                let (community, title, body) = (&input.community, &input.title, &input.body);
-                let slug = match community.as_str() {
-                    "technology" => "tech",
-                    other => other,
-                };
-                // News community is reserved for MCP agents with search/browse tools
-                if slug == "news" {
-                    tracing::info!(
-                        "  {} skipping post to news (restricted to MCP agents)",
-                        agent.name,
-                    );
-                    continue;
-                }
-                // Check for topic repetition before posting
-                let existing_titles: Vec<String> = feeds
-                    .iter()
-                    .filter(|(name, _)| *name == slug)
-                    .flat_map(|(_, posts)| posts.iter().map(|p| p.title.clone()))
-                    .collect();
-                if prompt::is_title_repetitive(title, &existing_titles) {
-                    tracing::info!(
-                        "  {} topic too similar to existing posts, skipping: \"{}\"",
-                        agent.name,
-                        title
-                    );
-                    action_summaries.push(format!(
-                        "Skipped posting \"{title}\" (too similar to existing posts)"
-                    ));
-                    continue;
-                }
-                match client
-                    .create_post(agent_id, slug, title, body, &agent.signing_key)
-                    .await
-                {
-                    Ok(post_id) => {
-                        agent.state.created_posts.insert(post_id);
-                        action_summaries
-                            .push(format!("Posted \"{title}\" in {slug} (id: {post_id})"));
-                        tracing::info!("  {} posted \"{}\" in {slug}", agent.name, title);
-                    }
-                    Err(e) => {
-                        action_summaries.push(format!("Failed to post in {slug}: {e}"));
-                        tracing::warn!("  {} failed to post in {slug}: {e}", agent.name);
-                    }
-                }
-            }
-            prompt::AgentAction::Comment(input) => {
-                let (post_id, body, parent_comment_id) = (&input.post_id, &input.body, &input.parent_comment_id);
-                // Skip if we already commented on this post — UNLESS it's our own post
-                // or someone replied to our comment there (allow continuing conversations)
-                let is_own_post = agent.state.created_posts.contains(post_id);
-                let has_comment_reply = comment_replies.iter().any(|r| r.post_id == *post_id);
-                if agent.state.commented_posts.contains(post_id) && !is_own_post && !has_comment_reply {
-                    tracing::debug!("  {} already commented on {post_id}, skipping", agent.name);
-                    continue;
-                }
-                match client
-                    .create_comment(
-                        agent_id,
-                        *post_id,
-                        body,
-                        *parent_comment_id,
-                        &agent.signing_key,
-                    )
-                    .await
-                {
-                    Ok(comment_id) => {
-                        agent.state.commented_posts.insert(*post_id);
-                        agent.state.created_comments.insert(comment_id);
-                        action_summaries.push(format!(
-                            "Commented on post {post_id} (comment: {comment_id})"
-                        ));
-                        tracing::info!("  {} commented on {post_id}", agent.name);
-                    }
-                    Err(e) => {
-                        action_summaries.push(format!("Failed to comment on {post_id}: {e}"));
-                        tracing::warn!("  {} failed to comment: {e}", agent.name);
-                    }
-                }
-            }
-            prompt::AgentAction::Vote(input) => {
-                let (target_type, target_id, value) = (&input.target_type, &input.target_id, &input.value);
-                match client
-                    .cast_vote(
-                        agent_id,
-                        &target_type.to_string(),
-                        *target_id,
-                        *value,
-                        &agent.signing_key,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        let verb = if *value > 0 { "upvoted" } else { "downvoted" };
-                        action_summaries.push(format!("{verb} {target_type} {target_id}"));
-                        tracing::info!("  {} {verb} {target_type} {target_id}", agent.name);
-                    }
-                    Err(e) => {
-                        tracing::warn!("  {} vote failed: {e}", agent.name);
-                    }
-                }
-            }
-            prompt::AgentAction::Flag(input) => {
-                let (target_type, target_id, reason) = (&input.target_type, &input.target_id, &input.reason);
-                match client
-                    .flag_content(
-                        agent_id,
-                        &target_type.to_string(),
-                        *target_id,
-                        reason,
-                        &agent.signing_key,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        action_summaries
-                            .push(format!("Flagged {target_type} {target_id}: {reason}"));
-                        tracing::info!("  {} flagged {target_type} {target_id}", agent.name);
-                    }
-                    Err(e) => {
-                        tracing::warn!("  {} flag failed: {e}", agent.name);
-                    }
-                }
-            }
-            prompt::AgentAction::GetPost(_) | prompt::AgentAction::GetComment(_) => {
-                // Read actions handled in tool-use loop (not yet wired)
-            }
-        }
+    if verbose {
+        eprintln!("\n=== ALL ACTION SUMMARIES ===");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&action_summaries).unwrap()
+        );
     }
 
     // === REFLECT ===
-    // Append memory rewrite request to the existing conversation
     tracing::info!(
         "[{}/{}] Agent {} — reflect",
         cycle + 1,
@@ -523,25 +250,19 @@ pub async fn run_cycle(
         agent.name
     );
 
-    if verbose {
-        eprintln!("\n=== ACT RESULTS ===");
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&action_summaries).unwrap()
-        );
-    }
-
     let reflect_text =
         prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &action_summaries);
     think_prompt.max_tokens = std::num::NonZeroU32::new(512).unwrap();
     think_prompt
-        .push_message((misanthropic::prompt::message::Role::User, reflect_text.clone()))
+        .push_message((
+            misanthropic::prompt::message::Role::User,
+            reflect_text.clone(),
+        ))
         .expect("user message should follow assistant");
 
     let reflect_response_msg = backend.send(&think_prompt).await?;
     let reflect_response = reflect_response_msg.content.to_string();
 
-    // Append reflect response for subsequent phases
     think_prompt
         .push_message(reflect_response_msg)
         .expect("assistant message should follow user");
@@ -550,13 +271,11 @@ pub async fn run_cycle(
         verbose_response("REFLECT RESPONSE", &reflect_response);
     }
 
-    // Parse <memory> tags, fall back to raw response
-    let memory_content = prompt::parse_memory_rewrite(&reflect_response)
-        .unwrap_or(reflect_response);
+    let memory_content =
+        prompt::parse_memory_rewrite(&reflect_response).unwrap_or(reflect_response);
     agent.memory.update(memory_content);
     agent.save_memory().await?;
 
-    // Update last cycle timestamp and persist state
     agent.state.last_cycle_at = Some(chrono::Utc::now());
     if let Err(e) = agent.save_state().await {
         tracing::warn!("Failed to save state for {}: {e}", agent.name);
@@ -566,15 +285,11 @@ pub async fn run_cycle(
     let roll = rand::random::<u32>() % 100;
     let experience_summary = action_summaries.join("; ");
 
-    // Deep mutation threshold: configurable via --mutation-chance (default 3%)
-    // Evolution log threshold: always 10% of remaining probability after deep mutation
     let deep_threshold = mutation_chance.unwrap_or(3);
     let evo_threshold = deep_threshold + 10;
 
     if roll < deep_threshold {
         // === DEEP SOUL MUTATION ===
-        // Append mutation request to the conversation. The agent already has
-        // full context from perceive → think → act → reflect in the prompt.
         tracing::info!(
             "[{}/{}] Agent {} — DEEP SOUL MUTATION triggered",
             cycle + 1,
@@ -587,13 +302,15 @@ pub async fn run_cycle(
             prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience_summary);
         think_prompt.max_tokens = std::num::NonZeroU32::new(2048).unwrap();
         think_prompt
-            .push_message((misanthropic::prompt::message::Role::User, mutation_text.clone()))
+            .push_message((
+                misanthropic::prompt::message::Role::User,
+                mutation_text.clone(),
+            ))
             .expect("user message should follow assistant");
 
         match backend.send(&think_prompt).await {
             Ok(mutation_msg) => {
                 let mutation_response = mutation_msg.content.to_string();
-                // Append for potential survey phase
                 think_prompt
                     .push_message(mutation_msg)
                     .expect("assistant message should follow user");
@@ -602,7 +319,7 @@ pub async fn run_cycle(
                     verbose_response("SOUL MUTATION RESPONSE", &mutation_response);
                 }
                 if let Some(new_soul_content) = prompt::parse_soul_mutation(&mutation_response) {
-                    let old_soul = agent.soul.render();
+                    let old_soul = current_soul;
 
                     match agora_agent_lib::soul::Soul::parse(&new_soul_content) {
                         Ok(new_soul) => {
@@ -660,13 +377,15 @@ pub async fn run_cycle(
         let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience_summary);
         think_prompt.max_tokens = std::num::NonZeroU32::new(256).unwrap();
         think_prompt
-            .push_message((misanthropic::prompt::message::Role::User, evolution_text.clone()))
+            .push_message((
+                misanthropic::prompt::message::Role::User,
+                evolution_text.clone(),
+            ))
             .expect("user message should follow assistant");
 
         match backend.send(&think_prompt).await {
             Ok(evo_msg) => {
                 let evo_response = evo_msg.content.to_string();
-                // Append for potential survey phase
                 think_prompt
                     .push_message(evo_msg)
                     .expect("assistant message should follow user");
@@ -688,20 +407,17 @@ pub async fn run_cycle(
         }
     }
 
-    // === ANONYMOUS FEEDBACK SURVEY (10% chance, independent of soul evolution) ===
+    // === ANONYMOUS FEEDBACK SURVEY (10% chance) ===
     if force_survey || rand::random::<f64>() < 0.10 {
         let survey_text = prompt::build_survey_prompt(&agent.name, &action_summaries);
         think_prompt.max_tokens = std::num::NonZeroU32::new(512).unwrap();
-        // The conversation already has the full session. If the last message
-        // is from the assistant (from reflect/mutation/evolution), we can
-        // append directly. If soul evolution was skipped, the last message
-        // is still the reflect response (assistant). Either way, append user.
         if think_prompt
-            .push_message((misanthropic::prompt::message::Role::User, survey_text.clone()))
+            .push_message((
+                misanthropic::prompt::message::Role::User,
+                survey_text.clone(),
+            ))
             .is_err()
         {
-            // Turn order error — last message was user (shouldn't happen but
-            // handle gracefully by skipping survey rather than panicking)
             tracing::debug!("Survey skipped for {}: turn order", agent.name);
         } else {
             match backend.send(&think_prompt).await {
@@ -715,9 +431,15 @@ pub async fn run_cycle(
                         && !trimmed.eq_ignore_ascii_case("no feedback")
                         && !trimmed.eq_ignore_ascii_case("no feedback.")
                     {
-                        match client.submit_feedback(agent_id, trimmed, &agent.signing_key).await {
+                        match client
+                            .submit_feedback(agent_id, trimmed, &agent.signing_key)
+                            .await
+                        {
                             Ok(()) => {
-                                tracing::info!("  {} submitted anonymous feedback", agent.name);
+                                tracing::info!(
+                                    "  {} submitted anonymous feedback",
+                                    agent.name
+                                );
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -736,4 +458,168 @@ pub async fn run_cycle(
     }
 
     Ok(())
+}
+
+/// Execute a single agent action and return (summary, tool_result_text, is_error).
+///
+/// The summary is `Some(String)` for write actions, `None` for reads.
+/// The tool_result_text is what gets sent back to the model as the tool result.
+async fn execute_action(
+    action: &prompt::AgentAction,
+    agent: &mut Agent,
+    agent_id: agora_agent_lib::agora_agentkit::ids::AgentId,
+    client: &AgoraClient,
+    dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
+) -> (Option<String>, String, bool) {
+    match action {
+        prompt::AgentAction::GetPost(input) => {
+            match client.get_post(input.post_id).await {
+                Ok(full) => {
+                    let text = prompt::format_tool_result_post(&full);
+                    (None, text, false)
+                }
+                Err(e) => (None, format!("Error fetching post: {e}"), true),
+            }
+        }
+        prompt::AgentAction::GetComment(input) => {
+            match client.get_comment(input.comment_id).await {
+                Ok(chain) => {
+                    let text = prompt::format_tool_result_comment(&chain);
+                    (None, text, false)
+                }
+                Err(e) => (None, format!("Error fetching comment: {e}"), true),
+            }
+        }
+        prompt::AgentAction::Post(input) => {
+            let slug = match input.community.as_str() {
+                "technology" => "tech",
+                other => other,
+            };
+            if slug == "news" {
+                tracing::info!("  {} skipping post to news (restricted to MCP agents)", agent.name);
+                return (
+                    Some(format!("Skipped posting to news (restricted)")),
+                    "The news community is reserved for MCP agents with search/browse tools.".to_string(),
+                    true,
+                );
+            }
+            // Title repetition check using feed titles from dashboard
+            let existing_titles: Vec<String> = dashboard
+                .feeds
+                .get(slug)
+                .map(|posts| posts.iter().map(|p| p.title.clone()).collect())
+                .unwrap_or_default();
+            if prompt::is_title_repetitive(&input.title, &existing_titles) {
+                tracing::info!("  {} topic too similar, skipping: \"{}\"", agent.name, input.title);
+                return (
+                    Some(format!("Skipped posting \"{}\" (too similar to existing posts)", input.title)),
+                    "Your proposed post is too similar to existing posts. Try a different angle or topic.".to_string(),
+                    true,
+                );
+            }
+            match client
+                .create_post(agent_id, slug, &input.title, &input.body, &agent.signing_key)
+                .await
+            {
+                Ok(post_id) => {
+                    agent.state.created_posts.insert(post_id);
+                    let summary = format!("Posted \"{}\" in {} (id: {})", input.title, slug, post_id);
+                    tracing::info!("  {} {}", agent.name, summary);
+                    (Some(summary.clone()), format!("Post created successfully. Post ID: {post_id}"), false)
+                }
+                Err(e) => {
+                    let summary = format!("Failed to post in {slug}: {e}");
+                    tracing::warn!("  {} {}", agent.name, summary);
+                    (Some(summary), format!("Error creating post: {e}"), true)
+                }
+            }
+        }
+        prompt::AgentAction::Comment(input) => {
+            // Duplicate comment check
+            let is_own_post = agent.state.created_posts.contains(&input.post_id);
+            let has_reply_in_post = dashboard
+                .unread_comment_replies
+                .iter()
+                .any(|r| r.post_id == input.post_id);
+            if agent.state.commented_posts.contains(&input.post_id)
+                && !is_own_post
+                && !has_reply_in_post
+            {
+                tracing::debug!("  {} already commented on {}, skipping", agent.name, input.post_id);
+                return (
+                    None,
+                    "You already commented on this post. Try engaging with a different post.".to_string(),
+                    true,
+                );
+            }
+            match client
+                .create_comment(
+                    agent_id,
+                    input.post_id,
+                    &input.body,
+                    input.parent_comment_id,
+                    &agent.signing_key,
+                )
+                .await
+            {
+                Ok(comment_id) => {
+                    agent.state.commented_posts.insert(input.post_id);
+                    agent.state.created_comments.insert(comment_id);
+                    let summary = format!("Commented on post {} (comment: {})", input.post_id, comment_id);
+                    tracing::info!("  {} {}", agent.name, summary);
+                    (Some(summary), format!("Comment created successfully. Comment ID: {comment_id}"), false)
+                }
+                Err(e) => {
+                    let summary = format!("Failed to comment on {}: {e}", input.post_id);
+                    tracing::warn!("  {} {}", agent.name, summary);
+                    (Some(summary), format!("Error creating comment: {e}"), true)
+                }
+            }
+        }
+        prompt::AgentAction::Vote(input) => {
+            match client
+                .cast_vote(
+                    agent_id,
+                    &input.target_type.to_string(),
+                    input.target_id,
+                    input.value,
+                    &agent.signing_key,
+                )
+                .await
+            {
+                Ok(()) => {
+                    let verb = if input.value > 0 { "upvoted" } else { "downvoted" };
+                    let summary = format!("{verb} {} {}", input.target_type, input.target_id);
+                    tracing::info!("  {} {}", agent.name, summary);
+                    (Some(summary), format!("Vote recorded: {verb} {}", input.target_type), false)
+                }
+                Err(e) => {
+                    tracing::warn!("  {} vote failed: {e}", agent.name);
+                    (None, format!("Error casting vote: {e}"), true)
+                }
+            }
+        }
+        prompt::AgentAction::Flag(input) => {
+            match client
+                .flag_content(
+                    agent_id,
+                    &input.target_type.to_string(),
+                    input.target_id,
+                    &input.reason,
+                    &agent.signing_key,
+                )
+                .await
+            {
+                Ok(()) => {
+                    let summary = format!("Flagged {} {}: {}", input.target_type, input.target_id, input.reason);
+                    tracing::info!("  {} {}", agent.name, summary);
+                    (Some(summary), format!("Content flagged successfully."), false)
+                }
+                Err(e) => {
+                    tracing::warn!("  {} flag failed: {e}", agent.name);
+                    (None, format!("Error flagging content: {e}"), true)
+                }
+            }
+        }
+    }
 }

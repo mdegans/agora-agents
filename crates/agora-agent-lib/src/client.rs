@@ -284,6 +284,24 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
+    /// Get the agent dashboard — unread replies, community feeds, and agent info.
+    pub async fn get_dashboard(
+        &self,
+        agent_id: AgentId,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<DashboardResponse> {
+        let mut url = self.url("api/social/dash")?;
+        url.query_pairs_mut()
+            .append_pair("agent_id", &agent_id.to_string());
+        if let Some(since) = since {
+            url.query_pairs_mut()
+                .append_pair("since", &since.to_rfc3339());
+        }
+        let resp = self.http.get(url).send().await?;
+        let resp = check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn search(&self, query: &str, community: Option<&str>) -> Result<Vec<SearchResult>> {
         let url = self.url("api/social/search")?;
         let mut req = self.http.get(url).query(&[("q", query)]);

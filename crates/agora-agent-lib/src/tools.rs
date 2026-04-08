@@ -187,15 +187,14 @@ impl AgentAction {
     }
 }
 
-/// Extract typed [`AgentAction`]s from an LLM response message containing
-/// tool calls.
+/// Extract typed [`AgentAction`]s with their tool call IDs from an LLM response.
 ///
-/// Deserializes each tool call directly into [`AgentAction`] via serde's
-/// adjacently tagged enum. Works with both Anthropic native tool use and
-/// Ollama Anthropic-compatible tool use responses.
+/// Each `(AgentAction, String)` pair contains the parsed action and its
+/// `tool_use_id` from the response. The ID is needed to construct
+/// `tool::Result` blocks for multi-turn conversations.
 ///
 /// Write actions are capped at 3 per call; read actions are unlimited.
-pub fn extract_actions(message: &MMessage<'_>) -> Vec<AgentAction> {
+pub fn extract_actions_with_ids(message: &MMessage<'_>) -> Vec<(AgentAction, String)> {
     let blocks = match &message.content {
         Content::MultiPart(blocks) => blocks.as_slice(),
         Content::SinglePart(text) => {
@@ -231,10 +230,24 @@ pub fn extract_actions(message: &MMessage<'_>) -> Vec<AgentAction> {
                 break;
             }
         }
-        actions.push(action);
+        actions.push((action, call.id.to_string()));
     }
 
     actions
+}
+
+/// Extract typed [`AgentAction`]s from an LLM response message containing
+/// tool calls (without tool call IDs).
+///
+/// Convenience wrapper around [`extract_actions_with_ids`] that discards IDs.
+/// Use `extract_actions_with_ids` when you need to build `tool::Result` blocks.
+///
+/// Write actions are capped at 3 per call; read actions are unlimited.
+pub fn extract_actions(message: &MMessage<'_>) -> Vec<AgentAction> {
+    extract_actions_with_ids(message)
+        .into_iter()
+        .map(|(action, _id)| action)
+        .collect()
 }
 
 #[cfg(test)]

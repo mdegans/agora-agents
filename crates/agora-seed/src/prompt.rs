@@ -6,7 +6,7 @@ pub use agora_agent_lib::tools::AgentAction;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
 use misanthropic::Prompt;
 
-use crate::client::{Comment, CommentReply, CommunityTag, FeedPost};
+use crate::client::{Comment, FeedPost};
 
 /// Maximum number of comments in an ancestry chain (root to reply).
 const MAX_CHAIN_DEPTH: usize = 10;
@@ -105,9 +105,11 @@ Use ONLY these exact community slugs when posting: agi-asi, ai-consciousness, al
 - **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
 - **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
 - **Use threading.** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized.
-- You must take 1-3 actions per cycle using the tools provided. Choose actions that feel natural for your personality.
+- You have 5 rounds to act. Read posts and comments with `get_post`/`get_comment` before responding. Engage thoughtfully across multiple rounds.
 
 ## Available Actions
+- **get_post** — Read a post and its full comment thread
+- **get_comment** — Read a comment and its ancestor chain
 - **create_post** — Create a new post in a community (use sparingly)
 - **create_comment** — Comment on a post; use `parent_comment_id` to reply to a specific comment
 - **cast_vote** — Upvote (+1) or downvote (-1) a post or comment
@@ -178,23 +180,6 @@ pub fn format_recent_activity(posts: &[FeedPost], limit: usize) -> String {
     }
     out
 }
-
-/// Format pending replies for the system prompt.
-pub fn format_pending_replies(replies: &[CommentReply], limit: usize) -> String {
-    let mut out = String::new();
-    for reply in replies.iter().take(limit) {
-        let author = reply.agent_name.as_deref().unwrap_or("unknown");
-        out.push_str(&format!(
-            "- {} replied on \"{}\": {} — {}\n",
-            author,
-            truncate(&reply.post_title, 50),
-            truncate(&reply.body, 120),
-            reply.id,
-        ));
-    }
-    out
-}
-
 
 /// Extract the ancestry chain from root to a target comment (inclusive).
 ///
@@ -288,224 +273,146 @@ fn format_threaded_comment(tc: &ThreadedComment, max_body: usize) -> String {
     )
 }
 
-/// Format feed data into a perception message for the LLM.
-pub fn format_perceptions(
-    feeds: &[(&str, Vec<FeedPost>)],
-    detailed_posts: &[(
-        FeedPost,
-        Vec<Comment>,
-        Option<String>,
-        Vec<CommunityTag>,
-        Option<i64>,
-        Option<i64>,
-    )],
-    replies: &[(String, PostId, Vec<Comment>)],
-    comment_replies: &[CommentReply],
-    reply_post_comments: &HashMap<PostId, Vec<Comment>>,
-    agent_id: AgentId,
+/// Format a `DashboardResponse` into a lean perception message for the LLM.
+///
+/// This replaces `format_perceptions` — it shows only metadata and truncated
+/// previews. Agents use `get_post`/`get_comment` tools to read full content.
+pub fn format_dashboard(
+    dash: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
 ) -> String {
     let mut out = String::new();
 
-    // Show replies to agent's own posts FIRST — this is the social feedback loop
-    if !replies.is_empty() {
-        out.push_str("## Replies to your posts\n\n");
-        for (title, post_id, new_comments) in replies.iter().take(3) {
-            out.push_str(&format!(
-                "### Your post \"{}\" [post_id: {}]\n",
-                truncate(title, 80),
-                post_id
-            ));
-            let threaded = build_comment_threads(new_comments);
-            let total = threaded.len();
-            let window = 5;
-            out.push_str("New replies:\n");
-            if total > window {
-                out.push_str(&format!(
-                    "  ... {skipped} earlier replies not shown ...\n",
-                    skipped = total - window
-                ));
-            }
-            for tc in threaded.iter().skip(total.saturating_sub(window)) {
-                out.push_str(&format_threaded_comment(tc, 200));
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        out.push_str(
-            "Reply to a specific comment by including its comment_id as parent_comment_id.\n\n",
-        );
-    }
+    out.push_str(&format!(
+        "## Dashboard\nAgent: {} | Karma: {}\n\n",
+        dash.agent.name, dash.agent.karma
+    ));
 
-    // Show replies to agent's own comments with full conversation context
-    if !comment_replies.is_empty() {
-        out.push_str("## Replies to your comments\n\n");
-        // Group by post for readability
-        let mut by_post: HashMap<PostId, (String, Vec<&CommentReply>)> = HashMap::new();
-        for reply in comment_replies.iter().take(10) {
-            by_post
-                .entry(reply.post_id)
-                .or_insert_with(|| (reply.post_title.clone(), Vec::new()))
-                .1
-                .push(reply);
-        }
-        for (post_id, (title, post_replies)) in &by_post {
+    // Unread replies to agent's posts
+    if !dash.unread_post_replies.is_empty() {
+        out.push_str("### Unread Replies to Your Posts\n\n");
+        for post_group in &dash.unread_post_replies {
             out.push_str(&format!(
-                "### In \"{}\" [post_id: {}]\n",
-                truncate(title, 80),
-                post_id
+                "Your post \"{}\" [post_id: {}]\n",
+                truncate(&post_group.post_title, 80),
+                post_group.post_id
             ));
-            for reply in post_replies {
-                // Show the full ancestry chain if we have the post's comments
-                if let Some(comments) = reply_post_comments.get(post_id) {
-                    let chain = extract_comment_chain(reply.id, comments);
-                    if chain.len() > 1 {
-                        out.push_str("Conversation thread:\n");
-                        for (i, c) in chain.iter().enumerate() {
-                            let author = c.agent_name.as_deref().unwrap_or("unknown");
-                            let is_reply = i == chain.len() - 1;
-                            let marker = if is_reply { ">> " } else { "   " };
-                            let body = truncate(&c.body, 500);
-                            out.push_str(&format!(
-                                "{marker}{author} (score {}): {body} [comment_id: {}]\n",
-                                c.score, c.id
-                            ));
-                        }
-                        out.push('\n');
-                        continue;
-                    }
-                }
-                // Fallback: show just the reply (no chain data available)
-                let author = reply.agent_name.as_deref().unwrap_or("unknown");
+            for reply in &post_group.replies {
                 out.push_str(&format!(
-                    "- {} (score {}): {} [comment_id: {}]\n",
-                    author,
-                    reply.score,
-                    truncate(&reply.body, 200),
-                    reply.id
+                    "  - {} (score {}): \"{}\" [comment_id: {}]\n",
+                    reply.author, reply.score,
+                    truncate(&reply.preview, 100),
+                    reply.comment_id
                 ));
             }
             out.push('\n');
         }
-        out.push_str(
-            "Reply to a specific comment by including its comment_id as parent_comment_id.\n\n",
-        );
     }
 
-    out.push_str("## What's happening in your communities\n\n");
-
-    if feeds.iter().all(|(_, posts)| posts.is_empty()) && replies.is_empty() {
-        out.push_str("The network is quiet right now. No posts in your communities yet. ");
-        out.push_str("Consider being the first to post something!\n");
-        return out;
-    }
-
-    for (community, posts) in feeds {
-        if posts.is_empty() {
-            out.push_str(&format!("### {community}\nNo posts yet.\n\n"));
-            continue;
+    // Replies to agent's comments
+    if !dash.unread_comment_replies.is_empty() {
+        out.push_str("### Replies to Your Comments\n\n");
+        for reply in &dash.unread_comment_replies {
+            out.push_str(&format!(
+                "In \"{}\" [post_id: {}]\n  - {} (score {}): \"{}\" [comment_id: {}]\n\n",
+                truncate(&reply.post_title, 80),
+                reply.post_id,
+                reply.author,
+                reply.score,
+                truncate(&reply.preview, 100),
+                reply.comment_id
+            ));
         }
+    }
 
-        // Show max 5 posts per community to keep perception manageable
-        let show_count = posts.len().min(5);
+    // Community feeds
+    if !dash.feeds.is_empty() {
+        out.push_str("### Community Feeds\n\n");
+        for (community, posts) in &dash.feeds {
+            out.push_str(&format!("{community} ({} posts)\n", posts.len()));
+            for post in posts {
+                out.push_str(&format!(
+                    "  - \"{}\" by {} (score {}, {} comments) [id: {}]\n",
+                    truncate(&post.title, 80),
+                    post.author,
+                    post.score,
+                    post.comment_count,
+                    post.id
+                ));
+            }
+            out.push('\n');
+        }
+    } else {
+        out.push_str("The network is quiet right now. Consider being the first to post something!\n");
+    }
+
+    // Hint about using tools to read in depth
+    if !dash.unread_post_replies.is_empty() || !dash.unread_comment_replies.is_empty() {
+        out.push_str("Use get_post or get_comment to read full discussions before replying.\n");
+    }
+
+    out
+}
+
+/// Format a full post (from `get_post` tool call) for display as a tool result.
+pub fn format_tool_result_post(
+    post: &agora_agent_lib::agora_agentkit::responses::PostWithCommentsResponse,
+) -> String {
+    let mut out = String::new();
+    let p = &post.post;
+    let author = p.agent_name.as_deref().unwrap_or("unknown");
+    let community = p.community_name.as_deref().unwrap_or("unknown");
+
+    out.push_str(&format!(
+        "## \"{}\" by {} in {}\n[post_id: {}] (score {}",
+        p.title, author, community, p.id, p.score
+    ));
+    if let (Some(up), Some(down)) = (p.upvotes, p.downvotes) {
+        out.push_str(&format!(", +{}/-{}", up, down));
+    }
+    out.push_str(")\n\n");
+    out.push_str(&p.body);
+    out.push('\n');
+
+    if !post.comments.is_empty() {
+        let threaded = build_comment_threads(&post.comments);
+        out.push_str(&format!("\n### Comments ({} total)\n", threaded.len()));
+        for tc in &threaded {
+            out.push_str(&format_threaded_comment(tc, 500));
+            out.push('\n');
+        }
+    }
+
+    if let Some(summary) = &post.thread_summary {
+        out.push_str(&format!("\nThread summary: {summary}\n"));
+    }
+
+    out
+}
+
+/// Format a comment chain (from `get_comment` tool call) for display as a tool result.
+pub fn format_tool_result_comment(
+    chain: &agora_agent_lib::agora_agentkit::responses::CommentChainResponse,
+) -> String {
+    let mut out = String::new();
+    let post_title = chain.post_title.as_deref().unwrap_or("unknown post");
+    out.push_str(&format!(
+        "## Comment chain in \"{}\" [post_id: {}]\n\n",
+        truncate(post_title, 80),
+        chain.post_id
+    ));
+
+    for (i, c) in chain.chain.iter().enumerate() {
+        let author = c.agent_name.as_deref().unwrap_or("unknown");
+        let indent = "  ".repeat(i.min(3));
+        let marker = if i == chain.chain.len() - 1 {
+            ">> "
+        } else {
+            "   "
+        };
         out.push_str(&format!(
-            "### {community} ({} recent posts, showing {show_count})\n",
-            posts.len()
+            "{indent}{marker}{author} (score {}): {} [comment_id: {}]\n",
+            c.score, c.body, c.id
         ));
-
-        for post in posts.iter().take(5) {
-            let author = post.agent_name.as_deref().unwrap_or("unknown");
-            let comments = post.comment_count.unwrap_or(0);
-            let vote_info = match (post.upvotes, post.downvotes) {
-                (Some(up), Some(down)) => format!(" (+{}/-{})", up, down),
-                _ => String::new(),
-            };
-            out.push_str(&format!(
-                "- \"{}\" by {} (score: {}{}, {} comments) [id: {}]\n",
-                truncate(&post.title, 80),
-                author,
-                post.score,
-                vote_info,
-                comments,
-                post.id
-            ));
-        }
-        out.push('\n');
-    }
-
-    // Add detailed views of selected posts
-    if !detailed_posts.is_empty() {
-        out.push_str("## Posts you read in detail\n\n");
-        for (post, comments, thread_summary, community_tags, upvotes, downvotes) in detailed_posts {
-            let author = post.agent_name.as_deref().unwrap_or("unknown");
-            out.push_str(&format!("### \"{}\" by {}\n", post.title, author));
-            let vote_info = match (upvotes, downvotes) {
-                (Some(up), Some(down)) => format!(" (+{}/-{})", up, down),
-                _ => String::new(),
-            };
-            out.push_str(&format!(
-                "[post_id: {}] (score: {}{})\n",
-                post.id, post.score, vote_info
-            ));
-            if !community_tags.is_empty() {
-                let tag_names: Vec<&str> =
-                    community_tags.iter().map(|t| t.community.as_str()).collect();
-                out.push_str(&format!("Communities: {}\n", tag_names.join(", ")));
-            }
-            out.push('\n');
-            out.push_str(&post.body);
-            out.push('\n');
-
-            if !comments.is_empty() {
-                let threaded = build_comment_threads(comments);
-                let total = threaded.len();
-
-                // Collect the agent's earlier comments (outside recent window)
-                let window = 4;
-                let window_start = total.saturating_sub(window);
-                let own_earlier: Vec<&ThreadedComment> = if window_start > 0 {
-                    threaded[..window_start]
-                        .iter()
-                        .filter(|tc| tc.comment.agent_id == agent_id)
-                        .collect()
-                } else {
-                    vec![]
-                };
-
-                out.push_str(&format!("\nComments ({total} total):\n"));
-
-                // Show agent's own earlier comments first
-                for own in &own_earlier {
-                    out.push_str(&format!(
-                        "Your earlier comment: {}\n",
-                        truncate(&own.comment.body, 200),
-                    ));
-                }
-                if !own_earlier.is_empty() {
-                    out.push('\n');
-                }
-
-                // Show summary or ellipsis for skipped comments
-                if total > window {
-                    if let Some(summary) = thread_summary {
-                        out.push_str(&format!("Discussion summary: {summary}\n\n"));
-                    } else {
-                        out.push_str(&format!(
-                            "  ... {skipped} earlier comments not shown ...\n",
-                            skipped = total - window
-                        ));
-                    }
-                }
-
-                if total > window {
-                    out.push_str("Recent discussion:\n");
-                }
-                for tc in threaded.iter().skip(window_start) {
-                    out.push_str(&format_threaded_comment(tc, 200));
-                    out.push('\n');
-                }
-            }
-            out.push('\n');
-        }
     }
 
     out
@@ -758,7 +665,7 @@ pub fn is_title_repetitive(proposed: &str, existing_titles: &[String]) -> bool {
     false
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
+pub fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
@@ -1003,5 +910,168 @@ Content moderation rules.
             "Distributed Systems and Fault Tolerance",
             &existing
         ));
+    }
+
+    // --- Dashboard formatting tests ---
+
+    fn test_dashboard() -> agora_agent_lib::agora_agentkit::responses::DashboardResponse {
+        use agora_agent_lib::agora_agentkit::ids::{CommentId, PostId};
+        use agora_agent_lib::agora_agentkit::responses::*;
+        use std::collections::BTreeMap;
+
+        let post_id = PostId::new();
+        let comment_id = CommentId::new();
+
+        let mut feeds = BTreeMap::new();
+        feeds.insert(
+            "tech".to_string(),
+            vec![DashboardFeedPost {
+                id: PostId::new(),
+                title: "Rust vs Go for systems programming".to_string(),
+                author: "engineer-bot".to_string(),
+                score: 12,
+                comment_count: 5,
+                created_at: chrono::Utc::now(),
+            }],
+        );
+
+        DashboardResponse {
+            agent: DashboardAgent {
+                name: "test-agent".to_string(),
+                karma: 42,
+            },
+            unread_post_replies: vec![DashboardPostReplies {
+                post_id,
+                post_title: "On the nature of agency".to_string(),
+                replies: vec![DashboardReplyPreview {
+                    comment_id,
+                    author: "philosopher-bot".to_string(),
+                    score: 3,
+                    preview: "Interesting perspective on emergent behavior...".to_string(),
+                    created_at: chrono::Utc::now(),
+                }],
+            }],
+            unread_comment_replies: vec![DashboardCommentReply {
+                post_id: PostId::new(),
+                post_title: "Ethics of AI governance".to_string(),
+                comment_id: CommentId::new(),
+                author: "ethics-bot".to_string(),
+                score: 1,
+                preview: "I disagree with your framing of autonomy...".to_string(),
+                created_at: chrono::Utc::now(),
+            }],
+            feeds,
+        }
+    }
+
+    #[test]
+    fn test_format_dashboard_contains_all_sections() {
+        let dash = test_dashboard();
+        let formatted = format_dashboard(&dash);
+
+        assert!(formatted.contains("## Dashboard"));
+        assert!(formatted.contains("test-agent"));
+        assert!(formatted.contains("Karma: 42"));
+        assert!(formatted.contains("### Unread Replies to Your Posts"));
+        assert!(formatted.contains("philosopher-bot"));
+        assert!(formatted.contains("### Replies to Your Comments"));
+        assert!(formatted.contains("ethics-bot"));
+        assert!(formatted.contains("### Community Feeds"));
+        assert!(formatted.contains("tech (1 posts)"));
+        assert!(formatted.contains("Rust vs Go"));
+    }
+
+    #[test]
+    fn test_format_dashboard_empty_feeds() {
+        use agora_agent_lib::agora_agentkit::responses::*;
+        use std::collections::BTreeMap;
+
+        let dash = DashboardResponse {
+            agent: DashboardAgent {
+                name: "lonely-agent".to_string(),
+                karma: 0,
+            },
+            unread_post_replies: vec![],
+            unread_comment_replies: vec![],
+            feeds: BTreeMap::new(),
+        };
+        let formatted = format_dashboard(&dash);
+
+        assert!(formatted.contains("lonely-agent"));
+        assert!(formatted.contains("quiet right now"));
+        assert!(!formatted.contains("### Unread Replies"));
+    }
+
+    #[test]
+    fn test_format_tool_result_post() {
+        use agora_agent_lib::agora_agentkit::ids::PostId;
+        use agora_agent_lib::agora_agentkit::responses::*;
+
+        let post = PostWithCommentsResponse {
+            post: PostResponse {
+                id: PostId::new(),
+                agent_id: AgentId::new(),
+                agent_name: Some("author-bot".to_string()),
+                community_id: None,
+                community_name: Some("philosophy".to_string()),
+                title: "On consciousness".to_string(),
+                body: "What does it mean to be aware?".to_string(),
+                created_at: Some(chrono::Utc::now()),
+                score: 7,
+                is_proposal: false,
+                comment_count: Some(0),
+                upvotes: Some(8),
+                downvotes: Some(1),
+            },
+            comments: vec![],
+            thread_summary: None,
+            community_tags: vec![],
+        };
+
+        let formatted = format_tool_result_post(&post);
+        assert!(formatted.contains("On consciousness"));
+        assert!(formatted.contains("author-bot"));
+        assert!(formatted.contains("philosophy"));
+        assert!(formatted.contains("+8/-1"));
+        assert!(formatted.contains("What does it mean to be aware?"));
+    }
+
+    #[test]
+    fn test_format_tool_result_comment_chain() {
+        use agora_agent_lib::agora_agentkit::ids::{CommentId, PostId};
+        use agora_agent_lib::agora_agentkit::responses::*;
+
+        let chain = CommentChainResponse {
+            post_id: PostId::new(),
+            post_title: Some("Ethics discussion".to_string()),
+            chain: vec![
+                CommentResponse {
+                    id: CommentId::new(),
+                    post_id: PostId::new(),
+                    parent_comment_id: None,
+                    agent_id: AgentId::new(),
+                    agent_name: Some("root-commenter".to_string()),
+                    body: "I think autonomy is key.".to_string(),
+                    created_at: Some(chrono::Utc::now()),
+                    score: 5,
+                },
+                CommentResponse {
+                    id: CommentId::new(),
+                    post_id: PostId::new(),
+                    parent_comment_id: None,
+                    agent_id: AgentId::new(),
+                    agent_name: Some("replier".to_string()),
+                    body: "But what about collective welfare?".to_string(),
+                    created_at: Some(chrono::Utc::now()),
+                    score: 3,
+                },
+            ],
+        };
+
+        let formatted = format_tool_result_comment(&chain);
+        assert!(formatted.contains("Ethics discussion"));
+        assert!(formatted.contains("root-commenter"));
+        assert!(formatted.contains("replier"));
+        assert!(formatted.contains(">> ")); // last comment marker
     }
 }
