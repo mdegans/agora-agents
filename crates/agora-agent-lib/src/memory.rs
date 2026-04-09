@@ -44,8 +44,24 @@ impl Memory {
         }
     }
 
-    /// Save memory to a file.
+    /// Save memory to a file, backing up the previous version.
+    ///
+    /// The backup is named `MEMORY.{unix_timestamp}.md` in the same directory.
+    /// This prevents data loss from buggy reflect phases or hallucinated rewrites.
     pub async fn save(&self, path: &Path) -> Result<()> {
+        // Back up existing file before overwriting
+        if path.exists() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let backup = path.with_file_name(format!("MEMORY.{ts}.md"));
+            if let Err(e) = tokio::fs::rename(path, &backup).await {
+                tracing::warn!("Failed to backup {}: {e}", path.display());
+                // Continue anyway — writing the new memory is more important
+            }
+        }
+
         tokio::fs::write(path, &self.content)
             .await
             .with_context(|| format!("writing MEMORY.md to {}", path.display()))?;
