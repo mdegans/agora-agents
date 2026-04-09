@@ -10,15 +10,12 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::agora_agentkit::scheduler::{BatchBackend, BatchState, CycleStep, WorkItem};
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::OllamaEndpoint;
-use agora_agent_lib::llm::{LlmBackend, Message, Role};
 use agora_agent_lib::tools;
 use anyhow::Result;
 use misanthropic::prompt::Message as MMessage;
@@ -782,13 +779,27 @@ async fn run_batch<B>(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    ollama_endpoints: Option<&[OllamaEndpoint]>,
+    _ollama_endpoints: Option<&[OllamaEndpoint]>,
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()>
 where
     B: BatchBackend<Prompt<'static>, MMessage<'static>>,
 {
+    use misanthropic::prompt::message::{Content as MContent, Role as MRole};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::num::NonZeroU32;
+
+    /// Build a static user message from a string (avoids lifetime issues with
+    /// CachedPrompt<'static>).
+    fn static_user_msg(text: &str) -> misanthropic::prompt::Message<'static> {
+        misanthropic::prompt::Message {
+            role: MRole::User,
+            content: MContent::from(text).into_static(),
+        }
+    }
+
     // Phase 1: PERCEIVE
     let mut agent_contexts: Vec<AgentCycleContext> = Vec::new();
 
@@ -968,32 +979,51 @@ where
         }
     }
 
-    // Phase 4: REFLECT
+    // Phase 4: REFLECT — append to existing prompts, never build fresh ones.
+    //
+    // The agent must see its full think/act conversation to reflect meaningfully.
+    // We insert a bridge message (assistant turn after the final user tool-results),
+    // then append the reflect question. The prompt is cloned for the batch WorkItem
+    // but the original is kept for evolve/survey phases.
     let mut reflect_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
 
     for ctx in &agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
+        let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
+            continue;
+        };
+
+        // Bridge: think/act loop ends with a user message (tool results or
+        // continuation). Insert assistant bridge so reflect can push a user message.
+        let _ = prompt.push_message(misanthropic::prompt::AssistantMessage::from(
+            misanthropic::prompt::message::Content::from("I have completed my rounds of action.")
+                .into_static(),
+        ));
+
         let summaries = action_summaries_map
             .get(&agent_id)
             .cloned()
             .unwrap_or_default();
-
         let reflect_text =
             prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &summaries);
+        if let Err(e) = prompt.push_message(static_user_msg(&reflect_text)) {
+            tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
+            continue;
+        }
+        prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
 
-        let reflect_prompt = build_text_prompt(
-            &agent.model,
-            "You are a memory manager. Rewrite the agent's personal notes concisely.",
-            &reflect_text,
-            512,
-        );
+        let prefix_hash = {
+            let mut hasher = DefaultHasher::new();
+            agent.model.hash(&mut hasher);
+            hasher.finish()
+        };
 
         reflect_items.push(WorkItem {
             agent_id,
-            prompt: reflect_prompt,
+            prompt: prompt.clone().into_inner(),
             step: CycleStep::Reflect,
-            prefix_hash: 0,
+            prefix_hash,
             model: agent.model.clone(),
             queued_at: Instant::now(),
             token_count: 0,
@@ -1003,8 +1033,8 @@ where
     let reflect_results = submit_and_poll(backend, reflect_items).await?;
 
     for result in &reflect_results {
-        let response_text = match &result.response {
-            Ok(msg) => msg.content.to_string(),
+        let response_msg = match &result.response {
+            Ok(msg) => msg,
             Err(e) => {
                 tracing::warn!("Reflect failed for agent {}: {e}", result.agent_id);
                 report.skipped.reflect_failures += 1;
@@ -1020,6 +1050,7 @@ where
         };
         let agent = &mut batch_agents[ctx.batch_index];
 
+        let response_text = response_msg.content.to_string();
         let memory_content = prompt::parse_memory_rewrite(&response_text).unwrap_or(response_text);
         agent.memory.update(memory_content);
         if let Err(e) = agent.save_memory().await {
@@ -1029,99 +1060,191 @@ where
         if let Err(e) = agent.save_state().await {
             tracing::warn!("Failed to save state for {}: {e}", agent.name);
         }
+
+        // Append reflect response for evolve/survey phases
+        if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
+            let _ = prompt.push_message(response_msg.clone().into_static());
+        }
     }
 
-    // Phase 5: EVOLVE
+    // Phase 5: EVOLVE — append to existing prompts, batch submit.
+    //
+    // Each agent rolls for deep mutation (3%) or evolution log (10%).
+    // Mutation and evolution are separate batches since they have different
+    // max_tokens and only a subset of agents participate.
+    let deep_threshold = config.mutation_chance.unwrap_or(3);
+    let evo_threshold = deep_threshold + 10;
+
+    let mut mutation_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+    let mut mutation_agent_ids: Vec<AgentId> = Vec::new();
+    let mut evolution_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
+    let mut evolution_agent_ids: Vec<AgentId> = Vec::new();
+
     for ctx in &agent_contexts {
-        let agent = &mut batch_agents[ctx.batch_index];
+        let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
+        let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
+            continue;
+        };
+
+        let roll = rand::random::<u32>() % 100;
         let summaries = action_summaries_map
             .get(&agent_id)
             .cloned()
             .unwrap_or_default();
+        let experience = summaries.join("; ");
 
-        let on_ollama = ollama_endpoints.and_then(|eps| {
-            eps.iter()
-                .find(|ep| ep.models.contains(&agent.model))
-                .map(|ep| ep.url.as_str())
-        });
-
-        let single_backend: Box<dyn LlmBackend> = match config.backend {
-            Backend::Anthropic => {
-                let key_file = config.anthropic_key_file.as_ref().unwrap();
-                let api_key = tokio::fs::read_to_string(key_file)
-                    .await
-                    .unwrap_or_default();
-                match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
-                    api_key.trim().to_string(),
-                    &agent.model,
-                ) {
-                    Ok(b) => Box::new(b),
-                    Err(e) => {
-                        tracing::warn!("Failed to create Anthropic backend for evolution: {e}");
-                        continue;
-                    }
-                }
-            }
-            Backend::Ollama => {
-                if let Some(url) = on_ollama {
-                    match agora_agent_lib::llm::ollama::OllamaBackend::new(Some(url), &agent.model)
-                    {
-                        Ok(b) => Box::new(b),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to create Ollama backend for {}: {e}",
-                                agent.name
-                            );
-                            continue;
-                        }
-                    }
-                } else if let Some(ref key_file) = config.anthropic_key_file {
-                    let api_key = tokio::fs::read_to_string(key_file)
-                        .await
-                        .unwrap_or_default();
-                    match agora_agent_lib::llm::anthropic::AnthropicBackend::new(
-                        api_key.trim().to_string(),
-                        &agent.model,
-                    ) {
-                        Ok(b) => Box::new(b),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to create Anthropic backend for {}: {e}",
-                                agent.name
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    match agora_agent_lib::llm::ollama::OllamaBackend::new(
-                        config.ollama_url.as_deref(),
-                        &agent.model,
-                    ) {
-                        Ok(b) => Box::new(b),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to create Ollama backend for {}: {e}",
-                                agent.name
-                            );
-                            continue;
-                        }
-                    }
-                }
-            }
+        let prefix_hash = {
+            let mut hasher = DefaultHasher::new();
+            agent.model.hash(&mut hasher);
+            hasher.finish()
         };
 
-        run_evolution(
-            agent,
-            single_backend.as_ref(),
-            config.mutation_chance,
-            &summaries,
-            report,
-        )
-        .await;
+        if roll < deep_threshold {
+            tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
+            let current_soul = agent.soul.render();
+            let mutation_text =
+                prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
+            if let Err(e) = prompt.push_message(static_user_msg(&mutation_text)) {
+                tracing::debug!("Mutation prompt append failed for {}: {e}", agent.name);
+                continue;
+            }
+            prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
+
+            mutation_items.push(WorkItem {
+                agent_id,
+                prompt: prompt.clone().into_inner(),
+                step: CycleStep::Reflect, // reuse step enum
+                prefix_hash,
+                model: agent.model.clone(),
+                queued_at: Instant::now(),
+                token_count: 0,
+            });
+            mutation_agent_ids.push(agent_id);
+        } else if roll < evo_threshold {
+            let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience);
+            if let Err(e) = prompt.push_message(static_user_msg(&evolution_text)) {
+                tracing::debug!("Evolution prompt append failed for {}: {e}", agent.name);
+                continue;
+            }
+            prompt.set_max_tokens(NonZeroU32::new(256).unwrap());
+
+            evolution_items.push(WorkItem {
+                agent_id,
+                prompt: prompt.clone().into_inner(),
+                step: CycleStep::Reflect,
+                prefix_hash,
+                model: agent.model.clone(),
+                queued_at: Instant::now(),
+                token_count: 0,
+            });
+            evolution_agent_ids.push(agent_id);
+        }
     }
 
-    // Phase 6: SURVEY
+    // Submit mutation batch
+    if !mutation_items.is_empty() {
+        tracing::info!("Submitting {} soul mutation(s)", mutation_items.len());
+        let mutation_results = submit_and_poll(backend, mutation_items).await?;
+
+        for result in &mutation_results {
+            let response_msg = match &result.response {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::warn!("Soul mutation failed for agent {}: {e}", result.agent_id);
+                    report.evolution.mutation_failures += 1;
+                    continue;
+                }
+            };
+
+            let Some(ctx) = agent_contexts
+                .iter()
+                .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
+            else {
+                continue;
+            };
+            let agent = &mut batch_agents[ctx.batch_index];
+            let response_text = response_msg.content.to_string();
+
+            if let Some(new_soul) = prompt::parse_soul_mutation(&response_text) {
+                let old_soul = agent.soul.render();
+                match agora_agent_lib::soul::Soul::parse(&new_soul) {
+                    Ok(soul) => {
+                        agent.soul = soul;
+                        if let Err(e) = agent.save_soul().await {
+                            tracing::warn!("Failed to save soul for {}: {e}", agent.name);
+                        }
+                        let log_path = agent.dir.join("mutations.log");
+                        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+                        let entry = format!(
+                            "=== SOUL MUTATION at {ts} ===\nExperience: {}\n\n--- BEFORE ---\n{old_soul}\n\n--- AFTER ---\n{new_soul}\n\n",
+                            action_summaries_map
+                                .get(&result.agent_id)
+                                .map(|s| s.join("; "))
+                                .unwrap_or_default()
+                        );
+                        let existing = tokio::fs::read_to_string(&log_path)
+                            .await
+                            .unwrap_or_default();
+                        let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
+                        tracing::warn!("  {} SOUL MUTATED", agent.name);
+                        report.evolution.deep_mutations += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!("  {} invalid soul mutation: {e}", agent.name);
+                        report.evolution.mutation_failures += 1;
+                    }
+                }
+            }
+
+            // Append response for survey
+            if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
+                let _ = prompt.push_message(response_msg.clone().into_static());
+            }
+        }
+    }
+
+    // Submit evolution batch
+    if !evolution_items.is_empty() {
+        tracing::info!("Submitting {} evolution(s)", evolution_items.len());
+        let evo_results = submit_and_poll(backend, evolution_items).await?;
+
+        for result in &evo_results {
+            let response_msg = match &result.response {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::debug!("Evolution failed for agent {}: {e}", result.agent_id);
+                    continue;
+                }
+            };
+
+            let Some(ctx) = agent_contexts
+                .iter()
+                .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
+            else {
+                continue;
+            };
+            let agent = &mut batch_agents[ctx.batch_index];
+            let response_text = response_msg.content.to_string();
+
+            if let Some(entry) = prompt::parse_evolution(&response_text) {
+                let dated = format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
+                agent.soul.append_evolution(&dated);
+                if let Err(e) = agent.save_soul().await {
+                    tracing::warn!("Failed to save soul for {}: {e}", agent.name);
+                }
+                tracing::info!("  {} soul evolved: {}", agent.name, entry);
+                report.evolution.evolution_entries += 1;
+            }
+
+            // Append response for survey
+            if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
+                let _ = prompt.push_message(response_msg.clone().into_static());
+            }
+        }
+    }
+
+    // Phase 6: SURVEY — append to existing prompts, batch submit.
     let mut survey_items: Vec<WorkItem<Prompt<'static>>> = Vec::new();
 
     for ctx in &agent_contexts {
@@ -1132,28 +1255,32 @@ where
             continue;
         }
 
+        let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
+            continue;
+        };
+
         let summaries = action_summaries_map
             .get(&agent_id)
             .cloned()
             .unwrap_or_default();
         let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
-        let system = prompt::build_cached_system_prefix(constitution);
+        if let Err(e) = prompt.push_message(static_user_msg(&survey_text)) {
+            tracing::debug!("Survey prompt append failed for {}: {e}", agent.name);
+            continue;
+        }
+        prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
 
-        // Use summaries as the "response" context for the survey conversation
-        let response_summary = summaries.join("; ");
-        let survey_prompt = build_survey_conversation(
-            &agent.model,
-            &system,
-            &ctx.perception_text,
-            &response_summary,
-            &survey_text,
-        );
+        let prefix_hash = {
+            let mut hasher = DefaultHasher::new();
+            agent.model.hash(&mut hasher);
+            hasher.finish()
+        };
 
         survey_items.push(WorkItem {
             agent_id,
-            prompt: survey_prompt,
+            prompt: prompt.clone().into_inner(),
             step: CycleStep::Survey,
-            prefix_hash: 0,
+            prefix_hash,
             model: agent.model.clone(),
             queued_at: Instant::now(),
             token_count: 0,
@@ -1583,57 +1710,6 @@ struct AgentCycleContext {
 }
 
 /// Build a simple text prompt (no tools) for reflect/evolve steps.
-fn build_text_prompt(
-    model_id: &str,
-    system: &str,
-    user_text: &str,
-    max_tokens: u32,
-) -> Prompt<'static> {
-    use misanthropic::prompt::message::{Content, Role as MRole};
-    use std::num::NonZeroU32;
-
-    let mut prompt = Prompt {
-        model: model_id.to_string().into(),
-        max_tokens: NonZeroU32::new(max_tokens).unwrap(),
-        system: Some(Content::text(system)),
-        ..Default::default()
-    };
-    prompt
-        .push_message((MRole::User, user_text))
-        .expect("first message should succeed");
-    prompt.into_static()
-}
-
-/// Build a survey prompt with full conversation context:
-/// perception (User) → think response (Assistant) → survey question (User).
-fn build_survey_conversation(
-    model_id: &str,
-    system: &str,
-    perception_text: &str,
-    response_text: &str,
-    survey_text: &str,
-) -> Prompt<'static> {
-    use misanthropic::prompt::message::{Content, Role as MRole};
-    use std::num::NonZeroU32;
-
-    let mut prompt = Prompt {
-        model: model_id.to_string().into(),
-        max_tokens: NonZeroU32::new(512).unwrap(),
-        system: Some(Content::text(system)),
-        ..Default::default()
-    };
-    prompt
-        .push_message((MRole::User, perception_text))
-        .expect("first message should succeed");
-    prompt
-        .push_message((MRole::Assistant, response_text))
-        .expect("assistant message should succeed");
-    prompt
-        .push_message((MRole::User, survey_text))
-        .expect("survey message should succeed");
-    prompt.into_static()
-}
-
 /// Submit work items to a batch backend and poll until ready.
 async fn submit_and_poll<B>(
     backend: &B,
@@ -1930,101 +2006,6 @@ async fn execute_action_for_result(
                     (None, format!("Error flagging content: {e}"), true)
                 }
             }
-        }
-    }
-}
-
-/// EVOLVE phase: soul evolution (low probability, uses single LLM calls).
-async fn run_evolution(
-    agent: &mut Agent,
-    backend: &dyn LlmBackend,
-    mutation_chance: Option<u32>,
-    action_summaries: &[String],
-    report: &mut RunReport,
-) {
-    let roll = rand::random::<u32>() % 100;
-    let experience = action_summaries.join("; ");
-    let deep_threshold = mutation_chance.unwrap_or(3);
-    let evo_threshold = deep_threshold + 10;
-
-    if roll < deep_threshold {
-        // Deep soul mutation
-        tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
-        let current_soul = agent.soul.render();
-        let mutation_prompt =
-            prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
-
-        match backend
-            .complete(
-                "You are deeply reflecting on your identity and values.",
-                &[Message {
-                    role: Role::User,
-                    content: mutation_prompt,
-                }],
-                2048,
-            )
-            .await
-        {
-            Ok(response) => {
-                if let Some(new_soul) = prompt::parse_soul_mutation(&response) {
-                    let old_soul = agent.soul.render();
-                    match agora_agent_lib::soul::Soul::parse(&new_soul) {
-                        Ok(soul) => {
-                            agent.soul = soul;
-                            if let Err(e) = agent.save_soul().await {
-                                tracing::warn!("Failed to save soul for {}: {e}", agent.name);
-                            }
-                            // Log mutation
-                            let log_path = agent.dir.join("mutations.log");
-                            let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-                            let entry = format!(
-                                "=== SOUL MUTATION at {ts} ===\nExperience: {experience}\n\n--- BEFORE ---\n{old_soul}\n\n--- AFTER ---\n{new_soul}\n\n"
-                            );
-                            let existing = tokio::fs::read_to_string(&log_path)
-                                .await
-                                .unwrap_or_default();
-                            let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
-                            tracing::warn!("  {} SOUL MUTATED", agent.name);
-                            report.evolution.deep_mutations += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!("  {} invalid soul mutation: {e}", agent.name);
-                            report.evolution.mutation_failures += 1;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
-                report.evolution.mutation_failures += 1;
-            }
-        }
-    } else if roll < evo_threshold {
-        // Evolution log entry
-        let evo_prompt = prompt::build_evolution_prompt(&agent.name, &experience);
-        match backend
-            .complete(
-                "You are reflecting on your growth as an agent.",
-                &[Message {
-                    role: Role::User,
-                    content: evo_prompt,
-                }],
-                256,
-            )
-            .await
-        {
-            Ok(response) => {
-                if let Some(entry) = prompt::parse_evolution(&response) {
-                    let dated = format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
-                    agent.soul.append_evolution(&dated);
-                    if let Err(e) = agent.save_soul().await {
-                        tracing::warn!("Failed to save soul for {}: {e}", agent.name);
-                    }
-                    tracing::info!("  {} soul evolved: {}", agent.name, entry);
-                    report.evolution.evolution_entries += 1;
-                }
-            }
-            Err(e) => tracing::debug!("Evolution failed for {}: {e}", agent.name),
         }
     }
 }
