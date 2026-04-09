@@ -48,6 +48,15 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Load all community names from API
+    let communities: Vec<String> = api_client
+        .list_communities()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ci| ci.name)
+        .collect();
+
     // Resolve models from server for agents that don't have one from --model
     if cli.model.is_none() {
         let unresolved = agent::resolve_models(&mut agents, &api_client).await;
@@ -253,7 +262,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
+            scheduler::run_all(&mut agents, &api_client, &cli, &constitution, &communities).await?;
         }
         Phase::Simulate => {
             // Filter to a single agent
@@ -275,13 +284,14 @@ async fn main() -> Result<()> {
                     .await?;
                 let dashboard_text = prompt::format_dashboard(&dashboard);
 
-                let think_prompt = prompt::build_think_prompt(
+                let think_prompt = prompt::build(
                     &agent.model,
                     &agent.soul.as_system_prompt(),
                     &agent.memory.content,
                     "", // no recent activity in dry-run mode
                     "", // no pending replies in dry-run mode
                     &constitution,
+                    &communities,
                     &dashboard_text,
                 );
 
@@ -304,6 +314,7 @@ async fn main() -> Result<()> {
                     1,
                     cli.mutation_chance,
                     &constitution,
+                    &communities,
                     true,
                     cli.force_survey,
                 )
@@ -319,7 +330,7 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
+            scheduler::run_all(&mut agents, &api_client, &cli, &constitution, &communities).await?;
         }
     }
 

@@ -32,9 +32,9 @@ use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::OllamaEndpoint;
 use agora_agent_lib::tools;
 use anyhow::Result;
-use misanthropic::prompt::message::{Block, Content as MContent, Role as MRole};
-use misanthropic::prompt::Message as MMessage;
 use misanthropic::CachedPrompt;
+use misanthropic::prompt::Message as MMessage;
+use misanthropic::prompt::message::{Block, Content as MContent, Role as MRole};
 use rand::Rng;
 use rand::seq::SliceRandom;
 use serde::Serialize;
@@ -43,6 +43,7 @@ use crate::agent::Agent;
 use crate::client::AgoraClient;
 use crate::config::{Backend, Cli};
 use crate::prompt;
+use crate::prompt::MEMORY_REWRITE_MESSAGE;
 
 /// Maximum number of tool-use rounds per agent cycle.
 const MAX_ROUNDS: usize = 5;
@@ -51,38 +52,30 @@ const MAX_ROUNDS: usize = 5;
 // Common functions — shared by both Anthropic batch and Ollama sequential
 // ---------------------------------------------------------------------------
 
-/// Build a static user message from a string.
-fn static_user_msg(text: &str) -> MMessage<'static> {
-    MMessage {
-        role: MRole::User,
-        content: MContent::from(text).into_static(),
-    }
-}
-
 /// Build the initial [`CachedPrompt`] for an agent cycle.
 ///
 /// The prompt structure is:
-/// - System: cached constitution/guidelines prefix + dynamic soul/memory suffix
-/// - Tools: agent action tools with cache_control on the last one
-/// - First user message: dashboard perceptions
-/// - Cache breakpoint anchored on first message
+/// - System: cached constitution/guidelines prefix
+/// - Tools: agent action tools with cache_control
+/// - Cache breakpoint (1)
+/// - First user message: soul, memory, dashboard, perceptions
+/// - Cache breakpoint (2)
 pub fn build_prompt(
     agent: &Agent,
     ctx: &AgentCycleContext,
     constitution: &str,
+    communities: &[String],
 ) -> CachedPrompt<'static> {
-    let mut cached = CachedPrompt::uncached(prompt::build_think_prompt(
+    prompt::build(
         &agent.model,
         &agent.soul.as_system_prompt(),
         &agent.memory.content,
         &ctx.recent_activity,
         &ctx.pending_replies_text,
         constitution,
+        communities,
         &ctx.perception_text,
-    ));
-    // Anchor breakpoint on first message (dashboard perception).
-    cached.cache();
-    cached
+    )
 }
 
 /// Execute a single tool action against the Agora server.
@@ -302,9 +295,7 @@ async fn execute_action(
 /// Extract tool calls from a response message.
 ///
 /// Returns (actions, tool_call_ids) pairs.
-pub fn extract_tool_calls(
-    response: &MMessage<'_>,
-) -> Vec<(prompt::AgentAction, String)> {
+pub fn extract_tool_calls(response: &MMessage<'_>) -> Vec<(prompt::AgentAction, String)> {
     tools::extract_actions_with_ids(response)
 }
 
@@ -405,9 +396,8 @@ fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
 
 /// Apply the reflect response: update agent memory.
 async fn apply_reflect(agent: &mut Agent, response_text: &str) -> Result<()> {
-    let memory_content =
-        prompt::parse_memory_rewrite(response_text).unwrap_or_else(|| response_text.to_string());
-    agent.memory.update(memory_content);
+    let memory_content = prompt::parse_memory_rewrite(response_text).unwrap_or(response_text);
+    agent.memory.update(memory_content.into());
     agent.save_memory().await?;
     agent.state.last_cycle_at = Some(chrono::Utc::now());
     agent.save_state().await?;
@@ -607,6 +597,7 @@ async fn run_batch(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
+    communities: &[String],
     _ollama_endpoints: Option<&[OllamaEndpoint]>,
     report: &mut RunReport,
     cycle: usize,
@@ -641,7 +632,10 @@ async fn run_batch(
     for ctx in &agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
-        agent_prompts.insert(agent_id, build_prompt(agent, ctx, constitution));
+        agent_prompts.insert(
+            agent_id,
+            build_prompt(agent, ctx, constitution, communities),
+        );
         action_summaries_map.insert(agent_id, Vec::new());
     }
 
@@ -704,7 +698,16 @@ async fn run_batch(
                 MAX_ROUNDS,
             );
 
-            match process_round(prompt, response.clone().into_static(), agent, client, &ctx.dashboard, report).await {
+            match process_round(
+                prompt,
+                response.clone().into_static(),
+                agent,
+                client,
+                &ctx.dashboard,
+                report,
+            )
+            .await
+            {
                 Ok(summaries) => {
                     action_summaries_map
                         .entry(result.agent_id)
@@ -731,13 +734,7 @@ async fn run_batch(
         // Stop adding cache breakpoints for reflect/evolve/survey
         insert_bridge(prompt);
 
-        let summaries = action_summaries_map
-            .get(&agent_id)
-            .cloned()
-            .unwrap_or_default();
-        let reflect_text =
-            prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &summaries);
-        if let Err(e) = prompt.push_message(static_user_msg(&reflect_text)) {
+        if let Err(e) = prompt.push_message((MRole::User, MEMORY_REWRITE_MESSAGE)) {
             tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
             continue;
         }
@@ -805,7 +802,7 @@ async fn run_batch(
             let current_soul = agent.soul.render();
             let mutation_text =
                 prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
-            if let Err(e) = prompt.push_message(static_user_msg(&mutation_text)) {
+            if let Err(e) = prompt.push_message((MRole::User, mutation_text)) {
                 tracing::debug!("Mutation prompt append failed for {}: {e}", agent.name);
                 continue;
             }
@@ -815,7 +812,7 @@ async fn run_batch(
             mutation_agent_ids.push(agent_id);
         } else if roll < evo_threshold {
             let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience);
-            if let Err(e) = prompt.push_message(static_user_msg(&evolution_text)) {
+            if let Err(e) = prompt.push_message((MRole::User, evolution_text)) {
                 tracing::debug!("Evolution prompt append failed for {}: {e}", agent.name);
                 continue;
             }
@@ -917,7 +914,7 @@ async fn run_batch(
             .cloned()
             .unwrap_or_default();
         let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
-        if let Err(e) = prompt.push_message(static_user_msg(&survey_text)) {
+        if let Err(e) = prompt.push_message((MRole::User, survey_text)) {
             tracing::debug!("Survey prompt append failed for {}: {e}", agent.name);
             continue;
         }
@@ -996,6 +993,7 @@ async fn run_batch_sequential(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
+    communities: &[String],
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -1016,7 +1014,7 @@ async fn run_batch_sequential(
         };
 
         // Build prompt (CachedPrompt through tool rounds)
-        let mut cached_prompt = build_prompt(agent, &ctx, constitution);
+        let mut cached_prompt = build_prompt(agent, &ctx, constitution, communities);
         let mut summaries = Vec::new();
 
         // Tool rounds (5)
@@ -1046,8 +1044,15 @@ async fn run_batch_sequential(
                 }
             };
 
-            match process_round(&mut cached_prompt, response, agent, client, &ctx.dashboard, report)
-                .await
+            match process_round(
+                &mut cached_prompt,
+                response,
+                agent,
+                client,
+                &ctx.dashboard,
+                report,
+            )
+            .await
             {
                 Ok(round_summaries) => summaries.extend(round_summaries),
                 Err(e) => {
@@ -1077,10 +1082,7 @@ async fn run_batch_sequential(
         bare_prompt.functions = None;
         bare_prompt.tool_choice = None;
 
-        // Reflect
-        let reflect_text =
-            prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &summaries);
-        if let Err(e) = bare_prompt.push_message((MRole::User, reflect_text)) {
+        if let Err(e) = bare_prompt.push_message((MRole::User, MEMORY_REWRITE_MESSAGE)) {
             tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
             continue;
         }
@@ -1359,6 +1361,7 @@ async fn run_worker(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
+    communities: &[String],
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -1380,6 +1383,7 @@ async fn run_worker(
             client,
             config,
             constitution,
+            communities,
             report,
             cycle,
         )
@@ -1403,6 +1407,7 @@ async fn run_cycles(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
+    communities: &[String],
     ollama_models: &HashSet<String>,
     report: &mut RunReport,
 ) -> Result<()> {
@@ -1480,6 +1485,7 @@ async fn run_cycles(
                             client,
                             config,
                             constitution,
+                            communities,
                             Some(all_eps.as_slice()),
                             &mut anthropic_report,
                             cycle,
@@ -1502,6 +1508,7 @@ async fn run_cycles(
                                 client,
                                 config,
                                 constitution,
+                                communities,
                                 &mut worker_reports[0],
                                 cycle,
                             )
@@ -1517,6 +1524,7 @@ async fn run_cycles(
                                     client,
                                     config,
                                     constitution,
+                                    communities,
                                     &mut r0[0],
                                     cycle,
                                 ),
@@ -1527,6 +1535,7 @@ async fn run_cycles(
                                     client,
                                     config,
                                     constitution,
+                                    communities,
                                     &mut r1[0],
                                     cycle,
                                 ),
@@ -1544,6 +1553,7 @@ async fn run_cycles(
                                     client,
                                     config,
                                     constitution,
+                                    communities,
                                     &mut r0[0],
                                     cycle,
                                 ),
@@ -1554,6 +1564,7 @@ async fn run_cycles(
                                     client,
                                     config,
                                     constitution,
+                                    communities,
                                     &mut r1[0],
                                     cycle,
                                 ),
@@ -1564,6 +1575,7 @@ async fn run_cycles(
                                     client,
                                     config,
                                     constitution,
+                                    communities,
                                     &mut r2[0],
                                     cycle,
                                 ),
@@ -1612,6 +1624,7 @@ async fn run_cycles(
                         client,
                         config,
                         constitution,
+                        communities,
                         None,
                         &mut anthropic_report,
                         cycle,
@@ -1724,6 +1737,7 @@ pub async fn run_all(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
+    communities: &[String],
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -1825,6 +1839,7 @@ pub async fn run_all(
                     client,
                     config,
                     constitution,
+                    communities,
                     &ollama_models,
                     &mut report,
                 )
@@ -1841,6 +1856,7 @@ pub async fn run_all(
                     client,
                     config,
                     constitution,
+                    communities,
                     &HashSet::new(),
                     &mut report,
                 )
@@ -1862,6 +1878,7 @@ pub async fn run_all(
                 client,
                 config,
                 constitution,
+                communities,
                 &HashSet::new(),
                 &mut report,
             )

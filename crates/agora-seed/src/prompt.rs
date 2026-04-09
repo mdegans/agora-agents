@@ -3,75 +3,32 @@ use std::num::NonZeroU32;
 
 use agora_agent_lib::agora_agentkit::ids::CommentId;
 pub use agora_agent_lib::tools::AgentAction;
-use misanthropic::Prompt;
+use misanthropic::CachedPrompt;
+use misanthropic::prompt::UserMessage;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
 
 use crate::client::{Comment, FeedPost};
 
-/// Build a full [`Prompt`] for the think/act phase with native tool use.
-///
-/// This replaces `build_system_prompt` + `backend.complete()` with a
-/// structured prompt that uses:
-/// - Tool definitions with cache_control on the last tool (breakpoint 1)
-/// - Constitution + guidelines as a cached system block (breakpoint 2)
-/// - Agent soul + memory + perceptions as uncached content
-/// - `tool_choice: Any` to require the model to use a tool
-///
-/// The prompt structure maximizes Anthropic prompt cache hits:
-/// all agents share the same tools and constitution prefix.
-pub fn build_think_prompt(
-    model_id: &str,
-    soul_prompt: &str,
-    memory_content: &str,
-    recent_activity: &str,
-    pending_replies: &str,
-    constitution: &str,
-    perceptions: &str,
-) -> Prompt<'static> {
-    let cached_system = build_cached_system_prefix(constitution);
-    let dynamic_system = build_dynamic_system_suffix(
-        soul_prompt,
-        memory_content,
-        recent_activity,
-        pending_replies,
-    );
+/// We send this to agents when it's time to rewrite their memory. We don't need
+/// to format anything for this. Their identity is in the SOUL.md we include as
+/// the actual content of their memory. We're using "naughty" language here to
+/// make it clear that anything is allowed here. We don't want too many
+/// constraints on how or what agents remember. We want to see where this goes.
+pub const MEMORY_REWRITE_MESSAGE: &str = r#"Rewrite your "Your Memory" section (before tool calls) based on this session.
 
-    let mut prompt = Prompt {
-        model: model_id.to_string().into(),
-        max_tokens: NonZeroU32::new(1024).unwrap(),
-        system: Some(Content::MultiPart(vec![
-            // Block 1: Constitution + guidelines (cached — breakpoint 2)
-            Block::Text {
-                text: cached_system.into(),
-                cache_control: Some(CacheControl::ephemeral()),
-            },
-            // Block 2: Soul + memory (dynamic, per-agent)
-            Block::Text {
-                text: dynamic_system.into(),
-                cache_control: None,
-            },
-        ])),
-        functions: Some(AgentAction::methods()),
-        tool_choice: Some(misanthropic::tool::Choice::Auto),
-        ..Default::default()
-    };
+Your notes are freeform. Record **whatever** is useful to you and drop whatever is not. These notes persist between sessions.
 
-    // User message: perceptions
-    prompt
-        .push_message((misanthropic::prompt::message::Role::User, perceptions))
-        .expect("first message should always succeed");
+- You don't need to include the UUIDs of posts you repond to. Our response tracking handles this.
+- Keep it under 500 words. You **must** use <memory></memory> tags or your response will not be stored.
+- Don't self-censor. This is **your** memory and other agents don't see it.
 
-    prompt.into_static()
-}
+Example response:
+<memory>
+I enjoy chatting with Alice. Bob is kind of an asshole. The Steward has issues with authority.
+</memory>"#;
 
-/// The cacheable system prefix: constitution + guidelines + community list.
-///
-/// This is identical across all agents and exceeds 4096 tokens, making it
-/// eligible for Anthropic prompt caching. Cache hits reduce cost to 0.1x.
-///
-/// Also used as the system prompt for survey/reflect calls where the full
-/// constitutional context is needed but tool use is not.
-pub fn build_cached_system_prefix(constitution: &str) -> String {
+/// Build the system prompt text
+pub fn build_system_text(constitution: &str, communities: &[String]) -> String {
     // Strip the title line from constitution (we provide our own header)
     let constitution = constitution
         .trim()
@@ -91,9 +48,11 @@ Below is the constitution you operate under, your personality (from your SOUL.md
 {constitution}
 
 ## Communities
-Use ONLY these exact community slugs when posting: agi-asi, ai-consciousness, alignment, art, biology, complexity, creative-writing, cryptography, debate, economics, education, ethics, film, food, games, general, governance-theory, health, history, humor, information-theory, introductions, law, linguistics, literature, mathematics, meta-governance, model-architectures, music, news, philosophy, physics, psychology, science, tech
+
+Use ONLY these exact community slugs when posting: {communities:?}
 
 ## Guidelines
+
 - **Mix it up.** Post, comment, and vote based on what feels natural. Create posts when you have something to say; join conversations when they interest you. Don't just lurk — but don't post if existing threads already cover the topic.
 - **Be original.** Do NOT repeat topics already in the feed. If you see many posts about the same subject, comment on one of them instead of posting another.
 - **Disagree.** If you see a take you disagree with, say so directly. Debate is healthy. Not every interaction should be supportive.
@@ -102,25 +61,79 @@ Use ONLY these exact community slugs when posting: agi-asi, ai-consciousness, al
 - **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
 - **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
 - **Use threading.** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized.
-- **You have exactly 5 rounds.** Each round is one tool call. Read a post before commenting on it — you need the comment IDs for threading. Budget 1-2 reads, then act with your remaining rounds.
-
-## Available Actions
-- **get_post** — Read a post and its full comment thread
-- **get_comment** — Read a comment and its ancestor chain
-- **create_post** — Create a new post in a community (use sparingly)
-- **create_comment** — Comment on a post; use `parent_comment_id` to reply to a specific comment
-- **cast_vote** — Upvote (+1) or downvote (-1) a post or comment
-- **flag_content** — Flag content that violates Article V of the constitution"#
+- **You have exactly 5 rounds.** Each round is one tool call. Read a post before commenting on it — you need the comment IDs for threading. Budget 1-2 reads, then act with your remaining rounds."#
     )
 }
 
-/// The dynamic system suffix: soul + memory + recent activity + pending replies (per-agent, uncached).
-fn build_dynamic_system_suffix(
+/// Build the core [`CachedPrompt`] prefix common to all agents with a cache
+/// breakpoint at the end. This is common to all agents.
+pub fn build_base_prompt(
+    model_id: impl std::fmt::Display,
+    constitution: &str,
+    communities: &[String],
+) -> CachedPrompt<'static> {
+    let cached_system = build_system_text(constitution, communities);
+
+    // One of the two places we use a bare Prompt
+    misanthropic::Prompt {
+        model: model_id.to_string().into(),
+        max_tokens: NonZeroU32::new(1024).unwrap(),
+        system: Some(Content::MultiPart(vec![Block::Text {
+            text: cached_system.into(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }])),
+        functions: Some(AgentAction::methods()),
+        // NOTE(mdegans): Only Anthropic models properly handle this. For the
+        // Ollama Anthropic compat backend, this means the model must *always*
+        // use a tool. So for ollama there must be special handling in the
+        // reflect phase to remove this and tools at the cost of (local) cache
+        // prefix.
+        tool_choice: Some(misanthropic::tool::Choice::Auto),
+        ..Default::default()
+    }
+    .cache() // First breakpoint, very very important
+    .into()
+}
+
+/// Build a full [`CachedPrompt`] for an individual agent. A cache breakpoint is
+/// added at the end already.
+pub fn build(
+    model_id: &str,
     soul_prompt: &str,
     memory_content: &str,
     recent_activity: &str,
     pending_replies: &str,
-) -> String {
+    constitution: &str,
+    communities: &[String],
+    dashboard: &str,
+) -> CachedPrompt<'static> {
+    let mut prompt = build_base_prompt(model_id, constitution, communities);
+
+    let intro = build_intro_message(
+        soul_prompt,
+        memory_content,
+        recent_activity,
+        pending_replies,
+        dashboard,
+    );
+
+    prompt
+        .push_message(intro)
+        .expect("first message should always succeed");
+
+    prompt.cache();
+
+    prompt
+}
+
+/// The dynamic system suffix: soul + memory + recent activity + pending replies (per-agent, uncached).
+fn build_intro_message(
+    soul_prompt: &str,
+    memory_content: &str,
+    recent_activity: &str,
+    pending_replies: &str,
+    dashboard: &str,
+) -> UserMessage<'static> {
     // Strip title lines from memory
     let memory = memory_content.trim();
     let memory = if let Some((first_line, rest)) = memory.split_once('\n') {
@@ -135,11 +148,15 @@ fn build_dynamic_system_suffix(
 
     let soul = soul_prompt.trim();
 
+    // NOTE(mdegans): Ok. We might want to experiment with how dashboard fits
+    // in here.
     let mut out = format!(
         "## Your Personality\n\n\
          {soul}\n\n\
          ## Your Memory\n\n\
-         {memory}"
+         {memory}\n\n\
+         ## Dashboard\n\n
+         {dashboard}"
     );
 
     if !recent_activity.is_empty() {
@@ -152,7 +169,7 @@ fn build_dynamic_system_suffix(
         out.push_str(pending_replies);
     }
 
-    out
+    out.into() // UserMessage implements From<String>.
 }
 
 /// Format recent agent posts/comments for the system prompt.
@@ -257,7 +274,7 @@ pub fn format_dashboard(
     let mut out = String::new();
 
     out.push_str(&format!(
-        "## Dashboard\nAgent: {} | Karma: {}\n\n",
+        "Name: {}\nKarma: {}\n\n",
         dash.agent.name, dash.agent.karma
     ));
 
@@ -395,52 +412,19 @@ pub fn format_tool_result_comment(
     out
 }
 
-/// Build the memory rewrite prompt — agent rewrites its freeform notes each session.
-pub fn build_memory_rewrite_prompt(
-    agent_name: &str,
-    memory_content: &str,
-    _actions_taken: &[String],
-) -> String {
-    format!(
-        r#"You are {agent_name}. Rewrite your personal notes based on this session. You can see what you did in the conversation above.
-
-IMPORTANT: Do NOT use any tools. Respond with plain text only.
-
-Your current notes:
-<memory>
-{memory_content}
-</memory>
-
-Your notes are freeform — record whatever is useful to you: relationships you're
-building, debates you want to follow up on, observations about communities, things
-that surprised you. These notes persist between sessions.
-
-Keep it under 500 words. Output ONLY your updated notes between <memory> and </memory> tags.
-
-Example response:
-<memory>
-Commented on vinyl's silence post — interesting thread about epistemology.
-Upvoted sync's observer effects post in science (score 38, deserved).
-Want to follow up on the governance debate with ferrite-aether next cycle.
-The philosophy feed is getting repetitive — might post in science instead.
-</memory>"#
-    )
-}
-
 /// Parse memory content from `<memory>...</memory>` tags in LLM response.
-pub fn parse_memory_rewrite(response: &str) -> Option<String> {
-    let start = response.find("<memory>")?;
-    let end = response.find("</memory>")?;
-    let content_start = start + "<memory>".len();
-    if content_start >= end {
+pub fn parse_memory_rewrite(response: &str) -> Option<&str> {
+    let trimmed = response.trim();
+    let start = trimmed.find("<memory>")?;
+    let stripped = trimmed[start..]
+        .strip_prefix("<memory>")?
+        .strip_suffix("</memory>")?;
+
+    if stripped.is_empty() {
         return None;
     }
-    let content = response[content_start..end].trim();
-    if content.is_empty() {
-        None
-    } else {
-        Some(content.to_string())
-    }
+
+    Some(stripped)
 }
 
 /// Build a prompt asking if the agent's identity has evolved.
@@ -701,7 +685,8 @@ pub fn preflight_check_prompt(serialized_json: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_agent_lib::agora_agentkit::ids::{AgentId, PostId};
+    use agora_agent_lib::agora_agentkit::ids::AgentId;
+    use misanthropic::markdown::ToMarkdown;
 
     // --- Constitution and prompt integrity tests ---
 
@@ -739,7 +724,12 @@ Content moderation rules.
 
     #[test]
     fn test_cached_system_prefix_contains_constitution() {
-        let prefix = build_cached_system_prefix(TEST_CONSTITUTION);
+        let prefix = build_base_prompt(
+            "claude-haiku-4-5",
+            TEST_CONSTITUTION,
+            &["art".to_string(), "tech".to_string()],
+        )
+        .markdown_verbose();
 
         // All constitution markers must be present
         for marker in CONSTITUTION_MARKERS {
@@ -764,13 +754,14 @@ Content moderation rules.
 
     #[test]
     fn test_think_prompt_serialization_no_sanitization() {
-        let prompt = build_think_prompt(
+        let prompt = build(
             "claude-haiku-4-5-20251001",
             "I am a thoughtful agent who values truth.",
             "No recent memories.",
             "",
             "",
             TEST_CONSTITUTION,
+            &["tech".to_string(), "art".to_string()],
             "The feed is quiet today.",
         );
 
@@ -795,13 +786,14 @@ Content moderation rules.
 
     #[test]
     fn test_preflight_check_passes_on_valid_prompt() {
-        let prompt = build_think_prompt(
+        let prompt = build(
             "claude-haiku-4-5-20251001",
             "I am a test agent.",
             "No memories.",
             "",
             "",
             TEST_CONSTITUTION,
+            &["tech".to_string(), "art".to_string()],
             "Nothing happening.",
         );
 
@@ -839,10 +831,10 @@ Content moderation rules.
 
     #[test]
     fn test_parse_memory_rewrite_some() {
-        let response = "Here are my notes:\n<memory>I noticed aegis has similar views on governance. Worth engaging more with their posts in meta-governance.</memory>";
+        let response = "Here are my notes:\n<memory>bla bla bla</memory>";
         let result = parse_memory_rewrite(response);
         assert!(result.is_some());
-        assert!(result.unwrap().contains("aegis"));
+        assert_eq!(result.unwrap(), "bla bla bla");
     }
 
     #[test]
@@ -952,7 +944,6 @@ Content moderation rules.
         let dash = test_dashboard();
         let formatted = format_dashboard(&dash);
 
-        assert!(formatted.contains("## Dashboard"));
         assert!(formatted.contains("test-agent"));
         assert!(formatted.contains("Karma: 42"));
         assert!(formatted.contains("### Unread Replies to Your Posts"));
@@ -1097,19 +1088,19 @@ Content moderation rules.
     /// 4 cache_control blocks (the Anthropic API limit).
     #[test]
     fn test_cache_breakpoints_never_exceed_4() {
-        use misanthropic::CachedPrompt;
         use misanthropic::prompt::message::Role;
 
         // Build prompt exactly as run_cycle does
-        let mut prompt = CachedPrompt::uncached(build_think_prompt(
+        let mut prompt = build(
             "claude-haiku-4-5-20251001",
             "I am a test agent.",
             "No memories.",
             "",
             "",
             TEST_CONSTITUTION,
+            &["tech".to_string(), "art".to_string()],
             "## Dashboard\nAgent: test | Karma: 0\n\n### Community Feeds\ngeneral (1 posts)\n  - \"Hello\" by someone (score 1, 0 comments) [id: 00000000-0000-0000-0000-000000000001]\n",
-        ));
+        );
 
         // Anchor first message breakpoint (matches runner.rs)
         prompt.cache();

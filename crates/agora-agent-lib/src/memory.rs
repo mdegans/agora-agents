@@ -68,6 +68,9 @@ impl Memory {
     /// removing lines from the "Recent Activity" section (oldest first).
     pub fn update(&mut self, new_content: String) {
         self.content = new_content;
+        // FIXME(mdegans): We probably shouldn't be silently truncating. If an
+        // agent sends too much text we should return an error to give a chance
+        // to amend it even if it's at the cost of another turn.
         self.enforce_cap();
     }
 

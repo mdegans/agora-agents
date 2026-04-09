@@ -5,7 +5,7 @@ use misanthropic::prompt::message::{Block, Content};
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
-use crate::prompt;
+use crate::prompt::{self, MEMORY_REWRITE_MESSAGE};
 
 /// Accumulate usage stats from a send response into a running total.
 fn accumulate_usage(total: &mut Option<Usage>, usage: Option<Usage>) {
@@ -74,6 +74,7 @@ pub async fn run_cycle(
     total_cycles: usize,
     mutation_chance: Option<u32>,
     constitution: &str,
+    communities: &[String],
     verbose: bool,
     force_survey: bool,
 ) -> Result<()> {
@@ -134,18 +135,16 @@ pub async fn run_cycle(
         .join("\n");
 
     // === BUILD PROMPT ===
-    let mut think_prompt = misanthropic::CachedPrompt::uncached(prompt::build_think_prompt(
+    let mut think_prompt = prompt::build(
         backend.model_id(),
         &agent.soul.as_system_prompt(),
         &agent.memory.content,
         &recent_activity,
         &pending_replies_text,
         constitution,
+        communities,
         &dashboard_text,
-    ));
-
-    // Anchor first message breakpoint (dashboard perception)
-    think_prompt.cache();
+    );
 
     // Preflight check
     {
@@ -301,13 +300,11 @@ pub async fn run_cycle(
         agent.name
     );
 
-    let reflect_text =
-        prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &action_summaries);
     think_prompt.set_max_tokens(std::num::NonZeroU32::new(1024).unwrap());
     think_prompt
         .push_message((
             misanthropic::prompt::message::Role::User,
-            reflect_text.clone(),
+            MEMORY_REWRITE_MESSAGE,
         ))
         .expect("user message should follow assistant");
 
@@ -327,8 +324,8 @@ pub async fn run_cycle(
     }
 
     let memory_content =
-        prompt::parse_memory_rewrite(&reflect_response).unwrap_or(reflect_response);
-    agent.memory.update(memory_content);
+        prompt::parse_memory_rewrite(&reflect_response).unwrap_or(&reflect_response);
+    agent.memory.update(memory_content.into());
     agent.save_memory().await?;
 
     agent.state.last_cycle_at = Some(chrono::Utc::now());

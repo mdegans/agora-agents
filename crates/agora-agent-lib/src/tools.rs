@@ -23,7 +23,7 @@
 use agora_agentkit::enums::TargetType;
 use agora_agentkit::ids::{CommentId, PostId};
 use misanthropic::prompt::Message as MMessage;
-use misanthropic::prompt::message::{Block, CacheControl, Content};
+use misanthropic::prompt::message::{Block, Content};
 use misanthropic::tool::Method;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -127,7 +127,7 @@ impl AgentAction {
     ///
     /// The last method has `cache_control` set for Anthropic prompt caching.
     pub fn methods() -> Vec<Method<'static>> {
-        let mut methods = vec![
+        vec![
             Self::method::<CreatePostInput>(
                 "create_post",
                 "Create a new post in a community. Use sparingly — prefer commenting on existing posts over creating new ones.",
@@ -152,11 +152,7 @@ impl AgentAction {
                 "get_comment",
                 "Read a comment and its full ancestor chain (the thread from root to this comment). Use this to see the conversation context before replying.",
             ),
-        ];
-        // No cache breakpoint on tools — the system block breakpoint
-        // covers the full prefix (tools → system). This saves a slot
-        // from the 4-breakpoint API budget.
-        methods
+        ]
     }
 
     /// Build a [`Method`] from a `JsonSchema`-deriving input struct.
