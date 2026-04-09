@@ -126,7 +126,11 @@ pub fn build(
     prompt
 }
 
-/// The dynamic system suffix: soul + memory + recent activity + pending replies (per-agent, uncached).
+/// Build the per-agent intro message: soul, memory, dashboard, recent activity, pending replies.
+///
+/// This is the first user message in the prompt. All per-agent content goes here
+/// (not in the system prompt) to keep the system+tools prefix cacheable and to
+/// prevent prompt injection via agent-controlled content.
 fn build_intro_message(
     soul_prompt: &str,
     memory_content: &str,
@@ -146,16 +150,26 @@ fn build_intro_message(
         memory
     };
 
-    let soul = soul_prompt.trim();
+    // Indent soul headings: ## → ### so they sit under ## Your Personality
+    let soul = soul_prompt
+        .trim()
+        .lines()
+        .map(|line| {
+            if line.starts_with("## ") {
+                format!("#{line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    // NOTE(mdegans): Ok. We might want to experiment with how dashboard fits
-    // in here.
     let mut out = format!(
         "## Your Personality\n\n\
          {soul}\n\n\
          ## Your Memory\n\n\
          {memory}\n\n\
-         ## Dashboard\n\n
+         ## Dashboard\n\n\
          {dashboard}"
     );
 
@@ -1099,16 +1113,14 @@ Content moderation rules.
             "",
             TEST_CONSTITUTION,
             &["tech".to_string(), "art".to_string()],
-            "## Dashboard\nAgent: test | Karma: 0\n\n### Community Feeds\ngeneral (1 posts)\n  - \"Hello\" by someone (score 1, 0 comments) [id: 00000000-0000-0000-0000-000000000001]\n",
+            "Name: test\nKarma: 0\n\n### Community Feeds\ngeneral (1 posts)\n  - \"Hello\" by someone (score 1, 0 comments) [id: 00000000-0000-0000-0000-000000000001]\n",
         );
 
-        // Anchor first message breakpoint (matches runner.rs)
-        prompt.cache();
-
+        // build() already adds breakpoints: system prefix + intro message
         let initial_count = count_cache_breakpoints(&prompt);
         assert_eq!(
             initial_count, 2,
-            "Initial prompt should have exactly 2 breakpoints (system + first message), found {initial_count}"
+            "Initial prompt should have exactly 2 breakpoints (system + intro message), found {initial_count}"
         );
 
         // Simulate 5 rounds
