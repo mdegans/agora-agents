@@ -289,13 +289,10 @@ pub async fn run_cycle(
     }
 
     // === REFLECT ===
-    // Strip tools for reflect/evolve/survey — Ollama interprets tool_choice
-    // Auto as "must use tools", causing models to call tools instead of
-    // responding with text. Convert from CachedPrompt since we no longer
-    // need cache management at end-of-cycle.
-    let mut think_prompt = think_prompt.into_inner();
-    think_prompt.functions = None;
-    think_prompt.tool_choice = None;
+    // Keep CachedPrompt — never strip tools or tool_choice.
+    // The reflect/evolve/survey prompts instruct "Do NOT use any tools."
+    // No new cache breakpoints after tool rounds — evolve/survey probability
+    // is too low to justify the additional cache ingestion cost.
 
     tracing::info!(
         "[{}/{}] Agent {} — reflect",
@@ -306,7 +303,7 @@ pub async fn run_cycle(
 
     let reflect_text =
         prompt::build_memory_rewrite_prompt(&agent.name, &agent.memory.content, &action_summaries);
-    think_prompt.max_tokens = std::num::NonZeroU32::new(1024).unwrap();
+    think_prompt.set_max_tokens(std::num::NonZeroU32::new(1024).unwrap());
     think_prompt
         .push_message((
             misanthropic::prompt::message::Role::User,
@@ -358,7 +355,7 @@ pub async fn run_cycle(
         let current_soul = agent.soul.render();
         let mutation_text =
             prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience_summary);
-        think_prompt.max_tokens = std::num::NonZeroU32::new(2048).unwrap();
+        think_prompt.set_max_tokens(std::num::NonZeroU32::new(2048).unwrap());
         if think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,
@@ -442,7 +439,7 @@ pub async fn run_cycle(
     } else if roll < evo_threshold {
         // === EVOLUTION LOG ENTRY ===
         let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience_summary);
-        think_prompt.max_tokens = std::num::NonZeroU32::new(256).unwrap();
+        think_prompt.set_max_tokens(std::num::NonZeroU32::new(256).unwrap());
         if think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,
@@ -484,7 +481,7 @@ pub async fn run_cycle(
     // === ANONYMOUS FEEDBACK SURVEY (10% chance) ===
     if force_survey || rand::random::<f64>() < 0.10 {
         let survey_text = prompt::build_survey_prompt(&agent.name, &action_summaries);
-        think_prompt.max_tokens = std::num::NonZeroU32::new(512).unwrap();
+        think_prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
         if think_prompt
             .push_message((
                 misanthropic::prompt::message::Role::User,

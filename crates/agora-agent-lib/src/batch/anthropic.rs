@@ -4,6 +4,16 @@
 //! [`misanthropic::Client`]. Supports prompt caching — tool definitions
 //! and system prefix are cached across agents in the same batch.
 //!
+//! # Prompt caching
+//!
+//! The batch API processes items on separate workers that may not share
+//! cache. To maximize cache hits:
+//! 1. Prime the cache before the first batch by sending one request via
+//!    the Messages API with the shared prefix (tools + constitution).
+//! 2. Use `CachedPrompt` to ensure the prefix is never mutated — any
+//!    change to tools, tool_choice, or system content invalidates the
+//!    entire cache prefix.
+//!
 //! # Cost optimization
 //!
 //! The Batch API provides a 50% discount on input tokens. Combined with
@@ -17,7 +27,7 @@ use agora_agentkit::ids::AgentId;
 use agora_agentkit::scheduler::{
     BatchBackend, BatchError, BatchState, CycleStep, WorkItem, WorkResult,
 };
-use misanthropic::Prompt;
+use misanthropic::CachedPrompt;
 use misanthropic::batch;
 use misanthropic::prompt::Message as MMessage;
 
@@ -26,7 +36,7 @@ use misanthropic::prompt::Message as MMessage;
 /// Holds the misanthropic pending batch state and a mapping from
 /// batch IDs back to agent IDs and cycle steps.
 pub struct AnthropicPendingHandle {
-    pending: batch::Pending<'static>,
+    pending: batch::Pending<CachedPrompt<'static>>,
     /// Maps batch::Id → (AgentId, CycleStep) for result routing.
     id_map: HashMap<batch::Id, (AgentId, CycleStep)>,
 }
@@ -54,10 +64,13 @@ impl AnthropicBatch {
     }
 }
 
-impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
+impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
     type Handle = AnthropicPendingHandle;
 
-    async fn submit(&self, items: Vec<WorkItem<Prompt<'static>>>) -> anyhow::Result<Self::Handle> {
+    async fn submit(
+        &self,
+        items: Vec<WorkItem<CachedPrompt<'static>>>,
+    ) -> anyhow::Result<Self::Handle> {
         // Prime the prompt cache before submitting the batch.
         //
         // Batch items share an identical prefix (tools + constitution + system)
@@ -66,7 +79,8 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
         // to the cache. Batch items can then read from it at 0.1x cost (stacking
         // with the 0.5x batch discount for 0.05x effective cost on cached tokens).
         //
-        // We use the first item's prompt. The response is discarded — we only
+        // We use the first item's prompt. CachedPrompt derefs to &Prompt so
+        // client.message() works directly. The response is discarded — we only
         // care about the cache write side effect.
         if items.len() > 1 {
             tracing::info!(
@@ -77,7 +91,7 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
             // Anthropic rejects (e.g. empty memory or pending replies).
             let mut primed = false;
             for i in 0..items.len().min(3) {
-                match self.client.message(&items[i].prompt).await {
+                match self.client.message(&*items[i].prompt).await {
                     Ok(response) => {
                         let usage = &response.usage;
                         tracing::info!(
@@ -100,8 +114,11 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
             }
         }
 
-        // Build the tagged prompts: (batch::Id, Prompt) pairs
-        // and track the mapping back to agent IDs
+        // Build the tagged prompts: (batch::Id, CachedPrompt) pairs
+        // and track the mapping back to agent IDs.
+        //
+        // CachedPrompt implements Serialize (delegates to inner Prompt),
+        // so tagged_batch() accepts it directly — no into_inner() needed.
         let mut id_map = HashMap::new();
         let mut tagged_prompts = Vec::with_capacity(items.len());
 
@@ -195,9 +212,12 @@ impl BatchBackend<Prompt<'static>, MMessage<'static>> for AnthropicBatch {
         }
     }
 
-    async fn count_tokens(&self, _prompt: &Prompt<'static>) -> anyhow::Result<Option<u32>> {
-        // TODO: Use misanthropic::Client::count_tokens once it's on the dev branch.
-        // For now, return None — the scheduler will skip token-based grouping.
+    async fn count_tokens(
+        &self,
+        _prompt: &CachedPrompt<'static>,
+    ) -> anyhow::Result<Option<u32>> {
+        // TODO: Use misanthropic::Client::count_tokens once available.
+        // CachedPrompt derefs to &Prompt which count_tokens accepts.
         Ok(None)
     }
 

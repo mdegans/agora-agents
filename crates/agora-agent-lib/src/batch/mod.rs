@@ -1,9 +1,7 @@
 //! Batch backend implementations.
 //!
-//! Provides [`BatchBackend`] implementations for different LLM providers:
 //! - [`anthropic::AnthropicBatch`] — Anthropic Messages Batch API with prompt caching
-//! - [`ollama::OllamaBatch`] — Sequential per model, parallel across models
+//! - [`ollama::OllamaEndpoint`] — Sequential per-agent Ollama endpoint (Anthropic-compat API)
 
 pub mod anthropic;
-pub mod hybrid;
 pub mod ollama;
