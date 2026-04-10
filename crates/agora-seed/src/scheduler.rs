@@ -556,6 +556,27 @@ async fn submit_and_poll(
 }
 
 /// Build a WorkItem from an agent's current prompt state.
+///
+/// **Note on `prefix_hash`:** we currently derive it from
+/// `hash(agent.model)` alone, as a proxy for "same cacheable prefix".
+/// This is safe in the current architecture because the cacheable
+/// prefix (constitution, communities list, tool definitions) is
+/// constructed from top-level values loaded once in `main` and
+/// handed down through `run_cycles` — every agent using the same
+/// model ends up with byte-identical system prefix + tools, which
+/// is what Anthropic's cache keys on. `AnthropicBatch::submit` uses
+/// this hash to prime the cache exactly once per model per session;
+/// if the hash is wrong we'd either re-prime unnecessarily (wasted
+/// latency) or skip a prime we needed (cache miss).
+///
+/// TODO: push this upstream into misanthropic as
+/// `CachedPrompt::prefix_cache_key() -> Option<u64>` — hash the
+/// serialized `system` + `functions` up to and including the first
+/// cache breakpoint. The `Option` matters: `None` means "no cache
+/// breakpoint present, Anthropic will not cache this prompt", which
+/// is almost always unintentional and worth surfacing. Once that
+/// lands, replace the hash-the-model heuristic here with the
+/// authoritative upstream version.
 fn make_work_item(
     agent: &Agent,
     prompt: &CachedPrompt<'static>,

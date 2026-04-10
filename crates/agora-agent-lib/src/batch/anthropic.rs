@@ -46,21 +46,38 @@ pub struct AnthropicPendingHandle {
 /// Wraps a [`misanthropic::Client`] and submits work items as a batch.
 /// Prompt caching is handled at the prompt construction level (cache_control
 /// on tool definitions and system prefix blocks).
+///
+/// Cache priming is done lazily: the first `submit()` call for a given
+/// prefix hash sends one message through the non-batch API to warm the
+/// prompt cache; subsequent batches sharing the same prefix skip the
+/// prime. This matters because each prime call adds ~5s of latency, and
+/// re-priming between every phase would push consecutive batches past
+/// the 5-minute ephemeral cache TTL and cause the cache to expire right
+/// before the next batch runs. The prefix_hash is stable per model
+/// across all phases (think / reflect / evolve / survey) so a single
+/// prime covers a whole cycle.
 pub struct AnthropicBatch {
     client: misanthropic::Client,
+    /// Prefix hashes we've already primed this session. Checked on every
+    /// `submit()` call — if the batch's prefix_hash is in here, we skip
+    /// priming.
+    primed_prefixes: std::sync::Mutex<std::collections::HashSet<u64>>,
 }
 
 impl AnthropicBatch {
     /// Create a new Anthropic batch backend from an existing client.
     pub fn new(client: misanthropic::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            primed_prefixes: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
     }
 
     /// Create from an API key string.
     pub fn from_key(api_key: String) -> anyhow::Result<Self> {
         let client = misanthropic::Client::new(api_key)
             .map_err(|e| anyhow::anyhow!("invalid API key: {e}"))?;
-        Ok(Self { client })
+        Ok(Self::new(client))
     }
 }
 
@@ -71,21 +88,40 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
         &self,
         items: Vec<WorkItem<CachedPrompt<'static>>>,
     ) -> anyhow::Result<Self::Handle> {
-        // Prime the prompt cache before submitting the batch.
+        // Prime the prompt cache before submitting the batch — but only
+        // once per prefix_hash per process lifetime.
         //
-        // Batch items share an identical prefix (tools + constitution + system)
-        // but are processed across different workers that may not share cache.
-        // By sending one request first via the Messages API, we write the prefix
-        // to the cache. Batch items can then read from it at 0.1x cost (stacking
-        // with the 0.5x batch discount for 0.05x effective cost on cached tokens).
+        // Batch items share an identical cacheable prefix (tools +
+        // constitution + system) but are processed across different
+        // workers that may not share cache. By sending one request first
+        // via the Messages API, we write the prefix to Anthropic's cache.
+        // Batch items can then read from it at 0.1x cost (stacking with
+        // the 0.5x batch discount for 0.05x effective cost on cached
+        // tokens).
         //
-        // We use the first item's prompt. CachedPrompt derefs to &Prompt so
-        // client.message() works directly. The response is discarded — we only
-        // care about the cache write side effect.
-        if items.len() > 1 {
+        // The prefix is stable across all phases and rounds for a given
+        // agent model, so we only need to prime once per model per
+        // cycle. Priming before every batch would add ~5s of latency
+        // each time, pushing consecutive batches past the 5-minute
+        // ephemeral cache TTL — exactly the opposite of what we want.
+        let prefix_hash = items.first().map(|it| it.prefix_hash);
+        let needs_prime = match prefix_hash {
+            Some(hash) => {
+                let mut set = self
+                    .primed_prefixes
+                    .lock()
+                    .expect("primed_prefixes mutex poisoned");
+                set.insert(hash) // insert returns true if the value was new
+            }
+            None => false,
+        };
+
+        if needs_prime && items.len() > 1 {
             tracing::info!(
-                "Priming prompt cache with 1 request before submitting {} batch items",
-                items.len()
+                "Priming prompt cache for prefix {:016x} (first batch for this prefix; \
+                 {} items)",
+                prefix_hash.unwrap(),
+                items.len(),
             );
             // Try up to 3 items — the first may have empty text blocks that
             // Anthropic rejects (e.g. empty memory or pending replies).
@@ -110,8 +146,22 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
                 }
             }
             if !primed {
+                // Rollback the set insertion so a future batch will retry
+                // priming. Otherwise a transient error during the first
+                // prime would permanently disable priming for this prefix.
+                if let Some(hash) = prefix_hash {
+                    self.primed_prefixes
+                        .lock()
+                        .expect("primed_prefixes mutex poisoned")
+                        .remove(&hash);
+                }
                 tracing::warn!("Cache priming failed for all candidates (continuing anyway)");
             }
+        } else if !needs_prime {
+            tracing::debug!(
+                "Skipping cache prime for prefix {:016x} — already primed this session",
+                prefix_hash.unwrap_or(0),
+            );
         }
 
         // Build the tagged prompts: (batch::Id, CachedPrompt) pairs
