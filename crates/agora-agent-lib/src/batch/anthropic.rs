@@ -79,6 +79,95 @@ impl AnthropicBatch {
             .map_err(|e| anyhow::anyhow!("invalid API key: {e}"))?;
         Ok(Self::new(client))
     }
+
+    /// Warm Anthropic's prompt cache by submitting a single-item batch
+    /// with the given prompt and polling until it completes.
+    ///
+    /// This is the [Anthropic-recommended prompt caching pattern][docs]:
+    /// submit one batch request carrying the shared prefix, wait for it
+    /// to finish, then submit the rest. Cache entries written by the
+    /// batch API are read by subsequent batch requests with the same
+    /// prefix.
+    ///
+    /// [docs]: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+    async fn prime_via_batch(
+        &self,
+        prompt: &CachedPrompt<'static>,
+    ) -> anyhow::Result<()> {
+        let prime_prompt = prompt.clone();
+        let mut pending = self
+            .client
+            .batch([prime_prompt])
+            .await
+            .map_err(|e| anyhow::anyhow!("prime batch submit failed: {e}"))?;
+
+        let prime_id = pending.meta().id.clone();
+        tracing::debug!("Prime batch submitted: id={prime_id}");
+
+        // Poll to completion. Single-item batches complete in a few
+        // seconds; we use a short interval to minimize the delay before
+        // the main batch can start reading from the cache.
+        let prime_timeout = std::time::Duration::from_secs(120);
+        let poll_interval = std::time::Duration::from_millis(500);
+        let prime_start = std::time::Instant::now();
+
+        let ready = loop {
+            match self
+                .client
+                .batch_poll(pending)
+                .await
+                .map_err(|e| anyhow::anyhow!("prime batch poll failed: {e}"))?
+            {
+                batch::Batch::Ready(ready) => break ready,
+                batch::Batch::Pending(p) => {
+                    if prime_start.elapsed() > prime_timeout {
+                        anyhow::bail!(
+                            "prime batch {} did not complete within {}s — aborting \
+                             prime and letting main batch surface errors",
+                            prime_id,
+                            prime_timeout.as_secs()
+                        );
+                    }
+                    pending = p;
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        };
+
+        // Inspect the single result to surface any item-level error
+        // loudly — an error here means the prompt itself is malformed
+        // (e.g. empty text block) and the main batch would hit the
+        // same error anyway. Fail fast.
+        let (_pending, results) = ready.decompose();
+        let (_id, result) = results
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("prime batch returned no results"))?;
+
+        match result {
+            batch::BatchResult::Ok(msg) => {
+                let usage = &msg.usage;
+                tracing::info!(
+                    "Cache primed via batch API ({:.1}s): {} creation tokens, \
+                     {} read tokens, {} input tokens",
+                    prime_start.elapsed().as_secs_f64(),
+                    usage.cache_creation_input_tokens.unwrap_or(0),
+                    usage.cache_read_input_tokens.unwrap_or(0),
+                    usage.input_tokens,
+                );
+                Ok(())
+            }
+            batch::BatchResult::Error(e) => {
+                anyhow::bail!("prime batch item errored: {e}")
+            }
+            batch::BatchResult::Canceled => {
+                anyhow::bail!("prime batch canceled")
+            }
+            batch::BatchResult::Expired => {
+                anyhow::bail!("prime batch expired")
+            }
+        }
+    }
 }
 
 impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
@@ -123,39 +212,44 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
                 prefix_hash.unwrap(),
                 items.len(),
             );
-            // Try up to 3 items — the first may have empty text blocks that
-            // Anthropic rejects (e.g. empty memory or pending replies).
-            let mut primed = false;
-            for i in 0..items.len().min(3) {
-                match self.client.message(&*items[i].prompt).await {
-                    Ok(response) => {
-                        let usage = &response.usage;
-                        tracing::info!(
-                            "Cache primed (item {}): {} creation tokens, {} read tokens, {} input tokens",
-                            i,
-                            usage.cache_creation_input_tokens.unwrap_or(0),
-                            usage.cache_read_input_tokens.unwrap_or(0),
-                            usage.input_tokens,
-                        );
-                        primed = true;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Cache priming with item {i} failed: {e}");
+            // Submit a single-item batch with the first prompt and poll
+            // until it completes, per Anthropic's documented cache-warming
+            // pattern: "Send a batch request with just a single request
+            // that has this shared prefix and a cache block. As soon as
+            // this is complete, submit the rest of the requests."
+            //
+            // We used to prime via `client.message()` (the non-batch
+            // Messages API). That appeared to work — we saw creation
+            // tokens on the prime and non-zero hit rates on subsequent
+            // batches — but it was relying on undocumented cache sharing
+            // between the Messages and Batch APIs. Switching to a batch
+            // prime removes that implementation-detail dependency.
+            //
+            // No 3-item fallback: if the first item errors (e.g. empty
+            // text block), the main batch would hit the same error on
+            // that item anyway. Surfacing the error loudly and aborting
+            // the prime is better than silently paving over a prompt-
+            // assembly bug. We do NOT abort the main batch; we roll back
+            // the prefix-primed set and continue, letting the real error
+            // surface through the normal submit path.
+            match self.prime_via_batch(&items[0].prompt).await {
+                Ok(()) => {
+                    // Success path already logged stats from the polled
+                    // result.
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Cache priming via batch API failed: {e}. Continuing \
+                         with main batch submission — the real error will \
+                         surface through the normal submit path."
+                    );
+                    if let Some(hash) = prefix_hash {
+                        self.primed_prefixes
+                            .lock()
+                            .expect("primed_prefixes mutex poisoned")
+                            .remove(&hash);
                     }
                 }
-            }
-            if !primed {
-                // Rollback the set insertion so a future batch will retry
-                // priming. Otherwise a transient error during the first
-                // prime would permanently disable priming for this prefix.
-                if let Some(hash) = prefix_hash {
-                    self.primed_prefixes
-                        .lock()
-                        .expect("primed_prefixes mutex poisoned")
-                        .remove(&hash);
-                }
-                tracing::warn!("Cache priming failed for all candidates (continuing anyway)");
             }
         } else if !needs_prime {
             tracing::debug!(
