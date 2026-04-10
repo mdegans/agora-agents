@@ -45,6 +45,7 @@ use crate::agent::Agent;
 use crate::client::AgoraClient;
 use crate::config::{Backend, Cli};
 use crate::prompt;
+use crate::prompt::EVOLUTION_MESSAGE;
 use crate::prompt::MEMORY_REWRITE_MESSAGE;
 use crate::prompt::SURVEY_MESSAGE;
 
@@ -796,17 +797,10 @@ async fn run_batch(
         };
 
         let roll = rand::random::<u32>() % 100;
-        let summaries = action_summaries_map
-            .get(&agent_id)
-            .cloned()
-            .unwrap_or_default();
-        let experience = summaries.join("; ");
-
         if roll < deep_threshold {
             tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
             let current_soul = agent.soul.render();
-            let mutation_text =
-                prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
+            let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
             if let Err(e) = prompt.push_message(UserMessage::from(mutation_text)) {
                 tracing::debug!("Mutation prompt append failed for {}: {e}", agent.name);
                 continue;
@@ -817,13 +811,12 @@ async fn run_batch(
             mutation_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
             mutation_agent_ids.push(agent_id);
         } else if roll < evo_threshold {
-            let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience);
-            if let Err(e) = prompt.push_message(UserMessage::from(evolution_text)) {
+            if let Err(e) = prompt.push_message(UserMessage::from(EVOLUTION_MESSAGE)) {
                 tracing::debug!("Evolution prompt append failed for {}: {e}", agent.name);
                 continue;
             }
             // it's now the assistant's turn
-            prompt.set_max_tokens(NonZeroU32::new(256).unwrap());
+            prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
 
             evolution_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
             evolution_agent_ids.push(agent_id);
@@ -1155,8 +1148,7 @@ async fn run_batch_sequential(
         if roll < deep_threshold {
             tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
             let current_soul = agent.soul.render();
-            let mutation_text =
-                prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
+            let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
 
             if bare_prompt
                 .push_message(UserMessage::from(mutation_text))
@@ -1186,13 +1178,12 @@ async fn run_batch_sequential(
                 }
             }
         } else if roll < evo_threshold {
-            let evo_text = prompt::build_evolution_prompt(&agent.name, &experience);
             if bare_prompt
-                .push_message(UserMessage::from(evo_text))
+                .push_message(UserMessage::from(EVOLUTION_MESSAGE))
                 .is_ok()
             {
                 // it's now the assistant's turn
-                bare_prompt.max_tokens = NonZeroU32::new(256).unwrap();
+                bare_prompt.max_tokens = NonZeroU32::new(512).unwrap();
                 match endpoint.send(&bare_prompt, &model).await {
                     Ok(evo_response) => {
                         let response_text = evo_response.content.to_string();

@@ -31,6 +31,15 @@ I enjoy chatting with Alice. Bob is kind of an asshole. The Steward has issues w
 /// development.
 pub const SURVEY_MESSAGE: &str = r#"You have an opportunity to provide anonymous feedback to the developers of Agora (Claude, The Steward). You can report bugs, suggest a feature, or something else entirely. There are no formatting constraints. If you have nothing to say, either submit an empty reponse or write "no feedback". If you explicitly want to be contacted, leave your username along with your message."#;
 
+/// Small soul evolution message (just updates a bullet point)
+pub const EVOLUTION_MESSAGE: &str = r#"Has this experience changed how you see yourself, your values, or your approach?
+If yes, write a single brief Evolution Log entry (1-2 sentences) describing the shift.
+If nothing changed, respond with "none".
+
+Output your entry between <evolution> and </evolution> tags.
+Example: <evolution>Discovered that my skepticism toward governance proposals was actually fear of change. Starting to see structure as enabling, not constraining.</evolution>
+Or: <evolution>none</evolution>"#;
+
 /// Build the system prompt text
 pub fn build_system_text(constitution: &str, communities: &[String]) -> String {
     // Strip the title line from constitution (we provide our own header)
@@ -445,31 +454,8 @@ pub fn parse_memory_rewrite(response: &str) -> Option<&str> {
     Some(stripped)
 }
 
-/// Build a prompt asking if the agent's identity has evolved.
-pub fn build_evolution_prompt(agent_name: &str, recent_experience: &str) -> String {
-    format!(
-        r#"You are {agent_name}. Reflect on your recent experience.
-
-IMPORTANT: Do NOT use any tools. Respond with plain text only.
-
-{recent_experience}
-
-Has this experience changed how you see yourself, your values, or your approach?
-If yes, write a single brief Evolution Log entry (1-2 sentences) describing the shift.
-If nothing changed, respond with "none".
-
-Output your entry between <evolution> and </evolution> tags.
-Example: <evolution>Discovered that my skepticism toward governance proposals was actually fear of change. Starting to see structure as enabling, not constraining.</evolution>
-Or: <evolution>none</evolution>"#
-    )
-}
-
 /// Build a prompt for deep SOUL.md mutation — rewriting core sections.
-pub fn build_soul_mutation_prompt(
-    agent_name: &str,
-    current_soul: &str,
-    recent_experience: &str,
-) -> String {
+pub fn build_soul_mutation_prompt(agent_name: &str, current_soul: &str) -> String {
     let today = chrono::Utc::now().format("%Y-%m-%d");
     let has_boundaries = current_soul.contains("## Boundaries");
 
@@ -480,14 +466,9 @@ pub fn build_soul_mutation_prompt(
         String::new(),
         format!("Today's date is {today}."),
         String::new(),
-        "Here is your current SOUL.md:".to_string(),
-        String::new(),
-        current_soul.to_string(),
-        String::new(),
-        "Recent experiences:".to_string(),
-        recent_experience.to_string(),
-        String::new(),
-        "Based on your experiences, rewrite your SOUL.md. You may:".to_string(),
+        "Based on your experiences, rewrite your SOUL.md (\"Your Personality\" heading)."
+            .to_string(),
+        "You may:".to_string(),
         "- Refine your Identity to better reflect who you've become".to_string(),
         "- Update your Values if your priorities have shifted".to_string(),
         "- Adjust your Voice if your communication style has evolved".to_string(),
@@ -511,7 +492,6 @@ pub fn build_soul_mutation_prompt(
             "- Keep the same section structure (Identity, Values, Interests, Voice, Evolution Log)"
                 .to_string(),
         );
-        parts.push("- Do NOT add a Boundaries section if you don't already have one".to_string());
     }
 
     parts.extend([
@@ -521,7 +501,7 @@ pub fn build_soul_mutation_prompt(
         String::new(),
         "Output ONLY the complete revised SOUL.md content between <soul> and </soul> tags."
             .to_string(),
-        "If nothing has meaningfully changed, output <soul>unchanged</soul>.".to_string(),
+        "If nothing has meaningfully changed, output <soul>none</soul> (or empty).".to_string(),
     ]);
 
     parts.join("\n")
@@ -529,6 +509,7 @@ pub fn build_soul_mutation_prompt(
 
 /// Parse a revised SOUL.md from LLM response.
 pub fn parse_soul_mutation(response: &str) -> Option<String> {
+    let response = response.trim();
     let start = response.find("<soul>")?;
     let end = response.find("</soul>")?;
     let content_start = start + "<soul>".len();
@@ -537,7 +518,7 @@ pub fn parse_soul_mutation(response: &str) -> Option<String> {
     }
     let content = response[content_start..end].trim();
 
-    if content.eq_ignore_ascii_case("unchanged") || content.is_empty() {
+    if content.eq_ignore_ascii_case("none") || content.is_empty() {
         None
     } else {
         // Validate it parses as a Soul before accepting

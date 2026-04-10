@@ -7,7 +7,7 @@ use misanthropic::tool;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
-use crate::prompt::{self, MEMORY_REWRITE_MESSAGE, SURVEY_MESSAGE};
+use crate::prompt::{self, EVOLUTION_MESSAGE, MEMORY_REWRITE_MESSAGE, SURVEY_MESSAGE};
 
 /// Accumulate usage stats from a send response into a running total.
 fn accumulate_usage(total: &mut Option<Usage>, usage: Option<Usage>) {
@@ -352,8 +352,7 @@ pub async fn run_cycle(
         );
 
         let current_soul = agent.soul.render();
-        let mutation_text =
-            prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience_summary);
+        let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
         think_prompt.set_max_tokens(std::num::NonZeroU32::new(2048).unwrap());
         if think_prompt
             .push_message(UserMessage::from(mutation_text.clone()))
@@ -439,10 +438,9 @@ pub async fn run_cycle(
         }
     } else if roll < evo_threshold {
         // === EVOLUTION LOG ENTRY ===
-        let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience_summary);
-        think_prompt.set_max_tokens(std::num::NonZeroU32::new(256).unwrap());
+        think_prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
         if think_prompt
-            .push_message(UserMessage::from(evolution_text.clone()))
+            .push_message(UserMessage::from(EVOLUTION_MESSAGE))
             .is_err()
         {
             tracing::debug!("Evolution skipped for {}: turn order", agent.name);
