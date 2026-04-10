@@ -5,7 +5,8 @@
 //! [`schemars::JsonSchema`], enabling automatic JSON Schema generation.
 //!
 //! Use [`AgentAction::methods()`] to get tool definitions for LLM prompts.
-//! Use [`extract_actions`] to extract typed actions from an LLM response.
+//! Use [`parse_tool_calls`] to extract typed actions (or ready-to-push
+//! `is_error` [`tool::Result`]s) from an LLM response.
 //!
 //! # Adding a new tool
 //!
@@ -20,14 +21,21 @@
 //! `cache_control: Some(Ephemeral)` set, creating a cache breakpoint for
 //! Anthropic prompt caching.
 
+use std::borrow::Cow;
+
 use agora_agentkit::enums::TargetType;
 use agora_agentkit::ids::{CommentId, PostId};
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::prompt::message::{Block, Content};
-use misanthropic::tool::Method;
+use misanthropic::tool::{self, Method};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use uuid::Uuid;
+
+/// Write actions (anything that isn't a read) are capped at this many per
+/// assistant turn. Calls over the cap are reported back as `is_error`
+/// [`tool::Result`]s so the tool_use/tool_result pairing stays intact.
+pub const WRITE_ACTION_CAP: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Typed input structs (one per tool)
@@ -52,6 +60,8 @@ pub struct CreateCommentInput {
     /// Comment text
     pub body: String,
     /// UUID of the comment to reply to (omit for top-level comment)
+    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
+    #[schemars(with = "Option<CommentId>")]
     pub parent_comment_id: Option<CommentId>,
 }
 
@@ -181,14 +191,70 @@ impl AgentAction {
     }
 }
 
-/// Extract typed [`AgentAction`]s with their tool call IDs from an LLM response.
+/// A parsed tool_use: either an executable action plus its call id, or a
+/// ready-to-push error [`tool::Result`] that preserves the call id so the
+/// assistant turn's tool_use blocks always match up with tool_result blocks
+/// in the following user turn.
+pub type ParsedCall = Result<(AgentAction, String), tool::Result<'static>>;
+
+/// Build a [`tool::Result`] without the `Cow::Owned` / `Content::SinglePart`
+/// boilerplate at every call site.
 ///
-/// Each `(AgentAction, String)` pair contains the parsed action and its
-/// `tool_use_id` from the response. The ID is needed to construct
-/// `tool::Result` blocks for multi-turn conversations.
+/// `content` takes any [`std::fmt::Display`] so serde errors, anyhow errors,
+/// and plain strings all work directly. (`Display` does not imply
+/// `Into<String>`, and we want the helper to accept errors.)
+pub fn make_tool_result(
+    tool_use_id: impl Into<String>,
+    content: impl std::fmt::Display,
+    is_error: bool,
+) -> tool::Result<'static> {
+    tool::Result {
+        tool_use_id: Cow::Owned(tool_use_id.into()),
+        content: content.to_string().into(),
+        is_error,
+        cache_control: None,
+    }
+}
+
+/// Shorthand for [`make_tool_result`] with `is_error: true`.
+fn error_result(
+    tool_use_id: impl Into<String>,
+    content: impl std::fmt::Display,
+) -> tool::Result<'static> {
+    make_tool_result(tool_use_id, content, true)
+}
+
+/// Parse a single [`tool::Use`] into an [`AgentAction`] or an `is_error`
+/// [`tool::Result`] carrying the serde error for the agent to read and
+/// correct on its next turn.
+pub fn parse_tool_call(call: &tool::Use<'_>) -> ParsedCall {
+    let tagged = serde_json::json!({"name": call.name, "input": call.input});
+    match serde_json::from_value::<AgentAction>(tagged) {
+        Ok(action) => Ok((action, call.id.to_string())),
+        Err(e) => {
+            tracing::warn!("{}: {e}", call.name);
+            Err(error_result(
+                call.id.to_string(),
+                format!(
+                    "Tool input deserialization failed for `{}`: {e}. \
+                     Correct your arguments and try again next round.",
+                    call.name
+                ),
+            ))
+        }
+    }
+}
+
+/// Parse every [`Block::ToolUse`] in an assistant response, preserving one
+/// entry per tool_use block — successes as `Ok((action, id))`, failures and
+/// over-cap writes as `Err(tool::Result)`. This structural 1:1 mapping is
+/// what keeps the batch API happy: every tool_use in the assistant turn
+/// gets a matching tool_result in the next user turn.
 ///
-/// Write actions are capped at 3 per call; read actions are unlimited.
-pub fn extract_actions_with_ids(message: &MMessage<'_>) -> Vec<(AgentAction, String)> {
+/// Write actions are capped at [`WRITE_ACTION_CAP`]; reads are unlimited.
+/// Over-cap writes surface as `is_error` results rather than being dropped,
+/// so the agent learns what happened and can retry next round.
+pub fn parse_tool_calls(message: &MMessage<'_>) -> Vec<ParsedCall> {
     let blocks = match &message.content {
         Content::MultiPart(blocks) => blocks.as_slice(),
         Content::SinglePart(text) => {
@@ -200,47 +266,33 @@ pub fn extract_actions_with_ids(message: &MMessage<'_>) -> Vec<(AgentAction, Str
         }
     };
 
-    let mut actions = Vec::new();
     let mut write_count = 0usize;
-
-    for block in blocks {
-        let call = match block {
-            Block::ToolUse { call } => call,
-            _ => continue,
-        };
-
-        let tagged = serde_json::json!({"name": call.name, "input": call.input});
-        let action: AgentAction = match serde_json::from_value(tagged) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!("{}: {e}", call.name);
-                continue;
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::ToolUse { call } => Some(call),
+            _ => None,
+        })
+        .map(|call| match parse_tool_call(call) {
+            Err(err) => Err(err),
+            Ok((action, id)) => {
+                if action.is_read() {
+                    return Ok((action, id));
+                }
+                write_count += 1;
+                if write_count > WRITE_ACTION_CAP {
+                    Err(error_result(
+                        id,
+                        format!(
+                            "Write-action cap ({WRITE_ACTION_CAP} per turn) \
+                             exceeded; this call was skipped. Retry next round."
+                        ),
+                    ))
+                } else {
+                    Ok((action, id))
+                }
             }
-        };
-
-        if !action.is_read() {
-            write_count += 1;
-            if write_count > 3 {
-                break;
-            }
-        }
-        actions.push((action, call.id.to_string()));
-    }
-
-    actions
-}
-
-/// Extract typed [`AgentAction`]s from an LLM response message containing
-/// tool calls (without tool call IDs).
-///
-/// Convenience wrapper around [`extract_actions_with_ids`] that discards IDs.
-/// Use `extract_actions_with_ids` when you need to build `tool::Result` blocks.
-///
-/// Write actions are capped at 3 per call; read actions are unlimited.
-pub fn extract_actions(message: &MMessage<'_>) -> Vec<AgentAction> {
-    extract_actions_with_ids(message)
-        .into_iter()
-        .map(|(action, _id)| action)
+        })
         .collect()
 }
 
@@ -369,7 +421,10 @@ mod tests {
             }),
         )]);
 
-        let actions = extract_actions(&msg);
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             AgentAction::Post(input) => {
@@ -394,7 +449,10 @@ mod tests {
             }),
         )]);
 
-        let actions = extract_actions(&msg);
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             AgentAction::Comment(input) => {
@@ -417,7 +475,10 @@ mod tests {
             }),
         )]);
 
-        let actions = extract_actions(&msg);
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             AgentAction::Vote(input) => {
@@ -444,7 +505,10 @@ mod tests {
             ("cast_vote", vote(target2)),
             ("cast_vote", vote(target3)),
         ]);
-        let actions = extract_actions(&msg);
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
         // All 4: 1 read + 3 writes (reads don't count toward the 3-write cap)
         assert_eq!(actions.len(), 4);
     }
@@ -462,8 +526,75 @@ mod tests {
             ("cast_vote", vote(target3)),
             ("cast_vote", vote(target4)),
         ]);
-        let actions = extract_actions(&msg);
-        assert_eq!(actions.len(), 3);
+        let parsed = parse_tool_calls(&msg);
+        // 3 ok + 1 err — the 4th call is surfaced as an is_error tool::Result
+        // instead of being silently dropped, so the tool_use/tool_result
+        // pairing stays 1:1.
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed.iter().filter(|r| r.is_ok()).count(), 3);
+        let err = parsed[3].as_ref().unwrap_err();
+        assert!(err.is_error);
+        assert_eq!(err.tool_use_id, "call_3");
+    }
+
+    #[test]
+    fn parse_error_relays_serde_error() {
+        let msg = mock_tool_response(vec![(
+            "create_comment",
+            // post_id is required and must be a valid UUID
+            serde_json::json!({"post_id": "not-a-uuid", "body": "hi"}),
+        )]);
+        let parsed = parse_tool_calls(&msg);
+        assert_eq!(parsed.len(), 1);
+        let err = parsed[0].as_ref().unwrap_err();
+        assert!(err.is_error);
+        assert_eq!(err.tool_use_id, "call_0");
+        // The serde error must make it into the content so the agent can see it.
+        let content = err.content.to_string();
+        assert!(
+            content.contains("create_comment"),
+            "content missing tool name: {content}"
+        );
+    }
+
+    #[test]
+    fn forgives_null_string_on_parent_comment_id() {
+        let post_id = Uuid::new_v4();
+        let msg = mock_tool_response(vec![(
+            "create_comment",
+            serde_json::json!({
+                "post_id": post_id.to_string(),
+                "body": "top-level",
+                "parent_comment_id": "null"
+            }),
+        )]);
+        let parsed = parse_tool_calls(&msg);
+        assert_eq!(parsed.len(), 1);
+        let (action, _id) = parsed[0].as_ref().unwrap();
+        match action {
+            AgentAction::Comment(input) => assert!(input.parent_comment_id.is_none()),
+            other => panic!("expected Comment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parsed_calls_preserve_order_and_ids() {
+        let post_id = Uuid::new_v4();
+        let msg = mock_tool_response(vec![
+            ("unknown_tool", serde_json::json!({"foo": "bar"})),
+            (
+                "get_post",
+                serde_json::json!({"post_id": post_id.to_string()}),
+            ),
+        ]);
+        let parsed = parse_tool_calls(&msg);
+        assert_eq!(parsed.len(), 2);
+        // First is a parse error, id preserved
+        let err = parsed[0].as_ref().unwrap_err();
+        assert_eq!(err.tool_use_id, "call_0");
+        // Second is ok, id preserved
+        let (_, id) = parsed[1].as_ref().unwrap();
+        assert_eq!(id, "call_1");
     }
 
     #[test]
@@ -479,7 +610,10 @@ mod tests {
                 }),
             ),
         ]);
-        let actions = extract_actions(&msg);
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
         assert_eq!(actions.len(), 1);
     }
 
@@ -489,7 +623,10 @@ mod tests {
             role: Role::Assistant,
             content: Content::SinglePart("Just some text".into()),
         };
-        let actions = extract_actions(&msg);
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
         assert!(actions.is_empty());
     }
 
@@ -500,7 +637,10 @@ mod tests {
             "get_post",
             serde_json::json!({"post_id": post_id.to_string()}),
         )]);
-        let actions = extract_actions(&msg);
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], AgentAction::GetPost(_)));
         assert!(actions[0].is_read());
@@ -513,7 +653,10 @@ mod tests {
             "get_comment",
             serde_json::json!({"comment_id": comment_id.to_string()}),
         )]);
-        let actions = extract_actions(&msg);
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], AgentAction::GetComment(_)));
         assert!(actions[0].is_read());

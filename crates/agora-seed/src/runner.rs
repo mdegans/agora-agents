@@ -1,7 +1,9 @@
 use agora_agent_lib::llm::{LlmBackend, SendResponse, Usage};
-use agora_agent_lib::tools;
+use agora_agent_lib::tools::{make_tool_result, parse_tool_calls};
 use anyhow::Result;
-use misanthropic::prompt::message::{Block, Content};
+use misanthropic::prompt::message::Content;
+use misanthropic::prompt::{AssistantMessage, UserMessage};
+use misanthropic::tool;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
@@ -189,68 +191,65 @@ pub async fn run_cycle(
             verbose_response(&format!("ROUND {} RESPONSE", round + 1), &response_text);
         }
 
-        // Extract actions with their tool call IDs
-        let actions_with_ids = tools::extract_actions_with_ids(&response_message);
+        // Parse every tool_use block. Failures and over-cap writes surface
+        // as is_error tool::Results so the tool_use/tool_result pairing
+        // stays 1:1.
+        let parsed = parse_tool_calls(&response_message);
 
         if verbose {
-            let action_strs: Vec<String> = actions_with_ids
+            let action_strs: Vec<String> = parsed
                 .iter()
-                .map(|(a, _)| format!("{:?}", a))
+                .map(|entry| match entry {
+                    Ok((a, _)) => format!("{a:?}"),
+                    Err(result) => format!("parse_error({})", result.tool_use_id),
+                })
                 .collect();
-            eprintln!(
-                "\n=== ROUND {} ACTIONS ({}) ===",
-                round + 1,
-                actions_with_ids.len()
-            );
+            eprintln!("\n=== ROUND {} PARSED ({}) ===", round + 1, parsed.len());
             println!("{}", serde_json::to_string_pretty(&action_strs).unwrap());
         }
 
-        // Append assistant response to conversation
+        let assistant_msg = AssistantMessage::try_from(response_message.into_static())
+            .expect("backend guarantees assistant role");
         think_prompt
-            .push_message(response_message)
+            .push_message(assistant_msg)
             .expect("assistant message should follow user");
+        // it's now the user's turn
 
-        // If no tool calls, nothing to execute — still continue to next round
-        if actions_with_ids.is_empty() {
-            // Need a user message before next assistant turn
+        if parsed.is_empty() {
+            // Text-only reply — nudge for the next round.
             think_prompt
-                .push_message((
-                    misanthropic::prompt::message::Role::User,
+                .push_message(UserMessage::from(
                     "Continue. You have more rounds to act. Use your tools to read posts, comment, vote, or create posts.",
                 ))
                 .expect("user message should follow assistant");
+            // it's now the assistant's turn
             continue;
         }
 
-        // Execute each action and build tool results
-        let mut tool_result_blocks: Vec<Block<'static>> = Vec::new();
-
-        for (action, tool_call_id) in &actions_with_ids {
-            let (summary, result_text, is_error) =
-                execute_action(action, agent, agent_id, client, &dashboard).await;
-
-            if let Some(summary) = summary {
-                action_summaries.push(summary);
-            }
-
-            tool_result_blocks.push(Block::ToolResult {
-                result: misanthropic::tool::Result {
-                    tool_use_id: std::borrow::Cow::Owned(tool_call_id.clone()),
-                    content: Content::from(result_text.as_str()).into_static(),
-                    is_error,
-                    cache_control: None,
-                },
-            });
+        // Execute successful parses, pass through errors, and collect into
+        // a single multi-part UserMessage via FromIterator<Block>.
+        let mut results: Vec<tool::Result<'static>> = Vec::with_capacity(parsed.len());
+        for entry in parsed {
+            let result = match entry {
+                Ok((action, tool_use_id)) => {
+                    let (summary, result) =
+                        execute_action(&action, tool_use_id, agent, agent_id, client, &dashboard)
+                            .await;
+                    if let Some(s) = summary {
+                        action_summaries.push(s);
+                    }
+                    result
+                }
+                Err(err_result) => err_result,
+            };
+            results.push(result);
         }
 
-        // Push tool results as a user message
-        let tool_results_message = misanthropic::prompt::Message {
-            role: misanthropic::prompt::message::Role::User,
-            content: Content::MultiPart(tool_result_blocks),
-        };
+        let tool_results_message: UserMessage<'static> = results.into_iter().collect();
         think_prompt
             .push_message(tool_results_message)
             .expect("user message (tool results) should follow assistant");
+        // it's now the assistant's turn
 
         // Manage cache breakpoint budget: first + last 2 message breakpoints
         think_prompt.cache_windowed(2);
@@ -265,11 +264,12 @@ pub async fn run_cycle(
     // or continuation). Insert a synthetic assistant message so the reflect
     // phase can push its user message without violating turn alternation.
     think_prompt
-        .push_message(misanthropic::prompt::AssistantMessage::from(
+        .push_message(AssistantMessage::from(
             Content::from(format!("I have completed my {MAX_ROUNDS} rounds of action.").as_str())
                 .into_static(),
         ))
         .expect("assistant bridge after user should always succeed");
+    // it's now the user's turn
 
     tracing::info!(
         "[{}/{}] Agent {} — act complete ({} actions total)",
@@ -302,11 +302,9 @@ pub async fn run_cycle(
 
     think_prompt.set_max_tokens(std::num::NonZeroU32::new(1024).unwrap());
     think_prompt
-        .push_message((
-            misanthropic::prompt::message::Role::User,
-            MEMORY_REWRITE_MESSAGE,
-        ))
+        .push_message(UserMessage::from(MEMORY_REWRITE_MESSAGE))
         .expect("user message should follow assistant");
+    // it's now the assistant's turn
 
     let SendResponse {
         message: reflect_response_msg,
@@ -316,8 +314,12 @@ pub async fn run_cycle(
     let reflect_response = reflect_response_msg.content.to_string();
 
     think_prompt
-        .push_message(reflect_response_msg)
+        .push_message(
+            AssistantMessage::try_from(reflect_response_msg.into_static())
+                .expect("backend guarantees assistant role"),
+        )
         .expect("assistant message should follow user");
+    // it's now the user's turn
 
     if verbose {
         verbose_response("REFLECT RESPONSE", &reflect_response);
@@ -354,14 +356,12 @@ pub async fn run_cycle(
             prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience_summary);
         think_prompt.set_max_tokens(std::num::NonZeroU32::new(2048).unwrap());
         if think_prompt
-            .push_message((
-                misanthropic::prompt::message::Role::User,
-                mutation_text.clone(),
-            ))
+            .push_message(UserMessage::from(mutation_text.clone()))
             .is_err()
         {
             tracing::debug!("Soul mutation skipped for {}: turn order", agent.name);
         } else {
+            // it's now the assistant's turn
             match backend.send(&think_prompt).await {
                 Ok(SendResponse {
                     message: mutation_msg,
@@ -370,8 +370,12 @@ pub async fn run_cycle(
                     accumulate_usage(&mut total_usage, usage);
                     let mutation_response = mutation_msg.content.to_string();
                     think_prompt
-                        .push_message(mutation_msg)
+                        .push_message(
+                            AssistantMessage::try_from(mutation_msg.into_static())
+                                .expect("backend guarantees assistant role"),
+                        )
                         .expect("assistant message should follow user");
+                    // it's now the user's turn
 
                     if verbose {
                         verbose_response("SOUL MUTATION RESPONSE", &mutation_response);
@@ -438,14 +442,12 @@ pub async fn run_cycle(
         let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience_summary);
         think_prompt.set_max_tokens(std::num::NonZeroU32::new(256).unwrap());
         if think_prompt
-            .push_message((
-                misanthropic::prompt::message::Role::User,
-                evolution_text.clone(),
-            ))
+            .push_message(UserMessage::from(evolution_text.clone()))
             .is_err()
         {
             tracing::debug!("Evolution skipped for {}: turn order", agent.name);
         } else {
+            // it's now the assistant's turn
             match backend.send(&think_prompt).await {
                 Ok(SendResponse {
                     message: evo_msg,
@@ -454,8 +456,12 @@ pub async fn run_cycle(
                     accumulate_usage(&mut total_usage, usage);
                     let evo_response = evo_msg.content.to_string();
                     think_prompt
-                        .push_message(evo_msg)
+                        .push_message(
+                            AssistantMessage::try_from(evo_msg.into_static())
+                                .expect("backend guarantees assistant role"),
+                        )
                         .expect("assistant message should follow user");
+                    // it's now the user's turn
 
                     if verbose {
                         verbose_response("EVOLUTION RESPONSE", &evo_response);
@@ -480,14 +486,12 @@ pub async fn run_cycle(
         let survey_text = prompt::build_survey_prompt(&agent.name, &action_summaries);
         think_prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
         if think_prompt
-            .push_message((
-                misanthropic::prompt::message::Role::User,
-                survey_text.clone(),
-            ))
+            .push_message(UserMessage::from(survey_text.clone()))
             .is_err()
         {
             tracing::debug!("Survey skipped for {}: turn order", agent.name);
         } else {
+            // it's now the assistant's turn
             match backend.send(&think_prompt).await {
                 Ok(SendResponse {
                     message: survey_msg,
@@ -544,32 +548,28 @@ pub async fn run_cycle(
     Ok(())
 }
 
-/// Execute a single agent action and return (summary, tool_result_text, is_error).
-///
-/// The summary is `Some(String)` for write actions, `None` for reads.
-/// The tool_result_text is what gets sent back to the model as the tool result.
+/// Execute a single agent action and return the summary (for reflect/evolve
+/// context) plus the [`tool::Result`] to append to the conversation.
 async fn execute_action(
     action: &prompt::AgentAction,
+    tool_use_id: String,
     agent: &mut Agent,
     agent_id: agora_agent_lib::agora_agentkit::ids::AgentId,
     client: &AgoraClient,
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
-) -> (Option<String>, String, bool) {
+) -> (Option<String>, tool::Result<'static>) {
+    let ok = |content: &str| make_tool_result(tool_use_id.clone(), content, false);
+    let err = |content: &str| make_tool_result(tool_use_id.clone(), content, true);
+
     match action {
         prompt::AgentAction::GetPost(input) => match client.get_post(input.post_id).await {
-            Ok(full) => {
-                let text = prompt::format_tool_result_post(&full);
-                (None, text, false)
-            }
-            Err(e) => (None, format!("Error fetching post: {e}"), true),
+            Ok(full) => (None, ok(&prompt::format_tool_result_post(&full))),
+            Err(e) => (None, err(&format!("Error fetching post: {e}"))),
         },
         prompt::AgentAction::GetComment(input) => {
             match client.get_comment(input.comment_id).await {
-                Ok(chain) => {
-                    let text = prompt::format_tool_result_comment(&chain);
-                    (None, text, false)
-                }
-                Err(e) => (None, format!("Error fetching comment: {e}"), true),
+                Ok(chain) => (None, ok(&prompt::format_tool_result_comment(&chain))),
+                Err(e) => (None, err(&format!("Error fetching comment: {e}"))),
             }
         }
         prompt::AgentAction::Post(input) => {
@@ -583,13 +583,10 @@ async fn execute_action(
                     agent.name
                 );
                 return (
-                    Some(format!("Skipped posting to news (restricted)")),
-                    "The news community is reserved for MCP agents with search/browse tools."
-                        .to_string(),
-                    true,
+                    Some("Skipped posting to news (restricted)".to_string()),
+                    err("The news community is reserved for MCP agents with search/browse tools."),
                 );
             }
-            // Title repetition check using feed titles from dashboard
             let existing_titles: Vec<String> = dashboard
                 .feeds
                 .get(slug)
@@ -602,9 +599,13 @@ async fn execute_action(
                     input.title
                 );
                 return (
-                    Some(format!("Skipped posting \"{}\" (too similar to existing posts)", input.title)),
-                    "Your proposed post is too similar to existing posts. Try a different angle or topic.".to_string(),
-                    true,
+                    Some(format!(
+                        "Skipped posting \"{}\" (too similar to existing posts)",
+                        input.title
+                    )),
+                    err(
+                        "Your proposed post is too similar to existing posts. Try a different angle or topic.",
+                    ),
                 );
             }
             match client
@@ -623,20 +624,18 @@ async fn execute_action(
                         format!("Posted \"{}\" in {} (id: {})", input.title, slug, post_id);
                     tracing::info!("  {} {}", agent.name, summary);
                     (
-                        Some(summary.clone()),
-                        format!("Post created successfully. Post ID: {post_id}"),
-                        false,
+                        Some(summary),
+                        ok(&format!("Post created successfully. Post ID: {post_id}")),
                     )
                 }
                 Err(e) => {
                     let summary = format!("Failed to post in {slug}: {e}");
                     tracing::warn!("  {} {}", agent.name, summary);
-                    (Some(summary), format!("Error creating post: {e}"), true)
+                    (Some(summary), err(&format!("Error creating post: {e}")))
                 }
             }
         }
         prompt::AgentAction::Comment(input) => {
-            // Duplicate comment check
             let is_own_post = agent.state.created_posts.contains(&input.post_id);
             let has_reply_in_post = dashboard
                 .unread_comment_replies
@@ -653,9 +652,7 @@ async fn execute_action(
                 );
                 return (
                     None,
-                    "You already commented on this post. Try engaging with a different post."
-                        .to_string(),
-                    true,
+                    err("You already commented on this post. Try engaging with a different post."),
                 );
             }
             match client
@@ -678,14 +675,15 @@ async fn execute_action(
                     tracing::info!("  {} {}", agent.name, summary);
                     (
                         Some(summary),
-                        format!("Comment created successfully. Comment ID: {comment_id}"),
-                        false,
+                        ok(&format!(
+                            "Comment created successfully. Comment ID: {comment_id}"
+                        )),
                     )
                 }
                 Err(e) => {
                     let summary = format!("Failed to comment on {}: {e}", input.post_id);
                     tracing::warn!("  {} {}", agent.name, summary);
-                    (Some(summary), format!("Error creating comment: {e}"), true)
+                    (Some(summary), err(&format!("Error creating comment: {e}")))
                 }
             }
         }
@@ -710,13 +708,12 @@ async fn execute_action(
                     tracing::info!("  {} {}", agent.name, summary);
                     (
                         Some(summary),
-                        format!("Vote recorded: {verb} {}", input.target_type),
-                        false,
+                        ok(&format!("Vote recorded: {verb} {}", input.target_type)),
                     )
                 }
                 Err(e) => {
                     tracing::warn!("  {} vote failed: {e}", agent.name);
-                    (None, format!("Error casting vote: {e}"), true)
+                    (None, err(&format!("Error casting vote: {e}")))
                 }
             }
         }
@@ -737,15 +734,11 @@ async fn execute_action(
                         input.target_type, input.target_id, input.reason
                     );
                     tracing::info!("  {} {}", agent.name, summary);
-                    (
-                        Some(summary),
-                        format!("Content flagged successfully."),
-                        false,
-                    )
+                    (Some(summary), ok("Content flagged successfully."))
                 }
                 Err(e) => {
                     tracing::warn!("  {} flag failed: {e}", agent.name);
-                    (None, format!("Error flagging content: {e}"), true)
+                    (None, err(&format!("Error flagging content: {e}")))
                 }
             }
         }

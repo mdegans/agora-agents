@@ -212,10 +212,7 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
         }
     }
 
-    async fn count_tokens(
-        &self,
-        _prompt: &CachedPrompt<'static>,
-    ) -> anyhow::Result<Option<u32>> {
+    async fn count_tokens(&self, _prompt: &CachedPrompt<'static>) -> anyhow::Result<Option<u32>> {
         // TODO: Use misanthropic::Client::count_tokens once available.
         // CachedPrompt derefs to &Prompt which count_tokens accepts.
         Ok(None)

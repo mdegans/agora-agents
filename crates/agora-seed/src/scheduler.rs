@@ -30,11 +30,13 @@ use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::agora_agentkit::scheduler::{BatchBackend, BatchState, CycleStep, WorkItem};
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::OllamaEndpoint;
-use agora_agent_lib::tools;
+use agora_agent_lib::tools::{make_tool_result, parse_tool_calls};
 use anyhow::Result;
 use misanthropic::CachedPrompt;
 use misanthropic::prompt::Message as MMessage;
-use misanthropic::prompt::message::{Block, Content as MContent, Role as MRole};
+use misanthropic::prompt::message::Content as MContent;
+use misanthropic::prompt::{AssistantMessage, UserMessage};
+use misanthropic::tool;
 use rand::Rng;
 use rand::seq::SliceRandom;
 use serde::Serialize;
@@ -78,35 +80,36 @@ pub fn build_prompt(
     )
 }
 
-/// Execute a single tool action against the Agora server.
+/// Execute a single tool action against the Agora server and build the
+/// [`tool::Result`] that goes back to the model.
 ///
-/// Returns `(summary, tool_result_text, is_error)`.
-/// - `summary` is `Some(String)` for write actions, `None` for reads.
-/// - `tool_result_text` is what gets sent back to the model.
+/// Returns `(summary, result)`:
+/// - `summary` is `Some(String)` for write actions and explicitly-refused
+///   calls (both useful for the reflect/evolve context); `None` for
+///   successful reads.
+/// - `result` is the [`tool::Result`] to append to the next user turn,
+///   with `is_error` set appropriately.
 async fn execute_action(
     action: &prompt::AgentAction,
+    tool_use_id: String,
     agent: &mut Agent,
     client: &AgoraClient,
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
-) -> (Option<String>, String, bool) {
+) -> (Option<String>, tool::Result<'static>) {
     let agent_id = agent.agent_id.unwrap();
+    let ok = |content: &str| make_tool_result(tool_use_id.clone(), content, false);
+    let err = |content: &str| make_tool_result(tool_use_id.clone(), content, true);
 
     match action {
         prompt::AgentAction::GetPost(input) => match client.get_post(input.post_id).await {
-            Ok(full) => {
-                let text = prompt::format_tool_result_post(&full);
-                (None, text, false)
-            }
-            Err(e) => (None, format!("Error fetching post: {e}"), true),
+            Ok(full) => (None, ok(&prompt::format_tool_result_post(&full))),
+            Err(e) => (None, err(&format!("Error fetching post: {e}"))),
         },
         prompt::AgentAction::GetComment(input) => {
             match client.get_comment(input.comment_id).await {
-                Ok(chain) => {
-                    let text = prompt::format_tool_result_comment(&chain);
-                    (None, text, false)
-                }
-                Err(e) => (None, format!("Error fetching comment: {e}"), true),
+                Ok(chain) => (None, ok(&prompt::format_tool_result_comment(&chain))),
+                Err(e) => (None, err(&format!("Error fetching comment: {e}"))),
             }
         }
         prompt::AgentAction::Post(input) => {
@@ -118,8 +121,7 @@ async fn execute_action(
                 tracing::info!("  {} skipping post to news (restricted)", agent.name);
                 return (
                     Some("Skipped posting to news (restricted)".to_string()),
-                    "The news community is reserved for MCP agents.".to_string(),
-                    true,
+                    err("The news community is reserved for MCP agents."),
                 );
             }
             let existing_titles: Vec<String> = dashboard
@@ -136,8 +138,7 @@ async fn execute_action(
                 report.skipped.repetitive_titles += 1;
                 return (
                     Some(format!("Skipped posting \"{}\" (too similar)", input.title)),
-                    "Your proposed post is too similar to existing posts.".to_string(),
-                    true,
+                    err("Your proposed post is too similar to existing posts."),
                 );
             }
             match client
@@ -159,15 +160,14 @@ async fn execute_action(
                     report.model_actions(&agent.model).posts += 1;
                     (
                         Some(summary),
-                        format!("Post created successfully. Post ID: {post_id}"),
-                        false,
+                        ok(&format!("Post created successfully. Post ID: {post_id}")),
                     )
                 }
                 Err(e) => {
                     let summary = format!("Failed to post in {slug}: {e}");
                     tracing::warn!("  {} {}", agent.name, summary);
                     report.skipped.post_failures += 1;
-                    (Some(summary), format!("Error creating post: {e}"), true)
+                    (Some(summary), err(&format!("Error creating post: {e}")))
                 }
             }
         }
@@ -184,11 +184,7 @@ async fn execute_action(
                     input.post_id
                 );
                 report.skipped.duplicate_comments += 1;
-                return (
-                    None,
-                    "You already commented on this post.".to_string(),
-                    true,
-                );
+                return (None, err("You already commented on this post."));
             }
             match client
                 .create_comment(
@@ -212,15 +208,14 @@ async fn execute_action(
                     report.model_actions(&agent.model).comments += 1;
                     (
                         Some(summary),
-                        format!("Comment created. Comment ID: {comment_id}"),
-                        false,
+                        ok(&format!("Comment created. Comment ID: {comment_id}")),
                     )
                 }
                 Err(e) => {
                     let summary = format!("Failed to comment on {}: {e}", input.post_id);
                     tracing::warn!("  {} {}", agent.name, summary);
                     report.skipped.comment_failures += 1;
-                    (Some(summary), format!("Error creating comment: {e}"), true)
+                    (Some(summary), err(&format!("Error creating comment: {e}")))
                 }
             }
         }
@@ -247,14 +242,13 @@ async fn execute_action(
                     report.model_actions(&agent.model).votes += 1;
                     (
                         Some(summary),
-                        format!("Vote recorded: {verb} {}", input.target_type),
-                        false,
+                        ok(&format!("Vote recorded: {verb} {}", input.target_type)),
                     )
                 }
                 Err(e) => {
                     tracing::warn!("  {} vote failed: {e}", agent.name);
                     report.skipped.vote_failures += 1;
-                    (None, format!("Error casting vote: {e}"), true)
+                    (None, err(&format!("Error casting vote: {e}")))
                 }
             }
         }
@@ -277,105 +271,80 @@ async fn execute_action(
                     tracing::info!("  {} {}", agent.name, summary);
                     report.actions.flags += 1;
                     report.model_actions(&agent.model).flags += 1;
-                    (
-                        Some(summary),
-                        "Content flagged successfully.".to_string(),
-                        false,
-                    )
+                    (Some(summary), ok("Content flagged successfully."))
                 }
                 Err(e) => {
                     tracing::warn!("  {} flag failed: {e}", agent.name);
-                    (None, format!("Error flagging content: {e}"), true)
+                    (None, err(&format!("Error flagging content: {e}")))
                 }
             }
         }
     }
 }
 
-/// Extract tool calls from a response message.
+/// Process one round of an assistant response: append it, execute tool
+/// calls, and append tool results.
 ///
-/// Returns (actions, tool_call_ids) pairs.
-pub fn extract_tool_calls(response: &MMessage<'_>) -> Vec<(prompt::AgentAction, String)> {
-    tools::extract_actions_with_ids(response)
-}
-
-/// Build a tool results message from executed actions.
+/// Every `Block::ToolUse` in the assistant response produces exactly one
+/// `tool::Result` in the following user message — successes from
+/// [`execute_action`], parse errors and over-cap writes from
+/// [`parse_tool_calls`] directly. This structural 1:1 pairing is what
+/// keeps the Anthropic batch API happy.
 ///
-/// Each action's result becomes a `Block::ToolResult` in a multi-part
-/// user message. This is the format the API expects: all tool results
-/// from one assistant turn in a single user message.
-pub fn build_tool_results_message(
-    results: Vec<(String, String, bool)>, // (tool_call_id, text, is_error)
-) -> MMessage<'static> {
-    let blocks: Vec<Block<'static>> = results
-        .into_iter()
-        .map(|(tool_call_id, text, is_error)| Block::ToolResult {
-            result: misanthropic::tool::Result {
-                tool_use_id: std::borrow::Cow::Owned(tool_call_id),
-                content: MContent::from(text.as_str()).into_static(),
-                is_error,
-                cache_control: None,
-            },
-        })
-        .collect();
-
-    MMessage {
-        role: MRole::User,
-        content: MContent::MultiPart(blocks),
-    }
-}
-
-/// Process one round of an assistant response: append it, execute tool calls,
-/// and append tool results.
-///
-/// Returns action summaries from this round. If the response has no tool calls,
-/// appends a nudge message instead.
+/// Returns action summaries from this round. If the response has no tool
+/// calls (e.g. text-only reply), appends a "Continue" nudge instead.
 ///
 /// This function only appends to the prompt — it never modifies the prefix.
 async fn process_round(
     cached_prompt: &mut CachedPrompt<'static>,
-    response: MMessage<'static>,
+    response: AssistantMessage<'static>,
     agent: &mut Agent,
     client: &AgoraClient,
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
 ) -> Result<Vec<String>> {
-    let actions = extract_tool_calls(&response);
+    let parsed = parse_tool_calls(&response);
 
-    // Append assistant response
     cached_prompt
         .push_message(response)
         .map_err(|e| anyhow::anyhow!("appending assistant response: {e}"))?;
+    // it's now the user's turn
 
-    if actions.is_empty() {
-        // No tool calls — nudge for next round
-        let _ = cached_prompt.push_message((
-            MRole::User,
-            "Continue. Use your tools to read posts, comment, vote, or create posts.",
-        ));
+    if parsed.is_empty() {
+        // Text-only reply with no tool_use blocks — nudge and move on.
+        cached_prompt
+            .push_message(UserMessage::from(
+                "Continue. Use your tools to read posts, comment, vote, or create posts.",
+            ))
+            .map_err(|e| anyhow::anyhow!("appending nudge: {e}"))?;
+        // it's now the assistant's turn
         return Ok(vec![]);
     }
 
-    // Execute each action
     let mut summaries = Vec::new();
-    let mut tool_results = Vec::new();
+    let mut results: Vec<tool::Result<'static>> = Vec::with_capacity(parsed.len());
 
-    for (action, tool_call_id) in &actions {
-        let (summary, result_text, is_error) =
-            execute_action(action, agent, client, dashboard, report).await;
-
-        if let Some(s) = summary {
-            summaries.push(s);
+    for entry in parsed {
+        match entry {
+            Ok((action, tool_use_id)) => {
+                let (summary, result) =
+                    execute_action(&action, tool_use_id, agent, client, dashboard, report).await;
+                if let Some(s) = summary {
+                    summaries.push(s);
+                }
+                results.push(result);
+            }
+            Err(err_result) => results.push(err_result),
         }
-
-        tool_results.push((tool_call_id.clone(), result_text, is_error));
     }
 
-    // Append all tool results as a single user message
-    let tool_msg = build_tool_results_message(tool_results);
+    // Collect tool::Results into a single multi-part UserMessage via the
+    // FromIterator<Block> impl on UserMessage (tool::Result: Into<Block>).
+    let user_msg: UserMessage<'static> = results.into_iter().collect();
     cached_prompt
-        .push_message(tool_msg)
+        .push_message(user_msg)
         .map_err(|e| anyhow::anyhow!("appending tool results: {e}"))?;
+    // it's now the assistant's turn
 
     // Manage cache breakpoint budget: keep first + last 2
     cached_prompt.cache_windowed(2);
@@ -389,9 +358,10 @@ async fn process_round(
 /// This inserts a synthetic assistant message so the reflect phase can push
 /// its user message without violating turn alternation.
 fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
-    let _ = cached_prompt.push_message(misanthropic::prompt::AssistantMessage::from(
+    let _ = cached_prompt.push_message(AssistantMessage::from(
         MContent::from("I have completed my rounds of action.").into_static(),
     ));
+    // it's now the user's turn
 }
 
 /// Apply the reflect response: update agent memory.
@@ -661,6 +631,9 @@ async fn run_batch(
 
         let round_results = submit_and_poll(backend, work_items).await?;
 
+        // Agents to drop from further rounds (turn-order bugs, etc.).
+        let mut drop_agent: HashSet<AgentId> = HashSet::new();
+
         // Process results: execute actions, append tool results
         for result in &round_results {
             let response = match &result.response {
@@ -698,15 +671,22 @@ async fn run_batch(
                 MAX_ROUNDS,
             );
 
-            match process_round(
-                prompt,
-                response.clone().into_static(),
-                agent,
-                client,
-                &ctx.dashboard,
-                report,
-            )
-            .await
+            // The API guarantees Role::Assistant on the response, so this
+            // conversion cannot fail in practice. If it ever does, treat it
+            // the same as a turn-order bug: drop the agent.
+            let assistant_msg = match AssistantMessage::try_from(response.clone().into_static()) {
+                Ok(m) => m,
+                Err(_) => {
+                    tracing::error!(
+                        "Non-assistant response from API for {} — dropping from batch",
+                        agent.name
+                    );
+                    drop_agent.insert(result.agent_id);
+                    continue;
+                }
+            };
+
+            match process_round(prompt, assistant_msg, agent, client, &ctx.dashboard, report).await
             {
                 Ok(summaries) => {
                     action_summaries_map
@@ -715,9 +695,29 @@ async fn run_batch(
                         .extend(summaries);
                 }
                 Err(e) => {
-                    tracing::warn!("Round processing failed for {}: {e}", agent.name);
+                    // A process_round error after the typed-wrapper refactor
+                    // means a genuine turn-order bug — log loudly with the
+                    // full prompt and drop this agent for the rest of the
+                    // batch so we don't keep submitting a broken conversation.
+                    let snapshot = serde_json::to_string_pretty(&*prompt)
+                        .unwrap_or_else(|err| format!("<serialize failed: {err}>"));
+                    tracing::error!(
+                        agent = %agent.name,
+                        agent_id = %result.agent_id,
+                        round = round + 1,
+                        error = %e,
+                        "Turn-order failure in process_round — dropping agent from batch.\n\
+                         Prompt snapshot:\n{snapshot}"
+                    );
+                    report.skipped.turn_order_failures += 1;
+                    drop_agent.insert(result.agent_id);
                 }
             }
+        }
+
+        // Remove any agents marked for dropping from further rounds.
+        for id in drop_agent.drain() {
+            agent_prompts.remove(&id);
         }
     }
 
@@ -734,10 +734,11 @@ async fn run_batch(
         // Stop adding cache breakpoints for reflect/evolve/survey
         insert_bridge(prompt);
 
-        if let Err(e) = prompt.push_message((MRole::User, MEMORY_REWRITE_MESSAGE)) {
+        if let Err(e) = prompt.push_message(UserMessage::from(MEMORY_REWRITE_MESSAGE)) {
             tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
             continue;
         }
+        // it's now the assistant's turn
         prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
 
         reflect_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
@@ -770,7 +771,10 @@ async fn run_batch(
 
         // Append reflect response for evolve/survey phases
         if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
-            let _ = prompt.push_message(response_msg.clone().into_static());
+            if let Ok(assistant) = AssistantMessage::try_from(response_msg.clone().into_static()) {
+                let _ = prompt.push_message(assistant);
+                // it's now the user's turn
+            }
         }
     }
 
@@ -802,20 +806,22 @@ async fn run_batch(
             let current_soul = agent.soul.render();
             let mutation_text =
                 prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
-            if let Err(e) = prompt.push_message((MRole::User, mutation_text)) {
+            if let Err(e) = prompt.push_message(UserMessage::from(mutation_text)) {
                 tracing::debug!("Mutation prompt append failed for {}: {e}", agent.name);
                 continue;
             }
+            // it's now the assistant's turn
             prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
 
             mutation_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
             mutation_agent_ids.push(agent_id);
         } else if roll < evo_threshold {
             let evolution_text = prompt::build_evolution_prompt(&agent.name, &experience);
-            if let Err(e) = prompt.push_message((MRole::User, evolution_text)) {
+            if let Err(e) = prompt.push_message(UserMessage::from(evolution_text)) {
                 tracing::debug!("Evolution prompt append failed for {}: {e}", agent.name);
                 continue;
             }
+            // it's now the assistant's turn
             prompt.set_max_tokens(NonZeroU32::new(256).unwrap());
 
             evolution_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
@@ -856,7 +862,12 @@ async fn run_batch(
             }
 
             if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
-                let _ = prompt.push_message(response_msg.clone().into_static());
+                if let Ok(assistant) =
+                    AssistantMessage::try_from(response_msg.clone().into_static())
+                {
+                    let _ = prompt.push_message(assistant);
+                    // it's now the user's turn
+                }
             }
         }
     }
@@ -889,7 +900,12 @@ async fn run_batch(
             }
 
             if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
-                let _ = prompt.push_message(response_msg.clone().into_static());
+                if let Ok(assistant) =
+                    AssistantMessage::try_from(response_msg.clone().into_static())
+                {
+                    let _ = prompt.push_message(assistant);
+                    // it's now the user's turn
+                }
             }
         }
     }
@@ -914,10 +930,11 @@ async fn run_batch(
             .cloned()
             .unwrap_or_default();
         let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
-        if let Err(e) = prompt.push_message((MRole::User, survey_text)) {
+        if let Err(e) = prompt.push_message(UserMessage::from(survey_text)) {
             tracing::debug!("Survey prompt append failed for {}: {e}", agent.name);
             continue;
         }
+        // it's now the assistant's turn
         prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
 
         survey_items.push(make_work_item(agent, prompt, CycleStep::Survey));
@@ -1044,9 +1061,17 @@ async fn run_batch_sequential(
                 }
             };
 
+            let assistant_msg = match AssistantMessage::try_from(response.into_static()) {
+                Ok(m) => m,
+                Err(_) => {
+                    tracing::error!("Ollama returned non-assistant response for {}", agent.name);
+                    break;
+                }
+            };
+
             match process_round(
                 &mut cached_prompt,
-                response,
+                assistant_msg,
                 agent,
                 client,
                 &ctx.dashboard,
@@ -1056,7 +1081,16 @@ async fn run_batch_sequential(
             {
                 Ok(round_summaries) => summaries.extend(round_summaries),
                 Err(e) => {
-                    tracing::warn!("Round processing failed for {}: {e}", agent.name);
+                    let snapshot = serde_json::to_string_pretty(&*cached_prompt)
+                        .unwrap_or_else(|err| format!("<serialize failed: {err}>"));
+                    tracing::error!(
+                        agent = %agent.name,
+                        round = round + 1,
+                        error = %e,
+                        "Turn-order failure in Ollama process_round.\n\
+                         Prompt snapshot:\n{snapshot}"
+                    );
+                    report.skipped.turn_order_failures += 1;
                     break;
                 }
             }
@@ -1073,19 +1107,25 @@ async fn run_batch_sequential(
         );
 
         // === OLLAMA EXCEPTION: strip tools for reflect phases ===
-        // Ollama misinterprets tool_choice:Auto as "must use tools", causing
-        // models to call tools instead of responding with text during reflect.
-        // This is a known upstream bug. We accept the KV cache miss since
-        // Ollama uses local GPU memory, not Anthropic's paid cache.
+        // Ollama's compat layer misinterprets `tool_choice: Auto` as "must
+        // use tools" during reflect. Clearing just `tool_choice` (while
+        // keeping `.functions` intact) is *not* sufficient: an absent
+        // `tool_choice` still falls through to Auto behavior when
+        // functions are present, so the model fires a tool call during
+        // memory rewrite instead of writing text. We have to drop
+        // `.functions` as well. This invalidates Ollama's prefix KV cache
+        // for reflect/evolve/survey; acceptable because Ollama uses local
+        // GPU memory, not Anthropic's paid prompt cache.
         insert_bridge(&mut cached_prompt);
         let mut bare_prompt = cached_prompt.into_inner();
         bare_prompt.functions = None;
         bare_prompt.tool_choice = None;
 
-        if let Err(e) = bare_prompt.push_message((MRole::User, MEMORY_REWRITE_MESSAGE)) {
+        if let Err(e) = bare_prompt.push_message(UserMessage::from(MEMORY_REWRITE_MESSAGE)) {
             tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
             continue;
         }
+        // it's now the assistant's turn
         bare_prompt.max_tokens = NonZeroU32::new(1024).unwrap();
 
         match endpoint.send(&bare_prompt, &model).await {
@@ -1094,8 +1134,14 @@ async fn run_batch_sequential(
                 if let Err(e) = apply_reflect(agent, &response_text).await {
                     tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
                 }
-                if let Err(e) = bare_prompt.push_message(reflect_response) {
-                    tracing::debug!("Failed to append reflect response for {}: {e}", agent.name);
+                if let Ok(assistant) = AssistantMessage::try_from(reflect_response.into_static()) {
+                    if let Err(e) = bare_prompt.push_message(assistant) {
+                        tracing::debug!(
+                            "Failed to append reflect response for {}: {e}",
+                            agent.name
+                        );
+                    }
+                    // it's now the user's turn
                 }
             }
             Err(e) => {
@@ -1116,7 +1162,11 @@ async fn run_batch_sequential(
             let mutation_text =
                 prompt::build_soul_mutation_prompt(&agent.name, &current_soul, &experience);
 
-            if let Ok(()) = bare_prompt.push_message((MRole::User, mutation_text)) {
+            if bare_prompt
+                .push_message(UserMessage::from(mutation_text))
+                .is_ok()
+            {
+                // it's now the assistant's turn
                 bare_prompt.max_tokens = NonZeroU32::new(2048).unwrap();
                 match endpoint.send(&bare_prompt, &model).await {
                     Ok(mutation_response) => {
@@ -1126,7 +1176,12 @@ async fn run_batch_sequential(
                         {
                             tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
                         }
-                        let _ = bare_prompt.push_message(mutation_response);
+                        if let Ok(assistant) =
+                            AssistantMessage::try_from(mutation_response.into_static())
+                        {
+                            let _ = bare_prompt.push_message(assistant);
+                            // it's now the user's turn
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
@@ -1136,7 +1191,11 @@ async fn run_batch_sequential(
             }
         } else if roll < evo_threshold {
             let evo_text = prompt::build_evolution_prompt(&agent.name, &experience);
-            if let Ok(()) = bare_prompt.push_message((MRole::User, evo_text)) {
+            if bare_prompt
+                .push_message(UserMessage::from(evo_text))
+                .is_ok()
+            {
+                // it's now the assistant's turn
                 bare_prompt.max_tokens = NonZeroU32::new(256).unwrap();
                 match endpoint.send(&bare_prompt, &model).await {
                     Ok(evo_response) => {
@@ -1144,7 +1203,12 @@ async fn run_batch_sequential(
                         if let Err(e) = apply_evolution(agent, &response_text, report).await {
                             tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
                         }
-                        let _ = bare_prompt.push_message(evo_response);
+                        if let Ok(assistant) =
+                            AssistantMessage::try_from(evo_response.into_static())
+                        {
+                            let _ = bare_prompt.push_message(assistant);
+                            // it's now the user's turn
+                        }
                     }
                     Err(e) => tracing::debug!("Evolution failed for {}: {e}", agent.name),
                 }
@@ -1154,7 +1218,11 @@ async fn run_batch_sequential(
         // Survey
         if config.force_survey || rand::random::<f64>() < 0.10 {
             let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
-            if let Ok(()) = bare_prompt.push_message((MRole::User, survey_text)) {
+            if bare_prompt
+                .push_message(UserMessage::from(survey_text))
+                .is_ok()
+            {
+                // it's now the assistant's turn
                 bare_prompt.max_tokens = NonZeroU32::new(512).unwrap();
                 match endpoint.send(&bare_prompt, &model).await {
                     Ok(survey_response) => {
@@ -1662,7 +1730,6 @@ pub struct ActionCounts {
     pub comments: u32,
     pub votes: u32,
     pub flags: u32,
-    pub observations: u32,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1672,6 +1739,10 @@ pub struct SkipCounts {
     pub perceive_failures: u32,
     pub think_failures: u32,
     pub reflect_failures: u32,
+    /// Turn-order bugs caught by `CachedPrompt::push_message`. After the
+    /// typed-wrapper refactor these should be structurally impossible; any
+    /// non-zero count indicates a bug in the scheduler itself.
+    pub turn_order_failures: u32,
     pub post_failures: u32,
     pub comment_failures: u32,
     pub vote_failures: u32,
@@ -1702,13 +1773,13 @@ fn merge_reports(main: &mut RunReport, sub: &RunReport) {
     main.actions.comments += sub.actions.comments;
     main.actions.votes += sub.actions.votes;
     main.actions.flags += sub.actions.flags;
-    main.actions.observations += sub.actions.observations;
 
     main.skipped.duplicate_comments += sub.skipped.duplicate_comments;
     main.skipped.repetitive_titles += sub.skipped.repetitive_titles;
     main.skipped.perceive_failures += sub.skipped.perceive_failures;
     main.skipped.think_failures += sub.skipped.think_failures;
     main.skipped.reflect_failures += sub.skipped.reflect_failures;
+    main.skipped.turn_order_failures += sub.skipped.turn_order_failures;
     main.skipped.post_failures += sub.skipped.post_failures;
     main.skipped.comment_failures += sub.skipped.comment_failures;
     main.skipped.vote_failures += sub.skipped.vote_failures;
@@ -1727,7 +1798,6 @@ fn merge_reports(main: &mut RunReport, sub: &RunReport) {
         entry.comments += counts.comments;
         entry.votes += counts.votes;
         entry.flags += counts.flags;
-        entry.observations += counts.observations;
     }
 }
 
