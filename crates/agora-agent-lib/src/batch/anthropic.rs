@@ -104,10 +104,14 @@ impl AnthropicBatch {
         let prime_id = pending.meta().id.clone();
         tracing::debug!("Prime batch submitted: id={prime_id}");
 
-        // Poll to completion. Single-item batches complete in a few
-        // seconds; we use a short interval to minimize the delay before
-        // the main batch can start reading from the cache.
-        let prime_timeout = std::time::Duration::from_secs(120);
+        // Poll to completion. Single-item batches usually finish in a
+        // few seconds but there's no SLA — Anthropic guarantees only a
+        // 24h ceiling. Cap at 30 minutes as a defensive timeout; if we
+        // hit it, fall through and let the main batch proceed without
+        // cache priming rather than stall a whole cycle indefinitely.
+        // Short poll interval so we can start the main batch as soon as
+        // the prime is ready.
+        let prime_timeout = std::time::Duration::from_secs(30 * 60);
         let poll_interval = std::time::Duration::from_millis(500);
         let prime_start = std::time::Instant::now();
 
