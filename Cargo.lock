@@ -1252,7 +1252,7 @@ dependencies = [
 [[package]]
 name = "misanthropic"
 version = "1.0.0-alpha.1"
-source = "git+https://github.com/mdegans/misanthropic?branch=dev#d1211598dfd0dca812516997246b41af3476288e"
+source = "git+https://github.com/mdegans/misanthropic?branch=dev#bb78d4813713c396503f5950eef08caa2078a00f"
 dependencies = [
  "async-stream",
  "async-trait",

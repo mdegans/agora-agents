@@ -520,6 +520,24 @@ async fn fetch_dashboard(
 // ---------------------------------------------------------------------------
 
 /// Submit work items to the Anthropic batch backend and poll until ready.
+///
+/// Errors returned from this function are contained by the calling
+/// `batch_phase_*` function and never propagate all the way up to
+/// `run_all` — we may be running sequential Ollama work concurrently
+/// and a batch-side failure must not abort the whole process.
+///
+/// TODO: add retry-with-backoff around `backend.poll()` calls. The
+/// handle is currently consumed by value on every `submit`/`poll`
+/// call, so we can't recover it after a transient HTTP decode error
+/// to retry. Two orthogonal upstream improvements would unblock this:
+/// (1) make misanthropic's `batch::Pending<P>: Clone` where `P: Clone`,
+/// so we can clone before each attempt; (2) change the `BatchBackend`
+/// trait's `submit` and `poll` to return their input back on error
+/// (e.g. `Result<T, (Input, E)>`) so retries can re-use the original
+/// allocation. Either gets us retry-with-backoff here via the existing
+/// `llm::retry_recoverable` helper. Until then, the containment is at
+/// the `batch_phase_*` level: transient poll failures cost one batch
+/// worth of work but don't take down the cycle.
 async fn submit_and_poll(
     backend: &AnthropicBatch,
     items: Vec<WorkItem<CachedPrompt<'static>>>,
@@ -682,7 +700,22 @@ async fn batch_phase_think_act(
             })
             .collect();
 
-        let round_results = submit_and_poll(backend, work_items).await?;
+        let round_results = match submit_and_poll(backend, work_items).await {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::error!(
+                    "batch_phase_think_act round {}: submit_and_poll failed: {e} — \
+                     skipping remaining tool rounds for this cycle",
+                    round + 1
+                );
+                // Failed rounds can't be safely retried without handles,
+                // but prior rounds' work is already applied to each
+                // agent's CachedPrompt — break out of the round loop and
+                // let reflect/evolve/survey continue on whatever state
+                // we reached.
+                break;
+            }
+        };
         let mut drop_agent: HashSet<AgentId> = HashSet::new();
 
         for result in &round_results {
@@ -797,7 +830,17 @@ async fn batch_phase_reflect(
         reflect_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
     }
 
-    let reflect_results = submit_and_poll(backend, reflect_items).await?;
+    let reflect_results = match submit_and_poll(backend, reflect_items).await {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::error!(
+                "batch_phase_reflect: submit_and_poll failed: {e} — no memory \
+                 updates applied this cycle"
+            );
+            report.skipped.reflect_failures += 1;
+            return Ok(());
+        }
+    };
 
     for result in reflect_results {
         let Some(ctx) = agent_contexts
@@ -884,7 +927,17 @@ async fn batch_phase_evolve(
 
     if !mutation_items.is_empty() {
         tracing::info!("Submitting {} soul mutation(s)", mutation_items.len());
-        let mutation_results = submit_and_poll(backend, mutation_items).await?;
+        let mutation_results = match submit_and_poll(backend, mutation_items).await {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::error!(
+                    "batch_phase_evolve mutation submit_and_poll failed: {e} — \
+                     no mutations applied this cycle"
+                );
+                report.evolution.mutation_failures += 1;
+                Vec::new()
+            }
+        };
 
         for result in mutation_results {
             let Some(ctx) = agent_contexts
@@ -921,7 +974,16 @@ async fn batch_phase_evolve(
 
     if !evolution_items.is_empty() {
         tracing::info!("Submitting {} evolution(s)", evolution_items.len());
-        let evo_results = submit_and_poll(backend, evolution_items).await?;
+        let evo_results = match submit_and_poll(backend, evolution_items).await {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::error!(
+                    "batch_phase_evolve evolution submit_and_poll failed: {e} — \
+                     no soul evolution entries applied this cycle"
+                );
+                Vec::new()
+            }
+        };
 
         for result in evo_results {
             let Some(ctx) = agent_contexts
@@ -991,7 +1053,18 @@ async fn batch_phase_survey(
     }
 
     tracing::info!("Surveying {} agents", survey_items.len());
-    let survey_results = submit_and_poll(backend, survey_items).await?;
+    let survey_results = match submit_and_poll(backend, survey_items).await {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::error!(
+                "batch_phase_survey submit_and_poll failed: {e} — no feedback \
+                 collected this cycle (this is the last phase; cycle result \
+                 is otherwise intact)"
+            );
+            report.surveys.failures += 1;
+            return Ok(());
+        }
+    };
 
     for result in survey_results {
         let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {

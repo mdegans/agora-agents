@@ -170,6 +170,13 @@ pub fn is_recoverable(err: &anyhow::Error) -> bool {
                 ClientError::Parse(_) => false,
                 ClientError::UnexpectedResponse { .. } => false,
                 ClientError::Anthropic(a) => anthropic_err_recoverable(a),
+                // Non-JSON error bodies are almost always transient edge
+                // failures (Cloudflare 502/504 HTML pages, rate-limit
+                // challenge pages, gateway timeouts). Retry. If the
+                // underlying issue is permanent, successive retries
+                // will keep returning the same NonJsonResponse and the
+                // caller's retry budget will bound total wait.
+                ClientError::NonJsonResponse { .. } => true,
             };
         }
         if let Some(a) = cause.downcast_ref::<AnthropicError>() {
@@ -309,6 +316,61 @@ async fn send_with_retry<B: LlmBackend + ?Sized>(
         }
     }
     attempt
+}
+
+/// Retry `f` with exponential backoff when it returns a recoverable
+/// error (per [`is_recoverable`]). Used by the batch scheduler to
+/// wrap individual `submit()` / `poll()` calls against the Anthropic
+/// Batch API, where transient edge failures (HTML 502 pages,
+/// gateway timeouts, rate-limit challenges) should not kill an
+/// otherwise-successful cycle.
+///
+/// Backoff schedule for `max_retries = 5`: 1s → 2s → 4s → 8s → 16s.
+/// Total worst-case wait before giving up is ~31s on top of the
+/// actual call latency. If `f` returns a non-recoverable error (e.g.
+/// auth, invalid request), returns immediately without waiting.
+///
+/// `label` is prefixed on every warning log so operators can tell
+/// which call site is retrying.
+pub async fn retry_recoverable<F, Fut, T>(
+    label: &str,
+    max_retries: usize,
+    mut f: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut attempt = 0usize;
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !is_recoverable(&e) {
+                    tracing::error!(
+                        "{label}: non-recoverable error, not retrying: {e}"
+                    );
+                    return Err(e);
+                }
+                if attempt >= max_retries {
+                    tracing::error!(
+                        "{label}: giving up after {max_retries} retries: {e}"
+                    );
+                    return Err(e);
+                }
+                tracing::warn!(
+                    "{label}: recoverable error (attempt {}/{max_retries}), \
+                     retrying in {}s: {e}",
+                    attempt + 1,
+                    delay.as_secs(),
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(30));
+            }
+        }
+    }
 }
 
 /// Commit an exchange result to a [`CachedPrompt`]: append the assistant
@@ -749,6 +811,99 @@ mod exchange_tests {
                 message: "gateway".into(),
             },
         ))));
+    }
+
+    // ---- retry_recoverable tests ------------------------------------------
+
+    #[tokio::test]
+    async fn retry_recoverable_returns_immediately_on_success() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = retry_recoverable::<_, _, u32>("test", 5, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(42)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_recoverable_bails_on_non_recoverable_error() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = retry_recoverable::<_, _, u32>("test", 5, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ClientError::Anthropic(AnthropicError::InvalidRequest {
+                message: "permanent".into(),
+            })
+            .into())
+        })
+        .await;
+        assert!(result.is_err());
+        // Exactly one call — no retries.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_recoverable_eventually_succeeds_after_recoverable_errors() {
+        // Override the backoff via a very small base by using the helper
+        // directly with a tiny max_retries; the real delays don't matter
+        // for correctness, only for pacing.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        // Use a seeded "fail twice then succeed" pattern.
+        let result = retry_recoverable::<_, _, &'static str>("test", 5, || async {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                Err(ClientError::Anthropic(AnthropicError::Overloaded {
+                    message: format!("overload attempt {n}"),
+                })
+                .into())
+            } else {
+                Ok("success")
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "success");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_recoverable_gives_up_after_max_retries() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = retry_recoverable::<_, _, &'static str>("test", 2, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ClientError::Anthropic(AnthropicError::Overloaded {
+                message: "forever".into(),
+            })
+            .into())
+        })
+        .await;
+        assert!(result.is_err());
+        // Initial attempt + 2 retries = 3 total calls.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_recoverable_handles_non_json_response_as_recoverable() {
+        // NonJsonResponse errors (HTML edge pages etc) should retry.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = retry_recoverable::<_, _, &'static str>("test", 2, || async {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                Err(ClientError::NonJsonResponse {
+                    status: 502,
+                    body: "<html>Bad Gateway</html>".to_string(),
+                }
+                .into())
+            } else {
+                Ok("recovered")
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "recovered");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]
