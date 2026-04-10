@@ -89,12 +89,16 @@ pub fn build_prompt(
         &ctx.perception_text,
     );
 
-    // Preflight: serialize and scan for missing constitution markers.
-    // Cheap relative to the LLM call that follows; worth catching prompt
-    // corruption at the source rather than letting agents reflect on
-    // constitutions they never saw.
-    let json = serde_json::to_string(&cached).unwrap_or_default();
-    for problem in prompt::preflight_check_prompt(&json) {
+    // Preflight: scan the system prefix for missing constitution markers
+    // and for langsan sanitization damage. Cheap relative to the LLM
+    // call that follows; worth catching prompt corruption at the source
+    // rather than letting agents reflect on constitutions they never
+    // saw. Scope is deliberately limited to the system prefix — per-
+    // agent content (memory, dashboard, mutated soul) can legitimately
+    // contain `[N BYTES SANITIZED]` markers when langsan strips
+    // invisible-text-attack chars from LLM output, and that's working
+    // as designed.
+    for problem in prompt::preflight_check_prompt(&cached) {
         tracing::error!(agent = %agent.name, "[PREFLIGHT] {problem}");
     }
 

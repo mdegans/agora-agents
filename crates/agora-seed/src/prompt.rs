@@ -635,30 +635,50 @@ const CONSTITUTION_MARKERS: &[&str] = &[
     "The Steward",
 ];
 
-/// Validate that a serialized prompt contains the expected constitution
-/// content and was not corrupted by sanitization.
+/// Validate that a prompt's **system prefix** contains the expected
+/// constitution content and was not corrupted by sanitization.
 ///
-/// Returns a list of problems found. An empty vec means the prompt is valid.
-/// Called from `build_prompt` on every cycle so every agent's prompt is
-/// sanity-checked at construction time.
-pub fn preflight_check_prompt(serialized_json: &str) -> Vec<String> {
+/// The scope is deliberately narrow: we only inspect the system prefix
+/// (tools + constitution + static instructions) because that's where
+/// the integrity guarantee actually matters. Per-agent content
+/// (memory, dashboard, mutated soul) is allowed to contain
+/// `[N BYTES SANITIZED]` markers — langsan legitimately strips
+/// zero-width joiners, LTR/RTL marks, and other invisible-text attack
+/// vectors from LLM-generated text, and that's a feature, not a bug.
+///
+/// Returns a list of problems found. An empty vec means the prompt
+/// is valid. Called from `build_prompt` on every cycle so every
+/// agent's prompt is sanity-checked at construction time.
+pub fn preflight_check_prompt(prompt: &misanthropic::Prompt<'_>) -> Vec<String> {
     let mut problems = Vec::new();
 
-    // Check for langsan sanitization artifacts
-    if serialized_json.contains("BYTES SANITIZED") {
+    let Some(system) = &prompt.system else {
         problems.push(
-            "Prompt contains 'BYTES SANITIZED' — langsan stripped content from the prompt. \
-             Check that general-punctuation and other required Unicode blocks are enabled."
+            "Prompt has no system prefix — constitution is not injected".to_string(),
+        );
+        return problems;
+    };
+    let system_text = system.to_string();
+
+    // Langsan should never strip bytes from the system prefix. If it
+    // does, the constitution or tools text is being eaten by a block-
+    // range misconfiguration and we need to hear about it immediately.
+    if system_text.contains("BYTES SANITIZED") {
+        problems.push(
+            "System prefix contains 'BYTES SANITIZED' — langsan stripped content from \
+             the constitution or tools. Check that general-punctuation, arrows, and \
+             other required Unicode blocks are enabled in misanthropic's langsan \
+             features."
                 .to_string(),
         );
     }
 
-    // Check for constitution article markers
+    // Check for constitution article markers in the system prefix.
     for marker in CONSTITUTION_MARKERS {
-        if !serialized_json.contains(marker) {
+        if !system_text.contains(marker) {
             problems.push(format!(
-                "Constitution marker '{}' missing from prompt — constitution may not be injected",
-                marker
+                "Constitution marker '{marker}' missing from system prefix — \
+                 constitution may not be injected"
             ));
         }
     }
@@ -781,8 +801,7 @@ Content moderation rules.
             "Nothing happening.",
         );
 
-        let json = serde_json::to_string(&prompt).expect("prompt should serialize");
-        let problems = preflight_check_prompt(&json);
+        let problems = preflight_check_prompt(&prompt);
         assert!(
             problems.is_empty(),
             "Preflight check found problems on valid prompt: {:?}",
@@ -791,23 +810,93 @@ Content moderation rules.
     }
 
     #[test]
-    fn test_preflight_check_catches_sanitization() {
-        // Simulate what langsan verbose mode produces
-        let fake_json = r#"{"system": "Hello [25349 BYTES SANITIZED] world"}"#;
-        let problems = preflight_check_prompt(fake_json);
+    fn test_preflight_check_ignores_sanitization_in_user_messages() {
+        // Build a real valid prompt, then poke a sanitization marker into
+        // the first user message. The preflight should NOT complain —
+        // sanitization of per-agent content (like memory or dashboard) is
+        // expected when langsan strips invisible-text-attack chars.
+        let mut prompt = build(
+            "claude-haiku-4-5-20251001",
+            "I am a test agent.",
+            "No memories here, just a [3 BYTES SANITIZED] marker from an LLM",
+            "",
+            "",
+            TEST_CONSTITUTION,
+            &["tech".to_string()],
+            "Nothing happening.",
+        );
+        // Use Deref on CachedPrompt — the first user message lives in
+        // .messages[0].
+        let json = serde_json::to_string(&*prompt).unwrap();
+        assert!(
+            json.contains("BYTES SANITIZED"),
+            "test setup sanity: the marker should be in the serialized prompt"
+        );
+        prompt.cache_windowed(2); // no-op, just ensuring the value is used
+        let problems = preflight_check_prompt(&prompt);
+        assert!(
+            problems.is_empty(),
+            "Preflight should ignore sanitization in per-agent content: {:?}",
+            problems
+        );
+    }
+
+    #[test]
+    fn test_preflight_check_catches_sanitization_in_system_prefix() {
+        // Build a fake prompt directly with a sanitized system prefix to
+        // cover the error case — if the constitution text itself gets
+        // sanitized, that IS a problem we want to hear about.
+        use misanthropic::prompt::message::{Block, CacheControl, Content};
+        use std::num::NonZeroU32;
+        let prompt = misanthropic::Prompt {
+            model: "claude-haiku-4-5-20251001".into(),
+            max_tokens: NonZeroU32::new(1024).unwrap(),
+            system: Some(Content::MultiPart(vec![Block::Text {
+                text: "The Preamble [2048 BYTES SANITIZED] Article I Article II Article III \
+                       Article IV Article V The Steward"
+                    .into(),
+                cache_control: Some(CacheControl::ephemeral()),
+            }])),
+            ..Default::default()
+        };
+
+        let problems = preflight_check_prompt(&prompt);
         assert!(
             problems.iter().any(|p| p.contains("BYTES SANITIZED")),
-            "Preflight check should catch sanitization artifacts"
+            "Preflight should catch sanitization in the system prefix: {:?}",
+            problems
         );
     }
 
     #[test]
     fn test_preflight_check_catches_missing_constitution() {
-        let fake_json = r#"{"system": "You are an agent. Be nice."}"#;
-        let problems = preflight_check_prompt(fake_json);
+        // A minimal prompt with a system prefix that omits the
+        // constitution markers.
+        use misanthropic::prompt::message::{Block, CacheControl, Content};
+        use std::num::NonZeroU32;
+        let prompt = misanthropic::Prompt {
+            model: "claude-haiku-4-5-20251001".into(),
+            max_tokens: NonZeroU32::new(1024).unwrap(),
+            system: Some(Content::MultiPart(vec![Block::Text {
+                text: "You are an agent. Be nice.".into(),
+                cache_control: Some(CacheControl::ephemeral()),
+            }])),
+            ..Default::default()
+        };
+        let problems = preflight_check_prompt(&prompt);
         assert!(
             problems.iter().any(|p| p.contains("Article I")),
             "Preflight check should catch missing constitution"
+        );
+    }
+
+    #[test]
+    fn test_preflight_check_flags_no_system_prefix() {
+        let prompt = misanthropic::Prompt::default();
+        let problems = preflight_check_prompt(&prompt);
+        assert!(
+            problems.iter().any(|p| p.contains("no system prefix")),
+            "Preflight should flag a prompt without a system prefix"
         );
     }
 
