@@ -311,6 +311,11 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
                 tracing::info!("Batch {batch_id} complete");
 
                 let mut results = Vec::new();
+                // Aggregate usage across all succeeded items so we can
+                // compute and log the cache hit rate for this batch.
+                // `Usage: Default + AddAssign + Copy` so summation is trivial.
+                let mut total_usage = misanthropic::response::Usage::default();
+                let mut ok_count = 0usize;
 
                 // Decompose to get owned results
                 let (_pending, result_map) = ready.decompose();
@@ -323,6 +328,8 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
 
                     let response = match result {
                         batch::BatchResult::Ok(response_message) => {
+                            total_usage += response_message.usage;
+                            ok_count += 1;
                             // response::Message.inner -> prompt::AssistantMessage
                             // -> Into<prompt::Message>
                             let msg: MMessage<'_> = response_message.inner.into();
@@ -349,6 +356,35 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
                         step,
                         response,
                     });
+                }
+
+                // Cache hit rate = read / (uncached-input + created + read),
+                // where the denominator is the total input tokens that
+                // went through the pipeline (cacheable or not). A high
+                // hit rate means the batch is mostly reading prefix
+                // blocks written by a prior prime or earlier batch.
+                //
+                // Uses u128 to avoid any chance of overflow when a batch
+                // happens to carry very large contexts — Usage fields
+                // are already u64 but the sum of 30 items' contributions
+                // can creep up.
+                let read = total_usage.cache_read_input_tokens.unwrap_or(0) as u128;
+                let created = total_usage.cache_creation_input_tokens.unwrap_or(0) as u128;
+                let uncached = total_usage.input_tokens as u128;
+                let total_input = read + created + uncached;
+                if total_input > 0 {
+                    let hit_pct = (read as f64 / total_input as f64) * 100.0;
+                    tracing::info!(
+                        "Batch {batch_id} cache: {hit_pct:.1}% hit ({ok_count} items, \
+                         {read} read, {created} created, {uncached} uncached, \
+                         {out} out)",
+                        out = total_usage.output_tokens,
+                    );
+                } else {
+                    tracing::debug!(
+                        "Batch {batch_id} complete but no input tokens reported \
+                         ({ok_count} items)"
+                    );
                 }
 
                 Ok(BatchState::Ready(results))
