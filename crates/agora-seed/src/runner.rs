@@ -7,7 +7,7 @@ use misanthropic::tool;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
-use crate::prompt::{self, MEMORY_REWRITE_MESSAGE};
+use crate::prompt::{self, MEMORY_REWRITE_MESSAGE, SURVEY_MESSAGE};
 
 /// Accumulate usage stats from a send response into a running total.
 fn accumulate_usage(total: &mut Option<Usage>, usage: Option<Usage>) {
@@ -483,13 +483,12 @@ pub async fn run_cycle(
 
     // === ANONYMOUS FEEDBACK SURVEY (10% chance) ===
     if force_survey || rand::random::<f64>() < 0.10 {
-        let survey_text = prompt::build_survey_prompt(&agent.name, &action_summaries);
-        think_prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
+        think_prompt.set_max_tokens(std::num::NonZeroU32::new(1024).unwrap());
         if think_prompt
-            .push_message(UserMessage::from(survey_text.clone()))
+            .push_message(UserMessage::from(SURVEY_MESSAGE))
             .is_err()
         {
-            tracing::debug!("Survey skipped for {}: turn order", agent.name);
+            tracing::error!("Survey skipped for {}: turn order", agent.name);
         } else {
             // it's now the assistant's turn
             match backend.send(&think_prompt).await {

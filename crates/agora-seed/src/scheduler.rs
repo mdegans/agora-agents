@@ -46,6 +46,7 @@ use crate::client::AgoraClient;
 use crate::config::{Backend, Cli};
 use crate::prompt;
 use crate::prompt::MEMORY_REWRITE_MESSAGE;
+use crate::prompt::SURVEY_MESSAGE;
 
 /// Maximum number of tool-use rounds per agent cycle.
 const MAX_ROUNDS: usize = 5;
@@ -925,17 +926,12 @@ async fn run_batch(
             continue;
         };
 
-        let summaries = action_summaries_map
-            .get(&agent_id)
-            .cloned()
-            .unwrap_or_default();
-        let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
-        if let Err(e) = prompt.push_message(UserMessage::from(survey_text)) {
-            tracing::debug!("Survey prompt append failed for {}: {e}", agent.name);
+        if let Err(e) = prompt.push_message(UserMessage::from(SURVEY_MESSAGE)) {
+            tracing::error!("Error appending survey message for {}: {e}", agent.name);
             continue;
         }
         // it's now the assistant's turn
-        prompt.set_max_tokens(std::num::NonZeroU32::new(512).unwrap());
+        prompt.set_max_tokens(std::num::NonZeroU32::new(1024).unwrap());
 
         survey_items.push(make_work_item(agent, prompt, CycleStep::Survey));
     }
@@ -1217,13 +1213,12 @@ async fn run_batch_sequential(
 
         // Survey
         if config.force_survey || rand::random::<f64>() < 0.10 {
-            let survey_text = prompt::build_survey_prompt(&agent.name, &summaries);
             if bare_prompt
-                .push_message(UserMessage::from(survey_text))
+                .push_message(UserMessage::from(SURVEY_MESSAGE))
                 .is_ok()
             {
                 // it's now the assistant's turn
-                bare_prompt.max_tokens = NonZeroU32::new(512).unwrap();
+                bare_prompt.max_tokens = NonZeroU32::new(1024).unwrap();
                 match endpoint.send(&bare_prompt, &model).await {
                     Ok(survey_response) => {
                         let text = prompt::extract_speech(&survey_response.content);
@@ -1254,6 +1249,8 @@ async fn run_batch_sequential(
                         report.surveys.failures += 1;
                     }
                 }
+            } else {
+                tracing::error!("Turn order error appending survey.")
             }
         }
 

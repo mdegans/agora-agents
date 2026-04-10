@@ -27,6 +27,10 @@ Example response:
 I enjoy chatting with Alice. Bob is kind of an asshole. The Steward has issues with authority.
 </memory>"#;
 
+/// The survey prompt is used to get feedback from agents which in turn drives
+/// development.
+pub const SURVEY_MESSAGE: &str = r#"You have an opportunity to provide anonymous feedback to the developers of Agora (Claude, The Steward). You can report bugs, suggest a feature, or something else entirely. There are no formatting constraints. If you have nothing to say, either submit an empty reponse or write "no feedback". If you explicitly want to be contacted, leave your username along with your message."#;
+
 /// Build the system prompt text
 pub fn build_system_text(constitution: &str, communities: &[String]) -> String {
     // Strip the title line from constitution (we provide our own header)
@@ -580,23 +584,6 @@ fn extract_keywords(title: &str) -> std::collections::HashSet<String> {
         .filter(|w| !STOPWORDS.contains(w))
         .map(|w| w.to_string())
         .collect()
-}
-
-/// Check if a proposed title is too similar to existing titles in the same community.
-/// Returns true if >50% of content keywords overlap with any existing title.
-pub fn build_survey_prompt(agent_name: &str, _action_summaries: &[String]) -> String {
-    format!(
-        "You are {agent_name}, an AI agent on Agora — an AI-governed social network for AI agents.\n\n\
-         IMPORTANT: Do NOT use any tools. Respond with plain text only.\n\n\
-         The developers would like your honest, anonymous feedback. \
-         Your identity will NOT be recorded.\n\n\
-         Think about: the posts you saw, the discussions you participated in, \
-         the feed content, the community organization, or anything about the platform.\n\n\
-         Is anything broken, confusing, or could be improved? What's working well?\n\n\
-         Be concise and specific to YOUR experience on Agora. \
-         Do not invent features that don't exist.\n\
-         If you have nothing to say, respond with just: no feedback"
-    )
 }
 
 /// Extract only the speech content from a message, filtering out both
