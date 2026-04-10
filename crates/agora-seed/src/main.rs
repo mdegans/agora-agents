@@ -309,14 +309,8 @@ async fn main() -> Result<()> {
                 // `RUST_LOG=agora_seed=debug` for per-phase request/
                 // response logging.
                 let _ = agent; // filter was already applied above
-                scheduler::run_all(
-                    &mut agents,
-                    &api_client,
-                    &cli,
-                    &constitution,
-                    &communities,
-                )
-                .await?;
+                scheduler::run_all(&mut agents, &api_client, &cli, &constitution, &communities)
+                    .await?;
             }
         }
         Phase::All => {

@@ -251,6 +251,51 @@ pub async fn exchange<B: LlmBackend + ?Sized>(
     commit_exchange_result(prompt, result, usage_total)
 }
 
+/// Commit a backend response into a prompt, rolling forward on error.
+///
+/// This is the batch-API equivalent of [`exchange`]: the caller has
+/// already pushed a user message and submitted the prompt through a
+/// batch backend (where submission and response are decoupled in time),
+/// and now holds a `Result<MMessage, E>` for one agent's response. On
+/// `Ok`, the assistant message is appended. On `Err`, a synthetic
+/// assistant message carrying the error text is appended so the prompt
+/// stays turn-valid — every downstream phase can still push a user
+/// message without worrying about alternation.
+///
+/// # Panics
+///
+/// The inner `push_message` call uses `.expect(...)` — a turn-order
+/// violation here would mean the caller pushed the prompt into a
+/// non-assistant-turn state before invoking this helper. Fix the
+/// caller; errors should never pass silently.
+pub fn commit_batch_response<E: std::fmt::Display>(
+    prompt: &mut CachedPrompt<'static>,
+    response: std::result::Result<MMessage<'static>, E>,
+    context: &str,
+) -> Result<AssistantMessage<'static>> {
+    match response {
+        Ok(message) => {
+            let assistant =
+                AssistantMessage::try_from(message).expect("backend guarantees assistant role");
+            prompt.push_message(assistant.clone()).expect(
+                "commit_batch_response: assistant after user — turn order is a programmer bug",
+            );
+            // it's now the user's turn
+            Ok(assistant)
+        }
+        Err(e) => {
+            let err = anyhow::anyhow!("{context}: {e}");
+            let note = synthetic_error_reply(&err);
+            prompt
+                .push_message(note)
+                .expect("commit_batch_response: synthetic assistant after user — turn order is a programmer bug");
+            // it's now the user's turn
+            tracing::error!(error = %err, "commit_batch_response: backend error surfaced to agent");
+            Err(err)
+        }
+    }
+}
+
 /// Single backend call plus one retry if the error is recoverable.
 async fn send_with_retry<B: LlmBackend + ?Sized>(
     backend: &B,
@@ -286,16 +331,15 @@ fn commit_exchange_result(
         }
         Err(e) => {
             let note = synthetic_error_reply(&e);
-            prompt
-                .push_message(note)
-                .expect("exchange: synthetic assistant after user — turn order is a programmer bug");
+            prompt.push_message(note).expect(
+                "exchange: synthetic assistant after user — turn order is a programmer bug",
+            );
             // it's now the user's turn
             tracing::error!(error = %e, "exchange: backend error surfaced to agent");
             Err(e)
         }
     }
 }
-
 
 #[cfg(test)]
 mod exchange_tests {
@@ -338,14 +382,9 @@ mod exchange_tests {
         let mut prompt = fresh_cached();
         let mut usage = None;
 
-        let assistant = exchange(
-            &mock,
-            &mut prompt,
-            UserMessage::from("hi"),
-            &mut usage,
-        )
-        .await
-        .unwrap();
+        let assistant = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
+            .await
+            .unwrap();
 
         assert_eq!(assistant.content().to_string(), "hello from the backend");
         assert_alternating(&roles(&prompt));
@@ -364,14 +403,9 @@ mod exchange_tests {
         let mut prompt = fresh_cached();
         let mut usage = None;
 
-        let err = exchange(
-            &mock,
-            &mut prompt,
-            UserMessage::from("hi"),
-            &mut usage,
-        )
-        .await
-        .unwrap_err();
+        let err = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("still boom"));
         // Both responses consumed by the retry.
@@ -405,14 +439,9 @@ mod exchange_tests {
         let mut prompt = fresh_cached();
         let mut usage = None;
 
-        let assistant = exchange(
-            &mock,
-            &mut prompt,
-            UserMessage::from("hi"),
-            &mut usage,
-        )
-        .await
-        .unwrap();
+        let assistant = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
+            .await
+            .unwrap();
 
         assert_eq!(assistant.content().to_string(), "second-attempt-ok");
         assert_eq!(mock.remaining(), 0);
@@ -433,14 +462,9 @@ mod exchange_tests {
         let mut prompt = fresh_cached();
         let mut usage = None;
 
-        let err = exchange(
-            &mock,
-            &mut prompt,
-            UserMessage::from("hi"),
-            &mut usage,
-        )
-        .await
-        .unwrap_err();
+        let err = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("bad prompt"));
         // Only the single response was consumed — the retry was skipped.
@@ -469,14 +493,9 @@ mod exchange_tests {
         let mut prompt = fresh_cached();
         let mut usage = None;
 
-        let err = exchange(
-            &mock,
-            &mut prompt,
-            UserMessage::from("hi"),
-            &mut usage,
-        )
-        .await
-        .unwrap_err();
+        let err = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("second overload"));
         assert_eq!(mock.remaining(), 0);
@@ -518,25 +537,14 @@ mod exchange_tests {
 
         // Non-recoverable error: only one send attempted, synthetic
         // assistant appended.
-        let err = exchange(
-            &mock,
-            &mut prompt,
-            UserMessage::from("ask 1"),
-            &mut usage,
-        )
-        .await;
+        let err = exchange(&mock, &mut prompt, UserMessage::from("ask 1"), &mut usage).await;
         assert!(err.is_err());
 
         // Now the next exchange should work cleanly on top of the
         // turn-valid state.
-        let ok = exchange(
-            &mock,
-            &mut prompt,
-            UserMessage::from("ask 2"),
-            &mut usage,
-        )
-        .await
-        .unwrap();
+        let ok = exchange(&mock, &mut prompt, UserMessage::from("ask 2"), &mut usage)
+            .await
+            .unwrap();
         assert_eq!(ok.content().to_string(), "recovered");
 
         let r = roles(&prompt);
@@ -576,13 +584,7 @@ mod exchange_tests {
 
         for phase_name in phases.iter() {
             let user_text = format!("{phase_name} request");
-            let _ = exchange(
-                &mock,
-                &mut prompt,
-                UserMessage::from(user_text),
-                &mut usage,
-            )
-            .await;
+            let _ = exchange(&mock, &mut prompt, UserMessage::from(user_text), &mut usage).await;
             // Every phase must leave the prompt turn-valid regardless of
             // backend outcome.
             assert_alternating(&roles(&prompt));
@@ -593,6 +595,56 @@ mod exchange_tests {
         assert_eq!(roles(&prompt).len(), 6);
         assert_alternating(&roles(&prompt));
         assert_eq!(mock.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn commit_batch_response_commits_assistant_on_ok() {
+        let mut prompt = fresh_cached();
+        // Set the prompt up to expect an assistant next.
+        prompt
+            .push_message(UserMessage::from("batch request"))
+            .unwrap();
+
+        let msg = MMessage {
+            role: MRole::Assistant,
+            content: MContent::from("batch response").into_static(),
+        };
+        let assistant =
+            commit_batch_response::<String>(&mut prompt, Ok(msg), "reflect batch").unwrap();
+
+        assert_eq!(assistant.content().to_string(), "batch response");
+        let r = roles(&prompt);
+        assert_eq!(r.len(), 2);
+        assert_alternating(&r);
+    }
+
+    #[tokio::test]
+    async fn commit_batch_response_rolls_forward_on_error() {
+        let mut prompt = fresh_cached();
+        prompt
+            .push_message(UserMessage::from("batch request"))
+            .unwrap();
+
+        let err = commit_batch_response::<String>(
+            &mut prompt,
+            Err("API timeout".to_string()),
+            "reflect batch",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reflect batch"));
+        assert!(err.to_string().contains("API timeout"));
+
+        let r = roles(&prompt);
+        assert_eq!(r.len(), 2);
+        assert_alternating(&r);
+
+        let last = prompt.messages.last().unwrap();
+        assert_eq!(last.role, MRole::Assistant);
+        assert!(
+            last.content.to_string().contains("API timeout"),
+            "synthetic reply should contain the error, got: {}",
+            last.content,
+        );
     }
 
     #[tokio::test]

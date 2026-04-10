@@ -69,10 +69,7 @@ impl MockLlmBackend {
     /// Number of responses still in the queue. Useful for asserting that
     /// a test consumed exactly the responses it queued.
     pub fn remaining(&self) -> usize {
-        self.responses
-            .lock()
-            .expect("mock mutex poisoned")
-            .len()
+        self.responses.lock().expect("mock mutex poisoned").len()
     }
 }
 

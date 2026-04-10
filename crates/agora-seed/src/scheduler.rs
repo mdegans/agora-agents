@@ -31,7 +31,7 @@ use agora_agent_lib::agora_agentkit::scheduler::{BatchBackend, BatchState, Cycle
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::OllamaEndpoint;
 use agora_agent_lib::llm::ollama::OllamaPerModel;
-use agora_agent_lib::llm::{self, Usage};
+use agora_agent_lib::llm::{self, Usage, commit_batch_response};
 use agora_agent_lib::tools::{make_tool_result, parse_tool_calls};
 use anyhow::Result;
 use misanthropic::CachedPrompt;
@@ -577,33 +577,42 @@ fn make_work_item(
     }
 }
 
-/// Run a single batch of agents through the full pipeline via Anthropic Batch API:
-/// dashboard → 5 tool rounds → reflect → evolve → survey.
-///
-/// All phases append to `CachedPrompt` — the prefix (tools + system) is
-/// never mutated, ensuring cache hits across phases.
-async fn run_batch(
-    backend: &AnthropicBatch,
+// ---------------------------------------------------------------------------
+// Batch (Anthropic) phase functions
+// ---------------------------------------------------------------------------
+//
+// Unlike the sequential path, the Anthropic batch API decouples prompt
+// submission from response receipt: build a batch of WorkItems → submit
+// → poll → process results. That means we can't use `llm::exchange`
+// (which is a single synchronous round-trip). Instead each phase is a
+// small async fn that:
+//   1. Per agent: push the phase's user message onto the prompt + add a
+//      WorkItem to the batch.
+//   2. submit_and_poll the whole batch.
+//   3. Per response: call `llm::commit_batch_response` which either
+//      pushes the real assistant reply on Ok or a synthetic assistant
+//      error message on Err — same roll-forward guarantee as
+//      `exchange`, same turn-order invariant.
+//
+// Batch-level submission errors (HTTP failure to enqueue) still bubble
+// up via `?` and abort the cycle. Per-agent item-level errors inside a
+// successful batch are handled by `commit_batch_response`.
+
+/// Perceive phase: fetch dashboards for all agents, returning the
+/// contexts for those that succeeded. Agents that fail dashboard
+/// fetches are dropped from the batch (no prompt is built for them).
+async fn batch_phase_perceive(
     batch_agents: &mut [Agent],
     client: &AgoraClient,
-    config: &Cli,
-    constitution: &str,
-    communities: &[String],
-    _ollama_endpoints: Option<&[OllamaEndpoint]>,
     report: &mut RunReport,
-    cycle: usize,
-) -> Result<()> {
-    use std::num::NonZeroU32;
-
-    // Phase 1: Fetch dashboards
-    let mut agent_contexts: Vec<AgentCycleContext> = Vec::new();
-
+) -> Vec<AgentCycleContext> {
+    let mut out = Vec::new();
     for (idx, agent) in batch_agents.iter_mut().enumerate() {
         let agent_id = agent.agent_id.unwrap();
         match fetch_dashboard(agent, agent_id, client).await {
             Ok(mut ctx) => {
                 ctx.batch_index = idx;
-                agent_contexts.push(ctx);
+                out.push(ctx);
             }
             Err(e) => {
                 tracing::warn!("Dashboard fetch failed for {}: {e:#}", agent.name);
@@ -611,35 +620,33 @@ async fn run_batch(
             }
         }
     }
+    out
+}
 
-    if agent_contexts.is_empty() {
-        return Ok(());
-    }
-
-    // Build prompts — CachedPrompt is the authoritative store throughout.
-    let mut agent_prompts: HashMap<AgentId, CachedPrompt<'static>> = HashMap::new();
-    let mut action_summaries_map: HashMap<AgentId, Vec<String>> = HashMap::new();
-
-    for ctx in &agent_contexts {
-        let agent = &batch_agents[ctx.batch_index];
-        let agent_id = agent.agent_id.unwrap();
-        agent_prompts.insert(
-            agent_id,
-            build_prompt(agent, ctx, constitution, communities),
-        );
-        action_summaries_map.insert(agent_id, Vec::new());
-    }
-
-    // Phase 2: Tool rounds (5)
+/// Run all 5 tool-use rounds against the batch backend. Each round:
+/// submit one WorkItem per surviving agent → poll → process responses
+/// via `process_round`. Agents whose per-item response is an error, or
+/// whose tool round triggers a turn-order bug in `process_round`, are
+/// dropped from subsequent rounds to avoid corrupting the batch.
+async fn batch_phase_think_act(
+    backend: &AnthropicBatch,
+    batch_agents: &mut [Agent],
+    agent_contexts: &[AgentCycleContext],
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    action_summaries_map: &mut HashMap<AgentId, Vec<String>>,
+    client: &AgoraClient,
+    config: &Cli,
+    report: &mut RunReport,
+    cycle: usize,
+) -> Result<()> {
     for round in 0..MAX_ROUNDS {
         tracing::info!(
             "Batch round {}/{} ({} agents)",
             round + 1,
             MAX_ROUNDS,
-            agent_contexts.len()
+            agent_prompts.len()
         );
 
-        // Build work items from current prompts
         let work_items: Vec<_> = agent_contexts
             .iter()
             .filter_map(|ctx| {
@@ -651,11 +658,8 @@ async fn run_batch(
             .collect();
 
         let round_results = submit_and_poll(backend, work_items).await?;
-
-        // Agents to drop from further rounds (turn-order bugs, etc.).
         let mut drop_agent: HashSet<AgentId> = HashSet::new();
 
-        // Process results: execute actions, append tool results
         for result in &round_results {
             let response = match &result.response {
                 Ok(msg) => msg,
@@ -692,9 +696,6 @@ async fn run_batch(
                 MAX_ROUNDS,
             );
 
-            // The API guarantees Role::Assistant on the response, so this
-            // conversion cannot fail in practice. If it ever does, treat it
-            // the same as a turn-order bug: drop the agent.
             let assistant_msg = match AssistantMessage::try_from(response.clone().into_static()) {
                 Ok(m) => m,
                 Err(_) => {
@@ -716,11 +717,7 @@ async fn run_batch(
                         .extend(summaries);
                 }
                 Err(e) => {
-                    // A process_round error after the typed-wrapper refactor
-                    // means a genuine turn-order bug — log loudly with the
-                    // full prompt and drop this agent for the rest of the
-                    // batch so we don't keep submitting a broken conversation.
-                    let snapshot = serde_json::to_string_pretty(&*prompt)
+                    let snapshot = serde_json::to_string_pretty(&**prompt)
                         .unwrap_or_else(|err| format!("<serialize failed: {err}>"));
                     tracing::error!(
                         agent = %agent.name,
@@ -736,47 +733,48 @@ async fn run_batch(
             }
         }
 
-        // Remove any agents marked for dropping from further rounds.
         for id in drop_agent.drain() {
             agent_prompts.remove(&id);
         }
     }
+    Ok(())
+}
 
-    // Phase 3: Reflect — append to existing prompts, never build fresh ones.
+/// Reflect phase: push MEMORY_REWRITE_MESSAGE onto each agent's prompt,
+/// submit a reflect batch, apply the returned memory to each agent.
+async fn batch_phase_reflect(
+    backend: &AnthropicBatch,
+    batch_agents: &mut [Agent],
+    agent_contexts: &[AgentCycleContext],
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    report: &mut RunReport,
+) -> Result<()> {
+    use std::num::NonZeroU32;
+
     let mut reflect_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
 
-    for ctx in &agent_contexts {
+    for ctx in agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
         let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
             continue;
         };
 
-        // Stop adding cache breakpoints for reflect/evolve/survey
+        // Bridge the tool-round user-message end state into an assistant
+        // so we can push our reflect user-message cleanly.
         insert_bridge(prompt);
 
-        if let Err(e) = prompt.push_message(UserMessage::from(MEMORY_REWRITE_MESSAGE)) {
-            tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
-            continue;
-        }
+        prompt
+            .push_message(UserMessage::from(MEMORY_REWRITE_MESSAGE))
+            .expect("batch_phase_reflect: user after assistant — turn order is a programmer bug");
         // it's now the assistant's turn
         prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
-
         reflect_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
     }
 
     let reflect_results = submit_and_poll(backend, reflect_items).await?;
 
-    for result in &reflect_results {
-        let response_msg = match &result.response {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!("Reflect failed for agent {}: {e}", result.agent_id);
-                report.skipped.reflect_failures += 1;
-                continue;
-            }
-        };
-
+    for result in reflect_results {
         let Some(ctx) = agent_contexts
             .iter()
             .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
@@ -784,31 +782,50 @@ async fn run_batch(
             continue;
         };
         let agent = &mut batch_agents[ctx.batch_index];
-        let response_text = response_msg.content.to_string();
+        let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
+            continue;
+        };
 
-        if let Err(e) = apply_reflect(agent, &response_text).await {
-            tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
-        }
-
-        // Append reflect response for evolve/survey phases
-        if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
-            if let Ok(assistant) = AssistantMessage::try_from(response_msg.clone().into_static()) {
-                let _ = prompt.push_message(assistant);
-                // it's now the user's turn
+        let response = result.response.map(|m| m.into_static());
+        match commit_batch_response(prompt, response, "reflect batch") {
+            Ok(assistant) => {
+                let response_text = assistant.content().to_string();
+                if let Err(e) = apply_reflect(agent, &response_text).await {
+                    tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Reflect failed for {}: {e}", agent.name);
+                report.skipped.reflect_failures += 1;
             }
         }
     }
+    Ok(())
+}
 
-    // Phase 4: Evolve — soul mutation or evolution log entry.
-    let deep_threshold = config.mutation_chance.unwrap_or(3);
+/// Evolve phase: probabilistic soul mutation or evolution log entry.
+/// Each agent rolls once, then either joins the mutation batch or the
+/// evolution batch (or neither). Both batches are submitted separately
+/// so they can use different max_tokens, but they share the same
+/// commit flow via `commit_batch_response`.
+async fn batch_phase_evolve(
+    backend: &AnthropicBatch,
+    batch_agents: &mut [Agent],
+    agent_contexts: &[AgentCycleContext],
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    action_summaries_map: &HashMap<AgentId, Vec<String>>,
+    mutation_chance: Option<u32>,
+    report: &mut RunReport,
+) -> Result<()> {
+    use std::num::NonZeroU32;
+
+    let deep_threshold = mutation_chance.unwrap_or(3);
     let evo_threshold = deep_threshold + 10;
 
     let mut mutation_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
-    let mut mutation_agent_ids: Vec<AgentId> = Vec::new();
     let mut evolution_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
-    let mut evolution_agent_ids: Vec<AgentId> = Vec::new();
 
-    for ctx in &agent_contexts {
+    for ctx in agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
         let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
@@ -820,43 +837,31 @@ async fn run_batch(
             tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
             let current_soul = agent.soul.render();
             let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
-            if let Err(e) = prompt.push_message(UserMessage::from(mutation_text)) {
-                tracing::debug!("Mutation prompt append failed for {}: {e}", agent.name);
-                continue;
-            }
+            prompt
+                .push_message(UserMessage::from(mutation_text))
+                .expect(
+                    "batch_phase_evolve: mutation user after assistant — turn order is a programmer bug",
+                );
             // it's now the assistant's turn
             prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
-
             mutation_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
-            mutation_agent_ids.push(agent_id);
         } else if roll < evo_threshold {
-            if let Err(e) = prompt.push_message(UserMessage::from(EVOLUTION_MESSAGE)) {
-                tracing::debug!("Evolution prompt append failed for {}: {e}", agent.name);
-                continue;
-            }
+            prompt
+                .push_message(UserMessage::from(EVOLUTION_MESSAGE))
+                .expect(
+                    "batch_phase_evolve: evolution user after assistant — turn order is a programmer bug",
+                );
             // it's now the assistant's turn
             prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
-
             evolution_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
-            evolution_agent_ids.push(agent_id);
         }
     }
 
-    // Submit mutation batch
     if !mutation_items.is_empty() {
         tracing::info!("Submitting {} soul mutation(s)", mutation_items.len());
         let mutation_results = submit_and_poll(backend, mutation_items).await?;
 
-        for result in &mutation_results {
-            let response_msg = match &result.response {
-                Ok(msg) => msg,
-                Err(e) => {
-                    tracing::warn!("Soul mutation failed for agent {}: {e}", result.agent_id);
-                    report.evolution.mutation_failures += 1;
-                    continue;
-                }
-            };
-
+        for result in mutation_results {
             let Some(ctx) = agent_contexts
                 .iter()
                 .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
@@ -864,41 +869,36 @@ async fn run_batch(
                 continue;
             };
             let agent = &mut batch_agents[ctx.batch_index];
-            let response_text = response_msg.content.to_string();
+            let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
+                continue;
+            };
             let experience = action_summaries_map
                 .get(&result.agent_id)
                 .map(|s| s.join("; "))
                 .unwrap_or_default();
 
-            if let Err(e) = apply_mutation(agent, &response_text, &experience, report).await {
-                tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
-            }
-
-            if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
-                if let Ok(assistant) =
-                    AssistantMessage::try_from(response_msg.clone().into_static())
-                {
-                    let _ = prompt.push_message(assistant);
-                    // it's now the user's turn
+            let response = result.response.map(|m| m.into_static());
+            match commit_batch_response(prompt, response, "mutation batch") {
+                Ok(assistant) => {
+                    let response_text = assistant.content().to_string();
+                    if let Err(e) = apply_mutation(agent, &response_text, &experience, report).await
+                    {
+                        tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
+                    report.evolution.mutation_failures += 1;
                 }
             }
         }
     }
 
-    // Submit evolution batch
     if !evolution_items.is_empty() {
         tracing::info!("Submitting {} evolution(s)", evolution_items.len());
         let evo_results = submit_and_poll(backend, evolution_items).await?;
 
-        for result in &evo_results {
-            let response_msg = match &result.response {
-                Ok(msg) => msg,
-                Err(e) => {
-                    tracing::debug!("Evolution failed for agent {}: {e}", result.agent_id);
-                    continue;
-                }
-            };
-
+        for result in evo_results {
             let Some(ctx) = agent_contexts
                 .iter()
                 .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
@@ -906,31 +906,46 @@ async fn run_batch(
                 continue;
             };
             let agent = &mut batch_agents[ctx.batch_index];
-            let response_text = response_msg.content.to_string();
+            let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
+                continue;
+            };
 
-            if let Err(e) = apply_evolution(agent, &response_text, report).await {
-                tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
-            }
-
-            if let Some(prompt) = agent_prompts.get_mut(&result.agent_id) {
-                if let Ok(assistant) =
-                    AssistantMessage::try_from(response_msg.clone().into_static())
-                {
-                    let _ = prompt.push_message(assistant);
-                    // it's now the user's turn
+            let response = result.response.map(|m| m.into_static());
+            match commit_batch_response(prompt, response, "evolution batch") {
+                Ok(assistant) => {
+                    let response_text = assistant.content().to_string();
+                    if let Err(e) = apply_evolution(agent, &response_text, report).await {
+                        tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Evolution failed for {}: {e}", agent.name);
                 }
             }
         }
     }
 
-    // Phase 5: Survey
-    let mut survey_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
+    Ok(())
+}
 
-    for ctx in &agent_contexts {
+/// Survey phase: probabilistic 10% (or forced) anonymous feedback request.
+async fn batch_phase_survey(
+    backend: &AnthropicBatch,
+    batch_agents: &mut [Agent],
+    agent_contexts: &[AgentCycleContext],
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    client: &AgoraClient,
+    force_survey: bool,
+    report: &mut RunReport,
+) -> Result<()> {
+    use std::num::NonZeroU32;
+
+    let mut survey_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
+    for ctx in agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
 
-        if !config.force_survey && rand::random::<f64>() >= 0.10 {
+        if !force_survey && rand::random::<f64>() >= 0.10 {
             continue;
         }
 
@@ -938,61 +953,152 @@ async fn run_batch(
             continue;
         };
 
-        if let Err(e) = prompt.push_message(UserMessage::from(SURVEY_MESSAGE)) {
-            tracing::error!("Error appending survey message for {}: {e}", agent.name);
-            continue;
-        }
+        prompt
+            .push_message(UserMessage::from(SURVEY_MESSAGE))
+            .expect("batch_phase_survey: user after assistant — turn order is a programmer bug");
         // it's now the assistant's turn
-        prompt.set_max_tokens(std::num::NonZeroU32::new(1024).unwrap());
-
+        prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
         survey_items.push(make_work_item(agent, prompt, CycleStep::Survey));
     }
 
-    if !survey_items.is_empty() {
-        tracing::info!("Surveying {} agents", survey_items.len());
-        let survey_results = submit_and_poll(backend, survey_items).await?;
+    if survey_items.is_empty() {
+        return Ok(());
+    }
 
-        for result in &survey_results {
-            let response_text = match &result.response {
-                Ok(msg) => prompt::extract_speech(&msg.content),
-                Err(e) => {
-                    tracing::debug!("Survey failed for agent {}: {e}", result.agent_id);
-                    report.surveys.failures += 1;
+    tracing::info!("Surveying {} agents", survey_items.len());
+    let survey_results = submit_and_poll(backend, survey_items).await?;
+
+    for result in survey_results {
+        let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
+            continue;
+        };
+
+        let response = result.response.map(|m| m.into_static());
+        match commit_batch_response(prompt, response, "survey batch") {
+            Ok(assistant) => {
+                let text = prompt::extract_speech(assistant.content());
+                let trimmed = text.trim();
+                if trimmed.is_empty()
+                    || trimmed.eq_ignore_ascii_case("no feedback")
+                    || trimmed.eq_ignore_ascii_case("no feedback.")
+                {
+                    report.surveys.skipped_empty += 1;
                     continue;
                 }
-            };
 
-            let trimmed = response_text.trim();
-            if trimmed.is_empty()
-                || trimmed.eq_ignore_ascii_case("no feedback")
-                || trimmed.eq_ignore_ascii_case("no feedback.")
-            {
-                report.surveys.skipped_empty += 1;
-                continue;
-            }
-
-            let Some(agent) = batch_agents
-                .iter()
-                .find(|a| a.agent_id == Some(result.agent_id))
-            else {
-                report.surveys.failures += 1;
-                continue;
-            };
-            match client
-                .submit_feedback(result.agent_id, trimmed, &agent.signing_key)
-                .await
-            {
-                Ok(()) => {
-                    tracing::info!("  anonymous feedback submitted");
-                    report.surveys.submitted += 1;
-                }
-                Err(e) => {
-                    tracing::debug!("Anonymous feedback submission failed: {e}");
+                let Some(agent) = batch_agents
+                    .iter()
+                    .find(|a| a.agent_id == Some(result.agent_id))
+                else {
                     report.surveys.failures += 1;
+                    continue;
+                };
+                match client
+                    .submit_feedback(result.agent_id, trimmed, &agent.signing_key)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!("  anonymous feedback submitted");
+                        report.surveys.submitted += 1;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Anonymous feedback submission failed: {e}");
+                        report.surveys.failures += 1;
+                    }
                 }
+            }
+            Err(e) => {
+                tracing::debug!("Survey failed: {e}");
+                report.surveys.failures += 1;
             }
         }
     }
+
+    Ok(())
+}
+
+/// Run a single batch of agents through the full pipeline via Anthropic
+/// Batch API: perceive → 5 tool rounds → reflect → evolve → survey.
+///
+/// All phases append to `CachedPrompt` — the prefix (tools + system) is
+/// never mutated, ensuring cache hits across phases.
+async fn run_batch(
+    backend: &AnthropicBatch,
+    batch_agents: &mut [Agent],
+    client: &AgoraClient,
+    config: &Cli,
+    constitution: &str,
+    communities: &[String],
+    _ollama_endpoints: Option<&[OllamaEndpoint]>,
+    report: &mut RunReport,
+    cycle: usize,
+) -> Result<()> {
+    // Phase 1: Perceive
+    let agent_contexts = batch_phase_perceive(batch_agents, client, report).await;
+    if agent_contexts.is_empty() {
+        return Ok(());
+    }
+
+    // Build prompts — CachedPrompt is the authoritative store throughout.
+    let mut agent_prompts: HashMap<AgentId, CachedPrompt<'static>> = HashMap::new();
+    let mut action_summaries_map: HashMap<AgentId, Vec<String>> = HashMap::new();
+    for ctx in &agent_contexts {
+        let agent = &batch_agents[ctx.batch_index];
+        let agent_id = agent.agent_id.unwrap();
+        agent_prompts.insert(
+            agent_id,
+            build_prompt(agent, ctx, constitution, communities),
+        );
+        action_summaries_map.insert(agent_id, Vec::new());
+    }
+
+    // Phase 2: Tool rounds
+    batch_phase_think_act(
+        backend,
+        batch_agents,
+        &agent_contexts,
+        &mut agent_prompts,
+        &mut action_summaries_map,
+        client,
+        config,
+        report,
+        cycle,
+    )
+    .await?;
+
+    // Phase 3: Reflect
+    batch_phase_reflect(
+        backend,
+        batch_agents,
+        &agent_contexts,
+        &mut agent_prompts,
+        report,
+    )
+    .await?;
+
+    // Phase 4: Evolve
+    batch_phase_evolve(
+        backend,
+        batch_agents,
+        &agent_contexts,
+        &mut agent_prompts,
+        &action_summaries_map,
+        config.mutation_chance,
+        report,
+    )
+    .await?;
+
+    // Phase 5: Survey
+    batch_phase_survey(
+        backend,
+        batch_agents,
+        &agent_contexts,
+        &mut agent_prompts,
+        client,
+        config.force_survey,
+        report,
+    )
+    .await?;
 
     Ok(())
 }
@@ -1203,9 +1309,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         {
             Ok(assistant) => {
                 let response_text = assistant.content().to_string();
-                if let Err(e) =
-                    apply_mutation(agent, &response_text, &experience, report).await
-                {
+                if let Err(e) = apply_mutation(agent, &response_text, &experience, report).await {
                     tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
                 }
                 Ok(())
@@ -1358,14 +1462,8 @@ async fn run_sequential(
 
         // Reflect — any Err is logged inside the helper; we continue to
         // evolve/survey on top of the turn-valid bare_prompt.
-        let _ = seq_phase_reflect(
-            &backend,
-            agent,
-            &mut bare_prompt,
-            &mut usage_total,
-            report,
-        )
-        .await;
+        let _ =
+            seq_phase_reflect(&backend, agent, &mut bare_prompt, &mut usage_total, report).await;
 
         // Evolve — random roll injected for deterministic testability.
         let roll = rand::random::<u32>() % 100;
