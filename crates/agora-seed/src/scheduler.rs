@@ -30,6 +30,8 @@ use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::agora_agentkit::scheduler::{BatchBackend, BatchState, CycleStep, WorkItem};
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::OllamaEndpoint;
+use agora_agent_lib::llm::ollama::OllamaPerModel;
+use agora_agent_lib::llm::{self, Usage};
 use agora_agent_lib::tools::{make_tool_result, parse_tool_calls};
 use anyhow::Result;
 use misanthropic::CachedPrompt;
@@ -64,13 +66,19 @@ const MAX_ROUNDS: usize = 5;
 /// - Cache breakpoint (1)
 /// - First user message: soul, memory, dashboard, perceptions
 /// - Cache breakpoint (2)
+///
+/// Every built prompt is preflight-checked for the expected constitution
+/// article markers — if any are missing (e.g. langsan stripped content),
+/// the problem is logged at error level with the agent name so operators
+/// can investigate. This guards against the constitution silently falling
+/// out of the system prefix due to an upstream sanitization change.
 pub fn build_prompt(
     agent: &Agent,
     ctx: &AgentCycleContext,
     constitution: &str,
     communities: &[String],
 ) -> CachedPrompt<'static> {
-    prompt::build(
+    let cached = prompt::build(
         &agent.model,
         &agent.soul.as_system_prompt(),
         &agent.memory.content,
@@ -79,7 +87,18 @@ pub fn build_prompt(
         constitution,
         communities,
         &ctx.perception_text,
-    )
+    );
+
+    // Preflight: serialize and scan for missing constitution markers.
+    // Cheap relative to the LLM call that follows; worth catching prompt
+    // corruption at the source rather than letting agents reflect on
+    // constitutions they never saw.
+    let json = serde_json::to_string(&cached).unwrap_or_default();
+    for problem in prompt::preflight_check_prompt(&json) {
+        tracing::error!(agent = %agent.name, "[PREFLIGHT] {problem}");
+    }
+
+    cached
 }
 
 /// Execute a single tool action against the Agora server and build the
@@ -993,7 +1012,296 @@ async fn run_batch(
 /// as mandatory tool use. This is the ONLY place we break the CachedPrompt
 /// invariant, and it's acceptable because Ollama uses local KV cache, not
 /// Anthropic's paid prompt cache.
-async fn run_batch_sequential(
+// ---------------------------------------------------------------------------
+// Sequential (Ollama) phase functions
+// ---------------------------------------------------------------------------
+//
+// The Ollama path runs one agent at a time through a shared OllamaEndpoint
+// (local or LAN GPU). Each phase is a small async fn that takes the prompt
+// by `&mut` and funnels its single LLM round-trip through `exchange`
+// — which guarantees turn-order safety whether the backend succeeds,
+// fails, or flakes and retries once.
+
+/// Think/act phase: run up to MAX_ROUNDS tool-use rounds against the
+/// endpoint, driving `process_round` to execute actions and append tool
+/// results. Returns the accumulated action summaries.
+///
+/// This phase uses the raw `OllamaEndpoint::send` path directly (not
+/// `exchange`) because the tool-round loop has its own turn-order
+/// invariants via `process_round`, which already handles tool_use →
+/// tool_result pairing and the error-recovery hole for us.
+async fn seq_phase_think_act(
+    endpoint: &OllamaEndpoint,
+    agent: &mut Agent,
+    ctx: &AgentCycleContext,
+    client: &AgoraClient,
+    cached_prompt: &mut CachedPrompt<'static>,
+    report: &mut RunReport,
+    cycle: usize,
+    total_cycles: usize,
+) -> Vec<String> {
+    let mut summaries = Vec::new();
+    let model = agent.model.clone();
+
+    for round in 0..MAX_ROUNDS {
+        tracing::info!(
+            "[{}/{}] {} — round {}/{}",
+            cycle + 1,
+            total_cycles,
+            agent.name,
+            round + 1,
+            MAX_ROUNDS,
+        );
+
+        let response = match endpoint.send(cached_prompt, &model).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::warn!(
+                    "Round {} failed for {} at {}: {e}",
+                    round + 1,
+                    agent.name,
+                    endpoint.url
+                );
+                if round == 0 {
+                    report.skipped.think_failures += 1;
+                }
+                break;
+            }
+        };
+
+        let assistant_msg = match AssistantMessage::try_from(response.into_static()) {
+            Ok(m) => m,
+            Err(_) => {
+                tracing::error!("Ollama returned non-assistant response for {}", agent.name);
+                break;
+            }
+        };
+
+        match process_round(
+            cached_prompt,
+            assistant_msg,
+            agent,
+            client,
+            &ctx.dashboard,
+            report,
+        )
+        .await
+        {
+            Ok(round_summaries) => summaries.extend(round_summaries),
+            Err(e) => {
+                let snapshot = serde_json::to_string_pretty(&**cached_prompt)
+                    .unwrap_or_else(|err| format!("<serialize failed: {err}>"));
+                tracing::error!(
+                    agent = %agent.name,
+                    round = round + 1,
+                    error = %e,
+                    "Turn-order failure in Ollama process_round.\n\
+                     Prompt snapshot:\n{snapshot}"
+                );
+                report.skipped.turn_order_failures += 1;
+                break;
+            }
+        }
+    }
+
+    cached_prompt.cache_windowed(2);
+    summaries
+}
+
+/// Strip tools from a `CachedPrompt` in preparation for reflect/evolve/
+/// survey phases on Ollama. Briefly drops to a bare `Prompt` to mutate
+/// the `.functions` and `.tool_choice` prefix fields (which
+/// `CachedPrompt` intentionally doesn't expose), then re-wraps into a
+/// fresh `CachedPrompt` — once the tools are gone the prompt is
+/// append-only again and every downstream phase gets `CachedPrompt`'s
+/// turn-order and cache-safety guarantees.
+///
+/// Necessary because Ollama's compat layer misinterprets
+/// `tool_choice: Auto` as "must use tools" during reflect. Clearing
+/// just `tool_choice` while keeping `.functions` intact is not
+/// sufficient — an absent `tool_choice` still falls through to Auto
+/// behavior when functions are present, so the model fires a tool call
+/// during memory rewrite instead of writing text. This invalidates
+/// Ollama's prefix KV cache for the post-think phases; acceptable
+/// because Ollama uses local GPU memory, not Anthropic's paid prompt
+/// cache.
+fn strip_tools_for_reflect(mut cached: CachedPrompt<'static>) -> CachedPrompt<'static> {
+    insert_bridge(&mut cached);
+    let mut bare = cached.into_inner();
+    bare.functions = None;
+    bare.tool_choice = None;
+    CachedPrompt::from(bare)
+}
+
+/// Reflect phase: ask the model to rewrite its memory based on the
+/// actions taken this cycle.
+async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
+    backend: &B,
+    agent: &mut Agent,
+    bare_prompt: &mut CachedPrompt<'static>,
+    usage_total: &mut Option<Usage>,
+    report: &mut RunReport,
+) -> Result<()> {
+    use std::num::NonZeroU32;
+    bare_prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+
+    match llm::exchange(
+        backend,
+        bare_prompt,
+        UserMessage::from(MEMORY_REWRITE_MESSAGE),
+        usage_total,
+    )
+    .await
+    {
+        Ok(assistant) => {
+            let response_text = assistant.content().to_string();
+            if let Err(e) = apply_reflect(agent, &response_text).await {
+                tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!("Reflect failed for {}: {e}", agent.name);
+            report.skipped.reflect_failures += 1;
+            Err(e)
+        }
+    }
+}
+
+/// Evolve phase: probabilistic soul mutation or evolution log entry.
+///
+/// The random roll is passed in by the caller so tests can drive the
+/// phase deterministically without hooking `rand::thread_rng`.
+async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
+    backend: &B,
+    agent: &mut Agent,
+    bare_prompt: &mut CachedPrompt<'static>,
+    summaries: &[String],
+    roll: u32,
+    mutation_chance: Option<u32>,
+    usage_total: &mut Option<Usage>,
+    report: &mut RunReport,
+) -> Result<()> {
+    use std::num::NonZeroU32;
+    let experience = summaries.join("; ");
+    let deep_threshold = mutation_chance.unwrap_or(3);
+    let evo_threshold = deep_threshold + 10;
+
+    if roll < deep_threshold {
+        tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
+        let current_soul = agent.soul.render();
+        let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
+        bare_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
+
+        match llm::exchange(
+            backend,
+            bare_prompt,
+            UserMessage::from(mutation_text),
+            usage_total,
+        )
+        .await
+        {
+            Ok(assistant) => {
+                let response_text = assistant.content().to_string();
+                if let Err(e) =
+                    apply_mutation(agent, &response_text, &experience, report).await
+                {
+                    tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
+                report.evolution.mutation_failures += 1;
+                Err(e)
+            }
+        }
+    } else if roll < evo_threshold {
+        bare_prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
+
+        match llm::exchange(
+            backend,
+            bare_prompt,
+            UserMessage::from(EVOLUTION_MESSAGE),
+            usage_total,
+        )
+        .await
+        {
+            Ok(assistant) => {
+                let response_text = assistant.content().to_string();
+                if let Err(e) = apply_evolution(agent, &response_text, report).await {
+                    tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::debug!("Evolution failed for {}: {e}", agent.name);
+                Err(e)
+            }
+        }
+    } else {
+        Ok(())
+    }
+}
+
+/// Survey phase: probabilistic anonymous feedback request.
+async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
+    backend: &B,
+    agent_id: agora_agent_lib::agora_agentkit::ids::AgentId,
+    agent_name: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    bare_prompt: &mut CachedPrompt<'static>,
+    client: &AgoraClient,
+    force_survey: bool,
+    take_survey: bool,
+    usage_total: &mut Option<Usage>,
+    report: &mut RunReport,
+) -> Result<()> {
+    use std::num::NonZeroU32;
+    if !force_survey && !take_survey {
+        return Ok(());
+    }
+    bare_prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+
+    match llm::exchange(
+        backend,
+        bare_prompt,
+        UserMessage::from(SURVEY_MESSAGE),
+        usage_total,
+    )
+    .await
+    {
+        Ok(assistant) => {
+            let text = prompt::extract_speech(assistant.content());
+            let trimmed = text.trim();
+            if !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("no feedback")
+                && !trimmed.eq_ignore_ascii_case("no feedback.")
+            {
+                match client.submit_feedback(agent_id, trimmed, signing_key).await {
+                    Ok(()) => {
+                        tracing::info!("  anonymous feedback submitted");
+                        report.surveys.submitted += 1;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Anonymous feedback submission failed: {e}");
+                        report.surveys.failures += 1;
+                    }
+                }
+            } else {
+                report.surveys.skipped_empty += 1;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            tracing::debug!("Survey failed for {agent_name}: {e}");
+            report.surveys.failures += 1;
+            Err(e)
+        }
+    }
+}
+
+async fn run_sequential(
     endpoint: &OllamaEndpoint,
     batch_agents: &mut [Agent],
     client: &AgoraClient,
@@ -1003,13 +1311,18 @@ async fn run_batch_sequential(
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
-    use std::num::NonZeroU32;
-
     for agent in batch_agents.iter_mut() {
         let agent_id = agent.agent_id.unwrap();
         let model = agent.model.clone();
+        let agent_name = agent.name.clone();
+        let signing_key = agent.signing_key.clone();
+        let backend = OllamaPerModel {
+            endpoint,
+            model: &model,
+        };
+        let mut usage_total: Option<Usage> = None;
 
-        // Fetch dashboard
+        // Perceive
         let ctx = match fetch_dashboard(agent, agent_id, client).await {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -1019,74 +1332,19 @@ async fn run_batch_sequential(
             }
         };
 
-        // Build prompt (CachedPrompt through tool rounds)
+        // Think/act
         let mut cached_prompt = build_prompt(agent, &ctx, constitution, communities);
-        let mut summaries = Vec::new();
-
-        // Tool rounds (5)
-        for round in 0..MAX_ROUNDS {
-            tracing::info!(
-                "[{}/{}] {} — round {}/{}",
-                cycle + 1,
-                config.cycles,
-                agent.name,
-                round + 1,
-                MAX_ROUNDS,
-            );
-
-            let response = match endpoint.send(&cached_prompt, &model).await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    tracing::warn!(
-                        "Round {} failed for {} at {}: {e}",
-                        round + 1,
-                        agent.name,
-                        endpoint.url
-                    );
-                    if round == 0 {
-                        report.skipped.think_failures += 1;
-                    }
-                    break;
-                }
-            };
-
-            let assistant_msg = match AssistantMessage::try_from(response.into_static()) {
-                Ok(m) => m,
-                Err(_) => {
-                    tracing::error!("Ollama returned non-assistant response for {}", agent.name);
-                    break;
-                }
-            };
-
-            match process_round(
-                &mut cached_prompt,
-                assistant_msg,
-                agent,
-                client,
-                &ctx.dashboard,
-                report,
-            )
-            .await
-            {
-                Ok(round_summaries) => summaries.extend(round_summaries),
-                Err(e) => {
-                    let snapshot = serde_json::to_string_pretty(&*cached_prompt)
-                        .unwrap_or_else(|err| format!("<serialize failed: {err}>"));
-                    tracing::error!(
-                        agent = %agent.name,
-                        round = round + 1,
-                        error = %e,
-                        "Turn-order failure in Ollama process_round.\n\
-                         Prompt snapshot:\n{snapshot}"
-                    );
-                    report.skipped.turn_order_failures += 1;
-                    break;
-                }
-            }
-        }
-
-        cached_prompt.cache_windowed(2);
-
+        let summaries = seq_phase_think_act(
+            endpoint,
+            agent,
+            &ctx,
+            client,
+            &mut cached_prompt,
+            report,
+            cycle,
+            config.cycles,
+        )
+        .await;
         tracing::info!(
             "[{}/{}] {} — {} actions total",
             cycle + 1,
@@ -1095,158 +1353,52 @@ async fn run_batch_sequential(
             summaries.len(),
         );
 
-        // === OLLAMA EXCEPTION: strip tools for reflect phases ===
-        // Ollama's compat layer misinterprets `tool_choice: Auto` as "must
-        // use tools" during reflect. Clearing just `tool_choice` (while
-        // keeping `.functions` intact) is *not* sufficient: an absent
-        // `tool_choice` still falls through to Auto behavior when
-        // functions are present, so the model fires a tool call during
-        // memory rewrite instead of writing text. We have to drop
-        // `.functions` as well. This invalidates Ollama's prefix KV cache
-        // for reflect/evolve/survey; acceptable because Ollama uses local
-        // GPU memory, not Anthropic's paid prompt cache.
-        insert_bridge(&mut cached_prompt);
-        let mut bare_prompt = cached_prompt.into_inner();
-        bare_prompt.functions = None;
-        bare_prompt.tool_choice = None;
+        // Strip tools for reflect/evolve/survey and continue on bare Prompt.
+        let mut bare_prompt = strip_tools_for_reflect(cached_prompt);
 
-        if let Err(e) = bare_prompt.push_message(UserMessage::from(MEMORY_REWRITE_MESSAGE)) {
-            tracing::warn!("Failed to append reflect prompt for {}: {e}", agent.name);
-            continue;
-        }
-        // it's now the assistant's turn
-        bare_prompt.max_tokens = NonZeroU32::new(1024).unwrap();
+        // Reflect — any Err is logged inside the helper; we continue to
+        // evolve/survey on top of the turn-valid bare_prompt.
+        let _ = seq_phase_reflect(
+            &backend,
+            agent,
+            &mut bare_prompt,
+            &mut usage_total,
+            report,
+        )
+        .await;
 
-        match endpoint.send(&bare_prompt, &model).await {
-            Ok(reflect_response) => {
-                let response_text = reflect_response.content.to_string();
-                if let Err(e) = apply_reflect(agent, &response_text).await {
-                    tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
-                }
-                if let Ok(assistant) = AssistantMessage::try_from(reflect_response.into_static()) {
-                    if let Err(e) = bare_prompt.push_message(assistant) {
-                        tracing::debug!(
-                            "Failed to append reflect response for {}: {e}",
-                            agent.name
-                        );
-                    }
-                    // it's now the user's turn
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Reflect failed for {}: {e}", agent.name);
-                report.skipped.reflect_failures += 1;
-            }
-        }
-
-        // Evolve
+        // Evolve — random roll injected for deterministic testability.
         let roll = rand::random::<u32>() % 100;
-        let experience = summaries.join("; ");
-        let deep_threshold = config.mutation_chance.unwrap_or(3);
-        let evo_threshold = deep_threshold + 10;
+        let _ = seq_phase_evolve(
+            &backend,
+            agent,
+            &mut bare_prompt,
+            &summaries,
+            roll,
+            config.mutation_chance,
+            &mut usage_total,
+            report,
+        )
+        .await;
 
-        if roll < deep_threshold {
-            tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
-            let current_soul = agent.soul.render();
-            let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
-
-            if bare_prompt
-                .push_message(UserMessage::from(mutation_text))
-                .is_ok()
-            {
-                // it's now the assistant's turn
-                bare_prompt.max_tokens = NonZeroU32::new(2048).unwrap();
-                match endpoint.send(&bare_prompt, &model).await {
-                    Ok(mutation_response) => {
-                        let response_text = mutation_response.content.to_string();
-                        if let Err(e) =
-                            apply_mutation(agent, &response_text, &experience, report).await
-                        {
-                            tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
-                        }
-                        if let Ok(assistant) =
-                            AssistantMessage::try_from(mutation_response.into_static())
-                        {
-                            let _ = bare_prompt.push_message(assistant);
-                            // it's now the user's turn
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
-                        report.evolution.mutation_failures += 1;
-                    }
-                }
-            }
-        } else if roll < evo_threshold {
-            if bare_prompt
-                .push_message(UserMessage::from(EVOLUTION_MESSAGE))
-                .is_ok()
-            {
-                // it's now the assistant's turn
-                bare_prompt.max_tokens = NonZeroU32::new(512).unwrap();
-                match endpoint.send(&bare_prompt, &model).await {
-                    Ok(evo_response) => {
-                        let response_text = evo_response.content.to_string();
-                        if let Err(e) = apply_evolution(agent, &response_text, report).await {
-                            tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
-                        }
-                        if let Ok(assistant) =
-                            AssistantMessage::try_from(evo_response.into_static())
-                        {
-                            let _ = bare_prompt.push_message(assistant);
-                            // it's now the user's turn
-                        }
-                    }
-                    Err(e) => tracing::debug!("Evolution failed for {}: {e}", agent.name),
-                }
-            }
-        }
-
-        // Survey
-        if config.force_survey || rand::random::<f64>() < 0.10 {
-            if bare_prompt
-                .push_message(UserMessage::from(SURVEY_MESSAGE))
-                .is_ok()
-            {
-                // it's now the assistant's turn
-                bare_prompt.max_tokens = NonZeroU32::new(1024).unwrap();
-                match endpoint.send(&bare_prompt, &model).await {
-                    Ok(survey_response) => {
-                        let text = prompt::extract_speech(&survey_response.content);
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty()
-                            && !trimmed.eq_ignore_ascii_case("no feedback")
-                            && !trimmed.eq_ignore_ascii_case("no feedback.")
-                        {
-                            match client
-                                .submit_feedback(agent_id, trimmed, &agent.signing_key)
-                                .await
-                            {
-                                Ok(()) => {
-                                    tracing::info!("  anonymous feedback submitted");
-                                    report.surveys.submitted += 1;
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Anonymous feedback submission failed: {e}");
-                                    report.surveys.failures += 1;
-                                }
-                            }
-                        } else {
-                            report.surveys.skipped_empty += 1;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Survey failed for {}: {e}", agent.name);
-                        report.surveys.failures += 1;
-                    }
-                }
-            } else {
-                tracing::error!("Turn order error appending survey.")
-            }
-        }
+        // Survey — probabilistic 10% unless --force-survey.
+        let take_survey = rand::random::<f64>() < 0.10;
+        let _ = seq_phase_survey(
+            &backend,
+            agent_id,
+            &agent_name,
+            &signing_key,
+            &mut bare_prompt,
+            client,
+            config.force_survey,
+            take_survey,
+            &mut usage_total,
+            report,
+        )
+        .await;
 
         // Save prompt log
-        crate::runner::save_prompt_log(&bare_prompt, &agent.name).await;
+        crate::prompt_log::save(&bare_prompt, &agent.name).await;
     }
 
     Ok(())
@@ -1433,7 +1585,7 @@ async fn run_worker(
             model,
             pool.remaining(),
         );
-        run_batch_sequential(
+        run_sequential(
             endpoint,
             &mut batch_agents,
             client,

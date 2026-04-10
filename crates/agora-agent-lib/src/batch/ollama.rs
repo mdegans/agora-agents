@@ -89,15 +89,25 @@ impl OllamaEndpoint {
         })
     }
 
-    /// Send a single prompt to this endpoint and return the response.
-    ///
-    /// This is the public API for the sequential per-agent pipeline where
-    /// the scheduler drives one request at a time for KV cache reuse.
+    /// Send a single prompt to this endpoint and return just the response
+    /// message, discarding usage statistics. Thin wrapper around
+    /// [`OllamaEndpoint::send_response`] for callers that don't track usage.
     pub async fn send(
         &self,
         prompt: &Prompt<'_>,
         model: &str,
     ) -> anyhow::Result<MMessage<'static>> {
+        Ok(self.send_response(prompt, model).await?.message)
+    }
+
+    /// Send a single prompt and return the full [`SendResponse`] including
+    /// usage statistics. Preferred over [`Self::send`] when usage matters
+    /// (cycle accounting, cost logging).
+    pub async fn send_response(
+        &self,
+        prompt: &Prompt<'_>,
+        model: &str,
+    ) -> anyhow::Result<crate::llm::SendResponse> {
         let start = std::time::Instant::now();
 
         let resp = send_with_nudge(&self.client, prompt).await?;
@@ -115,7 +125,7 @@ impl OllamaEndpoint {
             tracing::debug!("  [{model}@{}] {:.1}s", self.url, elapsed.as_secs_f64());
         }
 
-        Ok(resp.message)
+        Ok(resp)
     }
 }
 

@@ -2,7 +2,7 @@ mod agent;
 mod client;
 mod config;
 mod prompt;
-mod runner;
+mod prompt_log;
 mod scheduler;
 mod setup;
 mod state;
@@ -302,21 +302,19 @@ async fn main() -> Result<()> {
                     think_prompt.tool_choice,
                 );
             } else {
-                // Live run: full cycle with verbose JSON output, real actions
-                runner::run_cycle(
-                    agent,
-                    &agora_agent_lib::llm::ollama::OllamaBackend::new(
-                        cli.ollama_url.as_deref(),
-                        &agent.model,
-                    )?,
+                // Live single-agent simulation. Instead of a separate
+                // verbose code path (which used to live in runner.rs and
+                // drifted from the real scheduler over time), run the
+                // normal scheduler with a single-agent filter. Set
+                // `RUST_LOG=agora_seed=debug` for per-phase request/
+                // response logging.
+                let _ = agent; // filter was already applied above
+                scheduler::run_all(
+                    &mut agents,
                     &api_client,
-                    0,
-                    1,
-                    cli.mutation_chance,
+                    &cli,
                     &constitution,
                     &communities,
-                    true,
-                    cli.force_survey,
                 )
                 .await?;
             }

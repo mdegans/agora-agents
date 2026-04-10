@@ -43,7 +43,7 @@ pub async fn send_with_nudge(
     let response = client
         .message(prompt)
         .await
-        .map_err(|e| anyhow::anyhow!("Ollama request failed: {e}"))?;
+        .context("Ollama request failed")?;
     let mut total_usage = response.usage;
     let msg: MMessage<'_> = response.inner.into();
 
@@ -72,7 +72,7 @@ pub async fn send_with_nudge(
         let response = client
             .message(&retry_prompt)
             .await
-            .map_err(|e| anyhow::anyhow!("Ollama nudge request failed: {e}"))?;
+            .context("Ollama nudge request failed")?;
         total_usage = total_usage + response.usage;
         last_msg = response.inner.into();
 
@@ -155,5 +155,32 @@ impl LlmBackend for OllamaBackend {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+}
+
+/// [`LlmBackend`] adapter that binds an [`OllamaEndpoint`] to a specific
+/// model per call. Lets the scheduler's sequential path reuse the
+/// [`exchange`](super::exchange) / [`exchange_bare`](super::exchange_bare)
+/// helpers without spinning up a fresh [`OllamaBackend`] (and therefore a
+/// fresh `misanthropic::Client`) for every agent.
+///
+/// [`OllamaEndpoint`]: crate::batch::ollama::OllamaEndpoint
+pub struct OllamaPerModel<'a> {
+    pub endpoint: &'a crate::batch::ollama::OllamaEndpoint,
+    pub model: &'a str,
+}
+
+#[async_trait]
+impl<'a> LlmBackend for OllamaPerModel<'a> {
+    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
+        self.endpoint.send_response(prompt, self.model).await
+    }
+
+    fn backend_name(&self) -> &str {
+        "ollama-per-model"
+    }
+
+    fn model_id(&self) -> &str {
+        self.model
     }
 }

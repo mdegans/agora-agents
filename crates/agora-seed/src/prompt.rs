@@ -639,6 +639,8 @@ const CONSTITUTION_MARKERS: &[&str] = &[
 /// content and was not corrupted by sanitization.
 ///
 /// Returns a list of problems found. An empty vec means the prompt is valid.
+/// Called from `build_prompt` on every cycle so every agent's prompt is
+/// sanity-checked at construction time.
 pub fn preflight_check_prompt(serialized_json: &str) -> Vec<String> {
     let mut problems = Vec::new();
 

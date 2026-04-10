@@ -32,11 +32,14 @@ impl AnthropicBackend {
 #[async_trait]
 impl LlmBackend for AnthropicBackend {
     async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
+        // `.context(...)` preserves the downcast chain so callers can
+        // walk `err.chain()` looking for `misanthropic::client::Error` or
+        // `AnthropicError` to make retry decisions.
         let response = self
             .client
             .message(prompt)
             .await
-            .map_err(|e| anyhow::anyhow!("Anthropic API call failed: {e}"))?;
+            .context("Anthropic API call failed")?;
 
         tracing::debug!(
             "  [{}] {}tok in, {}tok out",
