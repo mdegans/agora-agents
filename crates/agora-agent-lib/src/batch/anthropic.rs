@@ -90,14 +90,10 @@ impl AnthropicBatch {
     /// prefix.
     ///
     /// [docs]: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
-    async fn prime_via_batch(
-        &self,
-        prompt: &CachedPrompt<'static>,
-    ) -> anyhow::Result<()> {
-        let prime_prompt = prompt.clone();
+    async fn prime_via_batch(&self, prompt: &CachedPrompt<'static>) -> anyhow::Result<()> {
         let mut pending = self
             .client
-            .batch([prime_prompt])
+            .batch([prompt])
             .await
             .map_err(|e| anyhow::anyhow!("prime batch submit failed: {e}"))?;
 
@@ -112,7 +108,7 @@ impl AnthropicBatch {
         // Short poll interval so we can start the main batch as soon as
         // the prime is ready.
         let prime_timeout = std::time::Duration::from_secs(30 * 60);
-        let poll_interval = std::time::Duration::from_millis(500);
+        let poll_interval = std::time::Duration::from_secs(5);
         let prime_start = std::time::Instant::now();
 
         let ready = loop {
@@ -194,8 +190,8 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
         //
         // The prefix is stable across all phases and rounds for a given
         // agent model, so we only need to prime once per model per
-        // cycle. Priming before every batch would add ~5s of latency
-        // each time, pushing consecutive batches past the 5-minute
+        // cycle. Priming before every batch would add several minutes of
+        // latency each time, pushing consecutive batches past the 5-minute
         // ephemeral cache TTL — exactly the opposite of what we want.
         let prefix_hash = items.first().map(|it| it.prefix_hash);
         let needs_prime = match prefix_hash {
@@ -242,17 +238,14 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
                     // result.
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Cache priming via batch API failed: {e}. Continuing \
-                         with main batch submission — the real error will \
-                         surface through the normal submit path."
-                    );
+                    tracing::error!("Cache priming via batch API failed: {e}.");
                     if let Some(hash) = prefix_hash {
                         self.primed_prefixes
                             .lock()
                             .expect("primed_prefixes mutex poisoned")
                             .remove(&hash);
                     }
+                    return Err(e); // If the batch has errors, fail fast
                 }
             }
         } else if !needs_prime {
