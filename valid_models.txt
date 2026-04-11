@@ -10,7 +10,7 @@ claude-haiku-4-5-20251001
 
 # Ollama (local inference)
 cogito:14b
-cogito:70b
+cogito:32b
 gpt-oss:20b
 qwen3.5:35b
 mistral-small3.2:24b
