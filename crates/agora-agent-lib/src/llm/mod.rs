@@ -145,64 +145,10 @@ pub fn accumulate_usage(total: &mut Option<Usage>, delta: Option<Usage>) {
     }
 }
 
-/// Is this backend error worth a single retry?
-///
-/// Retry rules:
-/// - Network errors (reqwest): true — tcp flaps, brief DNS hiccups.
-/// - Anthropic 5xx, 429, overloaded, timeout: true.
-/// - Anthropic 4xx (other than 429): false — our fault, won't fix itself.
-/// - Parse / unexpected-response errors: false.
-/// - Ollama or anything we can't classify: true. Ollama's compat layer
-///   returns opaque errors and one extra call is cheap compared to losing
-///   an agent's turn.
-///
-/// This walks the [`anyhow::Error`] chain with
-/// [`anyhow::Error::chain`] looking for `misanthropic::client::Error` and
-/// `misanthropic::client::AnthropicError`. Kept in agora-agent-lib rather
-/// than upstream because retry policy is context-dependent.
-pub fn is_recoverable(err: &anyhow::Error) -> bool {
-    use misanthropic::client::{AnthropicError, Error as ClientError};
-
-    for cause in err.chain() {
-        if let Some(client_err) = cause.downcast_ref::<ClientError>() {
-            return match client_err {
-                ClientError::HTTP(_) => true, // network blip
-                ClientError::Parse(_) => false,
-                ClientError::UnexpectedResponse { .. } => false,
-                ClientError::Anthropic(a) => anthropic_err_recoverable(a),
-                // Non-JSON error bodies are almost always transient edge
-                // failures (Cloudflare 502/504 HTML pages, rate-limit
-                // challenge pages, gateway timeouts). Retry. If the
-                // underlying issue is permanent, successive retries
-                // will keep returning the same NonJsonResponse and the
-                // caller's retry budget will bound total wait.
-                ClientError::NonJsonResponse { .. } => true,
-            };
-        }
-        if let Some(a) = cause.downcast_ref::<AnthropicError>() {
-            return anthropic_err_recoverable(a);
-        }
-    }
-    // Unknown error type — default to retrying once. Cheap.
-    true
-}
-
-fn anthropic_err_recoverable(err: &misanthropic::client::AnthropicError) -> bool {
-    use misanthropic::client::AnthropicError::*;
-    match err {
-        // Recoverable: transient server or rate limit.
-        RateLimit { .. } | API { .. } | Overloaded { .. } | Timeout { .. } => true,
-        // Unknown code: retry on 5xx, skip on 4xx.
-        Unknown { code, .. } => code.get() >= 500,
-        // Everything else (400/401/403/404/413/billing) is our fault.
-        InvalidRequest { .. }
-        | Authentication { .. }
-        | Billing { .. }
-        | Permission { .. }
-        | NotFound { .. }
-        | RequestTooLarge { .. } => false,
-    }
-}
+// Re-export is_recoverable from agora-agentkit::retry. This was local
+// here until we extracted it so both the main agora workspace
+// (agora-appeals) and this workspace could share one copy.
+pub use agora_agentkit::retry::is_recoverable;
 
 /// Build the synthetic assistant message appended on backend error.
 ///
@@ -318,60 +264,9 @@ async fn send_with_retry<B: LlmBackend + ?Sized>(
     attempt
 }
 
-/// Retry `f` with exponential backoff when it returns a recoverable
-/// error (per [`is_recoverable`]). Used by the batch scheduler to
-/// wrap individual `submit()` / `poll()` calls against the Anthropic
-/// Batch API, where transient edge failures (HTML 502 pages,
-/// gateway timeouts, rate-limit challenges) should not kill an
-/// otherwise-successful cycle.
-///
-/// Backoff schedule for `max_retries = 5`: 1s → 2s → 4s → 8s → 16s.
-/// Total worst-case wait before giving up is ~31s on top of the
-/// actual call latency. If `f` returns a non-recoverable error (e.g.
-/// auth, invalid request), returns immediately without waiting.
-///
-/// `label` is prefixed on every warning log so operators can tell
-/// which call site is retrying.
-pub async fn retry_recoverable<F, Fut, T>(
-    label: &str,
-    max_retries: usize,
-    mut f: F,
-) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let mut delay = std::time::Duration::from_secs(1);
-    let mut attempt = 0usize;
-    loop {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if !is_recoverable(&e) {
-                    tracing::error!(
-                        "{label}: non-recoverable error, not retrying: {e}"
-                    );
-                    return Err(e);
-                }
-                if attempt >= max_retries {
-                    tracing::error!(
-                        "{label}: giving up after {max_retries} retries: {e}"
-                    );
-                    return Err(e);
-                }
-                tracing::warn!(
-                    "{label}: recoverable error (attempt {}/{max_retries}), \
-                     retrying in {}s: {e}",
-                    attempt + 1,
-                    delay.as_secs(),
-                );
-                tokio::time::sleep(delay).await;
-                attempt += 1;
-                delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(30));
-            }
-        }
-    }
-}
+// Re-export retry_recoverable from agora-agentkit::retry (extracted
+// with is_recoverable, above).
+pub use agora_agentkit::retry::retry_recoverable;
 
 /// Commit an exchange result to a [`CachedPrompt`]: append the assistant
 /// response on success, or a synthetic error reply on failure.

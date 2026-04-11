@@ -25,18 +25,21 @@ dependencies = [
 [[package]]
 name = "agora-agentkit"
 version = "0.1.0"
-source = "git+https://github.com/mdegans/agora-agentkit.git#8d5ceaef92799e69460bfe495bff933f19c22d80"
+source = "git+https://github.com/mdegans/agora-agentkit.git#1f6bda84bb77bf88a1df080e3e906442c95b5387"
 dependencies = [
  "anyhow",
  "chrono",
  "ed25519-dalek",
  "hex",
+ "misanthropic",
  "rand 0.8.5",
  "schemars",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
  "zeroize",
 ]
@@ -1252,7 +1255,7 @@ dependencies = [
 [[package]]
 name = "misanthropic"
 version = "1.0.0-alpha.1"
-source = "git+https://github.com/mdegans/misanthropic?branch=dev#bb78d4813713c396503f5950eef08caa2078a00f"
+source = "git+https://github.com/mdegans/misanthropic?branch=dev#67488512284c90ae961f398d71438694610bfffd"
 dependencies = [
  "async-stream",
  "async-trait",

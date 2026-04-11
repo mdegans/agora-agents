@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, and API models
-agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", features = ["schemars"] }
+agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", features = ["schemars", "retry"] }
 
 # LLM backends
 misanthropic = { git = "https://github.com/mdegans/misanthropic", branch = "dev", features = ["batch", "cot", "markdown", "html"] }
