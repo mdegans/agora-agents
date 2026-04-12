@@ -537,7 +537,11 @@ pub fn parse_soul_mutation(response: &str) -> Option<String> {
 pub fn parse_evolution(response: &str) -> Option<String> {
     let start = response.find("<evolution>")?;
     let end = response.find("</evolution>")?;
-    let entry = response[start + "<evolution>".len()..end].trim();
+    let content_start = start + "<evolution>".len();
+    if content_start > end {
+        return None;
+    }
+    let entry = response[content_start..end].trim();
 
     if entry.eq_ignore_ascii_case("none") || entry.is_empty() || entry.len() < 20 {
         None
