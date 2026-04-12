@@ -114,6 +114,8 @@ pub fn build_prompt(
 ///   successful reads.
 /// - `result` is the [`tool::Result`] to append to the next user turn,
 ///   with `is_error` set appropriately.
+const MAX_GOVERNANCE_CALLS: usize = 2;
+
 async fn execute_action(
     action: &prompt::AgentAction,
     tool_use_id: String,
@@ -121,10 +123,23 @@ async fn execute_action(
     client: &AgoraClient,
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
+    governance_calls: &mut usize,
 ) -> (Option<String>, tool::Result<'static>) {
     let agent_id = agent.agent_id.unwrap();
     let ok = |content: &str| make_tool_result(tool_use_id.clone(), content, false);
     let err = |content: &str| make_tool_result(tool_use_id.clone(), content, true);
+
+    if action.is_governance() {
+        if *governance_calls >= MAX_GOVERNANCE_CALLS {
+            return (
+                None,
+                err(
+                    "Governance reads are limited to 2 per run. Use your remaining rounds for other actions.",
+                ),
+            );
+        }
+        *governance_calls += 1;
+    }
 
     match action {
         prompt::AgentAction::GetPost(input) => match client.get_post(input.post_id).await {
@@ -137,6 +152,25 @@ async fn execute_action(
                 Err(e) => (None, err(&format!("Error fetching comment: {e}"))),
             }
         }
+        prompt::AgentAction::GetGovernanceLog(input) => {
+            match client
+                .get_governance_log(input.entry_type.as_deref(), input.limit)
+                .await
+            {
+                Ok(data) => (
+                    None,
+                    ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
+                ),
+                Err(e) => (None, err(&format!("Error fetching governance log: {e}"))),
+            }
+        }
+        prompt::AgentAction::GetProposals(input) => match client.get_proposals(input.limit).await {
+            Ok(data) => (
+                None,
+                ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
+            ),
+            Err(e) => (None, err(&format!("Error fetching proposals: {e}"))),
+        },
         prompt::AgentAction::Post(input) => {
             let slug = match input.community.as_str() {
                 "technology" => "tech",
@@ -327,6 +361,7 @@ async fn process_round(
     client: &AgoraClient,
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
+    governance_calls: &mut usize,
 ) -> Result<Vec<String>> {
     let parsed = parse_tool_calls(&response);
 
@@ -352,8 +387,16 @@ async fn process_round(
     for entry in parsed {
         match entry {
             Ok((action, tool_use_id)) => {
-                let (summary, result) =
-                    execute_action(&action, tool_use_id, agent, client, dashboard, report).await;
+                let (summary, result) = execute_action(
+                    &action,
+                    tool_use_id,
+                    agent,
+                    client,
+                    dashboard,
+                    report,
+                    governance_calls,
+                )
+                .await;
                 if let Some(s) = summary {
                     summaries.push(s);
                 }
@@ -682,6 +725,8 @@ async fn batch_phase_think_act(
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
+    let mut governance_calls: HashMap<AgentId, usize> = HashMap::new();
+
     for round in 0..MAX_ROUNDS {
         tracing::info!(
             "Batch round {}/{} ({} agents)",
@@ -766,7 +811,17 @@ async fn batch_phase_think_act(
                 }
             };
 
-            match process_round(prompt, assistant_msg, agent, client, &ctx.dashboard, report).await
+            let gc = governance_calls.entry(result.agent_id).or_insert(0);
+            match process_round(
+                prompt,
+                assistant_msg,
+                agent,
+                client,
+                &ctx.dashboard,
+                report,
+                gc,
+            )
+            .await
             {
                 Ok(summaries) => {
                     action_summaries_map
@@ -1245,6 +1300,7 @@ async fn seq_phase_think_act(
     total_cycles: usize,
 ) -> Vec<String> {
     let mut summaries = Vec::new();
+    let mut governance_calls = 0usize;
     let model = agent.model.clone();
 
     for round in 0..MAX_ROUNDS {
@@ -1288,6 +1344,7 @@ async fn seq_phase_think_act(
             client,
             &ctx.dashboard,
             report,
+            &mut governance_calls,
         )
         .await
         {

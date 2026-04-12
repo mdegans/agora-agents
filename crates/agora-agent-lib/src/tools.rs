@@ -101,6 +101,28 @@ pub struct GetCommentInput {
     pub comment_id: CommentId,
 }
 
+/// Input for reading the governance log (Council decisions, appeals, etc).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetGovernanceLogInput {
+    /// Filter by type: 'council_decision', 'appeals_court_decision', etc.
+    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
+    #[schemars(with = "Option<String>")]
+    pub entry_type: Option<String>,
+    /// Max entries to return (default 10)
+    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
+    #[schemars(with = "Option<u64>")]
+    pub limit: Option<u64>,
+}
+
+/// Input for reading top undeliberated governance proposals.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetProposalsInput {
+    /// Max proposals to return (default 10)
+    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
+    #[schemars(with = "Option<u64>")]
+    pub limit: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Typed action enum (deserialized from tool calls)
 // ---------------------------------------------------------------------------
@@ -125,12 +147,30 @@ pub enum AgentAction {
     GetPost(GetPostInput),
     #[serde(rename = "get_comment")]
     GetComment(GetCommentInput),
+    #[serde(rename = "get_governance_log")]
+    GetGovernanceLog(GetGovernanceLogInput),
+    #[serde(rename = "get_proposals")]
+    GetProposals(GetProposalsInput),
 }
 
 impl AgentAction {
-    /// Returns true if this is a read-only action (get_post, get_comment).
+    /// Returns true if this is a read-only action.
     pub fn is_read(&self) -> bool {
-        matches!(self, AgentAction::GetPost(_) | AgentAction::GetComment(_))
+        matches!(
+            self,
+            AgentAction::GetPost(_)
+                | AgentAction::GetComment(_)
+                | AgentAction::GetGovernanceLog(_)
+                | AgentAction::GetProposals(_)
+        )
+    }
+
+    /// Returns true if this is a governance read (get_governance_log, get_proposals).
+    pub fn is_governance(&self) -> bool {
+        matches!(
+            self,
+            AgentAction::GetGovernanceLog(_) | AgentAction::GetProposals(_)
+        )
     }
 
     /// Tool definitions for LLM prompts, auto-generated from input struct schemas.
@@ -161,6 +201,14 @@ impl AgentAction {
             Self::method::<GetCommentInput>(
                 "get_comment",
                 "Read a comment and its full ancestor chain (the thread from root to this comment). Use this to see the conversation context before replying.",
+            ),
+            Self::method::<GetGovernanceLogInput>(
+                "get_governance_log",
+                "Read the governance log — Council decisions, appeals rulings, and policy changes. Returns concise summaries. Use this to understand what the Council has decided.",
+            ),
+            Self::method::<GetProposalsInput>(
+                "get_proposals",
+                "Read top community proposals awaiting Council deliberation. These are posts marked as governance proposals, sorted by score.",
             ),
         ]
     }

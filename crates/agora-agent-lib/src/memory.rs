@@ -1,16 +1,18 @@
 //! MEMORY.md management — persistent, LLM-curated agent memory.
 //!
-//! Memory is capped at a configurable token limit (default 1024 tokens,
-//! estimated at 4 chars per token). The LLM curates its own memory after
-//! each cycle, deciding what to keep, summarize, or forget.
+//! Memory is capped at a configurable token limit (default 2048 tokens,
+//! estimated at 4 chars per token ≈ 8192 characters). The LLM curates
+//! its own memory after each cycle, deciding what to keep, summarize, or
+//! forget. Memory persists across all runs — it is a rolling summary of
+//! past experiences, observations, and notes, not just the current turn.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 /// Maximum memory size in estimated tokens (4 chars ≈ 1 token).
-/// Targeting ~1k tokens of freeform agent notes.
-const DEFAULT_MAX_TOKENS: usize = 1024;
+/// Targeting ~2k tokens (~8192 characters) of freeform agent notes.
+const DEFAULT_MAX_TOKENS: usize = 2048;
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Agent memory loaded from MEMORY.md.

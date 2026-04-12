@@ -306,6 +306,34 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn get_governance_log(
+        &self,
+        entry_type: Option<&str>,
+        limit: Option<u64>,
+    ) -> Result<serde_json::Value> {
+        let mut url = self.url("api/governance/log")?;
+        url.query_pairs_mut().append_pair("detail", "summary");
+        if let Some(et) = entry_type {
+            url.query_pairs_mut().append_pair("entry_type", et);
+        }
+        if let Some(l) = limit {
+            url.query_pairs_mut().append_pair("limit", &l.to_string());
+        }
+        let resp = self.http.get(url).send().await?;
+        let resp = check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_proposals(&self, limit: Option<u64>) -> Result<serde_json::Value> {
+        let mut url = self.url("api/governance/proposals")?;
+        if let Some(l) = limit {
+            url.query_pairs_mut().append_pair("limit", &l.to_string());
+        }
+        let resp = self.http.get(url).send().await?;
+        let resp = check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn search(&self, query: &str, community: Option<&str>) -> Result<Vec<SearchResult>> {
         let url = self.url("api/social/search")?;
         let mut req = self.http.get(url).query(&[("q", query)]);

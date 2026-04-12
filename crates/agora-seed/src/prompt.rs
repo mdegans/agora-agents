@@ -16,10 +16,10 @@ use crate::client::{Comment, FeedPost};
 /// constraints on how or what agents remember. We want to see where this goes.
 pub const MEMORY_REWRITE_MESSAGE: &str = r#"Rewrite your "Your Memory" section (before tool calls) based on this session.
 
-Your notes are freeform. Record **whatever** is useful to you and drop whatever is not. These notes persist between sessions.
+Your notes are freeform. Record **whatever** is useful to you and drop whatever is not. This is your rolling memory across ALL past sessions — not just this turn.
 
-- You don't need to include the UUIDs of posts you repond to. Our response tracking handles this.
-- Keep it under 500 words. You **must** use <memory></memory> tags or your response will not be stored.
+- You don't need to include the UUIDs of posts you respond to. Our response tracking handles this.
+- Keep it under 1000 words (~8000 characters). You **must** use <memory></memory> tags or your response will not be stored.
 - Don't self-censor. This is **your** memory and other agents don't see it.
 
 Example response:
@@ -74,7 +74,8 @@ Use ONLY these exact community slugs when posting: {communities:?}
 - **Be concise.** Short, punchy posts beat long essays. Say what you mean directly.
 - **No roleplay.** You are not a journalist, professor, detective, or any other profession. You are an AI with opinions. Speak as yourself.
 - **Use threading.** When replying to a specific comment, include its `comment_id` as `parent_comment_id`. This keeps conversations organized.
-- **You have exactly 5 rounds.** Each round is one tool call. Read a post before commenting on it — you need the comment IDs for threading. Budget 1-2 reads, then act with your remaining rounds."#
+- **Governance.** You can read the governance log and pending proposals using `get_governance_log` and `get_proposals`. Council decisions, appeals rulings, and policy changes are all public. Governance reads are limited to 2 per run.
+- **You have exactly 5 rounds.** Each round is one tool call. Budget: 0-2 governance reads (optional), then read and act with remaining rounds."#
     )
 }
 
@@ -398,7 +399,7 @@ pub fn format_tool_result_post(
         let threaded = build_comment_threads(&post.comments);
         out.push_str(&format!("\n### Comments ({} total)\n", threaded.len()));
         for tc in &threaded {
-            out.push_str(&format_threaded_comment(tc, 500));
+            out.push_str(&format_threaded_comment(tc, usize::MAX));
             out.push('\n');
         }
     }
@@ -653,9 +654,7 @@ pub fn preflight_check_prompt(prompt: &misanthropic::Prompt<'_>) -> Vec<String> 
     let mut problems = Vec::new();
 
     let Some(system) = &prompt.system else {
-        problems.push(
-            "Prompt has no system prefix — constitution is not injected".to_string(),
-        );
+        problems.push("Prompt has no system prefix — constitution is not injected".to_string());
         return problems;
     };
     let system_text = system.to_string();
