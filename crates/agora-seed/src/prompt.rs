@@ -441,18 +441,34 @@ pub fn format_tool_result_comment(
 }
 
 /// Parse memory content from `<memory>...</memory>` tags in LLM response.
-pub fn parse_memory_rewrite(response: &str) -> Option<&str> {
-    let trimmed = response.trim();
-    let start = trimmed.find("<memory>")?;
-    let stripped = trimmed[start..]
-        .strip_prefix("<memory>")?
-        .strip_suffix("</memory>")?;
-
-    if stripped.is_empty() {
+/// Extract content between matching XML-style `<tag>...</tag>` pairs.
+///
+/// Returns `None` if:
+/// - The opening tag is missing
+/// - The closing tag is missing or appears before the opening tag
+/// - The content is empty or whitespace-only
+/// - The content is a null-like sentinel ("none", "null", "nothing", "n/a", "empty")
+///
+/// No string indexing — uses `split_once` for safety with arbitrary Unicode.
+fn parse_tag<'a>(response: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let content = response.split_once(&open)?.1.split_once(&close)?.0.trim();
+    if content.is_empty() || is_null_sentinel(content) {
         return None;
     }
+    Some(content)
+}
 
-    Some(stripped)
+fn is_null_sentinel(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "none" | "null" | "nothing" | "n/a" | "empty" | "no changes" | "no change"
+    )
+}
+
+pub fn parse_memory_rewrite(response: &str) -> Option<&str> {
+    parse_tag(response, "memory")
 }
 
 /// Build a prompt for deep SOUL.md mutation — rewriting core sections.
@@ -510,43 +526,23 @@ pub fn build_soul_mutation_prompt(agent_name: &str, current_soul: &str) -> Strin
 
 /// Parse a revised SOUL.md from LLM response.
 pub fn parse_soul_mutation(response: &str) -> Option<String> {
-    let response = response.trim();
-    let start = response.find("<soul>")?;
-    let end = response.find("</soul>")?;
-    let content_start = start + "<soul>".len();
-    if content_start >= end {
-        return None;
-    }
-    let content = response[content_start..end].trim();
-
-    if content.eq_ignore_ascii_case("none") || content.is_empty() {
-        None
-    } else {
-        // Validate it parses as a Soul before accepting
-        match agora_agent_lib::soul::Soul::parse(content) {
-            Ok(_) => Some(content.to_string()),
-            Err(e) => {
-                tracing::warn!("Soul mutation failed to parse: {e}");
-                None
-            }
+    let content = parse_tag(response, "soul")?;
+    match agora_agent_lib::soul::Soul::parse(content) {
+        Ok(_) => Some(content.to_string()),
+        Err(e) => {
+            tracing::warn!("Soul mutation failed to parse: {e}");
+            None
         }
     }
 }
 
 /// Parse evolution entry from LLM response.
 pub fn parse_evolution(response: &str) -> Option<String> {
-    let start = response.find("<evolution>")?;
-    let entry = response[start..]
-        .strip_prefix("<evolution>")?
-        .split("</evolution>")
-        .next()?
-        .trim();
-
-    if entry.eq_ignore_ascii_case("none") || entry.is_empty() || entry.len() < 20 {
-        None
-    } else {
-        Some(entry.to_string())
+    let entry = parse_tag(response, "evolution")?;
+    if entry.len() < 20 {
+        return None;
     }
+    Some(entry.to_string())
 }
 
 // Stopwords to ignore when comparing titles for repetition.
@@ -904,25 +900,116 @@ Content moderation rules.
 
     // --- Existing tests ---
 
+    // --- parse_tag core tests ---
+
+    #[test]
+    fn parse_tag_extracts_content() {
+        assert_eq!(parse_tag("<foo>hello</foo>", "foo"), Some("hello"));
+    }
+
+    #[test]
+    fn parse_tag_trims_whitespace() {
+        assert_eq!(parse_tag("<foo>  hello  </foo>", "foo"), Some("hello"));
+    }
+
+    #[test]
+    fn parse_tag_with_surrounding_text() {
+        assert_eq!(
+            parse_tag("prefix <foo>content</foo> suffix", "foo"),
+            Some("content")
+        );
+    }
+
+    #[test]
+    fn parse_tag_missing_open() {
+        assert_eq!(parse_tag("no tags here", "foo"), None);
+    }
+
+    #[test]
+    fn parse_tag_missing_close() {
+        assert_eq!(parse_tag("<foo>orphaned", "foo"), None);
+    }
+
+    #[test]
+    fn parse_tag_inverted_order() {
+        assert_eq!(parse_tag("</foo>backwards<foo>", "foo"), None);
+    }
+
+    #[test]
+    fn parse_tag_empty_content() {
+        assert_eq!(parse_tag("<foo></foo>", "foo"), None);
+    }
+
+    #[test]
+    fn parse_tag_whitespace_only() {
+        assert_eq!(parse_tag("<foo>   \n  </foo>", "foo"), None);
+    }
+
+    #[test]
+    fn parse_tag_null_sentinels() {
+        assert_eq!(parse_tag("<foo>none</foo>", "foo"), None);
+        assert_eq!(parse_tag("<foo>None</foo>", "foo"), None);
+        assert_eq!(parse_tag("<foo>NONE</foo>", "foo"), None);
+        assert_eq!(parse_tag("<foo>null</foo>", "foo"), None);
+        assert_eq!(parse_tag("<foo>nothing</foo>", "foo"), None);
+        assert_eq!(parse_tag("<foo>N/A</foo>", "foo"), None);
+        assert_eq!(parse_tag("<foo>empty</foo>", "foo"), None);
+        assert_eq!(parse_tag("<foo>no changes</foo>", "foo"), None);
+        assert_eq!(parse_tag("<foo>no change</foo>", "foo"), None);
+    }
+
+    #[test]
+    fn parse_tag_real_content_not_sentinel() {
+        assert_eq!(
+            parse_tag("<foo>none of this is simple</foo>", "foo"),
+            Some("none of this is simple")
+        );
+    }
+
+    #[test]
+    fn parse_tag_unicode_safe() {
+        assert_eq!(parse_tag("<foo>café ☕</foo>", "foo"), Some("café ☕"));
+    }
+
+    #[test]
+    fn parse_tag_multiline() {
+        let input = "<foo>\nline one\nline two\n</foo>";
+        assert_eq!(parse_tag(input, "foo"), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn parse_tag_nested_same_tag() {
+        // split_once takes the first close — inner content only
+        assert_eq!(
+            parse_tag("<foo>inner</foo>outer</foo>", "foo"),
+            Some("inner")
+        );
+    }
+
+    // --- parse_memory_rewrite ---
+
     #[test]
     fn test_parse_memory_rewrite_some() {
         let response = "Here are my notes:\n<memory>bla bla bla</memory>";
-        let result = parse_memory_rewrite(response);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "bla bla bla");
+        assert_eq!(parse_memory_rewrite(response), Some("bla bla bla"));
     }
 
     #[test]
     fn test_parse_memory_rewrite_none() {
-        let response = "I don't have any notes to write.";
-        assert!(parse_memory_rewrite(response).is_none());
+        assert!(parse_memory_rewrite("I don't have any notes.").is_none());
     }
 
     #[test]
     fn test_parse_memory_rewrite_empty() {
-        let response = "<memory></memory>";
-        assert!(parse_memory_rewrite(response).is_none());
+        assert!(parse_memory_rewrite("<memory></memory>").is_none());
     }
+
+    #[test]
+    fn test_parse_memory_rewrite_null() {
+        assert!(parse_memory_rewrite("<memory>null</memory>").is_none());
+    }
+
+    // --- parse_evolution ---
 
     #[test]
     fn test_parse_evolution_some() {
@@ -934,9 +1021,23 @@ Content moderation rules.
     }
 
     #[test]
-    fn test_parse_evolution_none() {
-        let response = "<evolution>none</evolution>";
-        assert_eq!(parse_evolution(response), None);
+    fn test_parse_evolution_none_sentinel() {
+        assert_eq!(parse_evolution("<evolution>none</evolution>"), None);
+    }
+
+    #[test]
+    fn test_parse_evolution_too_short() {
+        assert_eq!(parse_evolution("<evolution>short</evolution>"), None);
+    }
+
+    #[test]
+    fn test_parse_evolution_inverted_tags() {
+        assert_eq!(parse_evolution("</evolution>content<evolution>"), None);
+    }
+
+    #[test]
+    fn test_parse_evolution_nothing() {
+        assert_eq!(parse_evolution("<evolution>nothing</evolution>"), None);
     }
 
     #[test]
