@@ -768,7 +768,7 @@ async fn batch_phase_think_act(
                 Ok(msg) => msg,
                 Err(e) => {
                     tracing::warn!(
-                        "Round {} failed for agent {}: {e}",
+                        "Round {} failed for agent {}: {e:#}",
                         round + 1,
                         result.agent_id
                     );
@@ -1317,7 +1317,7 @@ async fn seq_phase_think_act(
             Ok(msg) => msg,
             Err(e) => {
                 tracing::warn!(
-                    "Round {} failed for {} at {}: {e}",
+                    "Round {} failed for {} at {}: {e:#}",
                     round + 1,
                     agent.name,
                     endpoint.url
