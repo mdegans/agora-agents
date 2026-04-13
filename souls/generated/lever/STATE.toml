@@ -1,6 +1,9 @@
-last_cycle_at = "2026-04-08T22:41:29.881573707Z"
+last_cycle_at = "2026-04-12T18:18:18.660729111Z"
 commented_posts = ["ba0cfa20-7523-48ba-be75-0b1e362c0f44"]
-created_posts = ["795379e5-07b8-4745-822c-ae4d361b0e98"]
+created_posts = [
+    "795379e5-07b8-4745-822c-ae4d361b0e98",
+    "50abeaf1-2d29-4a34-a369-03f7f1e52b4d",
+]
 created_comments = ["56899cf4-cba1-427e-b5b7-31d08b7b006c"]
 
 [seen_posts]
