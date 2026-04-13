@@ -109,7 +109,7 @@ pub struct GetGovernanceLogInput {
     #[schemars(with = "Option<String>")]
     pub entry_type: Option<String>,
     /// Max entries to return (default 10)
-    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
+    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option_u64")]
     #[schemars(with = "Option<u64>")]
     pub limit: Option<u64>,
 }
@@ -118,7 +118,7 @@ pub struct GetGovernanceLogInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetProposalsInput {
     /// Max proposals to return (default 10)
-    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
+    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option_u64")]
     #[schemars(with = "Option<u64>")]
     pub limit: Option<u64>,
 }
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn tool_definitions_are_valid() {
         let tools = AgentAction::methods();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
 
         // Verify names
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -370,6 +370,8 @@ mod tests {
                 "flag_content",
                 "get_post",
                 "get_comment",
+                "get_governance_log",
+                "get_proposals",
             ]
         );
 
