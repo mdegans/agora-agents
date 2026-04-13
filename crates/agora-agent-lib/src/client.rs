@@ -19,7 +19,7 @@ pub type Community = CommunityResponse;
 // Re-export types that are used as-is with their agentkit names.
 pub use agora_agentkit::responses::{
     CommunityTag, ContentResponse, IdResponse, PostWithCommentsResponse, RegisterAgentResponse,
-    SearchResult, TokenResponse,
+    TokenResponse,
 };
 
 /// Full post with comments — wraps `PostWithCommentsResponse` to provide
@@ -351,7 +351,7 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn search(&self, query: &str, community: Option<&str>) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, query: &str, community: Option<&str>) -> Result<Vec<PostResponse>> {
         let url = self.url("api/social/search")?;
         let mut req = self.http.get(url).query(&[("q", query)]);
 

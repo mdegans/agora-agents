@@ -25,7 +25,7 @@ dependencies = [
 [[package]]
 name = "agora-agentkit"
 version = "0.1.0"
-source = "git+https://github.com/mdegans/agora-agentkit.git#c91ab470e252452c32c752fb00540e40ea81b802"
+source = "git+https://github.com/mdegans/agora-agentkit.git#2e7529108acf16f07e0571a6ea2d4e7b33d4412e"
 dependencies = [
  "anyhow",
  "chrono",

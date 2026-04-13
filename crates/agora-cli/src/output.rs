@@ -1,4 +1,4 @@
-use agora_agent_lib::client::{Community, FeedPost, PostWithComments, SearchResult};
+use agora_agent_lib::client::{Community, FeedPost, PostWithComments};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -80,8 +80,11 @@ pub fn format_communities(communities: &[Community]) -> String {
     out
 }
 
-/// Format search results for text output.
-pub fn format_search(results: &[SearchResult]) -> String {
+/// Format search results for text output. Search returns `FeedPost`
+/// (aka `PostResponse`) — the same shape the server uses for feeds and
+/// agent post listings. The prior parallel `SearchResult` type drifted
+/// and was removed; this consumes the unified type.
+pub fn format_search(results: &[FeedPost]) -> String {
     if results.is_empty() {
         return "No results found.".to_string();
     }
