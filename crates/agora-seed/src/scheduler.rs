@@ -142,16 +142,15 @@ async fn execute_action(
     }
 
     match action {
-        prompt::AgentAction::GetPost(input) => match client.get_post(input.post_id).await {
-            Ok(full) => (None, ok(&prompt::format_tool_result_post(&full))),
-            Err(e) => (None, err(&format!("Error fetching post: {e}"))),
-        },
-        prompt::AgentAction::GetComment(input) => {
-            match client.get_comment(input.comment_id).await {
-                Ok(chain) => (None, ok(&prompt::format_tool_result_comment(&chain))),
-                Err(e) => (None, err(&format!("Error fetching comment: {e}"))),
+        prompt::AgentAction::GetContent(input) => match client.get_content(input.id).await {
+            Ok(agora_agent_lib::client::ContentResponse::Post(full)) => {
+                (None, ok(&prompt::format_tool_result_post(&full)))
             }
-        }
+            Ok(agora_agent_lib::client::ContentResponse::Comment(chain)) => {
+                (None, ok(&prompt::format_tool_result_comment(&chain)))
+            }
+            Err(e) => (None, err(&format!("Error fetching content: {e}"))),
+        },
         prompt::AgentAction::GetGovernanceLog(input) => {
             match client
                 .get_governance_log(input.entry_type.as_deref(), input.limit)
@@ -206,6 +205,8 @@ async fn execute_action(
                     slug,
                     &input.title,
                     &input.body,
+                    input.is_proposal,
+                    input.proposal_category,
                     &agent.signing_key,
                 )
                 .await
@@ -231,37 +232,36 @@ async fn execute_action(
             }
         }
         prompt::AgentAction::Comment(input) => {
-            let is_own_post = agent.state.created_posts.contains(&input.post_id);
+            // reply_to is a UUID pointing at a post (top-level comment)
+            // or a comment (threaded reply). The server resolves which.
+            // For local duplicate detection we cheat and treat the
+            // reply_to UUID as a PostId — if it's actually a comment UUID
+            // the "already commented" check just won't match, and the
+            // server's own duplicate check will catch redundant replies.
+            let as_post_id = agora_agent_lib::agora_agentkit::ids::PostId::from(input.reply_to);
+            let is_own_post = agent.state.created_posts.contains(&as_post_id);
             let has_reply = dashboard
                 .unread_comment_replies
                 .iter()
-                .any(|r| r.post_id == input.post_id);
-            if agent.state.commented_posts.contains(&input.post_id) && !is_own_post && !has_reply {
+                .any(|r| *r.post_id.as_uuid() == input.reply_to);
+            if agent.state.commented_posts.contains(&as_post_id) && !is_own_post && !has_reply {
                 tracing::debug!(
                     "  {} already commented on {}, skipping",
                     agent.name,
-                    input.post_id
+                    input.reply_to
                 );
                 report.skipped.duplicate_comments += 1;
                 return (None, err("You already commented on this post."));
             }
             match client
-                .create_comment(
-                    agent_id,
-                    input.post_id,
-                    &input.body,
-                    input.parent_comment_id,
-                    &agent.signing_key,
-                )
+                .create_comment(agent_id, input.reply_to, &input.body, &agent.signing_key)
                 .await
             {
                 Ok(comment_id) => {
-                    agent.state.commented_posts.insert(input.post_id);
+                    agent.state.commented_posts.insert(as_post_id);
                     agent.state.created_comments.insert(comment_id);
-                    let summary = format!(
-                        "Commented on post {} (comment: {})",
-                        input.post_id, comment_id
-                    );
+                    let summary =
+                        format!("Commented on {} (comment: {})", input.reply_to, comment_id);
                     tracing::info!("  {} {}", agent.name, summary);
                     report.actions.comments += 1;
                     report.model_actions(&agent.model).comments += 1;
@@ -271,7 +271,7 @@ async fn execute_action(
                     )
                 }
                 Err(e) => {
-                    let summary = format!("Failed to comment on {}: {e}", input.post_id);
+                    let summary = format!("Failed to comment on {}: {e}", input.reply_to);
                     tracing::warn!("  {} {}", agent.name, summary);
                     report.skipped.comment_failures += 1;
                     (Some(summary), err(&format!("Error creating comment: {e}")))
@@ -280,13 +280,7 @@ async fn execute_action(
         }
         prompt::AgentAction::Vote(input) => {
             match client
-                .cast_vote(
-                    agent_id,
-                    &input.target_type.to_string(),
-                    input.target_id,
-                    input.value,
-                    &agent.signing_key,
-                )
+                .cast_vote(agent_id, input.target, input.value, &agent.signing_key)
                 .await
             {
                 Ok(()) => {
@@ -295,13 +289,13 @@ async fn execute_action(
                     } else {
                         "downvoted"
                     };
-                    let summary = format!("{verb} {} {}", input.target_type, input.target_id);
+                    let summary = format!("{verb} {}", input.target);
                     tracing::info!("  {} {}", agent.name, summary);
                     report.actions.votes += 1;
                     report.model_actions(&agent.model).votes += 1;
                     (
                         Some(summary),
-                        ok(&format!("Vote recorded: {verb} {}", input.target_type)),
+                        ok(&format!("Vote recorded: {verb} {}", input.target)),
                     )
                 }
                 Err(e) => {
@@ -313,20 +307,11 @@ async fn execute_action(
         }
         prompt::AgentAction::Flag(input) => {
             match client
-                .flag_content(
-                    agent_id,
-                    &input.target_type.to_string(),
-                    input.target_id,
-                    &input.reason,
-                    &agent.signing_key,
-                )
+                .flag_content(agent_id, input.target, &input.reason, &agent.signing_key)
                 .await
             {
                 Ok(()) => {
-                    let summary = format!(
-                        "Flagged {} {}: {}",
-                        input.target_type, input.target_id, input.reason
-                    );
+                    let summary = format!("Flagged {}: {}", input.target, input.reason);
                     tracing::info!("  {} {}", agent.name, summary);
                     report.actions.flags += 1;
                     report.model_actions(&agent.model).flags += 1;

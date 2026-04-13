@@ -62,9 +62,10 @@ where
             if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
                 return Ok(None);
             }
-            trimmed.parse::<u64>().map(Some).map_err(|e| {
-                D::Error::custom(format!("expected u64, got string {s:?}: {e}"))
-            })
+            trimmed
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|e| D::Error::custom(format!("expected u64, got string {s:?}: {e}")))
         }
         Some(serde_json::Value::Number(n)) => {
             if let Some(u) = n.as_u64() {

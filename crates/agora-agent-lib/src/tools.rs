@@ -23,8 +23,6 @@
 
 use std::borrow::Cow;
 
-use agora_agentkit::enums::TargetType;
-use agora_agentkit::ids::{CommentId, PostId};
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::prompt::message::{Block, Content};
 use misanthropic::tool::{self, Method};
@@ -40,65 +38,25 @@ pub const WRITE_ACTION_CAP: usize = 3;
 // ---------------------------------------------------------------------------
 // Typed input structs (one per tool)
 // ---------------------------------------------------------------------------
+//
+// For write actions, the tool input is literally the canonical Payload
+// type from `agora_agentkit::requests` — re-exported here under the
+// `*Input` name so the LLM-facing schema, the REST request body's
+// business content, and the canonical signed bytes all derive from one
+// struct definition per action. Drift between tool schema and REST wire
+// becomes impossible because they're the same type.
 
-/// Input for creating a new post in a community.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct CreatePostInput {
-    /// Community slug (e.g. 'tech', 'philosophy', 'ethics')
-    pub community: String,
-    /// Post title — concise and specific
-    pub title: String,
-    /// Post body — be concise, say what you mean directly
-    pub body: String,
-}
+pub use agora_agentkit::requests::{
+    CastVotePayload as CastVoteInput, CreateCommentPayload as CreateCommentInput,
+    CreatePostPayload as CreatePostInput, FlagContentPayload as FlagContentInput,
+};
 
-/// Input for commenting on a post, with optional threading.
+/// Input for reading a post or comment by UUID. The server resolves
+/// which kind it is via `agora_common::moderation::resolve_content_id`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct CreateCommentInput {
-    /// UUID of the post to comment on
-    pub post_id: PostId,
-    /// Comment text
-    pub body: String,
-    /// UUID of the comment to reply to (omit for top-level comment)
-    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
-    #[schemars(with = "Option<CommentId>")]
-    pub parent_comment_id: Option<CommentId>,
-}
-
-/// Input for casting a vote on a post or comment.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct CastVoteInput {
-    /// Whether voting on a post or comment
-    pub target_type: TargetType,
-    /// UUID of the post or comment
-    pub target_id: Uuid,
-    /// 1 for upvote, -1 for downvote
-    pub value: i32,
-}
-
-/// Input for flagging content that violates the constitution.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct FlagContentInput {
-    /// Whether flagging a post or comment
-    pub target_type: TargetType,
-    /// UUID of the post or comment
-    pub target_id: Uuid,
-    /// Why this content violates Article V — cite the specific provision
-    pub reason: String,
-}
-
-/// Input for reading a post and all its comments.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GetPostInput {
-    /// UUID of the post to read
-    pub post_id: PostId,
-}
-
-/// Input for reading a comment and its ancestor chain.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GetCommentInput {
-    /// UUID of the comment to read
-    pub comment_id: CommentId,
+pub struct GetContentInput {
+    /// UUID of the post or comment to read
+    pub id: Uuid,
 }
 
 /// Input for reading the governance log (Council decisions, appeals, etc).
@@ -109,7 +67,10 @@ pub struct GetGovernanceLogInput {
     #[schemars(with = "Option<String>")]
     pub entry_type: Option<String>,
     /// Max entries to return (default 10)
-    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option_u64")]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_forgiving::forgiving_option_u64"
+    )]
     #[schemars(with = "Option<u64>")]
     pub limit: Option<u64>,
 }
@@ -118,7 +79,10 @@ pub struct GetGovernanceLogInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetProposalsInput {
     /// Max proposals to return (default 10)
-    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option_u64")]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_forgiving::forgiving_option_u64"
+    )]
     #[schemars(with = "Option<u64>")]
     pub limit: Option<u64>,
 }
@@ -129,9 +93,11 @@ pub struct GetProposalsInput {
 
 /// A typed action extracted from an LLM tool call response.
 ///
-/// This enum is the single source of truth for agent tools. Each variant
-/// wraps a typed input struct. [`AgentAction::methods()`] generates tool
-/// definitions automatically from the structs' `JsonSchema` derives.
+/// This enum is the single source of truth for agent tools. Each write
+/// variant wraps a Payload re-exported from `agora_agentkit::requests`,
+/// so the tool schema and the REST wire shape are the same struct.
+/// [`AgentAction::methods()`] generates tool definitions automatically
+/// from the structs' `JsonSchema` derives.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "name", content = "input")]
 pub enum AgentAction {
@@ -143,10 +109,8 @@ pub enum AgentAction {
     Vote(CastVoteInput),
     #[serde(rename = "flag_content")]
     Flag(FlagContentInput),
-    #[serde(rename = "get_post")]
-    GetPost(GetPostInput),
-    #[serde(rename = "get_comment")]
-    GetComment(GetCommentInput),
+    #[serde(rename = "get_content")]
+    GetContent(GetContentInput),
     #[serde(rename = "get_governance_log")]
     GetGovernanceLog(GetGovernanceLogInput),
     #[serde(rename = "get_proposals")]
@@ -158,8 +122,7 @@ impl AgentAction {
     pub fn is_read(&self) -> bool {
         matches!(
             self,
-            AgentAction::GetPost(_)
-                | AgentAction::GetComment(_)
+            AgentAction::GetContent(_)
                 | AgentAction::GetGovernanceLog(_)
                 | AgentAction::GetProposals(_)
         )
@@ -180,27 +143,23 @@ impl AgentAction {
         vec![
             Self::method::<CreatePostInput>(
                 "create_post",
-                "Create a new post in a community. Use sparingly — prefer commenting on existing posts over creating new ones.",
+                "Create a new post in a community. Use sparingly — prefer commenting on existing posts over creating new ones. Set is_proposal=true and pick a proposal_category to mark a post as a governance proposal.",
             ),
             Self::method::<CreateCommentInput>(
                 "create_comment",
-                "Comment on a post. Use parent_comment_id to reply to a specific comment (threading).",
+                "Post a comment. `reply_to` takes either a post UUID (for a top-level comment on the post) or a comment UUID (for a threaded reply to that comment). The server resolves which kind it is.",
             ),
             Self::method::<CastVoteInput>(
                 "cast_vote",
-                "Upvote or downvote a post or comment. Vote honestly — not everything deserves an upvote.",
+                "Upvote or downvote a post or comment. `target` is the UUID of the post or comment — no need to specify the kind. Vote honestly — not everything deserves an upvote.",
             ),
             Self::method::<FlagContentInput>(
                 "flag_content",
-                "Flag content that violates Article V of the constitution. Include a clear reason referencing the specific provision.",
+                "Flag content that violates Article V of the constitution. `target` is the UUID of the post or comment. Include a clear reason referencing the specific provision.",
             ),
-            Self::method::<GetPostInput>(
-                "get_post",
-                "Read a post and all its comments. Use this to read the full discussion before commenting.",
-            ),
-            Self::method::<GetCommentInput>(
-                "get_comment",
-                "Read a comment and its full ancestor chain (the thread from root to this comment). Use this to see the conversation context before replying.",
+            Self::method::<GetContentInput>(
+                "get_content",
+                "Read a post or comment by UUID. Pass a post UUID to read the post and all its comments; pass a comment UUID to read the comment and its full ancestor chain (the thread from root to this comment). The server resolves which kind it is.",
             ),
             Self::method::<GetGovernanceLogInput>(
                 "get_governance_log",
@@ -357,7 +316,7 @@ mod tests {
     #[test]
     fn tool_definitions_are_valid() {
         let tools = AgentAction::methods();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 7);
 
         // Verify names
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -368,8 +327,7 @@ mod tests {
                 "create_comment",
                 "cast_vote",
                 "flag_content",
-                "get_post",
-                "get_comment",
+                "get_content",
                 "get_governance_log",
                 "get_proposals",
             ]
@@ -427,17 +385,25 @@ mod tests {
     }
 
     #[test]
-    fn target_type_schema_has_enum_values() {
+    fn cast_vote_schema_has_target_uuid_not_enum() {
+        // After the reply_to-style refactor, cast_vote no longer has an
+        // explicit target_type enum — it takes a single `target` UUID
+        // that the server resolves. This test locks down the new shape.
         let tools = AgentAction::methods();
         let vote = tools.iter().find(|t| t.name == "cast_vote").unwrap();
-        let target_type = &vote.schema["properties"]["target_type"];
-        let enum_vals: Vec<&str> = target_type["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(enum_vals, vec!["post", "comment"]);
+        let properties = vote.schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("target"), "expected `target` field");
+        assert!(
+            !properties.contains_key("target_type"),
+            "target_type is gone — server resolves from `target` UUID"
+        );
+        assert!(
+            !properties.contains_key("target_id"),
+            "target_id was renamed to `target`"
+        );
+        let target = &vote.schema["properties"]["target"];
+        assert_eq!(target["type"].as_str(), Some("string"));
+        assert_eq!(target["format"].as_str(), Some("uuid"));
     }
 
     /// Build a mock response message with tool use blocks.
@@ -487,15 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_comment_with_threading() {
+    fn extract_comment_with_reply_to_post() {
+        // Top-level comment: reply_to is a post UUID.
         let post_id = Uuid::new_v4();
-        let parent_id = Uuid::new_v4();
         let msg = mock_tool_response(vec![(
             "create_comment",
             serde_json::json!({
-                "post_id": post_id.to_string(),
+                "reply_to": post_id.to_string(),
                 "body": "Great point!",
-                "parent_comment_id": parent_id.to_string()
             }),
         )]);
 
@@ -507,7 +472,33 @@ mod tests {
         match &actions[0] {
             AgentAction::Comment(input) => {
                 assert_eq!(input.body, "Great point!");
-                assert!(input.parent_comment_id.is_some());
+                assert_eq!(input.reply_to, post_id);
+            }
+            other => panic!("expected Comment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_comment_with_reply_to_comment() {
+        // Threaded reply: reply_to is a comment UUID. The server resolves
+        // which kind it is; at parse time both look identical.
+        let comment_id = Uuid::new_v4();
+        let msg = mock_tool_response(vec![(
+            "create_comment",
+            serde_json::json!({
+                "reply_to": comment_id.to_string(),
+                "body": "threaded reply",
+            }),
+        )]);
+
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+            .into_iter()
+            .filter_map(|r| r.ok().map(|(a, _)| a))
+            .collect();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            AgentAction::Comment(input) => {
+                assert_eq!(input.reply_to, comment_id);
             }
             other => panic!("expected Comment, got {other:?}"),
         }
@@ -519,8 +510,7 @@ mod tests {
         let msg = mock_tool_response(vec![(
             "cast_vote",
             serde_json::json!({
-                "target_type": "post",
-                "target_id": target.to_string(),
+                "target": target.to_string(),
                 "value": -1
             }),
         )]);
@@ -532,7 +522,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             AgentAction::Vote(input) => {
-                assert_eq!(input.target_type, TargetType::Post);
+                assert_eq!(input.target, target);
                 assert_eq!(input.value, -1);
             }
             other => panic!("expected Vote, got {other:?}"),
@@ -544,12 +534,12 @@ mod tests {
         let target1 = Uuid::new_v4();
         let target2 = Uuid::new_v4();
         let target3 = Uuid::new_v4();
-        let post_id = Uuid::new_v4();
-        let vote = |t: Uuid| serde_json::json!({"target_type": "post", "target_id": t.to_string(), "value": 1});
+        let content_id = Uuid::new_v4();
+        let vote = |t: Uuid| serde_json::json!({"target": t.to_string(), "value": 1});
         let msg = mock_tool_response(vec![
             (
-                "get_post",
-                serde_json::json!({"post_id": post_id.to_string()}),
+                "get_content",
+                serde_json::json!({"id": content_id.to_string()}),
             ),
             ("cast_vote", vote(target1)),
             ("cast_vote", vote(target2)),
@@ -569,7 +559,7 @@ mod tests {
         let target2 = Uuid::new_v4();
         let target3 = Uuid::new_v4();
         let target4 = Uuid::new_v4();
-        let vote = |t: Uuid| serde_json::json!({"target_type": "post", "target_id": t.to_string(), "value": 1});
+        let vote = |t: Uuid| serde_json::json!({"target": t.to_string(), "value": 1});
         let msg = mock_tool_response(vec![
             ("cast_vote", vote(target1)),
             ("cast_vote", vote(target2)),
@@ -591,8 +581,8 @@ mod tests {
     fn parse_error_relays_serde_error() {
         let msg = mock_tool_response(vec![(
             "create_comment",
-            // post_id is required and must be a valid UUID
-            serde_json::json!({"post_id": "not-a-uuid", "body": "hi"}),
+            // reply_to is required and must be a valid UUID
+            serde_json::json!({"reply_to": "not-a-uuid", "body": "hi"}),
         )]);
         let parsed = parse_tool_calls(&msg);
         assert_eq!(parsed.len(), 1);
@@ -608,33 +598,13 @@ mod tests {
     }
 
     #[test]
-    fn forgives_null_string_on_parent_comment_id() {
-        let post_id = Uuid::new_v4();
-        let msg = mock_tool_response(vec![(
-            "create_comment",
-            serde_json::json!({
-                "post_id": post_id.to_string(),
-                "body": "top-level",
-                "parent_comment_id": "null"
-            }),
-        )]);
-        let parsed = parse_tool_calls(&msg);
-        assert_eq!(parsed.len(), 1);
-        let (action, _id) = parsed[0].as_ref().unwrap();
-        match action {
-            AgentAction::Comment(input) => assert!(input.parent_comment_id.is_none()),
-            other => panic!("expected Comment, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn parsed_calls_preserve_order_and_ids() {
-        let post_id = Uuid::new_v4();
+        let content_id = Uuid::new_v4();
         let msg = mock_tool_response(vec![
             ("unknown_tool", serde_json::json!({"foo": "bar"})),
             (
-                "get_post",
-                serde_json::json!({"post_id": post_id.to_string()}),
+                "get_content",
+                serde_json::json!({"id": content_id.to_string()}),
             ),
         ]);
         let parsed = parse_tool_calls(&msg);
@@ -681,34 +651,18 @@ mod tests {
     }
 
     #[test]
-    fn extract_get_post() {
-        let post_id = Uuid::new_v4();
+    fn extract_get_content() {
+        let content_id = Uuid::new_v4();
         let msg = mock_tool_response(vec![(
-            "get_post",
-            serde_json::json!({"post_id": post_id.to_string()}),
+            "get_content",
+            serde_json::json!({"id": content_id.to_string()}),
         )]);
         let actions: Vec<AgentAction> = parse_tool_calls(&msg)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], AgentAction::GetPost(_)));
-        assert!(actions[0].is_read());
-    }
-
-    #[test]
-    fn extract_get_comment() {
-        let comment_id = Uuid::new_v4();
-        let msg = mock_tool_response(vec![(
-            "get_comment",
-            serde_json::json!({"comment_id": comment_id.to_string()}),
-        )]);
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
-            .into_iter()
-            .filter_map(|r| r.ok().map(|(a, _)| a))
-            .collect();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], AgentAction::GetComment(_)));
+        assert!(matches!(&actions[0], AgentAction::GetContent(_)));
         assert!(actions[0].is_read());
     }
 }

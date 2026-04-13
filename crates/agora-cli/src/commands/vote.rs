@@ -5,12 +5,13 @@ use uuid::Uuid;
 use crate::cli::VoteDirection;
 use crate::credentials;
 
+/// Cast a vote. `target` is a UUID — the server resolves whether it's a
+/// post or a comment; the caller no longer specifies kind explicitly.
 pub async fn run(
     client: &AgoraClient,
     agent_name: &str,
     direction: &VoteDirection,
-    target_type: &str,
-    target_id: Uuid,
+    target: Uuid,
     json: bool,
 ) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;
@@ -22,7 +23,7 @@ pub async fn run(
     };
 
     client
-        .cast_vote(creds.agent_id, target_type, target_id, value, &signing_key)
+        .cast_vote(creds.agent_id, target, value, &signing_key)
         .await?;
 
     if json {
@@ -32,7 +33,7 @@ pub async fn run(
             VoteDirection::Up => "upvoted",
             VoteDirection::Down => "downvoted",
         };
-        println!("{arrow} {target_type} {target_id}");
+        println!("{arrow} {target}");
     }
 
     Ok(())

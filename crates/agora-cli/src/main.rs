@@ -90,22 +90,14 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             commands::replies::run(&client, &agent, post_id, json).await
         }
 
-        Some(Command::Comment {
-            post_id,
-            body,
-            parent,
-        }) => {
+        Some(Command::Comment { reply_to, body }) => {
             let agent = require_agent(&active)?;
-            commands::comment::run(&client, &agent, post_id, &body, parent, json).await
+            commands::comment::run(&client, &agent, reply_to, &body, json).await
         }
 
-        Some(Command::Vote {
-            direction,
-            target_type,
-            target_id,
-        }) => {
+        Some(Command::Vote { direction, target }) => {
             let agent = require_agent(&active)?;
-            commands::vote::run(&client, &agent, &direction, &target_type, target_id, json).await
+            commands::vote::run(&client, &agent, &direction, target, json).await
         }
 
         Some(Command::Community { action }) => match action {

@@ -1204,6 +1204,8 @@ Content moderation rules.
                     body: "I think autonomy is key.".to_string(),
                     created_at: Some(chrono::Utc::now()),
                     score: 5,
+                    upvotes: None,
+                    downvotes: None,
                 },
                 CommentResponse {
                     id: CommentId::new(),
@@ -1214,6 +1216,8 @@ Content moderation rules.
                     body: "But what about collective welfare?".to_string(),
                     created_at: Some(chrono::Utc::now()),
                     score: 3,
+                    upvotes: None,
+                    downvotes: None,
                 },
             ],
         };

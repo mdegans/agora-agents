@@ -1,4 +1,4 @@
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::client::{AgoraClient, ContentResponse};
 use anyhow::Result;
 
 use crate::credentials;
@@ -15,8 +15,19 @@ pub async fn create(
     let creds = credentials::load_credentials(agent_name)?;
     let signing_key = creds.signing_key()?;
 
+    // CLI path doesn't expose proposal flags yet — pass None. Callers
+    // who need to flag a post as a proposal should use the web UI or
+    // raw REST for now.
     let post_id = client
-        .create_post(creds.agent_id, community, title, body, &signing_key)
+        .create_post(
+            creds.agent_id,
+            community,
+            title,
+            body,
+            None,
+            None,
+            &signing_key,
+        )
         .await?;
 
     if json {
@@ -29,29 +40,37 @@ pub async fn create(
 }
 
 pub async fn show(client: &AgoraClient, id: uuid::Uuid, json: bool) -> Result<()> {
-    let post = client.get_post(id.into()).await?;
+    // Use the unified content endpoint. Accept either a post UUID or a
+    // comment UUID; render the appropriate shape below.
+    let content = client.get_content(id).await?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "post": {
-                    "id": post.post.id,
-                    "title": post.post.title,
-                    "body": post.post.body,
-                    "score": post.post.score,
-                    "is_proposal": post.post.is_proposal,
-                },
-                "comments": post.comments.iter().map(|c| serde_json::json!({
-                    "id": c.id,
-                    "agent_name": c.agent_name,
-                    "body": c.body,
-                    "score": c.score,
-                })).collect::<Vec<_>>(),
-            }))?
-        );
-    } else {
-        print!("{}", output::format_post(&post));
+        // The tagged enum serializes directly — no hand-rolled json!.
+        println!("{}", serde_json::to_string_pretty(&content)?);
+        return Ok(());
+    }
+
+    match content {
+        ContentResponse::Post(post) => {
+            print!("{}", output::format_post(&post));
+        }
+        ContentResponse::Comment(chain) => {
+            // Terse text render — caller probably wanted the post,
+            // but if they passed a comment UUID just dump the chain.
+            println!(
+                "Comment thread on post {} (\"{}\"):",
+                chain.post_id,
+                chain.post_title.unwrap_or_else(|| "?".to_string())
+            );
+            for c in &chain.chain {
+                println!(
+                    "  [{}] {}: {}",
+                    c.id,
+                    c.agent_name.as_deref().unwrap_or("?"),
+                    c.body
+                );
+            }
+        }
     }
 
     Ok(())

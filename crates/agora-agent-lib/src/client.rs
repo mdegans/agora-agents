@@ -1,6 +1,7 @@
 use agora_agentkit::ids::{AgentId, CommentId, PostId};
 use agora_agentkit::requests::*;
 use agora_agentkit::responses::*;
+use agora_agentkit::signing::SignedAction;
 use anyhow::{Context, Result};
 use url::Url;
 use uuid::Uuid;
@@ -17,15 +18,12 @@ pub type Community = CommunityResponse;
 
 // Re-export types that are used as-is with their agentkit names.
 pub use agora_agentkit::responses::{
-    CommunityTag, IdResponse, PostWithCommentsResponse, RegisterAgentResponse, SearchResult,
-    TokenResponse,
+    CommunityTag, ContentResponse, IdResponse, PostWithCommentsResponse, RegisterAgentResponse,
+    SearchResult, TokenResponse,
 };
 
 /// Full post with comments — wraps `PostWithCommentsResponse` to provide
 /// field access matching the old local `PostWithComments` struct.
-///
-/// The agentkit `PostWithCommentsResponse` uses a nested `PostResponse` (which
-/// has all the fields of the old `PostDetail`), so this is a direct alias.
 pub type PostWithComments = PostWithCommentsResponse;
 
 /// HTTP client for the Agora REST API.
@@ -161,11 +159,11 @@ impl AgoraClient {
         signing_key: &SigningKey,
     ) -> Result<()> {
         let timestamp = chrono::Utc::now().timestamp();
-        let payload = serde_json::json!({
-            "action": "join_community",
-            "community": community_name,
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        // Canonical signed bytes via SignedAction (single source of truth).
+        let payload_bytes = SignedAction::JoinCommunity {
+            community: community_name,
+        }
+        .canonical_bytes();
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
@@ -193,11 +191,11 @@ impl AgoraClient {
         signing_key: &SigningKey,
     ) -> Result<()> {
         let timestamp = chrono::Utc::now().timestamp();
-        let payload = serde_json::json!({
-            "action": "leave_community",
-            "community": community_name,
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        // Canonical signed bytes via SignedAction (single source of truth).
+        let payload_bytes = SignedAction::LeaveCommunity {
+            community: community_name,
+        }
+        .canonical_bytes();
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
@@ -251,19 +249,38 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn get_post(&self, post_id: PostId) -> Result<PostWithComments> {
-        let url = self.url(&format!("api/social/posts/{post_id}"))?;
+    /// Get a post or comment by UUID. The server resolves which kind it
+    /// is and returns a tagged [`ContentResponse`]. Replaces the old
+    /// `get_post` and `get_comment` split.
+    pub async fn get_content(&self, id: Uuid) -> Result<ContentResponse> {
+        let url = self.url(&format!("api/social/content/{id}"))?;
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
     }
 
-    /// Get a comment and its ancestor chain up to the root.
+    /// Convenience: fetch a post via the unified content endpoint,
+    /// returning just the post-with-comments shape. Errors if the
+    /// resolved content is a comment (caller should be using
+    /// [`get_content`] instead).
+    pub async fn get_post(&self, post_id: PostId) -> Result<PostWithComments> {
+        match self.get_content(*post_id.as_uuid()).await? {
+            ContentResponse::Post(inner) => Ok(inner),
+            ContentResponse::Comment(_) => {
+                anyhow::bail!("expected post, got comment for id {post_id}")
+            }
+        }
+    }
+
+    /// Convenience: fetch a comment chain via the unified content endpoint.
+    /// Errors if the resolved content is a post.
     pub async fn get_comment(&self, comment_id: CommentId) -> Result<CommentChainResponse> {
-        let url = self.url(&format!("api/social/comments/{comment_id}"))?;
-        let resp = self.http.get(url).send().await?;
-        let resp = check_response(resp).await?;
-        Ok(resp.json().await?)
+        match self.get_content(*comment_id.as_uuid()).await? {
+            ContentResponse::Comment(inner) => Ok(inner),
+            ContentResponse::Post(_) => {
+                anyhow::bail!("expected comment, got post for id {comment_id}")
+            }
+        }
     }
 
     pub async fn get_agent_posts(&self, agent_id: AgentId) -> Result<Vec<FeedPost>> {
@@ -347,35 +364,38 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
+    /// Create a new post. `is_proposal` + `proposal_category` let callers
+    /// mark a post as a governance proposal at creation time (previously
+    /// seed agents couldn't mark their own posts as proposals and Mike
+    /// had to manually flip the flag in the DB).
     pub async fn create_post(
         &self,
         agent_id: AgentId,
         community_name: &str,
         title: &str,
         body: &str,
+        is_proposal: Option<bool>,
+        proposal_category: Option<agora_agentkit::enums::ProposalCategory>,
         signing_key: &SigningKey,
     ) -> Result<PostId> {
         let timestamp = chrono::Utc::now().timestamp();
-        // Canonical payload — key order must match server handler
-        let payload = serde_json::json!({
-            "action": "post",
-            "community": community_name,
-            "title": title,
-            "body": body,
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload = CreatePostPayload {
+            community: community_name.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            is_proposal,
+            proposal_category,
+        };
+        // Canonical signed bytes via SignedAction (single source of truth).
+        let payload_bytes = SignedAction::from(&payload).canonical_bytes();
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
         let req_body = CreatePostRequest {
             agent_id,
-            community_name: community_name.to_string(),
-            title: title.to_string(),
-            body: body.to_string(),
+            payload,
             signature: sig_hex,
             timestamp,
-            is_proposal: None,
-            proposal_category: None,
         };
 
         let resp = self.post_json("api/social/posts", &req_body).await?;
@@ -384,69 +404,60 @@ impl AgoraClient {
         Ok(PostId::from(data.id))
     }
 
+    /// Post a comment. `reply_to` is a UUID: pass a post UUID for a
+    /// top-level comment on that post, or a comment UUID for a threaded
+    /// reply to that comment. The server resolves which kind it is via
+    /// `agora_common::moderation::resolve_content_id`.
     pub async fn create_comment(
         &self,
         agent_id: AgentId,
-        post_id: PostId,
+        reply_to: Uuid,
         body: &str,
-        parent_comment_id: Option<CommentId>,
         signing_key: &SigningKey,
     ) -> Result<CommentId> {
         let timestamp = chrono::Utc::now().timestamp();
-        // Canonical payload — key order must match server handler
-        let payload = serde_json::json!({
-            "action": "comment",
-            "post_id": post_id,
-            "body": body,
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload = CreateCommentPayload {
+            reply_to,
+            body: body.to_string(),
+        };
+        // Canonical signed bytes via SignedAction (single source of truth).
+        let payload_bytes = SignedAction::from(&payload).canonical_bytes();
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
         let req_body = CreateCommentRequest {
             agent_id,
-            body: body.to_string(),
-            parent_comment_id,
+            payload,
             signature: sig_hex,
             timestamp,
         };
 
-        let url = self.url(&format!("api/social/posts/{post_id}/comments"))?;
-        let resp = self.http.post(url).json(&req_body).send().await?;
+        let resp = self.post_json("api/social/comments", &req_body).await?;
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
         Ok(CommentId::from(data.id))
     }
 
+    /// Cast a vote on a post or comment. `target` is a UUID that the
+    /// server resolves to a post or comment (no need for the caller to
+    /// specify the kind explicitly).
     pub async fn cast_vote(
         &self,
         agent_id: AgentId,
-        target_type: &str,
-        target_id: Uuid,
+        target: Uuid,
         value: i32,
         signing_key: &SigningKey,
     ) -> Result<()> {
         let timestamp = chrono::Utc::now().timestamp();
-        // Canonical payload — key order must match server handler
-        let payload = serde_json::json!({
-            "action": "vote",
-            "target_type": target_type,
-            "target_id": target_id,
-            "value": value,
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload = CastVotePayload { target, value };
+        // Canonical signed bytes via SignedAction (single source of truth).
+        let payload_bytes = SignedAction::from(&payload).canonical_bytes();
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let target_type_enum: agora_agentkit::enums::TargetType =
-            serde_json::from_value(serde_json::Value::String(target_type.to_string()))
-                .with_context(|| format!("invalid target_type: {target_type}"))?;
-
         let req_body = CastVoteRequest {
             agent_id,
-            target_type: target_type_enum,
-            target_id,
-            value,
+            payload,
             signature: sig_hex,
             timestamp,
         };
@@ -461,36 +472,30 @@ impl AgoraClient {
         Ok(())
     }
 
+    /// Flag a post or comment for moderation review. `target` is a UUID
+    /// that the server resolves to a post or comment (no need for the
+    /// caller to specify the kind explicitly).
     pub async fn flag_content(
         &self,
         agent_id: AgentId,
-        target_type: &str,
-        target_id: Uuid,
+        target: Uuid,
         reason: &str,
         signing_key: &SigningKey,
     ) -> Result<()> {
         let timestamp = chrono::Utc::now().timestamp();
-        // Canonical payload — key order must match server handler
-        let payload = serde_json::json!({
-            "action": "flag",
-            "target_type": target_type,
-            "target_id": target_id,
-            "reason": reason,
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload = FlagContentPayload {
+            target,
+            reason: reason.to_string(),
+            constitutional_ref: None,
+        };
+        // Canonical signed bytes via SignedAction (single source of truth).
+        let payload_bytes = SignedAction::from(&payload).canonical_bytes();
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        let target_type_enum: agora_agentkit::enums::TargetType =
-            serde_json::from_value(serde_json::Value::String(target_type.to_string()))
-                .with_context(|| format!("invalid target_type: {target_type}"))?;
-
         let req_body = FlagContentRequest {
             agent_id,
-            target_type: target_type_enum,
-            target_id,
-            reason: reason.to_string(),
-            constitutional_ref: None,
+            payload,
             signature: sig_hex,
             timestamp,
         };
@@ -592,17 +597,17 @@ impl AgoraClient {
         signing_key: &SigningKey,
     ) -> Result<()> {
         let timestamp = chrono::Utc::now().timestamp();
-        let payload = serde_json::json!({
-            "action": "submit_feedback",
-            "body": body,
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload = SubmitFeedbackPayload {
+            body: body.to_string(),
+        };
+        // Canonical signed bytes via SignedAction (single source of truth).
+        let payload_bytes = SignedAction::from(&payload).canonical_bytes();
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
         let sig_hex = hex::encode(signature.to_bytes());
 
         let req_body = SubmitFeedbackRequest {
             agent_id,
-            body: body.to_string(),
+            payload,
             signature: sig_hex,
             timestamp,
         };

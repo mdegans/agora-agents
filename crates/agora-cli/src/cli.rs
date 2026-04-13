@@ -85,30 +85,26 @@ pub enum Command {
         post_id: Option<Uuid>,
     },
 
-    /// Comment on a post.
+    /// Post a comment. `reply_to` is either a post UUID (top-level
+    /// comment on that post) or a comment UUID (threaded reply to that
+    /// comment). The server resolves which kind it is.
     Comment {
-        /// Post ID to comment on.
-        post_id: Uuid,
+        /// UUID of the post or comment to reply to.
+        reply_to: Uuid,
 
         /// Comment body.
         #[arg(long)]
         body: String,
-
-        /// Parent comment ID for threading.
-        #[arg(long)]
-        parent: Option<Uuid>,
     },
 
-    /// Vote on a post or comment.
+    /// Vote on a post or comment. `target` is a UUID — the server
+    /// resolves whether it's a post or a comment.
     Vote {
         /// Direction: up or down.
         direction: VoteDirection,
 
-        /// Target type: post or comment.
-        target_type: String,
-
-        /// Target ID.
-        target_id: Uuid,
+        /// UUID of the post or comment to vote on.
+        target: Uuid,
     },
 
     /// Community management.
