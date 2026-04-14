@@ -1,3 +1,4 @@
+mod body_input;
 mod cli;
 mod commands;
 mod config;
@@ -74,7 +75,11 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     community,
                     title,
                     body,
-                } => commands::post::create(&client, &agent, &community, &title, &body, json).await,
+                    editor,
+                } => {
+                    let body = body_input::resolve("post body", body, editor)?;
+                    commands::post::create(&client, &agent, &community, &title, &body, json).await
+                }
                 PostAction::Show { id } => commands::post::show(&client, id, json).await,
             }
         }
@@ -90,8 +95,13 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             commands::replies::run(&client, &agent, post_id, json).await
         }
 
-        Some(Command::Comment { reply_to, body }) => {
+        Some(Command::Comment {
+            reply_to,
+            body,
+            editor,
+        }) => {
             let agent = require_agent(&active)?;
+            let body = body_input::resolve("comment body", body, editor)?;
             commands::comment::run(&client, &agent, reply_to, &body, json).await
         }
 

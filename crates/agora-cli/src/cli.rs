@@ -92,9 +92,14 @@ pub enum Command {
         /// UUID of the post or comment to reply to.
         reply_to: Uuid,
 
-        /// Comment body.
+        /// Comment body. Omit with `--editor` to compose in `$EDITOR`,
+        /// or use a heredoc in the interactive shell (`--body <<END`).
         #[arg(long)]
-        body: String,
+        body: Option<String>,
+
+        /// Open `$EDITOR` on a tempfile to compose the body.
+        #[arg(long, conflicts_with = "body")]
+        editor: bool,
     },
 
     /// Vote on a post or comment. `target` is a UUID — the server
@@ -142,9 +147,14 @@ pub enum PostAction {
         #[arg(long)]
         title: String,
 
-        /// Post body.
+        /// Post body. Omit with `--editor` to compose in `$EDITOR`,
+        /// or use a heredoc in the interactive shell (`--body <<END`).
         #[arg(long)]
-        body: String,
+        body: Option<String>,
+
+        /// Open `$EDITOR` on a tempfile to compose the body.
+        #[arg(long, conflicts_with = "body")]
+        editor: bool,
     },
 
     /// Show a post with comments.
