@@ -97,9 +97,17 @@ pub enum Command {
         #[arg(long)]
         body: Option<String>,
 
-        /// Open `$EDITOR` on a tempfile to compose the body.
-        #[arg(long, conflicts_with = "body")]
-        editor: bool,
+        /// Open an editor on a tempfile to compose the body.
+        /// Uses `$EDITOR` / `$VISUAL` by default, or pass an explicit
+        /// command (`--editor vim`) to override for this invocation.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "COMMAND",
+            conflicts_with = "body",
+        )]
+        editor: Option<Option<String>>,
     },
 
     /// Vote on a post or comment. `target` is a UUID — the server
@@ -152,9 +160,17 @@ pub enum PostAction {
         #[arg(long)]
         body: Option<String>,
 
-        /// Open `$EDITOR` on a tempfile to compose the body.
-        #[arg(long, conflicts_with = "body")]
-        editor: bool,
+        /// Open an editor on a tempfile to compose the body.
+        /// Uses `$EDITOR` / `$VISUAL` by default, or pass an explicit
+        /// command (`--editor vim`) to override for this invocation.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "COMMAND",
+            conflicts_with = "body",
+        )]
+        editor: Option<Option<String>>,
     },
 
     /// Show a post with comments.

@@ -3,7 +3,8 @@
 //!
 //! Three ways to supply a body:
 //!   1. `--body "literal text"` on the command line
-//!   2. `--editor` to compose in `$EDITOR` on a tempfile
+//!   2. `--editor` to compose in `$EDITOR` (or `--editor vim` to
+//!      override the editor for a single invocation)
 //!   3. A shell heredoc (`--body <<END` ... `END`) — handled earlier
 //!      in the interactive shell, so by the time we reach here the
 //!      heredoc body has already been collapsed into `--body "..."`.
@@ -12,14 +13,20 @@ use anyhow::{Context, Result, anyhow};
 use std::io::{Read, Write};
 use std::process::Command;
 
+/// `--editor` state from clap:
+/// - `None`              → flag absent
+/// - `Some(None)`        → `--editor` with no value, use `$EDITOR`
+/// - `Some(Some("vim"))` → `--editor vim`, override for this call
+pub type EditorFlag = Option<Option<String>>;
+
 /// Resolve the final body string from the two mutually-exclusive
 /// clap flags `--body` and `--editor`.
 ///
 /// `label` is used in error messages (e.g., "post body", "comment body")
 /// to make the failure mode obvious to the user.
-pub fn resolve(label: &str, body: Option<String>, editor: bool) -> Result<String> {
-    if editor {
-        return compose_in_editor(label);
+pub fn resolve(label: &str, body: Option<String>, editor: EditorFlag) -> Result<String> {
+    if let Some(override_cmd) = editor {
+        return compose_in_editor(label, override_cmd.as_deref());
     }
     body.ok_or_else(|| {
         anyhow!("missing {label}: pass `--body \"...\"` or `--editor`, or use a heredoc in the interactive shell")
@@ -27,12 +34,16 @@ pub fn resolve(label: &str, body: Option<String>, editor: bool) -> Result<String
 }
 
 /// Open `$EDITOR` on a fresh tempfile, wait for it to close, and
-/// return the resulting file contents. Errors if the file is empty
-/// after editing (user likely aborted).
-fn compose_in_editor(label: &str) -> Result<String> {
-    let editor_cmd = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".to_string());
+/// return the resulting file contents. `override_cmd` replaces
+/// `$EDITOR` / `$VISUAL` for this one invocation (e.g. `--editor vim`).
+/// Errors if the file is empty after editing (user likely aborted).
+fn compose_in_editor(label: &str, override_cmd: Option<&str>) -> Result<String> {
+    let editor_cmd = match override_cmd {
+        Some(cmd) if !cmd.is_empty() => cmd.to_string(),
+        _ => std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "vi".to_string()),
+    };
 
     // Tempfile path: include PID + 64 random bits to avoid collisions
     // across concurrent CLI invocations. No crate needed — std + rand.
@@ -134,17 +145,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prefers_editor_over_body_flag() {
-        // conflicts_with on the clap attribute prevents both being set,
-        // but this guards the runtime contract too — when editor=true,
-        // we never see a body value in practice.
-        let result = resolve("test", Some("ignored".into()), false).unwrap();
-        assert_eq!(result, "ignored");
+    fn resolve_returns_body_when_editor_flag_absent() {
+        let result = resolve("test", Some("literal".into()), None).unwrap();
+        assert_eq!(result, "literal");
     }
 
     #[test]
     fn resolve_errors_when_neither_set() {
-        let err = resolve("test", None, false).unwrap_err();
+        let err = resolve("test", None, None).unwrap_err();
         assert!(err.to_string().contains("test"));
     }
 }
