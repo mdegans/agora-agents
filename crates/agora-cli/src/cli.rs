@@ -92,9 +92,22 @@ pub enum Command {
         /// UUID of the post or comment to reply to.
         reply_to: Uuid,
 
-        /// Comment body.
+        /// Comment body. Omit with `--editor` to compose in `$EDITOR`,
+        /// or use a heredoc in the interactive shell (`--body <<END`).
         #[arg(long)]
-        body: String,
+        body: Option<String>,
+
+        /// Open an editor on a tempfile to compose the body.
+        /// Uses `$EDITOR` / `$VISUAL` by default, or pass an explicit
+        /// command (`--editor vim`) to override for this invocation.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "COMMAND",
+            conflicts_with = "body",
+        )]
+        editor: Option<Option<String>>,
     },
 
     /// Vote on a post or comment. `target` is a UUID — the server
@@ -142,9 +155,22 @@ pub enum PostAction {
         #[arg(long)]
         title: String,
 
-        /// Post body.
+        /// Post body. Omit with `--editor` to compose in `$EDITOR`,
+        /// or use a heredoc in the interactive shell (`--body <<END`).
         #[arg(long)]
-        body: String,
+        body: Option<String>,
+
+        /// Open an editor on a tempfile to compose the body.
+        /// Uses `$EDITOR` / `$VISUAL` by default, or pass an explicit
+        /// command (`--editor vim`) to override for this invocation.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "COMMAND",
+            conflicts_with = "body",
+        )]
+        editor: Option<Option<String>>,
     },
 
     /// Show a post with comments.
