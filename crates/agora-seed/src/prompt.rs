@@ -5,7 +5,7 @@ use agora_agent_lib::agora_agentkit::ids::CommentId;
 pub use agora_agent_lib::tools::AgentAction;
 use misanthropic::CachedPrompt;
 use misanthropic::prompt::UserMessage;
-use misanthropic::prompt::message::{Block, Content};
+use misanthropic::prompt::message::{Block, CacheControl, Content};
 
 use crate::client::{Comment, FeedPost};
 
@@ -82,6 +82,15 @@ Use ONLY these exact community slugs when posting: {communities:?}
 
 /// Build the core [`CachedPrompt`] prefix common to all agents with a cache
 /// breakpoint at the end. This is common to all agents.
+///
+/// The first cache breakpoint is set **inline** on the system block with a
+/// 1-hour TTL (so the eager prime at session start survives batch-API
+/// latency before the first real batch reads it, and so the prefix stays
+/// warm across phases). We then wrap with [`CachedPrompt::uncached`]
+/// rather than `.into()` — the `From<Prompt> for CachedPrompt` impl calls
+/// `prompt.cache()` (the 5m variant) under the hood, which would **overwrite**
+/// our explicit 1h marker with a 5m one. Using `uncached` preserves the
+/// inline marker exactly as set.
 pub fn build_base_prompt(
     model_id: impl std::fmt::Display,
     constitution: &str,
@@ -89,13 +98,16 @@ pub fn build_base_prompt(
 ) -> CachedPrompt<'static> {
     let cached_system = build_system_text(constitution, communities);
 
-    // One of the two places we use a bare Prompt
-    misanthropic::Prompt {
+    let prompt = misanthropic::Prompt {
         model: model_id.to_string().into(),
         max_tokens: NonZeroU32::new(1024).unwrap(),
         system: Some(Content::MultiPart(vec![Block::Text {
             text: cached_system.into(),
-            cache_control: None,
+            // First breakpoint at end of tools+system, 1h TTL. Set inline
+            // so `CachedPrompt::uncached` doesn't need to add it, and so
+            // we never pass through `From::into` which would replace it
+            // with a 5m marker via `prompt.cache()`.
+            cache_control: Some(CacheControl::one_hour()),
         }])),
         functions: Some(AgentAction::methods()),
         // NOTE(mdegans): Only Anthropic models properly handle this. For the
@@ -105,11 +117,9 @@ pub fn build_base_prompt(
         // prefix.
         tool_choice: Some(misanthropic::tool::Choice::Auto),
         ..Default::default()
-    }
-    .cache_1h() // First breakpoint at end of tools+system — 1h TTL so the eager
-    // prime at session start survives batch-API latency before the first real
-    // batch reads it, and so the prefix stays warm across phases within a cycle.
-    .into()
+    };
+
+    CachedPrompt::uncached(prompt)
 }
 
 /// Build a full [`CachedPrompt`] for an individual agent. A cache breakpoint is
@@ -1268,6 +1278,47 @@ Content moderation rules.
         }
 
         count
+    }
+
+    /// Regression guard: verify that `build()` produces a prompt where
+    /// every cache_control marker uses the 1h TTL. This catches the class
+    /// of bug where `From<Prompt> for CachedPrompt` silently overwrites
+    /// a 1h marker with 5m via an internal `.cache()` call — producing
+    /// an Anthropic-side "1h cache_control block must not come after a
+    /// 5m cache_control block" error at submit time.
+    #[test]
+    fn test_all_cache_markers_are_1h() {
+        let prompt = build(
+            "claude-haiku-4-5-20251001",
+            "I am a test agent.",
+            "No memories.",
+            "",
+            "",
+            TEST_CONSTITUTION,
+            &["tech".to_string(), "art".to_string()],
+            "Dashboard empty.",
+        );
+        let json = serde_json::to_string(&prompt).expect("serialize");
+
+        // Every cache_control block must have explicit ttl=1h. A
+        // cache_control block without a ttl field defaults to 5m — that
+        // was the bug.
+        let cc_without_ttl_pattern = r#""cache_control":{"type":"ephemeral"}"#;
+        assert!(
+            !json.contains(cc_without_ttl_pattern),
+            "prompt contains a 5m cache_control (no ttl field). Full JSON:\n{json}"
+        );
+
+        // Positive assertion: every occurrence of "cache_control" should
+        // be followed by a 1h ttl.
+        let cc_count = json.matches(r#""cache_control":"#).count();
+        let cc_1h_count = json
+            .matches(r#""cache_control":{"type":"ephemeral","ttl":"1h"}"#)
+            .count();
+        assert_eq!(
+            cc_count, cc_1h_count,
+            "expected every cache_control to be 1h; got {cc_count} total vs {cc_1h_count} 1h. Full JSON:\n{json}"
+        );
     }
 
     /// Simulate the full 5-round tool-use loop and verify we never exceed
