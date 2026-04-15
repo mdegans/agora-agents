@@ -41,6 +41,30 @@ pub struct AnthropicPendingHandle {
     id_map: HashMap<batch::Id, (AgentId, CycleStep)>,
 }
 
+/// Maximum consecutive prime-batch failures before we give up priming
+/// a prefix and let the main batch submit cold.
+///
+/// Rationale: if we've timed out waiting for this many primes in a row,
+/// the prime batches themselves have almost certainly landed on
+/// Anthropic's side — we just didn't see their completion within our
+/// poll window. Submitting the main batch at that point is still likely
+/// to hit the cache, and even in the worst case (cold cache writes) we
+/// bound the wasted time. Without this cap, a persistent prime timeout
+/// would retry forever on every subsequent `submit()` call.
+const MAX_PRIME_ATTEMPTS: u32 = 3;
+
+/// Per-prefix cache priming state tracked by [`AnthropicBatch`].
+#[derive(Debug, Clone, Copy)]
+enum PrimeState {
+    /// Successfully primed this session. Skip future primes for this prefix.
+    Primed,
+    /// `n` consecutive prime attempts have failed. Future `submit()` calls
+    /// retry as long as `n < MAX_PRIME_ATTEMPTS`.
+    Failed(u32),
+    /// Hit the failure cap. Skip priming; submit the main batch directly.
+    Abandoned,
+}
+
 /// Anthropic Batch API backend.
 ///
 /// Wraps a [`misanthropic::Client`] and submits work items as a batch.
@@ -58,10 +82,10 @@ pub struct AnthropicPendingHandle {
 /// prime covers a whole cycle.
 pub struct AnthropicBatch {
     client: misanthropic::Client,
-    /// Prefix hashes we've already primed this session. Checked on every
-    /// `submit()` call — if the batch's prefix_hash is in here, we skip
-    /// priming.
-    primed_prefixes: std::sync::Mutex<std::collections::HashSet<u64>>,
+    /// Per-prefix priming state. See [`PrimeState`] for semantics. Keyed
+    /// by prefix hash so each distinct `(tools, system)` prefix is tracked
+    /// independently — the seed runner has one entry per Anthropic model.
+    prime_state: std::sync::Mutex<HashMap<u64, PrimeState>>,
 }
 
 impl AnthropicBatch {
@@ -69,7 +93,7 @@ impl AnthropicBatch {
     pub fn new(client: misanthropic::Client) -> Self {
         Self {
             client,
-            primed_prefixes: std::sync::Mutex::new(std::collections::HashSet::new()),
+            prime_state: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -102,12 +126,12 @@ impl AnthropicBatch {
 
         // Poll to completion. Single-item batches usually finish in a
         // few seconds but there's no SLA — Anthropic guarantees only a
-        // 24h ceiling. Cap at 30 minutes as a defensive timeout; if we
-        // hit it, fall through and let the main batch proceed without
-        // cache priming rather than stall a whole cycle indefinitely.
-        // Short poll interval so we can start the main batch as soon as
-        // the prime is ready.
-        let prime_timeout = std::time::Duration::from_secs(30 * 60);
+        // 24h ceiling. Cap at 45 minutes: long enough to give Anthropic's
+        // typical 5min–1h batch window a fair shot, short enough that a
+        // stuck prime doesn't stall the cycle indefinitely. The caller's
+        // retry cap (`MAX_PRIME_ATTEMPTS`) bounds total wall-clock spent
+        // priming a given prefix across successive `submit()` calls.
+        let prime_timeout = std::time::Duration::from_secs(45 * 60);
         let poll_interval = std::time::Duration::from_secs(5);
         let prime_start = std::time::Instant::now();
 
@@ -193,23 +217,52 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
         // cycle. Priming before every batch would add several minutes of
         // latency each time, pushing consecutive batches past the 5-minute
         // ephemeral cache TTL — exactly the opposite of what we want.
+        //
+        // If a prime batch has failed `MAX_PRIME_ATTEMPTS` times in a row
+        // for this prefix, we transition to `Abandoned` and submit the
+        // main batch without priming. See [`PrimeState`] for the full
+        // state machine.
         let prefix_hash = items.first().map(|it| it.prefix_hash);
-        let needs_prime = match prefix_hash {
-            Some(hash) => {
-                let mut set = self
-                    .primed_prefixes
-                    .lock()
-                    .expect("primed_prefixes mutex poisoned");
-                set.insert(hash) // insert returns true if the value was new
+        let should_prime = if let Some(hash) = prefix_hash {
+            let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
+            match state.get(&hash).copied() {
+                None => true,
+                Some(PrimeState::Failed(n)) if n < MAX_PRIME_ATTEMPTS => true,
+                Some(PrimeState::Failed(n)) => {
+                    // Hit the cap on this call. Transition to Abandoned
+                    // and log loudly — subsequent batches will see
+                    // `Abandoned` and skip priming silently.
+                    tracing::warn!(
+                        "Cache priming abandoned for prefix {hash:016x} after {n} \
+                         consecutive failures. Submitting main batch without prime; \
+                         if earlier prime batches eventually landed on Anthropic's \
+                         side, the cache may still serve hits."
+                    );
+                    state.insert(hash, PrimeState::Abandoned);
+                    false
+                }
+                Some(PrimeState::Primed) => {
+                    tracing::debug!(
+                        "Skipping cache prime for prefix {hash:016x} — already primed this session"
+                    );
+                    false
+                }
+                Some(PrimeState::Abandoned) => {
+                    tracing::debug!(
+                        "Skipping cache prime for prefix {hash:016x} — abandoned after \
+                         {MAX_PRIME_ATTEMPTS} consecutive failures"
+                    );
+                    false
+                }
             }
-            None => false,
+        } else {
+            false
         };
 
-        if needs_prime && items.len() > 1 {
+        if should_prime && items.len() > 1 {
+            let hash = prefix_hash.expect("should_prime implies prefix_hash is Some");
             tracing::info!(
-                "Priming prompt cache for prefix {:016x} (first batch for this prefix; \
-                 {} items)",
-                prefix_hash.unwrap(),
+                "Priming prompt cache for prefix {hash:016x} ({} items in this batch)",
                 items.len(),
             );
             // Submit a single-item batch with the first prompt and poll
@@ -224,35 +277,29 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
             // batches — but it was relying on undocumented cache sharing
             // between the Messages and Batch APIs. Switching to a batch
             // prime removes that implementation-detail dependency.
-            //
-            // No 3-item fallback: if the first item errors (e.g. empty
-            // text block), the main batch would hit the same error on
-            // that item anyway. Surfacing the error loudly and aborting
-            // the prime is better than silently paving over a prompt-
-            // assembly bug. We do NOT abort the main batch; we roll back
-            // the prefix-primed set and continue, letting the real error
-            // surface through the normal submit path.
             match self.prime_via_batch(&items[0].prompt).await {
                 Ok(()) => {
-                    // Success path already logged stats from the polled
-                    // result.
+                    let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
+                    state.insert(hash, PrimeState::Primed);
                 }
                 Err(e) => {
                     tracing::error!("Cache priming via batch API failed: {e}.");
-                    if let Some(hash) = prefix_hash {
-                        self.primed_prefixes
-                            .lock()
-                            .expect("primed_prefixes mutex poisoned")
-                            .remove(&hash);
+                    // Increment the failure counter. If a concurrent
+                    // submit() happened to land a successful prime for
+                    // the same prefix while this one was failing, trust
+                    // the success and do not overwrite `Primed`.
+                    let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
+                    let next = match state.get(&hash).copied() {
+                        Some(PrimeState::Primed) => None,
+                        Some(PrimeState::Failed(n)) => Some(PrimeState::Failed(n + 1)),
+                        _ => Some(PrimeState::Failed(1)),
+                    };
+                    if let Some(new_state) = next {
+                        state.insert(hash, new_state);
                     }
-                    return Err(e); // If the batch has errors, fail fast
+                    return Err(e); // Fail fast — scheduler will retry.
                 }
             }
-        } else if !needs_prime {
-            tracing::debug!(
-                "Skipping cache prime for prefix {:016x} — already primed this session",
-                prefix_hash.unwrap_or(0),
-            );
         }
 
         // Build the tagged prompts: (batch::Id, CachedPrompt) pairs
