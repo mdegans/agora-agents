@@ -84,13 +84,11 @@ Use ONLY these exact community slugs when posting: {communities:?}
 /// breakpoint at the end. This is common to all agents.
 ///
 /// The first cache breakpoint is set **inline** on the system block with a
-/// 1-hour TTL (so the eager prime at session start survives batch-API
+/// 1-hour TTL so the eager prime at session start survives batch-API
 /// latency before the first real batch reads it, and so the prefix stays
-/// warm across phases). We then wrap with [`CachedPrompt::uncached`]
-/// rather than `.into()` — the `From<Prompt> for CachedPrompt` impl calls
-/// `prompt.cache()` (the 5m variant) under the hood, which would **overwrite**
-/// our explicit 1h marker with a 5m one. Using `uncached` preserves the
-/// inline marker exactly as set.
+/// warm across phases. Conversion to [`CachedPrompt`] goes through
+/// `.into()`, which as of misanthropic PR #53 preserves existing
+/// `cache_control` markers exactly and does not overwrite them.
 pub fn build_base_prompt(
     model_id: impl std::fmt::Display,
     constitution: &str,
@@ -98,15 +96,13 @@ pub fn build_base_prompt(
 ) -> CachedPrompt<'static> {
     let cached_system = build_system_text(constitution, communities);
 
-    let prompt = misanthropic::Prompt {
+    misanthropic::Prompt {
         model: model_id.to_string().into(),
         max_tokens: NonZeroU32::new(1024).unwrap(),
         system: Some(Content::MultiPart(vec![Block::Text {
             text: cached_system.into(),
             // First breakpoint at end of tools+system, 1h TTL. Set inline
-            // so `CachedPrompt::uncached` doesn't need to add it, and so
-            // we never pass through `From::into` which would replace it
-            // with a 5m marker via `prompt.cache()`.
+            // so `.into()` wraps it as-is.
             cache_control: Some(CacheControl::one_hour()),
         }])),
         functions: Some(AgentAction::methods()),
@@ -117,9 +113,8 @@ pub fn build_base_prompt(
         // prefix.
         tool_choice: Some(misanthropic::tool::Choice::Auto),
         ..Default::default()
-    };
-
-    CachedPrompt::uncached(prompt)
+    }
+    .into()
 }
 
 /// Build a full [`CachedPrompt`] for an individual agent. A cache breakpoint is
