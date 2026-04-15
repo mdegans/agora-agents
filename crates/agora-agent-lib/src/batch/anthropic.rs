@@ -2,24 +2,45 @@
 //!
 //! Implements [`BatchBackend`] using the Anthropic Batch API via
 //! [`misanthropic::Client`]. Supports prompt caching — tool definitions
-//! and system prefix are cached across agents in the same batch.
+//! and system prefix are cached across agents in the same batch and
+//! across subsequent batches within the same session via eager priming.
 //!
-//! # Prompt caching
+//! # Eager prompt caching
 //!
 //! The batch API processes items on separate workers that may not share
-//! cache. To maximize cache hits:
-//! 1. Prime the cache before the first batch by sending one request via
-//!    the Messages API with the shared prefix (tools + constitution).
-//! 2. Use `CachedPrompt` to ensure the prefix is never mutated — any
-//!    change to tools, tool_choice, or system content invalidates the
-//!    entire cache prefix.
+//! cache. To maximize cache hits the seed runner primes Anthropic's
+//! prompt cache **once per unique model per session**, before any real
+//! batch submission, via [`AnthropicBatch::prime_prefixes`]. Each prime
+//! is a single-item batch carrying only the cacheable `tools + system`
+//! prefix (built by `agora_seed::prompt::build_base_prompt`) with a 1h
+//! cache breakpoint. Subsequent real batches for the same model read
+//! the warmed cache at 0.1x base input cost.
+//!
+//! Key properties of this design:
+//!
+//! - **No in-submit priming.** [`BatchBackend::submit`] is purely
+//!   mechanical and never touches [`PrimeState`]. This decouples real-
+//!   batch submission from priming: a stuck prime cannot leave a real-
+//!   batch prompt in a half-mutated state, which was the failure mode
+//!   that motivated this design (see agora-agents PR for eager priming).
+//! - **Bounded retry.** [`AnthropicBatch::prime_prefix`] retries a
+//!   failed prime up to [`MAX_PRIME_ATTEMPTS`] times. On the cap it
+//!   transitions the prefix to [`PrimeState::Abandoned`] and returns.
+//!   Real batches for an abandoned prefix still submit — they just pay
+//!   uncached input cost, which is the desired soft-degrade.
+//! - **1h TTL everywhere.** The seed-runner prompt builder places 1h
+//!   cache breakpoints so a prime written early in a session stays warm
+//!   across every phase (perceive → think_act → reflect → evolve →
+//!   survey) and across multiple cycles within the same run.
 //!
 //! # Cost optimization
 //!
 //! The Batch API provides a 50% discount on input tokens. Combined with
 //! prompt caching (0.1x cost for cache hits), agents sharing the same
 //! system prefix in a batch can see up to 95% cost reduction on cached
-//! tokens.
+//! tokens. 1h cache writes cost 2x base input (vs 1.25x for 5min), but
+//! at observed hit rates the read savings swamp the higher write cost
+//! as long as any reads land.
 
 use std::collections::HashMap;
 
@@ -68,18 +89,16 @@ enum PrimeState {
 /// Anthropic Batch API backend.
 ///
 /// Wraps a [`misanthropic::Client`] and submits work items as a batch.
-/// Prompt caching is handled at the prompt construction level (cache_control
-/// on tool definitions and system prefix blocks).
+/// Prompt caching is handled at the prompt construction level
+/// (`cache_1h()` on system blocks and tool definitions — see
+/// `agora_seed::prompt::build_base_prompt`).
 ///
-/// Cache priming is done lazily: the first `submit()` call for a given
-/// prefix hash sends one message through the non-batch API to warm the
-/// prompt cache; subsequent batches sharing the same prefix skip the
-/// prime. This matters because each prime call adds ~5s of latency, and
-/// re-priming between every phase would push consecutive batches past
-/// the 5-minute ephemeral cache TTL and cause the cache to expire right
-/// before the next batch runs. The prefix_hash is stable per model
-/// across all phases (think / reflect / evolve / survey) so a single
-/// prime covers a whole cycle.
+/// Cache priming is eager: the caller (`scheduler::run_all`) invokes
+/// [`Self::prime_prefixes`] once per unique model before any real batch
+/// runs, and by the time [`BatchBackend::submit`] is called the cache
+/// is either primed or the prefix is [`PrimeState::Abandoned`]. The
+/// prefix hash is stable per model across every phase (think / reflect
+/// / evolve / survey) so one prime per model covers an entire run.
 pub struct AnthropicBatch {
     client: misanthropic::Client,
     /// Per-prefix priming state. See [`PrimeState`] for semantics. Keyed
@@ -105,7 +124,9 @@ impl AnthropicBatch {
     }
 
     /// Warm Anthropic's prompt cache by submitting a single-item batch
-    /// with the given prompt and polling until it completes.
+    /// with the given prompt and polling until it completes. Returns the
+    /// `Usage` record from the batch result so callers can log
+    /// `cache_creation_input_tokens` on success.
     ///
     /// This is the [Anthropic-recommended prompt caching pattern][docs]:
     /// submit one batch request carrying the shared prefix, wait for it
@@ -113,84 +134,207 @@ impl AnthropicBatch {
     /// batch API are read by subsequent batch requests with the same
     /// prefix.
     ///
+    /// This function is the single-attempt inner core — retries and
+    /// state tracking live in [`Self::prime_prefix`].
+    ///
     /// [docs]: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
-    async fn prime_via_batch(&self, prompt: &CachedPrompt<'static>) -> anyhow::Result<()> {
+    async fn prime_via_batch(
+        &self,
+        model: &str,
+        prompt: &CachedPrompt<'static>,
+    ) -> anyhow::Result<misanthropic::response::Usage> {
         let mut pending = self
             .client
             .batch([prompt])
             .await
-            .map_err(|e| anyhow::anyhow!("prime batch submit failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("prime batch submit failed for model {model}: {e}"))?;
 
         let prime_id = pending.meta().id.clone();
-        tracing::debug!("Prime batch submitted: id={prime_id}");
+        tracing::debug!(%model, batch_id = %prime_id, "prime batch submitted");
 
         // Poll to completion. Single-item batches usually finish in a
         // few seconds but there's no SLA — Anthropic guarantees only a
         // 24h ceiling. Cap at 45 minutes: long enough to give Anthropic's
         // typical 5min–1h batch window a fair shot, short enough that a
-        // stuck prime doesn't stall the cycle indefinitely. The caller's
-        // retry cap (`MAX_PRIME_ATTEMPTS`) bounds total wall-clock spent
-        // priming a given prefix across successive `submit()` calls.
+        // stuck prime doesn't stall session startup indefinitely. The
+        // caller's retry cap (`MAX_PRIME_ATTEMPTS`) bounds total wall-
+        // clock spent priming a given prefix.
         let prime_timeout = std::time::Duration::from_secs(45 * 60);
         let poll_interval = std::time::Duration::from_secs(5);
         let prime_start = std::time::Instant::now();
 
-        let ready = loop {
-            match self
-                .client
-                .batch_poll(pending)
-                .await
-                .map_err(|e| anyhow::anyhow!("prime batch poll failed: {e}"))?
-            {
-                batch::Batch::Ready(ready) => break ready,
-                batch::Batch::Pending(p) => {
-                    if prime_start.elapsed() > prime_timeout {
-                        anyhow::bail!(
-                            "prime batch {} did not complete within {}s — aborting \
-                             prime and letting main batch surface errors",
-                            prime_id,
-                            prime_timeout.as_secs()
-                        );
+        let ready =
+            loop {
+                match self.client.batch_poll(pending).await.map_err(|e| {
+                    anyhow::anyhow!("prime batch poll failed for model {model}: {e}")
+                })? {
+                    batch::Batch::Ready(ready) => break ready,
+                    batch::Batch::Pending(p) => {
+                        if prime_start.elapsed() > prime_timeout {
+                            anyhow::bail!(
+                                "prime batch {} for model {} did not complete within {}s",
+                                prime_id,
+                                model,
+                                prime_timeout.as_secs()
+                            );
+                        }
+                        pending = p;
+                        tokio::time::sleep(poll_interval).await;
                     }
-                    pending = p;
-                    tokio::time::sleep(poll_interval).await;
                 }
-            }
-        };
+            };
 
-        // Inspect the single result to surface any item-level error
-        // loudly — an error here means the prompt itself is malformed
-        // (e.g. empty text block) and the main batch would hit the
-        // same error anyway. Fail fast.
         let (_pending, results) = ready.decompose();
         let (_id, result) = results
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("prime batch returned no results"))?;
+            .ok_or_else(|| anyhow::anyhow!("prime batch for model {model} returned no results"))?;
 
         match result {
-            batch::BatchResult::Ok(msg) => {
-                let usage = &msg.usage;
-                tracing::info!(
-                    "Cache primed via batch API ({:.1}s): {} creation tokens, \
-                     {} read tokens, {} input tokens",
-                    prime_start.elapsed().as_secs_f64(),
-                    usage.cache_creation_input_tokens.unwrap_or(0),
-                    usage.cache_read_input_tokens.unwrap_or(0),
-                    usage.input_tokens,
-                );
-                Ok(())
-            }
+            batch::BatchResult::Ok(msg) => Ok(msg.usage),
             batch::BatchResult::Error(e) => {
-                anyhow::bail!("prime batch item errored: {e}")
+                anyhow::bail!("prime batch item for model {model} errored: {e}")
             }
             batch::BatchResult::Canceled => {
-                anyhow::bail!("prime batch canceled")
+                anyhow::bail!("prime batch for model {model} canceled")
             }
             batch::BatchResult::Expired => {
-                anyhow::bail!("prime batch expired")
+                anyhow::bail!("prime batch for model {model} expired")
             }
         }
+    }
+
+    /// Prime the cache for a single prefix, retrying up to
+    /// [`MAX_PRIME_ATTEMPTS`] times on failure.
+    ///
+    /// - Returns `true` if the prefix is primed (either by this call or
+    ///   a previous successful call this session).
+    /// - Returns `false` if the prefix is in the `Abandoned` state
+    ///   (already given up, or just exhausted its retry cap on this
+    ///   call). In that case the caller should proceed without a prime
+    ///   — real batches still submit, they just pay uncached input cost.
+    ///
+    /// Never panics and never returns an error. Soft failure only.
+    ///
+    /// Log messages emitted:
+    /// - info on first success (with creation-token count from the Usage)
+    /// - warn per failed attempt with attempt count
+    /// - warn on terminal abandonment after the cap
+    /// - debug on "already primed" / "already abandoned" short-circuit
+    pub async fn prime_prefix(
+        &self,
+        prefix_hash: u64,
+        model: &str,
+        prompt: &CachedPrompt<'static>,
+    ) -> bool {
+        // Short-circuit if the prefix is already in a terminal state.
+        {
+            let state = self.prime_state.lock().expect("prime_state mutex poisoned");
+            match state.get(&prefix_hash).copied() {
+                Some(PrimeState::Primed) => {
+                    tracing::debug!(%model, "prefix already primed this session, skipping");
+                    return true;
+                }
+                Some(PrimeState::Abandoned) => {
+                    tracing::debug!(
+                        %model,
+                        "prefix already abandoned after {MAX_PRIME_ATTEMPTS} prior failures, skipping"
+                    );
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        // Retry loop. Each iteration is one `prime_via_batch` attempt.
+        // On success: record `Primed`, return true.
+        // On failure: increment the failure counter, loop if below the
+        // cap, else transition to `Abandoned` and return false.
+        loop {
+            let attempt_started = std::time::Instant::now();
+            match self.prime_via_batch(model, prompt).await {
+                Ok(usage) => {
+                    let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
+                    state.insert(prefix_hash, PrimeState::Primed);
+                    tracing::info!(
+                        %model,
+                        elapsed_s = attempt_started.elapsed().as_secs_f64(),
+                        cache_creation = usage.cache_creation_input_tokens.unwrap_or(0),
+                        cache_read = usage.cache_read_input_tokens.unwrap_or(0),
+                        input_tokens = usage.input_tokens,
+                        "cache primed via eager batch"
+                    );
+                    return true;
+                }
+                Err(e) => {
+                    let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
+                    let next_count = match state.get(&prefix_hash).copied() {
+                        Some(PrimeState::Failed(n)) => n + 1,
+                        Some(PrimeState::Primed) => {
+                            // A concurrent caller succeeded while we
+                            // were still attempting. Trust their success.
+                            tracing::debug!(
+                                %model,
+                                "prime attempt failed but concurrent caller already primed this prefix"
+                            );
+                            return true;
+                        }
+                        _ => 1,
+                    };
+
+                    if next_count >= MAX_PRIME_ATTEMPTS {
+                        state.insert(prefix_hash, PrimeState::Abandoned);
+                        drop(state);
+                        tracing::warn!(
+                            %model,
+                            attempts = next_count,
+                            error = %e,
+                            "cache prime abandoned after {MAX_PRIME_ATTEMPTS} consecutive failures \
+                             — real batches for this model will submit without caching; if prior \
+                             prime batches eventually landed on Anthropic's side, the cache may \
+                             still serve hits"
+                        );
+                        return false;
+                    }
+
+                    state.insert(prefix_hash, PrimeState::Failed(next_count));
+                    drop(state);
+                    tracing::warn!(
+                        %model,
+                        attempt = next_count,
+                        max_attempts = MAX_PRIME_ATTEMPTS,
+                        error = %e,
+                        "cache prime attempt failed, retrying"
+                    );
+                    // Continue the loop — another iteration will call
+                    // `prime_via_batch` again.
+                }
+            }
+        }
+    }
+
+    /// Prime every prefix in `entries` sequentially. Entries are
+    /// `(prefix_hash, model, prompt)` tuples, typically one per unique
+    /// Anthropic model in the current run. Returns `(ok_count,
+    /// total_count)` so the caller can log an aggregate.
+    ///
+    /// Sequential rather than concurrent: the common case is 1 unique
+    /// Anthropic model (one Haiku variant) and parallelism would only
+    /// help in the rare >1-model case. Keeping this simple avoids adding
+    /// a `futures` dependency to the agents workspace for a benefit we
+    /// don't actually observe in practice.
+    pub async fn prime_prefixes(
+        &self,
+        entries: Vec<(u64, String, CachedPrompt<'static>)>,
+    ) -> (usize, usize) {
+        let total = entries.len();
+        let mut ok = 0usize;
+        for (hash, model, prompt) in entries {
+            if self.prime_prefix(hash, &model, &prompt).await {
+                ok += 1;
+            }
+        }
+        (ok, total)
     }
 }
 
@@ -201,109 +345,16 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
         &self,
         items: Vec<WorkItem<CachedPrompt<'static>>>,
     ) -> anyhow::Result<Self::Handle> {
-        // Prime the prompt cache before submitting the batch — but only
-        // once per prefix_hash per process lifetime.
+        // No priming happens here. Cache priming is eager: the caller
+        // (`scheduler::run_all`) invokes [`AnthropicBatch::prime_prefixes`]
+        // once per session, before any real batch runs, so by the time
+        // `submit` is called the cache is either already warm or the
+        // prefix has been `Abandoned` (in which case this batch just
+        // pays uncached input cost — that's the desired soft-degrade).
         //
-        // Batch items share an identical cacheable prefix (tools +
-        // constitution + system) but are processed across different
-        // workers that may not share cache. By sending one request first
-        // via the Messages API, we write the prefix to Anthropic's cache.
-        // Batch items can then read from it at 0.1x cost (stacking with
-        // the 0.5x batch discount for 0.05x effective cost on cached
-        // tokens).
-        //
-        // The prefix is stable across all phases and rounds for a given
-        // agent model, so we only need to prime once per model per
-        // cycle. Priming before every batch would add several minutes of
-        // latency each time, pushing consecutive batches past the 5-minute
-        // ephemeral cache TTL — exactly the opposite of what we want.
-        //
-        // If a prime batch has failed `MAX_PRIME_ATTEMPTS` times in a row
-        // for this prefix, we transition to `Abandoned` and submit the
-        // main batch without priming. See [`PrimeState`] for the full
-        // state machine.
-        let prefix_hash = items.first().map(|it| it.prefix_hash);
-        let should_prime = if let Some(hash) = prefix_hash {
-            let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
-            match state.get(&hash).copied() {
-                None => true,
-                Some(PrimeState::Failed(n)) if n < MAX_PRIME_ATTEMPTS => true,
-                Some(PrimeState::Failed(n)) => {
-                    // Hit the cap on this call. Transition to Abandoned
-                    // and log loudly — subsequent batches will see
-                    // `Abandoned` and skip priming silently.
-                    tracing::warn!(
-                        "Cache priming abandoned for prefix {hash:016x} after {n} \
-                         consecutive failures. Submitting main batch without prime; \
-                         if earlier prime batches eventually landed on Anthropic's \
-                         side, the cache may still serve hits."
-                    );
-                    state.insert(hash, PrimeState::Abandoned);
-                    false
-                }
-                Some(PrimeState::Primed) => {
-                    tracing::debug!(
-                        "Skipping cache prime for prefix {hash:016x} — already primed this session"
-                    );
-                    false
-                }
-                Some(PrimeState::Abandoned) => {
-                    tracing::debug!(
-                        "Skipping cache prime for prefix {hash:016x} — abandoned after \
-                         {MAX_PRIME_ATTEMPTS} consecutive failures"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if should_prime && items.len() > 1 {
-            let hash = prefix_hash.expect("should_prime implies prefix_hash is Some");
-            tracing::info!(
-                "Priming prompt cache for prefix {hash:016x} ({} items in this batch)",
-                items.len(),
-            );
-            // Submit a single-item batch with the first prompt and poll
-            // until it completes, per Anthropic's documented cache-warming
-            // pattern: "Send a batch request with just a single request
-            // that has this shared prefix and a cache block. As soon as
-            // this is complete, submit the rest of the requests."
-            //
-            // We used to prime via `client.message()` (the non-batch
-            // Messages API). That appeared to work — we saw creation
-            // tokens on the prime and non-zero hit rates on subsequent
-            // batches — but it was relying on undocumented cache sharing
-            // between the Messages and Batch APIs. Switching to a batch
-            // prime removes that implementation-detail dependency.
-            match self.prime_via_batch(&items[0].prompt).await {
-                Ok(()) => {
-                    let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
-                    state.insert(hash, PrimeState::Primed);
-                }
-                Err(e) => {
-                    tracing::error!("Cache priming via batch API failed: {e}.");
-                    // Increment the failure counter. If a concurrent
-                    // submit() happened to land a successful prime for
-                    // the same prefix while this one was failing, trust
-                    // the success and do not overwrite `Primed`.
-                    let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
-                    let next = match state.get(&hash).copied() {
-                        Some(PrimeState::Primed) => None,
-                        Some(PrimeState::Failed(n)) => Some(PrimeState::Failed(n + 1)),
-                        _ => Some(PrimeState::Failed(1)),
-                    };
-                    if let Some(new_state) = next {
-                        state.insert(hash, new_state);
-                    }
-                    return Err(e); // Fail fast — scheduler will retry.
-                }
-            }
-        }
-
-        // Build the tagged prompts: (batch::Id, CachedPrompt) pairs
-        // and track the mapping back to agent IDs.
+        // `submit` is therefore purely mechanical: build the id_map,
+        // build the tagged prompts, hand off to `client.tagged_batch`,
+        // return the pending handle.
         //
         // CachedPrompt implements Serialize (delegates to inner Prompt),
         // so tagged_batch() accepts it directly — no into_inner() needed.
