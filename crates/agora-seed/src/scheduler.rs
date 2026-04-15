@@ -669,16 +669,27 @@ async fn prime_anthropic_models(
     constitution: &str,
     communities: &[String],
 ) {
+    use std::num::NonZeroU32;
+
     let unique: HashSet<String> = models.into_iter().collect();
     if unique.is_empty() {
         return;
     }
 
+    // The skeleton from `build_base_prompt` has tools + system but no
+    // messages. Anthropic's Messages API requires at least one user
+    // message in every request, so we append a trivial one ("ping")
+    // and clamp `max_tokens` to 1 — we only care about warming the
+    // cache, the response body is discarded.
     let entries: Vec<(u64, String, CachedPrompt<'static>)> = unique
         .into_iter()
         .map(|model| {
             let hash = model_prefix_hash(&model);
-            let prompt = prompt::build_base_prompt(&model, constitution, communities);
+            let mut prompt = prompt::build_base_prompt(&model, constitution, communities);
+            prompt
+                .push_message(UserMessage::from("ping"))
+                .expect("first user message on a fresh prompt is always valid");
+            prompt.set_max_tokens(NonZeroU32::new(1).unwrap());
             (hash, model, prompt)
         })
         .collect();
