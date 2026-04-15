@@ -399,8 +399,10 @@ async fn process_round(
         .map_err(|e| anyhow::anyhow!("appending tool results: {e}"))?;
     // it's now the assistant's turn
 
-    // Manage cache breakpoint budget: keep first + last 2
-    cached_prompt.cache_windowed(2);
+    // Manage cache breakpoint budget: keep first + last 2, at 1h TTL so the
+    // growing message window stays warm across tool rounds even if Anthropic's
+    // batch-API latency pushes the next round past a 5-minute window.
+    cached_prompt.cache_windowed_1h(2);
 
     Ok(summaries)
 }
@@ -601,19 +603,20 @@ async fn submit_and_poll(
     }
 }
 
-/// Build a WorkItem from an agent's current prompt state.
+/// Derive the `prefix_hash` that groups `WorkItem`s and prime entries
+/// by cacheable prefix.
 ///
-/// **Note on `prefix_hash`:** we currently derive it from
-/// `hash(agent.model)` alone, as a proxy for "same cacheable prefix".
-/// This is safe in the current architecture because the cacheable
-/// prefix (constitution, communities list, tool definitions) is
-/// constructed from top-level values loaded once in `main` and
-/// handed down through `run_cycles` — every agent using the same
-/// model ends up with byte-identical system prefix + tools, which
-/// is what Anthropic's cache keys on. `AnthropicBatch::submit` uses
-/// this hash to prime the cache exactly once per model per session;
-/// if the hash is wrong we'd either re-prime unnecessarily (wasted
-/// latency) or skip a prime we needed (cache miss).
+/// We derive it from `hash(agent.model)` alone, as a proxy for "same
+/// cacheable prefix". This is safe in the current architecture because
+/// the cacheable prefix (constitution, communities list, tool
+/// definitions) is constructed from top-level values loaded once in
+/// `main` and handed down through `run_cycles` — every agent using the
+/// same model ends up with byte-identical system prefix + tools, which
+/// is what Anthropic's cache keys on.
+///
+/// Both [`make_work_item`] and [`prime_anthropic_models`] compute the
+/// hash via this helper so real-batch submit and eager-prime state
+/// transitions share a single [`PrimeState`] entry per model.
 ///
 /// TODO: push this upstream into misanthropic as
 /// `CachedPrompt::prefix_cache_key() -> Option<u64>` — hash the
@@ -623,28 +626,74 @@ async fn submit_and_poll(
 /// is almost always unintentional and worth surfacing. Once that
 /// lands, replace the hash-the-model heuristic here with the
 /// authoritative upstream version.
+fn model_prefix_hash(model: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    model.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Build a `WorkItem` from an agent's current prompt state. The
+/// `prefix_hash` comes from [`model_prefix_hash`] so it matches the
+/// entry the eager-prime path writes at session start.
 fn make_work_item(
     agent: &Agent,
     prompt: &CachedPrompt<'static>,
     step: CycleStep,
 ) -> WorkItem<CachedPrompt<'static>> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let prefix_hash = {
-        let mut hasher = DefaultHasher::new();
-        agent.model.hash(&mut hasher);
-        hasher.finish()
-    };
-
     WorkItem {
         agent_id: agent.agent_id.unwrap(),
         prompt: prompt.clone(),
         step,
-        prefix_hash,
+        prefix_hash: model_prefix_hash(&agent.model),
         model: agent.model.clone(),
         queued_at: Instant::now(),
         token_count: 0,
+    }
+}
+
+/// Eagerly prime Anthropic's prompt cache for every unique model in
+/// `models` before any real batch runs. Builds a skeleton prompt via
+/// [`prompt::build_base_prompt`] (tools + system + 1h cache breakpoint,
+/// no per-agent state) for each unique model and hands them off to
+/// [`AnthropicBatch::prime_prefixes`].
+///
+/// Never errors. Logs an aggregate line; individual per-model outcomes
+/// are logged inside `prime_prefix`. If any prime ends up `Abandoned`,
+/// real batches for that model submit cold — slower/more expensive but
+/// correct.
+async fn prime_anthropic_models(
+    backend: &AnthropicBatch,
+    models: impl IntoIterator<Item = String>,
+    constitution: &str,
+    communities: &[String],
+) {
+    let unique: HashSet<String> = models.into_iter().collect();
+    if unique.is_empty() {
+        return;
+    }
+
+    let entries: Vec<(u64, String, CachedPrompt<'static>)> = unique
+        .into_iter()
+        .map(|model| {
+            let hash = model_prefix_hash(&model);
+            let prompt = prompt::build_base_prompt(&model, constitution, communities);
+            (hash, model, prompt)
+        })
+        .collect();
+
+    let total = entries.len();
+    tracing::info!("Priming Anthropic prompt cache for {total} unique model(s)");
+
+    let (ok, total) = backend.prime_prefixes(entries).await;
+    if ok == total {
+        tracing::info!("All {total} Anthropic model(s) primed successfully");
+    } else {
+        tracing::warn!(
+            "Primed {ok}/{total} Anthropic model(s); {} will submit without caching",
+            total - ok
+        );
     }
 }
 
@@ -1350,7 +1399,9 @@ async fn seq_phase_think_act(
         }
     }
 
-    cached_prompt.cache_windowed(2);
+    // Cosmetic for Ollama (its local KV cache ignores these markers), but
+    // kept identical to the Anthropic path so the breakpoints never diverge.
+    cached_prompt.cache_windowed_1h(2);
     summaries
 }
 
@@ -2280,6 +2331,14 @@ pub async fn run_all(
                     tracing::info!("Model '{model}' → anthropic ({count} agents)");
                 }
 
+                prime_anthropic_models(
+                    &anthropic,
+                    anthropic_missing.keys().cloned(),
+                    constitution,
+                    communities,
+                )
+                .await;
+
                 run_cycles(
                     &endpoints,
                     Some(&anthropic),
@@ -2319,6 +2378,15 @@ pub async fn run_all(
                 anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display())
             })?;
             let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
+
+            prime_anthropic_models(
+                &backend,
+                agents.iter().map(|a| a.model.clone()),
+                constitution,
+                communities,
+            )
+            .await;
+
             run_cycles(
                 &[],
                 Some(&backend),

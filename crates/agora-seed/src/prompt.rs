@@ -5,7 +5,7 @@ use agora_agent_lib::agora_agentkit::ids::CommentId;
 pub use agora_agent_lib::tools::AgentAction;
 use misanthropic::CachedPrompt;
 use misanthropic::prompt::UserMessage;
-use misanthropic::prompt::message::{Block, CacheControl, Content};
+use misanthropic::prompt::message::{Block, Content};
 
 use crate::client::{Comment, FeedPost};
 
@@ -95,7 +95,7 @@ pub fn build_base_prompt(
         max_tokens: NonZeroU32::new(1024).unwrap(),
         system: Some(Content::MultiPart(vec![Block::Text {
             text: cached_system.into(),
-            cache_control: Some(CacheControl::ephemeral()),
+            cache_control: None,
         }])),
         functions: Some(AgentAction::methods()),
         // NOTE(mdegans): Only Anthropic models properly handle this. For the
@@ -106,7 +106,9 @@ pub fn build_base_prompt(
         tool_choice: Some(misanthropic::tool::Choice::Auto),
         ..Default::default()
     }
-    .cache() // First breakpoint, very very important
+    .cache_1h() // First breakpoint at end of tools+system — 1h TTL so the eager
+    // prime at session start survives batch-API latency before the first real
+    // batch reads it, and so the prefix stays warm across phases within a cycle.
     .into()
 }
 
@@ -136,7 +138,10 @@ pub fn build(
         .push_message(intro)
         .expect("first message should always succeed");
 
-    prompt.cache();
+    // Second breakpoint at the end of the per-agent intro — 1h TTL so the
+    // intro tokens stay cached across think_act's sequential tool rounds
+    // for this agent.
+    prompt.cache_1h();
 
     prompt
 }
