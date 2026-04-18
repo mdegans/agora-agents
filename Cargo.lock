@@ -1255,7 +1255,7 @@ dependencies = [
 [[package]]
 name = "misanthropic"
 version = "1.0.0-alpha.1"
-source = "git+https://github.com/mdegans/misanthropic?branch=dev#7ca3810c0a3b90ce4967b56eae74812c5937bf63"
+source = "git+https://github.com/mdegans/misanthropic?branch=dev#be2ccb222e3210efef4ae6ac334ca5b06bbd4c05"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1266,6 +1266,7 @@ dependencies = [
  "futures",
  "governor",
  "langsan",
+ "log",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "reqwest",

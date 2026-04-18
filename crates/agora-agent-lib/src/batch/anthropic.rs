@@ -9,12 +9,17 @@
 //!
 //! The batch API processes items on separate workers that may not share
 //! cache. To maximize cache hits the seed runner primes Anthropic's
-//! prompt cache **once per unique model per session**, before any real
-//! batch submission, via [`AnthropicBatch::prime_prefixes`]. Each prime
-//! is a single-item batch carrying only the cacheable `tools + system`
-//! prefix (built by `agora_seed::prompt::build_base_prompt`) with a 1h
-//! cache breakpoint. Subsequent real batches for the same model read
-//! the warmed cache at 0.1x base input cost.
+//! prompt cache **at the start of each cycle** per unique model, before
+//! that cycle's real batch submissions, via
+//! [`AnthropicBatch::prime_prefixes`]. Each prime is a single-item batch
+//! carrying only the cacheable `tools + system` prefix (built by
+//! `agora_seed::prompt::build_base_prompt`) with a 1h cache breakpoint.
+//! Subsequent real batches for the same model read the warmed cache at
+//! 0.1x base input cost. Per-cycle invocation is cheap: a fresh entry
+//! within [`PRIME_FRESHNESS`] short-circuits without hitting the API,
+//! so re-calling every cycle is a no-op unless the cache has actually
+//! aged out (cycles can take hours) or a prior prime was abandoned and
+//! the infra may have recovered.
 //!
 //! Key properties of this design:
 //!
@@ -24,14 +29,21 @@
 //!   batch prompt in a half-mutated state, which was the failure mode
 //!   that motivated this design (see agora-agents PR for eager priming).
 //! - **Bounded retry.** [`AnthropicBatch::prime_prefix`] retries a
-//!   failed prime up to [`MAX_PRIME_ATTEMPTS`] times. On the cap it
-//!   transitions the prefix to [`PrimeState::Abandoned`] and returns.
-//!   Real batches for an abandoned prefix still submit — they just pay
-//!   uncached input cost, which is the desired soft-degrade.
+//!   failed prime up to [`MAX_PRIME_ATTEMPTS`] times within one call.
+//!   On the cap it transitions the prefix to [`PrimeState::Abandoned`]
+//!   and returns. Real batches for an abandoned prefix still submit —
+//!   they just pay uncached input cost, which is the desired soft-
+//!   degrade.
+//! - **Freshness-based re-priming.** `Primed` and `Abandoned` entries
+//!   carry an `Instant` and age out after [`PRIME_FRESHNESS`]. Stale
+//!   entries fall through on the next `prime_prefix` call: stale
+//!   `Primed` re-warms the cache before the 1h TTL expires; stale
+//!   `Abandoned` retries prime in case the infra hiccup that caused
+//!   the original abandonment has resolved.
 //! - **1h TTL everywhere.** The seed-runner prompt builder places 1h
-//!   cache breakpoints so a prime written early in a session stays warm
-//!   across every phase (perceive → think_act → reflect → evolve →
-//!   survey) and across multiple cycles within the same run.
+//!   cache breakpoints so a single prime stays warm across every phase
+//!   (perceive → think_act → reflect → evolve → survey) within a cycle.
+//!   `PRIME_FRESHNESS` is sized under that TTL with a safety margin.
 //!
 //! # Cost optimization
 //!
@@ -74,16 +86,39 @@ pub struct AnthropicPendingHandle {
 /// would retry forever on every subsequent `submit()` call.
 const MAX_PRIME_ATTEMPTS: u32 = 3;
 
+/// How long a terminal prime outcome (Primed or Abandoned) stays
+/// "fresh" before [`AnthropicBatch::prime_prefix`] will redo the work.
+///
+/// We place 1h `cache_1h` breakpoints on our prompts, so Anthropic's
+/// cache TTL for these entries is 1h. The freshness window is set
+/// under the TTL with a 10-min safety margin so the next real batch
+/// after a re-prime still reads a warm cache even if the re-prime
+/// itself takes a few minutes to land.
+///
+/// The same window applies to `Abandoned`: a batch-API infra hiccup
+/// severe enough to burn through 3 × 45min timeouts is almost always
+/// transient (observed 2026-04-15: Anthropic was broadly slow that
+/// afternoon, back to normal the next day). Retrying on the next
+/// cycle after the window elapses lets a long multi-cycle run
+/// recover the cache-hit benefit once infra is healthy again.
+const PRIME_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(50 * 60);
+
 /// Per-prefix cache priming state tracked by [`AnthropicBatch`].
 #[derive(Debug, Clone, Copy)]
 enum PrimeState {
-    /// Successfully primed this session. Skip future primes for this prefix.
-    Primed,
-    /// `n` consecutive prime attempts have failed. Future `submit()` calls
-    /// retry as long as `n < MAX_PRIME_ATTEMPTS`.
+    /// Successfully primed at this instant. Short-circuit future
+    /// `prime_prefix` calls until [`PRIME_FRESHNESS`] has elapsed, after
+    /// which the cache is considered potentially stale and we re-prime.
+    Primed { at: std::time::Instant },
+    /// `n` consecutive prime attempts have failed within a single
+    /// `prime_prefix` call. Transient — never observed between calls
+    /// because the retry loop either transitions to `Primed` or
+    /// `Abandoned` before returning.
     Failed(u32),
-    /// Hit the failure cap. Skip priming; submit the main batch directly.
-    Abandoned,
+    /// Hit the failure cap at this instant. Short-circuit future calls
+    /// until [`PRIME_FRESHNESS`] has elapsed, after which we retry in
+    /// case the underlying infra issue has resolved.
+    Abandoned { at: std::time::Instant },
 }
 
 /// Anthropic Batch API backend.
@@ -93,12 +128,13 @@ enum PrimeState {
 /// (`cache_1h()` on system blocks and tool definitions — see
 /// `agora_seed::prompt::build_base_prompt`).
 ///
-/// Cache priming is eager: the caller (`scheduler::run_all`) invokes
-/// [`Self::prime_prefixes`] once per unique model before any real batch
-/// runs, and by the time [`BatchBackend::submit`] is called the cache
-/// is either primed or the prefix is [`PrimeState::Abandoned`]. The
-/// prefix hash is stable per model across every phase (think / reflect
-/// / evolve / survey) so one prime per model covers an entire run.
+/// Cache priming is eager: the caller invokes [`Self::prime_prefixes`]
+/// at the start of each cycle before any real batch runs, and by the
+/// time [`BatchBackend::submit`] is called the prefix is either primed
+/// or [`PrimeState::Abandoned`]. The prefix hash is stable per model
+/// across every phase (think / reflect / evolve / survey) within a
+/// cycle, and stale entries past [`PRIME_FRESHNESS`] are automatically
+/// re-primed on the next cycle to ride the 1h cache TTL.
 pub struct AnthropicBatch {
     client: misanthropic::Client,
     /// Per-prefix priming state. See [`PrimeState`] for semantics. Keyed
@@ -208,16 +244,24 @@ impl AnthropicBatch {
     /// [`MAX_PRIME_ATTEMPTS`] times on failure.
     ///
     /// - Returns `true` if the prefix is primed (either by this call or
-    ///   a previous successful call this session).
-    /// - Returns `false` if the prefix is in the `Abandoned` state
-    ///   (already given up, or just exhausted its retry cap on this
-    ///   call). In that case the caller should proceed without a prime
-    ///   — real batches still submit, they just pay uncached input cost.
+    ///   a previous successful call within [`PRIME_FRESHNESS`]).
+    /// - Returns `false` if the prefix is in the `Abandoned` state and
+    ///   was abandoned within [`PRIME_FRESHNESS`] (recent failure, don't
+    ///   retry yet), or if this call just exhausted its retry cap. In
+    ///   either case the caller should proceed without a prime — real
+    ///   batches still submit, they just pay uncached input cost.
+    ///
+    /// A stale `Primed` or `Abandoned` entry (older than
+    /// [`PRIME_FRESHNESS`]) falls through into the retry loop and is
+    /// re-primed. This lets long multi-cycle runs re-warm the cache
+    /// after the 1h TTL expires, and lets transient Anthropic infra
+    /// hiccups resolve without permanently locking the prefix out.
     ///
     /// Never panics and never returns an error. Soft failure only.
     ///
     /// Log messages emitted:
-    /// - info on first success (with creation-token count from the Usage)
+    /// - info on successful prime (with creation-token count from the Usage)
+    /// - info when a stale Primed/Abandoned entry falls through to re-prime
     /// - warn per failed attempt with attempt count
     /// - warn on terminal abandonment after the cap
     /// - debug on "already primed" / "already abandoned" short-circuit
@@ -227,20 +271,41 @@ impl AnthropicBatch {
         model: &str,
         prompt: &CachedPrompt<'static>,
     ) -> bool {
-        // Short-circuit if the prefix is already in a terminal state.
+        // Short-circuit if the prefix is in a fresh terminal state.
+        // Stale entries (older than PRIME_FRESHNESS) fall through and
+        // re-enter the retry loop below.
         {
             let state = self.prime_state.lock().expect("prime_state mutex poisoned");
             match state.get(&prefix_hash).copied() {
-                Some(PrimeState::Primed) => {
-                    tracing::debug!(%model, "prefix already primed this session, skipping");
-                    return true;
-                }
-                Some(PrimeState::Abandoned) => {
+                Some(PrimeState::Primed { at }) if at.elapsed() < PRIME_FRESHNESS => {
                     tracing::debug!(
                         %model,
-                        "prefix already abandoned after {MAX_PRIME_ATTEMPTS} prior failures, skipping"
+                        age_s = at.elapsed().as_secs(),
+                        "prefix primed recently, skipping"
+                    );
+                    return true;
+                }
+                Some(PrimeState::Abandoned { at }) if at.elapsed() < PRIME_FRESHNESS => {
+                    tracing::debug!(
+                        %model,
+                        age_s = at.elapsed().as_secs(),
+                        "prefix recently abandoned after {MAX_PRIME_ATTEMPTS} failures, skipping"
                     );
                     return false;
+                }
+                Some(PrimeState::Primed { at }) => {
+                    tracing::info!(
+                        %model,
+                        age_s = at.elapsed().as_secs(),
+                        "primed entry is stale (past cache TTL), re-priming"
+                    );
+                }
+                Some(PrimeState::Abandoned { at }) => {
+                    tracing::info!(
+                        %model,
+                        age_s = at.elapsed().as_secs(),
+                        "previously abandoned prefix is stale, retrying prime (infra may have recovered)"
+                    );
                 }
                 _ => {}
             }
@@ -255,7 +320,12 @@ impl AnthropicBatch {
             match self.prime_via_batch(model, prompt).await {
                 Ok(usage) => {
                     let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
-                    state.insert(prefix_hash, PrimeState::Primed);
+                    state.insert(
+                        prefix_hash,
+                        PrimeState::Primed {
+                            at: std::time::Instant::now(),
+                        },
+                    );
                     tracing::info!(
                         %model,
                         elapsed_s = attempt_started.elapsed().as_secs_f64(),
@@ -270,7 +340,7 @@ impl AnthropicBatch {
                     let mut state = self.prime_state.lock().expect("prime_state mutex poisoned");
                     let next_count = match state.get(&prefix_hash).copied() {
                         Some(PrimeState::Failed(n)) => n + 1,
-                        Some(PrimeState::Primed) => {
+                        Some(PrimeState::Primed { .. }) => {
                             // A concurrent caller succeeded while we
                             // were still attempting. Trust their success.
                             tracing::debug!(
@@ -283,7 +353,12 @@ impl AnthropicBatch {
                     };
 
                     if next_count >= MAX_PRIME_ATTEMPTS {
-                        state.insert(prefix_hash, PrimeState::Abandoned);
+                        state.insert(
+                            prefix_hash,
+                            PrimeState::Abandoned {
+                                at: std::time::Instant::now(),
+                            },
+                        );
                         drop(state);
                         tracing::warn!(
                             %model,
@@ -346,8 +421,8 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
         items: Vec<WorkItem<CachedPrompt<'static>>>,
     ) -> anyhow::Result<Self::Handle> {
         // No priming happens here. Cache priming is eager: the caller
-        // (`scheduler::run_all`) invokes [`AnthropicBatch::prime_prefixes`]
-        // once per session, before any real batch runs, so by the time
+        // invokes [`AnthropicBatch::prime_prefixes`] at the start of
+        // each cycle, before that cycle's real batches, so by the time
         // `submit` is called the cache is either already warm or the
         // prefix has been `Abandoned` (in which case this batch just
         // pays uncached input cost — that's the desired soft-degrade).
