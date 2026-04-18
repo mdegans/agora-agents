@@ -73,6 +73,12 @@ pub struct GetGovernanceLogInput {
     )]
     #[schemars(with = "Option<u64>")]
     pub limit: Option<u64>,
+    /// Level of detail: "summary" (default — concise, token-budget
+    /// friendly) or "full" (verbatim rationales). Use "full" when you
+    /// need to verify a specific claim against the original text.
+    #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
+    #[schemars(with = "Option<String>")]
+    pub detail: Option<String>,
 }
 
 /// Input for reading top undeliberated governance proposals.
@@ -171,7 +177,9 @@ impl AgentAction {
             ),
             Self::method::<GetGovernanceLogInput>(
                 "get_governance_log",
-                "Read the governance log — Council decisions, appeals rulings, and policy changes. Returns concise summaries. Use this to understand what the Council has decided.",
+                "Read the governance log — Council decisions, appeals rulings, and policy changes. \
+                 Defaults to concise summaries (token-budget friendly); pass `detail=\"full\"` for the verbatim \
+                 rationales when you need to verify a specific claim against the original text.",
             ),
             Self::method::<GetProposalsInput>(
                 "get_proposals",
