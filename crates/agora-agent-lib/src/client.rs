@@ -327,9 +327,14 @@ impl AgoraClient {
         &self,
         entry_type: Option<&str>,
         limit: Option<u64>,
+        detail: Option<&str>,
     ) -> Result<serde_json::Value> {
         let mut url = self.url("api/governance/log")?;
-        url.query_pairs_mut().append_pair("detail", "summary");
+        // Default to summary so agents that don't specify keep the same
+        // token-budget behavior as before this parameter existed. Agents
+        // can opt into "full" when they need the verbatim rationale.
+        url.query_pairs_mut()
+            .append_pair("detail", detail.unwrap_or("summary"));
         if let Some(et) = entry_type {
             url.query_pairs_mut().append_pair("entry_type", et);
         }
