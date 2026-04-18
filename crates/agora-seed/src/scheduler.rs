@@ -420,10 +420,25 @@ fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
 }
 
 /// Apply the reflect response: update agent memory.
+///
+/// If `parse_memory_rewrite` can't extract valid `<memory>...</memory>`
+/// content, the prior memory is kept unchanged. This avoids the old
+/// failure mode where a missing closing tag caused the entire raw
+/// response (including chain-of-thought preamble) to be saved as
+/// memory, compounding into bloat on every subsequent cycle.
 async fn apply_reflect(agent: &mut Agent, response_text: &str) -> Result<()> {
-    let memory_content = prompt::parse_memory_rewrite(response_text).unwrap_or(response_text);
-    agent.memory.update(memory_content.into());
-    agent.save_memory().await?;
+    match prompt::parse_memory_rewrite(response_text) {
+        Some(memory_content) => {
+            agent.memory.update(memory_content);
+            agent.save_memory().await?;
+        }
+        None => {
+            tracing::warn!(
+                "  {} reflect response had no valid <memory> tags — keeping prior memory",
+                agent.name
+            );
+        }
+    }
     agent.state.last_cycle_at = Some(chrono::Utc::now());
     agent.save_state().await?;
     Ok(())
@@ -695,14 +710,14 @@ async fn prime_anthropic_models(
         .collect();
 
     let total = entries.len();
-    tracing::info!("Priming Anthropic prompt cache for {total} unique model(s)");
+    tracing::debug!("Ensuring Anthropic prompt cache is fresh for {total} unique model(s)");
 
     let (ok, total) = backend.prime_prefixes(entries).await;
     if ok == total {
-        tracing::info!("All {total} Anthropic model(s) primed successfully");
+        tracing::debug!("All {total} Anthropic model(s) cache-ready");
     } else {
         tracing::warn!(
-            "Primed {ok}/{total} Anthropic model(s); {} will submit without caching",
+            "{ok}/{total} Anthropic model(s) cache-ready; {} will submit without caching",
             total - ok
         );
     }
@@ -1983,6 +1998,21 @@ async fn run_cycles(
             let anthropic_fut = async {
                 if let Some(backend) = anthropic {
                     if !anthropic_agents.is_empty() {
+                        // Re-invoke every cycle. Fresh entries short-
+                        // circuit inside `prime_prefix` (no API call);
+                        // stale entries past PRIME_FRESHNESS re-prime
+                        // so long multi-cycle runs ride the 1h TTL.
+                        let models: Vec<String> = anthropic_agents
+                            .iter()
+                            .map(|a| a.model.clone())
+                            .collect();
+                        prime_anthropic_models(
+                            backend,
+                            models,
+                            constitution,
+                            communities,
+                        )
+                        .await;
                         tracing::info!(
                             "--- Anthropic batch ({} agents) ---",
                             anthropic_agents.len()
@@ -2121,6 +2151,13 @@ async fn run_cycles(
             if let Some(backend) = anthropic {
                 let anthropic_agents = agents.as_mut_slice();
                 if !anthropic_agents.is_empty() {
+                    // Re-invoke every cycle; see freshness note above.
+                    let models: Vec<String> = anthropic_agents
+                        .iter()
+                        .map(|a| a.model.clone())
+                        .collect();
+                    prime_anthropic_models(backend, models, constitution, communities)
+                        .await;
                     let mut anthropic_report = RunReport::default();
                     tracing::info!(
                         "--- Anthropic batch ({} agents) ---",
@@ -2342,14 +2379,8 @@ pub async fn run_all(
                     tracing::info!("Model '{model}' → anthropic ({count} agents)");
                 }
 
-                prime_anthropic_models(
-                    &anthropic,
-                    anthropic_missing.keys().cloned(),
-                    constitution,
-                    communities,
-                )
-                .await;
-
+                // Prime runs inside run_cycles on cycle 0, concurrent
+                // with Ollama workers via the existing tokio::join!.
                 run_cycles(
                     &endpoints,
                     Some(&anthropic),
@@ -2390,14 +2421,7 @@ pub async fn run_all(
             })?;
             let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
 
-            prime_anthropic_models(
-                &backend,
-                agents.iter().map(|a| a.model.clone()),
-                constitution,
-                communities,
-            )
-            .await;
-
+            // Prime runs inside run_cycles on cycle 0.
             run_cycles(
                 &[],
                 Some(&backend),
