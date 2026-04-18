@@ -153,7 +153,11 @@ async fn execute_action(
         },
         prompt::AgentAction::GetGovernanceLog(input) => {
             match client
-                .get_governance_log(input.entry_type.as_deref(), input.limit)
+                .get_governance_log(
+                    input.entry_type.as_deref(),
+                    input.limit,
+                    input.detail.as_deref(),
+                )
                 .await
             {
                 Ok(data) => (
