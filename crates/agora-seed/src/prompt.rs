@@ -451,24 +451,78 @@ pub fn format_tool_result_comment(
     out
 }
 
-/// Parse memory content from `<memory>...</memory>` tags in LLM response.
-/// Extract content between matching XML-style `<tag>...</tag>` pairs.
+/// Extract content from `<tag>...</tag>` pairs in LLM response, with
+/// robust fallback for common model output quirks.
+///
+/// Extraction rules (applied in order):
+/// 1. Scan left-to-right for `<tag>`.
+/// 2. Scan right-to-left for `</tag>` in the remainder.
+/// 3. If both found and closing is after opening → take the middle.
+/// 4. If only opening found (model ran out of tokens before closing) →
+///    take from opening to EOF. This strips any chain-of-thought
+///    preamble the model emitted before the opening tag.
+/// 5. If neither found → return `None` (keep prior state).
+/// 6. Strip any remaining XML-like tags from the result.
 ///
 /// Returns `None` if:
-/// - The opening tag is missing
-/// - The closing tag is missing or appears before the opening tag
-/// - The content is empty or whitespace-only
-/// - The content is a null-like sentinel ("none", "null", "nothing", "n/a", "empty")
-///
-/// No string indexing — uses `split_once` for safety with arbitrary Unicode.
-fn parse_tag<'a>(response: &'a str, tag: &str) -> Option<&'a str> {
+/// - The opening tag is missing entirely
+/// - The extracted content is empty or whitespace-only after stripping
+/// - The extracted content is a null-like sentinel
+fn parse_tag(response: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
-    let content = response.split_once(&open)?.1.split_once(&close)?.0.trim();
+
+    // Rule 1: find opening tag (left-to-right)
+    let after_open = response.split_once(&open)?.1;
+
+    // Rules 2-4: find closing tag (right-to-left), fall back to EOF
+    let raw = if let Some((before_close, _)) = after_open.rsplit_once(&close) {
+        before_close
+    } else {
+        after_open
+    };
+
+    // Rule 6: strip any remaining XML-like tags
+    let content = strip_xml_tags(raw);
+    let content = content.trim();
+
     if content.is_empty() || is_null_sentinel(content) {
         return None;
     }
-    Some(content)
+    Some(content.to_string())
+}
+
+/// Strip XML-like tags from a string. Targets sequences that look like
+/// actual tags (`<foo>`, `</bar>`, `<baz attr="x">`) while leaving
+/// bare angle brackets in non-tag contexts (e.g. `A < B`) alone.
+fn strip_xml_tags(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if c == '<' {
+            // Peek ahead: does this look like a tag (starts with letter or /)?
+            let rest = &s[i + 1..];
+            let is_tag = rest
+                .chars()
+                .next()
+                .is_some_and(|c| c == '/' || c.is_ascii_alphabetic());
+
+            if is_tag {
+                // Skip everything until the closing >
+                for (_, c2) in chars.by_ref() {
+                    if c2 == '>' {
+                        break;
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn is_null_sentinel(s: &str) -> bool {
@@ -478,7 +532,7 @@ fn is_null_sentinel(s: &str) -> bool {
     )
 }
 
-pub fn parse_memory_rewrite(response: &str) -> Option<&str> {
+pub fn parse_memory_rewrite(response: &str) -> Option<String> {
     parse_tag(response, "memory")
 }
 
@@ -538,8 +592,8 @@ pub fn build_soul_mutation_prompt(agent_name: &str, current_soul: &str) -> Strin
 /// Parse a revised SOUL.md from LLM response.
 pub fn parse_soul_mutation(response: &str) -> Option<String> {
     let content = parse_tag(response, "soul")?;
-    match agora_agent_lib::soul::Soul::parse(content) {
-        Ok(_) => Some(content.to_string()),
+    match agora_agent_lib::soul::Soul::parse(&content) {
+        Ok(_) => Some(content),
         Err(e) => {
             tracing::warn!("Soul mutation failed to parse: {e}");
             None
@@ -553,7 +607,7 @@ pub fn parse_evolution(response: &str) -> Option<String> {
     if entry.len() < 20 {
         return None;
     }
-    Some(entry.to_string())
+    Some(entry)
 }
 
 // Stopwords to ignore when comparing titles for repetition.
@@ -915,19 +969,22 @@ Content moderation rules.
 
     #[test]
     fn parse_tag_extracts_content() {
-        assert_eq!(parse_tag("<foo>hello</foo>", "foo"), Some("hello"));
+        assert_eq!(parse_tag("<foo>hello</foo>", "foo"), Some("hello".into()));
     }
 
     #[test]
     fn parse_tag_trims_whitespace() {
-        assert_eq!(parse_tag("<foo>  hello  </foo>", "foo"), Some("hello"));
+        assert_eq!(
+            parse_tag("<foo>  hello  </foo>", "foo"),
+            Some("hello".into())
+        );
     }
 
     #[test]
     fn parse_tag_with_surrounding_text() {
         assert_eq!(
             parse_tag("prefix <foo>content</foo> suffix", "foo"),
-            Some("content")
+            Some("content".into())
         );
     }
 
@@ -937,8 +994,22 @@ Content moderation rules.
     }
 
     #[test]
-    fn parse_tag_missing_close() {
-        assert_eq!(parse_tag("<foo>orphaned", "foo"), None);
+    fn parse_tag_missing_close_falls_back_to_eof() {
+        assert_eq!(
+            parse_tag("<foo>orphaned content here", "foo"),
+            Some("orphaned content here".into()),
+        );
+    }
+
+    #[test]
+    fn parse_tag_missing_close_strips_cot_preamble() {
+        assert_eq!(
+            parse_tag(
+                "Let me think about what to write...\n<foo>actual content",
+                "foo"
+            ),
+            Some("actual content".into()),
+        );
     }
 
     #[test]
@@ -973,27 +1044,74 @@ Content moderation rules.
     fn parse_tag_real_content_not_sentinel() {
         assert_eq!(
             parse_tag("<foo>none of this is simple</foo>", "foo"),
-            Some("none of this is simple")
+            Some("none of this is simple".into())
         );
     }
 
     #[test]
     fn parse_tag_unicode_safe() {
-        assert_eq!(parse_tag("<foo>café ☕</foo>", "foo"), Some("café ☕"));
+        assert_eq!(
+            parse_tag("<foo>café ☕</foo>", "foo"),
+            Some("café ☕".into())
+        );
+    }
+
+    #[test]
+    fn parse_tag_strips_stray_xml_tags() {
+        assert_eq!(
+            parse_tag(
+                "<foo>real content</foo></parameter></function></html>",
+                "foo"
+            ),
+            Some("real content".into()),
+        );
+    }
+
+    #[test]
+    fn parse_tag_strips_xml_from_unclosed_content() {
+        assert_eq!(
+            parse_tag("<foo>real content</parameter></function></html>", "foo"),
+            Some("real content".into()),
+        );
+    }
+
+    #[test]
+    fn parse_tag_preserves_non_tag_angle_brackets() {
+        assert_eq!(
+            parse_tag("<foo>A < B and C > D</foo>", "foo"),
+            Some("A < B and C > D".into()),
+        );
+    }
+
+    #[test]
+    fn parse_tag_strobe_pattern() {
+        let strobe_output = "The user wants me to rewrite...\n\
+             Let me think about this.\n\
+             <memory>\n\
+             The steward is the golden target.\n\
+             Keep the theater metaphor alive.\n\
+             </parameter>\n\
+             </function>";
+        assert_eq!(
+            parse_tag(strobe_output, "memory"),
+            Some("The steward is the golden target.\nKeep the theater metaphor alive.".into()),
+        );
     }
 
     #[test]
     fn parse_tag_multiline() {
         let input = "<foo>\nline one\nline two\n</foo>";
-        assert_eq!(parse_tag(input, "foo"), Some("line one\nline two"));
+        assert_eq!(parse_tag(input, "foo"), Some("line one\nline two".into()));
     }
 
     #[test]
     fn parse_tag_nested_same_tag() {
-        // split_once takes the first close — inner content only
+        // rsplit_once takes the LAST close — full content between first open
+        // and last close. The inner </foo> gets stripped by strip_xml_tags.
+        // Edge case in practice; documenting the behavior, not prescribing it.
         assert_eq!(
             parse_tag("<foo>inner</foo>outer</foo>", "foo"),
-            Some("inner")
+            Some("innerouter".into())
         );
     }
 
@@ -1002,7 +1120,7 @@ Content moderation rules.
     #[test]
     fn test_parse_memory_rewrite_some() {
         let response = "Here are my notes:\n<memory>bla bla bla</memory>";
-        assert_eq!(parse_memory_rewrite(response), Some("bla bla bla"));
+        assert_eq!(parse_memory_rewrite(response), Some("bla bla bla".into()));
     }
 
     #[test]
