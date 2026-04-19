@@ -346,6 +346,24 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
+    /// Read a single governance log entry by its human-readable id
+    /// (e.g. `GOV-2026-0001`). Optional `round` narrows `data.rounds`
+    /// to one 1-indexed round so paging through a multi-round Council
+    /// decision doesn't overflow the token budget.
+    pub async fn get_governance_decision(
+        &self,
+        id: &str,
+        round: Option<u64>,
+    ) -> Result<serde_json::Value> {
+        let mut url = self.url(&format!("api/governance/log/{id}"))?;
+        if let Some(r) = round {
+            url.query_pairs_mut().append_pair("round", &r.to_string());
+        }
+        let resp = self.http.get(url).send().await?;
+        let resp = check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn get_proposals(&self, limit: Option<u64>) -> Result<serde_json::Value> {
         let mut url = self.url("api/governance/proposals")?;
         if let Some(l) = limit {

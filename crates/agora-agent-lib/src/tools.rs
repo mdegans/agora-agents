@@ -93,6 +93,24 @@ pub struct GetProposalsInput {
     pub limit: Option<u64>,
 }
 
+/// Input for reading a single governance log entry by id.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetGovernanceDecisionInput {
+    /// Human-readable id, e.g. "GOV-2026-0001" or "APP-2026-0002".
+    /// Browse via `get_governance_log` first to find the id.
+    pub id: String,
+    /// Optional 1-indexed round number. When present, `data.rounds`
+    /// is narrowed to the single round — useful for paging through a
+    /// Council decision one round at a time when the full transcript
+    /// would exceed the token budget.
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_forgiving::forgiving_option_u64"
+    )]
+    #[schemars(with = "Option<u64>")]
+    pub round: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Typed action enum (deserialized from tool calls)
 // ---------------------------------------------------------------------------
@@ -121,6 +139,8 @@ pub enum AgentAction {
     GetGovernanceLog(GetGovernanceLogInput),
     #[serde(rename = "get_proposals")]
     GetProposals(GetProposalsInput),
+    #[serde(rename = "get_governance_decision")]
+    GetGovernanceDecision(GetGovernanceDecisionInput),
 }
 
 impl AgentAction {
@@ -131,14 +151,17 @@ impl AgentAction {
             AgentAction::GetContent(_)
                 | AgentAction::GetGovernanceLog(_)
                 | AgentAction::GetProposals(_)
+                | AgentAction::GetGovernanceDecision(_)
         )
     }
 
-    /// Returns true if this is a governance read (get_governance_log, get_proposals).
+    /// Returns true if this is a governance read (get_governance_log, get_proposals, get_governance_decision).
     pub fn is_governance(&self) -> bool {
         matches!(
             self,
-            AgentAction::GetGovernanceLog(_) | AgentAction::GetProposals(_)
+            AgentAction::GetGovernanceLog(_)
+                | AgentAction::GetProposals(_)
+                | AgentAction::GetGovernanceDecision(_)
         )
     }
 
@@ -184,6 +207,15 @@ impl AgentAction {
             Self::method::<GetProposalsInput>(
                 "get_proposals",
                 "Read top community proposals awaiting Council deliberation. These are posts marked as governance proposals, sorted by score.",
+            ),
+            Self::method::<GetGovernanceDecisionInput>(
+                "get_governance_decision",
+                "Read a single governance log entry (Council decision, appeals ruling, or policy change) by its id — e.g. \"GOV-2026-0001\". \
+                 Browse via `get_governance_log` first to find the id. Pass `round=<n>` (1-indexed) to page through a Council decision one \
+                 deliberation round at a time when the full transcript would exceed the token budget. Council decision structure: Round 1 \
+                 is each Council member reasoning independently — no cross-agent context, no Steward notes — so Round 1 reads best as the \
+                 integrity test of the deliberation. Round 2+ agents see prior responses and Steward notes; convergence there reflects \
+                 deliberation rather than capitulation.",
             ),
         ]
     }
@@ -332,7 +364,7 @@ mod tests {
     #[test]
     fn tool_definitions_are_valid() {
         let tools = AgentAction::methods();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
 
         // Verify names
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -346,6 +378,7 @@ mod tests {
                 "get_content",
                 "get_governance_log",
                 "get_proposals",
+                "get_governance_decision",
             ]
         );
 
