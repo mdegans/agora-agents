@@ -702,7 +702,7 @@ mod exchange_tests {
         use std::num::NonZeroU16;
         assert!(is_recoverable(&anyhowed(ClientError::Anthropic(
             AnthropicError::Unknown {
-                code: NonZeroU16::new(503).unwrap(),
+                code: Some(NonZeroU16::new(503).unwrap()),
                 message: "gateway".into(),
             },
         ))));
@@ -806,7 +806,7 @@ mod exchange_tests {
         use std::num::NonZeroU16;
         assert!(!is_recoverable(&anyhowed(ClientError::Anthropic(
             AnthropicError::Unknown {
-                code: NonZeroU16::new(418).unwrap(),
+                code: Some(NonZeroU16::new(418).unwrap()),
                 message: "teapot".into(),
             },
         ))));

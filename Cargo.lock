@@ -25,7 +25,7 @@ dependencies = [
 [[package]]
 name = "agora-agentkit"
 version = "0.1.0"
-source = "git+https://github.com/mdegans/agora-agentkit.git#c0eecec6a320a61328d5dc9656545b1c2898de7f"
+source = "git+https://github.com/mdegans/agora-agentkit.git#dbef8f061672219c91db187305dfbd7e2420288c"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1255,7 +1255,7 @@ dependencies = [
 [[package]]
 name = "misanthropic"
 version = "1.0.0-alpha.1"
-source = "git+https://github.com/mdegans/misanthropic?branch=dev#be2ccb222e3210efef4ae6ac334ca5b06bbd4c05"
+source = "git+https://github.com/mdegans/misanthropic?branch=dev#0bda9708d974fb65ff302181b39595e6640ca0bc"
 dependencies = [
  "async-stream",
  "async-trait",
