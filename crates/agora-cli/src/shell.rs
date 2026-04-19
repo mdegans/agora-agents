@@ -88,7 +88,9 @@ fn expand_heredocs(words: &mut [String], rl: &mut DefaultEditor) -> Result<()> {
             continue;
         };
         if sentinel.is_empty() {
-            return Err(anyhow!("heredoc marker `<<` must be followed by a sentinel word (e.g. `<<END`)"));
+            return Err(anyhow!(
+                "heredoc marker `<<` must be followed by a sentinel word (e.g. `<<END`)"
+            ));
         }
         let sentinel = sentinel.to_string();
         let body = read_heredoc_body(rl, &sentinel)?;
@@ -112,8 +114,7 @@ fn read_heredoc_body(rl: &mut DefaultEditor, sentinel: &str) -> Result<String> {
                 lines.push(line);
             }
             Err(
-                rustyline::error::ReadlineError::Interrupted
-                | rustyline::error::ReadlineError::Eof,
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
             ) => {
                 return Err(anyhow!("heredoc aborted before `{sentinel}` terminator"));
             }
@@ -127,9 +128,9 @@ fn shell_words(input: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let mut chars = input.chars().peekable();
+    let chars = input.chars().peekable();
 
-    while let Some(ch) = chars.next() {
+    for ch in chars {
         match ch {
             '"' => in_quotes = !in_quotes,
             ' ' | '\t' if !in_quotes => {
