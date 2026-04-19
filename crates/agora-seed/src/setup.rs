@@ -44,14 +44,14 @@ pub async fn register_all(
         // Check if agent exists on server
         match client.get_agent(&agent.name).await {
             Ok(Some(data)) => {
-                if let Some(id_str) = data.get("id").and_then(|v| v.as_str()) {
-                    if let Ok(uuid) = id_str.parse::<uuid::Uuid>() {
-                        agent.agent_id =
-                            Some(agora_agent_lib::agora_agentkit::ids::AgentId::from(uuid));
-                        agent.save_agent_id().await?;
-                        skipped += 1;
-                        continue;
-                    }
+                if let Some(id_str) = data.get("id").and_then(|v| v.as_str())
+                    && let Ok(uuid) = id_str.parse::<uuid::Uuid>()
+                {
+                    agent.agent_id =
+                        Some(agora_agent_lib::agora_agentkit::ids::AgentId::from(uuid));
+                    agent.save_agent_id().await?;
+                    skipped += 1;
+                    continue;
                 }
             }
             Ok(None) => {}

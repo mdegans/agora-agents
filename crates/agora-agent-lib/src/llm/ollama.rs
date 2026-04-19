@@ -73,7 +73,7 @@ pub async fn send_with_nudge(
             .message(&retry_prompt)
             .await
             .context("Ollama nudge request failed")?;
-        total_usage = total_usage + response.usage;
+        total_usage += response.usage;
         last_msg = response.inner.into();
 
         if has_tool_use(&last_msg) {

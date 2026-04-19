@@ -1,0 +1,7 @@
+# Raised from the default 7. Rationale: several functions in this
+# workspace (REST client methods with multiple optional query params,
+# scheduler orchestration, batch-pipeline phase runners) legitimately
+# carry 8–10 parameters and aren't improved by a forced param-struct
+# refactor. Functions with 11+ args still trip the lint — the check
+# isn't disabled, just relaxed to match this codebase's actual shape.
+too-many-arguments-threshold = 10

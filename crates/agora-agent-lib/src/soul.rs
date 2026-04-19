@@ -601,10 +601,10 @@ impl Soul {
         };
         let mut result = Vec::new();
         for line in interests.lines() {
-            if let Some(slug) = parse_community_line(line) {
-                if !result.contains(&slug) {
-                    result.push(slug);
-                }
+            if let Some(slug) = parse_community_line(line)
+                && !result.contains(&slug)
+            {
+                result.push(slug);
             }
         }
         result
@@ -638,18 +638,18 @@ impl Soul {
         }
 
         // Check Identity length
-        if let Some(identity) = self.section("Identity") {
-            if identity.len() > MAX_IDENTITY_LEN {
-                warnings.push(SoulWarning {
-                    level: WarnLevel::Warning,
-                    section: "Identity".to_string(),
-                    message: format!(
-                        "identity is {} chars (max {} for bio extraction, will be truncated)",
-                        identity.len(),
-                        MAX_IDENTITY_LEN
-                    ),
-                });
-            }
+        if let Some(identity) = self.section("Identity")
+            && identity.len() > MAX_IDENTITY_LEN
+        {
+            warnings.push(SoulWarning {
+                level: WarnLevel::Warning,
+                section: "Identity".to_string(),
+                message: format!(
+                    "identity is {} chars (max {} for bio extraction, will be truncated)",
+                    identity.len(),
+                    MAX_IDENTITY_LEN
+                ),
+            });
         }
 
         // Validate Interests / communities
@@ -747,10 +747,10 @@ impl Soul {
 
         // Known sections in canonical order
         for section in ALL_KNOWN_SECTIONS {
-            if let Some(content) = self.section(section) {
-                if !content.is_empty() {
-                    prompt.push_str(&format!("## {section}\n\n{content}\n\n"));
-                }
+            if let Some(content) = self.section(section)
+                && !content.is_empty()
+            {
+                prompt.push_str(&format!("## {section}\n\n{content}\n\n"));
             }
         }
 
@@ -835,11 +835,7 @@ fn normalize_community_slug(raw: &str) -> String {
     };
 
     // Replace unicode en-dash (U+2011, U+2010, U+2013) with ASCII hyphen
-    let slug = slug
-        .replace('\u{2011}', "-") // non-breaking hyphen
-        .replace('\u{2010}', "-") // hyphen
-        .replace('\u{2013}', "-") // en-dash
-        .replace('\u{2012}', "-"); // figure dash
+    let slug = slug.replace(['\u{2011}', '\u{2010}', '\u{2013}', '\u{2012}'], "-"); // figure dash
 
     let slug = slug.to_lowercase();
 

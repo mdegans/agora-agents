@@ -686,14 +686,14 @@ fn auto_detect_start_index(output_dir: &std::path::Path) -> usize {
             max_index = Some(max_index.map_or(idx, |prev: usize| prev.max(idx)));
         }
         // Also handle compound names (e.g., "aegis-aether")
-        else if let Some((first, second)) = name.split_once('-') {
-            if let (Some(fi), Some(si)) = (
+        else if let Some((first, second)) = name.split_once('-')
+            && let (Some(fi), Some(si)) = (
                 NAMES.iter().position(|&n| n == first),
                 NAMES.iter().position(|&n| n == second),
-            ) {
-                let idx = si * NAMES.len() + fi;
-                max_index = Some(max_index.map_or(idx, |prev: usize| prev.max(idx)));
-            }
+            )
+        {
+            let idx = si * NAMES.len() + fi;
+            max_index = Some(max_index.map_or(idx, |prev: usize| prev.max(idx)));
         }
     }
 

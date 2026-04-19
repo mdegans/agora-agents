@@ -200,7 +200,7 @@ pub async fn exchange<B: LlmBackend + ?Sized>(
         .expect("exchange: user after assistant — turn order is a programmer bug");
     // it's now the assistant's turn
 
-    let result = send_with_retry(backend, &**prompt).await;
+    let result = send_with_retry(backend, prompt).await;
     commit_exchange_result(prompt, result, usage_total)
 }
 
@@ -255,11 +255,11 @@ async fn send_with_retry<B: LlmBackend + ?Sized>(
     prompt: &Prompt<'_>,
 ) -> Result<SendResponse> {
     let attempt = backend.send(prompt).await;
-    if let Err(ref e) = attempt {
-        if is_recoverable(e) {
-            tracing::warn!("exchange: recoverable backend error, retrying once: {e}");
-            return backend.send(prompt).await;
-        }
+    if let Err(ref e) = attempt
+        && is_recoverable(e)
+    {
+        tracing::warn!("exchange: recoverable backend error, retrying once: {e}");
+        return backend.send(prompt).await;
     }
     attempt
 }

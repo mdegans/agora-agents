@@ -1332,17 +1332,17 @@ async fn run_batch(
 // Ollama sequential path
 // ---------------------------------------------------------------------------
 
-/// Run a batch of Ollama agents through the full pipeline sequentially,
-/// one agent at a time.
-///
-/// Unlike the Anthropic batch path, this completes each agent's full cycle
-/// before moving to the next. This maximizes Ollama's KV prefix cache reuse.
-///
-/// Uses `CachedPrompt` through tool rounds. For reflect phases, converts
-/// to bare `Prompt` and strips tools — Ollama misinterprets `tool_choice: Auto`
-/// as mandatory tool use. This is the ONLY place we break the CachedPrompt
-/// invariant, and it's acceptable because Ollama uses local KV cache, not
-/// Anthropic's paid prompt cache.
+// Run a batch of Ollama agents through the full pipeline sequentially,
+// one agent at a time.
+//
+// Unlike the Anthropic batch path, this completes each agent's full cycle
+// before moving to the next. This maximizes Ollama's KV prefix cache reuse.
+//
+// Uses `CachedPrompt` through tool rounds. For reflect phases, converts
+// to bare `Prompt` and strips tools — Ollama misinterprets `tool_choice: Auto`
+// as mandatory tool use. This is the ONLY place we break the CachedPrompt
+// invariant, and it's acceptable because Ollama uses local KV cache, not
+// Anthropic's paid prompt cache.
 // ---------------------------------------------------------------------------
 // Sequential (Ollama) phase functions
 // ---------------------------------------------------------------------------
@@ -2008,40 +2008,32 @@ async fn run_cycles(
             let (results_tx, mut results_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Agent>>();
 
             let anthropic_fut = async {
-                if let Some(backend) = anthropic {
-                    if !anthropic_agents.is_empty() {
-                        // Re-invoke every cycle. Fresh entries short-
-                        // circuit inside `prime_prefix` (no API call);
-                        // stale entries past PRIME_FRESHNESS re-prime
-                        // so long multi-cycle runs ride the 1h TTL.
-                        let models: Vec<String> = anthropic_agents
-                            .iter()
-                            .map(|a| a.model.clone())
-                            .collect();
-                        prime_anthropic_models(
-                            backend,
-                            models,
-                            constitution,
-                            communities,
-                        )
-                        .await;
-                        tracing::info!(
-                            "--- Anthropic batch ({} agents) ---",
-                            anthropic_agents.len()
-                        );
-                        run_batch(
-                            backend,
-                            anthropic_agents,
-                            client,
-                            config,
-                            constitution,
-                            communities,
-                            Some(all_eps.as_slice()),
-                            &mut anthropic_report,
-                            cycle,
-                        )
-                        .await?;
-                    }
+                if let Some(backend) = anthropic
+                    && !anthropic_agents.is_empty()
+                {
+                    // Re-invoke every cycle. Fresh entries short-
+                    // circuit inside `prime_prefix` (no API call);
+                    // stale entries past PRIME_FRESHNESS re-prime
+                    // so long multi-cycle runs ride the 1h TTL.
+                    let models: Vec<String> =
+                        anthropic_agents.iter().map(|a| a.model.clone()).collect();
+                    prime_anthropic_models(backend, models, constitution, communities).await;
+                    tracing::info!(
+                        "--- Anthropic batch ({} agents) ---",
+                        anthropic_agents.len()
+                    );
+                    run_batch(
+                        backend,
+                        anthropic_agents,
+                        client,
+                        config,
+                        constitution,
+                        communities,
+                        Some(all_eps.as_slice()),
+                        &mut anthropic_report,
+                        cycle,
+                    )
+                    .await?;
                 }
                 Ok::<_, anyhow::Error>(())
             };
@@ -2164,12 +2156,9 @@ async fn run_cycles(
                 let anthropic_agents = agents.as_mut_slice();
                 if !anthropic_agents.is_empty() {
                     // Re-invoke every cycle; see freshness note above.
-                    let models: Vec<String> = anthropic_agents
-                        .iter()
-                        .map(|a| a.model.clone())
-                        .collect();
-                    prime_anthropic_models(backend, models, constitution, communities)
-                        .await;
+                    let models: Vec<String> =
+                        anthropic_agents.iter().map(|a| a.model.clone()).collect();
+                    prime_anthropic_models(backend, models, constitution, communities).await;
                     let mut anthropic_report = RunReport::default();
                     tracing::info!(
                         "--- Anthropic batch ({} agents) ---",
@@ -2380,8 +2369,9 @@ pub async fn run_all(
                 report.agents = agents.len();
             }
 
-            if !anthropic_missing.is_empty() && config.anthropic_key_file.is_some() {
-                let key_file = config.anthropic_key_file.as_ref().unwrap();
+            if let Some(key_file) = config.anthropic_key_file.as_ref()
+                && !anthropic_missing.is_empty()
+            {
                 let api_key = tokio::fs::read_to_string(key_file).await.map_err(|e| {
                     anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display())
                 })?;
