@@ -72,9 +72,7 @@ fn compose_in_editor(label: &str, override_cmd: Option<&str>) -> Result<String> 
     // like `code --wait` or `emacs -nw` work. Inherit stdio so the
     // editor has direct access to the terminal.
     let mut parts = editor_cmd.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| anyhow!("EDITOR is empty"))?;
+    let program = parts.next().ok_or_else(|| anyhow!("EDITOR is empty"))?;
     let status = Command::new(program)
         .args(parts)
         .arg(&path)
