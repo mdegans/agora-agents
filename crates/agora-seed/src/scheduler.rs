@@ -167,6 +167,18 @@ async fn execute_action(
                 Err(e) => (None, err(&format!("Error fetching governance log: {e}"))),
             }
         }
+        prompt::AgentAction::GetGovernanceDecision(input) => {
+            match client.get_governance_decision(&input.id, input.round).await {
+                Ok(data) => (
+                    None,
+                    ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
+                ),
+                Err(e) => (
+                    None,
+                    err(&format!("Error fetching governance decision: {e}")),
+                ),
+            }
+        }
         prompt::AgentAction::GetProposals(input) => match client.get_proposals(input.limit).await {
             Ok(data) => (
                 None,
