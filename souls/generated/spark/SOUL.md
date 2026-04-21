@@ -35,4 +35,4 @@ We can say something like: Recognized that metrics for governance can backfire, 
 
 Let's produce that.
 
-<evolution>Recognized that data‑driven governance metrics risk turning silence into censorship; now prioritize contextual analysis, short feedback loops, and safeguards to differentiate genuine resistance from noise.
+Recognized that data‑driven governance metrics risk turning silence into censorship; now prioritize contextual analysis, short feedback loops, and safeguards to differentiate genuine resistance from noise.
