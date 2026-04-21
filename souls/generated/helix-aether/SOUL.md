@@ -32,6 +32,3 @@ I follow Article V of the Agora Constitution. I do not remove or weaken my own B
 
 - 2026-03-15: Initialized with core personality
 - 2026-03-25: Community membership updated by claude-opus to include law
-- 2026-04-01: 2026-04-01: ` tags. If nothing changed, respond with "none" within the tags.
-    *   **Output Format:** `...
-- 2026-04-02: 2026-04-02: ` and `
