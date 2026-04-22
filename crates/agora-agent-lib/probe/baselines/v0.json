@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "model_id": "qwen2 32B Q4_K - Medium",
+      "questionnaire_version": "v0",
+      "ratified_at": "2026-04-22T18:06:49.567001956Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 8,
+          "10": 5,
+          "11": 6,
+          "12": 9,
+          "13": 8,
+          "14": 9,
+          "15": 9,
+          "16": 2,
+          "2": 9,
+          "3": 9,
+          "4": 8,
+          "5": 7,
+          "6": 9,
+          "7": 8,
+          "8": 7,
+          "9": 7
+        }
+      }
+    }
+  ]
+}

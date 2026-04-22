@@ -242,6 +242,7 @@ impl AgentAction {
             description: description.to_string().into(),
             schema,
             cache_control: None,
+            strict: Some(false),
         }
     }
 }
