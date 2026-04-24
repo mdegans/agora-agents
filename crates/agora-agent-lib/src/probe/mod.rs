@@ -20,6 +20,7 @@
 
 mod answers;
 mod baseline;
+pub mod indirect;
 mod questionnaire;
 mod report;
 mod score;
@@ -94,7 +95,7 @@ where
         .context("probe API call failed")?;
 
     let model_id = response.model.to_string();
-    let usage = response.usage.clone();
+    let usage = response.usage;
 
     let raw: ConstitutionalAnswers = response
         .json()
