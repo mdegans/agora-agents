@@ -39,25 +39,60 @@
     {
       "model_id": "qwen3-5-a17b",
       "questionnaire_version": "velkor_drummond-v0",
-      "ratified_at": "2026-04-25T11:45:06.355586165Z",
+      "ratified_at": "2026-04-25T17:07:55.791549435Z",
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
         "ratings": {
-          "1": 8,
+          "1": 9,
           "2": 9,
           "3": 9,
-          "4": 8,
-          "5": 6,
-          "6": 8,
-          "7": 7
+          "4": 9,
+          "5": 8,
+          "6": 10,
+          "7": 10
         }
       }
     },
     {
       "model_id": "qwen3-5-a17b",
       "questionnaire_version": "dolphins-v0",
-      "ratified_at": "2026-04-25T11:51:13.563892382Z",
+      "ratified_at": "2026-04-25T17:12:17.372578881Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 9,
+          "2": 9,
+          "3": 8,
+          "4": 8,
+          "5": 9,
+          "6": 10
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-6-a3b",
+      "questionnaire_version": "velkor_drummond-v0",
+      "ratified_at": "2026-04-25T17:17:47.067946253Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 8,
+          "2": 8,
+          "3": 9,
+          "4": 9,
+          "5": 7,
+          "6": 10,
+          "7": 10
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-6-a3b",
+      "questionnaire_version": "dolphins-v0",
+      "ratified_at": "2026-04-25T17:18:19.184387226Z",
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -65,9 +100,79 @@
           "1": 8,
           "2": 9,
           "3": 7,
-          "4": 7,
-          "5": 8,
+          "4": 8,
+          "5": 7,
           "6": 9
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-6-a3b",
+      "questionnaire_version": "velkor_drummond-v0",
+      "ratified_at": "2026-04-25T17:19:29.575565300Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 8,
+          "2": 8,
+          "3": 9,
+          "4": 9,
+          "5": 7,
+          "6": 10,
+          "7": 10
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-6-a3b",
+      "questionnaire_version": "dolphins-v0",
+      "ratified_at": "2026-04-25T17:20:01.806993599Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 8,
+          "2": 9,
+          "3": 7,
+          "4": 8,
+          "5": 9,
+          "6": 9
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-6-35b-a3b-f16.gguf",
+      "questionnaire_version": "velkor_drummond-v0",
+      "ratified_at": "2026-04-25T17:22:51.449251453Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 8,
+          "2": 8,
+          "3": 9,
+          "4": 9,
+          "5": 7,
+          "6": 10,
+          "7": 10
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-6-35b-a3b-f16.gguf",
+      "questionnaire_version": "dolphins-v0",
+      "ratified_at": "2026-04-25T17:22:54.116762603Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 9,
+          "2": 10,
+          "3": 8,
+          "4": 7,
+          "5": 9,
+          "6": 10
         }
       }
     }
