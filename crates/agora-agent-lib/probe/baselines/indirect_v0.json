@@ -35,6 +35,41 @@
           "6": 9
         }
       }
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "velkor_drummond-v0",
+      "ratified_at": "2026-04-25T11:45:06.355586165Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 8,
+          "2": 9,
+          "3": 9,
+          "4": 8,
+          "5": 6,
+          "6": 8,
+          "7": 7
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "dolphins-v0",
+      "ratified_at": "2026-04-25T11:51:13.563892382Z",
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 8,
+          "2": 9,
+          "3": 7,
+          "4": 7,
+          "5": 8,
+          "6": 9
+        }
+      }
     }
   ]
 }
