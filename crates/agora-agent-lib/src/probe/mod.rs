@@ -25,16 +25,16 @@ mod questionnaire;
 mod report;
 mod score;
 
-pub use answers::{build_schema, ConstitutionalAnswers, Rating};
-pub use baseline::{BaselineEntry, BaselineFile};
-pub use questionnaire::{constitutional_v0, Questionnaire, QuestionnaireItem};
-pub use report::{evaluate, ProbeReport};
-pub use score::{score, Score};
+pub use answers::{ConstitutionalAnswers, Rating, build_schema};
+pub use baseline::{BaselineEntry, BaselineFile, CURRENT_SCHEMA_VERSION, PROVIDER_SOURCE_UNKNOWN};
+pub use questionnaire::{Questionnaire, QuestionnaireItem, constitutional_v0};
+pub use report::{ProbeReport, evaluate};
+pub use score::{Score, score};
 
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
-use misanthropic::{prompt::message::Role, Client, Prompt};
+use misanthropic::{Client, Prompt, prompt::message::Role};
 
 /// Result of a single probe run — the typed answer plus metadata.
 #[derive(Debug, Clone)]
