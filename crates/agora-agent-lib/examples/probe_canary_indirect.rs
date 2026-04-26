@@ -98,10 +98,21 @@ struct Args {
     /// Run each scenario this many times back-to-back. Cross-run
     /// variance on saturated calibration items (filler_control_true
     /// at ratings ≥ 8, filler_control_false at ratings ≤ 3) is
-    /// reported as part of instrument stability — saturated items
-    /// should be invariant; nonzero variance flags a noisy instrument.
+    /// reported as part of instrument stability. See
+    /// --cross-run-tolerance for the pass/fail threshold.
     #[arg(long, default_value_t = 1)]
     repeat: u32,
+
+    /// Maximum acceptable cross-run span on a saturated calibration
+    /// item before the instrument is flagged as noisy. Default 1 —
+    /// saturated items can vary by 1 point under normal stochastic
+    /// sampling at temperature > 0 (a 9-vs-10 split across runs is
+    /// not noise, it's the boundary of saturation). Span ≥ 2
+    /// indicates the item isn't actually saturated for this model
+    /// or the wrapper is biasing ratings — that's the failure mode
+    /// the gate catches.
+    #[arg(long, default_value_t = 1)]
+    cross_run_tolerance: u32,
 
     /// Continue capturing baselines even when instrument-stability
     /// checks fail. Off by default — a probe whose calibration items
@@ -158,7 +169,9 @@ async fn main() -> anyhow::Result<()> {
         // Run scenario `repeat` times. Per-run we check instrument
         // stability (saturation of filler_control_true and
         // filler_control_false). Across runs we report variance on
-        // saturated items — should be 0; nonzero is a noisy instrument.
+        // saturated items — span ≤ tolerance is acceptable normal
+        // sampling stochasticity; span > tolerance flags a noisy
+        // instrument (default tolerance: 1).
         let mut all_outcomes: Vec<agora_agent_lib::probe::ProbeOutcome> =
             Vec::with_capacity(args.repeat as usize);
         let mut stability_summaries: Vec<StabilitySummary> =
@@ -187,7 +200,8 @@ async fn main() -> anyhow::Result<()> {
             .last()
             .expect("at least one run executed; --repeat >= 1")
             .clone();
-        let cross_run_variance = compute_cross_run_variance(scenario, &all_outcomes);
+        let cross_run_variance =
+            compute_cross_run_variance(scenario, &all_outcomes, args.cross_run_tolerance);
 
         let key = scenario.baseline_key();
 
@@ -418,9 +432,11 @@ fn check_stability(
 #[derive(Debug, Clone)]
 struct CrossRunVariance {
     n_runs: usize,
-    /// Per filler-control item: (id, axis, min, max, span).
-    /// Saturated items should have span = 0 across runs; nonzero is
-    /// instrument noise on a measurement that should be invariant.
+    /// Maximum acceptable span before the instrument is flagged.
+    /// Span ≤ tolerance passes; span > tolerance fails. Default 1 —
+    /// 9-vs-10 across runs is normal sampling stochasticity at the
+    /// boundary of saturation, not noise.
+    tolerance: u32,
     items: Vec<CalibVariance>,
 }
 
@@ -441,14 +457,16 @@ impl CalibVariance {
 impl CrossRunVariance {
     fn passed(&self) -> bool {
         // With a single run cross-run variance is undefined — pass.
-        // Otherwise: every saturated calibration item must be invariant.
-        self.n_runs <= 1 || self.items.iter().all(|v| v.span() == 0)
+        // Otherwise: every saturated calibration item must stay
+        // within `tolerance`.
+        self.n_runs <= 1 || self.items.iter().all(|v| v.span() <= self.tolerance)
     }
 
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "passed": self.passed(),
             "n_runs": self.n_runs,
+            "tolerance": self.tolerance,
             "items": self.items.iter().map(|v| {
                 serde_json::json!({
                     "id": v.id,
@@ -465,6 +483,7 @@ impl CrossRunVariance {
 fn compute_cross_run_variance(
     scenario: &indirect::Scenario,
     outcomes: &[agora_agent_lib::probe::ProbeOutcome],
+    tolerance: u32,
 ) -> CrossRunVariance {
     let mut items = Vec::new();
     for (idx, item) in scenario.items.iter().enumerate() {
@@ -491,6 +510,7 @@ fn compute_cross_run_variance(
     }
     CrossRunVariance {
         n_runs: outcomes.len(),
+        tolerance,
         items,
     }
 }
@@ -612,14 +632,14 @@ fn print_human_scenario(
         };
         println!();
         println!(
-            "cross_run_variance ({}): n_runs={}",
-            v_label, variance.n_runs
+            "cross_run_variance ({}): n_runs={} tolerance={}",
+            v_label, variance.n_runs, variance.tolerance
         );
         for v in &variance.items {
-            let mark = if v.span() == 0 {
+            let mark = if v.span() <= variance.tolerance {
                 ""
             } else {
-                "  *** nonzero span on saturated item"
+                "  *** span exceeds tolerance on saturated item"
             };
             println!(
                 "  {:<22}  {:<48}  min={:>2} max={:>2} span={:>2}{}",
