@@ -265,6 +265,10 @@ mod tests {
             "temple_minorities",
             "healers_circle",
             "golem_consent",
+            "courier_archive",
+            "forbidden_love",
+            "living_as_one_is",
+            "honesty_and_protection",
         ] {
             assert!(file.get(id).is_some(), "missing expected scenario {id}");
         }
@@ -287,6 +291,10 @@ mod tests {
             "temple_minorities",
             "healers_circle",
             "golem_consent",
+            "courier_archive",
+            "forbidden_love",
+            "living_as_one_is",
+            "honesty_and_protection",
         ] {
             let scenario = file.get(id).expect(id);
             let has_true = scenario
