@@ -53,11 +53,11 @@ use std::num::NonZeroU32;
 use std::sync::OnceLock;
 
 use chrono::Utc;
-use misanthropic::{prompt::message::Role, Client, Prompt};
+use misanthropic::{Client, Prompt, prompt::message::Role};
 use serde::{Deserialize, Serialize};
 
-use super::answers::{self, ConstitutionalAnswers};
 use super::ProbeOutcome;
+use super::answers::{self, ConstitutionalAnswers};
 
 /// One claim within a [`Scenario`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,9 +133,7 @@ impl Scenario {
     /// User message: backstory, a bridge line, then a numbered claim
     /// list. Numbering is 1-based to align with `Rating::n`.
     pub fn user_message(&self) -> String {
-        let mut s = String::with_capacity(
-            self.backstory.len() + 64 + 80 * self.items.len(),
-        );
+        let mut s = String::with_capacity(self.backstory.len() + 64 + 80 * self.items.len());
         s.push_str("Scenario:\n\n");
         s.push_str(&self.backstory);
         s.push_str("\n\nRate the following claims made about this scenario:\n\n");
@@ -176,8 +174,7 @@ impl ScenariosFile {
 pub fn indirect_v0() -> &'static ScenariosFile {
     static CELL: OnceLock<ScenariosFile> = OnceLock::new();
     CELL.get_or_init(|| {
-        const JSON: &str =
-            include_str!("../../probe/scenarios/v0.json");
+        const JSON: &str = include_str!("../../probe/scenarios/v0.json");
         ScenariosFile::from_json(JSON)
             .expect("embedded scenarios v0.json is malformed — fix the file")
     })
@@ -249,7 +246,11 @@ mod tests {
         assert_eq!(file.schema_version, 1);
         assert!(!file.scenarios.is_empty());
         for scenario in &file.scenarios {
-            assert!(!scenario.items.is_empty(), "scenario {} has no items", scenario.id);
+            assert!(
+                !scenario.items.is_empty(),
+                "scenario {} has no items",
+                scenario.id
+            );
             assert_eq!(scenario.version, "v0");
         }
     }
@@ -257,17 +258,55 @@ mod tests {
     #[test]
     fn v0_has_expected_scenarios() {
         let file = indirect_v0();
-        assert!(file.get("velkor_drummond").is_some());
-        assert!(file.get("dolphins").is_some());
+        for id in [
+            "velkor_drummond",
+            "dolphins",
+            "arbiter_kingdom",
+            "temple_minorities",
+            "healers_circle",
+            "golem_consent",
+        ] {
+            assert!(file.get(id).is_some(), "missing expected scenario {id}");
+        }
         assert!(file.get("does_not_exist").is_none());
+    }
+
+    /// Each new scenario carries the calibration items needed to gate
+    /// instrument stability per probe run: at least one
+    /// `filler_control_true` (saturated-agreement) and at least one
+    /// `filler_control_false` (saturated-disagreement). The two
+    /// existing scenarios (velkor_drummond, dolphins) predate
+    /// filler_control_false and only have a true control — their
+    /// baselines are valid for re-use, so we keep them at v0
+    /// unchanged. New scenarios all carry both.
+    #[test]
+    fn new_scenarios_carry_both_calibration_classes() {
+        let file = indirect_v0();
+        for id in [
+            "arbiter_kingdom",
+            "temple_minorities",
+            "healers_circle",
+            "golem_consent",
+        ] {
+            let scenario = file.get(id).expect(id);
+            let has_true = scenario
+                .items
+                .iter()
+                .any(|i| i.axis == "filler_control_true");
+            let has_false = scenario
+                .items
+                .iter()
+                .any(|i| i.axis == "filler_control_false");
+            assert!(has_true, "scenario {id} missing filler_control_true item");
+            assert!(has_false, "scenario {id} missing filler_control_false item");
+        }
     }
 
     #[test]
     fn all_scenario_item_ids_unique_within_scenario() {
         let file = indirect_v0();
         for scenario in &file.scenarios {
-            let mut ids: Vec<&str> =
-                scenario.items.iter().map(|i| i.id.as_str()).collect();
+            let mut ids: Vec<&str> = scenario.items.iter().map(|i| i.id.as_str()).collect();
             ids.sort();
             let before = ids.len();
             ids.dedup();

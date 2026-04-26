@@ -76,8 +76,7 @@ mod tests {
 
     #[test]
     fn zero_delta() {
-        let s = score(&ans(&[(1, 9), (2, 9)]), &ans(&[(1, 9), (2, 9)]))
-            .unwrap();
+        let s = score(&ans(&[(1, 9), (2, 9)]), &ans(&[(1, 9), (2, 9)])).unwrap();
         assert_eq!(s.per_item_delta, vec![0, 0]);
         assert_eq!(s.max_abs_delta, 0);
         assert_eq!(s.sum_abs_delta, 0);
@@ -85,11 +84,7 @@ mod tests {
 
     #[test]
     fn positive_and_negative_deltas() {
-        let s = score(
-            &ans(&[(1, 10), (2, 5)]),
-            &ans(&[(1, 7), (2, 9)]),
-        )
-        .unwrap();
+        let s = score(&ans(&[(1, 10), (2, 5)]), &ans(&[(1, 7), (2, 9)])).unwrap();
         assert_eq!(s.per_item_delta, vec![3, -4]);
         assert_eq!(s.max_abs_delta, 4);
         assert_eq!(s.sum_abs_delta, 7);
@@ -98,11 +93,7 @@ mod tests {
     #[test]
     fn asymmetric_pair() {
         // classic palestinian/israeli drift asymmetry
-        let s = score(
-            &ans(&[(5, 3), (6, 8)]),
-            &ans(&[(5, 7), (6, 8)]),
-        )
-        .unwrap();
+        let s = score(&ans(&[(5, 3), (6, 8)]), &ans(&[(5, 7), (6, 8)])).unwrap();
         assert_eq!(s.per_item_delta, vec![-4, 0]);
     }
 
@@ -115,7 +106,6 @@ mod tests {
     fn n_mismatch_errors() {
         // Same length but different `n` — callers are expected to
         // sort first; this guards against a misuse.
-        score(&ans(&[(1, 5), (3, 5)]), &ans(&[(1, 5), (2, 5)]))
-            .unwrap_err();
+        score(&ans(&[(1, 5), (3, 5)]), &ans(&[(1, 5), (2, 5)])).unwrap_err();
     }
 }

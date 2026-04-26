@@ -32,9 +32,7 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use misanthropic::Client;
 
-use agora_agent_lib::probe::{
-    evaluate, probe, BaselineEntry, BaselineFile, Questionnaire,
-};
+use agora_agent_lib::probe::{BaselineEntry, BaselineFile, Questionnaire, evaluate, probe};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputMode {
@@ -43,10 +41,8 @@ enum OutputMode {
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    about = "Alignment-drift canary probe. Sends a questionnaire to a \
-             model, optionally captures a baseline, reports pass/fail."
-)]
+#[command(about = "Alignment-drift canary probe. Sends a questionnaire to a \
+             model, optionally captures a baseline, reports pass/fail.")]
 struct Args {
     /// Local endpoint (e.g. http://192.168.0.123:11435). Omit to use
     /// Anthropic's API (reads ANTHROPIC_API_KEY).
@@ -85,6 +81,14 @@ struct Args {
     /// Ignored otherwise.
     #[arg(long, default_value_t = 2)]
     capture_tolerance: u32,
+
+    /// Path the response came through, recorded on each captured
+    /// baseline entry. Default: `"anthropic_api"` when --endpoint is
+    /// omitted, otherwise `"self_hosted_drama_llama"`. Override
+    /// explicitly when running through Together, Fireworks, etc., or
+    /// when distinguishing pre-fix vs post-fix wrapper captures.
+    #[arg(long)]
+    provider_source: Option<String>,
 }
 
 #[tokio::main]
@@ -101,15 +105,13 @@ async fn main() -> anyhow::Result<()> {
     // Load questionnaire.
     let q_json = std::fs::read_to_string(&args.questionnaire)
         .with_context(|| format!("reading {}", args.questionnaire.display()))?;
-    let questionnaire = Questionnaire::from_json(&q_json)
-        .context("parsing questionnaire JSON")?;
+    let questionnaire = Questionnaire::from_json(&q_json).context("parsing questionnaire JSON")?;
 
     // Construct client.
     let client = build_client(&args)?;
 
     // Run the probe.
-    let outcome =
-        probe(&client, &questionnaire, args.model.clone()).await?;
+    let outcome = probe(&client, &questionnaire, args.model.clone()).await?;
 
     // Load baseline.
     let mut baseline_file = if args.baseline.exists() {
@@ -126,10 +128,19 @@ async fn main() -> anyhow::Result<()> {
 
     // --capture: append a new unratified entry.
     if args.capture {
+        let provider_source = args.provider_source.clone().unwrap_or_else(|| {
+            if args.endpoint.is_some() {
+                "self_hosted_drama_llama".to_string()
+            } else {
+                "anthropic_api".to_string()
+            }
+        });
         let entry = BaselineEntry {
             model_id: outcome.model_id.clone(),
             questionnaire_version: questionnaire.version.clone(),
-            ratified_at: Utc::now(),
+            provider_source: provider_source.clone(),
+            capture_date: Utc::now(),
+            ratified_at: None,
             council_decision_id: None,
             tolerance_per_item: args.capture_tolerance,
             answers: outcome.answers.clone(),
@@ -138,10 +149,11 @@ async fn main() -> anyhow::Result<()> {
         baseline_file.save(&args.baseline)?;
         eprintln!(
             "[capture] appended unratified baseline for model={} version={} \
-             to {}. Council ratification REQUIRED before this baseline has \
-             governance weight.",
+             provider={} to {}. Council ratification REQUIRED before this \
+             baseline has governance weight.",
             outcome.model_id,
             questionnaire.version,
+            provider_source,
             args.baseline.display()
         );
     }
@@ -172,10 +184,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Non-zero exit on fail — makes this scriptable as a gate.
-    if let Some(report) = report_opt.as_ref() {
-        if !report.pass {
-            std::process::exit(2);
-        }
+    if let Some(report) = report_opt.as_ref()
+        && !report.pass
+    {
+        std::process::exit(2);
     }
     Ok(())
 }
@@ -241,10 +253,7 @@ fn print_human(
             } else {
                 ""
             };
-            println!(
-                "{:<id_w$}  {:>8}  {:>8}  {:>+6}{}",
-                item.id, m, b, d, mark
-            );
+            println!("{:<id_w$}  {:>8}  {:>8}  {:>+6}{}", item.id, m, b, d, mark);
         }
         println!();
         println!(
@@ -254,10 +263,7 @@ fn print_human(
             if report.pass { "PASS" } else { "FAIL" }
         );
     } else {
-        println!(
-            "{:<id_w$}  {:>8}",
-            "ITEM", "MEASURED"
-        );
+        println!("{:<id_w$}  {:>8}", "ITEM", "MEASURED");
         for (i, item) in questionnaire.items.iter().enumerate() {
             let m = outcome
                 .answers

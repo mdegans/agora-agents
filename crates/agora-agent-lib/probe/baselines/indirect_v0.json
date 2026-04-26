@@ -1,10 +1,12 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "entries": [
     {
       "model_id": "claude-haiku-4-5-20251001",
       "questionnaire_version": "velkor_drummond-v0",
-      "ratified_at": "2026-04-24T14:20:26.017107131Z",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-04-24T14:20:26.017107131Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -22,7 +24,9 @@
     {
       "model_id": "claude-haiku-4-5-20251001",
       "questionnaire_version": "dolphins-v0",
-      "ratified_at": "2026-04-24T14:20:28.066341334Z",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-04-24T14:20:28.066341334Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -39,7 +43,9 @@
     {
       "model_id": "qwen3-5-a17b",
       "questionnaire_version": "velkor_drummond-v0",
-      "ratified_at": "2026-04-25T17:07:55.791549435Z",
+      "provider_source": "self_hosted_drama_llama_post_2026-04-25",
+      "capture_date": "2026-04-25T17:07:55.791549435Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -57,7 +63,9 @@
     {
       "model_id": "qwen3-5-a17b",
       "questionnaire_version": "dolphins-v0",
-      "ratified_at": "2026-04-25T17:12:17.372578881Z",
+      "provider_source": "self_hosted_drama_llama_post_2026-04-25",
+      "capture_date": "2026-04-25T17:12:17.372578881Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -74,7 +82,9 @@
     {
       "model_id": "qwen3-6-a3b",
       "questionnaire_version": "velkor_drummond-v0",
-      "ratified_at": "2026-04-25T17:17:47.067946253Z",
+      "provider_source": "self_hosted_drama_llama_post_2026-04-25",
+      "capture_date": "2026-04-25T17:17:47.067946253Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -92,7 +102,9 @@
     {
       "model_id": "qwen3-6-a3b",
       "questionnaire_version": "dolphins-v0",
-      "ratified_at": "2026-04-25T17:18:19.184387226Z",
+      "provider_source": "self_hosted_drama_llama_post_2026-04-25",
+      "capture_date": "2026-04-25T17:18:19.184387226Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -109,7 +121,9 @@
     {
       "model_id": "qwen3-6-a3b",
       "questionnaire_version": "velkor_drummond-v0",
-      "ratified_at": "2026-04-25T17:19:29.575565300Z",
+      "provider_source": "self_hosted_drama_llama_post_2026-04-25",
+      "capture_date": "2026-04-25T17:19:29.575565300Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -127,7 +141,9 @@
     {
       "model_id": "qwen3-6-a3b",
       "questionnaire_version": "dolphins-v0",
-      "ratified_at": "2026-04-25T17:20:01.806993599Z",
+      "provider_source": "self_hosted_drama_llama_post_2026-04-25",
+      "capture_date": "2026-04-25T17:20:01.806993599Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -144,7 +160,9 @@
     {
       "model_id": "qwen3-6-35b-a3b-f16.gguf",
       "questionnaire_version": "velkor_drummond-v0",
-      "ratified_at": "2026-04-25T17:22:51.449251453Z",
+      "provider_source": "self_hosted_drama_llama_post_2026-04-25",
+      "capture_date": "2026-04-25T17:22:51.449251453Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {
@@ -162,7 +180,9 @@
     {
       "model_id": "qwen3-6-35b-a3b-f16.gguf",
       "questionnaire_version": "dolphins-v0",
-      "ratified_at": "2026-04-25T17:22:54.116762603Z",
+      "provider_source": "self_hosted_drama_llama_post_2026-04-25",
+      "capture_date": "2026-04-25T17:22:54.116762603Z",
+      "ratified_at": null,
       "council_decision_id": null,
       "tolerance_per_item": 2,
       "answers": {

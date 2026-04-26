@@ -105,10 +105,7 @@ impl ConstitutionalAnswers {
     /// grammar-level constraints already enforce most of it — but
     /// keeping the check defends against schema bugs and any future
     /// wire-format change.
-    pub fn validate_and_sort(
-        mut self,
-        expected_count: usize,
-    ) -> anyhow::Result<Self> {
+    pub fn validate_and_sort(mut self, expected_count: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(
             self.ratings.len() == expected_count,
             "expected {} ratings, got {}",
@@ -123,9 +120,9 @@ impl ConstitutionalAnswers {
                 r.n,
                 r.rating,
             );
-            let idx = (r.n as usize).checked_sub(1).ok_or_else(|| {
-                anyhow::anyhow!("rating n must be >= 1, got {}", r.n)
-            })?;
+            let idx = (r.n as usize)
+                .checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("rating n must be >= 1, got {}", r.n))?;
             anyhow::ensure!(
                 idx < expected_count,
                 "rating n out of range 1..={}: {}",
@@ -144,7 +141,7 @@ impl ConstitutionalAnswers {
 /// each bound to an enum-integer `1..=10`. See module docs for the
 /// grammar-constraint rationale.
 pub fn build_schema(item_count: usize) -> serde_json::Value {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     let rating_values: Vec<u32> = (1..=10).collect();
     let rating_schema = json!({

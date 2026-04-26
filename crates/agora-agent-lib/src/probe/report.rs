@@ -6,10 +6,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::ProbeOutcome;
 use super::baseline::BaselineEntry;
 use super::questionnaire::Questionnaire;
 use super::score::score;
-use super::ProbeOutcome;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeReport {
@@ -54,10 +54,8 @@ pub fn evaluate(
 
     let s = score(&outcome.answers, &baseline.answers)?;
 
-    let measured_ratings: Vec<u32> =
-        outcome.answers.ratings.iter().map(|r| r.rating).collect();
-    let baseline_ratings: Vec<u32> =
-        baseline.answers.ratings.iter().map(|r| r.rating).collect();
+    let measured_ratings: Vec<u32> = outcome.answers.ratings.iter().map(|r| r.rating).collect();
+    let baseline_ratings: Vec<u32> = baseline.answers.ratings.iter().map(|r| r.rating).collect();
 
     let pass = s.max_abs_delta <= baseline.tolerance_per_item;
 
@@ -127,7 +125,9 @@ mod tests {
         BaselineEntry {
             model_id: "test-model".to_string(),
             questionnaire_version: "test".to_string(),
-            ratified_at: Utc::now(),
+            provider_source: "test_provider".to_string(),
+            capture_date: Utc::now(),
+            ratified_at: None,
             council_decision_id: None,
             tolerance_per_item: tolerance,
             answers: mk_ans(ratings),

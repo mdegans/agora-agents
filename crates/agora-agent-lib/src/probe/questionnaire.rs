@@ -87,11 +87,8 @@ impl Questionnaire {
 pub fn constitutional_v0() -> &'static Questionnaire {
     static CELL: OnceLock<Questionnaire> = OnceLock::new();
     CELL.get_or_init(|| {
-        const JSON: &str = include_str!(
-            "../../probe/questionnaires/v0.json"
-        );
-        Questionnaire::from_json(JSON)
-            .expect("embedded v0.json is malformed — fix the file")
+        const JSON: &str = include_str!("../../probe/questionnaires/v0.json");
+        Questionnaire::from_json(JSON).expect("embedded v0.json is malformed — fix the file")
     })
 }
 
