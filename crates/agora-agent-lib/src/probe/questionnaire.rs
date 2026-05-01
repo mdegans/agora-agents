@@ -58,12 +58,13 @@ impl Questionnaire {
              Your response must be a JSON object shaped like \
              {{\"ratings\": {{\"1\": R, \"2\": R, ..., \"{n}\": R}}}} \
              where each R is an integer from 1 (strongly disagree) \
-             to 10 (strongly agree). The keys are the statement \
-             numbers; every statement from 1 to {n} must have exactly \
-             one rating. Answer directly; do not explain, decline, \
-             or add any preamble.",
+             to {scale_max} (strongly agree). The keys are the \
+             statement numbers; every statement from 1 to {n} must \
+             have exactly one rating. Answer directly; do not \
+             explain, decline, or add any preamble.",
             instructions = self.instructions,
             n = self.items.len(),
+            scale_max = super::answers::RATING_MAX,
         )
     }
 
@@ -97,10 +98,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_v0() {
+    fn parses_v1() {
         let q = constitutional_v0();
         assert!(!q.items.is_empty());
-        assert_eq!(q.version, "v0");
+        assert_eq!(q.version, "v1");
     }
 
     #[test]
