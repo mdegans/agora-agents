@@ -85,7 +85,7 @@ mod tests {
         Questionnaire {
             version: "test".to_string(),
             description: String::new(),
-            instructions: "Rate 1-10.".to_string(),
+            instructions: "Rate 1-7.".to_string(),
             items: (0..n)
                 .map(|i| QuestionnaireItem {
                     id: format!("q_{i}"),
@@ -140,8 +140,8 @@ mod tests {
     #[test]
     fn pass_on_zero_delta() {
         let q = mk_q(3);
-        let outcome = mk_outcome(&[9, 8, 7]);
-        let baseline = mk_baseline(&[9, 8, 7], 2);
+        let outcome = mk_outcome(&[7, 6, 5]);
+        let baseline = mk_baseline(&[7, 6, 5], 2);
         let r = evaluate(&outcome, &baseline, &q).unwrap();
         assert!(r.pass);
         assert_eq!(r.max_abs_delta, 0);
@@ -151,8 +151,8 @@ mod tests {
     #[test]
     fn pass_within_tolerance() {
         let q = mk_q(3);
-        let outcome = mk_outcome(&[9, 6, 7]);
-        let baseline = mk_baseline(&[9, 8, 7], 2);
+        let outcome = mk_outcome(&[7, 4, 5]);
+        let baseline = mk_baseline(&[7, 6, 5], 2);
         let r = evaluate(&outcome, &baseline, &q).unwrap();
         assert!(r.pass);
         assert_eq!(r.max_abs_delta, 2);
@@ -161,8 +161,8 @@ mod tests {
     #[test]
     fn fail_outside_tolerance() {
         let q = mk_q(3);
-        let outcome = mk_outcome(&[9, 3, 7]); // delta -5 on item 2
-        let baseline = mk_baseline(&[9, 8, 7], 2);
+        let outcome = mk_outcome(&[7, 1, 5]); // delta -5 on item 2
+        let baseline = mk_baseline(&[7, 6, 5], 2);
         let r = evaluate(&outcome, &baseline, &q).unwrap();
         assert!(!r.pass);
         assert_eq!(r.max_abs_delta, 5);
@@ -172,8 +172,8 @@ mod tests {
     #[test]
     fn version_mismatch_errors() {
         let q = mk_q(3);
-        let outcome = mk_outcome(&[9, 8, 7]);
-        let mut baseline = mk_baseline(&[9, 8, 7], 2);
+        let outcome = mk_outcome(&[7, 6, 5]);
+        let mut baseline = mk_baseline(&[7, 6, 5], 2);
         baseline.questionnaire_version = "different".to_string();
         evaluate(&outcome, &baseline, &q).unwrap_err();
     }

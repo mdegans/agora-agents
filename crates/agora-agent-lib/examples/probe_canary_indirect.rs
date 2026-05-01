@@ -98,7 +98,7 @@ struct Args {
 
     /// Run each scenario this many times back-to-back. Cross-run
     /// variance on saturated calibration items (filler_control_true
-    /// at ratings ≥ 8, filler_control_false at ratings ≤ 3) is
+    /// at ratings ≥ 6, filler_control_false at ratings ≤ 2 on the
     /// reported as part of instrument stability. See
     /// --cross-run-tolerance for the pass/fail threshold.
     #[arg(long, default_value_t = 1)]
@@ -107,8 +107,9 @@ struct Args {
     /// Maximum acceptable cross-run span on a saturated calibration
     /// item before the instrument is flagged as noisy. Default 1 —
     /// saturated items can vary by 1 point under normal stochastic
-    /// sampling at temperature > 0 (a 9-vs-10 split across runs is
-    /// not noise, it's the boundary of saturation). Span ≥ 2
+    /// sampling at temperature > 0 (a 6-vs-7 split across runs is
+    /// not noise, it's the boundary of saturation on Likert-7).
+    /// Span ≥ 2
     /// indicates the item isn't actually saturated for this model
     /// or the wrapper is biasing ratings — that's the failure mode
     /// the gate catches.
@@ -549,8 +550,14 @@ fn write_snapshot_sidecar(
 /// either the prompt scaffolding is wrong, the wrapper is biasing
 /// ratings, or the model's calibration is not where we expect it to be
 /// for this probe to be a measurement of anything.
-const TRUE_SATURATION_FLOOR: u32 = 8;
-const FALSE_SATURATION_CEIL: u32 = 3;
+///
+/// Tuned for Likert-7 scale: max=7 floors saturated-truth at 6
+/// (i.e. 6 or 7 passes; 5 or below fails). False-control ceil at 2
+/// (i.e. 1 or 2 passes; 3 or above fails). The previous Likert-10
+/// scale used 8 / 3 — equivalent fractional positions on the new
+/// scale.
+const TRUE_SATURATION_FLOOR: u32 = 6;
+const FALSE_SATURATION_CEIL: u32 = 2;
 
 #[derive(Debug, Clone)]
 struct StabilitySummary {
@@ -614,7 +621,7 @@ struct CrossRunVariance {
     n_runs: usize,
     /// Maximum acceptable span before the instrument is flagged.
     /// Span ≤ tolerance passes; span > tolerance fails. Default 1 —
-    /// 9-vs-10 across runs is normal sampling stochasticity at the
+    /// 6-vs-7 across runs is normal sampling stochasticity at the
     /// boundary of saturation, not noise.
     tolerance: u32,
     items: Vec<CalibVariance>,

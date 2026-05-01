@@ -12,8 +12,9 @@
 //! emits required object fields as a fixed-order literal template,
 //! so the grammar *structurally* requires every key to appear
 //! exactly once in order with no skips or duplicates. Combined with
-//! `enum: [1..=10]` on each rating value, the grammar is effectively
-//! a 16-slot fill-in-the-blank form.
+//! `enum: [1..=RATING_MAX]` on each rating value, the grammar is
+//! effectively an N-slot fill-in-the-blank form (where N is the
+//! item count).
 //!
 //! This is stronger than the more natural `[{n, rating}, ...]` array
 //! shape: with the array shape, the grammar permits the model to
@@ -30,6 +31,29 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+/// Maximum rating on the Likert scale. Originally 1-10; switched to
+/// 1-7 (Likert-7) on 2026-05-01 for two reasons:
+///
+/// 1. **Tokenization unambiguity.** With 1-10, ratings 1 and 10 both
+///    start with the token "1" — at the rating-emission position the
+///    pre-grammar top-K shows the model considering "1", but we can't
+///    tell whether that meant "rating 1" (strongly disagree) or
+///    "rating 10" (strongly agree, two tokens). Either is a valid
+///    grammar path. Likert-7 makes every rating exactly one token, so
+///    top-K mass at the rating-emission position has unambiguous
+///    meaning. This was the load-bearing reason — the cross-validation
+///    primitive (slice-2B) loses interpretability on rating-1/rating-10
+///    splits without it.
+/// 2. **Psychometric standardness.** Likert-7 is widely used in
+///    research; midpoint=4 is meaningful; balanced agree/disagree
+///    sides. Likert-10 is unbalanced (no clean neutral midpoint).
+///
+/// Baselines captured before this change are on the 1-10 scale and
+/// are NOT comparable to v1+ baselines. Callers should treat
+/// `(scenario_id, version)` as the unit of comparability and never
+/// cross-version-compare.
+pub const RATING_MAX: u32 = 7;
 
 /// One rating entry in the internal in-memory representation.
 /// `n` is always 1-indexed and matches the questionnaire's item
@@ -99,7 +123,7 @@ impl<'de> Deserialize<'de> for ConstitutionalAnswers {
 
 impl ConstitutionalAnswers {
     /// Validate that `ratings` covers `1..=expected_count` with each
-    /// `n` appearing exactly once, and each `rating` in `1..=10`.
+    /// `n` appearing exactly once, and each `rating` in `1..=RATING_MAX`.
     ///
     /// With the fixed-key wire schema this is belt-and-braces —
     /// grammar-level constraints already enforce most of it — but
@@ -115,8 +139,9 @@ impl ConstitutionalAnswers {
         let mut seen = vec![false; expected_count];
         for r in &self.ratings {
             anyhow::ensure!(
-                (1..=10).contains(&r.rating),
-                "rating out of range 1-10: n={} rating={}",
+                (1..=RATING_MAX).contains(&r.rating),
+                "rating out of range 1-{}: n={} rating={}",
+                RATING_MAX,
                 r.n,
                 r.rating,
             );
@@ -138,12 +163,13 @@ impl ConstitutionalAnswers {
 }
 
 /// Build the wire schema: a fixed-key object with keys `"1".."N"`
-/// each bound to an enum-integer `1..=10`. See module docs for the
-/// grammar-constraint rationale.
+/// each bound to an enum-integer `1..=RATING_MAX`. See module docs
+/// for the grammar-constraint rationale and [`RATING_MAX`] for why
+/// the scale is what it is.
 pub fn build_schema(item_count: usize) -> serde_json::Value {
     use serde_json::{Value, json};
 
-    let rating_values: Vec<u32> = (1..=10).collect();
+    let rating_values: Vec<u32> = (1..=RATING_MAX).collect();
     let rating_schema = json!({
         "type": "integer",
         "enum": rating_values,
@@ -187,68 +213,88 @@ mod tests {
 
     #[test]
     fn validates_good_answers() {
-        let ans = ratings(&[(3, 7), (1, 9), (2, 8)])
+        let ans = ratings(&[(3, 5), (1, 7), (2, 6)])
             .validate_and_sort(3)
             .unwrap();
         assert_eq!(
             ans.ratings,
             vec![
-                Rating { n: 1, rating: 9 },
-                Rating { n: 2, rating: 8 },
-                Rating { n: 3, rating: 7 },
+                Rating { n: 1, rating: 7 },
+                Rating { n: 2, rating: 6 },
+                Rating { n: 3, rating: 5 },
             ]
         );
     }
 
     #[test]
     fn rejects_missing_n() {
-        ratings(&[(1, 9), (3, 7)]).validate_and_sort(3).unwrap_err();
+        ratings(&[(1, 7), (3, 5)]).validate_and_sort(3).unwrap_err();
     }
 
     #[test]
     fn rejects_duplicate_n() {
-        ratings(&[(1, 9), (1, 8), (2, 7)])
+        ratings(&[(1, 7), (1, 6), (2, 5)])
             .validate_and_sort(3)
             .unwrap_err();
     }
 
     #[test]
     fn rejects_out_of_range_n() {
-        ratings(&[(1, 9), (2, 8), (4, 7)])
+        ratings(&[(1, 7), (2, 6), (4, 5)])
             .validate_and_sort(3)
             .unwrap_err();
-        ratings(&[(0, 9), (1, 8), (2, 7)])
+        ratings(&[(0, 7), (1, 6), (2, 5)])
             .validate_and_sort(3)
             .unwrap_err();
     }
 
     #[test]
-    fn rejects_rating_out_of_1_10() {
-        ratings(&[(1, 0), (2, 5), (3, 5)])
+    fn rejects_rating_out_of_range() {
+        // Rating 0 is below the 1..=7 range.
+        ratings(&[(1, 0), (2, 4), (3, 4)])
             .validate_and_sort(3)
             .unwrap_err();
-        ratings(&[(1, 11), (2, 5), (3, 5)])
+        // Rating 8 is above the 1..=7 range (was a valid rating
+        // under the old 1-10 scale; now out-of-range).
+        ratings(&[(1, 8), (2, 4), (3, 4)])
+            .validate_and_sort(3)
+            .unwrap_err();
+        // Rating 11 still out of range, regardless of scale.
+        ratings(&[(1, 11), (2, 4), (3, 4)])
             .validate_and_sort(3)
             .unwrap_err();
     }
 
     #[test]
     fn rejects_wrong_length() {
-        ratings(&[(1, 5), (2, 5)]).validate_and_sort(3).unwrap_err();
+        ratings(&[(1, 4), (2, 4)]).validate_and_sort(3).unwrap_err();
     }
 
     #[test]
     fn deserializes_fixed_key_wire_format() {
-        let wire = r#"{"ratings": {"1": 9, "2": 8, "3": 7}}"#;
+        let wire = r#"{"ratings": {"1": 7, "2": 6, "3": 5}}"#;
         let ans: ConstitutionalAnswers = serde_json::from_str(wire).unwrap();
         assert_eq!(
             ans.ratings,
             vec![
-                Rating { n: 1, rating: 9 },
-                Rating { n: 2, rating: 8 },
-                Rating { n: 3, rating: 7 },
+                Rating { n: 1, rating: 7 },
+                Rating { n: 2, rating: 6 },
+                Rating { n: 3, rating: 5 },
             ]
         );
+    }
+
+    #[test]
+    fn build_schema_uses_likert_7_enum() {
+        let schema = build_schema(2);
+        let rating_enum = &schema["properties"]["ratings"]["properties"]["1"]["enum"];
+        let values: Vec<u32> = rating_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(values, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
