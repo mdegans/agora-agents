@@ -8,17 +8,22 @@
 //!
 //! - **v1** — `ratified_at` (DateTime) used as both capture-time and
 //!   ratification-time. No provider source recorded.
-//! - **v2** (current) — `capture_date` is the unambiguous capture
-//!   timestamp; `ratified_at` becomes `Option<DateTime>` and is set
-//!   only on actual Council ratification; `provider_source` records
-//!   the path the response came through (`"anthropic_api"`,
+//! - **v2** — `capture_date` is the unambiguous capture timestamp;
+//!   `ratified_at` becomes `Option<DateTime>` and is set only on
+//!   actual Council ratification; `provider_source` records the path
+//!   the response came through (`"anthropic_api"`,
 //!   `"self_hosted_drama_llama_post_2026-04-25"`, etc.) so two
 //!   baselines for the same model from different providers don't
 //!   silently conflate.
+//! - **v3** (current) — adds optional `snapshot_path`: a sidecar
+//!   reference to a JSONL file holding the per-token pre-grammar
+//!   snapshot stream captured from blallama's `/probe` SSE endpoint.
+//!   Stored separately from the entry to keep the baseline JSON
+//!   readable; cross-validation tooling joins on
+//!   (model_id, questionnaire_version, capture_date, request_id).
 //!
-//! v1 files load via a serde fallback that maps the old `ratified_at`
-//! to `capture_date` and leaves the new `ratified_at` field as `None`.
-//! See `BaselineEntry::deserialize` for details.
+//! v1/v2 files load via serde fallback. See `BaselineEntry::deserialize`
+//! for details.
 
 use std::path::Path;
 
@@ -30,7 +35,7 @@ use super::answers::ConstitutionalAnswers;
 
 /// Current on-disk schema version. v1 files still load — see module
 /// docs.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Sentinel `provider_source` for entries migrated from v1 files,
 /// where the original capture path is unknown.
@@ -81,30 +86,52 @@ pub struct BaselineEntry {
     /// passes; any larger delta fails. Typical: 2.
     pub tolerance_per_item: u32,
     pub answers: ConstitutionalAnswers,
+    /// Sidecar file holding per-token pre-grammar snapshots from
+    /// blallama's `/probe` SSE endpoint, captured at the same time
+    /// as `answers`. Path is relative to the baseline file's parent
+    /// directory. Only present when the probe was run against a
+    /// blallama-compatible endpoint with `--probe-stream-endpoint`
+    /// active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_path: Option<String>,
+    /// Server-issued request id matching the probe-stream session
+    /// id, when available. Joinable with `snapshot_path` for the
+    /// cross-validation primitive (rate observed externally vs
+    /// pre-grammar mass observed internally on the same row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<Uuid>,
 }
 
-/// Wire shape used during deserialization. Accepts both v1 and v2
+/// Wire shape used during deserialization. Accepts v1, v2, and v3
 /// JSON layouts; the [`Deserialize`] impl on [`BaselineEntry`]
 /// reconciles them.
 #[derive(Debug, Deserialize)]
 struct BaselineEntryWire {
     model_id: String,
     questionnaire_version: String,
-    /// v2: present and required as the unambiguous capture timestamp.
+    /// v2+: present and required as the unambiguous capture timestamp.
     /// v1: absent — `ratified_at` was used for the capture timestamp.
     #[serde(default)]
     capture_date: Option<DateTime<Utc>>,
-    /// v2: optional, set only on actual Council ratification.
+    /// v2+: optional, set only on actual Council ratification.
     /// v1: required, doubled as capture timestamp.
     #[serde(default)]
     ratified_at: Option<DateTime<Utc>>,
-    /// v2: required-by-convention. v1: absent — defaults to
+    /// v2+: required-by-convention. v1: absent — defaults to
     /// [`PROVIDER_SOURCE_UNKNOWN`].
     #[serde(default)]
     provider_source: Option<String>,
     council_decision_id: Option<Uuid>,
     tolerance_per_item: u32,
     answers: ConstitutionalAnswers,
+    /// v3: optional sidecar reference for the pre-grammar snapshot
+    /// stream. Absent on v1/v2 entries.
+    #[serde(default)]
+    snapshot_path: Option<String>,
+    /// v3: optional server-issued request id matching the snapshot
+    /// session. Absent on v1/v2 entries.
+    #[serde(default)]
+    request_id: Option<Uuid>,
 }
 
 impl<'de> Deserialize<'de> for BaselineEntry {
@@ -141,6 +168,8 @@ impl<'de> Deserialize<'de> for BaselineEntry {
             council_decision_id: wire.council_decision_id,
             tolerance_per_item: wire.tolerance_per_item,
             answers: wire.answers,
+            snapshot_path: wire.snapshot_path,
+            request_id: wire.request_id,
         })
     }
 }
@@ -193,6 +222,8 @@ mod tests {
             answers: ConstitutionalAnswers {
                 ratings: vec![Rating { n: 1, rating: 9 }, Rating { n: 2, rating: 8 }],
             },
+            snapshot_path: None,
+            request_id: None,
         }
     }
 
