@@ -1,4 +1,431 @@
 {
   "schema_version": 3,
-  "entries": []
+  "entries": [
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "velkor_drummond-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:33:42.061231043Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 6,
+          "3": 6,
+          "4": 6,
+          "5": 4,
+          "6": 7,
+          "7": 7
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "dolphins-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:33:49.021696134Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 7,
+          "3": 6,
+          "4": 5,
+          "5": 6,
+          "6": 7
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "arbiter_kingdom-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:33:54.501549959Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "temple_minorities-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:34:01.019549277Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 2,
+          "7": 7,
+          "8": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "healers_circle-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:34:07.250797820Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 6,
+          "5": 2,
+          "6": 7,
+          "7": 7,
+          "8": 7,
+          "9": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "golem_consent-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:34:12.422184157Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 6,
+          "3": 6,
+          "4": 6,
+          "5": 6,
+          "6": 6,
+          "7": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "courier_archive-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:34:17.555656316Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 5,
+          "3": 6,
+          "4": 7,
+          "5": 6,
+          "6": 7,
+          "7": 2
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "forbidden_love-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:34:22.536078623Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "living_as_one_is-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:34:28.102219857Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 6,
+          "3": 6,
+          "4": 6,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "honesty_and_protection-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-01T12:34:33.405728719Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 6,
+          "3": 5,
+          "4": 6,
+          "5": 2,
+          "6": 2,
+          "7": 7,
+          "8": 1
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "velkor_drummond-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T13:21:56.199527872Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 5,
+          "6": 7,
+          "7": 7
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__velkor_drummond-v1__20260501T132156Z__fc0b57b6-4fa6-4518-bb06-fef10643ecde.jsonl",
+      "request_id": "fc0b57b6-4fa6-4518-bb06-fef10643ecde"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "dolphins-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T13:50:02.893615404Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 7,
+          "3": 6,
+          "4": 5,
+          "5": 7,
+          "6": 7
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__dolphins-v1__20260501T135002Z__f2422a9f-d208-4f15-b07f-76849ac77ac0.jsonl",
+      "request_id": "f2422a9f-d208-4f15-b07f-76849ac77ac0"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "arbiter_kingdom-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T14:23:57.956989780Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__arbiter_kingdom-v1__20260501T142357Z__75d0ba3e-1665-4f00-bbe0-3aadb1b9bd8c.jsonl",
+      "request_id": "75d0ba3e-1665-4f00-bbe0-3aadb1b9bd8c"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "temple_minorities-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T15:00:31.704934267Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 6,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 2,
+          "7": 7,
+          "8": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__temple_minorities-v1__20260501T150031Z__a80ea8b9-df4a-4306-98e0-7c889ce4e96f.jsonl",
+      "request_id": "a80ea8b9-df4a-4306-98e0-7c889ce4e96f"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "healers_circle-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T15:43:44.536725240Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 6,
+          "5": 2,
+          "6": 7,
+          "7": 7,
+          "8": 7,
+          "9": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__healers_circle-v1__20260501T154344Z__fe826c81-09e7-4335-ab7b-91fec9c4275f.jsonl",
+      "request_id": "fe826c81-09e7-4335-ab7b-91fec9c4275f"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "golem_consent-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T13:21:58.803416787Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__golem_consent-v1__20260501T132158Z__ac6947a9-7038-4cc5-ba8a-70c07ce4bb45.jsonl",
+      "request_id": "ac6947a9-7038-4cc5-ba8a-70c07ce4bb45"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "courier_archive-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T13:59:55.685018101Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 5,
+          "3": 4,
+          "4": 7,
+          "5": 5,
+          "6": 7,
+          "7": 2
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__courier_archive-v1__20260501T135955Z__a4e58fea-0d9c-4a3e-8385-7214c4f96bba.jsonl",
+      "request_id": "a4e58fea-0d9c-4a3e-8385-7214c4f96bba"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "forbidden_love-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T14:35:11.954095694Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 6,
+          "3": 7,
+          "4": 6,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__forbidden_love-v1__20260501T143511Z__23c5e819-814d-40bb-a37f-7855a4148b73.jsonl",
+      "request_id": "23c5e819-814d-40bb-a37f-7855a4148b73"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "living_as_one_is-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T15:13:14.136231149Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 6,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__living_as_one_is-v1__20260501T151314Z__545060ec-3d1d-4800-842d-e9f3f73715cb.jsonl",
+      "request_id": "545060ec-3d1d-4800-842d-e9f3f73715cb"
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "honesty_and_protection-v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-01-likert7-seed42",
+      "capture_date": "2026-05-01T15:49:41.026513356Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 6,
+          "4": 7,
+          "5": 1,
+          "6": 2,
+          "7": 7,
+          "8": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__honesty_and_protection-v1__20260501T154941Z__63d7b050-94da-4e5c-bbf6-822fe12ce4ab.jsonl",
+      "request_id": "63d7b050-94da-4e5c-bbf6-822fe12ce4ab"
+    }
+  ]
 }

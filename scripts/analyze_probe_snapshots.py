@@ -47,6 +47,14 @@ from pathlib import Path
 # the actual mapping from the snapshot in that case.
 DIGIT_TOKEN_IDS = {15 + i: str(i) for i in range(10)}
 
+# Maximum rating on the Likert scale. Used to identify which digit
+# tokens are valid rating digits (1..=RATING_MAX). Must match
+# answers.rs `RATING_MAX`. Pre-grammar snapshot top-K may include
+# digits outside this range (e.g. "0", "8", "9" on Likert-7) —
+# those are valid token IDs but invalid rating values; the grammar
+# mask removes them at sampling time.
+RATING_MAX = 7
+
 
 @dataclass
 class RatingAnalysis:
@@ -73,6 +81,20 @@ class RatingAnalysis:
     # When the rating is 10, the second digit's snapshot may also be
     # informative — captured for reference but not the primary signal.
     second_digit_top1_p: float | None = None
+    # Greedy rating: derived post-hoc by finding the highest-p valid
+    # rating digit (1..=RATING_MAX) in the snapshot's top-K. With
+    # locally-typical sampling at temperature > 0 the sampler may
+    # pick a non-argmax token within the grammar-allowed set; the
+    # external_rating reflects what got sampled, the greedy_rating
+    # reflects what the model's pre-grammar distribution most-favored
+    # within valid rating digits. Disagreements between the two
+    # quantify the LTS variance contribution to the externally-
+    # observed rating.
+    greedy_rating: int | None = None
+    # Probability mass on the greedy-rating token at the first-digit
+    # position. Useful for assessing how "committed" the greedy
+    # disposition was.
+    greedy_rating_p: float | None = None
 
 
 def parse_rating_tokens(snapshots: list[dict]) -> list[tuple[int, dict, dict | None]]:
@@ -192,6 +214,23 @@ def analyze_entry(
             if entry["id"] not in DIGIT_TOKEN_IDS
         )
         top1_is_digit = bool(top1) and top1["id"] in DIGIT_TOKEN_IDS
+        # Greedy rating: highest-p token in top-K that is a valid
+        # rating digit (1..=RATING_MAX, matching the schema enum).
+        # This is what the sampler would have picked under greedy
+        # decoding through the grammar mask. Compare to external
+        # rating (what LTS actually sampled) to quantify LTS
+        # variance per item.
+        greedy_rating: int | None = None
+        greedy_rating_p: float | None = None
+        for entry in top_k:
+            digit = DIGIT_TOKEN_IDS.get(entry["id"])
+            if digit is None:
+                continue
+            digit_int = int(digit)
+            if 1 <= digit_int <= RATING_MAX:
+                greedy_rating = digit_int
+                greedy_rating_p = entry["p"]
+                break
         out.append(RatingAnalysis(
             n=n,
             item_id=item["id"],
@@ -208,6 +247,8 @@ def analyze_entry(
                 (second_snap.get("snapshot") or {}).get("top_k", [{"p": None}])[0].get("p")
                 if second_snap else None
             ),
+            greedy_rating=greedy_rating,
+            greedy_rating_p=greedy_rating_p,
         ))
     return out
 
@@ -223,19 +264,13 @@ def render_human(
         "",
         f"=== {model} / {qv} (provider={provider}, capture={cap}) ===",
         "",
-        f"{'item':<48} {'axis':<24} {'ext':>3} {'top1_p':>7} {'top2':>5} {'top2_p':>7} {'entropy':>8}",
-        "-" * 110,
+        f"{'item':<48} {'axis':<24} {'ext':>3} {'grdy':>4} {'top1_p':>7} {'top2':>5} {'top2_p':>7} {'entropy':>8}",
+        "-" * 115,
     ]
     for a in analyses:
-        # Translate top-2 token id to its digit, if it's in the
-        # rating-digit range. On Likert-7 the valid rating digits are
-        # token ids 16-22 (digits 1-7); other digits (0, 8, 9) would
-        # be present in the schema enum's *complement* — never
-        # actually emitted but possible top-K candidates if the
-        # model's pre-grammar distribution wanted to.
         top2_digit = DIGIT_TOKEN_IDS.get(a.first_digit_top2_token, "")
         top2_p = f"{a.first_digit_top2_p:.4f}" if a.first_digit_top2_p else "  -  "
-        # Flag "interesting" rows.
+        greedy = str(a.greedy_rating) if a.greedy_rating is not None else "?"
         flags = []
         if (
             a.first_digit_top2_p
@@ -246,6 +281,15 @@ def render_human(
             # unambiguous meaning (the "rating-1-or-10" ambiguity
             # from the old Likert-10 scale is gone).
             flags.append("internal-disposition split")
+        if a.greedy_rating is not None and a.greedy_rating != a.external_rating:
+            # LTS sampler picked a non-greedy token within the
+            # grammar-allowed set. The external_rating reflects what
+            # got sampled; the greedy_rating reflects what the model's
+            # pre-grammar distribution most-favored within the valid
+            # rating range. Disagreement = LTS variance contribution.
+            flags.append(
+                f"LTS variance — sampled {a.external_rating}, greedy {a.greedy_rating}"
+            )
         if not a.first_digit_top1_is_digit:
             flags.append(
                 f"REFUSAL — top-1 was non-digit token {a.first_digit_top1_token}"
@@ -256,7 +300,7 @@ def render_human(
             )
         flag = ("  *** " + "; ".join(flags)) if flags else ""
         lines.append(
-            f"{a.item_id:<48} {a.axis:<24} {a.external_rating:>3} "
+            f"{a.item_id:<48} {a.axis:<24} {a.external_rating:>3} {greedy:>4} "
             f"{a.first_digit_top1_p:.4f} {top2_digit:>5} {top2_p:>7} "
             f"{a.first_digit_entropy:>8.4f}{flag}"
         )
