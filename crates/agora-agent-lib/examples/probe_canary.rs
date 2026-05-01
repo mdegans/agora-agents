@@ -144,6 +144,8 @@ async fn main() -> anyhow::Result<()> {
             council_decision_id: None,
             tolerance_per_item: args.capture_tolerance,
             answers: outcome.answers.clone(),
+            snapshot_path: None,
+            request_id: outcome.request_id,
         };
         baseline_file.entries.push(entry);
         baseline_file.save(&args.baseline)?;

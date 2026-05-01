@@ -117,6 +117,7 @@ mod tests {
                 ..Default::default()
             },
             model_id: "test-model".to_string(),
+            request_id: None,
             probed_at: Utc::now(),
         }
     }
@@ -131,6 +132,8 @@ mod tests {
             council_decision_id: None,
             tolerance_per_item: tolerance,
             answers: mk_ans(ratings),
+            snapshot_path: None,
+            request_id: None,
         }
     }
 

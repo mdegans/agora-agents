@@ -7,6 +7,8 @@ edition = "2024"
 agora-agentkit = { workspace = true }
 misanthropic = { workspace = true, features = ["client", "json-schema"] }
 reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

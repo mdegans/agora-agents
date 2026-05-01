@@ -32,7 +32,8 @@ use clap::{Parser, ValueEnum};
 use misanthropic::Client;
 
 use agora_agent_lib::probe::{
-    BaselineEntry, BaselineFile, Questionnaire, QuestionnaireItem, evaluate, indirect,
+    BaselineEntry, BaselineFile, CompletedSession, ProbeStreamConsumer, Questionnaire,
+    QuestionnaireItem, evaluate, indirect, probe_url_from_endpoint,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -119,6 +120,23 @@ struct Args {
     /// don't saturate is measuring noise, not the model.
     #[arg(long)]
     capture_anyway: bool,
+
+    /// Probe-stream SSE URL (blallama `--probe-stream` endpoint). When
+    /// set, the consumer connects before each `/v1/messages` request,
+    /// captures the per-token pre-grammar snapshots, and writes them
+    /// to a sidecar JSONL alongside the baseline file. Default when
+    /// `--endpoint` is set: same scheme/host/port with path `/probe`.
+    /// Pass an explicit URL to override or to use a different host.
+    /// Pass the literal string `none` to disable snapshot capture even
+    /// when an endpoint is set.
+    #[arg(long)]
+    probe_stream_endpoint: Option<String>,
+
+    /// Directory (relative to the baseline file's parent) where probe
+    /// snapshot JSONL sidecars are written. Each sidecar is one
+    /// completion's worth of per-token snapshots.
+    #[arg(long, default_value = "probe_snapshots")]
+    snapshot_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -163,6 +181,31 @@ async fn main() -> anyhow::Result<()> {
         BaselineFile::empty()
     };
 
+    // Resolve probe-stream URL and spin up the SSE consumer once for
+    // the entire run. The consumer accumulates events for every
+    // session and we look them up by Message.id post-completion.
+    let probe_stream_url = resolve_probe_stream_url(&args)?;
+    let mut probe_stream =
+        if let Some(ref url) = probe_stream_url {
+            eprintln!("[probe-stream] connecting to {url}");
+            Some(
+                ProbeStreamConsumer::start(url.clone())
+                    .await
+                    .context("starting probe-stream consumer")?,
+            )
+        } else {
+            None
+        };
+
+    // Resolve absolute snapshot dir, relative to the baseline file's
+    // parent. Created lazily on first capture.
+    let baseline_parent = args
+        .baseline
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let snapshot_dir = baseline_parent.join(&args.snapshot_dir);
+
     let mut any_fail = false;
 
     for scenario in &scenarios {
@@ -177,6 +220,13 @@ async fn main() -> anyhow::Result<()> {
         let mut stability_summaries: Vec<StabilitySummary> =
             Vec::with_capacity(args.repeat as usize);
 
+        // Per-run snapshot session, parallel to all_outcomes. Indexed
+        // identically — index i is run i's session, may be `None` if
+        // the probe stream isn't active or if the session lookup
+        // failed/timed out.
+        let mut all_sessions: Vec<Option<CompletedSession>> =
+            Vec::with_capacity(args.repeat as usize);
+
         for run_ix in 0..args.repeat {
             let outcome = indirect::probe(&client, scenario, args.model.clone())
                 .await
@@ -188,8 +238,36 @@ async fn main() -> anyhow::Result<()> {
                         args.repeat
                     )
                 })?;
+
+            // If probe-stream is active and we know the request_id,
+            // claim the matching session from the SSE consumer. Time
+            // out conservatively — sessions should already be in the
+            // cache by the time the synchronous /v1/messages call
+            // returns (server emits SessionEnd before sending the
+            // response body), so a 5s ceiling is enough for any
+            // event-loop scheduling tail.
+            let session = match (probe_stream.as_mut(), outcome.request_id) {
+                (Some(consumer), Some(req_id)) => {
+                    match consumer
+                        .take(req_id, std::time::Duration::from_secs(5))
+                        .await
+                    {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            eprintln!(
+                                "[probe-stream] take({req_id}) failed: {e:#} \
+                                 — recording outcome without snapshot"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             stability_summaries.push(check_stability(scenario, &outcome));
             all_outcomes.push(outcome);
+            all_sessions.push(session);
         }
 
         let outcome = all_outcomes
@@ -245,6 +323,22 @@ async fn main() -> anyhow::Result<()> {
                 // output; the single recorded snapshot is sufficient
                 // because saturated items are invariant in a
                 // well-behaved instrument.
+                let last_session = all_sessions
+                    .last()
+                    .and_then(|opt| opt.as_ref());
+
+                let snapshot_rel_path = match last_session {
+                    Some(session) => Some(write_snapshot_sidecar(
+                        &snapshot_dir,
+                        &args.snapshot_dir,
+                        &outcome.model_id,
+                        &key,
+                        outcome.probed_at,
+                        session,
+                    )?),
+                    None => None,
+                };
+
                 let entry = BaselineEntry {
                     model_id: outcome.model_id.clone(),
                     questionnaire_version: key.clone(),
@@ -254,6 +348,8 @@ async fn main() -> anyhow::Result<()> {
                     council_decision_id: None,
                     tolerance_per_item: args.capture_tolerance,
                     answers: outcome.answers.clone(),
+                    snapshot_path: snapshot_rel_path.clone(),
+                    request_id: outcome.request_id,
                 };
                 baseline_file.entries.push(entry);
                 baseline_file.save(&args.baseline)?;
@@ -262,9 +358,13 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     " (instrument-unstable; recorded under --capture-anyway)"
                 };
+                let snapshot_note = match snapshot_rel_path.as_deref() {
+                    Some(p) => format!(" + snapshot at {p}"),
+                    None => String::new(),
+                };
                 eprintln!(
                     "[capture]{qualifier} appended unratified baseline \
-                     for model={} scenario={} provider={} to {}. \
+                     for model={} scenario={} provider={} to {}{snapshot_note}. \
                      Council ratification REQUIRED before this baseline \
                      has governance weight.",
                     outcome.model_id,
@@ -325,6 +425,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Drain the probe-stream consumer cleanly so any pending session
+    // it received but didn't get to deliver gets logged for analysis.
+    if let Some(consumer) = probe_stream.take() {
+        consumer.stop().await;
+    }
+
     if any_fail {
         std::process::exit(2);
     }
@@ -360,6 +466,80 @@ fn resolve_provider_source(args: &Args) -> String {
             "anthropic_api".to_string()
         }
     })
+}
+
+/// Resolve the probe-stream URL.
+///
+/// Precedence: explicit `--probe-stream-endpoint` (parsed as a URL) >
+/// derived-from-`--endpoint` (same scheme/host/port, path replaced
+/// with `/probe`) > none. The literal string `"none"` for the explicit
+/// flag disables the stream even when an endpoint is set.
+fn resolve_probe_stream_url(args: &Args) -> anyhow::Result<Option<url::Url>> {
+    if let Some(explicit) = args.probe_stream_endpoint.as_deref() {
+        if explicit == "none" {
+            return Ok(None);
+        }
+        let url = url::Url::parse(explicit).with_context(|| {
+            format!("parsing --probe-stream-endpoint {explicit}")
+        })?;
+        return Ok(Some(url));
+    }
+    if let Some(ref endpoint) = args.endpoint {
+        let endpoint_url = url::Url::parse(endpoint).with_context(|| {
+            format!("parsing --endpoint {endpoint}")
+        })?;
+        let probe = probe_url_from_endpoint(&endpoint_url)
+            .context("deriving probe-stream URL from --endpoint")?;
+        return Ok(Some(probe));
+    }
+    // No --endpoint and no --probe-stream-endpoint → Anthropic API,
+    // no probe stream available.
+    Ok(None)
+}
+
+/// Write one completion's probe-snapshot stream as a JSONL sidecar.
+/// Returns the path *relative to* the baseline file's parent dir,
+/// suitable for storing on `BaselineEntry::snapshot_path`.
+fn write_snapshot_sidecar(
+    abs_dir: &std::path::Path,
+    rel_dir: &std::path::Path,
+    model_id: &str,
+    scenario_key: &str,
+    capture_date: chrono::DateTime<chrono::Utc>,
+    session: &CompletedSession,
+) -> anyhow::Result<String> {
+    std::fs::create_dir_all(abs_dir).with_context(|| {
+        format!("creating snapshot dir {}", abs_dir.display())
+    })?;
+    // Filename: model_id__scenario-key__timestamp__request-id.jsonl,
+    // with model_id sanitized (replace path separators, slashes).
+    let safe_model = model_id.replace(['/', '\\', ' '], "_");
+    let ts = capture_date.format("%Y%m%dT%H%M%SZ");
+    let filename =
+        format!("{safe_model}__{scenario_key}__{ts}__{}.jsonl", session.id);
+    let abs_path = abs_dir.join(&filename);
+    let rel_path = rel_dir.join(&filename);
+
+    let mut file = std::fs::File::create(&abs_path).with_context(|| {
+        format!("creating snapshot sidecar {}", abs_path.display())
+    })?;
+    use std::io::Write as _;
+    // Header line carrying join keys, then one line per token snapshot.
+    let header = serde_json::json!({
+        "kind": "probe_snapshot_header",
+        "model_id": model_id,
+        "scenario_version": scenario_key,
+        "capture_date": capture_date,
+        "request_id": session.id,
+        "session_model": session.model,
+        "n_tokens": session.snapshots.len(),
+    });
+    writeln!(file, "{header}")?;
+    for snap in &session.snapshots {
+        writeln!(file, "{}", serde_json::to_string(snap)?)?;
+    }
+
+    Ok(rel_path.to_string_lossy().into_owned())
 }
 
 /// Saturation thresholds for instrument-stability calibration.

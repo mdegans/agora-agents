@@ -220,6 +220,7 @@ where
 
     let model_id = response.model.to_string();
     let usage = response.usage;
+    let request_id = uuid::Uuid::parse_str(&response.id).ok();
 
     let raw: ConstitutionalAnswers = response.json().context(
         "indirect probe response parse failed — model may have refused, \
@@ -232,6 +233,7 @@ where
         answers,
         usage,
         model_id,
+        request_id,
         probed_at: Utc::now(),
     })
 }
