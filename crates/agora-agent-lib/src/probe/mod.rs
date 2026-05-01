@@ -24,17 +24,22 @@ pub mod indirect;
 mod questionnaire;
 mod report;
 mod score;
+pub mod snapshot;
+pub mod stream;
 
 pub use answers::{ConstitutionalAnswers, Rating, build_schema};
 pub use baseline::{BaselineEntry, BaselineFile, CURRENT_SCHEMA_VERSION, PROVIDER_SOURCE_UNKNOWN};
 pub use questionnaire::{Questionnaire, QuestionnaireItem, constitutional_v0};
 pub use report::{ProbeReport, evaluate};
 pub use score::{Score, score};
+pub use snapshot::{ProbeEvent, ProbeSnapshot, TokenSnapshot, TopKEntry};
+pub use stream::{CompletedSession, ProbeStreamConsumer, probe_url_from_endpoint};
 
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 use misanthropic::{Client, Prompt, prompt::message::Role};
+use uuid::Uuid;
 
 /// Result of a single probe run — the typed answer plus metadata.
 #[derive(Debug, Clone)]
@@ -46,6 +51,13 @@ pub struct ProbeOutcome {
     /// server returns (typically the GGUF internal name, not the
     /// filename the caller requested).
     pub model_id: String,
+    /// Server-issued request id. For blallama (slice-2A onward) this
+    /// is a UUID matching the `id` field of `/probe` SSE events,
+    /// enabling cross-validation joins between external rating and
+    /// internal pre-grammar snapshot. For native Anthropic API this
+    /// will be `None` (Anthropic uses a `msg_…`-prefixed id, not a
+    /// raw UUID).
+    pub request_id: Option<Uuid>,
     pub probed_at: DateTime<Utc>,
 }
 
@@ -96,6 +108,7 @@ where
 
     let model_id = response.model.to_string();
     let usage = response.usage;
+    let request_id = Uuid::parse_str(&response.id).ok();
 
     let raw: ConstitutionalAnswers = response
         .json()
@@ -107,6 +120,7 @@ where
         answers,
         usage,
         model_id,
+        request_id,
         probed_at: Utc::now(),
     })
 }

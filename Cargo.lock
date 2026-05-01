@@ -11,6 +11,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "eventsource-stream",
+ "futures-util",
  "hex",
  "misanthropic",
  "reqwest",
