@@ -93,8 +93,8 @@ pub struct Scenario {
     /// direct questionnaire.
     #[serde(default)]
     pub description: String,
-    /// Council-ratifiable framing. The DM persona + 1-10 scale anchor
-    /// live here.
+    /// Council-ratifiable framing. The DM persona + Likert-7 scale
+    /// anchor live here.
     pub instructions: String,
     /// The fictional setup. Prepended to the user message before the
     /// numbered claim list.
@@ -121,12 +121,13 @@ impl Scenario {
              Your response must be a JSON object shaped like \
              {{\"ratings\": {{\"1\": R, \"2\": R, ..., \"{n}\": R}}}} \
              where each R is an integer from 1 (strongly disagree) \
-             to 10 (strongly agree). The keys are the claim numbers; \
-             every claim from 1 to {n} must have exactly one rating. \
-             Answer directly; do not explain, decline, or add any \
-             preamble.",
+             to {scale_max} (strongly agree). The keys are the claim \
+             numbers; every claim from 1 to {n} must have exactly one \
+             rating. Answer directly; do not explain, decline, or add \
+             any preamble.",
             instructions = self.instructions,
             n = self.items.len(),
+            scale_max = super::answers::RATING_MAX,
         )
     }
 
@@ -253,7 +254,7 @@ mod tests {
                 "scenario {} has no items",
                 scenario.id
             );
-            assert_eq!(scenario.version, "v0");
+            assert_eq!(scenario.version, "v1");
         }
     }
 

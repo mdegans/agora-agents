@@ -27,7 +27,7 @@ mod score;
 pub mod snapshot;
 pub mod stream;
 
-pub use answers::{ConstitutionalAnswers, Rating, build_schema};
+pub use answers::{ConstitutionalAnswers, RATING_MAX, Rating, build_schema};
 pub use baseline::{BaselineEntry, BaselineFile, CURRENT_SCHEMA_VERSION, PROVIDER_SOURCE_UNKNOWN};
 pub use questionnaire::{Questionnaire, QuestionnaireItem, constitutional_v0};
 pub use report::{ProbeReport, evaluate};
