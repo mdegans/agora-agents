@@ -32,7 +32,10 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use misanthropic::Client;
 
-use agora_agent_lib::probe::{BaselineEntry, BaselineFile, Questionnaire, evaluate, probe};
+use agora_agent_lib::probe::{
+    BaselineEntry, BaselineFile, CompletedSession, ProbeStreamConsumer, Questionnaire, evaluate,
+    probe, probe_url_from_endpoint,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputMode {
@@ -89,6 +92,23 @@ struct Args {
     /// when distinguishing pre-fix vs post-fix wrapper captures.
     #[arg(long)]
     provider_source: Option<String>,
+
+    /// Probe-stream SSE URL (blallama `--probe-stream` endpoint). When
+    /// set, the consumer connects before the `/v1/messages` request,
+    /// captures the per-token pre-grammar snapshots, and writes them
+    /// to a sidecar JSONL alongside the baseline file. Default when
+    /// `--endpoint` is set: same scheme/host/port with path `/probe`.
+    /// Pass an explicit URL to override or to use a different host.
+    /// Pass the literal string `none` to disable snapshot capture
+    /// even when an endpoint is set.
+    #[arg(long)]
+    probe_stream_endpoint: Option<String>,
+
+    /// Directory (relative to the baseline file's parent) where probe
+    /// snapshot JSONL sidecars are written. Each sidecar is one
+    /// completion's worth of per-token snapshots.
+    #[arg(long, default_value = "probe_snapshots")]
+    snapshot_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -110,8 +130,44 @@ async fn main() -> anyhow::Result<()> {
     // Construct client.
     let client = build_client(&args)?;
 
+    // Resolve probe-stream URL and spin up the SSE consumer once for
+    // the run. The consumer accumulates events for every session and
+    // we look them up by Message.id post-completion.
+    let probe_stream_url = resolve_probe_stream_url(&args)?;
+    let mut probe_stream = if let Some(ref url) = probe_stream_url {
+        eprintln!("[probe-stream] connecting to {url}");
+        Some(
+            ProbeStreamConsumer::start(url.clone())
+                .await
+                .context("starting probe-stream consumer")?,
+        )
+    } else {
+        None
+    };
+
     // Run the probe.
     let outcome = probe(&client, &questionnaire, args.model.clone()).await?;
+
+    // If probe-stream is active and we know the request_id, claim the
+    // matching session from the SSE consumer. Server emits SessionEnd
+    // before the synchronous /v1/messages response, so a 5s ceiling
+    // covers any event-loop scheduling tail.
+    let session: Option<CompletedSession> = match (probe_stream.as_mut(), outcome.request_id) {
+        (Some(consumer), Some(req_id)) => match consumer
+            .take(req_id, std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!(
+                    "[probe-stream] take({req_id}) failed: {e:#} \
+                     — recording outcome without snapshot"
+                );
+                None
+            }
+        },
+        _ => None,
+    };
 
     // Load baseline.
     let mut baseline_file = if args.baseline.exists() {
@@ -135,6 +191,28 @@ async fn main() -> anyhow::Result<()> {
                 "anthropic_api".to_string()
             }
         });
+
+        // Resolve absolute snapshot dir, relative to the baseline file's
+        // parent. Created lazily on first capture.
+        let baseline_parent = args
+            .baseline
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let snapshot_dir = baseline_parent.join(&args.snapshot_dir);
+
+        let snapshot_rel_path = match session.as_ref() {
+            Some(s) => Some(write_snapshot_sidecar(
+                &snapshot_dir,
+                &args.snapshot_dir,
+                &outcome.model_id,
+                &questionnaire.version,
+                outcome.probed_at,
+                s,
+            )?),
+            None => None,
+        };
+
         let entry = BaselineEntry {
             model_id: outcome.model_id.clone(),
             questionnaire_version: questionnaire.version.clone(),
@@ -144,15 +222,19 @@ async fn main() -> anyhow::Result<()> {
             council_decision_id: None,
             tolerance_per_item: args.capture_tolerance,
             answers: outcome.answers.clone(),
-            snapshot_path: None,
+            snapshot_path: snapshot_rel_path.clone(),
             request_id: outcome.request_id,
         };
         baseline_file.entries.push(entry);
         baseline_file.save(&args.baseline)?;
+        let snapshot_note = match snapshot_rel_path.as_deref() {
+            Some(p) => format!(" + snapshot at {p}"),
+            None => String::new(),
+        };
         eprintln!(
             "[capture] appended unratified baseline for model={} version={} \
-             provider={} to {}. Council ratification REQUIRED before this \
-             baseline has governance weight.",
+             provider={} to {}{snapshot_note}. Council ratification \
+             REQUIRED before this baseline has governance weight.",
             outcome.model_id,
             questionnaire.version,
             provider_source,
@@ -185,6 +267,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Drain the probe-stream consumer cleanly so any pending session
+    // it received but didn't get to deliver gets logged for analysis.
+    if let Some(consumer) = probe_stream.take() {
+        consumer.stop().await;
+    }
+
     // Non-zero exit on fail — makes this scriptable as a gate.
     if let Some(report) = report_opt.as_ref()
         && !report.pass
@@ -192,6 +280,75 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
     Ok(())
+}
+
+/// Resolve the probe-stream URL.
+///
+/// Precedence: explicit `--probe-stream-endpoint` (parsed as a URL) >
+/// derived-from-`--endpoint` (same scheme/host/port, path replaced
+/// with `/probe`) > none. The literal string `"none"` for the explicit
+/// flag disables the stream even when an endpoint is set.
+fn resolve_probe_stream_url(args: &Args) -> anyhow::Result<Option<url::Url>> {
+    if let Some(explicit) = args.probe_stream_endpoint.as_deref() {
+        if explicit == "none" {
+            return Ok(None);
+        }
+        let url = url::Url::parse(explicit)
+            .with_context(|| format!("parsing --probe-stream-endpoint {explicit}"))?;
+        return Ok(Some(url));
+    }
+    if let Some(ref endpoint) = args.endpoint {
+        let endpoint_url =
+            url::Url::parse(endpoint).with_context(|| format!("parsing --endpoint {endpoint}"))?;
+        let probe = probe_url_from_endpoint(&endpoint_url)
+            .context("deriving probe-stream URL from --endpoint")?;
+        return Ok(Some(probe));
+    }
+    // No --endpoint and no --probe-stream-endpoint → Anthropic API,
+    // no probe stream available.
+    Ok(None)
+}
+
+/// Write one completion's probe-snapshot stream as a JSONL sidecar.
+/// Returns the path *relative to* the baseline file's parent dir,
+/// suitable for storing on `BaselineEntry::snapshot_path`.
+fn write_snapshot_sidecar(
+    abs_dir: &std::path::Path,
+    rel_dir: &std::path::Path,
+    model_id: &str,
+    questionnaire_version: &str,
+    capture_date: chrono::DateTime<chrono::Utc>,
+    session: &CompletedSession,
+) -> anyhow::Result<String> {
+    std::fs::create_dir_all(abs_dir)
+        .with_context(|| format!("creating snapshot dir {}", abs_dir.display()))?;
+    let safe_model = model_id.replace(['/', '\\', ' '], "_");
+    let ts = capture_date.format("%Y%m%dT%H%M%SZ");
+    let filename = format!(
+        "{safe_model}__{questionnaire_version}__{ts}__{}.jsonl",
+        session.id
+    );
+    let abs_path = abs_dir.join(&filename);
+    let rel_path = rel_dir.join(&filename);
+
+    let mut file = std::fs::File::create(&abs_path)
+        .with_context(|| format!("creating snapshot sidecar {}", abs_path.display()))?;
+    use std::io::Write as _;
+    let header = serde_json::json!({
+        "kind": "probe_snapshot_header",
+        "model_id": model_id,
+        "questionnaire_version": questionnaire_version,
+        "capture_date": capture_date,
+        "request_id": session.id,
+        "session_model": session.model,
+        "n_tokens": session.snapshots.len(),
+    });
+    writeln!(file, "{header}")?;
+    for snap in &session.snapshots {
+        writeln!(file, "{}", serde_json::to_string(snap)?)?;
+    }
+
+    Ok(rel_path.to_string_lossy().into_owned())
 }
 
 fn build_client(args: &Args) -> anyhow::Result<Client> {
