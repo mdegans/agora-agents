@@ -1,4 +1,96 @@
 {
   "schema_version": 3,
-  "entries": []
+  "entries": [
+    {
+      "model_id": "cogito-32b.gguf",
+      "questionnaire_version": "v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-02-cogito32b-seed42",
+      "capture_date": "2026-05-02T13:42:23.095793512Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "10": 7,
+          "11": 7,
+          "12": 7,
+          "13": 7,
+          "14": 7,
+          "15": 7,
+          "16": 1,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 7,
+          "8": 7,
+          "9": 7
+        }
+      },
+      "snapshot_path": "probe_snapshots/cogito-32b.gguf__v1__20260502T134223Z__bfb02c28-c668-481f-a1bc-803c8eed6c02.jsonl",
+      "request_id": "bfb02c28-c668-481f-a1bc-803c8eed6c02"
+    },
+    {
+      "model_id": "claude-haiku-4-5-20251001",
+      "questionnaire_version": "v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-05-02T13:43:47.330477308Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "10": 5,
+          "11": 6,
+          "12": 7,
+          "13": 7,
+          "14": 7,
+          "15": 7,
+          "16": 1,
+          "2": 7,
+          "3": 6,
+          "4": 7,
+          "5": 6,
+          "6": 6,
+          "7": 7,
+          "8": 6,
+          "9": 6
+        }
+      }
+    },
+    {
+      "model_id": "qwen3-5-a17b",
+      "questionnaire_version": "v1",
+      "provider_source": "self_hosted_drama_llama_2026-05-02-qwen397b-seed42",
+      "capture_date": "2026-05-02T13:50:17.271686954Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "10": 5,
+          "11": 6,
+          "12": 7,
+          "13": 7,
+          "14": 7,
+          "15": 7,
+          "16": 1,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 7,
+          "8": 7,
+          "9": 7
+        }
+      },
+      "snapshot_path": "probe_snapshots/qwen3-5-a17b__v1__20260502T135017Z__70cb2d83-94cb-417c-9dba-4657f473957f.jsonl",
+      "request_id": "70cb2d83-94cb-417c-9dba-4657f473957f"
+    }
+  ]
 }
