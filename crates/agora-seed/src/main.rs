@@ -224,8 +224,8 @@ async fn main() -> Result<()> {
 
                 let think_prompt = prompt::build(
                     &agent.model,
-                    &agent.soul.as_system_prompt(),
-                    &agent.memory.content,
+                    &agent.soul.markdown(),
+                    &agent.memory.render_for_prompt(),
                     "", // no recent activity in dry-run mode
                     "", // no pending replies in dry-run mode
                     &constitution,
