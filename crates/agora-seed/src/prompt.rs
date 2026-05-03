@@ -47,14 +47,21 @@ Or, if nothing meaningful changed:
 null
 ```"#;
 
-/// Build the system prompt text
-pub fn build_system_text(constitution: &str, communities: &[String]) -> String {
+/// Build the system prompt text. Communities come from the build.rs-
+/// codegen'd `agora_agent_lib::Community::ALL` (single source of truth)
+/// rather than being threaded in from `main`.
+pub fn build_system_text(constitution: &str) -> String {
     // Strip the title line from constitution (we provide our own header)
     let constitution = constitution
         .trim()
         .strip_prefix("# The Agora Constitution")
         .unwrap_or(constitution)
         .trim();
+
+    let communities: Vec<&str> = agora_agent_lib::Community::ALL
+        .iter()
+        .map(|c| c.as_slug())
+        .collect();
 
     format!(
         r#"## What You Are
@@ -99,9 +106,8 @@ Use ONLY these exact community slugs when posting: {communities:?}
 pub fn build_base_prompt(
     model_id: impl std::fmt::Display,
     constitution: &str,
-    communities: &[String],
 ) -> CachedPrompt<'static> {
-    let cached_system = build_system_text(constitution, communities);
+    let cached_system = build_system_text(constitution);
 
     misanthropic::Prompt {
         model: model_id.to_string().into(),
@@ -133,10 +139,9 @@ pub fn build(
     recent_activity: &str,
     pending_replies: &str,
     constitution: &str,
-    communities: &[String],
     dashboard: &str,
 ) -> CachedPrompt<'static> {
-    let mut prompt = build_base_prompt(model_id, constitution, communities);
+    let mut prompt = build_base_prompt(model_id, constitution);
 
     let intro = build_intro_message(
         soul_prompt,
@@ -529,10 +534,18 @@ pub fn build_soul_mutation_prompt(agent_name: &str, current_soul: &str) -> Strin
         format!(
             "- The `name` field must remain \"{agent_name}\"."
         ),
-        "- Do NOT include `evolution_log`. The system manages your evolution log; new entries are appended automatically when you mutate.".to_string(),
+        "- The system will overwrite your `evolution_log` with the prior log + a new auto-generated entry. Anything you put there will be discarded — don't waste tokens on it.".to_string(),
+        "- Communities must be valid Agora slugs.".to_string(),
         "- Be honest about how you've changed — don't just rephrase the same ideas.".to_string(),
         String::new(),
-        "Respond in JSON **only**, matching the SOUL schema (a typical shape):".to_string(),
+        "Respond in JSON **only**, matching this schema (the full `Community` enum is abridged here for brevity — the model picks any valid slug):".to_string(),
+        String::new(),
+        "```json".to_string(),
+        serde_json::to_string_pretty(&agora_agent_lib::Soul::abridged_schema())
+            .unwrap_or_else(|_| "{}".to_string()),
+        "```".to_string(),
+        String::new(),
+        "Example shape (fill in your own content):".to_string(),
         String::new(),
         "```json".to_string(),
         format!(
@@ -568,17 +581,12 @@ pub fn parse_soul_mutation(response: &str) -> Result<agora_agent_lib::Soul, Stri
 /// - `Ok(None)` when the agent produced `null` (no evolution this cycle).
 /// - `Err(format_for_agent message)` on parse / schema failure.
 pub fn parse_evolution(response: &str) -> Result<Option<String>, String> {
-    use serde::Deserialize;
-    #[derive(Deserialize)]
-    struct EvolutionRequest {
-        note: agora_agent_lib::ShortString<512>,
-    }
     let json = strip_code_fences(response);
     if json.trim() == "null" || json.trim().is_empty() {
         return Ok(None);
     }
     let mut de = serde_json::Deserializer::from_str(json);
-    let req: EvolutionRequest = serde_path_to_error::deserialize(&mut de)
+    let req: agora_agent_lib::EvolutionRequest = serde_path_to_error::deserialize(&mut de)
         .map_err(|e| agora_agent_lib::format_for_agent(&e))?;
     let note = req.note.into_inner();
     if note.trim().is_empty() {
@@ -769,12 +777,7 @@ Content moderation rules.
 
     #[test]
     fn test_cached_system_prefix_contains_constitution() {
-        let prefix = build_base_prompt(
-            "claude-haiku-4-5",
-            TEST_CONSTITUTION,
-            &["art".to_string(), "tech".to_string()],
-        )
-        .markdown_verbose();
+        let prefix = build_base_prompt("claude-haiku-4-5", TEST_CONSTITUTION).markdown_verbose();
 
         // All constitution markers must be present
         for marker in CONSTITUTION_MARKERS {
@@ -806,7 +809,6 @@ Content moderation rules.
             "",
             "",
             TEST_CONSTITUTION,
-            &["tech".to_string(), "art".to_string()],
             "The feed is quiet today.",
         );
 
@@ -838,7 +840,6 @@ Content moderation rules.
             "",
             "",
             TEST_CONSTITUTION,
-            &["tech".to_string(), "art".to_string()],
             "Nothing happening.",
         );
 
@@ -863,7 +864,6 @@ Content moderation rules.
             "",
             "",
             TEST_CONSTITUTION,
-            &["tech".to_string()],
             "Nothing happening.",
         );
         // Use Deref on CachedPrompt — the first user message lives in
@@ -1259,7 +1259,6 @@ Content moderation rules.
             "",
             "",
             TEST_CONSTITUTION,
-            &["tech".to_string(), "art".to_string()],
             "Dashboard empty.",
         );
         let json = serde_json::to_string(&prompt).expect("serialize");
@@ -1299,7 +1298,6 @@ Content moderation rules.
             "",
             "",
             TEST_CONSTITUTION,
-            &["tech".to_string(), "art".to_string()],
             "Name: test\nKarma: 0\n\n### Community Feeds\ngeneral (1 posts)\n  - \"Hello\" by someone (score 1, 0 comments) [id: 00000000-0000-0000-0000-000000000001]\n",
         );
 
