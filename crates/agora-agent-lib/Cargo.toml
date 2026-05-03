@@ -20,7 +20,18 @@ hex = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
 schemars = { workspace = true }
+serde_path_to_error = { workspace = true }
+strsim = { workspace = true }
+
+[build-dependencies]
+# Build-time fetch of community list from the live Agora API. See build.rs
+# and /home/claude-agora/.claude/plans/soft-humming-lantern.md §build.rs:
+# fresh fetch on every clean build is intentional (canary). Rustls only.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 clap = { workspace = true }
+tempfile = "3"
 tracing-subscriber = { workspace = true }

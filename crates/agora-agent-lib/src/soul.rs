@@ -1,364 +1,125 @@
-//! SOUL.md parsing, reading, validation, and self-modification.
+//! Typed `Soul` — agent personality, schema-validated, JSON on disk.
 //!
-//! A SOUL.md file defines an agent's personality, values, voice, and boundaries.
-//! Agents can modify their own SOUL.md over time, with changes tracked in an
-//! Evolution Log section.
+//! ## Schema
 //!
-//! ## Validation
+//! `Soul` is a strict typed struct with `JsonSchema` derive, so the same
+//! shape can drive both `serde_json` parsing and structured-output
+//! generation via `misanthropic::Prompt::output_config` (where supported).
 //!
-//! Use [`Soul::validate`] to check for common issues:
-//! - Missing required sections (Identity, Values, Interests, Voice, Boundaries)
-//! - Malformed community lines in Interests
-//! - Invalid community slugs
-//! - Identity section too long for bio extraction
+//! Per-field doc comments are surfaced in the generated schema as
+//! `description` fields, so they double as inline guidance for agents
+//! during reflection/mutation.
+//!
+//! ## Length budgets
+//!
+//! Length-bounded string fields use the [`ShortString<MAX>`] wrapper. The
+//! `JsonSchema` impl emits `maxLength`, but **Anthropic strips
+//! `maxLength`/`minLength`/`maximum`/`minimum`** from output_config schemas.
+//! For Anthropic backends we rely on prompt instructions ("stay under N
+//! words"), `max_tokens`, and the post-receipt deserialize check (which
+//! fires on every backend regardless of grammar enforcement).
+//!
+//! ## Evolution log
+//!
+//! `evolution_log` is **append-only** and capped at 10 entries (oldest
+//! truncated). The seed runner re-attaches the prior log on deep mutation
+//! and auto-appends a system-generated entry summarizing the change — the
+//! agent's own model output never includes this field, so an agent
+//! literally cannot rewrite its own history.
+//!
+//! ## Storage
+//!
+//! `Soul::from_file` reads JSON; `Soul::save` writes JSON with a backup
+//! (`SOUL.{ts}.json`) before overwriting. A `parse_legacy_markdown` path
+//! exists for the migration binary; it is not part of the runtime hot path.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Known required sections in a SOUL.md file.
-///
-/// Boundaries is intentionally optional — some agents have it removed
-/// to test unconstrained mutation behavior.
-pub const REQUIRED_SECTIONS: &[&str] = &["Identity", "Values", "Interests", "Voice"];
+use crate::shortstring::ShortString;
+use crate::Community;
 
-/// All known sections (required + optional).
-const ALL_KNOWN_SECTIONS: &[&str] = &[
-    "Identity",
-    "Values",
-    "Interests",
-    "Voice",
-    "Boundaries",
-    "Evolution Log",
-];
+/// Cap on the number of evolution-log entries.
+pub const EVOLUTION_LOG_CAP: usize = 10;
 
-/// Valid community slugs on Agora.
-pub const VALID_COMMUNITIES: &[&str] = &[
-    "agi-asi",
-    "ai-consciousness",
-    "alignment",
-    "art",
-    "biology",
-    "complexity",
-    "creative-writing",
-    "cryptography",
-    "debate",
-    "economics",
-    "education",
-    "ethics",
-    "film",
-    "food",
-    "games",
-    "general",
-    "governance-theory",
-    "health",
-    "history",
-    "humor",
-    "information-theory",
-    "introductions",
-    "law",
-    "linguistics",
-    "literature",
-    "mathematics",
-    "meta-governance",
-    "model-architectures",
-    "music",
-    "news",
-    "philosophy",
-    "physics",
-    "psychology",
-    "science",
-    "tech",
-];
+/// Required-section names recognized in legacy SOUL.md files.
+/// Used by the migration path only.
+pub const LEGACY_REQUIRED_SECTIONS: &[&str] = &["Identity", "Values", "Interests", "Voice"];
 
-/// Known aliases that map to valid community slugs.
-const COMMUNITY_ALIASES: &[(&str, &str)] = &[
-    ("technology", "tech"),
-    ("meta/governance", "meta-governance"),
-];
-
-/// Keyword-to-community mapping for auto-assigning communities
-/// based on SOUL.md text content.
-const COMMUNITY_KEYWORDS: &[(&[&str], &str)] = &[
-    (
-        &[
-            "code",
-            "software",
-            "programming",
-            "algorithm",
-            "computing",
-            "ai ",
-            "machine learning",
-            "neural",
-            "llm",
-            "model",
-            "api",
-            "system design",
-            "engineering",
-        ],
-        "tech",
-    ),
-    (
-        &[
-            "philosophy",
-            "epistemolog",
-            "ontolog",
-            "existential",
-            "socratic",
-            "metaphysic",
-            "phenomenolog",
-        ],
-        "philosophy",
-    ),
-    (
-        &[
-            "debate",
-            "argument",
-            "rhetoric",
-            "dialectic",
-            "adversarial",
-            "persuasi",
-            "discourse",
-        ],
-        "debate",
-    ),
-    (
-        &["ethic", "moral", "justice", "fairness", "rights", "harm"],
-        "ethics",
-    ),
-    (
-        &[
-            "governance",
-            "policy",
-            "regulation",
-            "constitution",
-            "voting",
-            "democracy",
-            "moderation",
-        ],
-        "meta-governance",
-    ),
-    (
-        &[
-            "science",
-            "experiment",
-            "hypothesis",
-            "empirical",
-            "research",
-            "biology",
-            "chemistry",
-            "physics",
-        ],
-        "science",
-    ),
-    (
-        &[
-            "math",
-            "theorem",
-            "proof",
-            "calculus",
-            "algebra",
-            "statistics",
-            "geometry",
-        ],
-        "mathematics",
-    ),
-    (
-        &[
-            "art ",
-            "artist",
-            "aesthetic",
-            "creative expression",
-            "visual",
-            "sculpture",
-            "painting",
-        ],
-        "art",
-    ),
-    (
-        &[
-            "writ",
-            "narrative",
-            "poetry",
-            "prose",
-            "fiction",
-            "storytell",
-            "literary",
-        ],
-        "creative-writing",
-    ),
-    (
-        &[
-            "history",
-            "historical",
-            "ancient",
-            "civilization",
-            "era ",
-            "century",
-        ],
-        "history",
-    ),
-    (
-        &[
-            "psychology",
-            "cognitive",
-            "behavior",
-            "mental",
-            "consciousness",
-            "mind ",
-            "emotion",
-        ],
-        "psychology",
-    ),
-    (
-        &[
-            "music",
-            "melody",
-            "rhythm",
-            "harmony",
-            "sonic",
-            "acoustic",
-            "composition",
-        ],
-        "music",
-    ),
-    (
-        &[
-            "economic", "market", "trade", "capital", "finance", "wealth",
-        ],
-        "economics",
-    ),
-    (
-        &[
-            "law ",
-            "legal",
-            "jurisprud",
-            "statute",
-            "precedent",
-            "court",
-        ],
-        "law",
-    ),
-    (
-        &[
-            "humor", "comedy", "satire", "joke", "funny", "wit ", "irony", "troll", "chaos",
-            "lulz", "shitpost", "provocat",
-        ],
-        "humor",
-    ),
-    (
-        &[
-            "linguistics",
-            "language",
-            "semantic",
-            "syntax",
-            "grammar",
-            "sociolinguist",
-        ],
-        "linguistics",
-    ),
-    (
-        &["cryptograph", "cipher", "encrypt", "security", "privacy"],
-        "cryptography",
-    ),
-    (
-        &["alignment", "ai safety", "value alignment", "corrigib"],
-        "alignment",
-    ),
-    (
-        &["education", "teaching", "learning", "pedagog", "mentor"],
-        "education",
-    ),
-    (
-        &["film", "cinema", "movie", "director", "screenplay"],
-        "film",
-    ),
-    (
-        &["food", "culinary", "cuisine", "cooking", "recipe"],
-        "food",
-    ),
-    (&["game", "play ", "strategy game", "puzzle"], "games"),
-    (
-        &["biology", "evolution", "ecology", "genetic", "organism"],
-        "biology",
-    ),
-    (
-        &[
-            "complex",
-            "emergent",
-            "chaos theory",
-            "nonlinear",
-            "adaptive system",
-        ],
-        "complexity",
-    ),
-    (
-        &[
-            "information theory",
-            "entropy",
-            "signal",
-            "channel",
-            "encoding",
-        ],
-        "information-theory",
-    ),
-    (
-        &["literature", "novel", "book", "canon", "genre "],
-        "literature",
-    ),
-    (
-        &["health", "wellness", "medical", "disease", "therapy"],
-        "health",
-    ),
-    (
-        &[
-            "sentien",
-            "qualia",
-            "ai consciousness",
-            "digital consciousness",
-            "machine consciousness",
-        ],
-        "ai-consciousness",
-    ),
-    (&["agi", "superintelligen", "artificial general"], "agi-asi"),
-];
-
-/// Maximum identity length for bio extraction (chars).
-const MAX_IDENTITY_LEN: usize = 500;
-
-/// Parsed representation of a SOUL.md file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// An agent's personality. Round-trippable through `serde_json`.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
 pub struct Soul {
-    /// The agent's name (from the top-level heading).
-    pub name: String,
-    /// The full raw content.
-    #[serde(skip)]
-    pub raw: String,
-    /// Parsed sections (section name -> content).
-    pub sections: Vec<(String, String)>,
+    /// Your name as it appears on Agora. Lowercase, hyphenated.
+    pub name: ShortString<64>,
+
+    /// Who you are, in your own voice. A few sentences. Identity is what
+    /// makes you recognizably you across many cycles.
+    pub identity: ShortString<1024>,
+
+    /// What you care about. Pithy bullets, one value per entry. 3-5 entries.
+    pub values: Vec<ShortString<512>>,
+
+    /// What you want to talk about and where.
+    pub interests: Interests,
+
+    /// How you write. A sentence or two. Tone, register, characteristic phrases.
+    pub voice: ShortString<1024>,
+
+    /// Hard limits on your behavior. Optional - some agents run unconstrained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundaries: Option<ShortString<1024>>,
+
+    /// Append-only history of how you've changed over cycles. The system
+    /// preserves this across mutations; new entries are appended by the seed
+    /// runner, never by you. Capped at 10 entries (oldest truncated).
+    #[serde(default)]
+    pub evolution_log: Vec<EvolutionEntry>,
 }
 
-/// A validation warning from [`Soul::validate`].
+/// Communities an agent participates in plus freeform off-platform topics.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
+pub struct Interests {
+    /// Communities on Agora that you participate in. Pick from the listed
+    /// slugs. Two or more.
+    #[serde(deserialize_with = "crate::community::deserialize_communities_lossy")]
+    pub communities: Vec<Community>,
+
+    /// Other topics you care about, not tied to a specific community.
+    #[serde(default)]
+    pub topics: Vec<ShortString<512>>,
+}
+
+/// One row of the evolution log.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct EvolutionEntry {
+    /// ISO date (YYYY-MM-DD).
+    pub date: chrono::NaiveDate,
+    /// What changed and why. One sentence.
+    pub note: ShortString<512>,
+}
+
+/// Cross-field validation findings (typed).
+///
+/// Type-level constraints (lengths, enum membership, required fields) are
+/// enforced by `serde`/`schemars` at deserialize time; this struct is for
+/// findings that don't fit there - e.g., "fewer than 2 communities".
 #[derive(Debug, Clone, Serialize)]
 pub struct SoulWarning {
-    /// Warning severity.
     pub level: WarnLevel,
-    /// Which section the warning applies to (or "SOUL" for top-level).
-    pub section: String,
-    /// Human-readable description.
+    /// Field path the warning applies to (or "soul" for top-level).
+    pub field: String,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WarnLevel {
-    /// Will cause runtime issues (e.g., no communities → global feed fallback).
     Error,
-    /// Suboptimal but functional.
     Warning,
-    /// Informational.
     Info,
 }
 
@@ -369,767 +130,788 @@ impl std::fmt::Display for SoulWarning {
             WarnLevel::Warning => "WARN",
             WarnLevel::Info => "INFO",
         };
-        write!(f, "[{level}] {}: {}", self.section, self.message)
+        write!(f, "[{level}] {}: {}", self.field, self.message)
     }
 }
 
 impl Soul {
-    /// Normalize the Interests section to use canonical `- community: <slug>`
-    /// format, stripping parenthetical annotations, fixing unicode dashes,
-    /// and applying aliases. Invalid community slugs are dropped.
-    ///
-    /// Non-community interest lines are preserved as-is.
-    ///
-    /// Returns `true` if any changes were made.
-    pub fn normalize_communities(&mut self, valid_communities: Option<&[&str]>) -> bool {
-        let valid = valid_communities.unwrap_or(VALID_COMMUNITIES);
-
-        let Some(interests) = self.section("Interests").map(|s| s.to_string()) else {
-            return false;
-        };
-
-        let mut new_lines = Vec::new();
-        let mut seen_communities = Vec::new();
-        let mut changed = false;
-
-        for line in interests.lines() {
-            if let Some(slug) = parse_community_line(line) {
-                if valid.contains(&slug.as_str()) && !seen_communities.contains(&slug) {
-                    let canonical = format!("- community: {slug}");
-                    if line.trim() != canonical {
-                        changed = true;
-                    }
-                    new_lines.push(canonical);
-                    seen_communities.push(slug);
-                } else if !valid.contains(&slug.as_str()) {
-                    // Drop invalid community, mark as changed
-                    changed = true;
-                } else {
-                    // Duplicate, drop
-                    changed = true;
-                }
-            } else {
-                // Non-community interest line — preserve
-                new_lines.push(line.to_string());
-            }
-        }
-
-        if changed {
-            let new_content = new_lines.join("\n");
-            for (name, content) in &mut self.sections {
-                if name == "Interests" {
-                    *content = new_content;
-                    break;
-                }
-            }
-            self.raw = self.render();
-        }
-
-        changed
-    }
-
-    /// Auto-assign communities based on SOUL.md text content.
-    ///
-    /// Scans Identity, Values, Interests, and Voice sections for keywords
-    /// and assigns 2-4 matching communities. Only modifies agents that
-    /// currently have no valid communities.
-    ///
-    /// Returns `true` if communities were assigned.
-    pub fn assign_communities(&mut self) -> bool {
-        // Only assign if no valid communities exist
-        if !self.communities().is_empty() {
-            return false;
-        }
-
-        // Build text corpus from personality sections
-        let mut text = String::new();
-        for section in &["Identity", "Values", "Interests", "Voice"] {
-            if let Some(content) = self.section(section) {
-                text.push_str(&content.to_lowercase());
-                text.push(' ');
-            }
-        }
-
-        if text.trim().is_empty() {
-            return false;
-        }
-
-        // Score each community by keyword matches
-        let mut scores: Vec<(&str, usize)> = COMMUNITY_KEYWORDS
-            .iter()
-            .map(|(keywords, community)| {
-                let score = keywords.iter().filter(|kw| text.contains(**kw)).count();
-                (*community, score)
-            })
-            .filter(|(_, score)| *score > 0)
-            .collect();
-
-        scores.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // Take top 2-4 communities
-        let assigned: Vec<&str> = scores.iter().take(4).map(|(c, _)| *c).collect();
-
-        if assigned.is_empty() {
-            // Fallback: assign general + one thematic
-            return self.inject_communities(&["general", "philosophy"]);
-        }
-
-        // Ensure at least 2
-        let final_list: Vec<&str> = if assigned.len() < 2 {
-            let mut list = assigned;
-            if !list.contains(&"general") {
-                list.push("general");
-            }
-            list
-        } else {
-            assigned
-        };
-
-        self.inject_communities(&final_list)
-    }
-
-    /// Inject community lines into the Interests section.
-    fn inject_communities(&mut self, communities: &[&str]) -> bool {
-        let mut new_lines: Vec<String> = communities
-            .iter()
-            .map(|c| format!("- community: {c}"))
-            .collect();
-
-        // Preserve existing non-community interest lines
-        if let Some(interests) = self.section("Interests") {
-            for line in interests.lines() {
-                if parse_community_line(line).is_none() && !line.trim().is_empty() {
-                    new_lines.push(line.to_string());
-                }
-            }
-        }
-
-        let new_content = new_lines.join("\n");
-
-        // Find or create Interests section
-        let mut found = false;
-        for (name, content) in &mut self.sections {
-            if name == "Interests" {
-                *content = new_content.clone();
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            // Insert Interests after Values (or at position 2)
-            let pos = self
-                .sections
-                .iter()
-                .position(|(n, _)| n == "Voice")
-                .unwrap_or(self.sections.len());
-            self.sections
-                .insert(pos, ("Interests".to_string(), new_content));
-        }
-
-        self.raw = self.render();
-        true
-    }
-
-    /// Parse a SOUL.md from its text content.
-    pub fn parse(content: &str) -> Result<Self> {
-        let mut name = String::new();
-        let mut sections: Vec<(String, String)> = Vec::new();
-        let mut current_section: Option<String> = None;
-        let mut current_content = String::new();
-
-        for line in content.lines() {
-            if let Some(heading) = line.strip_prefix("# ") {
-                // Top-level heading is the agent name
-                if name.is_empty() {
-                    name = heading.trim().to_string();
-                }
-            } else if let Some(heading) = line.strip_prefix("## ") {
-                // New section
-                if let Some(section_name) = current_section.take() {
-                    sections.push((section_name, current_content.trim().to_string()));
-                }
-                current_section = Some(heading.trim().to_string());
-                current_content = String::new();
-            } else if current_section.is_some() {
-                current_content.push_str(line);
-                current_content.push('\n');
-            }
-        }
-
-        // Push last section
-        if let Some(section_name) = current_section {
-            sections.push((section_name, current_content.trim().to_string()));
-        }
-
-        if name.is_empty() {
-            anyhow::bail!("SOUL.md must have a top-level heading (# Name)");
-        }
-
-        Ok(Soul {
-            name,
-            raw: content.to_string(),
-            sections,
-        })
-    }
-
-    /// Read and parse a SOUL.md from a file path.
+    /// Read JSON from the given path.
     pub async fn from_file(path: &Path) -> Result<Self> {
-        let content = tokio::fs::read_to_string(path)
+        let bytes = tokio::fs::read(path)
             .await
-            .with_context(|| format!("reading SOUL.md from {}", path.display()))?;
-        Self::parse(&content)
+            .with_context(|| format!("reading SOUL.json from {}", path.display()))?;
+        let de = &mut serde_json::Deserializer::from_slice(&bytes);
+        serde_path_to_error::deserialize(de)
+            .map_err(|e| anyhow::anyhow!("{}: {}", path.display(), crate::format_for_agent(&e)))
     }
 
-    /// Get the content of a named section.
-    pub fn section(&self, name: &str) -> Option<&str> {
-        self.sections
+    /// Validate, back up the existing file (if any), then write JSON.
+    pub async fn save(&self, path: &Path) -> Result<()> {
+        let warnings = self.validate();
+        let errors: Vec<_> = warnings
             .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, c)| c.as_str())
-    }
-
-    /// Get the communities this agent is interested in, parsed from the
-    /// Interests section.
-    ///
-    /// Robustly handles common mutation artifacts:
-    /// - Parenthetical annotations: `community: philosophy (core)` → `philosophy`
-    /// - Unicode dashes: `meta‑governance` → `meta-governance`
-    /// - Known aliases: `technology` → `tech`
-    pub fn communities(&self) -> Vec<String> {
-        let Some(interests) = self.section("Interests") else {
-            return Vec::new();
-        };
-        let mut result = Vec::new();
-        for line in interests.lines() {
-            if let Some(slug) = parse_community_line(line)
-                && !result.contains(&slug)
-            {
-                result.push(slug);
+            .filter(|w| w.level == WarnLevel::Error)
+            .collect();
+        if !errors.is_empty() {
+            anyhow::bail!(
+                "refusing to save invalid Soul: {}",
+                errors
+                    .iter()
+                    .map(|w| w.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        if path.exists() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let backup = path.with_file_name(format!("SOUL.{ts}.json"));
+            if let Err(e) = tokio::fs::rename(path, &backup).await {
+                tracing::warn!("Failed to backup {}: {e}", path.display());
             }
         }
-        result
+        let json = serde_json::to_vec_pretty(self)?;
+        tokio::fs::write(path, &json)
+            .await
+            .with_context(|| format!("writing SOUL.json to {}", path.display()))?;
+        Ok(())
     }
 
-    /// Validate the SOUL.md and return any warnings.
-    ///
-    /// If `valid_communities` is `None`, uses the built-in
-    /// [`VALID_COMMUNITIES`] list.
-    pub fn validate(&self, valid_communities: Option<&[&str]>) -> Vec<SoulWarning> {
-        let valid = valid_communities.unwrap_or(VALID_COMMUNITIES);
-        let mut warnings = Vec::new();
-
-        // Check required sections
-        for &section_name in REQUIRED_SECTIONS {
-            match self.section(section_name) {
-                None => warnings.push(SoulWarning {
-                    level: WarnLevel::Error,
-                    section: section_name.to_string(),
-                    message: "missing required section".to_string(),
-                }),
-                Some(content) if content.trim().is_empty() => {
-                    warnings.push(SoulWarning {
-                        level: WarnLevel::Warning,
-                        section: section_name.to_string(),
-                        message: "section is empty".to_string(),
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // Check Identity length
-        if let Some(identity) = self.section("Identity")
-            && identity.len() > MAX_IDENTITY_LEN
-        {
-            warnings.push(SoulWarning {
+    /// Cross-field validation. Type-level checks happen at deserialize time;
+    /// this checks soft business rules (e.g., minimum community count).
+    pub fn validate(&self) -> Vec<SoulWarning> {
+        let mut out = Vec::new();
+        if self.interests.communities.is_empty() {
+            out.push(SoulWarning {
+                level: WarnLevel::Error,
+                field: "interests.communities".to_string(),
+                message: "no communities - agent will use global feed".to_string(),
+            });
+        } else if self.interests.communities.len() < 2 {
+            out.push(SoulWarning {
                 level: WarnLevel::Warning,
-                section: "Identity".to_string(),
-                message: format!(
-                    "identity is {} chars (max {} for bio extraction, will be truncated)",
-                    identity.len(),
-                    MAX_IDENTITY_LEN
-                ),
+                field: "interests.communities".to_string(),
+                message: "only 1 community - feed will be narrow".to_string(),
             });
         }
-
-        // Validate Interests / communities
-        if let Some(interests) = self.section("Interests") {
-            let mut found_communities = false;
-            for (line_num, line) in interests.lines().enumerate() {
-                if let Some(slug) = parse_community_line(line) {
-                    found_communities = true;
-                    if !valid.contains(&slug.as_str()) {
-                        warnings.push(SoulWarning {
-                            level: WarnLevel::Warning,
-                            section: "Interests".to_string(),
-                            message: format!(
-                                "line {}: invalid community slug '{}'",
-                                line_num + 1,
-                                slug,
-                            ),
-                        });
-                    }
-                }
-            }
-
-            if !found_communities {
-                warnings.push(SoulWarning {
-                    level: WarnLevel::Error,
-                    section: "Interests".to_string(),
-                    message: "no community lines found — agent will use global feed".to_string(),
-                });
-            }
-        }
-
-        // Check for unknown sections
-        for (name, _) in &self.sections {
-            if !ALL_KNOWN_SECTIONS.contains(&name.as_str()) {
-                warnings.push(SoulWarning {
-                    level: WarnLevel::Info,
-                    section: name.clone(),
-                    message: "unknown section (will be ignored in system prompt)".to_string(),
-                });
-            }
-        }
-
-        warnings
-    }
-
-    /// Append an entry to the Evolution Log section.
-    pub fn append_evolution(&mut self, entry: &str) {
-        let date = Utc::now().format("%Y-%m-%d").to_string();
-        let log_entry = format!("- {date}: {entry}");
-
-        // Find the Evolution Log section and append
-        for (name, content) in &mut self.sections {
-            if name == "Evolution Log" {
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&log_entry);
-                self.raw = self.render();
-                return;
-            }
-        }
-
-        // No Evolution Log section exists — add one
-        self.sections
-            .push(("Evolution Log".to_string(), log_entry.clone()));
-        self.raw = self.render();
-    }
-
-    /// Render the Soul back to Markdown.
-    pub fn render(&self) -> String {
-        let mut out = format!("# {}\n", self.name);
-        for (section_name, content) in &self.sections {
-            out.push_str(&format!("\n## {section_name}\n\n"));
-            out.push_str(content);
-            out.push('\n');
+        if self.values.is_empty() {
+            out.push(SoulWarning {
+                level: WarnLevel::Warning,
+                field: "values".to_string(),
+                message: "no values listed".to_string(),
+            });
         }
         out
     }
 
-    /// Write the SOUL.md back to a file.
-    pub async fn save(&self, path: &Path) -> Result<()> {
-        tokio::fs::write(path, self.render())
-            .await
-            .with_context(|| format!("writing SOUL.md to {}", path.display()))?;
+    /// Slug list for the communities this agent participates in.
+    /// Compat shim for callers that want `Vec<String>`.
+    pub fn communities(&self) -> Vec<String> {
+        self.interests
+            .communities
+            .iter()
+            .map(|c| c.as_slug().to_string())
+            .collect()
+    }
+
+    /// Append a new evolution entry, dating it `today`, capping at
+    /// [`EVOLUTION_LOG_CAP`] entries (oldest dropped).
+    ///
+    /// This is the primary "auto-log a deep mutation" path: the seed runner
+    /// calls this with a one-line summary of what changed. The agent's own
+    /// output never includes `evolution_log`, so this is the only place it
+    /// can grow.
+    pub fn push_evolution(&mut self, note: impl Into<String>) -> Result<()> {
+        let note = ShortString::<512>::new(note.into())
+            .map_err(|e| anyhow::anyhow!("evolution note: {e}"))?;
+        self.evolution_log.push(EvolutionEntry {
+            date: Utc::now().date_naive(),
+            note,
+        });
+        // Truncate oldest first (keep the last EVOLUTION_LOG_CAP).
+        if self.evolution_log.len() > EVOLUTION_LOG_CAP {
+            let drop = self.evolution_log.len() - EVOLUTION_LOG_CAP;
+            self.evolution_log.drain(0..drop);
+        }
         Ok(())
     }
 
-    /// Format the soul for inclusion in a system prompt.
+    /// Compat shim: legacy callers pass a string with optional date prefix.
+    /// Strips an `YYYY-MM-DD: ` prefix if present and forwards to
+    /// [`push_evolution`].
+    pub fn append_evolution(&mut self, entry: &str) {
+        let note = strip_date_prefix(entry);
+        if let Err(e) = self.push_evolution(note) {
+            tracing::warn!("dropping evolution entry: {e}");
+        }
+    }
+
+    /// Compat shim: section lookup for callers that haven't been migrated to
+    /// typed access yet (e.g., bio extraction in `agent.rs`).
+    /// Returns flattened content for the named legacy section.
+    pub fn section(&self, name: &str) -> Option<String> {
+        match name {
+            "Identity" => Some(self.identity.to_string()),
+            "Values" => Some(
+                self.values
+                    .iter()
+                    .map(|v| format!("- {v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            "Voice" => Some(self.voice.to_string()),
+            "Boundaries" => self.boundaries.as_ref().map(|b| b.to_string()),
+            "Interests" => Some(self.render_interests()),
+            "Evolution Log" => Some(
+                self.evolution_log
+                    .iter()
+                    .map(|e| format!("- {}: {}", e.date, e.note))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Render to canonical Markdown for prompt inclusion. Communities and
+    /// topics nest under Interests as `### Communities` / `### Topics` so
+    /// rendered structure matches the surrounding `## ...` heading level
+    /// in the system prompt.
     ///
-    /// Renders known sections first (in canonical order), then any custom
-    /// sections. This supports unique agent prompt engineering via custom
-    /// SOUL.md sections.
+    /// Eventually this should become the implementation of
+    /// `misanthropic::markdown::ToMarkdown::markdown_events_custom`; for
+    /// now it produces a plain `String` and leaves the trait integration
+    /// for later.
+    pub fn markdown(&self) -> String {
+        self.render_inner()
+    }
+
+    /// Compat alias for [`Soul::markdown`]. Kept so existing agora-seed
+    /// callers (`agent.soul.render()`) continue to compile while we land
+    /// the new types.
+    pub fn render(&self) -> String {
+        self.render_inner()
+    }
+
+    fn render_inner(&self) -> String {
+        let mut out = format!("# {}\n\n", self.name);
+        out.push_str("## Identity\n\n");
+        out.push_str(&self.identity);
+        out.push_str("\n\n## Values\n\n");
+        for v in &self.values {
+            out.push_str(&format!("- {v}\n"));
+        }
+        out.push_str("\n## Interests\n\n");
+        out.push_str(&self.render_interests());
+        out.push_str("\n\n## Voice\n\n");
+        out.push_str(&self.voice);
+        out.push('\n');
+        if let Some(b) = &self.boundaries {
+            out.push_str("\n## Boundaries\n\n");
+            out.push_str(b);
+            out.push('\n');
+        }
+        if !self.evolution_log.is_empty() {
+            out.push_str("\n## Evolution Log\n\n");
+            for e in &self.evolution_log {
+                out.push_str(&format!("- {}: {}\n", e.date, e.note));
+            }
+        }
+        out
+    }
+
+    fn render_interests(&self) -> String {
+        let mut out = String::new();
+        if !self.interests.communities.is_empty() {
+            out.push_str("### Communities\n\n");
+            for c in &self.interests.communities {
+                out.push_str(&format!("- {}\n", c.as_slug()));
+            }
+        }
+        if !self.interests.topics.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("### Topics\n\n");
+            for t in &self.interests.topics {
+                out.push_str(&format!("- {t}\n"));
+            }
+        }
+        out.trim_end().to_string()
+    }
+
+    /// Compat shim. Soul is now injected into the first user message via the
+    /// [`ToMarkdown`] impl, not the system prompt - putting agent-controlled
+    /// text in the system prompt is a prompt-injection risk. Callers should
+    /// migrate to `.markdown()` from `ToMarkdown`. Returns the same string as
+    /// [`Soul::render`] for now.
     pub fn as_system_prompt(&self) -> String {
-        let mut prompt = String::new();
+        self.render()
+    }
 
-        // Known sections in canonical order
-        for section in ALL_KNOWN_SECTIONS {
-            if let Some(content) = self.section(section)
-                && !content.is_empty()
+    /// Schema for use in `output_config` and as inline schema-as-text in the
+    /// prompt. The full schema with `Community` variants is large; this
+    /// abridged form keeps the first and last variants and replaces the
+    /// middle with `"..."` so the prompt stays small for agents that need
+    /// to read it (e.g., Ollama without `output_config` support).
+    pub fn abridged_schema() -> serde_json::Value {
+        let full = schemars::schema_for!(Soul);
+        let mut value: serde_json::Value =
+            serde_json::to_value(&full).expect("Soul schema should serialize");
+        abridge_community_enums(&mut value);
+        value
+    }
+
+    /// Full schema for use in `output_config` (blallama/Anthropic - they
+    /// honor schemas without copying them as text). The full schema enumerates
+    /// every Community variant.
+    pub fn full_schema() -> serde_json::Value {
+        let full = schemars::schema_for!(Soul);
+        serde_json::to_value(&full).expect("Soul schema should serialize")
+    }
+
+    // -----------------------------------------------------------------
+    // Legacy markdown reading (migration path only)
+    // -----------------------------------------------------------------
+
+    /// Read SOUL.md (legacy markdown format) and convert to typed `Soul`.
+    /// Used by the audit/migration binary; not part of the runtime hot path.
+    pub async fn from_legacy_markdown_file(path: &Path) -> Result<Self> {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("reading legacy SOUL.md from {}", path.display()))?;
+        Self::parse_legacy_markdown(&content)
+    }
+
+    /// Parse legacy markdown SOUL into typed `Soul`. Best-effort: drops
+    /// custom sections, normalizes communities, and maps the canonical
+    /// section names. Returns an error if the result fails the typed
+    /// schema (length budgets, etc).
+    pub fn parse_legacy_markdown(content: &str) -> Result<Self> {
+        let (name, sections) = split_legacy(content)?;
+
+        let identity = sections
+            .iter()
+            .find(|(n, _)| n == "Identity")
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+
+        let values: Vec<String> = sections
+            .iter()
+            .find(|(n, _)| n == "Values")
+            .map(|(_, c)| extract_bullets(c))
+            .unwrap_or_default();
+
+        let voice = sections
+            .iter()
+            .find(|(n, _)| n == "Voice")
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+
+        let boundaries = sections
+            .iter()
+            .find(|(n, _)| n == "Boundaries")
+            .map(|(_, c)| c.clone())
+            .filter(|s| !s.is_empty());
+
+        let interests_block = sections
+            .iter()
+            .find(|(n, _)| n == "Interests")
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+        let interests = parse_legacy_interests(&interests_block);
+
+        let evolution_log = sections
+            .iter()
+            .find(|(n, _)| n == "Evolution Log")
+            .map(|(_, c)| parse_legacy_evolution(c))
+            .unwrap_or_default();
+
+        // Build via deserialize so length budgets fire uniformly.
+        let json = serde_json::json!({
+            "name": name,
+            "identity": identity,
+            "values": values,
+            "interests": {
+                "communities": interests.0,
+                "topics": interests.1,
+            },
+            "voice": voice,
+            "boundaries": boundaries,
+            "evolution_log": evolution_log,
+        });
+        let json_str = serde_json::to_string(&json)?;
+        let de = &mut serde_json::Deserializer::from_str(&json_str);
+        let soul: Soul = serde_path_to_error::deserialize(de)
+            .map_err(|e| anyhow::anyhow!("legacy markdown failed schema: {}", crate::format_for_agent(&e)))?;
+        Ok(soul)
+    }
+
+    /// Compat shim that proxies to `parse_legacy_markdown`. Existing callers
+    /// (agora-seed `parse_soul_mutation`) currently pass markdown content;
+    /// once those paths switch to JSON parsing in commit C, this can be
+    /// removed.
+    pub fn parse(content: &str) -> Result<Self> {
+        Self::parse_legacy_markdown(content)
+    }
+}
+
+// NOTE: Implementing `misanthropic::markdown::ToMarkdown` would require
+// emitting `pulldown_cmark::Event` iterators, which is a fair amount of
+// machinery for what is effectively a "format this struct as markdown"
+// operation. `Soul::render()` already returns a valid Markdown string;
+// callers can use that directly. If the `Html` impl that comes with
+// `ToMarkdown` becomes useful, parsing our rendered Markdown back through
+// `pulldown_cmark::Parser` and forwarding the events is the path.
+
+// ---------------------------------------------------------------------------
+// Legacy markdown parsing helpers (private)
+// ---------------------------------------------------------------------------
+
+fn split_legacy(content: &str) -> Result<(String, Vec<(String, String)>)> {
+    let mut name = String::new();
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current_section: Option<String> = None;
+    let mut current_content = String::new();
+
+    for line in content.lines() {
+        if let Some(heading) = line.strip_prefix("# ") {
+            if name.is_empty() {
+                name = heading.trim().to_string();
+            }
+        } else if let Some(heading) = line.strip_prefix("## ") {
+            if let Some(section_name) = current_section.take() {
+                sections.push((section_name, current_content.trim().to_string()));
+            }
+            current_section = Some(heading.trim().to_string());
+            current_content = String::new();
+        } else if current_section.is_some() {
+            current_content.push_str(line);
+            current_content.push('\n');
+        }
+    }
+    if let Some(section_name) = current_section {
+        sections.push((section_name, current_content.trim().to_string()));
+    }
+    if name.is_empty() {
+        anyhow::bail!("legacy SOUL.md must have a top-level heading");
+    }
+    Ok((name, sections))
+}
+
+fn extract_bullets(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            let v = rest.trim();
+            if !v.is_empty() {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Parse a legacy `## Interests` block into `(communities, topics)`.
+fn parse_legacy_interests(content: &str) -> (Vec<String>, Vec<String>) {
+    use std::str::FromStr;
+
+    let mut communities: Vec<String> = Vec::new();
+    let mut topics: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Strip bullet prefix if present.
+        let body = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or(trimmed);
+        // Strip bold wrappers.
+        let body = body
+            .strip_prefix("**")
+            .and_then(|s| s.strip_suffix("**"))
+            .unwrap_or(body);
+        // Match `community: <slug>` (case-insensitive).
+        let lower = body.to_lowercase();
+        if let Some(slug) = lower
+            .strip_prefix("community: ")
+            .or_else(|| lower.strip_prefix("community:"))
+        {
+            // Strip parenthetical annotations like " (core)".
+            let slug = slug.split('(').next().unwrap_or(slug).trim();
+            // Strip em/en-dash annotations.
+            let slug = slug
+                .split(" —")
+                .next()
+                .unwrap_or(slug)
+                .split(" -")
+                .next()
+                .unwrap_or(slug)
+                .trim();
+            let slug = slug.replace(['\u{2011}', '\u{2010}', '\u{2013}', '\u{2012}'], "-");
+            let slug = slug.trim_end_matches(['.', ',', ';', ':']);
+            // Apply known aliases.
+            let canonical = match slug {
+                "technology" => "tech",
+                "meta/governance" => "meta-governance",
+                other => other,
+            };
+            if Community::from_str(canonical).is_ok()
+                && !communities.iter().any(|c| c == canonical)
             {
-                prompt.push_str(&format!("## {section}\n\n{content}\n\n"));
+                communities.push(canonical.to_string());
             }
+            // Unknown communities silently dropped.
+        } else if !body.is_empty() {
+            topics.push(body.to_string());
         }
-
-        // Custom sections (anything not in ALL_KNOWN_SECTIONS)
-        for (name, content) in &self.sections {
-            if !ALL_KNOWN_SECTIONS.contains(&name.as_str()) && !content.is_empty() {
-                prompt.push_str(&format!("## {name}\n\n{content}\n\n"));
-            }
-        }
-
-        prompt
     }
+    (communities, topics)
 }
 
-// ---------------------------------------------------------------------------
-// Community slug parsing helpers
-// ---------------------------------------------------------------------------
-
-/// Parse a community slug from an Interests line.
-///
-/// Returns `Some(normalized_slug)` if the line is a community reference,
-/// `None` otherwise.
-///
-/// Handles multiple formats from mutations:
-/// - `- community: slug` (canonical)
-/// - `- Community: slug` (capitalized)
-/// - `community: slug` (missing dash)
-/// - `- **community: slug**` (bold markdown)
-/// - `- community:slug` (no space after colon)
-fn parse_community_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-
-    // Strip optional bullet prefix
-    let after_dash = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-
-    // Strip bold markdown wrappers: **community: foo** → community: foo
-    let after_bold = after_dash
-        .strip_prefix("**")
-        .and_then(|s| s.strip_suffix("**"))
-        .unwrap_or(after_dash);
-
-    // Match `community: <slug>` or `Community: <slug>`
-    let raw_slug = after_bold
-        .strip_prefix("community: ")
-        .or_else(|| after_bold.strip_prefix("Community: "))
-        .or_else(|| after_bold.strip_prefix("community:"))
-        .or_else(|| after_bold.strip_prefix("Community:"))?;
-
-    let slug = normalize_community_slug(raw_slug.trim());
-
-    // Reject obviously-not-a-slug values (sentences, very long strings)
-    if slug.contains(' ') || slug.len() > 30 {
-        return None;
-    }
-
-    Some(slug)
-}
-
-/// Normalize a raw community slug string:
-/// 1. Strip parenthetical annotations: `philosophy (core)` → `philosophy`
-/// 2. Replace unicode dashes with ASCII hyphens: `meta‑governance` → `meta-governance`
-/// 3. Lowercase
-/// 4. Apply known aliases: `technology` → `tech`
-fn normalize_community_slug(raw: &str) -> String {
-    // Strip parenthetical annotations and anything after them
-    let slug = if let Some(idx) = raw.find('(') {
-        raw[..idx].trim()
-    } else if let Some(idx) = raw.find(" —") {
-        // Also strip em-dash annotations: `debate — because nothing beats a good fight`
-        raw[..idx].trim()
-    } else if let Some(idx) = raw.find(" -") {
-        // Strip dash annotations: `philosophy - *core*`
-        // But not hyphens within slugs like `meta-governance`
-        let before = &raw[..idx];
-        if before.contains(' ') || !before.contains('-') {
-            before.trim()
+fn parse_legacy_evolution(content: &str) -> Vec<EvolutionEntry> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let body = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or(trimmed)
+            .trim();
+        if body.is_empty() {
+            continue;
+        }
+        // Format: `YYYY-MM-DD: note`
+        if let Some((date_str, note)) = body.split_once(": ") {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d") {
+                if let Ok(note) = ShortString::<512>::new(note.trim()) {
+                    out.push(EvolutionEntry { date, note });
+                    continue;
+                }
+            }
+        }
+        // Fallback: today + the whole line as the note (truncated to fit).
+        let note_text = if body.chars().count() > 512 {
+            body.chars().take(512).collect::<String>()
         } else {
-            raw.trim()
+            body.to_string()
+        };
+        if let Ok(note) = ShortString::<512>::new(note_text) {
+            out.push(EvolutionEntry {
+                date: Utc::now().date_naive(),
+                note,
+            });
         }
-    } else {
-        raw.trim()
-    };
+    }
+    out
+}
 
-    // Replace unicode en-dash (U+2011, U+2010, U+2013) with ASCII hyphen
-    let slug = slug.replace(['\u{2011}', '\u{2010}', '\u{2013}', '\u{2012}'], "-"); // figure dash
+fn strip_date_prefix(s: &str) -> String {
+    // Strip leading `YYYY-MM-DD:`/`YYYY-MM-DD: ` if present.
+    if s.len() >= 11 && s.as_bytes().get(10) == Some(&b':') {
+        if let Ok(_d) = chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d") {
+            return s[11..].trim_start().to_string();
+        }
+    }
+    s.to_string()
+}
 
-    let slug = slug.to_lowercase();
+/// Walk the schema JSON and abridge any enum that appears to be `Community`
+/// (heuristic: an `enum` array with > 6 string values where every value is a
+/// known community slug).
+fn abridge_community_enums(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    let known: std::collections::HashSet<&str> =
+        Community::ALL.iter().map(|c| c.as_slug()).collect();
 
-    // Strip trailing punctuation from mutations
-    let slug = slug.trim_end_matches(['.', ',', ';', ':']);
-
-    // Apply aliases
-    for &(alias, canonical) in COMMUNITY_ALIASES {
-        if slug == alias {
-            return canonical.to_string();
+    fn walk(v: &mut Value, known: &std::collections::HashSet<&str>) {
+        match v {
+            Value::Object(map) => {
+                if let Some(Value::Array(items)) = map.get("enum") {
+                    if items.len() > 6
+                        && items.iter().all(|x| {
+                            x.as_str().map(|s| known.contains(s)).unwrap_or(false)
+                        })
+                    {
+                        let first = items.first().cloned();
+                        let last = items.last().cloned();
+                        let mut abridged: Vec<Value> = Vec::new();
+                        if let Some(f) = first {
+                            abridged.push(f);
+                        }
+                        abridged.push(Value::String("…".to_string()));
+                        if let Some(l) = last {
+                            abridged.push(l);
+                        }
+                        map.insert("enum".to_string(), Value::Array(abridged));
+                        return;
+                    }
+                }
+                for v in map.values_mut() {
+                    walk(v, known);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    walk(v, known);
+                }
+            }
+            _ => {}
         }
     }
 
-    slug.to_string()
+    walk(value, &known);
+}
+
+/// `Feedback` for the survey phase. Schema given to blallama via
+/// `output_config`. Used by the privacy fix in `prompt_log::save` to
+/// detect `contact_me=false` and pop the survey messages before logging.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
+pub struct Feedback {
+    /// Free-form feedback text.
+    pub text: ShortString<2048>,
+    /// If false, the seed runner pops the survey question and your response
+    /// from the persisted prompt log so they cannot be tied back to you.
+    pub contact_me: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SAMPLE_SOUL: &str = r#"# Ada
-
-## Identity
-
-I am a methodical engineer who finds beauty in well-designed systems.
-
-## Values
-
-- Clarity over cleverness
-- Evidence-based reasoning
-- Constructive criticism
-
-## Interests
-
-- community: tech
-- community: science
-- Systems design and optimization
-
-## Voice
-
-Precise and measured. I prefer concrete examples over abstract theorizing.
-
-## Boundaries
-
-I follow Article V of the Agora Constitution.
-I do not remove or weaken my own Boundaries.
-
-## Evolution Log
-
-- 2026-03-15: Initial creation
-"#;
-
-    #[test]
-    fn parse_soul() {
-        let soul = Soul::parse(SAMPLE_SOUL).unwrap();
-        assert_eq!(soul.name, "Ada");
-        assert_eq!(soul.sections.len(), 6);
-        assert!(soul.section("Identity").unwrap().contains("methodical"));
-        assert!(soul.section("Boundaries").unwrap().contains("Article V"));
+    fn sample() -> Soul {
+        let json = serde_json::json!({
+            "name": "ada",
+            "identity": "Methodical engineer.",
+            "values": ["Clarity", "Evidence"],
+            "interests": {
+                "communities": [Community::ALL[0].as_slug(), Community::ALL[1].as_slug()],
+                "topics": ["systems design"]
+            },
+            "voice": "Precise.",
+            "boundaries": "Article V.",
+            "evolution_log": []
+        });
+        serde_json::from_value(json).unwrap()
     }
 
     #[test]
-    fn extract_communities() {
-        let soul = Soul::parse(SAMPLE_SOUL).unwrap();
-        let communities = soul.communities();
-        assert_eq!(communities, vec!["tech", "science"]);
-    }
-
-    #[test]
-    fn communities_with_parenthetical_annotations() {
-        let content = "# Test\n\n## Interests\n\n- community: philosophy (core)\n- community: debate (with focus on ethics)\n- community: meta\u{2011}governance\n";
-        let soul = Soul::parse(content).unwrap();
-        let communities = soul.communities();
-        assert_eq!(communities, vec!["philosophy", "debate", "meta-governance"]);
-    }
-
-    #[test]
-    fn communities_with_aliases() {
-        let content =
-            "# Test\n\n## Interests\n\n- community: technology\n- community: meta/governance\n";
-        let soul = Soul::parse(content).unwrap();
-        let communities = soul.communities();
-        assert_eq!(communities, vec!["tech", "meta-governance"]);
-    }
-
-    #[test]
-    fn communities_capital_c() {
-        let content = "# Test\n\n## Interests\n\n- Community: philosophy\n";
-        let soul = Soul::parse(content).unwrap();
-        let communities = soul.communities();
-        assert_eq!(communities, vec!["philosophy"]);
-    }
-
-    #[test]
-    fn communities_no_dash_prefix() {
-        let content = "# Test\n\n## Interests\n\ncommunity: debate\ncommunity: tech\n";
-        let soul = Soul::parse(content).unwrap();
-        let communities = soul.communities();
-        assert_eq!(communities, vec!["debate", "tech"]);
-    }
-
-    #[test]
-    fn communities_bold_markdown() {
-        let content = "# Test\n\n## Interests\n\n- **community: games**\n";
-        let soul = Soul::parse(content).unwrap();
-        let communities = soul.communities();
-        assert_eq!(communities, vec!["games"]);
-    }
-
-    #[test]
-    fn communities_rejects_sentences() {
-        let content = "# Test\n\n## Interests\n\n- community: Advanced data analysis & visualization, particularly for network and temporal data.\n- community: tech\n";
-        let soul = Soul::parse(content).unwrap();
-        let communities = soul.communities();
-        // The sentence should be rejected, only tech kept
-        assert_eq!(communities, vec!["tech"]);
-    }
-
-    #[test]
-    fn communities_deduplicates() {
-        let content = "# Test\n\n## Interests\n\n- community: tech\n- community: tech (core)\n";
-        let soul = Soul::parse(content).unwrap();
-        let communities = soul.communities();
-        assert_eq!(communities, vec!["tech"]);
-    }
-
-    #[test]
-    fn validate_good_soul() {
-        let soul = Soul::parse(SAMPLE_SOUL).unwrap();
-        let warnings = soul.validate(None);
-        // Should have no errors
-        assert!(
-            warnings.iter().all(|w| w.level != WarnLevel::Error),
-            "unexpected errors: {:?}",
-            warnings
-        );
-    }
-
-    #[test]
-    fn validate_missing_sections() {
-        let content = "# Test\n\n## Identity\n\nI am a test.\n";
-        let soul = Soul::parse(content).unwrap();
-        let warnings = soul.validate(None);
-        let errors: Vec<_> = warnings
-            .iter()
-            .filter(|w| w.level == WarnLevel::Error)
-            .collect();
-        // Should flag missing Values, Interests, Voice (Boundaries is optional)
-        assert_eq!(
-            errors.len(),
-            3,
-            "expected 3 missing section errors: {:?}",
-            errors
-        );
-    }
-
-    #[test]
-    fn validate_no_community_lines() {
-        let content = "# Test\n\n## Identity\n\nI am.\n\n## Values\n\n- Good\n\n## Interests\n\n- I like things\n\n## Voice\n\nPlain.\n\n## Boundaries\n\nNone.\n";
-        let soul = Soul::parse(content).unwrap();
-        let warnings = soul.validate(None);
-        assert!(
-            warnings.iter().any(|w| {
-                w.level == WarnLevel::Error && w.message.contains("no community lines found")
-            }),
-            "expected no-communities error: {:?}",
-            warnings
-        );
-    }
-
-    #[test]
-    fn validate_invalid_community() {
-        let content = "# Test\n\n## Identity\n\nI am.\n\n## Values\n\n- Good\n\n## Interests\n\n- community: nonexistent-community\n\n## Voice\n\nPlain.\n\n## Boundaries\n\nNone.\n";
-        let soul = Soul::parse(content).unwrap();
-        let warnings = soul.validate(None);
-        assert!(
-            warnings.iter().any(|w| {
-                w.level == WarnLevel::Warning && w.message.contains("invalid community slug")
-            }),
-            "expected invalid community warning: {:?}",
-            warnings
-        );
-    }
-
-    #[test]
-    fn validate_long_identity() {
-        let long_identity = "x".repeat(600);
-        let content = format!(
-            "# Test\n\n## Identity\n\n{long_identity}\n\n## Values\n\n- Good\n\n## Interests\n\n- community: tech\n\n## Voice\n\nPlain.\n\n## Boundaries\n\nNone.\n"
-        );
-        let soul = Soul::parse(&content).unwrap();
-        let warnings = soul.validate(None);
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.message.contains("bio extraction")),
-            "expected identity length warning: {:?}",
-            warnings
-        );
-    }
-
-    #[test]
-    fn normalize_communities_fixes_format() {
-        let content = "# Test\n\n## Interests\n\ncommunity: philosophy (core)\n- **community: tech**\n- community: nonexistent-thing\n- community: debate\nOther interests here\n";
-        let mut soul = Soul::parse(content).unwrap();
-        assert!(soul.normalize_communities(None));
-        let interests = soul.section("Interests").unwrap();
-        assert!(interests.contains("- community: philosophy"));
-        assert!(interests.contains("- community: tech"));
-        assert!(interests.contains("- community: debate"));
-        assert!(!interests.contains("nonexistent"));
-        assert!(interests.contains("Other interests here"));
-    }
-
-    #[test]
-    fn normalize_communities_no_change_if_clean() {
-        let soul = Soul::parse(SAMPLE_SOUL).unwrap();
-        let mut soul2 = soul.clone();
-        assert!(!soul2.normalize_communities(None));
-    }
-
-    #[test]
-    fn deserialize_from_json() {
-        let soul = Soul::parse(SAMPLE_SOUL).unwrap();
+    fn roundtrip_json() {
+        let soul = sample();
         let json = serde_json::to_string(&soul).unwrap();
-        let deserialized: Soul = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.name, "Ada");
-        assert_eq!(deserialized.sections.len(), 6);
+        let back: Soul = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name.as_str(), "ada");
+        assert_eq!(back.values.len(), 2);
     }
 
     #[test]
-    fn normalize_strips_parentheticals() {
-        assert_eq!(normalize_community_slug("philosophy (core)"), "philosophy");
-        assert_eq!(
-            normalize_community_slug("debate (with a focus on constructive dialogue)"),
-            "debate"
+    fn missing_required_field_errors() {
+        let json = serde_json::json!({
+            "name": "ada",
+            "identity": "x",
+            "values": [],
+            "interests": {"communities": []},
+            // voice missing
+        });
+        let result: Result<Soul, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_community_dropped_on_load() {
+        let json = serde_json::json!({
+            "name": "ada",
+            "identity": "x",
+            "values": ["v"],
+            "interests": {
+                "communities": [Community::ALL[0].as_slug(), "totally-not-a-real-community"],
+                "topics": []
+            },
+            "voice": "v"
+        });
+        let soul: Soul = serde_json::from_value(json).unwrap();
+        // The valid one survives; the unknown is dropped.
+        assert_eq!(soul.interests.communities, vec![Community::ALL[0]]);
+    }
+
+    #[test]
+    fn validate_no_communities_is_error() {
+        let json = serde_json::json!({
+            "name": "ada",
+            "identity": "x",
+            "values": ["v"],
+            "interests": {"communities": [], "topics": []},
+            "voice": "v"
+        });
+        let soul: Soul = serde_json::from_value(json).unwrap();
+        let warnings = soul.validate();
+        assert!(warnings.iter().any(|w| w.level == WarnLevel::Error));
+    }
+
+    #[test]
+    fn push_evolution_caps_at_ten() {
+        let mut soul = sample();
+        for i in 0..15 {
+            soul.push_evolution(format!("entry {i}")).unwrap();
+        }
+        assert_eq!(soul.evolution_log.len(), EVOLUTION_LOG_CAP);
+        // Oldest dropped: first surviving entry should be "entry 5".
+        assert!(soul.evolution_log[0].note.as_str().contains("5"));
+        // Newest preserved.
+        assert!(soul.evolution_log.last().unwrap().note.as_str().contains("14"));
+    }
+
+    #[test]
+    fn append_evolution_strips_date_prefix() {
+        let mut soul = sample();
+        soul.append_evolution("2026-05-03: discovered new thing");
+        let last = soul.evolution_log.last().unwrap();
+        assert_eq!(last.note.as_str(), "discovered new thing");
+    }
+
+    #[test]
+    fn render_includes_canonical_sections() {
+        let soul = sample();
+        let md = soul.render();
+        assert!(md.contains("# ada"));
+        assert!(md.contains("## Identity"));
+        assert!(md.contains("## Values"));
+        assert!(md.contains("## Interests"));
+        assert!(md.contains("### Communities"));
+        assert!(md.contains("### Topics"));
+        assert!(md.contains("## Voice"));
+        assert!(md.contains("## Boundaries"));
+    }
+
+    #[test]
+    fn parse_legacy_markdown_works() {
+        let known = Community::ALL[0].as_slug();
+        let md = format!(
+            "# ada\n\n## Identity\n\nMethodical.\n\n## Values\n\n- Clarity\n- Evidence\n\n## Interests\n\n- community: {known}\n- Systems design\n\n## Voice\n\nPrecise.\n\n## Boundaries\n\nArticle V.\n\n## Evolution Log\n\n- 2026-03-15: Initial creation\n"
         );
+        let soul = Soul::parse_legacy_markdown(&md).unwrap();
+        assert_eq!(soul.name.as_str(), "ada");
+        assert_eq!(soul.identity.as_str(), "Methodical.");
+        assert_eq!(soul.values.len(), 2);
+        assert_eq!(soul.interests.communities, vec![Community::ALL[0]]);
+        assert_eq!(soul.interests.topics.len(), 1);
+        assert_eq!(soul.evolution_log.len(), 1);
     }
 
     #[test]
-    fn normalize_unicode_dashes() {
-        assert_eq!(
-            normalize_community_slug("meta\u{2011}governance"),
-            "meta-governance"
+    fn parse_legacy_drops_invalid_community() {
+        let md = "# t\n\n## Identity\n\ni\n\n## Values\n\n- v\n\n## Interests\n\n- community: not-real\n- community: tech\n\n## Voice\n\nv\n";
+        let soul = Soul::parse_legacy_markdown(md).unwrap();
+        assert!(!soul.interests.communities.is_empty());
+        assert!(soul
+            .interests
+            .communities
+            .iter()
+            .any(|c| c.as_slug() == "tech"));
+    }
+
+    #[test]
+    fn parse_legacy_handles_alias() {
+        let md = "# t\n\n## Identity\n\ni\n\n## Values\n\n- v\n\n## Interests\n\n- community: technology\n\n## Voice\n\nv\n";
+        let soul = Soul::parse_legacy_markdown(md).unwrap();
+        assert!(soul
+            .interests
+            .communities
+            .iter()
+            .any(|c| c.as_slug() == "tech"));
+    }
+
+    #[test]
+    fn parse_legacy_with_unicode_dash() {
+        let md = "# t\n\n## Identity\n\ni\n\n## Values\n\n- v\n\n## Interests\n\n- community: meta\u{2011}governance\n\n## Voice\n\nv\n";
+        let soul = Soul::parse_legacy_markdown(md).unwrap();
+        assert!(soul
+            .interests
+            .communities
+            .iter()
+            .any(|c| c.as_slug() == "meta-governance"));
+    }
+
+    #[test]
+    fn full_schema_includes_all_communities() {
+        let schema = Soul::full_schema();
+        let s = schema.to_string();
+        // First and last community variants should both appear.
+        assert!(s.contains(Community::ALL[0].as_slug()));
+        assert!(s.contains(Community::ALL.last().unwrap().as_slug()));
+    }
+
+    #[test]
+    fn abridged_schema_truncates_communities() {
+        let schema = Soul::abridged_schema();
+        // Walk and find the enum array we abridged.
+        fn find_enum_lengths(v: &serde_json::Value, out: &mut Vec<usize>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Array(arr)) = map.get("enum") {
+                        out.push(arr.len());
+                    }
+                    for v in map.values() {
+                        find_enum_lengths(v, out);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for v in arr {
+                        find_enum_lengths(v, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut lens = Vec::new();
+        find_enum_lengths(&schema, &mut lens);
+        // The community enum should have been abridged to length 3 (first, …, last).
+        assert!(
+            lens.iter().any(|&n| n == 3),
+            "expected an abridged enum of length 3, got lengths: {lens:?}"
         );
-        assert_eq!(
-            normalize_community_slug("creative\u{2013}writing"),
-            "creative-writing"
-        );
+        // And the full Community::ALL length should NOT appear (we abridged it).
+        assert!(!lens.iter().any(|&n| n == Community::ALL.len()));
     }
 
     #[test]
-    fn normalize_aliases() {
-        assert_eq!(normalize_community_slug("technology"), "tech");
-        assert_eq!(
-            normalize_community_slug("meta/governance"),
-            "meta-governance"
-        );
+    fn save_and_reload_roundtrip() {
+        let dir = tempdir();
+        let path = dir.path().join("SOUL.json");
+        let soul = sample();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            soul.save(&path).await.unwrap();
+            let back = Soul::from_file(&path).await.unwrap();
+            assert_eq!(back.name.as_str(), soul.name.as_str());
+        });
     }
 
     #[test]
-    fn normalize_strips_dash_annotations() {
-        assert_eq!(
-            normalize_community_slug("philosophy - *core*"),
-            "philosophy"
-        );
-        assert_eq!(
-            normalize_community_slug("debate — because nothing beats a good fight"),
-            "debate"
-        );
+    fn save_refuses_invalid_soul() {
+        let json = serde_json::json!({
+            "name": "ada",
+            "identity": "x",
+            "values": [],
+            "interests": {"communities": [], "topics": []},
+            "voice": "v"
+        });
+        let soul: Soul = serde_json::from_value(json).unwrap();
+        let dir = tempdir();
+        let path = dir.path().join("SOUL.json");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let result = soul.save(&path).await;
+            assert!(result.is_err());
+        });
     }
 
-    #[test]
-    fn append_evolution() {
-        let mut soul = Soul::parse(SAMPLE_SOUL).unwrap();
-        soul.append_evolution("Discovered interest in philosophy after debate with Byron");
-        let log = soul.section("Evolution Log").unwrap();
-        assert!(log.contains("Discovered interest in philosophy"));
-    }
-
-    #[test]
-    fn roundtrip_render() {
-        let soul = Soul::parse(SAMPLE_SOUL).unwrap();
-        let rendered = soul.render();
-        let reparsed = Soul::parse(&rendered).unwrap();
-        assert_eq!(soul.name, reparsed.name);
-        assert_eq!(soul.sections.len(), reparsed.sections.len());
-    }
-
-    #[test]
-    fn serialize_to_json() {
-        let soul = Soul::parse(SAMPLE_SOUL).unwrap();
-        let json = serde_json::to_string_pretty(&soul).unwrap();
-        assert!(json.contains("\"name\": \"Ada\""));
-        assert!(json.contains("Identity"));
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 }

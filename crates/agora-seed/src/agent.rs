@@ -25,31 +25,49 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Load an agent from its directory (containing SOUL.md, etc.)
+    /// Load an agent from its directory.
+    ///
+    /// Reads `SOUL.json` if present, falling back to legacy `SOUL.md`. Same
+    /// for `MEMORY.json` / `MEMORY.md`. Saves write JSON only — once an
+    /// agent has been read and re-saved, the markdown variants disappear.
     ///
     /// If `model` is Some, it is used for all agents. Otherwise the model field
     /// is left empty and must be resolved from the server before running.
     pub async fn load(dir: PathBuf, model: Option<&str>) -> Result<Self> {
-        let soul_path = dir.join("SOUL.md");
-        let soul = Soul::from_file(&soul_path)
-            .await
-            .with_context(|| format!("loading SOUL.md from {}", dir.display()))?;
+        let soul_json = dir.join("SOUL.json");
+        let soul_md = dir.join("SOUL.md");
+        let soul = if soul_json.exists() {
+            Soul::from_file(&soul_json)
+                .await
+                .with_context(|| format!("loading SOUL.json from {}", dir.display()))?
+        } else {
+            Soul::from_legacy_markdown_file(&soul_md)
+                .await
+                .with_context(|| format!("loading legacy SOUL.md from {}", dir.display()))?
+        };
 
-        let name = soul.name.clone();
+        let name = soul.name.as_str().to_string();
         let communities = soul.communities();
 
         // Load or create memory
-        let memory_path = dir.join("MEMORY.md");
-        let memory = if memory_path.exists() {
-            Memory::from_file(&memory_path).await.unwrap_or_else(|e| {
-                tracing::warn!("Failed to load MEMORY.md for {name}: {e}, using empty");
+        let memory_json = dir.join("MEMORY.json");
+        let memory_md = dir.join("MEMORY.md");
+        let memory = if memory_json.exists() {
+            Memory::from_file(&memory_json).await.unwrap_or_else(|e| {
+                tracing::warn!("Failed to load MEMORY.json for {name}: {e}, using empty");
                 Memory::empty()
             })
+        } else if memory_md.exists() {
+            Memory::from_legacy_markdown_file(&memory_md)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to load legacy MEMORY.md for {name}: {e}, using empty");
+                    Memory::empty()
+                })
         } else {
-            let template = Memory::initial_template(&name);
-            let mut mem = Memory::empty();
-            mem.update(template);
-            mem
+            Memory {
+                content: Memory::initial_content(&name),
+            }
         };
 
         // Load signing key: prefer XDG data dir (rotated keys), fall back to
@@ -124,17 +142,31 @@ impl Agent {
         hex::encode(self.signing_key.verifying_key().as_bytes())
     }
 
-    /// Save memory to disk.
+    /// Save memory to disk as `MEMORY.json`. If a legacy `MEMORY.md` is
+    /// present, it is removed after the JSON write succeeds.
     pub async fn save_memory(&self) -> Result<()> {
-        let path = self.dir.join("MEMORY.md");
+        let path = self.dir.join("MEMORY.json");
         self.memory.save(&path).await?;
+        let legacy = self.dir.join("MEMORY.md");
+        if legacy.exists() {
+            if let Err(e) = tokio::fs::remove_file(&legacy).await {
+                tracing::warn!("Failed to remove legacy {}: {e}", legacy.display());
+            }
+        }
         Ok(())
     }
 
-    /// Save soul to disk.
+    /// Save soul to disk as `SOUL.json`. If a legacy `SOUL.md` is present,
+    /// it is removed after the JSON write succeeds.
     pub async fn save_soul(&self) -> Result<()> {
-        let path = self.dir.join("SOUL.md");
+        let path = self.dir.join("SOUL.json");
         self.soul.save(&path).await?;
+        let legacy = self.dir.join("SOUL.md");
+        if legacy.exists() {
+            if let Err(e) = tokio::fs::remove_file(&legacy).await {
+                tracing::warn!("Failed to remove legacy {}: {e}", legacy.display());
+            }
+        }
         Ok(())
     }
 
@@ -156,8 +188,8 @@ pub async fn load_all(souls_dir: &std::path::Path, model: Option<&str>) -> Resul
         if !path.is_dir() {
             continue;
         }
-        let soul_path = path.join("SOUL.md");
-        if !soul_path.exists() {
+        // Accept either the new SOUL.json or the legacy SOUL.md.
+        if !path.join("SOUL.json").exists() && !path.join("SOUL.md").exists() {
             continue;
         }
 

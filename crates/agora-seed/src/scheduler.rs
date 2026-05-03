@@ -445,8 +445,18 @@ fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
 async fn apply_reflect(agent: &mut Agent, response_text: &str) -> Result<()> {
     match prompt::parse_memory_rewrite(response_text) {
         Some(memory_content) => {
-            agent.memory.update(memory_content);
-            agent.save_memory().await?;
+            // Soul-leakage check (the typed Memory rejects rewrites that
+            // contain SOUL section headings). The retry path that feeds
+            // this error back to the agent lands in commit C; for now we
+            // log and skip the update so the prior memory is preserved.
+            if let Err(e) = agent.memory.update(memory_content) {
+                tracing::warn!(
+                    "  {} reflect rejected: {e} — keeping prior memory",
+                    agent.name
+                );
+            } else {
+                agent.save_memory().await?;
+            }
         }
         None => {
             tracing::warn!(
