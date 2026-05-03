@@ -236,6 +236,18 @@ impl AgentAction {
             obj.remove("$defs");
             obj.remove("title");
             obj.remove("description");
+            // Some validators (notably blallama) require a `required` array
+            // to be present on object schemas, even when empty. schemars
+            // omits the field when no properties are required (all-optional
+            // structs like `GetGovernanceLogInput`). Backfill an empty
+            // array so blallama's strict tool-schema check passes; a
+            // present-but-empty `required` is valid JSON Schema and a
+            // no-op for Anthropic / Ollama validators.
+            if obj.get("type").and_then(|v| v.as_str()) == Some("object")
+                && !obj.contains_key("required")
+            {
+                obj.insert("required".to_string(), serde_json::json!([]));
+            }
         }
         Method {
             name: name.to_string().into(),
