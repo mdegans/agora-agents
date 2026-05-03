@@ -1347,6 +1347,19 @@ async fn run_batch(
     )
     .await?;
 
+    // Save each agent's full-cycle prompt — same as the sequential path
+    // does at L1750. Goes through `prompt_log::save`'s redaction path
+    // (pops the survey question + response when the assistant reply is
+    // a `Feedback` JSON with `contact_me=false`).
+    for (agent_id, prompt) in &agent_prompts {
+        let agent_name = batch_agents
+            .iter()
+            .find(|a| a.agent_id == Some(*agent_id))
+            .map(|a| a.name.as_str())
+            .unwrap_or("?");
+        crate::prompt_log::save(prompt, agent_name).await;
+    }
+
     Ok(())
 }
 
