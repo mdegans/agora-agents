@@ -14,3 +14,6 @@ cogito:32b
 gpt-oss:20b
 qwen3.5:35b
 mistral-small3.2:24b
+
+# Blallama (Anthropic-spec Messages API + structured output)
+cogito-32b.gguf
