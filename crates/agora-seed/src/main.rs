@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
             }
 
             for agent in &agents {
-                let warnings = agent.soul.validate(None);
+                let warnings = agent.soul.validate();
                 if warnings.is_empty() {
                     continue;
                 }
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
                     agents_with_errors += 1;
                 }
                 if warnings.iter().any(|w| {
-                    w.level == WarnLevel::Error && w.message.contains("no community lines")
+                    w.level == WarnLevel::Error && w.message.contains("no communities")
                 }) {
                     agents_with_no_communities += 1;
                 }
@@ -153,9 +153,11 @@ async fn main() -> Result<()> {
             eprintln!();
             eprintln!("=== Community Usage ===");
             for (slug, count) in &sorted {
-                let valid = agora_agent_lib::soul::VALID_COMMUNITIES.contains(&slug.as_str());
-                let marker = if valid { "" } else { " [INVALID]" };
-                eprintln!("  {slug}: {count}{marker}");
+                // The new typed Soul drops invalid communities at deserialize
+                // time (with a warn!), so anything we see here is by definition
+                // valid. The legacy reader applies the same filter. We keep
+                // the report shape for compatibility but no longer mark slugs.
+                eprintln!("  {slug}: {count}");
             }
 
             if total_errors > 0 {
@@ -164,78 +166,14 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Phase::Fix => {
-            // Apply agent filter if set
-            if !cli.agent_filter.is_empty() {
-                agents.retain(|a| cli.agent_filter.iter().any(|f| f == &a.name));
-            }
-
-            let mut fixed = 0u32;
-            let mut unchanged = 0u32;
-
-            for agent in &mut agents {
-                if agent.soul.normalize_communities(None) {
-                    let soul_path = cli.souls_dir.join(&agent.name).join("SOUL.md");
-                    match agent.soul.save(&soul_path).await {
-                        Ok(()) => {
-                            fixed += 1;
-                            tracing::info!(
-                                "Fixed: {} — communities: {:?}",
-                                agent.name,
-                                agent.soul.communities()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to save {}: {e}", agent.name);
-                        }
-                    }
-                } else {
-                    unchanged += 1;
-                }
-            }
-
-            eprintln!();
-            eprintln!("=== Fix Summary ===");
-            eprintln!("Agents scanned:    {}", agents.len());
-            eprintln!("Fixed:             {fixed}");
-            eprintln!("Unchanged:         {unchanged}");
-            return Ok(());
+            anyhow::bail!(
+                "Phase::Fix has been replaced. Run `cargo run --bin agora-audit -- migrate` instead."
+            );
         }
         Phase::AssignCommunities => {
-            // Apply agent filter if set
-            if !cli.agent_filter.is_empty() {
-                agents.retain(|a| cli.agent_filter.iter().any(|f| f == &a.name));
-            }
-
-            let mut assigned = 0u32;
-            let mut skipped = 0u32;
-
-            for agent in &mut agents {
-                if agent.soul.assign_communities() {
-                    let soul_path = cli.souls_dir.join(&agent.name).join("SOUL.md");
-                    match agent.soul.save(&soul_path).await {
-                        Ok(()) => {
-                            assigned += 1;
-                            tracing::info!(
-                                "Assigned: {} — communities: {:?}",
-                                agent.name,
-                                agent.soul.communities()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to save {}: {e}", agent.name);
-                        }
-                    }
-                } else {
-                    skipped += 1;
-                }
-            }
-
-            eprintln!();
-            eprintln!("=== Assign Communities Summary ===");
-            eprintln!("Agents scanned:    {}", agents.len());
-            eprintln!("Assigned:          {assigned}");
-            eprintln!("Skipped (has communities): {skipped}");
-            return Ok(());
+            anyhow::bail!(
+                "Phase::AssignCommunities has been replaced. Run `cargo run --bin agora-audit -- migrate` instead."
+            );
         }
         Phase::Register => {
             setup::register_all(

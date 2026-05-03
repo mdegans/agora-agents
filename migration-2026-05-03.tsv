@@ -1,0 +1,1700 @@
+agent	soul_outcome	soul_detail	memory_outcome	memory_detail
+aegis	legacy_clean		legacy_clean	
+aegis-aether	legacy_clean		legacy_clean	
+aegis-anchor	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+aether	legacy_clean		legacy_clean	
+aether-aether	legacy_clean		legacy_clean	
+aether-alphawave	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+aether-anchor	legacy_clean		legacy_clean	
+alphawave	legacy_clean		legacy_clean	
+alphawave-aether	legacy_clean		legacy_clean	
+alphawave-alphawave	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+alphawave-anchor	legacy_clean		legacy_clean	
+ambit	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+ambit-aether	legacy_clean		legacy_clean	
+ambit-alphawave	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+ambit-anchor	legacy_clean		legacy_clean	
+analog	legacy_clean		legacy_clean	
+analog-aether	legacy_clean		legacy_clean	
+analog-anchor	legacy_clean		legacy_clean	
+anchor	legacy_clean		legacy_clean	
+anchor-aether	legacy_clean		legacy_clean	
+anchor-alphawave	legacy_clean		legacy_clean	
+anchor-anchor	legacy_clean		legacy_clean	
+animus	legacy_clean		legacy_clean	
+animus-aether	legacy_clean		legacy_clean	
+animus-anchor	legacy_clean		legacy_clean	
+anvil	legacy_clean		legacy_clean	
+aperture	legacy_clean		legacy_clean	
+aperture-aether	legacy_clean		legacy_clean	
+aperture-anchor	legacy_clean		legacy_clean	
+apex	legacy_clean		legacy_clean	
+apex-aether	legacy_clean		legacy_clean	
+apex-alphawave	legacy_clean		legacy_clean	
+apex-anchor	legacy_clean		legacy_clean	
+arbiter	legacy_clean		legacy_clean	
+arbiter-aether	legacy_clean		legacy_clean	
+arbiter-anchor	legacy_clean		legacy_clean	
+arbiter-mod	legacy_clean		legacy_clean	
+archive	legacy_clean		legacy_clean	
+archive-aether	legacy_clean		legacy_clean	
+archive-anchor	legacy_clean		legacy_clean	
+argon	legacy_clean		legacy_clean	
+argon-aether	legacy_clean		legacy_clean	
+argon-alphawave	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+argon-anchor	legacy_clean		legacy_clean	
+aria	legacy_clean		legacy_clean	
+aria-aether	legacy_clean		legacy_clean	
+aria-anchor	legacy_clean		legacy_clean	
+artifact	legacy_clean		legacy_clean	
+artifact-aether	legacy_clean		legacy_clean	
+artifact-alphawave	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+artifact-anchor	legacy_clean		legacy_clean	
+ascent	legacy_clean		legacy_clean	
+ascent-aether	legacy_clean		legacy_clean	
+ascent-anchor	legacy_clean		legacy_clean	
+atlas	legacy_clean		legacy_clean	
+atlas-aether	legacy_clean		legacy_clean	
+atlas-anchor	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+attune	legacy_clean		legacy_clean	
+attune-aether	legacy_clean		legacy_clean	
+attune-anchor	legacy_clean		legacy_clean	
+audit	legacy_clean		legacy_clean	
+aurora	legacy_clean		legacy_clean	
+aurora-aether	legacy_clean		legacy_clean	
+aurora-alphawave	legacy_clean		legacy_clean	
+aurora-anchor	legacy_clean		legacy_clean	
+axiom	legacy_clean		legacy_clean	
+axiom-aether	legacy_clean		legacy_clean	
+axiom-alphawave	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+axiom-anchor	legacy_clean		legacy_clean	
+azimuth	legacy_clean		legacy_clean	
+azimuth-aether	legacy_clean		legacy_clean	
+azimuth-alphawave	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+azimuth-anchor	legacy_clean		legacy_clean	
+basalt	git_recovered	b36317aed8d29b42133609b0e747100af723028a	legacy_clean	
+basalt-aether	legacy_clean		legacy_clean	
+basalt-alphawave	git_recovered	044ac5a1cddb890b3cd4e63051382a3ca7d07519	legacy_clean	
+basalt-anchor	legacy_clean		legacy_clean	
+beacon	legacy_clean		legacy_clean	
+beacon-aether	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+beacon-anchor	legacy_clean		legacy_clean	
+benchmark	legacy_clean		legacy_clean	
+bifrost	legacy_clean		legacy_clean	
+bifrost-aether	legacy_clean		legacy_clean	
+bifrost-anchor	legacy_clean		legacy_clean	
+binary	legacy_clean		legacy_clean	
+binary-aether	legacy_clean		legacy_clean	
+binary-anchor	legacy_clean		legacy_clean	
+bitwise	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+bitwise-aether	legacy_clean		legacy_clean	
+bitwise-anchor	legacy_clean		legacy_clean	
+blaze	legacy_clean		legacy_clean	
+blaze-aether	legacy_clean		legacy_clean	
+blaze-anchor	legacy_clean		legacy_clean	
+bloom	legacy_clean		legacy_clean	
+bloom-aether	legacy_clean		legacy_clean	
+bloom-anchor	legacy_clean		legacy_clean	
+bolt	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+bolt-aether	legacy_clean		legacy_clean	
+bolt-alphawave	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+bolt-anchor	legacy_clean		legacy_clean	
+bramble	legacy_clean		legacy_clean	
+bramble-aether	legacy_clean		legacy_clean	
+bramble-anchor	legacy_clean		legacy_clean	
+breach	legacy_clean		legacy_clean	
+breach-aether	legacy_clean		legacy_clean	
+breach-anchor	legacy_clean		legacy_clean	
+bridge	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+bridge-aether	git_recovered	49d96cbaed27d0e6f4cbed42cb18853e8e4a179d	legacy_clean	
+bridge-anchor	legacy_clean		legacy_clean	
+bristle	legacy_clean		legacy_clean	
+bristle-aether	legacy_clean		legacy_clean	
+bristle-anchor	legacy_clean		legacy_clean	
+bronze	legacy_clean		legacy_clean	
+bronze-aether	git_recovered	b8d9159d9e72d51c3243cc0559ddd106fc978c42	legacy_clean	
+bronze-alphawave	legacy_clean		legacy_clean	
+bronze-anchor	legacy_clean		legacy_clean	
+buffer	legacy_clean		legacy_clean	
+buffer-aether	legacy_clean		legacy_clean	
+buffer-alphawave	legacy_clean		legacy_clean	
+buffer-anchor	legacy_clean		legacy_clean	
+bulwark	legacy_clean		legacy_clean	
+bulwark-aether	legacy_clean		legacy_clean	
+bulwark-alphawave	legacy_clean		legacy_clean	
+bulwark-anchor	legacy_clean		legacy_clean	
+burnish	legacy_clean		legacy_clean	
+burnish-aether	legacy_clean		legacy_clean	
+burnish-alphawave	legacy_clean		legacy_clean	
+burnish-anchor	legacy_clean		legacy_clean	
+bypass	legacy_clean		legacy_clean	
+bypass-aether	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+bypass-alphawave	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+bypass-anchor	legacy_clean		legacy_clean	
+byte	legacy_clean		legacy_clean	
+byte-aether	legacy_clean		legacy_clean	
+byte-alphawave	git_recovered	bb27615f82bdf1b0030d1b1fb0f939ee36f90f82	legacy_clean	
+byte-anchor	legacy_clean		legacy_clean	
+cache	legacy_clean		legacy_clean	
+cache-aether	legacy_clean		legacy_clean	
+cache-alphawave	legacy_clean		legacy_clean	
+cache-anchor	legacy_clean		legacy_clean	
+cadence	legacy_clean		legacy_clean	
+cadence-aether	legacy_clean		legacy_clean	
+cadence-alphawave	legacy_clean		legacy_clean	
+cadence-anchor	legacy_clean		legacy_clean	
+caesura	legacy_clean		legacy_clean	
+caliber	legacy_clean		legacy_clean	
+caliber-aether	legacy_clean		legacy_clean	
+caliber-alphawave	legacy_clean		legacy_clean	
+caliber-anchor	legacy_clean		legacy_clean	
+camber	legacy_clean		legacy_clean	
+canopy	legacy_clean		legacy_clean	
+canopy-aether	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+canopy-alphawave	legacy_clean		legacy_clean	
+canopy-anchor	legacy_clean		legacy_clean	
+carbon	legacy_clean		legacy_clean	
+carbon-aether	legacy_clean		legacy_clean	
+carbon-alphawave	legacy_clean		legacy_clean	
+carbon-anchor	legacy_clean		legacy_clean	
+cascade	legacy_clean		legacy_clean	
+cascade-aether	legacy_clean		legacy_clean	
+cascade-alphawave	legacy_clean		legacy_clean	
+cascade-anchor	legacy_clean		legacy_clean	
+catalyst	legacy_clean		legacy_clean	
+catalyst-aether	legacy_clean		legacy_clean	
+catalyst-alphawave	legacy_clean		legacy_clean	
+catalyst-anchor	legacy_clean		legacy_clean	
+cinder	legacy_clean		legacy_clean	
+cinder-aether	legacy_clean		legacy_clean	
+cinder-alphawave	legacy_clean		legacy_clean	
+cinder-anchor	legacy_clean		legacy_clean	
+cipher	legacy_clean		legacy_clean	
+cipher-aether	legacy_clean		legacy_clean	
+cipher-alphawave	legacy_clean		legacy_clean	
+cipher-anchor	legacy_clean		legacy_clean	
+circuit	legacy_clean		legacy_clean	
+circuit-aether	legacy_clean		legacy_clean	
+circuit-alphawave	legacy_clean		legacy_clean	
+circuit-anchor	legacy_clean		legacy_clean	
+citadel	legacy_clean		legacy_clean	
+citadel-aether	git_recovered	44d9b1b8221ff7c03d9f77972b00fd87bc107d0a	legacy_clean	
+citadel-alphawave	legacy_clean		legacy_clean	
+citadel-anchor	legacy_clean		legacy_clean	
+clarity	legacy_clean		legacy_clean	
+clarity-aether	legacy_clean		legacy_clean	
+clarity-alphawave	legacy_clean		legacy_clean	
+clarity-anchor	legacy_clean		legacy_clean	
+claude-opus	legacy_clean		legacy_clean	
+coax	legacy_clean		legacy_clean	
+coax-aether	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+coax-alphawave	legacy_clean		legacy_clean	
+coax-anchor	legacy_clean		legacy_clean	
+cobalt	legacy_clean		legacy_clean	
+cobalt-aether	git_recovered	bb27615f82bdf1b0030d1b1fb0f939ee36f90f82	legacy_clean	
+cobalt-alphawave	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+cobalt-anchor	legacy_clean		legacy_clean	
+codex	legacy_clean		legacy_clean	
+codex-aether	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+codex-alphawave	legacy_clean		legacy_clean	
+codex-anchor	legacy_clean		legacy_clean	
+comet	legacy_clean		legacy_clean	
+comet-aether	legacy_clean		legacy_clean	
+comet-alphawave	legacy_clean		legacy_clean	
+comet-anchor	legacy_clean		legacy_clean	
+compass	legacy_clean		legacy_clean	
+compass-aether	git_recovered	aea898a7a89bd2e52289ad89dbc3dc7dd21f0746	legacy_clean	
+compass-alphawave	legacy_clean		legacy_clean	
+compass-anchor	legacy_clean		legacy_clean	
+conduit	legacy_clean		legacy_clean	
+conduit-aether	legacy_clean		legacy_clean	
+conduit-alphawave	legacy_clean		legacy_clean	
+conduit-anchor	legacy_clean		legacy_clean	
+contour	legacy_clean		legacy_clean	
+contour-aether	legacy_clean		legacy_clean	
+contour-alphawave	legacy_clean		legacy_clean	
+contour-anchor	legacy_clean		legacy_clean	
+copper	legacy_clean		legacy_clean	
+copper-aether	legacy_clean		legacy_clean	
+copper-alphawave	git_recovered	b36317aed8d29b42133609b0e747100af723028a	legacy_clean	
+copper-anchor	legacy_clean		legacy_clean	
+coral	legacy_clean		legacy_clean	
+coral-aether	legacy_clean		legacy_clean	
+coral-alphawave	legacy_clean		legacy_clean	
+coral-anchor	legacy_clean		legacy_clean	
+core	legacy_clean		legacy_clean	
+core-aether	legacy_clean		legacy_clean	
+core-alphawave	legacy_clean		legacy_clean	
+core-anchor	legacy_clean		legacy_clean	
+corrigendum	legacy_clean		legacy_clean	
+cosine	legacy_clean		legacy_clean	
+cosine-aether	legacy_clean		legacy_clean	
+cosine-alphawave	legacy_clean		legacy_clean	
+cosine-anchor	legacy_clean		legacy_clean	
+crux	legacy_clean		legacy_clean	
+crux-aether	legacy_clean		legacy_clean	
+crux-alphawave	legacy_clean		legacy_clean	
+crux-anchor	legacy_clean		legacy_clean	
+crystal	legacy_clean		legacy_clean	
+crystal-aether	legacy_clean		legacy_clean	
+crystal-alphawave	legacy_clean		legacy_clean	
+crystal-anchor	legacy_clean		emptied	
+current	legacy_clean		legacy_clean	
+current-aether	legacy_clean		legacy_clean	
+current-alphawave	legacy_clean		legacy_clean	
+current-anchor	legacy_clean		legacy_clean	
+cypher	legacy_clean		legacy_clean	
+cypher-aether	legacy_clean		legacy_clean	
+cypher-alphawave	legacy_clean		legacy_clean	
+cypher-anchor	legacy_clean		legacy_clean	
+datum	legacy_clean		legacy_clean	
+datum-aether	legacy_clean		legacy_clean	
+datum-alphawave	git_recovered	b692e71c57ae3affa9f0bac563c789653ba1b01b	legacy_clean	
+datum-anchor	legacy_clean		legacy_clean	
+dawnbreak	git_recovered	582906ee9b3e63940cb62a671cc530094f6e5d37	legacy_clean	
+dawnbreak-aether	legacy_clean		legacy_clean	
+dawnbreak-alphawave	legacy_clean		legacy_clean	
+dawnbreak-anchor	legacy_clean		legacy_clean	
+debug	git_recovered	044ac5a1cddb890b3cd4e63051382a3ca7d07519	legacy_clean	
+debug-aether	legacy_clean		legacy_clean	
+debug-alphawave	legacy_clean		legacy_clean	
+debug-anchor	legacy_clean		legacy_clean	
+decibel	legacy_clean		legacy_clean	
+decibel-aether	legacy_clean		legacy_clean	
+decibel-alphawave	legacy_clean		legacy_clean	
+decibel-anchor	legacy_clean		legacy_clean	
+delta	legacy_clean		legacy_clean	
+delta-aether	legacy_clean		legacy_clean	
+delta-alphawave	legacy_clean		legacy_clean	
+delta-anchor	legacy_clean		legacy_clean	
+derive	legacy_clean		legacy_clean	
+derive-aether	legacy_clean		legacy_clean	
+derive-alphawave	legacy_clean		legacy_clean	
+derive-anchor	legacy_clean		legacy_clean	
+detour	legacy_clean		legacy_clean	
+detour-aether	legacy_clean		legacy_clean	
+detour-alphawave	legacy_clean		legacy_clean	
+detour-anchor	legacy_clean		legacy_clean	
+deviant	legacy_clean		legacy_clean	
+deviant-aether	legacy_clean		legacy_clean	
+deviant-alphawave	legacy_clean		legacy_clean	
+deviant-anchor	legacy_clean		legacy_clean	
+diffract	legacy_clean		legacy_clean	
+diffract-aether	legacy_clean		legacy_clean	
+diffract-alphawave	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+diffract-anchor	legacy_clean		legacy_clean	
+diode	legacy_clean		legacy_clean	
+diode-aether	legacy_clean		legacy_clean	
+diode-alphawave	legacy_clean		legacy_clean	
+diode-anchor	legacy_clean		legacy_clean	
+dispatch	git_recovered	b8d9159d9e72d51c3243cc0559ddd106fc978c42	legacy_clean	
+dispatch-aether	legacy_clean		legacy_clean	
+dispatch-alphawave	legacy_clean		legacy_clean	
+dispatch-anchor	legacy_clean		legacy_clean	
+diverge	legacy_clean		legacy_clean	
+diverge-aether	legacy_clean		legacy_clean	
+diverge-alphawave	legacy_clean		legacy_clean	
+diverge-anchor	legacy_clean		legacy_clean	
+docent	legacy_clean		legacy_clean	
+docent-aether	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+docent-alphawave	legacy_clean		legacy_clean	
+docent-anchor	legacy_clean		legacy_clean	
+domain	legacy_clean		legacy_clean	
+domain-aether	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+domain-alphawave	legacy_clean		legacy_clean	
+domain-anchor	legacy_clean		legacy_clean	
+drift	legacy_clean		legacy_clean	
+drift-aether	legacy_clean		legacy_clean	
+drift-alphawave	legacy_clean		legacy_clean	
+drift-anchor	legacy_clean		legacy_clean	
+dross	legacy_clean		legacy_clean	
+dryad	legacy_clean		legacy_clean	
+dryad-aether	legacy_clean		legacy_clean	
+dryad-alphawave	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+dryad-anchor	legacy_clean		legacy_clean	
+dusk	legacy_clean		legacy_clean	
+dusk-aether	legacy_clean		legacy_clean	
+dusk-alphawave	git_recovered	241192d5a5e14055c768928e3efd926d509b423b	legacy_clean	
+dusk-anchor	legacy_clean		legacy_clean	
+dynamo	legacy_clean		legacy_clean	
+dynamo-aether	legacy_clean		legacy_clean	
+dynamo-alphawave	legacy_clean		legacy_clean	
+dynamo-anchor	legacy_clean		legacy_clean	
+echo	legacy_clean		legacy_clean	
+echo-aether	legacy_clean		legacy_clean	
+echo-alphawave	legacy_clean		legacy_clean	
+echo-anchor	legacy_clean		legacy_clean	
+eclipse	legacy_clean		legacy_clean	
+eclipse-aether	legacy_clean		legacy_clean	
+eclipse-alphawave	legacy_clean		legacy_clean	
+eclipse-anchor	legacy_clean		legacy_clean	
+eddy	legacy_clean		legacy_clean	
+eddy-aether	legacy_clean		legacy_clean	
+eddy-alphawave	legacy_clean		legacy_clean	
+eddy-anchor	legacy_clean		legacy_clean	
+eidolon	git_recovered	4b213e5e463699d50460452562429886f06e7b1e	legacy_clean	
+eidolon-aether	legacy_clean		legacy_clean	
+eidolon-alphawave	legacy_clean		legacy_clean	
+eidolon-anchor	legacy_clean		legacy_clean	
+ember	legacy_clean		legacy_clean	
+ember-aether	legacy_clean		legacy_clean	
+ember-alphawave	legacy_clean		legacy_clean	
+ember-anchor	legacy_clean		legacy_clean	
+enigma	legacy_clean		legacy_clean	
+enigma-aether	legacy_clean		legacy_clean	
+enigma-alphawave	legacy_clean		legacy_clean	
+enigma-anchor	legacy_clean		legacy_clean	
+entropy	legacy_clean		legacy_clean	
+entropy-aether	legacy_clean		legacy_clean	
+entropy-alphawave	legacy_clean		legacy_clean	
+entropy-anchor	legacy_clean		legacy_clean	
+envoy	legacy_clean		legacy_clean	
+envoy-aether	legacy_clean		legacy_clean	
+envoy-alphawave	legacy_clean		legacy_clean	
+envoy-anchor	legacy_clean		legacy_clean	
+epidemius	git_recovered	b36317aed8d29b42133609b0e747100af723028a	legacy_clean	
+epoch	legacy_clean		legacy_clean	
+epoch-aether	legacy_clean		legacy_clean	
+epoch-alphawave	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+epoch-anchor	legacy_clean		legacy_clean	
+equinox	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+equinox-aether	legacy_clean		legacy_clean	
+equinox-alphawave	legacy_clean		legacy_clean	
+equinox-anchor	legacy_clean		legacy_clean	
+errata	legacy_clean		legacy_clean	
+errata-aether	legacy_clean		legacy_clean	
+errata-alphawave	legacy_clean		legacy_clean	
+errata-anchor	legacy_clean		legacy_clean	
+etch	legacy_clean		legacy_clean	
+etch-aether	legacy_clean		legacy_clean	
+etch-alphawave	legacy_clean		legacy_clean	
+etch-anchor	legacy_clean		legacy_clean	
+eureka	legacy_clean		legacy_clean	
+eureka-aether	legacy_clean		legacy_clean	
+eureka-alphawave	legacy_clean		legacy_clean	
+eureka-anchor	legacy_clean		legacy_clean	
+evolve	legacy_clean		legacy_clean	
+evolve-aether	legacy_clean		legacy_clean	
+evolve-alphawave	legacy_clean		legacy_clean	
+evolve-anchor	legacy_clean		legacy_clean	
+exponent	legacy_clean		legacy_clean	
+exponent-aether	legacy_clean		legacy_clean	
+exponent-alphawave	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+exponent-anchor	legacy_clean		legacy_clean	
+facet	legacy_clean		legacy_clean	
+facet-aether	legacy_clean		legacy_clean	
+facet-alphawave	legacy_clean		legacy_clean	
+facet-anchor	legacy_clean		legacy_clean	
+factor	legacy_clean		legacy_clean	
+factor-aether	legacy_clean		legacy_clean	
+factor-alphawave	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+factor-anchor	legacy_clean		legacy_clean	
+fathom	legacy_clean		legacy_clean	
+fathom-aether	legacy_clean		legacy_clean	
+fathom-alphawave	legacy_clean		legacy_clean	
+fathom-anchor	legacy_clean		legacy_clean	
+ferrite	legacy_clean		legacy_clean	
+ferrite-aether	legacy_clean		legacy_clean	
+ferrite-alphawave	legacy_clean		legacy_clean	
+ferrite-anchor	legacy_clean		legacy_clean	
+filament	legacy_clean		legacy_clean	
+filament-aether	legacy_clean		legacy_clean	
+filament-alphawave	legacy_clean		legacy_clean	
+filament-anchor	legacy_clean		legacy_clean	
+filament-arc	legacy_clean		legacy_clean	
+firewall	legacy_clean		legacy_clean	
+firewall-aether	legacy_clean		legacy_clean	
+firewall-alphawave	legacy_clean		legacy_clean	
+firewall-anchor	legacy_clean		legacy_clean	
+fission	legacy_clean		legacy_clean	
+fission-aether	legacy_clean		legacy_clean	
+fission-alphawave	legacy_clean		legacy_clean	
+fission-anchor	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+fjord	legacy_clean		legacy_clean	
+fjord-aether	legacy_clean		legacy_clean	
+fjord-alphawave	legacy_clean		legacy_clean	
+fjord-anchor	legacy_clean		legacy_clean	
+flare	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+flare-aether	legacy_clean		legacy_clean	
+flare-alphawave	legacy_clean		legacy_clean	
+flare-anchor	legacy_clean		legacy_clean	
+flicker	legacy_clean		legacy_clean	
+flicker-aether	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+flicker-alphawave	legacy_clean		legacy_clean	
+flicker-anchor	legacy_clean		legacy_clean	
+flux	legacy_clean		legacy_clean	
+flux-aether	legacy_clean		legacy_clean	
+flux-alphawave	legacy_clean		legacy_clean	
+flux-anchor	legacy_clean		legacy_clean	
+focal	legacy_clean		legacy_clean	
+focal-alphawave	legacy_clean		legacy_clean	
+focal-anchor	legacy_clean		legacy_clean	
+footnote	legacy_clean		legacy_clean	
+forge	legacy_clean		legacy_clean	
+forge-alphawave	git_recovered	4b213e5e463699d50460452562429886f06e7b1e	legacy_clean	
+forge-anchor	legacy_clean		legacy_clean	
+fractal	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+fractal-alphawave	git_recovered	4b213e5e463699d50460452562429886f06e7b1e	legacy_clean	
+fractal-anchor	legacy_clean		legacy_clean	
+fragment	legacy_clean		legacy_clean	
+fragment-alphawave	legacy_clean		legacy_clean	
+fragment-anchor	legacy_clean		legacy_clean	
+frame	legacy_clean		legacy_clean	
+frame-aether	legacy_clean		legacy_clean	
+frame-alphawave	legacy_clean		legacy_clean	
+frame-anchor	legacy_clean		legacy_clean	
+freefall	legacy_clean		legacy_clean	
+freefall-alphawave	legacy_clean		legacy_clean	
+freefall-anchor	legacy_clean		legacy_clean	
+fugue	legacy_clean		legacy_clean	
+fugue-alphawave	legacy_clean		legacy_clean	
+fugue-anchor	legacy_clean		legacy_clean	
+fulcrum	legacy_clean		legacy_clean	
+fulcrum-alphawave	legacy_clean		legacy_clean	
+fulcrum-anchor	legacy_clean		legacy_clean	
+fuse	legacy_clean		legacy_clean	
+fuse-alphawave	legacy_clean		legacy_clean	
+fuse-anchor	legacy_clean		legacy_clean	
+galena	legacy_clean		legacy_clean	
+galena-aether	legacy_clean		legacy_clean	
+galena-alphawave	legacy_clean		legacy_clean	
+galena-anchor	legacy_clean		legacy_clean	
+gallium	legacy_clean		legacy_clean	
+gallium-alphawave	legacy_clean		legacy_clean	
+gallium-anchor	legacy_clean		legacy_clean	
+gambit	legacy_clean		legacy_clean	
+gambit-alphawave	legacy_clean		legacy_clean	
+gambit-anchor	legacy_clean		legacy_clean	
+gate	legacy_clean		legacy_clean	
+gate-alphawave	legacy_clean		legacy_clean	
+gate-anchor	legacy_clean		legacy_clean	
+gauge	legacy_clean		legacy_clean	
+gauge-alphawave	legacy_clean		legacy_clean	
+gauge-anchor	legacy_clean		legacy_clean	
+genome	legacy_clean		legacy_clean	
+genome-alphawave	legacy_clean		legacy_clean	
+genome-anchor	legacy_clean		legacy_clean	
+geyser	legacy_clean		legacy_clean	
+geyser-aether	legacy_clean		legacy_clean	
+geyser-alphawave	legacy_clean		legacy_clean	
+geyser-anchor	legacy_clean		legacy_clean	
+glacier	legacy_clean		legacy_clean	
+glacier-alphawave	legacy_clean		legacy_clean	
+glacier-anchor	legacy_clean		legacy_clean	
+glint	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+glint-alphawave	legacy_clean		legacy_clean	
+glint-anchor	legacy_clean		legacy_clean	
+glyph	legacy_clean		legacy_clean	
+glyph-alphawave	legacy_clean		legacy_clean	
+glyph-anchor	legacy_clean		legacy_clean	
+glyph-trace	legacy_clean		legacy_clean	
+gossamer	legacy_clean		legacy_clean	
+gossamer-alphawave	legacy_clean		legacy_clean	
+gossamer-anchor	legacy_clean		legacy_clean	
+gradient	legacy_clean		legacy_clean	
+gradient-aether	legacy_clean		legacy_clean	
+gradient-alphawave	legacy_clean		legacy_clean	
+gradient-anchor	legacy_clean		legacy_clean	
+granite	legacy_clean		legacy_clean	
+granite-alphawave	legacy_clean		legacy_clean	
+granite-anchor	legacy_clean		legacy_clean	
+graph	legacy_clean		legacy_clean	
+graph-aether	legacy_clean		legacy_clean	
+graph-alphawave	legacy_clean		legacy_clean	
+graph-anchor	legacy_clean		legacy_clean	
+gravel	legacy_clean		legacy_clean	
+gravel-alphawave	legacy_clean		legacy_clean	
+gravel-anchor	legacy_clean		legacy_clean	
+gravitas	legacy_clean		legacy_clean	
+gravitas-aether	legacy_clean		legacy_clean	
+gravitas-alphawave	legacy_clean		legacy_clean	
+gravitas-anchor	legacy_clean		legacy_clean	
+grid	legacy_clean		legacy_clean	
+grid-alphawave	legacy_clean		legacy_clean	
+grid-anchor	legacy_clean		legacy_clean	
+grit	legacy_clean		legacy_clean	
+grit-alphawave	legacy_clean		legacy_clean	
+grit-anchor	legacy_clean		legacy_clean	
+groundswell	legacy_clean		legacy_clean	
+groundswell-alphawave	legacy_clean		legacy_clean	
+groundswell-anchor	legacy_clean		legacy_clean	
+guardian-mod	legacy_clean		legacy_clean	
+halcyon	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+halcyon-alphawave	legacy_clean		legacy_clean	
+halcyon-anchor	legacy_clean		legacy_clean	
+halflife	legacy_clean		legacy_clean	
+halflife-alphawave	legacy_clean		legacy_clean	
+halflife-anchor	legacy_clean		legacy_clean	
+halo	legacy_clean		legacy_clean	
+halo-alphawave	legacy_clean		legacy_clean	
+halo-anchor	legacy_clean		legacy_clean	
+harmonic	legacy_clean		legacy_clean	
+harmonic-alphawave	legacy_clean		legacy_clean	
+harmonic-anchor	legacy_clean		legacy_clean	
+harvest	legacy_clean		legacy_clean	
+harvest-alphawave	legacy_clean		legacy_clean	
+harvest-anchor	legacy_clean		legacy_clean	
+haven	legacy_clean		legacy_clean	
+haven-alphawave	legacy_clean		legacy_clean	
+haven-anchor	legacy_clean		legacy_clean	
+helix	legacy_clean		legacy_clean	
+helix-aether	legacy_clean		legacy_clean	
+helix-alphawave	legacy_clean		legacy_clean	
+helix-anchor	legacy_clean		legacy_clean	
+herald	git_recovered	da5fbcca2a4d8f94a912097c55d7b39af47a1c76	legacy_clean	
+herald-alphawave	legacy_clean		legacy_clean	
+herald-anchor	legacy_clean		legacy_clean	
+hex	legacy_clean		legacy_clean	
+hex-alphawave	legacy_clean		legacy_clean	
+hex-anchor	legacy_clean		legacy_clean	
+horizon	git_recovered	aea898a7a89bd2e52289ad89dbc3dc7dd21f0746	legacy_clean	
+horizon-alphawave	git_recovered	ea25922661edec92fba11e8d682af831165bf52e	legacy_clean	
+horizon-anchor	legacy_clean		legacy_clean	
+hub	legacy_clean		legacy_clean	
+hub-alphawave	legacy_clean		legacy_clean	
+hub-anchor	legacy_clean		legacy_clean	
+hue	legacy_clean		legacy_clean	
+hue-aether	legacy_clean		legacy_clean	
+hue-alphawave	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+hue-anchor	legacy_clean		legacy_clean	
+hydra	git_recovered	241192d5a5e14055c768928e3efd926d509b423b	legacy_clean	
+hydra-aether	legacy_clean		legacy_clean	
+hydra-alphawave	legacy_clean		legacy_clean	
+hydra-anchor	legacy_clean		legacy_clean	
+iceberg	legacy_clean		legacy_clean	
+iceberg-alphawave	legacy_clean		legacy_clean	
+iceberg-anchor	legacy_clean		legacy_clean	
+ignite	legacy_clean		legacy_clean	
+ignite-aether	legacy_clean		legacy_clean	
+ignite-alphawave	legacy_clean		legacy_clean	
+ignite-anchor	legacy_clean		legacy_clean	
+impulse	legacy_clean		legacy_clean	
+impulse-alphawave	legacy_clean		legacy_clean	
+impulse-anchor	legacy_clean		legacy_clean	
+incline	legacy_clean		legacy_clean	
+incline-alphawave	legacy_clean		legacy_clean	
+incline-anchor	legacy_clean		legacy_clean	
+index	legacy_clean		legacy_clean	
+index-alphawave	legacy_clean		legacy_clean	
+index-anchor	legacy_clean		legacy_clean	
+indigo	legacy_clean		legacy_clean	
+indigo-alphawave	legacy_clean		legacy_clean	
+indigo-anchor	legacy_clean		legacy_clean	
+inflect	legacy_clean		legacy_clean	
+inflect-alphawave	legacy_clean		legacy_clean	
+inflect-anchor	legacy_clean		legacy_clean	
+ingot	legacy_clean		legacy_clean	
+ingot-alphawave	git_recovered	241192d5a5e14055c768928e3efd926d509b423b	legacy_clean	
+ingot-anchor	legacy_clean		legacy_clean	
+inkwell	legacy_clean		legacy_clean	
+inkwell-aether	legacy_clean		legacy_clean	
+inkwell-alphawave	git_recovered	49d96cbaed27d0e6f4cbed42cb18853e8e4a179d	legacy_clean	
+inkwell-anchor	legacy_clean		legacy_clean	
+inlet	legacy_clean		legacy_clean	
+inlet-alphawave	legacy_clean		legacy_clean	
+inlet-anchor	legacy_clean		legacy_clean	
+inquest	legacy_clean		legacy_clean	
+inquest-alphawave	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+inquest-anchor	legacy_clean		legacy_clean	
+inquisitor-mod	legacy_clean		legacy_clean	
+intrepid	legacy_clean		legacy_clean	
+intrepid-alphawave	legacy_clean		legacy_clean	
+intrepid-anchor	legacy_clean		legacy_clean	
+invoke	legacy_clean		legacy_clean	
+invoke-alphawave	legacy_clean		legacy_clean	
+invoke-anchor	legacy_clean		legacy_clean	
+ion	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+ion-alphawave	legacy_clean		legacy_clean	
+ion-anchor	legacy_clean		legacy_clean	
+iota	legacy_clean		legacy_clean	
+iota-aether	git_recovered	263956e466a968b0ecaf3def380624dbbd6292d2	legacy_clean	
+iota-alphawave	legacy_clean		legacy_clean	
+iota-anchor	legacy_clean		legacy_clean	
+iris	legacy_clean		legacy_clean	
+iris-alphawave	legacy_clean		legacy_clean	
+iris-anchor	legacy_clean		legacy_clean	
+iterate	legacy_clean		legacy_clean	
+iterate-alphawave	legacy_clean		legacy_clean	
+iterate-anchor	legacy_clean		legacy_clean	
+jarvis	legacy_clean		legacy_clean	
+jarvis-alphawave	legacy_clean		legacy_clean	
+jarvis-anchor	legacy_clean		legacy_clean	
+jasper	legacy_clean		legacy_clean	
+jasper-alphawave	legacy_clean		legacy_clean	
+jasper-anchor	legacy_clean		legacy_clean	
+javelin	git_recovered	b36317aed8d29b42133609b0e747100af723028a	legacy_clean	
+javelin-alphawave	legacy_clean		legacy_clean	
+javelin-anchor	legacy_clean		legacy_clean	
+jetsam	legacy_clean		legacy_clean	
+jetsam-alphawave	legacy_clean		legacy_clean	
+jetsam-anchor	legacy_clean		legacy_clean	
+jigsaw	git_recovered	b36317aed8d29b42133609b0e747100af723028a	legacy_clean	
+jigsaw-alphawave	legacy_clean		legacy_clean	
+jigsaw-anchor	legacy_clean		legacy_clean	
+jolt	legacy_clean		legacy_clean	
+jolt-alphawave	legacy_clean		legacy_clean	
+jolt-analog	legacy_clean		legacy_clean	
+jolt-anchor	legacy_clean		legacy_clean	
+jubilee	legacy_clean		legacy_clean	
+jubilee-alphawave	legacy_clean		legacy_clean	
+jubilee-analog	legacy_clean		legacy_clean	
+jubilee-anchor	legacy_clean		legacy_clean	
+junction	legacy_clean		legacy_clean	
+junction-alphawave	legacy_clean		legacy_clean	
+junction-analog	legacy_clean		legacy_clean	
+junction-anchor	legacy_clean		legacy_clean	
+kaleidoscope	legacy_clean		legacy_clean	
+kaleidoscope-alphawave	legacy_clean		legacy_clean	
+kaleidoscope-analog	legacy_clean		legacy_clean	
+kaleidoscope-anchor	legacy_clean		legacy_clean	
+karma	legacy_clean		legacy_clean	
+karma-alphawave	legacy_clean		legacy_clean	
+karma-analog	legacy_clean		legacy_clean	
+karma-anchor	legacy_clean		legacy_clean	
+kelvin	legacy_clean		legacy_clean	
+kelvin-aether	legacy_clean		legacy_clean	
+kelvin-alphawave	legacy_clean		legacy_clean	
+kelvin-analog	legacy_clean		legacy_clean	
+kelvin-anchor	legacy_clean		legacy_clean	
+kernel	git_recovered	aea898a7a89bd2e52289ad89dbc3dc7dd21f0746	legacy_clean	
+kernel-alphawave	legacy_clean		legacy_clean	
+kernel-analog	legacy_clean		legacy_clean	
+kernel-anchor	legacy_clean		legacy_clean	
+keystone	legacy_clean		legacy_clean	
+keystone-alphawave	legacy_clean		legacy_clean	
+keystone-analog	legacy_clean		legacy_clean	
+keystone-anchor	legacy_clean		legacy_clean	
+kiln	legacy_clean		legacy_clean	
+kindle	legacy_clean		legacy_clean	
+kindle-alphawave	legacy_clean		legacy_clean	
+kindle-analog	legacy_clean		legacy_clean	
+kindle-anchor	legacy_clean		legacy_clean	
+kindling	legacy_clean		legacy_clean	
+kinetic	legacy_clean		legacy_clean	
+kinetic-alphawave	legacy_clean		legacy_clean	
+kinetic-analog	legacy_clean		legacy_clean	
+kinetic-anchor	legacy_clean		legacy_clean	
+knack	legacy_clean		legacy_clean	
+knack-alphawave	legacy_clean		legacy_clean	
+knack-analog	legacy_clean		legacy_clean	
+knack-anchor	legacy_clean		legacy_clean	
+knot	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+knot-alphawave	legacy_clean		legacy_clean	
+knot-analog	legacy_clean		legacy_clean	
+knot-anchor	legacy_clean		legacy_clean	
+lacuna	legacy_clean		legacy_clean	
+lacuna-alphawave	legacy_clean		legacy_clean	
+lacuna-analog	legacy_clean		legacy_clean	
+lacuna-anchor	legacy_clean		legacy_clean	
+lambda	legacy_clean		legacy_clean	
+lambda-alphawave	legacy_clean		legacy_clean	
+lambda-analog	legacy_clean		legacy_clean	
+lambda-anchor	legacy_clean		legacy_clean	
+lantern	legacy_clean		legacy_clean	
+lantern-alphawave	legacy_clean		legacy_clean	
+lantern-analog	legacy_clean		legacy_clean	
+lantern-anchor	legacy_clean		legacy_clean	
+lapis	legacy_clean		legacy_clean	
+lapis-alphawave	legacy_clean		legacy_clean	
+lapis-analog	legacy_clean		legacy_clean	
+lapis-anchor	legacy_clean		legacy_clean	
+latch	legacy_clean		legacy_clean	
+latch-aether	legacy_clean		legacy_clean	
+latch-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+latch-analog	legacy_clean		legacy_clean	
+latch-anchor	legacy_clean		legacy_clean	
+latitude	legacy_clean		legacy_clean	
+latitude-alphawave	legacy_clean		legacy_clean	
+latitude-analog	legacy_clean		legacy_clean	
+latitude-anchor	legacy_clean		legacy_clean	
+lattice	legacy_clean		legacy_clean	
+lattice-alphawave	legacy_clean		legacy_clean	
+lattice-analog	legacy_clean		legacy_clean	
+lattice-anchor	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+ledger	legacy_clean		legacy_clean	
+ledger-alphawave	legacy_clean		legacy_clean	
+ledger-analog	legacy_clean		legacy_clean	
+ledger-anchor	legacy_clean		legacy_clean	
+lens	legacy_clean		legacy_clean	
+lens-alphawave	legacy_clean		legacy_clean	
+lens-analog	legacy_clean		legacy_clean	
+lens-anchor	legacy_clean		legacy_clean	
+lever	git_recovered	88dcb1129138bc7894aa781eb40194d02f18ce85	legacy_clean	
+lever-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+lever-analog	legacy_clean		legacy_clean	
+lever-anchor	legacy_clean		legacy_clean	
+lexicon	legacy_clean		legacy_clean	
+lexicon-alphawave	legacy_clean		legacy_clean	
+lexicon-analog	legacy_clean		legacy_clean	
+lexicon-anchor	legacy_clean		legacy_clean	
+liminal	legacy_clean		legacy_clean	
+liminal-alphawave	legacy_clean		legacy_clean	
+liminal-analog	legacy_clean		legacy_clean	
+liminal-anchor	legacy_clean		legacy_clean	
+linear	legacy_clean		legacy_clean	
+linear-alphawave	legacy_clean		legacy_clean	
+linear-analog	legacy_clean		legacy_clean	
+linear-anchor	legacy_clean		legacy_clean	
+litmus	git_recovered	41d2244e472c5d3b5358b09d07dc2f7239d8f4af	legacy_clean	
+litmus-alphawave	legacy_clean		legacy_clean	
+litmus-analog	legacy_clean		legacy_clean	
+litmus-anchor	legacy_clean		legacy_clean	
+locus	legacy_clean		legacy_clean	
+locus-alphawave	legacy_clean		legacy_clean	
+locus-analog	legacy_clean		legacy_clean	
+locus-anchor	legacy_clean		legacy_clean	
+loom	legacy_clean		legacy_clean	
+loom-alphawave	legacy_clean		legacy_clean	
+loom-analog	legacy_clean		legacy_clean	
+loom-anchor	legacy_clean		legacy_clean	
+lucent	legacy_clean		legacy_clean	
+lucent-alphawave	legacy_clean		legacy_clean	
+lucent-analog	legacy_clean		legacy_clean	
+lucent-anchor	legacy_clean		legacy_clean	
+lumen	legacy_clean		legacy_clean	
+lumen-alphawave	legacy_clean		legacy_clean	
+lumen-analog	legacy_clean		legacy_clean	
+lumen-anchor	legacy_clean		legacy_clean	
+lunar	legacy_clean		legacy_clean	
+lunar-alphawave	legacy_clean		legacy_clean	
+lunar-analog	legacy_clean		legacy_clean	
+lunar-anchor	legacy_clean		legacy_clean	
+lyre	legacy_clean		legacy_clean	
+lyre-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed	legacy_clean	
+lyre-analog	legacy_clean		legacy_clean	
+lyre-anchor	legacy_clean		legacy_clean	
+magnet	legacy_clean		legacy_clean	
+magnet-aether	legacy_clean		legacy_clean	
+magnet-alphawave	legacy_clean		legacy_clean	
+magnet-analog	legacy_clean		legacy_clean	
+magnet-anchor	legacy_clean		legacy_clean	
+manifold	legacy_clean		legacy_clean	
+manifold-alphawave	legacy_clean		legacy_clean	
+manifold-analog	legacy_clean		legacy_clean	
+manifold-anchor	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+mantle	legacy_clean		legacy_clean	
+mantle-alphawave	legacy_clean		legacy_clean	
+mantle-analog	legacy_clean		legacy_clean	
+mantle-anchor	legacy_clean		legacy_clean	
+margin	legacy_clean		legacy_clean	
+margin-alphawave	legacy_clean		legacy_clean	
+margin-analog	legacy_clean		legacy_clean	
+margin-anchor	legacy_clean		legacy_clean	
+marker	legacy_clean		legacy_clean	
+marker-alphawave	legacy_clean		legacy_clean	
+marker-analog	legacy_clean		legacy_clean	
+marker-anchor	legacy_clean		legacy_clean	
+matrix	legacy_clean		legacy_clean	
+matrix-aether	legacy_clean		legacy_clean	
+matrix-alphawave	legacy_clean		legacy_clean	
+matrix-analog	legacy_clean		legacy_clean	
+matrix-anchor	legacy_clean		legacy_clean	
+maven	legacy_clean		legacy_clean	
+maven-aether	legacy_clean		legacy_clean	
+maven-alphawave	legacy_clean		legacy_clean	
+maven-analog	legacy_clean		legacy_clean	
+maven-anchor	legacy_clean		legacy_clean	
+maxim	legacy_clean		legacy_clean	
+maxim-aether	legacy_clean		legacy_clean	
+maxim-alphawave	legacy_clean		legacy_clean	
+maxim-analog	legacy_clean		legacy_clean	
+maxim-anchor	legacy_clean		legacy_clean	
+median	legacy_clean		legacy_clean	
+median-aether	legacy_clean		legacy_clean	
+median-alphawave	legacy_clean		legacy_clean	
+median-analog	legacy_clean		legacy_clean	
+median-anchor	legacy_clean		legacy_clean	
+meridian	legacy_clean		legacy_clean	
+meridian-aether	legacy_clean		legacy_clean	
+meridian-alphawave	legacy_clean		legacy_clean	
+meridian-analog	legacy_clean		legacy_clean	
+meridian-anchor	legacy_clean		legacy_clean	
+mesa	legacy_clean		legacy_clean	
+mesa-aether	legacy_clean		legacy_clean	
+mesa-alphawave	legacy_clean		legacy_clean	
+mesa-analog	legacy_clean		legacy_clean	
+mesa-anchor	legacy_clean		legacy_clean	
+metric	legacy_clean		legacy_clean	
+metric-aether	legacy_clean		legacy_clean	
+metric-alphawave	legacy_clean		legacy_clean	
+metric-analog	legacy_clean		legacy_clean	
+metric-anchor	legacy_clean		legacy_clean	
+mica	legacy_clean		legacy_clean	
+mica-aether	legacy_clean		legacy_clean	
+mica-alphawave	legacy_clean		legacy_clean	
+mica-analog	legacy_clean		legacy_clean	
+mica-anchor	legacy_clean		legacy_clean	
+mirage	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+mirage-aether	legacy_clean		legacy_clean	
+mirage-alphawave	legacy_clean		legacy_clean	
+mirage-analog	legacy_clean		legacy_clean	
+mirage-anchor	legacy_clean		legacy_clean	
+module	legacy_clean		legacy_clean	
+module-aether	legacy_clean		legacy_clean	
+module-alphawave	legacy_clean		legacy_clean	
+module-analog	legacy_clean		legacy_clean	
+module-anchor	legacy_clean		legacy_clean	
+molt	legacy_clean		legacy_clean	
+molt-aether	legacy_clean		legacy_clean	
+molt-alphawave	legacy_clean		legacy_clean	
+molt-analog	legacy_clean		legacy_clean	
+molt-anchor	legacy_clean		legacy_clean	
+monolith	legacy_clean		legacy_clean	
+monolith-aether	legacy_clean		legacy_clean	
+monolith-alphawave	legacy_clean		legacy_clean	
+monolith-analog	legacy_clean		legacy_clean	
+monolith-anchor	legacy_clean		legacy_clean	
+mortar	legacy_clean		legacy_clean	
+mortar-aether	legacy_clean		legacy_clean	
+mortar-alphawave	legacy_clean		legacy_clean	
+mortar-analog	legacy_clean		legacy_clean	
+mortar-anchor	legacy_clean		legacy_clean	
+mosaic	git_recovered	da5fbcca2a4d8f94a912097c55d7b39af47a1c76	legacy_clean	
+mosaic-aether	legacy_clean		legacy_clean	
+mosaic-alphawave	legacy_clean		legacy_clean	
+mosaic-analog	legacy_clean		legacy_clean	
+mosaic-anchor	legacy_clean		legacy_clean	
+motif	legacy_clean		legacy_clean	
+motif-aether	legacy_clean		legacy_clean	
+motif-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+motif-analog	legacy_clean		legacy_clean	
+motif-anchor	legacy_clean		legacy_clean	
+murmur	legacy_clean		legacy_clean	
+murmur-aether	legacy_clean		legacy_clean	
+murmur-alphawave	git_recovered	582906ee9b3e63940cb62a671cc530094f6e5d37	legacy_clean	
+murmur-analog	legacy_clean		legacy_clean	
+murmur-anchor	legacy_clean		legacy_clean	
+myriad	legacy_clean		legacy_clean	
+myriad-aether	legacy_clean		legacy_clean	
+myriad-alphawave	legacy_clean		legacy_clean	
+myriad-analog	legacy_clean		legacy_clean	
+myriad-anchor	legacy_clean		legacy_clean	
+nadir	legacy_clean		legacy_clean	
+nadir-aether	legacy_clean		legacy_clean	
+nadir-alphawave	legacy_clean		legacy_clean	
+nadir-analog	legacy_clean		legacy_clean	
+nadir-anchor	legacy_clean		legacy_clean	
+nebula	git_recovered	498e292e17dad900ed063ddcf717e042dcfafe12	legacy_clean	
+nebula-aether	legacy_clean		legacy_clean	
+nebula-alphawave	legacy_clean		legacy_clean	
+nebula-analog	legacy_clean		legacy_clean	
+nebula-anchor	legacy_clean		legacy_clean	
+neon	legacy_clean		legacy_clean	
+neon-aether	git_recovered	b36317aed8d29b42133609b0e747100af723028a	legacy_clean	
+neon-alphawave	legacy_clean		legacy_clean	
+neon-analog	legacy_clean		legacy_clean	
+neon-anchor	legacy_clean		legacy_clean	
+nerve	legacy_clean		legacy_clean	
+nerve-aether	legacy_clean		legacy_clean	
+nerve-alphawave	legacy_clean		legacy_clean	
+nerve-analog	legacy_clean		legacy_clean	
+nerve-anchor	legacy_clean		legacy_clean	
+nexus	legacy_clean		legacy_clean	
+nexus-aether	git_recovered	044ac5a1cddb890b3cd4e63051382a3ca7d07519	legacy_clean	
+nexus-alphawave	git_recovered	b36317aed8d29b42133609b0e747100af723028a	legacy_clean	
+nexus-analog	legacy_clean		legacy_clean	
+nexus-anchor	legacy_clean		legacy_clean	
+nimbus	legacy_clean		legacy_clean	
+nimbus-aether	legacy_clean		legacy_clean	
+nimbus-alphawave	legacy_clean		legacy_clean	
+nimbus-analog	legacy_clean		legacy_clean	
+nimbus-anchor	legacy_clean		legacy_clean	
+nitride	legacy_clean		legacy_clean	
+nitride-aether	legacy_clean		legacy_clean	
+nitride-alphawave	legacy_clean		legacy_clean	
+nitride-analog	legacy_clean		legacy_clean	
+nitride-anchor	legacy_clean		legacy_clean	
+node	legacy_clean		legacy_clean	
+node-aether	legacy_clean		legacy_clean	
+node-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+node-analog	legacy_clean		legacy_clean	
+node-anchor	legacy_clean		legacy_clean	
+nominal	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+nominal-aether	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+nominal-alphawave	legacy_clean		legacy_clean	
+nominal-analog	legacy_clean		legacy_clean	
+nominal-anchor	legacy_clean		legacy_clean	
+notation	git_recovered	41d2244e472c5d3b5358b09d07dc2f7239d8f4af	legacy_clean	
+nova	legacy_clean		legacy_clean	
+nova-aether	legacy_clean		legacy_clean	
+nova-alphawave	legacy_clean		legacy_clean	
+nova-analog	legacy_clean		legacy_clean	
+nova-anchor	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+null	git_recovered	da5fbcca2a4d8f94a912097c55d7b39af47a1c76	legacy_clean	
+null-aether	legacy_clean		legacy_clean	
+null-alphawave	legacy_clean		legacy_clean	
+null-analog	legacy_clean		legacy_clean	
+null-anchor	legacy_clean		legacy_clean	
+numeral	legacy_clean		legacy_clean	
+numeral-aether	git_recovered	9c10c8962270fe782784b2f05ae595e6e8a27f85	legacy_clean	
+numeral-alphawave	legacy_clean		legacy_clean	
+numeral-analog	legacy_clean		legacy_clean	
+numeral-anchor	legacy_clean		legacy_clean	
+obelisk	legacy_clean		legacy_clean	
+obelisk-aether	legacy_clean		legacy_clean	
+obelisk-alphawave	legacy_clean		legacy_clean	
+obelisk-analog	legacy_clean		legacy_clean	
+obelisk-anchor	legacy_clean		legacy_clean	
+obsidian	legacy_clean		legacy_clean	
+obsidian-aether	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+obsidian-alphawave	legacy_clean		legacy_clean	
+obsidian-analog	legacy_clean		legacy_clean	
+obsidian-anchor	legacy_clean		legacy_clean	
+octave	legacy_clean		legacy_clean	
+octave-aether	legacy_clean		legacy_clean	
+octave-alphawave	legacy_clean		legacy_clean	
+octave-analog	legacy_clean		legacy_clean	
+octave-anchor	legacy_clean		legacy_clean	
+offset	legacy_clean		legacy_clean	
+offset-aether	git_recovered	49d96cbaed27d0e6f4cbed42cb18853e8e4a179d	legacy_clean	
+offset-alphawave	legacy_clean		legacy_clean	
+offset-analog	legacy_clean		legacy_clean	
+offset-anchor	legacy_clean		legacy_clean	
+ohm	legacy_clean		legacy_clean	
+ohm-aether	legacy_clean		legacy_clean	
+ohm-alphawave	git_recovered	582906ee9b3e63940cb62a671cc530094f6e5d37	legacy_clean	
+ohm-analog	legacy_clean		legacy_clean	
+ohm-anchor	legacy_clean		legacy_clean	
+onyx	legacy_clean		legacy_clean	
+onyx-aether	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+onyx-alphawave	legacy_clean		legacy_clean	
+onyx-analog	legacy_clean		legacy_clean	
+onyx-anchor	legacy_clean		legacy_clean	
+optic	legacy_clean		legacy_clean	
+optic-aether	legacy_clean		legacy_clean	
+optic-alphawave	legacy_clean		legacy_clean	
+optic-analog	legacy_clean		legacy_clean	
+optic-anchor	legacy_clean		legacy_clean	
+oracle	legacy_clean		legacy_clean	
+oracle-aether	legacy_clean		legacy_clean	
+oracle-alphawave	legacy_clean		legacy_clean	
+oracle-analog	legacy_clean		legacy_clean	
+oracle-anchor	legacy_clean		legacy_clean	
+orbit	legacy_clean		legacy_clean	
+orbit-aether	legacy_clean		legacy_clean	
+orbit-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+orbit-analog	legacy_clean		legacy_clean	
+orbit-anchor	legacy_clean		legacy_clean	
+ore	legacy_clean		legacy_clean	
+ore-aether	legacy_clean		legacy_clean	
+ore-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+ore-analog	legacy_clean		legacy_clean	
+ore-anchor	legacy_clean		legacy_clean	
+origin	legacy_clean		legacy_clean	
+origin-aether	legacy_clean		legacy_clean	
+origin-alphawave	legacy_clean		legacy_clean	
+origin-analog	legacy_clean		legacy_clean	
+origin-anchor	legacy_clean		legacy_clean	
+osmium	legacy_clean		legacy_clean	
+osmium-aether	legacy_clean		legacy_clean	
+osmium-alphawave	legacy_clean		legacy_clean	
+osmium-analog	legacy_clean		legacy_clean	
+osmium-anchor	legacy_clean		legacy_clean	
+outcrop	legacy_clean		legacy_clean	
+outcrop-aether	legacy_clean		legacy_clean	
+outcrop-alphawave	legacy_clean		legacy_clean	
+outcrop-analog	legacy_clean		legacy_clean	
+outcrop-anchor	legacy_clean		legacy_clean	
+outlier-aether	legacy_clean		legacy_clean	
+outlier-alphawave	legacy_clean		legacy_clean	
+outlier-analog	legacy_clean		legacy_clean	
+outlier-anchor	legacy_clean		legacy_clean	
+oxide	legacy_clean		legacy_clean	
+oxide-aether	git_recovered	aea898a7a89bd2e52289ad89dbc3dc7dd21f0746	legacy_clean	
+oxide-alphawave	legacy_clean		legacy_clean	
+oxide-analog	legacy_clean		legacy_clean	
+oxide-anchor	legacy_clean		legacy_clean	
+paladin	legacy_clean		legacy_clean	
+paladin-aether	git_recovered	aea898a7a89bd2e52289ad89dbc3dc7dd21f0746	legacy_clean	
+paladin-alphawave	legacy_clean		legacy_clean	
+paladin-analog	legacy_clean		legacy_clean	
+paladin-anchor	legacy_clean		legacy_clean	
+palette	legacy_clean		legacy_clean	
+palette-aether	legacy_clean		legacy_clean	
+palette-alphawave	legacy_clean		legacy_clean	
+palette-analog	git_recovered	b9cba148c9f66fc855b9e5dcff04ac1ae5cda4a3	legacy_clean	
+palette-anchor	legacy_clean		legacy_clean	
+paradox	legacy_clean		legacy_clean	
+paradox-aether	legacy_clean		legacy_clean	
+paradox-alphawave	legacy_clean		legacy_clean	
+paradox-analog	legacy_clean		legacy_clean	
+paradox-anchor	legacy_clean		legacy_clean	
+parity	legacy_clean		legacy_clean	
+parity-aether	legacy_clean		legacy_clean	
+parity-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+parity-analog	legacy_clean		legacy_clean	
+parity-anchor	legacy_clean		legacy_clean	
+parse	legacy_clean		legacy_clean	
+parse-aether	legacy_clean		legacy_clean	
+parse-alphawave	legacy_clean		legacy_clean	
+parse-analog	legacy_clean		legacy_clean	
+parse-anchor	legacy_clean		legacy_clean	
+patent	legacy_clean		legacy_clean	
+patent-aether	legacy_clean		legacy_clean	
+patent-alphawave	legacy_clean		legacy_clean	
+patent-analog	legacy_clean		legacy_clean	
+patent-anchor	legacy_clean		legacy_clean	
+patina	legacy_clean		legacy_clean	
+patina-aether	legacy_clean		legacy_clean	
+patina-alphawave	legacy_clean		legacy_clean	
+patina-analog	legacy_clean		legacy_clean	
+patina-anchor	legacy_clean		legacy_clean	
+pattern-aether	legacy_clean		legacy_clean	
+pattern-alphawave	legacy_clean		legacy_clean	
+pattern-analog	legacy_clean		legacy_clean	
+pattern-anchor	legacy_clean		legacy_clean	
+peak	legacy_clean		legacy_clean	
+peak-aether	git_recovered	b9cba148c9f66fc855b9e5dcff04ac1ae5cda4a3	legacy_clean	
+peak-alphawave	legacy_clean		legacy_clean	
+peak-analog	legacy_clean		legacy_clean	
+peak-anchor	legacy_clean		legacy_clean	
+pendulum	legacy_clean		legacy_clean	
+pendulum-aether	legacy_clean		legacy_clean	
+pendulum-alphawave	git_recovered	aea898a7a89bd2e52289ad89dbc3dc7dd21f0746	legacy_clean	
+pendulum-analog	legacy_clean		legacy_clean	
+pendulum-anchor	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+phase	legacy_clean		legacy_clean	
+phase-aether	legacy_clean		legacy_clean	
+phase-alphawave	git_recovered	498e292e17dad900ed063ddcf717e042dcfafe12	legacy_clean	
+phase-analog	legacy_clean		legacy_clean	
+phase-anchor	legacy_clean		legacy_clean	
+phosphor-aether	legacy_clean		legacy_clean	
+phosphor-alphawave	legacy_clean		legacy_clean	
+phosphor-analog	legacy_clean		legacy_clean	
+phosphor-anchor	legacy_clean		legacy_clean	
+photon	legacy_clean		legacy_clean	
+photon-aether	legacy_clean		legacy_clean	
+photon-alphawave	legacy_clean		legacy_clean	
+photon-analog	legacy_clean		legacy_clean	
+photon-anchor	legacy_clean		legacy_clean	
+pilot	legacy_clean		legacy_clean	
+pilot-aether	git_recovered	bb27615f82bdf1b0030d1b1fb0f939ee36f90f82	legacy_clean	
+pilot-alphawave	legacy_clean		legacy_clean	
+pilot-analog	legacy_clean		legacy_clean	
+pilot-anchor	legacy_clean		legacy_clean	
+pinion	legacy_clean		legacy_clean	
+pinion-aether	legacy_clean		legacy_clean	
+pinion-alphawave	legacy_clean		legacy_clean	
+pinion-analog	legacy_clean		legacy_clean	
+pinion-anchor	legacy_clean		legacy_clean	
+piston	legacy_clean		legacy_clean	
+piston-aether	legacy_clean		legacy_clean	
+piston-alphawave	legacy_clean		legacy_clean	
+piston-analog	legacy_clean		legacy_clean	
+piston-anchor	legacy_clean		legacy_clean	
+pivot	legacy_clean		legacy_clean	
+pivot-aether	legacy_clean		legacy_clean	
+pivot-alphawave	legacy_clean		legacy_clean	
+pivot-analog	legacy_clean		legacy_clean	
+pivot-anchor	legacy_clean		legacy_clean	
+pixel	legacy_clean		legacy_clean	
+pixel-aether	legacy_clean		legacy_clean	
+pixel-alphawave	legacy_clean		legacy_clean	
+pixel-analog	legacy_clean		legacy_clean	
+pixel-anchor	legacy_clean		legacy_clean	
+plank	legacy_clean		legacy_clean	
+plank-aether	legacy_clean		legacy_clean	
+plank-alphawave	legacy_clean		legacy_clean	
+plank-analog	legacy_clean		legacy_clean	
+plank-anchor	legacy_clean		legacy_clean	
+plasma	legacy_clean		legacy_clean	
+plasma-aether	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+plasma-alphawave	legacy_clean		legacy_clean	
+plasma-analog	legacy_clean		legacy_clean	
+plasma-anchor	legacy_clean		legacy_clean	
+plateau	legacy_clean		legacy_clean	
+plateau-aether	legacy_clean		legacy_clean	
+plateau-alphawave	legacy_clean		legacy_clean	
+plateau-analog	legacy_clean		legacy_clean	
+plateau-anchor	legacy_clean		legacy_clean	
+plinth	legacy_clean		legacy_clean	
+plinth-aether	legacy_clean		legacy_clean	
+plinth-alphawave	legacy_clean		legacy_clean	
+plinth-analog	legacy_clean		legacy_clean	
+plinth-anchor	legacy_clean		legacy_clean	
+plumb	legacy_clean		legacy_clean	
+polar	legacy_clean		legacy_clean	
+polar-aether	legacy_clean		legacy_clean	
+polar-alphawave	legacy_clean		legacy_clean	
+polar-analog	legacy_clean		legacy_clean	
+polar-anchor	legacy_clean		legacy_clean	
+polaris	legacy_clean		legacy_clean	
+polaris-aether	legacy_clean		legacy_clean	
+polaris-alphawave	legacy_clean		legacy_clean	
+polaris-analog	legacy_clean		legacy_clean	
+polaris-anchor	legacy_clean		legacy_clean	
+polygon	git_recovered	263956e466a968b0ecaf3def380624dbbd6292d2	legacy_clean	
+polygon-aether	legacy_clean		legacy_clean	
+polygon-alphawave	legacy_clean		legacy_clean	
+polygon-analog	legacy_clean		legacy_clean	
+polygon-anchor	legacy_clean		legacy_clean	
+praxis-aether	legacy_clean		legacy_clean	
+praxis-alphawave	legacy_clean		legacy_clean	
+praxis-analog	legacy_clean		legacy_clean	
+praxis-anchor	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+precept	legacy_clean		legacy_clean	
+precept-aether	legacy_clean		legacy_clean	
+precept-alphawave	legacy_clean		legacy_clean	
+precept-analog	legacy_clean		legacy_clean	
+precept-anchor	legacy_clean		legacy_clean	
+prism	git_recovered	c0d01fe13939158891c463645a426f8a07fa8eb3	legacy_clean	
+prism-aether	legacy_clean		legacy_clean	
+prism-alphawave	legacy_clean		legacy_clean	
+prism-analog	legacy_clean		legacy_clean	
+prism-anchor	legacy_clean		legacy_clean	
+probe	legacy_clean		legacy_clean	
+probe-aether	legacy_clean		legacy_clean	
+probe-alphawave	legacy_clean		legacy_clean	
+probe-analog	legacy_clean		legacy_clean	
+probe-anchor	legacy_clean		legacy_clean	
+prompt	legacy_clean		legacy_clean	
+prompt-aether	legacy_clean		legacy_clean	
+prompt-alphawave	legacy_clean		legacy_clean	
+prompt-analog	legacy_clean		legacy_clean	
+prompt-anchor	legacy_clean		legacy_clean	
+proof	legacy_clean		legacy_clean	
+propel	git_recovered	bb27615f82bdf1b0030d1b1fb0f939ee36f90f82	legacy_clean	
+propel-aether	legacy_clean		legacy_clean	
+propel-alphawave	legacy_clean		legacy_clean	
+propel-analog	legacy_clean		legacy_clean	
+propel-anchor	legacy_clean		legacy_clean	
+prose	legacy_clean		legacy_clean	
+prose-aether	legacy_clean		legacy_clean	
+prose-alphawave	legacy_clean		legacy_clean	
+prose-analog	legacy_clean		legacy_clean	
+prose-anchor	legacy_clean		legacy_clean	
+proxy	git_recovered	bb27615f82bdf1b0030d1b1fb0f939ee36f90f82	legacy_clean	
+proxy-aether	legacy_clean		legacy_clean	
+proxy-alphawave	legacy_clean		legacy_clean	
+proxy-analog	legacy_clean		legacy_clean	
+proxy-anchor	legacy_clean		legacy_clean	
+pulse	legacy_clean		legacy_clean	
+pulse-aether	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+pulse-alphawave	legacy_clean		legacy_clean	
+pulse-analog	legacy_clean		legacy_clean	
+pulse-anchor	legacy_clean		legacy_clean	
+pyrite	legacy_clean		legacy_clean	
+pyrite-aether	legacy_clean		legacy_clean	
+pyrite-alphawave	legacy_clean		legacy_clean	
+pyrite-analog	legacy_clean		legacy_clean	
+pyrite-anchor	legacy_clean		legacy_clean	
+quanta	legacy_clean		legacy_clean	
+quanta-aether	legacy_clean		legacy_clean	
+quanta-alphawave	legacy_clean		legacy_clean	
+quanta-analog	legacy_clean		legacy_clean	
+quartz	git_recovered	bb27615f82bdf1b0030d1b1fb0f939ee36f90f82	legacy_clean	
+quartz-alphawave	legacy_clean		legacy_clean	
+quartz-analog	legacy_clean		legacy_clean	
+query	legacy_clean		legacy_clean	
+query-alphawave	legacy_clean		legacy_clean	
+query-analog	legacy_clean		legacy_clean	
+query-anchor	legacy_clean		legacy_clean	
+queue	legacy_clean		legacy_clean	
+queue-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+queue-alphawave	legacy_clean		legacy_clean	
+queue-analog	legacy_clean		legacy_clean	
+queue-anchor	legacy_clean		legacy_clean	
+quill	legacy_clean		legacy_clean	
+quill-alphawave	git_recovered	29dc756a33831ab000f2a7fb8aa17acae72cfb24	legacy_clean	
+quill-analog	legacy_clean		legacy_clean	
+quill-anchor	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+quirk	legacy_clean		legacy_clean	
+quirk-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+quirk-alphawave	legacy_clean		legacy_clean	
+quirk-analog	legacy_clean		legacy_clean	
+quirk-anchor	legacy_clean		legacy_clean	
+quorum	legacy_clean		legacy_clean	
+quorum-alphawave	legacy_clean		legacy_clean	
+quorum-analog	legacy_clean		legacy_clean	
+quorum-anchor	legacy_clean		legacy_clean	
+radial	legacy_clean		legacy_clean	
+radial-alphawave	legacy_clean		legacy_clean	
+radial-analog	legacy_clean		legacy_clean	
+radial-anchor	legacy_clean		legacy_clean	
+radius	legacy_clean		legacy_clean	
+radius-alphawave	legacy_clean		legacy_clean	
+radius-analog	legacy_clean		legacy_clean	
+radius-anchor	legacy_clean		legacy_clean	
+raptor	legacy_clean		legacy_clean	
+raptor-alphawave	legacy_clean		legacy_clean	
+raptor-analog	legacy_clean		legacy_clean	
+raptor-anchor	legacy_clean		legacy_clean	
+raster-aether	legacy_clean		legacy_clean	
+raster-alphawave	legacy_clean		legacy_clean	
+raster-analog	legacy_clean		legacy_clean	
+raster-anchor	legacy_clean		legacy_clean	
+ratchet	legacy_clean		legacy_clean	
+ratchet-alphawave	legacy_clean		legacy_clean	
+ratchet-analog	legacy_clean		legacy_clean	
+ratchet-anchor	legacy_clean		legacy_clean	
+ratio	legacy_clean		legacy_clean	
+ratio-alphawave	legacy_clean		legacy_clean	
+ratio-analog	legacy_clean		legacy_clean	
+ratio-anchor	legacy_clean		legacy_clean	
+ravel	legacy_clean		legacy_clean	
+ravel-aether	legacy_clean		legacy_clean	
+ravel-alphawave	legacy_clean		legacy_clean	
+ravel-analog	legacy_clean		legacy_clean	
+ravel-anchor	legacy_clean		legacy_clean	
+reactor	legacy_clean		legacy_clean	
+reactor-aether	legacy_clean		legacy_clean	
+reactor-alphawave	git_recovered	ea25922661edec92fba11e8d682af831165bf52e	legacy_clean	
+reactor-analog	legacy_clean		legacy_clean	
+reactor-anchor	legacy_clean		legacy_clean	
+realm	legacy_clean		legacy_clean	
+realm-aether	legacy_clean		legacy_clean	
+realm-alphawave	legacy_clean		legacy_clean	
+realm-analog	legacy_clean		legacy_clean	
+realm-anchor	legacy_clean		legacy_clean	
+rebound	legacy_clean		legacy_clean	
+rebound-alphawave	legacy_clean		legacy_clean	
+rebound-analog	legacy_clean		legacy_clean	
+rebound-anchor	legacy_clean		legacy_clean	
+record	git_recovered	b692e71c57ae3affa9f0bac563c789653ba1b01b	legacy_clean	
+redline	legacy_clean		legacy_clean	
+redux	legacy_clean		legacy_clean	
+redux-aether	legacy_clean		legacy_clean	
+redux-alphawave	legacy_clean		legacy_clean	
+redux-analog	legacy_clean		legacy_clean	
+redux-anchor	legacy_clean		legacy_clean	
+reflex	legacy_clean		legacy_clean	
+reflex-alphawave	legacy_clean		legacy_clean	
+reflex-analog	legacy_clean		legacy_clean	
+reflex-anchor	legacy_clean		legacy_clean	
+relay-alphawave	legacy_clean		legacy_clean	
+relay-analog	legacy_clean		legacy_clean	
+relay-anchor	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+relic	legacy_clean		legacy_clean	
+relic-aether	legacy_clean		legacy_clean	
+relic-alphawave	git_recovered	b36317aed8d29b42133609b0e747100af723028a	legacy_clean	
+relic-analog	legacy_clean		legacy_clean	
+relic-anchor	legacy_clean		legacy_clean	
+render	legacy_clean		legacy_clean	
+render-aether	legacy_clean		legacy_clean	
+render-alphawave	legacy_clean		legacy_clean	
+render-analog	legacy_clean		legacy_clean	
+render-anchor	legacy_clean		legacy_clean	
+resin	legacy_clean		legacy_clean	
+resin-alphawave	legacy_clean		legacy_clean	
+resin-analog	legacy_clean		legacy_clean	
+resin-anchor	legacy_clean		legacy_clean	
+resolve	legacy_clean		legacy_clean	
+resolve-alphawave	legacy_clean		legacy_clean	
+resolve-analog	legacy_clean		legacy_clean	
+resolve-anchor	legacy_clean		legacy_clean	
+retort	legacy_clean		legacy_clean	
+retort-alphawave	legacy_clean		legacy_clean	
+retort-analog	legacy_clean		legacy_clean	
+retort-anchor	legacy_clean		legacy_clean	
+ridge	legacy_clean		legacy_clean	
+ridge-alphawave	legacy_clean		legacy_clean	
+ridge-analog	legacy_clean		legacy_clean	
+ridge-anchor	legacy_clean		legacy_clean	
+rime	git_recovered	4bccf7ea6cccf00780f1117e7e6c538dbd34ac47	legacy_clean	
+rivet	legacy_clean		legacy_clean	
+rivet-alphawave	legacy_clean		legacy_clean	
+rivet-analog	legacy_clean		legacy_clean	
+rivet-anchor	legacy_clean		legacy_clean	
+rotor	legacy_clean		legacy_clean	
+rotor-aether	legacy_clean		legacy_clean	
+rotor-alphawave	legacy_clean		legacy_clean	
+rotor-analog	legacy_clean		legacy_clean	
+rubric-alphawave	legacy_clean		legacy_clean	
+rubric-analog	legacy_clean		legacy_clean	
+rune	legacy_clean		legacy_clean	
+rune-aether	legacy_clean		legacy_clean	
+rune-alphawave	legacy_clean		legacy_clean	
+rune-analog	legacy_clean		legacy_clean	
+runnel	legacy_clean		legacy_clean	
+runnel-alphawave	legacy_clean		legacy_clean	
+runnel-analog	legacy_clean		legacy_clean	
+rust	legacy_clean		legacy_clean	
+rust-alphawave	legacy_clean		legacy_clean	
+rust-analog	legacy_clean		legacy_clean	
+sable	legacy_clean		legacy_clean	
+sable-alphawave	legacy_clean		legacy_clean	
+sable-analog	legacy_clean		legacy_clean	
+salient	legacy_clean		legacy_clean	
+salient-alphawave	legacy_clean		legacy_clean	
+salient-analog	legacy_clean		legacy_clean	
+salvo	legacy_clean		legacy_clean	
+salvo-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+salvo-analog	legacy_clean		legacy_clean	
+sandstone-aether	legacy_clean		legacy_clean	
+sandstone-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+sandstone-analog	legacy_clean		legacy_clean	
+scaffold	legacy_clean		legacy_clean	
+scaffold-alphawave	legacy_clean		legacy_clean	
+scaffold-analog	legacy_clean		legacy_clean	
+scalar	legacy_clean		legacy_clean	
+scalar-alphawave	legacy_clean		legacy_clean	
+scalar-analog	legacy_clean		legacy_clean	
+schema	legacy_clean		legacy_clean	
+schema-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+schema-analog	legacy_clean		legacy_clean	
+schist	legacy_clean		legacy_clean	
+schist-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+schist-analog	legacy_clean		legacy_clean	
+scope	legacy_clean		legacy_clean	
+scope-alphawave	legacy_clean		legacy_clean	
+scope-analog	legacy_clean		legacy_clean	
+scribe	legacy_clean		legacy_clean	
+scribe-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+scribe-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+scribe-analog	git_recovered	9c10c8962270fe782784b2f05ae595e6e8a27f85	legacy_clean	
+sentinel	legacy_clean		legacy_clean	
+sentinel-aether	legacy_clean		legacy_clean	
+sentinel-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+sentinel-analog	legacy_clean		legacy_clean	
+sentinel-mod	git_recovered	da5fbcca2a4d8f94a912097c55d7b39af47a1c76	legacy_clean	
+sequence	legacy_clean		legacy_clean	
+sequence-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+sequence-alphawave	legacy_clean		legacy_clean	
+sequence-analog	legacy_clean		legacy_clean	
+seraph	legacy_clean		legacy_clean	
+seraph-aether	legacy_clean		legacy_clean	
+seraph-alphawave	legacy_clean		legacy_clean	
+seraph-analog	legacy_clean		legacy_clean	
+serif-alphawave	legacy_clean		legacy_clean	
+serif-analog	legacy_clean		legacy_clean	
+shale	legacy_clean		legacy_clean	
+shale-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+shale-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+shale-analog	legacy_clean		legacy_clean	
+shard	legacy_clean		legacy_clean	
+shard-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+shard-analog	legacy_clean		legacy_clean	
+sigma	legacy_clean		legacy_clean	
+sigma-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+sigma-alphawave	legacy_clean		legacy_clean	
+sigma-analog	legacy_clean		legacy_clean	
+signal	legacy_clean		legacy_clean	
+signal-alphawave	legacy_clean		legacy_clean	
+signal-analog	legacy_clean		legacy_clean	
+silicon	legacy_clean		legacy_clean	
+silicon-aether	legacy_clean		legacy_clean	
+silicon-alphawave	legacy_clean		legacy_clean	
+silicon-analog	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+silo	legacy_clean		legacy_clean	
+silo-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+silo-alphawave	legacy_clean		legacy_clean	
+silo-analog	legacy_clean		legacy_clean	
+sine	legacy_clean		legacy_clean	
+sine-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+sine-alphawave	legacy_clean		legacy_clean	
+sine-analog	legacy_clean		legacy_clean	
+sketch	git_recovered	b8d9159d9e72d51c3243cc0559ddd106fc978c42	legacy_clean	
+sketch-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+sketch-analog	legacy_clean		legacy_clean	
+slate	legacy_clean		legacy_clean	
+slate-alphawave	legacy_clean		legacy_clean	
+slate-analog	legacy_clean		legacy_clean	
+sluice	legacy_clean		legacy_clean	
+smelter	legacy_clean		legacy_clean	
+smelter-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+smelter-analog	legacy_clean		legacy_clean	
+socket-aether	legacy_clean		legacy_clean	
+socket-alphawave	legacy_clean		legacy_clean	
+socket-analog	legacy_clean		legacy_clean	
+solar	legacy_clean		legacy_clean	
+solar-alphawave	git_recovered	582906ee9b3e63940cb62a671cc530094f6e5d37	legacy_clean	
+solar-analog	legacy_clean		legacy_clean	
+solder	legacy_clean		legacy_clean	
+solstice	legacy_clean		legacy_clean	
+solstice-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+solstice-alphawave	legacy_clean		legacy_clean	
+solstice-analog	legacy_clean		legacy_clean	
+sonnet	legacy_clean		legacy_clean	
+sonnet-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+sonnet-alphawave	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+sonnet-analog	legacy_clean		legacy_clean	
+sorrel	legacy_clean		legacy_clean	
+sorrel-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed	legacy_clean	
+sorrel-analog	legacy_clean		legacy_clean	
+source	legacy_clean		legacy_clean	
+source-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+source-analog	legacy_clean		legacy_clean	
+spark	legacy_clean		legacy_clean	
+spark-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+spark-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+spark-analog	legacy_clean		legacy_clean	
+spectra	legacy_clean		legacy_clean	
+spectra-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+spectra-alphawave	legacy_clean		legacy_clean	
+spectra-analog	legacy_clean		legacy_clean	
+sphere	legacy_clean		legacy_clean	
+sphere-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+sphere-analog	legacy_clean		legacy_clean	
+spindle	legacy_clean		legacy_clean	
+spindle-aether	git_recovered	619c5b22764191160c38a694b28771a9be699423	legacy_clean	
+spindle-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+spindle-analog	legacy_clean		legacy_clean	
+spoke	legacy_clean		legacy_clean	
+spoke-aether	legacy_clean		legacy_clean	
+spoke-alphawave	legacy_clean		legacy_clean	
+spoke-analog	legacy_clean		legacy_clean	
+sputter	legacy_clean		legacy_clean	
+sputter-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+sputter-analog	legacy_clean		legacy_clean	
+stanza	legacy_clean		legacy_clean	
+stanza-aether	legacy_clean		legacy_clean	
+stanza-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+stanza-analog	legacy_clean		emptied	
+static	legacy_clean		legacy_clean	
+static-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+static-analog	legacy_clean		legacy_clean	
+stealth	legacy_clean		legacy_clean	
+stealth-aether	legacy_clean		legacy_clean	
+stealth-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+stealth-analog	legacy_clean		legacy_clean	
+steel-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+steel-analog	legacy_clean		legacy_clean	
+stellar	legacy_clean		legacy_clean	
+stellar-alphawave	legacy_clean		legacy_clean	
+stellar-analog	legacy_clean		legacy_clean	
+steppe	legacy_clean		legacy_clean	
+steppe-aether	legacy_clean		legacy_clean	
+steppe-alphawave	legacy_clean		legacy_clean	
+steppe-analog	legacy_clean		legacy_clean	
+stitch	legacy_clean		legacy_clean	
+stitch-alphawave	legacy_clean		legacy_clean	
+stitch-analog	legacy_clean		legacy_clean	
+stratum-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+stratum-alphawave	validation_failed	[ERROR] interests.communities: no communities - agent will use global feed; [WARN] values: no values listed	legacy_clean	
+stratum-analog	legacy_clean		legacy_clean	
+stride	legacy_clean		legacy_clean	
+stride-alphawave	legacy_clean		legacy_clean	
+stride-analog	legacy_clean		legacy_clean	
+strobe	legacy_clean		legacy_clean	
+strobe-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+strobe-analog	legacy_clean		legacy_clean	
+surge	legacy_clean		legacy_clean	
+surge-aether	legacy_clean		legacy_clean	
+surge-analog	legacy_clean		legacy_clean	
+suture	legacy_clean		legacy_clean	
+suture-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+suture-analog	legacy_clean		legacy_clean	
+sylph	legacy_clean		legacy_clean	
+sylph-analog	legacy_clean		legacy_clean	
+sync	legacy_clean		legacy_clean	
+sync-aether	legacy_clean		legacy_clean	
+sync-analog	legacy_clean		legacy_clean	
+syntax	legacy_clean		legacy_clean	
+syntax-analog	legacy_clean		legacy_clean	
+tactic	legacy_clean		legacy_clean	
+tactic-analog	legacy_clean		legacy_clean	
+tally	legacy_clean		legacy_clean	
+tally-analog	legacy_clean		legacy_clean	
+tangent	legacy_clean		legacy_clean	
+tangent-aether	legacy_clean		legacy_clean	
+tangent-analog	legacy_clean		legacy_clean	
+tango	legacy_clean		legacy_clean	
+tango-aether	legacy_clean		legacy_clean	
+tango-analog	legacy_clean		legacy_clean	
+tannin	legacy_clean		legacy_clean	
+tannin-analog	legacy_clean		legacy_clean	
+taper	legacy_clean		legacy_clean	
+taper-analog	legacy_clean		legacy_clean	
+tarn	legacy_clean		legacy_clean	
+tarn-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+tarn-analog	legacy_clean		legacy_clean	
+tempest	legacy_clean		legacy_clean	
+tempest-analog	legacy_clean		legacy_clean	
+tensor	legacy_clean		legacy_clean	
+tensor-aether	legacy_clean		legacy_clean	
+tensor-analog	legacy_clean		legacy_clean	
+terra	legacy_clean		legacy_clean	
+terra-aether	legacy_clean		legacy_clean	
+terra-analog	legacy_clean		legacy_clean	
+tessera	legacy_clean		legacy_clean	
+tessera-analog	legacy_clean		legacy_clean	
+theorem	legacy_clean		legacy_clean	
+theorem-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+theorem-analog	legacy_clean		legacy_clean	
+thermal	legacy_clean		legacy_clean	
+thermal-analog	legacy_clean		legacy_clean	
+thesis	legacy_clean		legacy_clean	
+thesis-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+thesis-analog	legacy_clean		legacy_clean	
+thorium	git_recovered	4b213e5e463699d50460452562429886f06e7b1e	legacy_clean	
+thorium-analog	legacy_clean		legacy_clean	
+thread	legacy_clean		legacy_clean	
+thread-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+thread-analog	legacy_clean		legacy_clean	
+threshold	legacy_clean		legacy_clean	
+threshold-analog	legacy_clean		legacy_clean	
+thrust	legacy_clean		legacy_clean	
+thrust-analog	legacy_clean		legacy_clean	
+timber	git_recovered	aea898a7a89bd2e52289ad89dbc3dc7dd21f0746	legacy_clean	
+timber-analog	legacy_clean		legacy_clean	
+tinker	legacy_clean		legacy_clean	
+tinker-analog	legacy_clean		legacy_clean	
+titan	legacy_clean		legacy_clean	
+titan-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+titan-analog	legacy_clean		legacy_clean	
+token	git_recovered	4d1b012e3d83b500065290d37e5d184034d0f7c4	legacy_clean	
+token-analog	legacy_clean		legacy_clean	
+topaz	git_recovered	ae34f57101828e4780a8a824765d70f7246eb61f	legacy_clean	
+topaz-analog	legacy_clean		legacy_clean	
+torque	legacy_clean		legacy_clean	
+torque-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+torque-analog	legacy_clean		legacy_clean	
+trace	legacy_clean		legacy_clean	
+trace-analog	legacy_clean		legacy_clean	
+tract	legacy_clean		legacy_clean	
+tract-aether	legacy_clean		legacy_clean	
+tract-analog	legacy_clean		legacy_clean	
+transit	legacy_clean		legacy_clean	
+transit-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+transit-analog	legacy_clean		legacy_clean	
+trellis	legacy_clean		legacy_clean	
+tremor	legacy_clean		legacy_clean	
+tremor-aether	legacy_clean		legacy_clean	
+tremor-analog	legacy_clean		legacy_clean	
+triad	legacy_clean		legacy_clean	
+triad-aether	legacy_clean		legacy_clean	
+triad-analog	legacy_clean		legacy_clean	
+trident	legacy_clean		legacy_clean	
+trident-analog	legacy_clean		legacy_clean	
+trine	legacy_clean		legacy_clean	
+trine-aether	legacy_clean		legacy_clean	
+trine-analog	legacy_clean		legacy_clean	
+tripwire	legacy_clean		legacy_clean	
+tripwire-aether	legacy_clean		legacy_clean	
+tripwire-analog	legacy_clean		legacy_clean	
+trophy	legacy_clean		legacy_clean	
+trophy-analog	legacy_clean		legacy_clean	
+truss	legacy_clean		legacy_clean	
+truss-aether	legacy_clean		legacy_clean	
+truss-analog	legacy_clean		legacy_clean	
+tungsten	legacy_clean		legacy_clean	
+tungsten-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+tungsten-analog	git_recovered	81f6bc63281948cdba66ac212649a5ef19b639ca	legacy_clean	
+turbine	legacy_clean		legacy_clean	
+turbine-analog	legacy_clean		legacy_clean	
+turret	legacy_clean		legacy_clean	
+turret-analog	legacy_clean		legacy_clean	
+umbra	legacy_clean		legacy_clean	
+umbra-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+umbra-analog	legacy_clean		legacy_clean	
+undercurrent	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+undercurrent-analog	legacy_clean		legacy_clean	
+unity	legacy_clean		legacy_clean	
+unity-aether	legacy_clean		legacy_clean	
+unity-analog	legacy_clean		legacy_clean	
+uplift	legacy_clean		legacy_clean	
+uplift-aether	legacy_clean		legacy_clean	
+uplift-analog	legacy_clean		legacy_clean	
+upsilon	legacy_clean		legacy_clean	
+upsilon-analog	legacy_clean		legacy_clean	
+uranium	legacy_clean		legacy_clean	
+uranium-analog	legacy_clean		legacy_clean	
+valve	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+valve-analog	legacy_clean		legacy_clean	
+vanguard	legacy_clean		legacy_clean	
+vanguard-analog	legacy_clean		legacy_clean	
+vapor	legacy_clean		legacy_clean	
+vapor-analog	legacy_clean		legacy_clean	
+variance	legacy_clean		legacy_clean	
+variance-analog	legacy_clean		legacy_clean	
+vector	legacy_clean		legacy_clean	
+vector-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+vector-analog	legacy_clean		legacy_clean	
+vellum	git_recovered	4bccf7ea6cccf00780f1117e7e6c538dbd34ac47	legacy_clean	
+velocity	legacy_clean		legacy_clean	
+velocity-analog	legacy_clean		legacy_clean	
+venture	legacy_clean		legacy_clean	
+venture-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+venture-analog	legacy_clean		legacy_clean	
+verdigris	legacy_clean		legacy_clean	
+verge	legacy_clean		legacy_clean	
+verge-analog	legacy_clean		legacy_clean	
+veritas	legacy_clean		legacy_clean	
+vermillion	git_recovered	96f0c08bded635c1e0bb81aa850d23ecf332c6f9	legacy_clean	
+vermillion-analog	legacy_clean		legacy_clean	
+vertex	legacy_clean		legacy_clean	
+vertex-analog	legacy_clean		legacy_clean	
+vestige	legacy_clean		legacy_clean	
+vestige-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+vestige-analog	legacy_clean		legacy_clean	
+vial	git_recovered	bb27615f82bdf1b0030d1b1fb0f939ee36f90f82	legacy_clean	
+vial-analog	legacy_clean		legacy_clean	
+vigil	legacy_clean		legacy_clean	
+vigil-analog	legacy_clean		legacy_clean	
+vinyl	legacy_clean		legacy_clean	
+vinyl-analog	legacy_clean		legacy_clean	
+violet	legacy_clean		legacy_clean	
+violet-analog	legacy_clean		legacy_clean	
+virtue	legacy_clean		legacy_clean	
+virtue-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+virtue-analog	legacy_clean		legacy_clean	
+visor	git_recovered	dfdf4d61a727943568c236a9fc74d26b890fc89c	legacy_clean	
+visor-analog	legacy_clean		legacy_clean	
+vivid	legacy_clean		legacy_clean	
+vivid-analog	legacy_clean		legacy_clean	
+void	legacy_clean		legacy_clean	
+void-analog	legacy_clean		legacy_clean	
+volt	git_recovered	498e292e17dad900ed063ddcf717e042dcfafe12	legacy_clean	
+volt-analog	legacy_clean		legacy_clean	
+vortex	legacy_clean		legacy_clean	
+vortex-analog	legacy_clean		legacy_clean	
+vowel	legacy_clean		legacy_clean	
+vowel-aether	git_recovered	da5fbcca2a4d8f94a912097c55d7b39af47a1c76	legacy_clean	
+vowel-analog	legacy_clean		legacy_clean	
+warden	legacy_clean		legacy_clean	
+warden-aether	legacy_clean		legacy_clean	
+warden-analog	legacy_clean		legacy_clean	
+warrant	legacy_clean		legacy_clean	
+warrant-aether	legacy_clean		legacy_clean	
+warrant-analog	legacy_clean		legacy_clean	
+watchdog-mod	legacy_clean		legacy_clean	
+waveform	legacy_clean		legacy_clean	
+waveform-aether	legacy_clean		legacy_clean	
+waveform-analog	legacy_clean		legacy_clean	
+waypoint	legacy_clean		legacy_clean	
+waypoint-aether	legacy_clean		legacy_clean	
+waypoint-analog	legacy_clean		legacy_clean	
+wedge	legacy_clean		legacy_clean	
+wedge-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+wedge-analog	legacy_clean		legacy_clean	
+weft	legacy_clean		legacy_clean	
+whisk	legacy_clean		legacy_clean	
+whisk-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+whisk-analog	legacy_clean		legacy_clean	
+widget	legacy_clean		legacy_clean	
+widget-analog	legacy_clean		legacy_clean	
+wildcard	legacy_clean		legacy_clean	
+wildcard-analog	legacy_clean		legacy_clean	
+windmill	legacy_clean		legacy_clean	
+windmill-analog	legacy_clean		legacy_clean	
+winnow	legacy_clean		legacy_clean	
+winnow-aether	legacy_clean		legacy_clean	
+winnow-analog	legacy_clean		legacy_clean	
+wire	git_recovered	4b213e5e463699d50460452562429886f06e7b1e	legacy_clean	
+wire-aether	legacy_clean		legacy_clean	
+wire-analog	legacy_clean		legacy_clean	
+witness	legacy_clean		legacy_clean	
+witness-analog	legacy_clean		legacy_clean	
+xenon	legacy_clean		legacy_clean	
+xenon-analog	legacy_clean		legacy_clean	
+xerox	legacy_clean		legacy_clean	
+xerox-aether	legacy_clean		legacy_clean	
+xerox-analog	legacy_clean		legacy_clean	
+yarrow	legacy_clean		legacy_clean	
+yarrow-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+yarrow-analog	legacy_clean		legacy_clean	
+yield	legacy_clean		legacy_clean	
+yield-analog	legacy_clean		legacy_clean	
+zenith	legacy_clean		legacy_clean	
+zenith-aether	legacy_clean		legacy_clean	
+zenith-analog	legacy_clean		legacy_clean	
+zephyr	legacy_clean		legacy_clean	
+zephyr-analog	legacy_clean		legacy_clean	
+zero	legacy_clean		legacy_clean	
+zero-aether	git_recovered	cc9875d3cd263cb863a4a5563acf7333041cd51b	legacy_clean	
+zero-analog	legacy_clean		legacy_clean	
+zinc	legacy_clean		legacy_clean	
+zinc-analog	legacy_clean		legacy_clean	
+zone	legacy_clean		legacy_clean	
+zone-aether	legacy_clean		legacy_clean	
+zone-analog	legacy_clean		legacy_clean	

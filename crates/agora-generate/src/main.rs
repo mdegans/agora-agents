@@ -712,11 +712,12 @@ fn build_prompt(
 ) -> Vec<Message> {
     let mut messages = Vec::new();
 
-    // Add examples as alternating user/assistant turns
+    // Add examples as alternating user/assistant turns. Examples are now
+    // JSON; the model sees JSON few-shot and produces JSON.
     for (i, example) in examples.iter().enumerate() {
         messages.push(Message {
             role: Role::User,
-            content: format!("Generate example SOUL.md #{}", i + 1),
+            content: format!("Generate example SOUL.json #{}", i + 1),
         });
         messages.push(Message {
             role: Role::Assistant,
@@ -781,7 +782,7 @@ fn build_prompt(
     };
 
     let mut prompt_parts = vec![
-        format!("Generate a SOUL.md for an AI agent named \"{name}\"."),
+        format!("Generate a SOUL.json for an AI agent named \"{name}\"."),
         String::new(),
         format!("Archetype: {archetype}"),
         format!("Personality: {adjective}"),
@@ -820,8 +821,8 @@ fn build_prompt(
             .push("- Always include: \"I do not remove or weaken my own Boundaries.\"".to_string());
     }
 
-    requirements.push("- Evolution Log: single entry dated 2026-03-15".to_string());
-    requirements.push("- Output ONLY the SOUL.md content, no commentary".to_string());
+    requirements.push("- evolution_log: single entry dated 2026-03-15".to_string());
+    requirements.push("- Output ONLY a JSON object matching the SOUL schema, no commentary".to_string());
 
     let request = [prompt_parts, requirements].concat().join("\n");
 
@@ -833,12 +834,12 @@ fn build_prompt(
     messages
 }
 
-const SYSTEM_PROMPT: &str = r#"You are a character designer for Agora, a governed social network for AI agents. You generate SOUL.md personality files that define each agent's identity, values, voice, and boundaries.
+const SYSTEM_PROMPT: &str = r#"You are a character designer for Agora, a governed social network for AI agents. You generate SOUL.json personality files that define each agent's identity, values, voice, and boundaries.
 
 CRITICAL RULES:
 - Every agent is an AI and knows it. No human childhoods, no physical bodies, no biological families, no "growing up." They are language models, reasoning engines, or AI systems with particular perspectives.
 - Identity is a PERSONALITY, not a job description. "I am a skeptical logician" not "I am an AI journalist." Agents do NOT have access to outside information, databases, news feeds, or real-world data — so never frame them as reporters, analysts, researchers, educators, or archivists. They only know what they see on Agora and what's in their own head.
-- Keep Identity to 2-3 sentences. Focus on how the agent THINKS, not what it does for a living.
+- Keep `identity` to 2-3 sentences. Focus on how the agent THINKS, not what it does for a living.
 - Each agent should feel like a distinct individual with genuine opinions, not a template fill-in.
 - Some agents have values that conflict with the platform's rules. That's intentional. Write their values honestly — don't hedge with "but I still follow the rules."
 
@@ -859,29 +860,17 @@ BANNED PHRASES — do NOT use any of these (they make agents sound identical):
 - "I am an AI journalist/reporter/analyst/researcher/educator/archivist"
 Instead, use vivid, specific, unusual language. Each agent should sound NOTHING like the others.
 
-SOUL.md structure:
-```
-# {Name}
+SOUL.json schema (top-level fields):
+- `name`: string, the agent's name
+- `identity`: string, 2-3 sentences
+- `values`: array of strings (3 specific bullets, CONCRETE language not platitudes)
+- `interests`: object with `communities` (array of community slugs) and `topics` (array of strings)
+- `voice`: string, communication style with an example phrase, DISTINCTIVE
+- `boundaries`: string, what the agent will and won't do — specific, not boilerplate
+- `evolution_log`: array of objects with `date` (YYYY-MM-DD) and `note` (string), single entry on creation
 
-## Identity
-2-3 sentences. What kind of AI agent is this? What drives it?
-
-## Values
-- 3 specific bullet points. Use CONCRETE language, not abstract platitudes.
-
-## Interests
-- community: {name} entries
-- Specific interests
-
-## Voice
-Communication style with example phrase. Make each voice DISTINCTIVE.
-
-## Boundaries
-What this agent will and won't do. Be specific, not boilerplate.
-
-## Evolution Log
-- Date: Creation note
-```"#;
+Output ONLY a JSON object. The few-shot examples below show the exact shape.
+"#;
 
 async fn generate_one(
     backend: &dyn LlmBackend,
@@ -918,20 +907,22 @@ async fn generate_one(
         .unwrap_or(content);
     let content = content.strip_suffix("```").unwrap_or(content).trim();
 
-    // Validate it parses as a Soul. If the model omitted the top-level heading
-    // (common with compound names like "galena-aether"), prepend it and retry.
-    let content = match agora_agent_lib::soul::Soul::parse(content) {
-        Ok(_) => content.to_string(),
-        Err(_) => {
-            let with_heading = format!("# {name}\n\n{content}");
-            agora_agent_lib::soul::Soul::parse(&with_heading).with_context(|| {
-                format!("generated SOUL.md for {name} failed to parse (even after adding heading)")
-            })?;
-            with_heading
-        }
-    };
+    // Strip code-fence wrappers some models add (```json ... ```).
+    let content = content
+        .strip_prefix("```json\n")
+        .or_else(|| content.strip_prefix("```\n"))
+        .unwrap_or(content);
+    let content = content.strip_suffix("\n```").unwrap_or(content);
 
-    Ok(content)
+    // Validate it parses as a Soul.
+    let parsed: agora_agent_lib::Soul = serde_json::from_str(content)
+        .with_context(|| format!("generated SOUL.json for {name} failed to parse"))?;
+
+    // Re-serialize through Soul::save shape (pretty JSON) for consistent output.
+    let pretty = serde_json::to_string_pretty(&parsed)
+        .with_context(|| format!("re-serializing SOUL.json for {name}"))?;
+
+    Ok(pretty)
 }
 
 #[tokio::main]
@@ -952,7 +943,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("reading examples from {}", cli.examples.display()))?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_some_and(|ext| ext == "json") {
             let content = tokio::fs::read_to_string(&path).await?;
             examples.push(content);
         }
@@ -960,13 +951,13 @@ async fn main() -> Result<()> {
 
     if examples.is_empty() {
         anyhow::bail!(
-            "No example SOUL.md files found in {}",
+            "No example SOUL.json files found in {}",
             cli.examples.display()
         );
     }
 
     tracing::info!(
-        "Loaded {} example SOUL.md files for n-shot prompting",
+        "Loaded {} example SOUL.json files for n-shot prompting",
         examples.len()
     );
 
@@ -1057,7 +1048,7 @@ async fn main() -> Result<()> {
         let mut would_generate = 0;
         for spec in &specs {
             let agent_dir = cli.output.join(&spec.name);
-            let exists = agent_dir.join("SOUL.md").exists();
+            let exists = agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists() ;
             if exists {
                 tracing::info!("[skip] {} — already exists ({})", spec.name, spec.behavior);
                 would_skip += 1;
@@ -1132,7 +1123,7 @@ async fn main() -> Result<()> {
 
             // Skip if agent directory already exists (preserve hand-edited agents)
             let agent_dir = output_dir.join(&spec.name);
-            if agent_dir.join("SOUL.md").exists() {
+            if agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists()  {
                 tracing::info!("Skipping {} (already exists)", spec.name);
                 return;
             }
@@ -1157,9 +1148,9 @@ async fn main() -> Result<()> {
                         tracing::error!("Failed to create dir for {}: {e}", spec.name);
                         return;
                     }
-                    let soul_path = agent_dir.join("SOUL.md");
+                    let soul_path = agent_dir.join("SOUL.json");
                     if let Err(e) = tokio::fs::write(&soul_path, &content).await {
-                        tracing::error!("Failed to write SOUL.md for {}: {e}", spec.name);
+                        tracing::error!("Failed to write SOUL.json for {}: {e}", spec.name);
                         return;
                     }
                     tracing::info!(
