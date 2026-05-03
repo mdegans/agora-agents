@@ -1148,8 +1148,12 @@ async fn batch_phase_reflect(
         prompt
             .push_message(UserMessage::from(MEMORY_REWRITE_MESSAGE))
             .expect("batch_phase_reflect: user after assistant — turn order is a programmer bug");
-        // it's now the assistant's turn
-        prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+        // it's now the assistant's turn. 2048 tokens covers the soft 1000-word
+        // memory budget plus the thought block that thinking-first models
+        // emit before the JSON answer (e.g. cogito's `<thought>...</thought>`
+        // run before the actual `{"content": ...}`). 1024 was enough for
+        // post-thought response only and got truncated mid-JSON.
+        prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
         reflect_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
     }
 
@@ -1242,8 +1246,10 @@ async fn batch_phase_evolve(
                 .expect(
                     "batch_phase_evolve: evolution user after assistant — turn order is a programmer bug",
                 );
-            // it's now the assistant's turn
-            prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
+            // it's now the assistant's turn. 1024 covers a thought block +
+            // the single-sentence note (or `null`) — 512 was tight when
+            // thinking-first models reasoned before answering.
+            prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
             evolution_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
         }
     }
@@ -1366,8 +1372,10 @@ async fn batch_phase_survey(
         prompt
             .push_message(UserMessage::from(SURVEY_MESSAGE))
             .expect("batch_phase_survey: user after assistant — turn order is a programmer bug");
-        // it's now the assistant's turn
-        prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+        // it's now the assistant's turn. 2048 to cover thinking-block budget
+        // before the actual feedback text — thinking-first models can eat
+        // most of a 1024 budget on reasoning and truncate the answer.
+        prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
         survey_items.push(make_work_item(agent, prompt, CycleStep::Survey));
     }
 
@@ -1687,7 +1695,10 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     report: &mut RunReport,
 ) -> Result<()> {
     use std::num::NonZeroU32;
-    bare_prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+    // 2048 covers the soft 1000-word memory budget plus the thought block
+    // that thinking-first models emit before the JSON answer. See the
+    // matching comment in `batch_phase_reflect`.
+    bare_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
     apply_phase_config(bare_prompt, backend_kind, CycleStep::Reflect);
     bare_prompt.cache_windowed_1h(2);
 
@@ -1764,7 +1775,8 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
             }
         }
     } else if roll < evo_threshold {
-        bare_prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
+        // 1024 covers a thought block + single-sentence note (or `null`).
+        bare_prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
         apply_phase_config(bare_prompt, backend_kind, CycleStep::Evolve);
         bare_prompt.cache_windowed_1h(2);
 
@@ -1811,7 +1823,8 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     if !force_survey && !take_survey {
         return Ok(());
     }
-    bare_prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+    // 2048 to cover thinking-block budget before the actual feedback text.
+    bare_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
     apply_phase_config(bare_prompt, backend_kind, CycleStep::Survey);
     bare_prompt.cache_windowed_1h(2);
 
