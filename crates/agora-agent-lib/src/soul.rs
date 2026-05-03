@@ -680,6 +680,16 @@ pub struct Feedback {
     pub contact_me: bool,
 }
 
+/// `EvolutionRequest` for the small soul-evolution phase. The agent emits
+/// either this shape (with a `note`) or the JSON literal `null` for "no
+/// change". Schema given to blallama via `output_config`. The seed runner
+/// stamps today's date on apply.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
+pub struct EvolutionRequest {
+    /// One sentence describing the shift.
+    pub note: ShortString<512>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

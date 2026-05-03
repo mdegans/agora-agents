@@ -48,14 +48,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Load all community names from API
-    let communities: Vec<String> = api_client
-        .list_communities()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|ci| ci.name)
-        .collect();
+    // (Community list comes from `agora_agent_lib::Community::ALL`, codegen'd
+    // at build time in agora-agent-lib/build.rs from the live API. No
+    // runtime fetch needed.)
 
     // Resolve models from server for agents that don't have one from --model
     if cli.model.is_none() {
@@ -200,7 +195,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            scheduler::run_all(&mut agents, &api_client, &cli, &constitution, &communities).await?;
+            scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
         }
         Phase::Simulate => {
             // Filter to a single agent
@@ -229,7 +224,6 @@ async fn main() -> Result<()> {
                     "", // no recent activity in dry-run mode
                     "", // no pending replies in dry-run mode
                     &constitution,
-                    &communities,
                     &dashboard_text,
                 );
 
@@ -247,7 +241,7 @@ async fn main() -> Result<()> {
                 // `RUST_LOG=agora_seed=debug` for per-phase request/
                 // response logging.
                 let _ = agent; // filter was already applied above
-                scheduler::run_all(&mut agents, &api_client, &cli, &constitution, &communities)
+                scheduler::run_all(&mut agents, &api_client, &cli, &constitution)
                     .await?;
             }
         }
@@ -260,7 +254,7 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            scheduler::run_all(&mut agents, &api_client, &cli, &constitution, &communities).await?;
+            scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
         }
     }
 

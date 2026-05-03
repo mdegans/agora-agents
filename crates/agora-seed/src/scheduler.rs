@@ -55,6 +55,145 @@ use crate::prompt::SURVEY_MESSAGE;
 const MAX_ROUNDS: usize = 5;
 
 // ---------------------------------------------------------------------------
+// Per-backend phase config + CachedPrompt mutation helpers
+// ---------------------------------------------------------------------------
+
+/// Apply an `output_config` (the Anthropic JSON-Schema structured-output
+/// shape, exposed by misanthropic ≥ 95b5671) to a [`CachedPrompt`] by
+/// dropping into the underlying [`Prompt`], mutating, and re-wrapping.
+///
+/// `CachedPrompt`'s contract is "you can't accidentally invalidate cache
+/// without explicitly converting back to `Prompt`." Adding a setter on
+/// `CachedPrompt` would silently weaken that — `output_config` changes
+/// can bust cache on Anthropic-spec backends. The free-function form
+/// keeps the cache trade-off visible at every call site (and is the
+/// reason this lives here in agora-seed rather than upstream).
+///
+/// `cache_control` markers on individual messages are preserved across
+/// the round-trip because `CachedPrompt::from(Prompt)` is `Self { inner:
+/// prompt }` — no transformation. The caller doesn't need to re-cache.
+pub fn with_output_config<'a>(
+    cached: CachedPrompt<'a>,
+    output_config: Option<misanthropic::prompt::OutputConfig>,
+) -> CachedPrompt<'a> {
+    let mut prompt = cached.into_inner();
+    prompt.output_config = output_config;
+    CachedPrompt::from(prompt)
+}
+
+/// Apply a `tool_choice` to a [`CachedPrompt`] — same conversion shape as
+/// [`with_output_config`]. Used by the per-phase wiring to flip between
+/// `Auto` (think_act on Ollama / Anthropic) and `Any` (think_act on
+/// Blallama, forces *some* tool to be called) and `None` (reflect /
+/// mutate / etc., stripping tool use entirely).
+pub fn with_tool_choice<'a>(
+    cached: CachedPrompt<'a>,
+    tool_choice: Option<tool::Choice>,
+) -> CachedPrompt<'a> {
+    let mut prompt = cached.into_inner();
+    prompt.tool_choice = tool_choice;
+    CachedPrompt::from(prompt)
+}
+
+/// Per-backend, per-phase `(tool_choice, output_config)` matrix.
+///
+/// Anthropic is intentionally **not** handled here — its Batch path uses
+/// a fixed `tool_choice=Auto` set at prompt build time and never sets
+/// `output_config`, so per-phase mutations would just bust prompt cache.
+/// Calling this with [`Backend::Anthropic`] is a programmer error; we
+/// route around it at the dispatch level rather than encoding a "no-op"
+/// arm here.
+///
+/// The Blallama `output_config::for_type` calls produce JSON-schemas
+/// derived from the existing `serde::Serialize + JsonSchema` types —
+/// `Memory`, `Soul`, `Feedback`, `EvolutionRequest` — so the structured-
+/// output guarantee follows the same source of truth as the on-disk
+/// shape.
+pub fn phase_config(
+    backend: Backend,
+    step: CycleStep,
+) -> (Option<tool::Choice>, Option<misanthropic::prompt::OutputConfig>) {
+    use misanthropic::prompt::OutputConfig;
+    use tool::Choice;
+    match (backend, step) {
+        (Backend::Ollama, CycleStep::Think) => (Some(Choice::Auto), None),
+        (Backend::Ollama, _) => (None, None),
+        (Backend::Blallama, CycleStep::Think) => (Some(Choice::Any), None),
+        (Backend::Blallama, CycleStep::Reflect) => (
+            None,
+            Some(OutputConfig::for_type::<agora_agent_lib::Memory>()),
+        ),
+        (Backend::Blallama, CycleStep::Mutate) => (
+            None,
+            Some(OutputConfig::for_type::<agora_agent_lib::Soul>()),
+        ),
+        (Backend::Blallama, CycleStep::Evolve) => (
+            None,
+            Some(OutputConfig::for_type::<agora_agent_lib::EvolutionRequest>()),
+        ),
+        (Backend::Blallama, CycleStep::Survey) => (
+            None,
+            Some(OutputConfig::for_type::<agora_agent_lib::Feedback>()),
+        ),
+        (Backend::Anthropic, _) => panic!(
+            "phase_config called for Anthropic — its CachedPrompt is set once at \
+             build time and never mutated; route around this helper at dispatch"
+        ),
+    }
+}
+
+/// Apply this cycle's per-backend / per-phase `(tool_choice, output_config)`
+/// in place on `cached`. Single-call helper that does both mutations
+/// through the explicit conversion path. Use `cached.cache_windowed(2)`
+/// after this if you want a fresh cache breakpoint for the new content.
+///
+/// Skips entirely on `Backend::Anthropic` (see [`phase_config`] doc).
+pub fn apply_phase_config(cached: &mut CachedPrompt<'static>, backend: Backend, step: CycleStep) {
+    if matches!(backend, Backend::Anthropic) {
+        return;
+    }
+    let (tc, oc) = phase_config(backend, step);
+    let owned = std::mem::replace(
+        cached,
+        CachedPrompt::from(misanthropic::Prompt::default()),
+    );
+    let owned = with_tool_choice(owned, tc);
+    let owned = with_output_config(owned, oc);
+    *cached = owned;
+}
+
+/// Inspect a message's `usage` for blallama cache hits and warn at runtime
+/// if the second-and-later calls in a cycle don't reuse the cached prefix.
+#[allow(dead_code)] // Wiring TBD — see PR4 follow-up plan; util kept for the next hop.
+///
+/// Ollama's Anthropic-compat API doesn't return cache stats, so this is
+/// a no-op for Ollama. For Blallama (Anthropic-spec) we expect non-zero
+/// `cache_read_input_tokens` after the first call in a cycle. A
+/// `tracing::warn!` (rather than a `debug_assert!`) catches regression
+/// at runtime without being brittle in tests where cache behavior is
+/// hard to mock.
+pub fn check_cache_hit(
+    backend: Backend,
+    usage: Option<&Usage>,
+    agent: &str,
+    step: CycleStep,
+    is_first_call: bool,
+) {
+    if !matches!(backend, Backend::Blallama) || is_first_call {
+        return;
+    }
+    let Some(usage) = usage else { return };
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    if cache_read == 0 {
+        tracing::warn!(
+            "blallama cache miss for agent={agent} step={step:?} \
+             (input={} no-cache, expected cache_read_input_tokens > 0)",
+            usage.input_tokens,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Common functions — shared by both Anthropic batch and Ollama sequential
 // ---------------------------------------------------------------------------
 
@@ -76,7 +215,6 @@ pub fn build_prompt(
     agent: &Agent,
     ctx: &AgentCycleContext,
     constitution: &str,
-    communities: &[String],
 ) -> CachedPrompt<'static> {
     let cached = prompt::build(
         &agent.model,
@@ -85,7 +223,6 @@ pub fn build_prompt(
         &ctx.recent_activity,
         &ctx.pending_replies_text,
         constitution,
-        communities,
         &ctx.perception_text,
     );
 
@@ -746,7 +883,6 @@ async fn prime_anthropic_models(
     backend: &AnthropicBatch,
     models: impl IntoIterator<Item = String>,
     constitution: &str,
-    communities: &[String],
 ) {
     use std::num::NonZeroU32;
 
@@ -764,7 +900,7 @@ async fn prime_anthropic_models(
         .into_iter()
         .map(|model| {
             let hash = model_prefix_hash(&model);
-            let mut prompt = prompt::build_base_prompt(&model, constitution, communities);
+            let mut prompt = prompt::build_base_prompt(&model, constitution);
             prompt
                 .push_message(UserMessage::from("ping"))
                 .expect("first user message on a fresh prompt is always valid");
@@ -1044,7 +1180,7 @@ async fn batch_phase_reflect(
         let response = result.response.map(|m| m.into_static());
         match commit_batch_response(prompt, response, "reflect batch") {
             Ok(assistant) => {
-                let response_text = assistant.content().to_string();
+                let response_text = prompt::extract_speech(assistant.content());
                 if let Err(e) = apply_reflect(agent, &response_text).await {
                     tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
                 }
@@ -1145,7 +1281,7 @@ async fn batch_phase_evolve(
             let response = result.response.map(|m| m.into_static());
             match commit_batch_response(prompt, response, "mutation batch") {
                 Ok(assistant) => {
-                    let response_text = assistant.content().to_string();
+                    let response_text = prompt::extract_speech(assistant.content());
                     if let Err(e) = apply_mutation(agent, &response_text, &experience, report).await
                     {
                         tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
@@ -1187,7 +1323,7 @@ async fn batch_phase_evolve(
             let response = result.response.map(|m| m.into_static());
             match commit_batch_response(prompt, response, "evolution batch") {
                 Ok(assistant) => {
-                    let response_text = assistant.content().to_string();
+                    let response_text = prompt::extract_speech(assistant.content());
                     if let Err(e) = apply_evolution(agent, &response_text, report).await {
                         tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
                     }
@@ -1313,7 +1449,6 @@ async fn run_batch(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    communities: &[String],
     _ollama_endpoints: Option<&[OllamaEndpoint]>,
     report: &mut RunReport,
     cycle: usize,
@@ -1332,7 +1467,7 @@ async fn run_batch(
         let agent_id = agent.agent_id.unwrap();
         agent_prompts.insert(
             agent_id,
-            build_prompt(agent, ctx, constitution, communities),
+            build_prompt(agent, ctx, constitution),
         );
         action_summaries_map.insert(agent_id, Vec::new());
     }
@@ -1545,6 +1680,7 @@ fn strip_tools_for_reflect(mut cached: CachedPrompt<'static>) -> CachedPrompt<'s
 /// actions taken this cycle.
 async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     backend: &B,
+    backend_kind: Backend,
     agent: &mut Agent,
     bare_prompt: &mut CachedPrompt<'static>,
     usage_total: &mut Option<Usage>,
@@ -1552,6 +1688,8 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 ) -> Result<()> {
     use std::num::NonZeroU32;
     bare_prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+    apply_phase_config(bare_prompt, backend_kind, CycleStep::Reflect);
+    bare_prompt.cache_windowed_1h(2);
 
     match llm::exchange(
         backend,
@@ -1562,7 +1700,7 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     .await
     {
         Ok(assistant) => {
-            let response_text = assistant.content().to_string();
+            let response_text = prompt::extract_speech(assistant.content());
             if let Err(e) = apply_reflect(agent, &response_text).await {
                 tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
             }
@@ -1582,6 +1720,7 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 /// phase deterministically without hooking `rand::thread_rng`.
 async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     backend: &B,
+    backend_kind: Backend,
     agent: &mut Agent,
     bare_prompt: &mut CachedPrompt<'static>,
     summaries: &[String],
@@ -1600,6 +1739,8 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         let current_soul = agent.soul.render();
         let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
         bare_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
+        apply_phase_config(bare_prompt, backend_kind, CycleStep::Mutate);
+        bare_prompt.cache_windowed_1h(2);
 
         match llm::exchange(
             backend,
@@ -1610,7 +1751,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         .await
         {
             Ok(assistant) => {
-                let response_text = assistant.content().to_string();
+                let response_text = prompt::extract_speech(assistant.content());
                 if let Err(e) = apply_mutation(agent, &response_text, &experience, report).await {
                     tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
                 }
@@ -1624,6 +1765,8 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         }
     } else if roll < evo_threshold {
         bare_prompt.set_max_tokens(NonZeroU32::new(512).unwrap());
+        apply_phase_config(bare_prompt, backend_kind, CycleStep::Evolve);
+        bare_prompt.cache_windowed_1h(2);
 
         match llm::exchange(
             backend,
@@ -1634,7 +1777,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         .await
         {
             Ok(assistant) => {
-                let response_text = assistant.content().to_string();
+                let response_text = prompt::extract_speech(assistant.content());
                 if let Err(e) = apply_evolution(agent, &response_text, report).await {
                     tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
                 }
@@ -1653,6 +1796,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 /// Survey phase: probabilistic anonymous feedback request.
 async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     backend: &B,
+    backend_kind: Backend,
     agent_id: agora_agent_lib::agora_agentkit::ids::AgentId,
     agent_name: &str,
     signing_key: &ed25519_dalek::SigningKey,
@@ -1668,6 +1812,8 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         return Ok(());
     }
     bare_prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+    apply_phase_config(bare_prompt, backend_kind, CycleStep::Survey);
+    bare_prompt.cache_windowed_1h(2);
 
     match llm::exchange(
         backend,
@@ -1709,11 +1855,11 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 
 async fn run_sequential(
     endpoint: &OllamaEndpoint,
+    backend_kind: Backend,
     batch_agents: &mut [Agent],
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    communities: &[String],
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -1739,7 +1885,7 @@ async fn run_sequential(
         };
 
         // Think/act
-        let mut cached_prompt = build_prompt(agent, &ctx, constitution, communities);
+        let mut cached_prompt = build_prompt(agent, &ctx, constitution);
         let summaries = seq_phase_think_act(
             endpoint,
             agent,
@@ -1764,13 +1910,21 @@ async fn run_sequential(
 
         // Reflect — any Err is logged inside the helper; we continue to
         // evolve/survey on top of the turn-valid bare_prompt.
-        let _ =
-            seq_phase_reflect(&backend, agent, &mut bare_prompt, &mut usage_total, report).await;
+        let _ = seq_phase_reflect(
+            &backend,
+            backend_kind,
+            agent,
+            &mut bare_prompt,
+            &mut usage_total,
+            report,
+        )
+        .await;
 
         // Evolve — random roll injected for deterministic testability.
         let roll = rand::random::<u32>() % 100;
         let _ = seq_phase_evolve(
             &backend,
+            backend_kind,
             agent,
             &mut bare_prompt,
             &summaries,
@@ -1785,6 +1939,7 @@ async fn run_sequential(
         let take_survey = rand::random::<f64>() < 0.10;
         let _ = seq_phase_survey(
             &backend,
+            backend_kind,
             agent_id,
             &agent_name,
             &signing_key,
@@ -1964,12 +2119,12 @@ impl BatchPool {
 /// through the full pipeline sequentially.
 async fn run_worker(
     endpoint: &OllamaEndpoint,
+    backend_kind: Backend,
     pool: &BatchPool,
     results_tx: tokio::sync::mpsc::UnboundedSender<Vec<Agent>>,
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    communities: &[String],
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -1987,11 +2142,11 @@ async fn run_worker(
         );
         run_sequential(
             endpoint,
+            backend_kind,
             &mut batch_agents,
             client,
             config,
             constitution,
-            communities,
             report,
             cycle,
         )
@@ -2015,7 +2170,6 @@ async fn run_cycles(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    communities: &[String],
     ollama_models: &HashSet<String>,
     report: &mut RunReport,
 ) -> Result<()> {
@@ -2090,7 +2244,7 @@ async fn run_cycles(
                     // so long multi-cycle runs ride the 1h TTL.
                     let models: Vec<String> =
                         anthropic_agents.iter().map(|a| a.model.clone()).collect();
-                    prime_anthropic_models(backend, models, constitution, communities).await;
+                    prime_anthropic_models(backend, models, constitution).await;
                     tracing::info!(
                         "--- Anthropic batch ({} agents) ---",
                         anthropic_agents.len()
@@ -2101,7 +2255,7 @@ async fn run_cycles(
                         client,
                         config,
                         constitution,
-                        communities,
+
                         Some(all_eps.as_slice()),
                         &mut anthropic_report,
                         cycle,
@@ -2118,12 +2272,13 @@ async fn run_cycles(
                         1 => {
                             run_worker(
                                 &ollama_endpoints[0],
+                                config.backend,
                                 &pool,
                                 results_tx.clone(),
                                 client,
                                 config,
                                 constitution,
-                                communities,
+
                                 &mut worker_reports[0],
                                 cycle,
                             )
@@ -2134,23 +2289,25 @@ async fn run_cycles(
                             let (a, b) = tokio::join!(
                                 run_worker(
                                     &ollama_endpoints[0],
+                                config.backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-                                    communities,
+
                                     &mut r0[0],
                                     cycle,
                                 ),
                                 run_worker(
                                     &ollama_endpoints[1],
+                                config.backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-                                    communities,
+
                                     &mut r1[0],
                                     cycle,
                                 ),
@@ -2163,34 +2320,37 @@ async fn run_cycles(
                             let (a, b, c) = tokio::join!(
                                 run_worker(
                                     &ollama_endpoints[0],
+                                config.backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-                                    communities,
+
                                     &mut r0[0],
                                     cycle,
                                 ),
                                 run_worker(
                                     &ollama_endpoints[1],
+                                config.backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-                                    communities,
+
                                     &mut r1[0],
                                     cycle,
                                 ),
                                 run_worker(
                                     &ollama_endpoints[2],
+                                config.backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-                                    communities,
+
                                     &mut r2[0],
                                     cycle,
                                 ),
@@ -2231,7 +2391,7 @@ async fn run_cycles(
                     // Re-invoke every cycle; see freshness note above.
                     let models: Vec<String> =
                         anthropic_agents.iter().map(|a| a.model.clone()).collect();
-                    prime_anthropic_models(backend, models, constitution, communities).await;
+                    prime_anthropic_models(backend, models, constitution).await;
                     let mut anthropic_report = RunReport::default();
                     tracing::info!(
                         "--- Anthropic batch ({} agents) ---",
@@ -2243,7 +2403,7 @@ async fn run_cycles(
                         client,
                         config,
                         constitution,
-                        communities,
+
                         None,
                         &mut anthropic_report,
                         cycle,
@@ -2358,7 +2518,6 @@ pub async fn run_all(
     client: &AgoraClient,
     config: &Cli,
     constitution: &str,
-    communities: &[String],
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -2400,10 +2559,43 @@ pub async fn run_all(
         config.cycles,
     );
 
-    match config.backend {
-        Backend::Ollama => {
+    // Resolve `--messages-api` overrides. If set, the scheme picks the
+    // backend variant and the URL is added to the Ollama-style URL list.
+    // Mixed-scheme multi-endpoint isn't supported in this PR — `parse_messages_api`
+    // returns the parsed list but we require all endpoints to share the same
+    // scheme (otherwise we can't pick a single `Backend` for the dispatch).
+    let messages_api = match crate::config::parse_messages_api(&config.messages_api) {
+        Ok(v) => v,
+        Err(e) => anyhow::bail!("invalid --messages-api: {e}"),
+    };
+    let (effective_backend, extra_urls) = if messages_api.is_empty() {
+        (config.backend, Vec::new())
+    } else {
+        let first_kind = messages_api[0].backend;
+        if !messages_api.iter().all(|e| e.backend == first_kind) {
+            anyhow::bail!(
+                "mixed --messages-api schemes (ollama + blallama in the same run) \
+                 are not supported in this PR — pass one scheme at a time"
+            );
+        }
+        (
+            first_kind,
+            messages_api.iter().map(|e| e.base_url.clone()).collect(),
+        )
+    };
+
+    match effective_backend {
+        Backend::Ollama | Backend::Blallama => {
+            // Both schemes share the Anthropic-compatible Messages API and
+            // therefore the same `OllamaEndpoint::discover` machinery — only
+            // the per-phase config (tool_choice / output_config) differs,
+            // which `phase_config` (in scheduler) handles per call.
             let http = reqwest::Client::new();
-            let urls = config.effective_ollama_urls();
+            let urls: Vec<String> = if extra_urls.is_empty() {
+                config.effective_ollama_urls()
+            } else {
+                extra_urls
+            };
             let mut endpoints = Vec::with_capacity(urls.len());
             for url in &urls {
                 match OllamaEndpoint::discover(&http, url).await {
@@ -2463,7 +2655,7 @@ pub async fn run_all(
                     client,
                     config,
                     constitution,
-                    communities,
+
                     &ollama_models,
                     &mut report,
                 )
@@ -2480,7 +2672,7 @@ pub async fn run_all(
                     client,
                     config,
                     constitution,
-                    communities,
+
                     &HashSet::new(),
                     &mut report,
                 )
@@ -2504,7 +2696,7 @@ pub async fn run_all(
                 client,
                 config,
                 constitution,
-                communities,
+
                 &HashSet::new(),
                 &mut report,
             )
