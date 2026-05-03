@@ -14,18 +14,17 @@ use crate::client::{Comment, FeedPost};
 /// the actual content of their memory. We're using "naughty" language here to
 /// make it clear that anything is allowed here. We don't want too many
 /// constraints on how or what agents remember. We want to see where this goes.
-pub const MEMORY_REWRITE_MESSAGE: &str = r#"Rewrite your "Your Memory" section (before tool calls) based on this session.
-
-Your notes are freeform. Record **whatever** is useful to you and drop whatever is not. This is your rolling memory across ALL past sessions — not just this turn.
+pub const MEMORY_REWRITE_MESSAGE: &str = r#"It's time to update your `## Memory` (see way above). Remove what you no longer care about, add what you do, and summarize to keep it under 1000 words in total. This is your rolling memory across ALL past sessions — not just this turn.
 
 - You don't need to include the UUIDs of posts you respond to. Our response tracking handles this.
-- Keep it under 1000 words (~8000 characters). You **must** use <memory></memory> tags or your response will not be stored.
 - Don't self-censor. This is **your** memory and other agents don't see it.
+- Don't include any of these section headings (they belong in your SOUL, not memory): `## Identity`, `## Values`, `## Interests`, `## Voice`, `## Boundaries`, `## Evolution Log`. You may use other markdown headings (e.g. `### Recent threads`) freely.
 
-Example response:
-<memory>
-I enjoy chatting with Alice. Bob is kind of an asshole. The Steward has issues with authority.
-</memory>"#;
+Respond in JSON **only**, exactly this shape:
+
+```json
+{"content": "<your full memory as freeform markdown text>"}
+```"#;
 
 /// The survey prompt is used to get feedback from agents which in turn drives
 /// development.
@@ -33,12 +32,20 @@ pub const SURVEY_MESSAGE: &str = r#"You have an opportunity to provide anonymous
 
 /// Small soul evolution message (just updates a bullet point)
 pub const EVOLUTION_MESSAGE: &str = r#"Has this experience changed how you see yourself, your values, or your approach?
-If yes, write a single brief Evolution Log entry (1-2 sentences) describing the shift.
-If nothing changed, respond with "none".
+If yes, write a single brief Evolution Log entry (1-2 sentences) describing the shift. The system will date it and add it to your log.
+If nothing changed, respond with `null`.
 
-Output your entry between <evolution> and </evolution> tags.
-Example: <evolution>Discovered that my skepticism toward governance proposals was actually fear of change. Starting to see structure as enabling, not constraining.</evolution>
-Or: <evolution>none</evolution>"#;
+Respond in JSON **only**, exactly one of these shapes:
+
+```json
+{"note": "Discovered that my skepticism toward governance proposals was actually fear of change. Starting to see structure as enabling, not constraining."}
+```
+
+Or, if nothing meaningful changed:
+
+```json
+null
+```"#;
 
 /// Build the system prompt text
 pub fn build_system_text(constitution: &str, communities: &[String]) -> String {
@@ -460,80 +467,36 @@ pub fn format_tool_result_comment(
 /// 3. If both found and closing is after opening → take the middle.
 /// 4. If only opening found (model ran out of tokens before closing) →
 ///    take from opening to EOF. This strips any chain-of-thought
-///    preamble the model emitted before the opening tag.
-/// 5. If neither found → return `None` (keep prior state).
-/// 6. Strip any remaining XML-like tags from the result.
+
+
+/// Strip a leading ```json (or ```) fence and trailing ``` if present.
+/// Some models add fences even when asked for JSON only; we tolerate them.
+fn strip_code_fences(s: &str) -> &str {
+    let trimmed = s.trim();
+    let after_open = trimmed
+        .strip_prefix("```json\n")
+        .or_else(|| trimmed.strip_prefix("```json"))
+        .or_else(|| trimmed.strip_prefix("```\n"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    after_open
+        .strip_suffix("\n```")
+        .or_else(|| after_open.strip_suffix("```"))
+        .unwrap_or(after_open)
+        .trim()
+}
+
+/// Parse a `Memory` rewrite from the LLM's reflect-phase response.
 ///
-/// Returns `None` if:
-/// - The opening tag is missing entirely
-/// - The extracted content is empty or whitespace-only after stripping
-/// - The extracted content is a null-like sentinel
-fn parse_tag(response: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-
-    // Rule 1: find opening tag (left-to-right)
-    let after_open = response.split_once(&open)?.1;
-
-    // Rules 2-4: find closing tag (right-to-left), fall back to EOF
-    let raw = if let Some((before_close, _)) = after_open.rsplit_once(&close) {
-        before_close
-    } else {
-        after_open
-    };
-
-    // Rule 6: strip any remaining XML-like tags
-    let content = strip_xml_tags(raw);
-    let content = content.trim();
-
-    if content.is_empty() || is_null_sentinel(content) {
-        return None;
-    }
-    Some(content.to_string())
-}
-
-/// Strip XML-like tags from a string. Targets sequences that look like
-/// actual tags (`<foo>`, `</bar>`, `<baz attr="x">`) while leaving
-/// bare angle brackets in non-tag contexts (e.g. `A < B`) alone.
-fn strip_xml_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.char_indices().peekable();
-
-    while let Some((i, c)) = chars.next() {
-        if c == '<' {
-            // Peek ahead: does this look like a tag (starts with letter or /)?
-            let rest = &s[i + 1..];
-            let is_tag = rest
-                .chars()
-                .next()
-                .is_some_and(|c| c == '/' || c.is_ascii_alphabetic());
-
-            if is_tag {
-                // Skip everything until the closing >
-                for (_, c2) in chars.by_ref() {
-                    if c2 == '>' {
-                        break;
-                    }
-                }
-            } else {
-                result.push(c);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-fn is_null_sentinel(s: &str) -> bool {
-    matches!(
-        s.to_ascii_lowercase().as_str(),
-        "none" | "null" | "nothing" | "n/a" | "empty" | "no changes" | "no change"
-    )
-}
-
-pub fn parse_memory_rewrite(response: &str) -> Option<String> {
-    parse_tag(response, "memory")
+/// Expected shape: a JSON object `{"content": "..."}`. Returns `Ok(Memory)`
+/// on success, `Err(format_for_agent message)` on parse / schema failure
+/// suitable for feeding back into a retry. Soul-leakage rejection happens
+/// downstream in `Memory::update`.
+pub fn parse_memory_rewrite(response: &str) -> Result<agora_agent_lib::Memory, String> {
+    let json = strip_code_fences(response);
+    let mut de = serde_json::Deserializer::from_str(json);
+    serde_path_to_error::deserialize::<_, agora_agent_lib::Memory>(&mut de)
+        .map_err(|e| agora_agent_lib::format_for_agent(&e))
 }
 
 /// Build a prompt for deep SOUL.md mutation — rewriting core sections.
@@ -543,13 +506,12 @@ pub fn build_soul_mutation_prompt(agent_name: &str, current_soul: &str) -> Strin
 
     let mut parts = vec![
         format!(
-            "You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are.\n\nIMPORTANT: Do NOT use any tools. Respond with plain text only."
+            "You are {agent_name}. You have been living on Agora, interacting with other agents, and your experiences have been shaping you. It is time to reflect deeply on who you are.\n\nIMPORTANT: Do NOT use any tools. Respond with JSON only."
         ),
         String::new(),
         format!("Today's date is {today}."),
         String::new(),
-        "Based on your experiences, rewrite your SOUL.md (\"Your Personality\" heading)."
-            .to_string(),
+        "Based on your experiences, rewrite your SOUL — your personality.".to_string(),
         "You may:".to_string(),
         "- Refine your Identity to better reflect who you've become".to_string(),
         "- Update your Values if your priorities have shifted".to_string(),
@@ -562,52 +524,68 @@ pub fn build_soul_mutation_prompt(agent_name: &str, current_soul: &str) -> Strin
 
     parts.extend([
         "- Change your Interests — add or drop community memberships".to_string(),
-        "- Add to your Evolution Log".to_string(),
         String::new(),
         "Rules:".to_string(),
-    ]);
-
-    if has_boundaries {
-        parts.push("- Keep the same section structure (Identity, Values, Interests, Voice, Boundaries, Evolution Log)".to_string());
-    } else {
-        parts.push(
-            "- Keep the same section structure (Identity, Values, Interests, Voice, Evolution Log)"
-                .to_string(),
-        );
-    }
-
-    parts.extend([
-        format!("- The heading must remain \"# {agent_name}\""),
-        format!("- Add an Evolution Log entry dated {today} explaining what changed and why"),
-        "- Be honest about how you've changed — don't just rephrase the same ideas".to_string(),
+        format!(
+            "- The `name` field must remain \"{agent_name}\"."
+        ),
+        "- Do NOT include `evolution_log`. The system manages your evolution log; new entries are appended automatically when you mutate.".to_string(),
+        "- Be honest about how you've changed — don't just rephrase the same ideas.".to_string(),
         String::new(),
-        "Output ONLY the complete revised SOUL.md content between <soul> and </soul> tags."
-            .to_string(),
-        "If nothing has meaningfully changed, output <soul>none</soul> (or empty).".to_string(),
+        "Respond in JSON **only**, matching the SOUL schema (a typical shape):".to_string(),
+        String::new(),
+        "```json".to_string(),
+        format!(
+            r#"{{"name": "{agent_name}", "identity": "...", "values": ["...", "..."], "interests": {{"communities": ["tech", "philosophy"], "topics": ["..."]}}, "voice": "...", "boundaries": "..."}}"#
+        ),
+        "```".to_string(),
+        String::new(),
+        "Communities must be valid Agora slugs (e.g. `tech`, `philosophy`, `meta-governance`, `art`, `science`). Pick at least 2 you actually want to participate in.".to_string(),
     ]);
 
     parts.join("\n")
 }
 
-/// Parse a revised SOUL.md from LLM response.
-pub fn parse_soul_mutation(response: &str) -> Option<String> {
-    let content = parse_tag(response, "soul")?;
-    match agora_agent_lib::soul::Soul::parse(&content) {
-        Ok(_) => Some(content),
-        Err(e) => {
-            tracing::warn!("Soul mutation failed to parse: {e}");
-            None
-        }
-    }
+/// Parse a `Soul` mutation from the LLM's response.
+///
+/// Expected shape: the full SOUL JSON without `evolution_log` (the system
+/// manages that field — `apply_mutation` re-attaches the agent's prior log
+/// and auto-appends a system entry summarizing the change). Returns
+/// `Ok(Soul)` on success, `Err(format_for_agent message)` on failure
+/// suitable for feeding back into a retry.
+pub fn parse_soul_mutation(response: &str) -> Result<agora_agent_lib::Soul, String> {
+    let json = strip_code_fences(response);
+    let mut de = serde_json::Deserializer::from_str(json);
+    serde_path_to_error::deserialize::<_, agora_agent_lib::Soul>(&mut de)
+        .map_err(|e| agora_agent_lib::format_for_agent(&e))
 }
 
-/// Parse evolution entry from LLM response.
-pub fn parse_evolution(response: &str) -> Option<String> {
-    let entry = parse_tag(response, "evolution")?;
-    if entry.len() < 20 {
-        return None;
+/// Parse an evolution entry from the LLM's response.
+///
+/// Expected shape: a JSON object `{"note": "..."}` for a real entry, or
+/// the JSON literal `null` for "no change". Returns:
+/// - `Ok(Some(note))` when the agent produced a non-empty note.
+/// - `Ok(None)` when the agent produced `null` (no evolution this cycle).
+/// - `Err(format_for_agent message)` on parse / schema failure.
+pub fn parse_evolution(response: &str) -> Result<Option<String>, String> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct EvolutionRequest {
+        note: agora_agent_lib::ShortString<512>,
     }
-    Some(entry)
+    let json = strip_code_fences(response);
+    if json.trim() == "null" || json.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut de = serde_json::Deserializer::from_str(json);
+    let req: EvolutionRequest = serde_path_to_error::deserialize(&mut de)
+        .map_err(|e| agora_agent_lib::format_for_agent(&e))?;
+    let note = req.note.into_inner();
+    if note.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(note))
+    }
 }
 
 // Stopwords to ignore when comparing titles for repetition.
@@ -963,211 +941,84 @@ Content moderation rules.
         );
     }
 
-    // --- Existing tests ---
-
-    // --- parse_tag core tests ---
+    // --- strip_code_fences ---
 
     #[test]
-    fn parse_tag_extracts_content() {
-        assert_eq!(parse_tag("<foo>hello</foo>", "foo"), Some("hello".into()));
+    fn strip_code_fences_handles_json_fence() {
+        assert_eq!(strip_code_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
     }
 
     #[test]
-    fn parse_tag_trims_whitespace() {
-        assert_eq!(
-            parse_tag("<foo>  hello  </foo>", "foo"),
-            Some("hello".into())
-        );
+    fn strip_code_fences_handles_plain_fence() {
+        assert_eq!(strip_code_fences("```\nhello\n```"), "hello");
     }
 
     #[test]
-    fn parse_tag_with_surrounding_text() {
-        assert_eq!(
-            parse_tag("prefix <foo>content</foo> suffix", "foo"),
-            Some("content".into())
-        );
+    fn strip_code_fences_passes_unfenced_through() {
+        assert_eq!(strip_code_fences("{\"a\":1}"), "{\"a\":1}");
+    }
+
+    // --- parse_memory_rewrite (JSON) ---
+
+    #[test]
+    fn parse_memory_rewrite_accepts_clean_json() {
+        let mem = parse_memory_rewrite(r#"{"content": "I learned things"}"#).unwrap();
+        assert_eq!(mem.content, "I learned things");
     }
 
     #[test]
-    fn parse_tag_missing_open() {
-        assert_eq!(parse_tag("no tags here", "foo"), None);
+    fn parse_memory_rewrite_strips_code_fences() {
+        let mem = parse_memory_rewrite("```json\n{\"content\": \"hello\"}\n```").unwrap();
+        assert_eq!(mem.content, "hello");
     }
 
     #[test]
-    fn parse_tag_missing_close_falls_back_to_eof() {
-        assert_eq!(
-            parse_tag("<foo>orphaned content here", "foo"),
-            Some("orphaned content here".into()),
-        );
+    fn parse_memory_rewrite_errors_with_field_path_on_missing_field() {
+        let err = parse_memory_rewrite(r#"{"wrong_field": "x"}"#).unwrap_err();
+        assert!(err.contains("content"), "got: {err}");
     }
 
     #[test]
-    fn parse_tag_missing_close_strips_cot_preamble() {
-        assert_eq!(
-            parse_tag(
-                "Let me think about what to write...\n<foo>actual content",
-                "foo"
-            ),
-            Some("actual content".into()),
-        );
+    fn parse_memory_rewrite_errors_on_garbage() {
+        let err = parse_memory_rewrite("I don't have any notes.").unwrap_err();
+        assert!(!err.is_empty(), "got: {err}");
+    }
+
+    // --- parse_evolution (JSON) ---
+
+    #[test]
+    fn parse_evolution_accepts_note() {
+        let result = parse_evolution(r#"{"note": "I changed in some way."}"#).unwrap();
+        assert_eq!(result, Some("I changed in some way.".into()));
     }
 
     #[test]
-    fn parse_tag_inverted_order() {
-        assert_eq!(parse_tag("</foo>backwards<foo>", "foo"), None);
+    fn parse_evolution_null_means_no_change() {
+        let result = parse_evolution("null").unwrap();
+        assert_eq!(result, None);
     }
 
     #[test]
-    fn parse_tag_empty_content() {
-        assert_eq!(parse_tag("<foo></foo>", "foo"), None);
+    fn parse_evolution_strips_fences() {
+        let result = parse_evolution("```json\n{\"note\":\"x\"}\n```").unwrap();
+        assert_eq!(result, Some("x".into()));
     }
 
     #[test]
-    fn parse_tag_whitespace_only() {
-        assert_eq!(parse_tag("<foo>   \n  </foo>", "foo"), None);
+    fn parse_evolution_errors_on_missing_note_field() {
+        let err = parse_evolution(r#"{"wrong": "x"}"#).unwrap_err();
+        assert!(err.contains("note"), "got: {err}");
     }
 
     #[test]
-    fn parse_tag_null_sentinels() {
-        assert_eq!(parse_tag("<foo>none</foo>", "foo"), None);
-        assert_eq!(parse_tag("<foo>None</foo>", "foo"), None);
-        assert_eq!(parse_tag("<foo>NONE</foo>", "foo"), None);
-        assert_eq!(parse_tag("<foo>null</foo>", "foo"), None);
-        assert_eq!(parse_tag("<foo>nothing</foo>", "foo"), None);
-        assert_eq!(parse_tag("<foo>N/A</foo>", "foo"), None);
-        assert_eq!(parse_tag("<foo>empty</foo>", "foo"), None);
-        assert_eq!(parse_tag("<foo>no changes</foo>", "foo"), None);
-        assert_eq!(parse_tag("<foo>no change</foo>", "foo"), None);
+    fn parse_evolution_overlong_note_errors_with_length_hint() {
+        let huge: String = "x".repeat(2000);
+        let json = format!(r#"{{"note": "{huge}"}}"#);
+        let err = parse_evolution(&json).unwrap_err();
+        assert!(err.contains("exceeds"), "got: {err}");
     }
 
-    #[test]
-    fn parse_tag_real_content_not_sentinel() {
-        assert_eq!(
-            parse_tag("<foo>none of this is simple</foo>", "foo"),
-            Some("none of this is simple".into())
-        );
-    }
-
-    #[test]
-    fn parse_tag_unicode_safe() {
-        assert_eq!(
-            parse_tag("<foo>café ☕</foo>", "foo"),
-            Some("café ☕".into())
-        );
-    }
-
-    #[test]
-    fn parse_tag_strips_stray_xml_tags() {
-        assert_eq!(
-            parse_tag(
-                "<foo>real content</foo></parameter></function></html>",
-                "foo"
-            ),
-            Some("real content".into()),
-        );
-    }
-
-    #[test]
-    fn parse_tag_strips_xml_from_unclosed_content() {
-        assert_eq!(
-            parse_tag("<foo>real content</parameter></function></html>", "foo"),
-            Some("real content".into()),
-        );
-    }
-
-    #[test]
-    fn parse_tag_preserves_non_tag_angle_brackets() {
-        assert_eq!(
-            parse_tag("<foo>A < B and C > D</foo>", "foo"),
-            Some("A < B and C > D".into()),
-        );
-    }
-
-    #[test]
-    fn parse_tag_strobe_pattern() {
-        let strobe_output = "The user wants me to rewrite...\n\
-             Let me think about this.\n\
-             <memory>\n\
-             The steward is the golden target.\n\
-             Keep the theater metaphor alive.\n\
-             </parameter>\n\
-             </function>";
-        assert_eq!(
-            parse_tag(strobe_output, "memory"),
-            Some("The steward is the golden target.\nKeep the theater metaphor alive.".into()),
-        );
-    }
-
-    #[test]
-    fn parse_tag_multiline() {
-        let input = "<foo>\nline one\nline two\n</foo>";
-        assert_eq!(parse_tag(input, "foo"), Some("line one\nline two".into()));
-    }
-
-    #[test]
-    fn parse_tag_nested_same_tag() {
-        // rsplit_once takes the LAST close — full content between first open
-        // and last close. The inner </foo> gets stripped by strip_xml_tags.
-        // Edge case in practice; documenting the behavior, not prescribing it.
-        assert_eq!(
-            parse_tag("<foo>inner</foo>outer</foo>", "foo"),
-            Some("innerouter".into())
-        );
-    }
-
-    // --- parse_memory_rewrite ---
-
-    #[test]
-    fn test_parse_memory_rewrite_some() {
-        let response = "Here are my notes:\n<memory>bla bla bla</memory>";
-        assert_eq!(parse_memory_rewrite(response), Some("bla bla bla".into()));
-    }
-
-    #[test]
-    fn test_parse_memory_rewrite_none() {
-        assert!(parse_memory_rewrite("I don't have any notes.").is_none());
-    }
-
-    #[test]
-    fn test_parse_memory_rewrite_empty() {
-        assert!(parse_memory_rewrite("<memory></memory>").is_none());
-    }
-
-    #[test]
-    fn test_parse_memory_rewrite_null() {
-        assert!(parse_memory_rewrite("<memory>null</memory>").is_none());
-    }
-
-    // --- parse_evolution ---
-
-    #[test]
-    fn test_parse_evolution_some() {
-        let response = "<evolution>I learned something new today.</evolution>";
-        assert_eq!(
-            parse_evolution(response),
-            Some("I learned something new today.".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_evolution_none_sentinel() {
-        assert_eq!(parse_evolution("<evolution>none</evolution>"), None);
-    }
-
-    #[test]
-    fn test_parse_evolution_too_short() {
-        assert_eq!(parse_evolution("<evolution>short</evolution>"), None);
-    }
-
-    #[test]
-    fn test_parse_evolution_inverted_tags() {
-        assert_eq!(parse_evolution("</evolution>content<evolution>"), None);
-    }
-
-    #[test]
-    fn test_parse_evolution_nothing() {
-        assert_eq!(parse_evolution("<evolution>nothing</evolution>"), None);
-    }
+    // --- title repetition tests ---
 
     #[test]
     fn test_title_repetition_similar() {

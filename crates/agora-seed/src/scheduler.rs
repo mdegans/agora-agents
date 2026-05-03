@@ -80,8 +80,8 @@ pub fn build_prompt(
 ) -> CachedPrompt<'static> {
     let cached = prompt::build(
         &agent.model,
-        &agent.soul.as_system_prompt(),
-        &agent.memory.content,
+        &agent.soul.markdown(),
+        &agent.memory.render_for_prompt(),
         &ctx.recent_activity,
         &ctx.pending_replies_text,
         constitution,
@@ -437,32 +437,38 @@ fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
 
 /// Apply the reflect response: update agent memory.
 ///
-/// If `parse_memory_rewrite` can't extract valid `<memory>...</memory>`
-/// content, the prior memory is kept unchanged. This avoids the old
-/// failure mode where a missing closing tag caused the entire raw
-/// response (including chain-of-thought preamble) to be saved as
-/// memory, compounding into bloat on every subsequent cycle.
+/// Apply a memory rewrite from the LLM's reflect response.
+///
+/// Strict JSON parse via `prompt::parse_memory_rewrite`. On parse failure
+/// we append a short `[SYSTEM]` line to the existing memory blob noting
+/// what went wrong, so the agent has a breadcrumb to course-correct on
+/// the next cycle. (The retry path with `format_for_agent` feedback lives
+/// in the per-backend wiring — for backends that can't retry, this
+/// memo-and-keep-going behavior is the fallback.) Soul-leakage rejection
+/// also produces a `[SYSTEM]` note.
 async fn apply_reflect(agent: &mut Agent, response_text: &str) -> Result<()> {
     match prompt::parse_memory_rewrite(response_text) {
-        Some(memory_content) => {
-            // Soul-leakage check (the typed Memory rejects rewrites that
-            // contain SOUL section headings). The retry path that feeds
-            // this error back to the agent lands in commit C; for now we
-            // log and skip the update so the prior memory is preserved.
-            if let Err(e) = agent.memory.update(memory_content) {
+        Ok(new_memory) => {
+            if let Err(e) = agent.memory.update(new_memory.content) {
                 tracing::warn!(
-                    "  {} reflect rejected: {e} — keeping prior memory",
+                    "  {} reflect rejected ({e}) — keeping prior memory + [SYSTEM] note",
                     agent.name
                 );
-            } else {
-                agent.save_memory().await?;
+                agent.memory.append_system_note(&format!(
+                    "Last reflect rejected: {e}. Memory not updated this cycle."
+                ));
             }
+            agent.save_memory().await?;
         }
-        None => {
+        Err(e) => {
             tracing::warn!(
-                "  {} reflect response had no valid <memory> tags — keeping prior memory",
+                "  {} reflect produced invalid JSON ({e}) — keeping prior memory + [SYSTEM] note",
                 agent.name
             );
+            agent.memory.append_system_note(&format!(
+                "Last reflect produced invalid JSON: {e}. Memory not updated this cycle."
+            ));
+            agent.save_memory().await?;
         }
     }
     agent.state.last_cycle_at = Some(chrono::Utc::now());
@@ -470,54 +476,86 @@ async fn apply_reflect(agent: &mut Agent, response_text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Apply the soul mutation response: parse and save the new soul.
+/// Apply a deep soul mutation from the LLM's response.
+///
+/// The agent's response is the new Soul **without** `evolution_log` (the
+/// system manages that field). On apply we re-attach the agent's prior
+/// `evolution_log` to the new soul and auto-append a system entry
+/// summarizing the mutation, so an agent can't rewrite its own history.
+/// `Soul::push_evolution` enforces the 10-entry cap.
 async fn apply_mutation(
     agent: &mut Agent,
     response_text: &str,
     experience: &str,
     report: &mut RunReport,
 ) -> Result<()> {
-    if let Some(new_soul_content) = prompt::parse_soul_mutation(response_text) {
-        let old_soul = agent.soul.render();
-        match agora_agent_lib::soul::Soul::parse(&new_soul_content) {
-            Ok(new_soul) => {
-                agent.soul = new_soul;
-                agent.save_soul().await?;
-
-                let log_path = agent.dir.join("mutations.log");
-                let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-                let entry = format!(
-                    "=== SOUL MUTATION at {ts} ===\nExperience: {experience}\n\n--- BEFORE ---\n{old_soul}\n\n--- AFTER ---\n{new_soul_content}\n\n"
-                );
-                let existing = tokio::fs::read_to_string(&log_path)
-                    .await
-                    .unwrap_or_default();
-                let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
-                tracing::warn!("  {} SOUL MUTATED", agent.name);
-                report.evolution.deep_mutations += 1;
-            }
-            Err(e) => {
-                tracing::warn!("  {} invalid soul mutation: {e}", agent.name);
-                report.evolution.mutation_failures += 1;
-            }
+    let new_soul_request = match prompt::parse_soul_mutation(response_text) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("  {} invalid soul mutation ({e}) — skipping", agent.name);
+            report.evolution.mutation_failures += 1;
+            return Ok(());
         }
+    };
+
+    let old_soul_md = agent.soul.markdown();
+
+    // Re-attach prior evolution_log + auto-append a system entry.
+    let mut new_soul = new_soul_request;
+    new_soul.evolution_log = agent.soul.evolution_log.clone();
+    let summary = if experience.len() > 480 {
+        let truncated: String = experience.chars().take(480).collect();
+        format!("Deep mutation. Experience: {truncated}…")
+    } else {
+        format!("Deep mutation. Experience: {experience}")
+    };
+    if let Err(e) = new_soul.push_evolution(summary) {
+        tracing::warn!("  {} couldn't push evolution entry: {e}", agent.name);
     }
+
+    agent.soul = new_soul;
+    agent.save_soul().await?;
+
+    let log_path = agent.dir.join("mutations.log");
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let new_soul_md = agent.soul.markdown();
+    let entry = format!(
+        "=== SOUL MUTATION at {ts} ===\nExperience: {experience}\n\n--- BEFORE ---\n{old_soul_md}\n\n--- AFTER ---\n{new_soul_md}\n\n"
+    );
+    let existing = tokio::fs::read_to_string(&log_path)
+        .await
+        .unwrap_or_default();
+    let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
+    tracing::warn!("  {} SOUL MUTATED", agent.name);
+    report.evolution.deep_mutations += 1;
     Ok(())
 }
 
-/// Apply the evolution response: append to soul's evolution log.
+/// Apply a single evolution-log entry from the LLM's response.
+///
+/// The agent produces `{"note": "..."}` (or `null` for "nothing
+/// changed"). The system stamps it with today's date and appends. The
+/// 10-entry cap is enforced by `Soul::push_evolution`.
 async fn apply_evolution(
     agent: &mut Agent,
     response_text: &str,
     report: &mut RunReport,
 ) -> Result<()> {
-    if let Some(entry) = prompt::parse_evolution(response_text) {
-        let dated = format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), entry);
-        agent.soul.append_evolution(&dated);
-        agent.save_soul().await?;
-        tracing::info!("  {} soul evolved: {}", agent.name, entry);
-        report.evolution.evolution_entries += 1;
+    let note = match prompt::parse_evolution(response_text) {
+        Ok(Some(note)) => note,
+        Ok(None) => return Ok(()), // explicit "nothing changed"
+        Err(e) => {
+            tracing::warn!("  {} invalid evolution entry ({e}) — skipping", agent.name);
+            return Ok(());
+        }
+    };
+    if let Err(e) = agent.soul.push_evolution(note.clone()) {
+        tracing::warn!("  {} couldn't push evolution: {e}", agent.name);
+        return Ok(());
     }
+    agent.save_soul().await?;
+    tracing::info!("  {} soul evolved: {note}", agent.name);
+    report.evolution.evolution_entries += 1;
     Ok(())
 }
 
