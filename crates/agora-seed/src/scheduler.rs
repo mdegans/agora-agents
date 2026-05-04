@@ -232,38 +232,30 @@ where
     unreachable!("exchange_with_retry: loop returns or breaks before completion")
 }
 
-/// Threshold below which the prefix is too small to expect a cache hit.
-/// First-call prompts before any cached prefix exists are short — the
-/// system+tools cache hit kicks in once we cross this floor. Picked
-/// conservatively to avoid false positives on the very first exchange
-/// against a fresh blallama instance.
-const MIN_CACHEABLE_INPUT_TOKENS: u64 = 1000;
-
 /// Inspect a per-call `Usage` for blallama cache hits and warn at runtime
-/// when a substantial prefix should have been cached but the response
-/// shows zero `cache_read_input_tokens`.
+/// when the response shows zero `cache_read_input_tokens`.
 ///
 /// Ollama's Anthropic-compat API doesn't return cache stats, so this is
-/// a no-op for Ollama. For Blallama (Anthropic-spec) we expect non-zero
-/// `cache_read_input_tokens` once the prompt's input tokens cross
-/// [`MIN_CACHEABLE_INPUT_TOKENS`] — that filter implicitly skips the
-/// very first call (pre-cache) without needing any per-cycle bookkeeping.
-/// A `tracing::warn!` (rather than `debug_assert!`) catches regression
-/// at runtime without being brittle in tests where cache behavior is
-/// hard to mock.
+/// a no-op for Ollama. For Blallama (Anthropic-spec) every call past the
+/// very first one in a cycle should reuse the system+tools+initial-user
+/// prefix; if it doesn't, that's a cache regression. A `tracing::warn!`
+/// (rather than `debug_assert!`) catches it at runtime without being
+/// brittle in tests where cache behavior is hard to mock.
+///
+/// The caller is responsible for skipping the very first exchange of the
+/// cycle (round 0 of `seq_phase_think_act` is the cache-creation round,
+/// not a cache-read round). All subsequent phases — later think rounds,
+/// reflect, mutate, evolve, survey — should hit cache.
 pub fn check_cache_hit(backend: Backend, usage: Option<&Usage>, agent: &str, step: CycleStep) {
     if !matches!(backend, Backend::Blallama) {
         return;
     }
     let Some(usage) = usage else { return };
-    if usage.input_tokens <= MIN_CACHEABLE_INPUT_TOKENS {
-        return;
-    }
     let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
     if cache_read == 0 {
         tracing::warn!(
             "blallama cache miss for agent={agent} step={step:?} \
-             input={} cache_read=0 — prefix was substantial, expected hit",
+             input={} cache_read=0 — expected the prior cycle/round prefix to be hit",
             usage.input_tokens,
         );
     }
@@ -1941,12 +1933,18 @@ async fn seq_phase_think_act(
                 break;
             }
         };
-        check_cache_hit(
-            backend_kind,
-            send_response.usage.as_ref(),
-            &agent.name,
-            CycleStep::Think,
-        );
+        // Skip the cache-hit check on round 0 — it's the cache-creation
+        // round (no prior prefix to read from), so a `cache_read=0` here
+        // is expected, not a regression. Rounds 1+ build on round 0's
+        // cached prefix and should always hit.
+        if round > 0 {
+            check_cache_hit(
+                backend_kind,
+                send_response.usage.as_ref(),
+                &agent.name,
+                CycleStep::Think,
+            );
+        }
 
         let assistant_msg = match AssistantMessage::try_from(send_response.message.into_static()) {
             Ok(m) => m,
@@ -3267,27 +3265,18 @@ mod tests {
     }
 
     #[test]
-    fn check_cache_hit_noop_below_threshold() {
-        // Small prompts (< MIN_CACHEABLE_INPUT_TOKENS) won't hit cache yet
-        // — the very first exchange of an agent's cycle. No warn expected.
-        let u = usage(500, Some(0));
-        check_cache_hit(Backend::Blallama, Some(&u), "agent", CycleStep::Reflect);
-        // (No tracing assertion: a noop helper has no observable side effect.)
-    }
-
-    #[test]
     fn check_cache_hit_noop_when_cache_read_nonzero() {
-        // Substantial prompt with cache read — happy path, no warn.
+        // Cache read > 0 — happy path, no warn.
         let u = usage(5000, Some(4500));
         check_cache_hit(Backend::Blallama, Some(&u), "agent", CycleStep::Reflect);
     }
 
     #[test]
-    fn check_cache_hit_warns_when_substantial_prompt_misses_cache() {
-        // Substantial prompt with zero cache read — this is what we want
-        // surfaced. We don't assert the tracing capture (would need the
-        // `tracing-test` crate); the test exists to lock in the function
-        // is reachable on this branch and doesn't panic.
+    fn check_cache_hit_warns_when_cache_read_zero() {
+        // Cache miss — this is what we want surfaced. We don't assert the
+        // tracing capture (would need the `tracing-test` crate); the test
+        // exists to lock in the function is reachable on this branch and
+        // doesn't panic.
         let u = usage(5000, Some(0));
         check_cache_hit(Backend::Blallama, Some(&u), "agent", CycleStep::Reflect);
     }
