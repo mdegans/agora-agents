@@ -19,7 +19,7 @@ pub use misanthropic::prompt::Message as MMessage;
 pub use misanthropic::prompt::message::Content as MContent;
 pub use misanthropic::prompt::message::Role as MRole;
 pub use misanthropic::prompt::{AssistantMessage, UserMessage};
-pub use misanthropic::response::Usage;
+pub use misanthropic::response::{StopReason, Usage};
 
 /// Response from an LLM backend, including the converted prompt message
 /// and optional usage statistics from the API.
@@ -30,6 +30,12 @@ pub struct SendResponse {
     pub message: MMessage<'static>,
     /// Token usage stats (populated by Anthropic; Ollama compat may vary).
     pub usage: Option<Usage>,
+    /// Why the model stopped generating. `None` if the backend doesn't
+    /// surface it. The retry path uses this to tell `MaxTokens` truncation
+    /// (give the model a hint about thinking budget) apart from a normal
+    /// `EndTurn` that produced unparseable JSON (give the model the parse
+    /// error verbatim).
+    pub stop_reason: Option<StopReason>,
 }
 
 /// A message in a conversation (simple text-only representation).
@@ -168,6 +174,20 @@ fn synthetic_error_reply(err: &anyhow::Error) -> AssistantMessage<'static> {
     )
 }
 
+/// One round of [`exchange_with_stop_reason`]: the assistant message
+/// committed onto the prompt plus the side-channel info the retry layer
+/// needs to dispatch on (`stop_reason` to detect `MaxTokens` truncation,
+/// and per-call `usage` so cache-hit checks can read the latest
+/// `cache_read_input_tokens` directly rather than the running total).
+#[derive(Debug)]
+pub struct ExchangeOutcome {
+    pub assistant: AssistantMessage<'static>,
+    pub stop_reason: Option<StopReason>,
+    /// Per-call usage (also accumulated into the running `usage_total`
+    /// passed to `exchange_with_stop_reason`).
+    pub usage: Option<Usage>,
+}
+
 /// Push a user message, call the backend (retrying once on recoverable
 /// errors), then push the assistant response back onto the prompt. On
 /// failure, append a synthetic assistant message carrying the error text
@@ -195,13 +215,29 @@ pub async fn exchange<B: LlmBackend + ?Sized>(
     user: UserMessage<'static>,
     usage_total: &mut Option<Usage>,
 ) -> Result<AssistantMessage<'static>> {
+    exchange_with_stop_reason(backend, prompt, user, usage_total)
+        .await
+        .map(|o| o.assistant)
+}
+
+/// Like [`exchange`] but also returns the [`StopReason`] and per-call
+/// [`Usage`] from the response. Use this when the caller needs to dispatch
+/// on `MaxTokens` truncation (the retry layer does this) or inspect
+/// `cache_read_input_tokens` for per-call cache-hit checks. Same
+/// invariants as `exchange` for prompt/turn state.
+pub async fn exchange_with_stop_reason<B: LlmBackend + ?Sized>(
+    backend: &B,
+    prompt: &mut CachedPrompt<'static>,
+    user: UserMessage<'static>,
+    usage_total: &mut Option<Usage>,
+) -> Result<ExchangeOutcome> {
     prompt
         .push_message(user)
         .expect("exchange: user after assistant — turn order is a programmer bug");
     // it's now the assistant's turn
 
     let result = send_with_retry(backend, prompt).await;
-    commit_exchange_result(prompt, result, usage_total)
+    commit_exchange_result_full(prompt, result, usage_total)
 }
 
 /// Commit a backend response into a prompt, rolling forward on error.
@@ -268,15 +304,23 @@ async fn send_with_retry<B: LlmBackend + ?Sized>(
 // with is_recoverable, above).
 pub use agora_agentkit::retry::retry_recoverable;
 
-/// Commit an exchange result to a [`CachedPrompt`]: append the assistant
-/// response on success, or a synthetic error reply on failure.
-fn commit_exchange_result(
+/// Commit an exchange result to a [`CachedPrompt`], returning the
+/// committed assistant + side-channel info (`stop_reason`, per-call
+/// `usage`) the retry layer needs.
+///
+/// On `Ok`: appends the real assistant. On `Err`: appends a synthetic
+/// assistant carrying the error text so the prompt stays turn-valid.
+fn commit_exchange_result_full(
     prompt: &mut CachedPrompt<'static>,
     result: Result<SendResponse>,
     usage_total: &mut Option<Usage>,
-) -> Result<AssistantMessage<'static>> {
+) -> Result<ExchangeOutcome> {
     match result {
-        Ok(SendResponse { message, usage }) => {
+        Ok(SendResponse {
+            message,
+            usage,
+            stop_reason,
+        }) => {
             accumulate_usage(usage_total, usage);
             let assistant = AssistantMessage::try_from(message.into_static())
                 .expect("backend guarantees assistant role");
@@ -284,7 +328,11 @@ fn commit_exchange_result(
                 .push_message(assistant.clone())
                 .expect("exchange: assistant after user — turn order is a programmer bug");
             // it's now the user's turn
-            Ok(assistant)
+            Ok(ExchangeOutcome {
+                assistant,
+                stop_reason,
+                usage,
+            })
         }
         Err(e) => {
             let note = synthetic_error_reply(&e);

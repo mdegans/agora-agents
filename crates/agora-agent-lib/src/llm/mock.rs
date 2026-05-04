@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
-use super::{LlmBackend, MContent, MMessage, MRole, Prompt, SendResponse};
+use super::{LlmBackend, MContent, MMessage, MRole, Prompt, SendResponse, StopReason};
 
 /// Mock [`LlmBackend`] driven by a FIFO queue of canned responses.
 pub struct MockLlmBackend {
@@ -20,8 +20,11 @@ pub struct MockLlmBackend {
 }
 
 enum Response {
-    /// Plain-text assistant reply. Converted to an `MMessage` on pop.
-    OkText(String),
+    /// Plain-text assistant reply with optional [`StopReason`]. Converted
+    /// to an `MMessage` on pop. The default stop_reason via `push_ok` is
+    /// `None`; tests that need to drive the retry helper's max-tokens
+    /// branch use `push_ok_with_stop` to set `StopReason::MaxTokens`.
+    OkText(String, Option<StopReason>),
     /// Pre-built error, taken on pop so the original downcast chain
     /// survives (important for tests that exercise `is_recoverable`).
     Err(Option<anyhow::Error>),
@@ -42,7 +45,21 @@ impl MockLlmBackend {
         self.responses
             .lock()
             .expect("mock mutex poisoned")
-            .push_back(Response::OkText(text.into()));
+            .push_back(Response::OkText(text.into(), None));
+        self
+    }
+
+    /// Queue a successful text response with an explicit [`StopReason`].
+    /// Used to drive retry-helper tests that branch on `MaxTokens`.
+    pub fn push_ok_with_stop(
+        &self,
+        text: impl Into<String>,
+        stop: StopReason,
+    ) -> &Self {
+        self.responses
+            .lock()
+            .expect("mock mutex poisoned")
+            .push_back(Response::OkText(text.into(), Some(stop)));
         self
     }
 
@@ -82,12 +99,13 @@ impl LlmBackend for MockLlmBackend {
             .expect("mock mutex poisoned")
             .pop_front();
         match next {
-            Some(Response::OkText(text)) => Ok(SendResponse {
+            Some(Response::OkText(text, stop_reason)) => Ok(SendResponse {
                 message: MMessage {
                     role: MRole::Assistant,
                     content: MContent::from(text.as_str()).into_static(),
                 },
                 usage: None,
+                stop_reason,
             }),
             Some(Response::Err(mut slot)) => {
                 Err(slot.take().expect("mock: error slot already consumed"))
