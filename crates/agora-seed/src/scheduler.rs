@@ -31,7 +31,7 @@ use agora_agent_lib::agora_agentkit::scheduler::{BatchBackend, BatchState, Cycle
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::OllamaEndpoint;
 use agora_agent_lib::llm::ollama::OllamaPerModel;
-use agora_agent_lib::llm::{self, Usage, commit_batch_response};
+use agora_agent_lib::llm::{Usage, commit_batch_response};
 use agora_agent_lib::tools::{make_tool_result, parse_tool_calls};
 use anyhow::Result;
 use misanthropic::CachedPrompt;
@@ -162,24 +162,91 @@ pub fn apply_phase_config(cached: &mut CachedPrompt<'static>, backend: Backend, 
     *cached = owned;
 }
 
-/// Inspect a message's `usage` for blallama cache hits and warn at runtime
-/// if the second-and-later calls in a cycle don't reuse the cached prefix.
-#[allow(dead_code)] // Wiring TBD — see PR4 follow-up plan; util kept for the next hop.
+// ---------------------------------------------------------------------------
+// Two-shot retry for parse-failed / max-tokens-truncated assistant responses
+// ---------------------------------------------------------------------------
+
+/// User message appended on retry when the previous assistant response hit
+/// `max_tokens`. Stable string so the prefix-cache hit on the next call is
+/// preserved across agents (only the prior assistant text differs per
+/// agent, and that's already in the cache by the time we get here).
+const MAX_TOKENS_RETRY_MESSAGE: &str = "Your message hit `max_tokens` and was truncated before the JSON could be closed. Note: thinking blocks count toward this limit. Try again with less reasoning before the answer.";
+
+/// Prefix appended on retry when parse failed for any non-max-tokens
+/// reason. The `format_for_agent` parse-error string is appended after the
+/// newline; it varies per failure but always sits *after* the cache
+/// breakpoint, so prefix-cache hits are unaffected.
+const PARSE_RETRY_PREFIX: &str = "Your previous response failed to parse. Please respond with valid JSON only, matching the schema. Error:";
+
+/// Two-shot exchange-then-parse: send the initial user message, parse the
+/// response with `parse_fn`. On parse failure (or `MaxTokens` truncation)
+/// push a synthetic user explaining what went wrong and re-exchange.
+/// Returns the parsed value on success or the final parse error on failure
+/// after the retry budget is spent.
+///
+/// The truncated assistant from attempt 1 stays in the prompt because
+/// `exchange_with_stop_reason` already pushed it before this helper sees
+/// the parse error. That keeps Ollama's prefix cache warm — the bytes the
+/// model just generated against are still on the wire for attempt 2.
+///
+/// Anthropic batch path doesn't go through this helper — see
+/// `retry_phase_batch` for the batch analog.
+async fn exchange_with_retry<B, T, F>(
+    backend: &B,
+    backend_kind: Backend,
+    agent_name: &str,
+    step: CycleStep,
+    prompt: &mut CachedPrompt<'static>,
+    initial_user: UserMessage<'static>,
+    parse_fn: F,
+    usage_total: &mut Option<Usage>,
+) -> Result<T, String>
+where
+    B: agora_agent_lib::llm::LlmBackend + ?Sized,
+    F: Fn(&str) -> Result<T, String>,
+{
+    use agora_agent_lib::llm::{StopReason, exchange_with_stop_reason};
+
+    const MAX_RETRIES: usize = 1;
+    let mut user = initial_user;
+
+    for attempt in 0..=MAX_RETRIES {
+        let outcome = exchange_with_stop_reason(backend, prompt, user, usage_total)
+            .await
+            .map_err(|e| format!("backend error: {e}"))?;
+        check_cache_hit(backend_kind, outcome.usage.as_ref(), agent_name, step);
+        let response_text = prompt::extract_speech(outcome.assistant.content());
+        match parse_fn(&response_text) {
+            Ok(parsed) => return Ok(parsed),
+            Err(parse_err) if attempt == MAX_RETRIES => return Err(parse_err),
+            Err(parse_err) => {
+                let retry_text = if matches!(outcome.stop_reason, Some(StopReason::MaxTokens)) {
+                    MAX_TOKENS_RETRY_MESSAGE.to_string()
+                } else {
+                    format!("{PARSE_RETRY_PREFIX}\n{parse_err}")
+                };
+                user = UserMessage::from(retry_text);
+            }
+        }
+    }
+    unreachable!("exchange_with_retry: loop returns or breaks before completion")
+}
+
+/// Inspect a per-call `Usage` for blallama cache hits and warn at runtime
+/// when the response shows zero `cache_read_input_tokens`.
 ///
 /// Ollama's Anthropic-compat API doesn't return cache stats, so this is
-/// a no-op for Ollama. For Blallama (Anthropic-spec) we expect non-zero
-/// `cache_read_input_tokens` after the first call in a cycle. A
-/// `tracing::warn!` (rather than a `debug_assert!`) catches regression
-/// at runtime without being brittle in tests where cache behavior is
-/// hard to mock.
-pub fn check_cache_hit(
-    backend: Backend,
-    usage: Option<&Usage>,
-    agent: &str,
-    step: CycleStep,
-    is_first_call: bool,
-) {
-    if !matches!(backend, Backend::Blallama) || is_first_call {
+/// a no-op for Ollama. For Blallama (Anthropic-spec) every call should
+/// hit cache: the system+tools prefix is preserved across agents within
+/// a run (blallama supports multiple cache breakpoints, unlike Ollama),
+/// so even round 0 of agent N≥2 sees the prefix already cached from
+/// agent #1. The only expected warn per run is the very first agent's
+/// very first call — the cold-start cost of catching every subsequent
+/// regression cleanly. A `tracing::warn!` (rather than `debug_assert!`)
+/// catches it at runtime without being brittle in tests where cache
+/// behavior is hard to mock.
+pub fn check_cache_hit(backend: Backend, usage: Option<&Usage>, agent: &str, step: CycleStep) {
+    if !matches!(backend, Backend::Blallama) {
         return;
     }
     let Some(usage) = usage else { return };
@@ -187,7 +254,7 @@ pub fn check_cache_hit(
     if cache_read == 0 {
         tracing::warn!(
             "blallama cache miss for agent={agent} step={step:?} \
-             (input={} no-cache, expected cache_read_input_tokens > 0)",
+             input={} cache_read=0 — expected the prior cycle/round prefix to be hit",
             usage.input_tokens,
         );
     }
@@ -572,72 +639,59 @@ fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
     // it's now the user's turn
 }
 
-/// Apply the reflect response: update agent memory.
+/// Save half of the reflect phase: write a successfully-parsed memory back
+/// to the agent + advance `last_cycle_at`. Used by both the legacy
+/// [`apply_reflect`] (single-shot) and the retry-success path in
+/// `seq_phase_reflect`.
 ///
-/// Apply a memory rewrite from the LLM's reflect response.
-///
-/// Strict JSON parse via `prompt::parse_memory_rewrite`. On parse failure
-/// we append a short `[SYSTEM]` line to the existing memory blob noting
-/// what went wrong, so the agent has a breadcrumb to course-correct on
-/// the next cycle. (The retry path with `format_for_agent` feedback lives
-/// in the per-backend wiring — for backends that can't retry, this
-/// memo-and-keep-going behavior is the fallback.) Soul-leakage rejection
-/// also produces a `[SYSTEM]` note.
-async fn apply_reflect(agent: &mut Agent, response_text: &str) -> Result<()> {
-    match prompt::parse_memory_rewrite(response_text) {
-        Ok(new_memory) => {
-            if let Err(e) = agent.memory.update(new_memory.content) {
-                tracing::warn!(
-                    "  {} reflect rejected ({e}) — keeping prior memory + [SYSTEM] note",
-                    agent.name
-                );
-                agent.memory.append_system_note(&format!(
-                    "Last reflect rejected: {e}. Memory not updated this cycle."
-                ));
-            }
-            agent.save_memory().await?;
-        }
-        Err(e) => {
-            tracing::warn!(
-                "  {} reflect produced invalid JSON ({e}) — keeping prior memory + [SYSTEM] note",
-                agent.name
-            );
-            agent.memory.append_system_note(&format!(
-                "Last reflect produced invalid JSON: {e}. Memory not updated this cycle."
-            ));
-            agent.save_memory().await?;
-        }
+/// `Memory::update` can still reject the content for soul leakage; in that
+/// case we breadcrumb a `[SYSTEM]` note rather than retry, because the
+/// problem is the agent's chosen *content* (not parse), and a retry won't
+/// help.
+async fn save_memory(agent: &mut Agent, new_memory: agora_agent_lib::Memory) -> Result<()> {
+    if let Err(e) = agent.memory.update(new_memory.content) {
+        tracing::warn!(
+            "  {} reflect rejected ({e}) — keeping prior memory + [SYSTEM] note",
+            agent.name
+        );
+        agent.memory.append_system_note(&format!(
+            "Last reflect rejected: {e}. Memory not updated this cycle."
+        ));
     }
+    agent.save_memory().await?;
     agent.state.last_cycle_at = Some(chrono::Utc::now());
     agent.save_state().await?;
     Ok(())
 }
 
-/// Apply a deep soul mutation from the LLM's response.
-///
-/// The agent's response is the new Soul **without** `evolution_log` (the
-/// system manages that field). On apply we re-attach the agent's prior
-/// `evolution_log` to the new soul and auto-append a system entry
-/// summarizing the mutation, so an agent can't rewrite its own history.
-/// `Soul::push_evolution` enforces the 10-entry cap.
-async fn apply_mutation(
+/// Breadcrumb half of the reflect phase: append a `[SYSTEM]` note to memory
+/// describing the failure + advance `last_cycle_at`. Used when reflect
+/// failed (parse, max_tokens, or after the retry budget is exhausted).
+async fn breadcrumb_memory_failure(agent: &mut Agent, err_msg: &str) -> Result<()> {
+    tracing::warn!(
+        "  {} reflect failed ({err_msg}) — keeping prior memory + [SYSTEM] note",
+        agent.name
+    );
+    agent.memory.append_system_note(err_msg);
+    agent.save_memory().await?;
+    agent.state.last_cycle_at = Some(chrono::Utc::now());
+    agent.save_state().await?;
+    Ok(())
+}
+
+/// Save half of the deep mutation phase: replace the agent's soul with a
+/// successfully-parsed new soul, re-attaching the prior `evolution_log` and
+/// auto-appending a system summary entry. The agent never writes its own
+/// evolution log; `Soul::push_evolution` enforces the 10-entry cap. Also
+/// writes a `mutations.log` audit entry.
+async fn save_mutation(
     agent: &mut Agent,
-    response_text: &str,
+    new_soul_request: agora_agent_lib::Soul,
     experience: &str,
     report: &mut RunReport,
 ) -> Result<()> {
-    let new_soul_request = match prompt::parse_soul_mutation(response_text) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("  {} invalid soul mutation ({e}) — skipping", agent.name);
-            report.evolution.mutation_failures += 1;
-            return Ok(());
-        }
-    };
-
     let old_soul_md = agent.soul.markdown();
 
-    // Re-attach prior evolution_log + auto-append a system entry.
     let mut new_soul = new_soul_request;
     new_soul.evolution_log = agent.soul.evolution_log.clone();
     let summary = if experience.len() > 480 {
@@ -668,24 +722,15 @@ async fn apply_mutation(
     Ok(())
 }
 
-/// Apply a single evolution-log entry from the LLM's response.
-///
-/// The agent produces `{"note": "..."}` (or `null` for "nothing
-/// changed"). The system stamps it with today's date and appends. The
-/// 10-entry cap is enforced by `Soul::push_evolution`.
-async fn apply_evolution(
+/// Save half of the evolution phase: stamp + append a single evolution-log
+/// entry. `None` means "nothing changed this cycle" → no-op. `Soul::push_evolution`
+/// enforces the 10-entry cap.
+async fn save_evolution(
     agent: &mut Agent,
-    response_text: &str,
+    note: Option<String>,
     report: &mut RunReport,
 ) -> Result<()> {
-    let note = match prompt::parse_evolution(response_text) {
-        Ok(Some(note)) => note,
-        Ok(None) => return Ok(()), // explicit "nothing changed"
-        Err(e) => {
-            tracing::warn!("  {} invalid evolution entry ({e}) — skipping", agent.name);
-            return Ok(());
-        }
-    };
+    let Some(note) = note else { return Ok(()) };
     if let Err(e) = agent.soul.push_evolution(note.clone()) {
         tracing::warn!("  {} couldn't push evolution: {e}", agent.name);
         return Ok(());
@@ -815,6 +860,75 @@ async fn submit_and_poll(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 current = next;
             }
+        }
+    }
+}
+
+/// Push retry-feedback user messages onto each parse-failed agent's
+/// prompt and submit a follow-up batch. Mirrors the sequential
+/// `exchange_with_retry` shape: one retry, hard cap. Returns the raw
+/// retry results; caller commits + parses them and decides save-or-
+/// breadcrumb per agent.
+///
+/// Lossy: this path always uses the parse-error retry message, never
+/// the MaxTokens variant — the Anthropic batch API discards
+/// `stop_reason` when results travel through `WorkResult` (it's lost in
+/// the `response::Message → prompt::Message` conversion in
+/// `agora-agent-lib::batch::anthropic`). Plumbing it through agora-
+/// agentkit's `WorkResult` type is a follow-up; for now batch retry
+/// gets the generic parse-error message, which is still useful — the
+/// agent at least knows what failed and gets a second chance. At
+/// Haiku's ~99% success rate this trade-off costs nothing measurable.
+///
+/// On submit-batch error, returns an empty vec — the caller will
+/// breadcrumb the parse-failed agents without a retry attempt. Hard cap
+/// at one retry; never recurses.
+async fn submit_retry_batch(
+    backend: &AnthropicBatch,
+    batch_agents: &[Agent],
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    failed: &[(AgentId, String)],
+    step: CycleStep,
+    max_tokens: u32,
+    context: &str,
+) -> Vec<agora_agent_lib::agora_agentkit::scheduler::WorkResult<MMessage<'static>>> {
+    use std::num::NonZeroU32;
+    if failed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut retry_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
+    for (agent_id, parse_err) in failed {
+        let Some(prompt) = agent_prompts.get_mut(agent_id) else {
+            continue;
+        };
+        let Some(agent) = batch_agents.iter().find(|a| a.agent_id == Some(*agent_id)) else {
+            continue;
+        };
+        let retry_text = format!("{PARSE_RETRY_PREFIX}\n{parse_err}");
+        prompt
+            .push_message(UserMessage::from(retry_text))
+            .expect("submit_retry_batch: user after assistant — turn order is a programmer bug");
+        prompt.set_max_tokens(NonZeroU32::new(max_tokens).unwrap());
+        retry_items.push(make_work_item(agent, prompt, step));
+    }
+
+    if retry_items.is_empty() {
+        return Vec::new();
+    }
+
+    tracing::info!(
+        "Retrying {} parse-failed {context} item(s) in a follow-up batch",
+        retry_items.len()
+    );
+    match submit_and_poll(backend, retry_items).await {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::warn!(
+                "{context} retry batch submit_and_poll failed: {e} — \
+                 parse-failed agents will be breadcrumbed without a retry attempt"
+            );
+            Vec::new()
         }
     }
 }
@@ -1169,32 +1283,112 @@ async fn batch_phase_reflect(
         }
     };
 
-    for result in reflect_results {
-        let Some(ctx) = agent_contexts
-            .iter()
-            .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
-        else {
-            continue;
-        };
-        let agent = &mut batch_agents[ctx.batch_index];
-        let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
-            continue;
-        };
+    // First pass: commit + parse. Successes are saved immediately; parse
+    // failures are queued for a follow-up retry batch.
+    let mut to_save: Vec<(AgentId, agora_agent_lib::Memory)> = Vec::new();
+    let mut failed_for_retry: Vec<(AgentId, String)> = Vec::new();
 
+    for result in reflect_results {
+        let agent_id = result.agent_id;
+        let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
+            continue;
+        };
         let response = result.response.map(|m| m.into_static());
         match commit_batch_response(prompt, response, "reflect batch") {
             Ok(assistant) => {
                 let response_text = prompt::extract_speech(assistant.content());
-                if let Err(e) = apply_reflect(agent, &response_text).await {
-                    tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
+                match prompt::parse_memory_rewrite(&response_text) {
+                    Ok(memory) => to_save.push((agent_id, memory)),
+                    Err(parse_err) => failed_for_retry.push((agent_id, parse_err)),
                 }
             }
             Err(e) => {
-                tracing::warn!("Reflect failed for {}: {e}", agent.name);
+                let agent_name = batch_agents
+                    .iter()
+                    .find(|a| a.agent_id == Some(agent_id))
+                    .map(|a| a.name.as_str())
+                    .unwrap_or("?");
+                tracing::warn!("Reflect backend error for {agent_name}: {e}");
                 report.skipped.reflect_failures += 1;
             }
         }
     }
+
+    // Retry batch for parse failures (one shot, hard cap).
+    let retry_results = submit_retry_batch(
+        backend,
+        batch_agents,
+        agent_prompts,
+        &failed_for_retry,
+        CycleStep::Reflect,
+        2048,
+        "reflect",
+    )
+    .await;
+    let mut retry_succeeded: HashSet<AgentId> = HashSet::new();
+    for result in retry_results {
+        let agent_id = result.agent_id;
+        let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
+            continue;
+        };
+        let response = result.response.map(|m| m.into_static());
+        match commit_batch_response(prompt, response, "reflect retry batch") {
+            Ok(assistant) => {
+                let response_text = prompt::extract_speech(assistant.content());
+                match prompt::parse_memory_rewrite(&response_text) {
+                    Ok(memory) => {
+                        to_save.push((agent_id, memory));
+                        retry_succeeded.insert(agent_id);
+                    }
+                    Err(_) => { /* both attempts parsed-failed; will breadcrumb below */ }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Reflect retry backend error: {e}");
+            }
+        }
+    }
+
+    // Apply saves.
+    for (agent_id, memory) in to_save {
+        let Some(ctx) = agent_contexts
+            .iter()
+            .find(|c| batch_agents[c.batch_index].agent_id == Some(agent_id))
+        else {
+            continue;
+        };
+        let agent = &mut batch_agents[ctx.batch_index];
+        if let Err(e) = save_memory(agent, memory).await {
+            tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
+        }
+    }
+
+    // Breadcrumb the agents whose retry also failed (or whose retry batch
+    // submit errored above and never produced a result).
+    for (agent_id, original_err) in failed_for_retry {
+        if retry_succeeded.contains(&agent_id) {
+            continue;
+        }
+        let Some(ctx) = agent_contexts
+            .iter()
+            .find(|c| batch_agents[c.batch_index].agent_id == Some(agent_id))
+        else {
+            continue;
+        };
+        let agent = &mut batch_agents[ctx.batch_index];
+        report.skipped.reflect_failures += 1;
+        if let Err(e) = breadcrumb_memory_failure(
+            agent,
+            &format!(
+                "Last reflect failed after retry: {original_err}. Memory not updated this cycle."
+            ),
+        )
+        .await
+        {
+            tracing::warn!("Failed to breadcrumb reflect for {}: {e}", agent.name);
+        }
+    }
+
     Ok(())
 }
 
@@ -1268,35 +1462,79 @@ async fn batch_phase_evolve(
             }
         };
 
+        // First pass: commit + parse. Successes saved; parse failures retried.
+        let mut to_save: Vec<(AgentId, agora_agent_lib::Soul)> = Vec::new();
+        let mut failed_for_retry: Vec<(AgentId, String)> = Vec::new();
         for result in mutation_results {
-            let Some(ctx) = agent_contexts
-                .iter()
-                .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
-            else {
+            let agent_id = result.agent_id;
+            let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
                 continue;
             };
-            let agent = &mut batch_agents[ctx.batch_index];
-            let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
-                continue;
-            };
-            let experience = action_summaries_map
-                .get(&result.agent_id)
-                .map(|s| s.join("; "))
-                .unwrap_or_default();
-
             let response = result.response.map(|m| m.into_static());
             match commit_batch_response(prompt, response, "mutation batch") {
                 Ok(assistant) => {
                     let response_text = prompt::extract_speech(assistant.content());
-                    if let Err(e) = apply_mutation(agent, &response_text, &experience, report).await
-                    {
-                        tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
+                    match prompt::parse_soul_mutation(&response_text) {
+                        Ok(soul) => to_save.push((agent_id, soul)),
+                        Err(parse_err) => failed_for_retry.push((agent_id, parse_err)),
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
+                    tracing::warn!("Soul mutation backend error: {e}");
                     report.evolution.mutation_failures += 1;
                 }
+            }
+        }
+
+        // Retry batch for parse failures.
+        let retry_results = submit_retry_batch(
+            backend,
+            batch_agents,
+            agent_prompts,
+            &failed_for_retry,
+            CycleStep::Mutate,
+            2048,
+            "mutation",
+        )
+        .await;
+        let mut retry_succeeded: HashSet<AgentId> = HashSet::new();
+        for result in retry_results {
+            let agent_id = result.agent_id;
+            let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
+                continue;
+            };
+            let response = result.response.map(|m| m.into_static());
+            if let Ok(assistant) = commit_batch_response(prompt, response, "mutation retry batch")
+                && let Ok(soul) = prompt::parse_soul_mutation(&prompt::extract_speech(
+                    assistant.content(),
+                ))
+            {
+                to_save.push((agent_id, soul));
+                retry_succeeded.insert(agent_id);
+            }
+        }
+
+        // Apply saves.
+        for (agent_id, soul) in to_save {
+            let Some(ctx) = agent_contexts
+                .iter()
+                .find(|c| batch_agents[c.batch_index].agent_id == Some(agent_id))
+            else {
+                continue;
+            };
+            let agent = &mut batch_agents[ctx.batch_index];
+            let experience = action_summaries_map
+                .get(&agent_id)
+                .map(|s| s.join("; "))
+                .unwrap_or_default();
+            if let Err(e) = save_mutation(agent, soul, &experience, report).await {
+                tracing::warn!("Mutation save failed for {}: {e}", agent.name);
+            }
+        }
+        // Count remaining (retry-also-failed) failures.
+        for (agent_id, _) in &failed_for_retry {
+            if !retry_succeeded.contains(agent_id) {
+                report.evolution.mutation_failures += 1;
             }
         }
     }
@@ -1314,29 +1552,65 @@ async fn batch_phase_evolve(
             }
         };
 
+        // First pass: commit + parse.
+        let mut to_save: Vec<(AgentId, Option<String>)> = Vec::new();
+        let mut failed_for_retry: Vec<(AgentId, String)> = Vec::new();
         for result in evo_results {
-            let Some(ctx) = agent_contexts
-                .iter()
-                .find(|c| batch_agents[c.batch_index].agent_id == Some(result.agent_id))
-            else {
+            let agent_id = result.agent_id;
+            let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
                 continue;
             };
-            let agent = &mut batch_agents[ctx.batch_index];
-            let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
-                continue;
-            };
-
             let response = result.response.map(|m| m.into_static());
             match commit_batch_response(prompt, response, "evolution batch") {
                 Ok(assistant) => {
                     let response_text = prompt::extract_speech(assistant.content());
-                    if let Err(e) = apply_evolution(agent, &response_text, report).await {
-                        tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
+                    match prompt::parse_evolution(&response_text) {
+                        Ok(note) => to_save.push((agent_id, note)),
+                        Err(parse_err) => failed_for_retry.push((agent_id, parse_err)),
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("Evolution failed for {}: {e}", agent.name);
+                    tracing::debug!("Evolution backend error: {e}");
                 }
+            }
+        }
+
+        // Retry batch for parse failures.
+        let retry_results = submit_retry_batch(
+            backend,
+            batch_agents,
+            agent_prompts,
+            &failed_for_retry,
+            CycleStep::Evolve,
+            1024,
+            "evolution",
+        )
+        .await;
+        for result in retry_results {
+            let agent_id = result.agent_id;
+            let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
+                continue;
+            };
+            let response = result.response.map(|m| m.into_static());
+            if let Ok(assistant) = commit_batch_response(prompt, response, "evolution retry batch")
+                && let Ok(note) =
+                    prompt::parse_evolution(&prompt::extract_speech(assistant.content()))
+            {
+                to_save.push((agent_id, note));
+            }
+        }
+
+        // Apply saves.
+        for (agent_id, note) in to_save {
+            let Some(ctx) = agent_contexts
+                .iter()
+                .find(|c| batch_agents[c.batch_index].agent_id == Some(agent_id))
+            else {
+                continue;
+            };
+            let agent = &mut batch_agents[ctx.batch_index];
+            if let Err(e) = save_evolution(agent, note, report).await {
+                tracing::warn!("Evolution save failed for {}: {e}", agent.name);
             }
         }
     }
@@ -1397,49 +1671,90 @@ async fn batch_phase_survey(
         }
     };
 
+    // First pass: commit + parse. None = skipped, Some = save, Err = retry.
+    let mut to_submit: Vec<(AgentId, agora_agent_lib::Feedback)> = Vec::new();
+    let mut failed_for_retry: Vec<(AgentId, String)> = Vec::new();
     for result in survey_results {
-        let Some(prompt) = agent_prompts.get_mut(&result.agent_id) else {
+        let agent_id = result.agent_id;
+        let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
             continue;
         };
-
         let response = result.response.map(|m| m.into_static());
         match commit_batch_response(prompt, response, "survey batch") {
             Ok(assistant) => {
                 let text = prompt::extract_speech(assistant.content());
-                let trimmed = text.trim();
-                if trimmed.is_empty()
-                    || trimmed.eq_ignore_ascii_case("no feedback")
-                    || trimmed.eq_ignore_ascii_case("no feedback.")
-                {
-                    report.surveys.skipped_empty += 1;
-                    continue;
-                }
-
-                let Some(agent) = batch_agents
-                    .iter()
-                    .find(|a| a.agent_id == Some(result.agent_id))
-                else {
-                    report.surveys.failures += 1;
-                    continue;
-                };
-                match client
-                    .submit_feedback(result.agent_id, trimmed, &agent.signing_key)
-                    .await
-                {
-                    Ok(()) => {
-                        tracing::info!("  anonymous feedback submitted");
-                        report.surveys.submitted += 1;
-                    }
-                    Err(e) => {
-                        tracing::debug!("Anonymous feedback submission failed: {e}");
-                        report.surveys.failures += 1;
-                    }
+                match prompt::parse_feedback(&text) {
+                    Ok(None) => report.surveys.skipped_empty += 1,
+                    Ok(Some(feedback)) => to_submit.push((agent_id, feedback)),
+                    Err(parse_err) => failed_for_retry.push((agent_id, parse_err)),
                 }
             }
             Err(e) => {
-                tracing::debug!("Survey failed: {e}");
+                tracing::debug!("Survey backend error: {e}");
                 report.surveys.failures += 1;
             }
+        }
+    }
+
+    // Retry batch for parse failures.
+    let retry_results = submit_retry_batch(
+        backend,
+        batch_agents,
+        agent_prompts,
+        &failed_for_retry,
+        CycleStep::Survey,
+        2048,
+        "survey",
+    )
+    .await;
+    let mut retry_succeeded: HashSet<AgentId> = HashSet::new();
+    for result in retry_results {
+        let agent_id = result.agent_id;
+        let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
+            continue;
+        };
+        let response = result.response.map(|m| m.into_static());
+        if let Ok(assistant) = commit_batch_response(prompt, response, "survey retry batch") {
+            let text = prompt::extract_speech(assistant.content());
+            match prompt::parse_feedback(&text) {
+                Ok(None) => {
+                    report.surveys.skipped_empty += 1;
+                    retry_succeeded.insert(agent_id);
+                }
+                Ok(Some(feedback)) => {
+                    to_submit.push((agent_id, feedback));
+                    retry_succeeded.insert(agent_id);
+                }
+                Err(_) => { /* still failed after retry; counted below */ }
+            }
+        }
+    }
+
+    // Submit feedback (only for the agents that produced parseable feedback).
+    for (agent_id, feedback) in to_submit {
+        let Some(agent) = batch_agents.iter().find(|a| a.agent_id == Some(agent_id)) else {
+            report.surveys.failures += 1;
+            continue;
+        };
+        match client
+            .submit_feedback(agent_id, feedback.text.as_str(), &agent.signing_key)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!("  anonymous feedback submitted");
+                report.surveys.submitted += 1;
+            }
+            Err(e) => {
+                tracing::debug!("Anonymous feedback submission failed: {e}");
+                report.surveys.failures += 1;
+            }
+        }
+    }
+
+    // Count the agents whose retry also failed.
+    for (agent_id, _) in &failed_for_retry {
+        if !retry_succeeded.contains(agent_id) {
+            report.surveys.failures += 1;
         }
     }
 
@@ -1573,12 +1888,13 @@ async fn run_batch(
 /// endpoint, driving `process_round` to execute actions and append tool
 /// results. Returns the accumulated action summaries.
 ///
-/// This phase uses the raw `OllamaEndpoint::send` path directly (not
-/// `exchange`) because the tool-round loop has its own turn-order
+/// This phase uses the raw `OllamaEndpoint::send_response` path directly
+/// (not `exchange`) because the tool-round loop has its own turn-order
 /// invariants via `process_round`, which already handles tool_use →
 /// tool_result pairing and the error-recovery hole for us.
 async fn seq_phase_think_act(
     endpoint: &OllamaEndpoint,
+    backend_kind: Backend,
     agent: &mut Agent,
     ctx: &AgentCycleContext,
     client: &AgoraClient,
@@ -1601,8 +1917,8 @@ async fn seq_phase_think_act(
             MAX_ROUNDS,
         );
 
-        let response = match endpoint.send(cached_prompt, &model).await {
-            Ok(msg) => msg,
+        let send_response = match endpoint.send_response(cached_prompt, &model).await {
+            Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(
                     "Round {} failed for {} at {}: {e:#}",
@@ -1616,8 +1932,20 @@ async fn seq_phase_think_act(
                 break;
             }
         };
+        // Always call the cache-hit check, even on round 0. On blallama,
+        // the system+tools prefix is preserved across agents within a run
+        // (multiple cache breakpoints supported), so round 0 of every
+        // agent past the very first should still hit. The very first
+        // agent's round 0 will produce one expected warn per run — the
+        // cost of catching every other regression cleanly.
+        check_cache_hit(
+            backend_kind,
+            send_response.usage.as_ref(),
+            &agent.name,
+            CycleStep::Think,
+        );
 
-        let assistant_msg = match AssistantMessage::try_from(response.into_static()) {
+        let assistant_msg = match AssistantMessage::try_from(send_response.message.into_static()) {
             Ok(m) => m,
             Err(_) => {
                 tracing::error!("Ollama returned non-assistant response for {}", agent.name);
@@ -1702,25 +2030,33 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     apply_phase_config(bare_prompt, backend_kind, CycleStep::Reflect);
     bare_prompt.cache_windowed_1h(2);
 
-    match llm::exchange(
+    match exchange_with_retry(
         backend,
+        backend_kind,
+        &agent.name,
+        CycleStep::Reflect,
         bare_prompt,
         UserMessage::from(MEMORY_REWRITE_MESSAGE),
+        prompt::parse_memory_rewrite,
         usage_total,
     )
     .await
     {
-        Ok(assistant) => {
-            let response_text = prompt::extract_speech(assistant.content());
-            if let Err(e) = apply_reflect(agent, &response_text).await {
+        Ok(memory) => {
+            if let Err(e) = save_memory(agent, memory).await {
                 tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
             }
             Ok(())
         }
-        Err(e) => {
-            tracing::warn!("Reflect failed for {}: {e}", agent.name);
+        Err(parse_err) => {
             report.skipped.reflect_failures += 1;
-            Err(e)
+            breadcrumb_memory_failure(
+                agent,
+                &format!(
+                    "Last reflect failed after retry: {parse_err}. Memory not updated this cycle."
+                ),
+            )
+            .await
         }
     }
 }
@@ -1753,25 +2089,31 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         apply_phase_config(bare_prompt, backend_kind, CycleStep::Mutate);
         bare_prompt.cache_windowed_1h(2);
 
-        match llm::exchange(
+        match exchange_with_retry(
             backend,
+            backend_kind,
+            &agent.name,
+            CycleStep::Mutate,
             bare_prompt,
             UserMessage::from(mutation_text),
+            prompt::parse_soul_mutation,
             usage_total,
         )
         .await
         {
-            Ok(assistant) => {
-                let response_text = prompt::extract_speech(assistant.content());
-                if let Err(e) = apply_mutation(agent, &response_text, &experience, report).await {
-                    tracing::warn!("Mutation apply failed for {}: {e}", agent.name);
+            Ok(new_soul) => {
+                if let Err(e) = save_mutation(agent, new_soul, &experience, report).await {
+                    tracing::warn!("Mutation save failed for {}: {e}", agent.name);
                 }
                 Ok(())
             }
-            Err(e) => {
-                tracing::warn!("Soul mutation failed for {}: {e}", agent.name);
+            Err(parse_err) => {
+                tracing::warn!(
+                    "Soul mutation for {} failed after retry: {parse_err} — skipping",
+                    agent.name
+                );
                 report.evolution.mutation_failures += 1;
-                Err(e)
+                Ok(())
             }
         }
     } else if roll < evo_threshold {
@@ -1780,24 +2122,30 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         apply_phase_config(bare_prompt, backend_kind, CycleStep::Evolve);
         bare_prompt.cache_windowed_1h(2);
 
-        match llm::exchange(
+        match exchange_with_retry(
             backend,
+            backend_kind,
+            &agent.name,
+            CycleStep::Evolve,
             bare_prompt,
             UserMessage::from(EVOLUTION_MESSAGE),
+            prompt::parse_evolution,
             usage_total,
         )
         .await
         {
-            Ok(assistant) => {
-                let response_text = prompt::extract_speech(assistant.content());
-                if let Err(e) = apply_evolution(agent, &response_text, report).await {
-                    tracing::warn!("Evolution apply failed for {}: {e}", agent.name);
+            Ok(note) => {
+                if let Err(e) = save_evolution(agent, note, report).await {
+                    tracing::warn!("Evolution save failed for {}: {e}", agent.name);
                 }
                 Ok(())
             }
-            Err(e) => {
-                tracing::debug!("Evolution failed for {}: {e}", agent.name);
-                Err(e)
+            Err(parse_err) => {
+                tracing::debug!(
+                    "Evolution for {} failed after retry: {parse_err} — skipping",
+                    agent.name
+                );
+                Ok(())
             }
         }
     } else {
@@ -1828,40 +2176,44 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     apply_phase_config(bare_prompt, backend_kind, CycleStep::Survey);
     bare_prompt.cache_windowed_1h(2);
 
-    match llm::exchange(
+    match exchange_with_retry(
         backend,
+        backend_kind,
+        agent_name,
+        CycleStep::Survey,
         bare_prompt,
         UserMessage::from(SURVEY_MESSAGE),
+        prompt::parse_feedback,
         usage_total,
     )
     .await
     {
-        Ok(assistant) => {
-            let text = prompt::extract_speech(assistant.content());
-            let trimmed = text.trim();
-            if !trimmed.is_empty()
-                && !trimmed.eq_ignore_ascii_case("no feedback")
-                && !trimmed.eq_ignore_ascii_case("no feedback.")
+        Ok(None) => {
+            report.surveys.skipped_empty += 1;
+            Ok(())
+        }
+        Ok(Some(feedback)) => {
+            match client
+                .submit_feedback(agent_id, feedback.text.as_str(), signing_key)
+                .await
             {
-                match client.submit_feedback(agent_id, trimmed, signing_key).await {
-                    Ok(()) => {
-                        tracing::info!("  anonymous feedback submitted");
-                        report.surveys.submitted += 1;
-                    }
-                    Err(e) => {
-                        tracing::debug!("Anonymous feedback submission failed: {e}");
-                        report.surveys.failures += 1;
-                    }
+                Ok(()) => {
+                    tracing::info!("  anonymous feedback submitted");
+                    report.surveys.submitted += 1;
                 }
-            } else {
-                report.surveys.skipped_empty += 1;
+                Err(e) => {
+                    tracing::debug!("Anonymous feedback submission failed: {e}");
+                    report.surveys.failures += 1;
+                }
             }
             Ok(())
         }
-        Err(e) => {
-            tracing::debug!("Survey failed for {agent_name}: {e}");
+        Err(parse_err) => {
+            tracing::debug!(
+                "Survey for {agent_name} failed after retry: {parse_err}"
+            );
             report.surveys.failures += 1;
-            Err(e)
+            Ok(())
         }
     }
 }
@@ -1901,6 +2253,7 @@ async fn run_sequential(
         let mut cached_prompt = build_prompt(agent, &ctx, constitution);
         let summaries = seq_phase_think_act(
             endpoint,
+            backend_kind,
             agent,
             &ctx,
             client,
@@ -2738,4 +3091,192 @@ pub async fn run_all(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agora_agent_lib::llm::StopReason;
+    use agora_agent_lib::llm::mock::MockLlmBackend;
+    use misanthropic::Prompt;
+    use misanthropic::prompt::message::Role;
+
+    fn fresh_cached() -> CachedPrompt<'static> {
+        CachedPrompt::from(Prompt::default())
+    }
+
+    /// Trivial parse_fn used by the retry tests: succeeds when the input
+    /// equals "ok", fails otherwise. Keeps the tests focused on the retry
+    /// loop without coupling them to the real `parse_memory_rewrite` etc.
+    fn parse_ok_marker(s: &str) -> Result<String, String> {
+        if s.trim() == "ok" {
+            Ok(s.trim().to_string())
+        } else {
+            Err(format!("expected 'ok', got {s:?}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_with_retry_succeeds_on_first_try() {
+        let mock = MockLlmBackend::new("test");
+        mock.push_ok("ok");
+
+        let mut prompt = fresh_cached();
+        let mut usage = None;
+        let result = exchange_with_retry(
+            &mock,
+            Backend::Ollama,
+            "test-agent",
+            CycleStep::Reflect,
+            &mut prompt,
+            UserMessage::from("question"),
+            parse_ok_marker,
+            &mut usage,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "ok");
+        assert_eq!(mock.remaining(), 0, "should have used exactly one response");
+        // user, assistant
+        assert_eq!(prompt.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exchange_with_retry_succeeds_on_second_try() {
+        let mock = MockLlmBackend::new("test");
+        mock.push_ok("garbage").push_ok("ok");
+
+        let mut prompt = fresh_cached();
+        let mut usage = None;
+        let result = exchange_with_retry(
+            &mock,
+            Backend::Ollama,
+            "test-agent",
+            CycleStep::Reflect,
+            &mut prompt,
+            UserMessage::from("question"),
+            parse_ok_marker,
+            &mut usage,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "ok");
+        assert_eq!(mock.remaining(), 0, "should have used both responses");
+        // user, assistant(garbage), user(retry-feedback), assistant(ok)
+        assert_eq!(prompt.messages.len(), 4);
+        // Confirm the retry-user includes the parse-error prefix (PARSE_RETRY_PREFIX).
+        let retry_user = &prompt.messages[2];
+        assert_eq!(retry_user.role, Role::User);
+        assert!(
+            retry_user.content.to_string().contains(PARSE_RETRY_PREFIX),
+            "retry user should include PARSE_RETRY_PREFIX, got: {}",
+            retry_user.content,
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_with_retry_gives_up_after_one_retry() {
+        let mock = MockLlmBackend::new("test");
+        mock.push_ok("garbage1").push_ok("garbage2");
+
+        let mut prompt = fresh_cached();
+        let mut usage = None;
+        let err = exchange_with_retry(
+            &mock,
+            Backend::Ollama,
+            "test-agent",
+            CycleStep::Reflect,
+            &mut prompt,
+            UserMessage::from("question"),
+            parse_ok_marker,
+            &mut usage,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.contains("expected 'ok'"),
+            "should surface the final parse error, got: {err}"
+        );
+        assert_eq!(mock.remaining(), 0, "should not have called the backend a third time");
+        // user, assistant(garbage1), user(retry-feedback), assistant(garbage2)
+        assert_eq!(prompt.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn exchange_with_retry_uses_max_tokens_message_when_truncated() {
+        let mock = MockLlmBackend::new("test");
+        // First response: truncated (MaxTokens) and unparseable.
+        // Second: clean parse so the test asserts the retry user shape.
+        mock.push_ok_with_stop("partial-json", StopReason::MaxTokens)
+            .push_ok("ok");
+
+        let mut prompt = fresh_cached();
+        let mut usage = None;
+        let result = exchange_with_retry(
+            &mock,
+            Backend::Ollama,
+            "test-agent",
+            CycleStep::Reflect,
+            &mut prompt,
+            UserMessage::from("question"),
+            parse_ok_marker,
+            &mut usage,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "ok");
+        let retry_user = &prompt.messages[2];
+        assert_eq!(retry_user.role, Role::User);
+        let retry_text = retry_user.content.to_string();
+        assert!(
+            retry_text.contains("max_tokens"),
+            "retry user should be the MaxTokens variant, got: {retry_text}"
+        );
+        // And it must NOT be the parse-error variant.
+        assert!(
+            !retry_text.contains(PARSE_RETRY_PREFIX),
+            "MaxTokens path should not use the parse-error prefix"
+        );
+    }
+
+    // --- check_cache_hit tests ---
+
+    fn usage(input: u64, cache_read: Option<u64>) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: cache_read,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn check_cache_hit_noop_for_ollama() {
+        // Ollama doesn't expose cache stats; helper should return without
+        // a panic regardless of usage shape.
+        let u = usage(5000, None);
+        check_cache_hit(Backend::Ollama, Some(&u), "agent", CycleStep::Reflect);
+    }
+
+    #[test]
+    fn check_cache_hit_noop_when_cache_read_nonzero() {
+        // Cache read > 0 — happy path, no warn.
+        let u = usage(5000, Some(4500));
+        check_cache_hit(Backend::Blallama, Some(&u), "agent", CycleStep::Reflect);
+    }
+
+    #[test]
+    fn check_cache_hit_warns_when_cache_read_zero() {
+        // Cache miss — this is what we want surfaced. We don't assert the
+        // tracing capture (would need the `tracing-test` crate); the test
+        // exists to lock in the function is reachable on this branch and
+        // doesn't panic.
+        let u = usage(5000, Some(0));
+        check_cache_hit(Backend::Blallama, Some(&u), "agent", CycleStep::Reflect);
+    }
 }

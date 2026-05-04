@@ -48,10 +48,12 @@ impl LlmBackend for AnthropicBackend {
             response.usage.output_tokens,
         );
 
+        let stop_reason = response.stop_reason;
         let msg: misanthropic::prompt::Message<'_> = response.inner.into();
         Ok(SendResponse {
             message: msg.into_static(),
             usage: Some(response.usage),
+            stop_reason,
         })
     }
 
