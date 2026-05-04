@@ -45,6 +45,7 @@ pub async fn send_with_nudge(
         .await
         .context("Ollama request failed")?;
     let mut total_usage = response.usage;
+    let mut last_stop = response.stop_reason;
     let msg: MMessage<'_> = response.inner.into();
 
     // Only nudge if the prompt has tools defined — reflect/survey prompts
@@ -54,6 +55,7 @@ pub async fn send_with_nudge(
         return Ok(SendResponse {
             message: msg.into_static(),
             usage: Some(total_usage),
+            stop_reason: last_stop,
         });
     }
 
@@ -74,12 +76,14 @@ pub async fn send_with_nudge(
             .await
             .context("Ollama nudge request failed")?;
         total_usage += response.usage;
+        last_stop = response.stop_reason;
         last_msg = response.inner.into();
 
         if has_tool_use(&last_msg) {
             return Ok(SendResponse {
                 message: last_msg.into_static(),
                 usage: Some(total_usage),
+                stop_reason: last_stop,
             });
         }
 
@@ -93,6 +97,7 @@ pub async fn send_with_nudge(
     Ok(SendResponse {
         message: last_msg.into_static(),
         usage: Some(total_usage),
+        stop_reason: last_stop,
     })
 }
 
