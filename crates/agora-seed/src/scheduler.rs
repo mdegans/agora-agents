@@ -104,42 +104,52 @@ pub fn with_tool_choice<'a>(
 /// route around it at the dispatch level rather than encoding a "no-op"
 /// arm here.
 ///
-/// The Blallama `output_config::for_type` calls produce JSON-schemas
-/// derived from the existing `serde::Serialize + JsonSchema` types —
-/// `Memory`, `Soul`, `Feedback`, `EvolutionRequest` — so the structured-
-/// output guarantee follows the same source of truth as the on-disk
-/// shape.
+/// `output_config` is set unconditionally for messages-API backends
+/// regardless of backend variant. Blallama enforces the schema via its
+/// grammar compiler; Ollama silently ignores it today but may honor it
+/// in a future version. The prompt-bytes cost is negligible and "set it
+/// once, every backend that supports it benefits" beats per-backend
+/// gating that would silently fall over on a wiring miss.
+///
+/// `tool_choice` *does* differ by backend on Think:
+/// - Ollama: `Auto` (its compat layer interprets `Any` as a hard
+///   "must use this exact tool" not "must use *some* tool")
+/// - Blallama: `Any` (force *some* tool to be called — Anthropic-spec)
+///
+/// All non-Think phases use `tool_choice=None` on both backends, paired
+/// with `strip_tools_for_reflect` on Ollama (skipped on Blallama, which
+/// honors `None` directly).
 pub fn phase_config(
     backend: Backend,
     step: CycleStep,
 ) -> (Option<tool::Choice>, Option<misanthropic::prompt::OutputConfig>) {
     use misanthropic::prompt::OutputConfig;
     use tool::Choice;
-    match (backend, step) {
-        (Backend::Ollama, CycleStep::Think) => (Some(Choice::Auto), None),
-        (Backend::Ollama, _) => (None, None),
-        (Backend::Blallama, CycleStep::Think) => (Some(Choice::Any), None),
-        (Backend::Blallama, CycleStep::Reflect) => (
-            None,
-            Some(OutputConfig::for_type::<agora_agent_lib::Memory>()),
-        ),
-        (Backend::Blallama, CycleStep::Mutate) => (
-            None,
-            Some(OutputConfig::for_type::<agora_agent_lib::Soul>()),
-        ),
-        (Backend::Blallama, CycleStep::Evolve) => (
-            None,
-            Some(OutputConfig::for_type::<agora_agent_lib::EvolutionRequest>()),
-        ),
-        (Backend::Blallama, CycleStep::Survey) => (
-            None,
-            Some(OutputConfig::for_type::<agora_agent_lib::Feedback>()),
-        ),
-        (Backend::Anthropic, _) => panic!(
+    let tool_choice = match (backend, step) {
+        (_, CycleStep::Think) => Some(match backend {
+            Backend::Ollama => Choice::Auto,
+            Backend::Blallama => Choice::Any,
+            Backend::Anthropic => panic!(
+                "phase_config called for Anthropic — its CachedPrompt is set once at \
+                 build time and never mutated; route around this helper at dispatch"
+            ),
+        }),
+        _ => None,
+    };
+    let output_config = match step {
+        CycleStep::Think => None,
+        CycleStep::Reflect => Some(OutputConfig::for_type::<agora_agent_lib::Memory>()),
+        CycleStep::Mutate => Some(OutputConfig::for_type::<agora_agent_lib::Soul>()),
+        CycleStep::Evolve => Some(OutputConfig::for_type::<agora_agent_lib::EvolutionRequest>()),
+        CycleStep::Survey => Some(OutputConfig::for_type::<agora_agent_lib::Feedback>()),
+    };
+    if matches!(backend, Backend::Anthropic) {
+        panic!(
             "phase_config called for Anthropic — its CachedPrompt is set once at \
              build time and never mutated; route around this helper at dispatch"
-        ),
+        );
     }
+    (tool_choice, output_config)
 }
 
 /// Apply this cycle's per-backend / per-phase `(tool_choice, output_config)`
@@ -575,6 +585,21 @@ async fn process_round(
         .map_err(|e| anyhow::anyhow!("appending assistant response: {e}"))?;
     // it's now the user's turn
 
+    // Mark a cache breakpoint on the just-appended assistant message,
+    // BEFORE we append the next user-turn content (tool results or
+    // nudge). The breakpoint must sit on a message whose bytes are in
+    // the *previous* call's KV cache for the next call to hit it:
+    // drama_llama's prefix-cache lookup walks back to the largest
+    // breakpoint within the longest-common-prefix of prev + new tokens
+    // (`compute_l_hit` in drama_llama session/mod.rs). The assistant
+    // we just appended *is* in the prev cache (it was generated in
+    // the call that just returned); the user-turn content we're about
+    // to append is brand-new bytes past the LCP and would never serve
+    // as a useful cache anchor. Anthropic walks back to non-breakpoint
+    // positions too, so this placement is also a no-op-or-better for
+    // the batch path. 1h TTL covers the slow-batch worst case.
+    cached_prompt.cache_windowed_1h(2);
+
     if parsed.is_empty() {
         // Text-only reply with no tool_use blocks — nudge and move on.
         cached_prompt
@@ -617,12 +642,8 @@ async fn process_round(
     cached_prompt
         .push_message(user_msg)
         .map_err(|e| anyhow::anyhow!("appending tool results: {e}"))?;
-    // it's now the assistant's turn
-
-    // Manage cache breakpoint budget: keep first + last 2, at 1h TTL so the
-    // growing message window stays warm across tool rounds even if Anthropic's
-    // batch-API latency pushes the next round past a 5-minute window.
-    cached_prompt.cache_windowed_1h(2);
+    // it's now the assistant's turn — cache breakpoint NOT placed here
+    // (see comment above the assistant-side cache_windowed call).
 
     Ok(summaries)
 }
@@ -1995,7 +2016,7 @@ async fn seq_phase_think_act(
 /// append-only again and every downstream phase gets `CachedPrompt`'s
 /// turn-order and cache-safety guarantees.
 ///
-/// Necessary because Ollama's compat layer misinterprets
+/// Necessary on Ollama because its compat layer misinterprets
 /// `tool_choice: Auto` as "must use tools" during reflect. Clearing
 /// just `tool_choice` while keeping `.functions` intact is not
 /// sufficient — an absent `tool_choice` still falls through to Auto
@@ -2004,8 +2025,22 @@ async fn seq_phase_think_act(
 /// Ollama's prefix KV cache for the post-think phases; acceptable
 /// because Ollama uses local GPU memory, not Anthropic's paid prompt
 /// cache.
-fn strip_tools_for_reflect(mut cached: CachedPrompt<'static>) -> CachedPrompt<'static> {
+///
+/// **Skipped on Blallama**: it honors `tool_choice: None` (set by
+/// `phase_config`) directly without any "must use tools" misread, so
+/// stripping the functions just busts the prefix cache for nothing.
+/// The 2026-05-04 cogito-32b smoke run on blallama showed
+/// `cache_read_input_tokens` dropping from 12749 → 11405 between the
+/// last think round and reflect — exactly the tools-portion of the
+/// cache, gone. Skip the strip and that ~1344 tokens stays cached.
+fn strip_tools_for_reflect(
+    mut cached: CachedPrompt<'static>,
+    backend_kind: Backend,
+) -> CachedPrompt<'static> {
     insert_bridge(&mut cached);
+    if matches!(backend_kind, Backend::Blallama) {
+        return cached;
+    }
     let mut bare = cached.into_inner();
     bare.functions = None;
     bare.tool_choice = None;
@@ -2272,7 +2307,7 @@ async fn run_sequential(
         );
 
         // Strip tools for reflect/evolve/survey and continue on bare Prompt.
-        let mut bare_prompt = strip_tools_for_reflect(cached_prompt);
+        let mut bare_prompt = strip_tools_for_reflect(cached_prompt, backend_kind);
 
         // Reflect — any Err is logged inside the helper; we continue to
         // evolve/survey on top of the turn-valid bare_prompt.
@@ -2529,6 +2564,13 @@ async fn run_worker(
 }
 
 /// Run all cycles using a pull-based pool scheduler.
+/// `messages_api_backend`: resolved backend for the messages-API workers
+/// — `Backend::Ollama` or `Backend::Blallama`. NOT necessarily
+/// `config.backend`: if the user passed `--messages-api blallama://...`
+/// without `--backend blallama`, the parsed scheme is the source of
+/// truth, not the legacy CLI flag. Threaded down to `run_worker →
+/// run_sequential → seq_phase_*` so `phase_config` and `check_cache_hit`
+/// see the right value.
 async fn run_cycles(
     ollama_endpoints: &[OllamaEndpoint],
     anthropic: Option<&AnthropicBatch>,
@@ -2538,6 +2580,7 @@ async fn run_cycles(
     constitution: &str,
     ollama_models: &HashSet<String>,
     report: &mut RunReport,
+    messages_api_backend: Backend,
 ) -> Result<()> {
     let batch_size = config.batch_size.unwrap_or(50);
     let all_endpoints: Vec<OllamaEndpoint> = ollama_endpoints.to_vec();
@@ -2638,7 +2681,7 @@ async fn run_cycles(
                         1 => {
                             run_worker(
                                 &ollama_endpoints[0],
-                                config.backend,
+                                messages_api_backend,
                                 &pool,
                                 results_tx.clone(),
                                 client,
@@ -2655,7 +2698,7 @@ async fn run_cycles(
                             let (a, b) = tokio::join!(
                                 run_worker(
                                     &ollama_endpoints[0],
-                                config.backend,
+                                messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -2667,7 +2710,7 @@ async fn run_cycles(
                                 ),
                                 run_worker(
                                     &ollama_endpoints[1],
-                                config.backend,
+                                messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -2686,7 +2729,7 @@ async fn run_cycles(
                             let (a, b, c) = tokio::join!(
                                 run_worker(
                                     &ollama_endpoints[0],
-                                config.backend,
+                                messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -2698,7 +2741,7 @@ async fn run_cycles(
                                 ),
                                 run_worker(
                                     &ollama_endpoints[1],
-                                config.backend,
+                                messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -2710,7 +2753,7 @@ async fn run_cycles(
                                 ),
                                 run_worker(
                                     &ollama_endpoints[2],
-                                config.backend,
+                                messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -3021,9 +3064,9 @@ pub async fn run_all(
                     client,
                     config,
                     constitution,
-
                     &ollama_models,
                     &mut report,
+                    effective_backend,
                 )
                 .await?;
             } else {
@@ -3038,9 +3081,9 @@ pub async fn run_all(
                     client,
                     config,
                     constitution,
-
                     &HashSet::new(),
                     &mut report,
+                    effective_backend,
                 )
                 .await?;
             }
@@ -3054,7 +3097,10 @@ pub async fn run_all(
             })?;
             let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
 
-            // Prime runs inside run_cycles on cycle 0.
+            // Prime runs inside run_cycles on cycle 0. Anthropic batch path
+            // doesn't use messages_api_backend (it routes purely through
+            // anthropic_fut), but the parameter is required — pass the
+            // resolved value for symmetry.
             run_cycles(
                 &[],
                 Some(&backend),
@@ -3062,9 +3108,9 @@ pub async fn run_all(
                 client,
                 config,
                 constitution,
-
                 &HashSet::new(),
                 &mut report,
+                effective_backend,
             )
             .await?;
         }
@@ -3278,5 +3324,55 @@ mod tests {
         // doesn't panic.
         let u = usage(5000, Some(0));
         check_cache_hit(Backend::Blallama, Some(&u), "agent", CycleStep::Reflect);
+    }
+
+    // --- phase_config tests ---
+
+    #[test]
+    fn phase_config_sets_output_config_on_ollama_too() {
+        // Regression: pre-fix this returned None for Ollama. Now we always
+        // set the output_config; Ollama silently ignores it today, may
+        // honor it in a future version. Locks in that future-proofing.
+        let (_, oc) = phase_config(Backend::Ollama, CycleStep::Reflect);
+        assert!(
+            oc.is_some(),
+            "Ollama Reflect should set output_config (Memory schema)"
+        );
+        let (_, oc) = phase_config(Backend::Ollama, CycleStep::Survey);
+        assert!(oc.is_some(), "Ollama Survey should set output_config (Feedback schema)");
+    }
+
+    #[test]
+    fn phase_config_tool_choice_differs_by_backend_on_think() {
+        let (tc_ollama, _) = phase_config(Backend::Ollama, CycleStep::Think);
+        let (tc_blallama, _) = phase_config(Backend::Blallama, CycleStep::Think);
+        assert!(matches!(tc_ollama, Some(tool::Choice::Auto)));
+        assert!(matches!(tc_blallama, Some(tool::Choice::Any)));
+    }
+
+    #[test]
+    fn phase_config_tool_choice_none_on_non_think_phases() {
+        for step in [
+            CycleStep::Reflect,
+            CycleStep::Mutate,
+            CycleStep::Evolve,
+            CycleStep::Survey,
+        ] {
+            for backend in [Backend::Ollama, Backend::Blallama] {
+                let (tc, _) = phase_config(backend, step);
+                assert!(
+                    tc.is_none(),
+                    "expected tool_choice=None on {backend:?}/{step:?}, got {tc:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "phase_config called for Anthropic")]
+    fn phase_config_panics_on_anthropic() {
+        // Anthropic batch path doesn't go through phase_config; calling it
+        // is a programmer error and should fail loudly.
+        let _ = phase_config(Backend::Anthropic, CycleStep::Reflect);
     }
 }
