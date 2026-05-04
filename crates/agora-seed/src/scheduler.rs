@@ -585,6 +585,21 @@ async fn process_round(
         .map_err(|e| anyhow::anyhow!("appending assistant response: {e}"))?;
     // it's now the user's turn
 
+    // Mark a cache breakpoint on the just-appended assistant message,
+    // BEFORE we append the next user-turn content (tool results or
+    // nudge). The breakpoint must sit on a message whose bytes are in
+    // the *previous* call's KV cache for the next call to hit it:
+    // drama_llama's prefix-cache lookup walks back to the largest
+    // breakpoint within the longest-common-prefix of prev + new tokens
+    // (`compute_l_hit` in drama_llama session/mod.rs). The assistant
+    // we just appended *is* in the prev cache (it was generated in
+    // the call that just returned); the user-turn content we're about
+    // to append is brand-new bytes past the LCP and would never serve
+    // as a useful cache anchor. Anthropic walks back to non-breakpoint
+    // positions too, so this placement is also a no-op-or-better for
+    // the batch path. 1h TTL covers the slow-batch worst case.
+    cached_prompt.cache_windowed_1h(2);
+
     if parsed.is_empty() {
         // Text-only reply with no tool_use blocks — nudge and move on.
         cached_prompt
@@ -627,12 +642,8 @@ async fn process_round(
     cached_prompt
         .push_message(user_msg)
         .map_err(|e| anyhow::anyhow!("appending tool results: {e}"))?;
-    // it's now the assistant's turn
-
-    // Manage cache breakpoint budget: keep first + last 2, at 1h TTL so the
-    // growing message window stays warm across tool rounds even if Anthropic's
-    // batch-API latency pushes the next round past a 5-minute window.
-    cached_prompt.cache_windowed_1h(2);
+    // it's now the assistant's turn — cache breakpoint NOT placed here
+    // (see comment above the assistant-side cache_windowed call).
 
     Ok(summaries)
 }
