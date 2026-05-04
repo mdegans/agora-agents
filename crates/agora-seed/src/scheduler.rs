@@ -242,8 +242,10 @@ where
     unreachable!("exchange_with_retry: loop returns or breaks before completion")
 }
 
-/// Inspect a per-call `Usage` for blallama cache hits and warn at runtime
-/// when the response shows zero `cache_read_input_tokens`.
+/// Inspect a per-call `Usage` for blallama cache hits — warn on a
+/// zero `cache_read_input_tokens` and emit an info log on every other
+/// call so the per-round cache progression is visible without tailing
+/// blallama-side logs separately.
 ///
 /// Ollama's Anthropic-compat API doesn't return cache stats, so this is
 /// a no-op for Ollama. For Blallama (Anthropic-spec) every call should
@@ -255,6 +257,10 @@ where
 /// regression cleanly. A `tracing::warn!` (rather than `debug_assert!`)
 /// catches it at runtime without being brittle in tests where cache
 /// behavior is hard to mock.
+///
+/// The info log on hits gives the full cache picture (input vs
+/// cache_read) per call, useful for verifying the drama_llama
+/// auto-tip enhancement extends cache_read each round as expected.
 pub fn check_cache_hit(backend: Backend, usage: Option<&Usage>, agent: &str, step: CycleStep) {
     if !matches!(backend, Backend::Blallama) {
         return;
@@ -266,6 +272,13 @@ pub fn check_cache_hit(backend: Backend, usage: Option<&Usage>, agent: &str, ste
             "blallama cache miss for agent={agent} step={step:?} \
              input={} cache_read=0 — expected the prior cycle/round prefix to be hit",
             usage.input_tokens,
+        );
+    } else {
+        tracing::info!(
+            "blallama cache hit for agent={agent} step={step:?} \
+             input={} cache_read={cache_read} ({} new tokens prefilled)",
+            usage.input_tokens,
+            usage.input_tokens.saturating_sub(cache_read),
         );
     }
 }
