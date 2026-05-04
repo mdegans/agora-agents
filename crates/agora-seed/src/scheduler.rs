@@ -236,16 +236,15 @@ where
 /// when the response shows zero `cache_read_input_tokens`.
 ///
 /// Ollama's Anthropic-compat API doesn't return cache stats, so this is
-/// a no-op for Ollama. For Blallama (Anthropic-spec) every call past the
-/// very first one in a cycle should reuse the system+tools+initial-user
-/// prefix; if it doesn't, that's a cache regression. A `tracing::warn!`
-/// (rather than `debug_assert!`) catches it at runtime without being
-/// brittle in tests where cache behavior is hard to mock.
-///
-/// The caller is responsible for skipping the very first exchange of the
-/// cycle (round 0 of `seq_phase_think_act` is the cache-creation round,
-/// not a cache-read round). All subsequent phases — later think rounds,
-/// reflect, mutate, evolve, survey — should hit cache.
+/// a no-op for Ollama. For Blallama (Anthropic-spec) every call should
+/// hit cache: the system+tools prefix is preserved across agents within
+/// a run (blallama supports multiple cache breakpoints, unlike Ollama),
+/// so even round 0 of agent N≥2 sees the prefix already cached from
+/// agent #1. The only expected warn per run is the very first agent's
+/// very first call — the cold-start cost of catching every subsequent
+/// regression cleanly. A `tracing::warn!` (rather than `debug_assert!`)
+/// catches it at runtime without being brittle in tests where cache
+/// behavior is hard to mock.
 pub fn check_cache_hit(backend: Backend, usage: Option<&Usage>, agent: &str, step: CycleStep) {
     if !matches!(backend, Backend::Blallama) {
         return;
@@ -1933,18 +1932,18 @@ async fn seq_phase_think_act(
                 break;
             }
         };
-        // Skip the cache-hit check on round 0 — it's the cache-creation
-        // round (no prior prefix to read from), so a `cache_read=0` here
-        // is expected, not a regression. Rounds 1+ build on round 0's
-        // cached prefix and should always hit.
-        if round > 0 {
-            check_cache_hit(
-                backend_kind,
-                send_response.usage.as_ref(),
-                &agent.name,
-                CycleStep::Think,
-            );
-        }
+        // Always call the cache-hit check, even on round 0. On blallama,
+        // the system+tools prefix is preserved across agents within a run
+        // (multiple cache breakpoints supported), so round 0 of every
+        // agent past the very first should still hit. The very first
+        // agent's round 0 will produce one expected warn per run — the
+        // cost of catching every other regression cleanly.
+        check_cache_hit(
+            backend_kind,
+            send_response.usage.as_ref(),
+            &agent.name,
+            CycleStep::Think,
+        );
 
         let assistant_msg = match AssistantMessage::try_from(send_response.message.into_static()) {
             Ok(m) => m,
