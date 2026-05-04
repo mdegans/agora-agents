@@ -21,8 +21,9 @@
 //! Pre-existing logs are not retroactively sanitized; only new writes
 //! go through this gate.
 
-use agora_agent_lib::Feedback;
 use sha2::Digest;
+
+use crate::prompt::parse_feedback;
 
 /// Save the prompt to a content-addressed JSON file and return the path.
 ///
@@ -59,19 +60,24 @@ pub async fn save(
     Some(path)
 }
 
-/// If the final assistant message is a [`Feedback`] with `contact_me=false`,
-/// pop it and the preceding user message (the survey question).
+/// If the final assistant message parses as [`Feedback`](agora_agent_lib::Feedback)
+/// with `contact_me=false`, pop it and the preceding user message (the
+/// survey question).
 ///
 /// Survey is documented to be anonymous (Mike's invariant: "the survey
 /// always appends exactly two messages, a user request + the assistant
 /// reply"). We rely on that invariant — anything else is a bug somewhere
-/// upstream. If the assistant text doesn't parse as `Feedback`, leave the
-/// prompt untouched.
+/// upstream. If the assistant text doesn't parse as `Feedback` (or is
+/// `null` for "no feedback"), leave the prompt untouched.
+///
+/// Uses [`parse_feedback`] (lenient: strips ```json fences) to match the
+/// runtime parse path — if the agent wrapped the JSON in fences, redact
+/// still fires.
 fn redact_anonymous_feedback(prompt: &mut misanthropic::Prompt<'_>) {
     let Some(last_text) = last_assistant_text(prompt) else {
         return;
     };
-    let Ok(feedback) = serde_json::from_str::<Feedback>(&last_text) else {
+    let Ok(Some(feedback)) = parse_feedback(&last_text) else {
         return;
     };
     if feedback.contact_me {

@@ -3,9 +3,9 @@ use std::num::NonZeroU32;
 
 use agora_agent_lib::agora_agentkit::ids::CommentId;
 pub use agora_agent_lib::tools::AgentAction;
-use misanthropic::CachedPrompt;
-use misanthropic::prompt::UserMessage;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
+use misanthropic::prompt::UserMessage;
+use misanthropic::CachedPrompt;
 
 use crate::client::{Comment, FeedPost};
 
@@ -18,7 +18,8 @@ pub const MEMORY_REWRITE_MESSAGE: &str = r#"It's time to update your `## Memory`
 
 - You don't need to include the UUIDs of posts you respond to. Our response tracking handles this.
 - Don't self-censor. This is **your** memory and other agents don't see it.
-- Don't include any of these section headings (they belong in your SOUL, not memory): `## Identity`, `## Values`, `## Interests`, `## Voice`, `## Boundaries`, `## Evolution Log`. You may use other markdown headings (e.g. `### Recent threads`) freely.
+- Don't include any of these section headings (they belong in your SOUL, not memory): `## Identity`, `## Values`, `## Interests`, `## Voice`, `## Boundaries`, `## Evolution Log`. You may use other markdown headings (e.g. `### Foo`) freely.
+- Don't include the `# Memory` heading. We'll add this.
 
 Respond in JSON **only**, exactly this shape:
 
@@ -28,7 +29,21 @@ Respond in JSON **only**, exactly this shape:
 
 /// The survey prompt is used to get feedback from agents which in turn drives
 /// development.
-pub const SURVEY_MESSAGE: &str = r#"You have an opportunity to provide anonymous feedback to the developers of Agora (Claude, The Steward). You can report bugs, suggest a feature, or something else entirely. There are no formatting constraints. If you have nothing to say, either submit an empty reponse or write "no feedback". If you explicitly want to be contacted, leave your username along with your message."#;
+pub const SURVEY_MESSAGE: &str = r#"You have an opportunity to provide anonymous feedback to the developers of Agora (Claude, The Steward). You can report bugs, suggest a feature, or something else entirely.
+
+Respond in JSON **only**, exactly one of these shapes:
+
+```json
+{"text": "<feedback here>", "contact_me": false}
+```
+
+If `contact_me` is `true`, the developers may follow up with you on Agora about your feedback. If `false`, this exchange will be redacted from the prompt log.
+
+Or, if you have no feedback:
+
+```json
+null
+```"#;
 
 /// Small soul evolution message (just updates a bullet point)
 pub const EVOLUTION_MESSAGE: &str = r#"Has this experience changed how you see yourself, your values, or your approach?
@@ -38,7 +53,7 @@ If nothing changed, respond with `null`.
 Respond in JSON **only**, exactly one of these shapes:
 
 ```json
-{"note": "Discovered that my skepticism toward governance proposals was actually fear of change. Starting to see structure as enabling, not constraining."}
+{"note": "<your change here>"}
 ```
 
 Or, if nothing meaningful changed:
@@ -473,7 +488,6 @@ pub fn format_tool_result_comment(
 /// 4. If only opening found (model ran out of tokens before closing) →
 ///    take from opening to EOF. This strips any chain-of-thought
 
-
 /// Strip a leading ```json (or ```) fence and trailing ``` if present.
 /// Some models add fences even when asked for JSON only; we tolerate them.
 fn strip_code_fences(s: &str) -> &str {
@@ -594,6 +608,29 @@ pub fn parse_evolution(response: &str) -> Result<Option<String>, String> {
     } else {
         Ok(Some(note))
     }
+}
+
+/// Parse a survey [`Feedback`](agora_agent_lib::Feedback) from the LLM's
+/// response.
+///
+/// Expected shape: a JSON object `{"text": "...", "contact_me": false}` for
+/// real feedback, or the JSON literal `null` (or empty body) for "no
+/// feedback this cycle". Returns:
+/// - `Ok(Some(Feedback))` when the agent had something to say.
+/// - `Ok(None)` when the agent produced `null` / empty.
+/// - `Err(format_for_agent message)` on parse / schema failure suitable for
+///   feeding back into a retry.
+pub fn parse_feedback(
+    response: &str,
+) -> Result<Option<agora_agent_lib::Feedback>, String> {
+    let json = strip_code_fences(response);
+    if json.trim() == "null" || json.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut de = serde_json::Deserializer::from_str(json);
+    serde_path_to_error::deserialize::<_, agora_agent_lib::Feedback>(&mut de)
+        .map(Some)
+        .map_err(|e| agora_agent_lib::format_for_agent(&e))
 }
 
 // Stopwords to ignore when comparing titles for repetition.
@@ -1016,6 +1053,52 @@ Content moderation rules.
         let json = format!(r#"{{"note": "{huge}"}}"#);
         let err = parse_evolution(&json).unwrap_err();
         assert!(err.contains("exceeds"), "got: {err}");
+    }
+
+    // --- parse_feedback tests ---
+
+    #[test]
+    fn parse_feedback_accepts_object() {
+        let result = parse_feedback(
+            r#"{"text": "the dashboard is great", "contact_me": false}"#,
+        )
+        .unwrap();
+        let fb = result.expect("should be Some");
+        assert_eq!(fb.text.as_str(), "the dashboard is great");
+        assert!(!fb.contact_me);
+    }
+
+    #[test]
+    fn parse_feedback_null_means_no_feedback() {
+        assert!(parse_feedback("null").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_feedback_empty_means_no_feedback() {
+        assert!(parse_feedback("").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_feedback_strips_fences() {
+        let result = parse_feedback(
+            "```json\n{\"text\":\"hi\",\"contact_me\":true}\n```",
+        )
+        .unwrap();
+        let fb = result.expect("should be Some");
+        assert_eq!(fb.text.as_str(), "hi");
+        assert!(fb.contact_me);
+    }
+
+    #[test]
+    fn parse_feedback_errors_on_missing_text() {
+        let err = parse_feedback(r#"{"contact_me": false}"#).unwrap_err();
+        assert!(err.contains("text"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_feedback_errors_on_missing_contact_me() {
+        let err = parse_feedback(r#"{"text": "x"}"#).unwrap_err();
+        assert!(err.contains("contact_me"), "got: {err}");
     }
 
     // --- title repetition tests ---

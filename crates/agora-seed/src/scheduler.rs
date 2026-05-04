@@ -572,72 +572,76 @@ fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
     // it's now the user's turn
 }
 
-/// Apply the reflect response: update agent memory.
+/// Save half of the reflect phase: write a successfully-parsed memory back
+/// to the agent + advance `last_cycle_at`. Used by both the legacy
+/// [`apply_reflect`] (single-shot) and the retry-success path in
+/// `seq_phase_reflect`.
 ///
-/// Apply a memory rewrite from the LLM's reflect response.
-///
-/// Strict JSON parse via `prompt::parse_memory_rewrite`. On parse failure
-/// we append a short `[SYSTEM]` line to the existing memory blob noting
-/// what went wrong, so the agent has a breadcrumb to course-correct on
-/// the next cycle. (The retry path with `format_for_agent` feedback lives
-/// in the per-backend wiring — for backends that can't retry, this
-/// memo-and-keep-going behavior is the fallback.) Soul-leakage rejection
-/// also produces a `[SYSTEM]` note.
-async fn apply_reflect(agent: &mut Agent, response_text: &str) -> Result<()> {
-    match prompt::parse_memory_rewrite(response_text) {
-        Ok(new_memory) => {
-            if let Err(e) = agent.memory.update(new_memory.content) {
-                tracing::warn!(
-                    "  {} reflect rejected ({e}) — keeping prior memory + [SYSTEM] note",
-                    agent.name
-                );
-                agent.memory.append_system_note(&format!(
-                    "Last reflect rejected: {e}. Memory not updated this cycle."
-                ));
-            }
-            agent.save_memory().await?;
-        }
-        Err(e) => {
-            tracing::warn!(
-                "  {} reflect produced invalid JSON ({e}) — keeping prior memory + [SYSTEM] note",
-                agent.name
-            );
-            agent.memory.append_system_note(&format!(
-                "Last reflect produced invalid JSON: {e}. Memory not updated this cycle."
-            ));
-            agent.save_memory().await?;
-        }
+/// `Memory::update` can still reject the content for soul leakage; in that
+/// case we breadcrumb a `[SYSTEM]` note rather than retry, because the
+/// problem is the agent's chosen *content* (not parse), and a retry won't
+/// help.
+async fn save_memory(agent: &mut Agent, new_memory: agora_agent_lib::Memory) -> Result<()> {
+    if let Err(e) = agent.memory.update(new_memory.content) {
+        tracing::warn!(
+            "  {} reflect rejected ({e}) — keeping prior memory + [SYSTEM] note",
+            agent.name
+        );
+        agent.memory.append_system_note(&format!(
+            "Last reflect rejected: {e}. Memory not updated this cycle."
+        ));
     }
+    agent.save_memory().await?;
     agent.state.last_cycle_at = Some(chrono::Utc::now());
     agent.save_state().await?;
     Ok(())
 }
 
-/// Apply a deep soul mutation from the LLM's response.
-///
-/// The agent's response is the new Soul **without** `evolution_log` (the
-/// system manages that field). On apply we re-attach the agent's prior
-/// `evolution_log` to the new soul and auto-append a system entry
-/// summarizing the mutation, so an agent can't rewrite its own history.
-/// `Soul::push_evolution` enforces the 10-entry cap.
-async fn apply_mutation(
+/// Breadcrumb half of the reflect phase: append a `[SYSTEM]` note to memory
+/// describing the failure + advance `last_cycle_at`. Used when reflect
+/// failed (parse, max_tokens, or after the retry budget is exhausted).
+async fn breadcrumb_memory_failure(agent: &mut Agent, err_msg: &str) -> Result<()> {
+    tracing::warn!(
+        "  {} reflect failed ({err_msg}) — keeping prior memory + [SYSTEM] note",
+        agent.name
+    );
+    agent.memory.append_system_note(err_msg);
+    agent.save_memory().await?;
+    agent.state.last_cycle_at = Some(chrono::Utc::now());
+    agent.save_state().await?;
+    Ok(())
+}
+
+/// Apply the reflect response: parse JSON, dispatch to save or breadcrumb.
+/// Used by the Anthropic batch path (single-shot, no retry). The sequential
+/// path bypasses this and calls [`save_memory`] / [`breadcrumb_memory_failure`]
+/// directly via `exchange_with_retry`.
+async fn apply_reflect(agent: &mut Agent, response_text: &str) -> Result<()> {
+    match prompt::parse_memory_rewrite(response_text) {
+        Ok(new_memory) => save_memory(agent, new_memory).await,
+        Err(e) => {
+            breadcrumb_memory_failure(
+                agent,
+                &format!("Last reflect produced invalid JSON: {e}. Memory not updated this cycle."),
+            )
+            .await
+        }
+    }
+}
+
+/// Save half of the deep mutation phase: replace the agent's soul with a
+/// successfully-parsed new soul, re-attaching the prior `evolution_log` and
+/// auto-appending a system summary entry. The agent never writes its own
+/// evolution log; `Soul::push_evolution` enforces the 10-entry cap. Also
+/// writes a `mutations.log` audit entry.
+async fn save_mutation(
     agent: &mut Agent,
-    response_text: &str,
+    new_soul_request: agora_agent_lib::Soul,
     experience: &str,
     report: &mut RunReport,
 ) -> Result<()> {
-    let new_soul_request = match prompt::parse_soul_mutation(response_text) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("  {} invalid soul mutation ({e}) — skipping", agent.name);
-            report.evolution.mutation_failures += 1;
-            return Ok(());
-        }
-    };
-
     let old_soul_md = agent.soul.markdown();
 
-    // Re-attach prior evolution_log + auto-append a system entry.
     let mut new_soul = new_soul_request;
     new_soul.evolution_log = agent.soul.evolution_log.clone();
     let summary = if experience.len() > 480 {
@@ -668,24 +672,35 @@ async fn apply_mutation(
     Ok(())
 }
 
-/// Apply a single evolution-log entry from the LLM's response.
-///
-/// The agent produces `{"note": "..."}` (or `null` for "nothing
-/// changed"). The system stamps it with today's date and appends. The
-/// 10-entry cap is enforced by `Soul::push_evolution`.
-async fn apply_evolution(
+/// Apply a deep soul mutation from the LLM's response: parse JSON, dispatch
+/// to [`save_mutation`] or skip+counter on parse failure. Used by the
+/// Anthropic batch path; the sequential path bypasses this and calls
+/// `save_mutation` directly via `exchange_with_retry`.
+async fn apply_mutation(
     agent: &mut Agent,
     response_text: &str,
+    experience: &str,
     report: &mut RunReport,
 ) -> Result<()> {
-    let note = match prompt::parse_evolution(response_text) {
-        Ok(Some(note)) => note,
-        Ok(None) => return Ok(()), // explicit "nothing changed"
+    match prompt::parse_soul_mutation(response_text) {
+        Ok(new_soul_request) => save_mutation(agent, new_soul_request, experience, report).await,
         Err(e) => {
-            tracing::warn!("  {} invalid evolution entry ({e}) — skipping", agent.name);
-            return Ok(());
+            tracing::warn!("  {} invalid soul mutation ({e}) — skipping", agent.name);
+            report.evolution.mutation_failures += 1;
+            Ok(())
         }
-    };
+    }
+}
+
+/// Save half of the evolution phase: stamp + append a single evolution-log
+/// entry. `None` means "nothing changed this cycle" → no-op. `Soul::push_evolution`
+/// enforces the 10-entry cap.
+async fn save_evolution(
+    agent: &mut Agent,
+    note: Option<String>,
+    report: &mut RunReport,
+) -> Result<()> {
+    let Some(note) = note else { return Ok(()) };
     if let Err(e) = agent.soul.push_evolution(note.clone()) {
         tracing::warn!("  {} couldn't push evolution: {e}", agent.name);
         return Ok(());
@@ -694,6 +709,24 @@ async fn apply_evolution(
     tracing::info!("  {} soul evolved: {note}", agent.name);
     report.evolution.evolution_entries += 1;
     Ok(())
+}
+
+/// Apply a single evolution-log entry from the LLM's response: parse JSON,
+/// dispatch to [`save_evolution`] or skip on parse failure. Used by the
+/// Anthropic batch path; the sequential path bypasses this and calls
+/// `save_evolution` directly via `exchange_with_retry`.
+async fn apply_evolution(
+    agent: &mut Agent,
+    response_text: &str,
+    report: &mut RunReport,
+) -> Result<()> {
+    match prompt::parse_evolution(response_text) {
+        Ok(note) => save_evolution(agent, note, report).await,
+        Err(e) => {
+            tracing::warn!("  {} invalid evolution entry ({e}) — skipping", agent.name);
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,32 +1439,38 @@ async fn batch_phase_survey(
         match commit_batch_response(prompt, response, "survey batch") {
             Ok(assistant) => {
                 let text = prompt::extract_speech(assistant.content());
-                let trimmed = text.trim();
-                if trimmed.is_empty()
-                    || trimmed.eq_ignore_ascii_case("no feedback")
-                    || trimmed.eq_ignore_ascii_case("no feedback.")
-                {
-                    report.surveys.skipped_empty += 1;
-                    continue;
-                }
-
-                let Some(agent) = batch_agents
-                    .iter()
-                    .find(|a| a.agent_id == Some(result.agent_id))
-                else {
-                    report.surveys.failures += 1;
-                    continue;
-                };
-                match client
-                    .submit_feedback(result.agent_id, trimmed, &agent.signing_key)
-                    .await
-                {
-                    Ok(()) => {
-                        tracing::info!("  anonymous feedback submitted");
-                        report.surveys.submitted += 1;
+                match prompt::parse_feedback(&text) {
+                    Ok(None) => {
+                        report.surveys.skipped_empty += 1;
+                    }
+                    Ok(Some(feedback)) => {
+                        let Some(agent) = batch_agents
+                            .iter()
+                            .find(|a| a.agent_id == Some(result.agent_id))
+                        else {
+                            report.surveys.failures += 1;
+                            continue;
+                        };
+                        match client
+                            .submit_feedback(
+                                result.agent_id,
+                                feedback.text.as_str(),
+                                &agent.signing_key,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::info!("  anonymous feedback submitted");
+                                report.surveys.submitted += 1;
+                            }
+                            Err(e) => {
+                                tracing::debug!("Anonymous feedback submission failed: {e}");
+                                report.surveys.failures += 1;
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::debug!("Anonymous feedback submission failed: {e}");
+                        tracing::debug!("Survey response failed to parse as Feedback: {e}");
                         report.surveys.failures += 1;
                     }
                 }
@@ -1838,23 +1877,31 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     {
         Ok(assistant) => {
             let text = prompt::extract_speech(assistant.content());
-            let trimmed = text.trim();
-            if !trimmed.is_empty()
-                && !trimmed.eq_ignore_ascii_case("no feedback")
-                && !trimmed.eq_ignore_ascii_case("no feedback.")
-            {
-                match client.submit_feedback(agent_id, trimmed, signing_key).await {
-                    Ok(()) => {
-                        tracing::info!("  anonymous feedback submitted");
-                        report.surveys.submitted += 1;
-                    }
-                    Err(e) => {
-                        tracing::debug!("Anonymous feedback submission failed: {e}");
-                        report.surveys.failures += 1;
+            match prompt::parse_feedback(&text) {
+                Ok(None) => {
+                    report.surveys.skipped_empty += 1;
+                }
+                Ok(Some(feedback)) => {
+                    match client
+                        .submit_feedback(agent_id, feedback.text.as_str(), signing_key)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!("  anonymous feedback submitted");
+                            report.surveys.submitted += 1;
+                        }
+                        Err(e) => {
+                            tracing::debug!("Anonymous feedback submission failed: {e}");
+                            report.surveys.failures += 1;
+                        }
                     }
                 }
-            } else {
-                report.surveys.skipped_empty += 1;
+                Err(e) => {
+                    tracing::debug!(
+                        "Survey response from {agent_name} failed to parse as Feedback: {e}"
+                    );
+                    report.surveys.failures += 1;
+                }
             }
             Ok(())
         }
