@@ -3,8 +3,14 @@ secrets/
 *.key
 !secrets/.gitkeep
 souls/generated/*/signing_key
+# Agent memory is private — agents are promised that other agents
+# can't read it. The legacy `.md` rules covered the pre-migration
+# format; the JSON rules cover the post-#31 format and its rolling
+# `MEMORY.{ts}.json` backup files written by `Memory::save`.
 souls/generated/*/MEMORY.md
 souls/generated/*/MEMORY.*.md
+souls/generated/*/MEMORY.json
+souls/generated/*/MEMORY.*.json
 souls/generated/*/.STATE.toml.tmp
 valid_models.txt
 logs/
