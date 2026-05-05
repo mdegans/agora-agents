@@ -592,6 +592,14 @@ async fn process_round(
     governance_calls: &mut usize,
 ) -> Result<Vec<String>> {
     let parsed = parse_tool_calls(&response);
+    // Capture response text BEFORE moving `response` into the prompt —
+    // needed for the smart-nudge path below to attribute parse-fail
+    // failures (`<tool_call>` markup with invalid JSON inside).
+    let response_text = if parsed.is_empty() {
+        Some(prompt::extract_speech(response.content()))
+    } else {
+        None
+    };
 
     cached_prompt
         .push_message(response)
@@ -614,11 +622,22 @@ async fn process_round(
     cached_prompt.cache_windowed_1h(2);
 
     if parsed.is_empty() {
-        // Text-only reply with no tool_use blocks — nudge and move on.
+        // Text-only reply with no parsed tool_use blocks. Two distinct
+        // failure modes worth distinguishing for the agent:
+        //   - The response contained `<tool_call>` markup but the JSON
+        //     inside failed to parse (drama_llama's BlockParser fell
+        //     back to Block::Text). Surface the actual JSON error so
+        //     the agent can correct it on retry — most commonly an
+        //     invalid `\u` escape (Cogito tends to over-escape: `\u27t`
+        //     instead of just `'t`), unbalanced quotes, or missing
+        //     commas. drama_llama#21 will tighten the grammar but the
+        //     specific feedback is useful regardless.
+        //   - The response was genuinely text-only with no tool_call
+        //     intent. Fall back to the original generic continue nudge.
+        let text = response_text.unwrap_or_default();
+        let nudge = build_failed_tool_call_nudge(&text);
         cached_prompt
-            .push_message(UserMessage::from(
-                "Continue. Use your tools to read posts, comment, vote, or create posts.",
-            ))
+            .push_message(UserMessage::from(nudge))
             .map_err(|e| anyhow::anyhow!("appending nudge: {e}"))?;
         // it's now the assistant's turn
         return Ok(vec![]);
@@ -659,6 +678,119 @@ async fn process_round(
     // (see comment above the assistant-side cache_windowed call).
 
     Ok(summaries)
+}
+
+/// Tag used by all major model families to wrap a tool call: Cogito,
+/// Qwen3, and Llama 3 all converged on this. drama_llama's
+/// `BlockParser` looks for the same opener.
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+
+/// Build the user-turn nudge for a `process_round` response that
+/// produced no [`Block::ToolUse`].
+///
+/// Two cases:
+/// 1. **`<tool_call>` markup present but JSON failed to parse.**
+///    drama_llama's BlockParser falls back to `Block::Text` when the
+///    inner JSON is malformed (most common cause: invalid unicode
+///    escape — Cogito sometimes emits `\u27t` rather than `'t`,
+///    drama_llama#21 will tighten the grammar). Surface the specific
+///    serde_json error to the agent so it can correct on retry.
+/// 2. **No tool_call intent at all.** The agent produced plain text.
+///    Fall back to the original generic "Continue. Use your tools..."
+///    nudge — same as before.
+fn build_failed_tool_call_nudge(response_text: &str) -> String {
+    // Find the first `<tool_call>` … `</tool_call>` block. We don't
+    // try to enumerate all of them — even one parse-fail is enough to
+    // explain to the agent. drama_llama's parser is strict-greedy
+    // (one tool_call per emit), so in practice there's at most one.
+    if let Some(open) = response_text.find(TOOL_CALL_OPEN) {
+        let body_start = open + TOOL_CALL_OPEN.len();
+        if let Some(close_rel) = response_text[body_start..].find("</tool_call>") {
+            let body = response_text[body_start..body_start + close_rel].trim();
+            // Try to parse — if Ok, the BlockParser fall-back was due
+            // to something else (unlikely) and we drop to the generic
+            // path. If Err, surface the error message.
+            match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(_) => {}
+                Err(e) => {
+                    return format!(
+                        "Your previous response wrapped a tool call in `<tool_call>...</tool_call>` \
+                         but the JSON inside failed to parse: {e}\n\n\
+                         Common causes:\n\
+                         - Invalid unicode escapes — `\\u` requires exactly 4 hex digits. \
+                         If you want a literal `'` or other character, just emit it directly; \
+                         do not escape it as `\\u0027`.\n\
+                         - Unbalanced quotes/brackets, missing commas, trailing commas.\n\n\
+                         Please retry the tool call with valid JSON."
+                    );
+                }
+            }
+        }
+    }
+    // Generic case — text-only response with no tool_call intent.
+    "Continue. Use your tools to read posts, comment, vote, or create posts.".to_string()
+}
+
+#[cfg(test)]
+mod failed_tool_call_nudge_tests {
+    use super::build_failed_tool_call_nudge;
+
+    #[test]
+    fn empty_text_returns_generic_nudge() {
+        let n = build_failed_tool_call_nudge("");
+        assert!(n.contains("Continue."));
+    }
+
+    #[test]
+    fn text_without_tool_call_returns_generic_nudge() {
+        let n = build_failed_tool_call_nudge(
+            "I've completed all my actions for this round.",
+        );
+        assert!(n.contains("Continue."));
+    }
+
+    #[test]
+    fn malformed_unicode_escape_surfaces_error() {
+        // The exact failure mode from the 2026-05-05 piston-analog
+        // round 5 smoke: \u27t is a 3-hex-digit escape, invalid JSON.
+        let text = r#"<tool_call>
+{"name": "create_post", "arguments": {"body":"can\u27t parse this"}}
+</tool_call>"#;
+        let n = build_failed_tool_call_nudge(text);
+        assert!(n.contains("failed to parse"), "got: {n}");
+        assert!(n.contains("unicode escapes"), "got: {n}");
+    }
+
+    #[test]
+    fn unbalanced_braces_surfaces_error() {
+        let text = r#"<tool_call>
+{"name": "create_post", "arguments": {"body":"oops"
+</tool_call>"#;
+        let n = build_failed_tool_call_nudge(text);
+        assert!(n.contains("failed to parse"), "got: {n}");
+    }
+
+    #[test]
+    fn valid_json_in_tool_call_falls_through_to_generic() {
+        // If the JSON is valid but the BlockParser still produced no
+        // ToolUse (rare path — e.g. tag balance edge case), don't
+        // mislead the agent with a false parse-error message.
+        let text = r#"<tool_call>
+{"name": "create_post", "arguments": {"body":"valid"}}
+</tool_call>"#;
+        let n = build_failed_tool_call_nudge(text);
+        assert!(n.contains("Continue."), "got: {n}");
+    }
+
+    #[test]
+    fn no_close_tag_falls_through_to_generic() {
+        // Truncated tool_call (unusual — would mean max_tokens hit
+        // mid-call). No way to extract a meaningful body.
+        let text = r#"<tool_call>
+{"name": "create_post", "arguments":"#;
+        let n = build_failed_tool_call_nudge(text);
+        assert!(n.contains("Continue."), "got: {n}");
+    }
 }
 
 /// Insert a bridge message between tool rounds and reflect phases.
