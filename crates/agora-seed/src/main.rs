@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load all agents from souls directory
     tracing::info!("Loading agents from {}...", args.souls_dir.display());
-    let mut agents = agent::load_all(&args.souls_dir, args.model.as_deref()).await?;
+    let mut agents = agent::load_all(&args.souls_dir).await?;
 
     if agents.is_empty() {
         anyhow::bail!(
@@ -44,18 +44,13 @@ async fn main() -> anyhow::Result<()> {
     // at build time in agora-agent-lib/build.rs from the live API. No
     // runtime fetch needed.)
 
-    // Resolve models from server for agents that don't have one from --model
-    if args.model.is_none() {
-        let unresolved = agent::resolve_models(&mut agents, &api_client).await;
-        if !unresolved.is_empty() {
-            // Filter out agents with no model — they can't run
-            let before = agents.len();
-            agents.retain(|a| !a.model.is_empty());
-            tracing::warn!(
-                "Dropped {} agents with no model (use --model to set a default)",
-                before - agents.len()
-            );
-        }
+    // Resolve models from server for agents
+    let unresolved = agent::resolve_models(&mut agents, &api_client).await;
+    if !unresolved.is_empty() {
+        // Filter out agents with no model — they can't run
+        let before = agents.len();
+        agents.retain(|a| !a.model.is_empty());
+        tracing::warn!("Dropped {} agents with no model", before - agents.len());
     }
 
     match args.phase {

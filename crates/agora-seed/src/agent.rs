@@ -33,7 +33,7 @@ impl Agent {
     ///
     /// If `model` is Some, it is used for all agents. Otherwise the model field
     /// is left empty and must be resolved from the server before running.
-    pub async fn load(dir: PathBuf, model: Option<&str>) -> Result<Self> {
+    pub async fn load(dir: PathBuf) -> Result<Self> {
         let soul_json = dir.join("SOUL.json");
         let soul_md = dir.join("SOUL.md");
         let soul = if soul_json.exists() {
@@ -110,8 +110,8 @@ impl Agent {
             None
         };
 
-        // Model assignment: from CLI flag or resolved later from server
-        let model = model.unwrap_or_default().to_string();
+        // Model assignment: resolved later from server
+        let model = String::new();
 
         let state = State::load(&dir).await;
 
@@ -177,7 +177,7 @@ impl Agent {
 }
 
 /// Load all agents from the souls directory.
-pub async fn load_all(souls_dir: &std::path::Path, model: Option<&str>) -> Result<Vec<Agent>> {
+pub async fn load_all(souls_dir: &std::path::Path) -> Result<Vec<Agent>> {
     let mut agents = Vec::new();
     let mut entries = tokio::fs::read_dir(souls_dir)
         .await
@@ -193,7 +193,7 @@ pub async fn load_all(souls_dir: &std::path::Path, model: Option<&str>) -> Resul
             continue;
         }
 
-        match Agent::load(path.clone(), model).await {
+        match Agent::load(path.clone()).await {
             Ok(agent) => agents.push(agent),
             Err(e) => {
                 tracing::warn!("Failed to load agent from {}: {e:#}", path.display());

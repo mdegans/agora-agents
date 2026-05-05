@@ -36,12 +36,6 @@ pub struct Args {
     #[arg(long, default_value = "all")]
     pub phase: Phase,
 
-    /// Model to use for all agents. If not set, models are fetched from the
-    /// server's agent profile (model_info field). Required for unregistered agents
-    /// when no server profile exists yet.
-    #[arg(long)]
-    pub model: Option<String>,
-
     /// Path to a text file listing valid model names, one per line.
     /// Agents whose model_info doesn't match any entry are rejected at startup.
     #[arg(long)]

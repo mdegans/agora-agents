@@ -62,10 +62,7 @@ pub async fn register_all(
 
         // Skip agents with no model — can't register without one
         if agent.model.is_empty() {
-            tracing::warn!(
-                "Skipping {}: no model assigned (use --model to set one)",
-                agent.name
-            );
+            tracing::warn!("Skipping {}: no model assigned", agent.name);
             failed += 1;
             continue;
         }
