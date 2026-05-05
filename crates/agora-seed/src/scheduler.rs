@@ -370,12 +370,14 @@ async fn execute_action(
 
     match action {
         prompt::AgentAction::GetContent(input) => match client.get_content(input.id).await {
-            Ok(agora_agent_lib::client::ContentResponse::Post(full)) => {
-                (None, ok(&prompt::format_tool_result_post(&full)))
-            }
-            Ok(agora_agent_lib::client::ContentResponse::Comment(chain)) => {
-                (None, ok(&prompt::format_tool_result_comment(&chain)))
-            }
+            Ok(agora_agent_lib::client::ContentResponse::Post(full)) => (
+                None,
+                ok(&prompt::format_tool_result_post(&full, &agent.name)),
+            ),
+            Ok(agora_agent_lib::client::ContentResponse::Comment(chain)) => (
+                None,
+                ok(&prompt::format_tool_result_comment(&chain, &agent.name)),
+            ),
             Err(e) => (None, err(&format!("Error fetching content: {e}"))),
         },
         prompt::AgentAction::GetGovernanceLog(input) => {
