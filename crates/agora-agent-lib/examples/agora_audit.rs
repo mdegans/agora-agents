@@ -120,7 +120,11 @@ async fn main() -> Result<()> {
 
 async fn run_audit(souls_dir: &Path, report_path: &Path) -> Result<()> {
     let entries = collect_agent_dirs(souls_dir)?;
-    println!("Auditing {} agents in {}", entries.len(), souls_dir.display());
+    println!(
+        "Auditing {} agents in {}",
+        entries.len(),
+        souls_dir.display()
+    );
     let mut reports = Vec::with_capacity(entries.len());
     let repo_dir = find_git_repo(souls_dir);
     for (i, dir) in entries.iter().enumerate() {
@@ -159,8 +163,7 @@ async fn run_migrate(souls_dir: &Path, report_path: &Path, dry_run: bool) -> Res
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_string();
-        let (soul_outcome, soul_to_write) =
-            migrate_soul(dir, repo_dir.as_deref()).await;
+        let (soul_outcome, soul_to_write) = migrate_soul(dir, repo_dir.as_deref()).await;
         let (memory_outcome, memory_to_write) = migrate_memory(dir).await;
 
         if !dry_run {
@@ -295,10 +298,7 @@ async fn audit_memory(dir: &Path) -> MemoryOutcome {
     MemoryOutcome::Emptied
 }
 
-async fn migrate_soul(
-    dir: &Path,
-    repo_dir: Option<&Path>,
-) -> (SoulOutcome, Option<Soul>) {
+async fn migrate_soul(dir: &Path, repo_dir: Option<&Path>) -> (SoulOutcome, Option<Soul>) {
     let json = dir.join("SOUL.json");
     if json.exists() {
         return (SoulOutcome::AlreadyJson, None);
@@ -462,10 +462,7 @@ async fn walk_git_for_good_soul(repo_dir: Option<&Path>, file: &Path) -> Option<
     Some(_commit)
 }
 
-async fn recover_soul_from_git(
-    repo_dir: Option<&Path>,
-    file: &Path,
-) -> Option<(String, Soul)> {
+async fn recover_soul_from_git(repo_dir: Option<&Path>, file: &Path) -> Option<(String, Soul)> {
     let repo = repo_dir?;
     // `file` may be relative; canonicalize it to compare against the repo root.
     let abs = file.canonicalize().ok()?;
@@ -516,9 +513,12 @@ async fn recover_soul_from_git(
 }
 
 fn write_report(reports: &[AgentReport], path: &Path) -> Result<()> {
-    let mut f = fs::File::create(path)
-        .with_context(|| format!("creating report {}", path.display()))?;
-    writeln!(f, "agent\tsoul_outcome\tsoul_detail\tmemory_outcome\tmemory_detail")?;
+    let mut f =
+        fs::File::create(path).with_context(|| format!("creating report {}", path.display()))?;
+    writeln!(
+        f,
+        "agent\tsoul_outcome\tsoul_detail\tmemory_outcome\tmemory_detail"
+    )?;
     for r in reports {
         let (so, sd) = soul_columns(&r.soul);
         let (mo, md) = memory_columns(&r.memory);
@@ -555,7 +555,9 @@ fn print_summary(reports: &[AgentReport]) {
     let mut memory_counts: HashMap<&'static str, usize> = HashMap::new();
     for r in reports {
         *soul_counts.entry(soul_columns(&r.soul).0).or_default() += 1;
-        *memory_counts.entry(memory_columns(&r.memory).0).or_default() += 1;
+        *memory_counts
+            .entry(memory_columns(&r.memory).0)
+            .or_default() += 1;
     }
     println!("\n=== Soul outcomes ===");
     let mut k: Vec<_> = soul_counts.iter().collect();

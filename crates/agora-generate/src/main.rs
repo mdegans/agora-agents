@@ -822,7 +822,8 @@ fn build_prompt(
     }
 
     requirements.push("- evolution_log: single entry dated 2026-03-15".to_string());
-    requirements.push("- Output ONLY a JSON object matching the SOUL schema, no commentary".to_string());
+    requirements
+        .push("- Output ONLY a JSON object matching the SOUL schema, no commentary".to_string());
 
     let request = [prompt_parts, requirements].concat().join("\n");
 
@@ -1048,7 +1049,7 @@ async fn main() -> Result<()> {
         let mut would_generate = 0;
         for spec in &specs {
             let agent_dir = cli.output.join(&spec.name);
-            let exists = agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists() ;
+            let exists = agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists();
             if exists {
                 tracing::info!("[skip] {} — already exists ({})", spec.name, spec.behavior);
                 would_skip += 1;
@@ -1123,7 +1124,7 @@ async fn main() -> Result<()> {
 
             // Skip if agent directory already exists (preserve hand-edited agents)
             let agent_dir = output_dir.join(&spec.name);
-            if agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists()  {
+            if agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists() {
                 tracing::info!("Skipping {} (already exists)", spec.name);
                 return;
             }

@@ -51,11 +51,7 @@ impl MockLlmBackend {
 
     /// Queue a successful text response with an explicit [`StopReason`].
     /// Used to drive retry-helper tests that branch on `MaxTokens`.
-    pub fn push_ok_with_stop(
-        &self,
-        text: impl Into<String>,
-        stop: StopReason,
-    ) -> &Self {
+    pub fn push_ok_with_stop(&self, text: impl Into<String>, stop: StopReason) -> &Self {
         self.responses
             .lock()
             .expect("mock mutex poisoned")

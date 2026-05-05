@@ -122,7 +122,10 @@ pub fn with_tool_choice<'a>(
 pub fn phase_config(
     backend: Backend,
     step: CycleStep,
-) -> (Option<tool::Choice>, Option<misanthropic::prompt::OutputConfig>) {
+) -> (
+    Option<tool::Choice>,
+    Option<misanthropic::prompt::OutputConfig>,
+) {
     use misanthropic::prompt::OutputConfig;
     use tool::Choice;
     let tool_choice = match (backend, step) {
@@ -163,10 +166,7 @@ pub fn apply_phase_config(cached: &mut CachedPrompt<'static>, backend: Backend, 
         return;
     }
     let (tc, oc) = phase_config(backend, step);
-    let owned = std::mem::replace(
-        cached,
-        CachedPrompt::from(misanthropic::Prompt::default()),
-    );
+    let owned = std::mem::replace(cached, CachedPrompt::from(misanthropic::Prompt::default()));
     let owned = with_tool_choice(owned, tc);
     let owned = with_output_config(owned, oc);
     *cached = owned;
@@ -745,9 +745,7 @@ mod failed_tool_call_nudge_tests {
 
     #[test]
     fn text_without_tool_call_returns_generic_nudge() {
-        let n = build_failed_tool_call_nudge(
-            "I've completed all my actions for this round.",
-        );
+        let n = build_failed_tool_call_nudge("I've completed all my actions for this round.");
         assert!(n.contains("Continue."));
     }
 
@@ -1673,9 +1671,8 @@ async fn batch_phase_evolve(
             };
             let response = result.response.map(|m| m.into_static());
             if let Ok(assistant) = commit_batch_response(prompt, response, "mutation retry batch")
-                && let Ok(soul) = prompt::parse_soul_mutation(&prompt::extract_speech(
-                    assistant.content(),
-                ))
+                && let Ok(soul) =
+                    prompt::parse_soul_mutation(&prompt::extract_speech(assistant.content()))
             {
                 to_save.push((agent_id, soul));
                 retry_succeeded.insert(agent_id);
@@ -1956,10 +1953,7 @@ async fn run_batch(
     for ctx in &agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
-        agent_prompts.insert(
-            agent_id,
-            build_prompt(agent, ctx, constitution),
-        );
+        agent_prompts.insert(agent_id, build_prompt(agent, ctx, constitution));
         action_summaries_map.insert(agent_id, Vec::new());
     }
 
@@ -2391,9 +2385,7 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
             Ok(())
         }
         Err(parse_err) => {
-            tracing::debug!(
-                "Survey for {agent_name} failed after retry: {parse_err}"
-            );
+            tracing::debug!("Survey for {agent_name} failed after retry: {parse_err}");
             report.surveys.failures += 1;
             Ok(())
         }
@@ -2810,7 +2802,6 @@ async fn run_cycles(
                         client,
                         config,
                         constitution,
-
                         Some(all_eps.as_slice()),
                         &mut anthropic_report,
                         cycle,
@@ -2833,7 +2824,6 @@ async fn run_cycles(
                                 client,
                                 config,
                                 constitution,
-
                                 &mut worker_reports[0],
                                 cycle,
                             )
@@ -2844,25 +2834,23 @@ async fn run_cycles(
                             let (a, b) = tokio::join!(
                                 run_worker(
                                     &ollama_endpoints[0],
-                                messages_api_backend,
+                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-
                                     &mut r0[0],
                                     cycle,
                                 ),
                                 run_worker(
                                     &ollama_endpoints[1],
-                                messages_api_backend,
+                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-
                                     &mut r1[0],
                                     cycle,
                                 ),
@@ -2875,37 +2863,34 @@ async fn run_cycles(
                             let (a, b, c) = tokio::join!(
                                 run_worker(
                                     &ollama_endpoints[0],
-                                messages_api_backend,
+                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-
                                     &mut r0[0],
                                     cycle,
                                 ),
                                 run_worker(
                                     &ollama_endpoints[1],
-                                messages_api_backend,
+                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-
                                     &mut r1[0],
                                     cycle,
                                 ),
                                 run_worker(
                                     &ollama_endpoints[2],
-                                messages_api_backend,
+                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
                                     config,
                                     constitution,
-
                                     &mut r2[0],
                                     cycle,
                                 ),
@@ -2958,7 +2943,6 @@ async fn run_cycles(
                         client,
                         config,
                         constitution,
-
                         None,
                         &mut anthropic_report,
                         cycle,
@@ -3395,7 +3379,11 @@ mod tests {
             err.contains("expected 'ok'"),
             "should surface the final parse error, got: {err}"
         );
-        assert_eq!(mock.remaining(), 0, "should not have called the backend a third time");
+        assert_eq!(
+            mock.remaining(),
+            0,
+            "should not have called the backend a third time"
+        );
         // user, assistant(garbage1), user(retry-feedback), assistant(garbage2)
         assert_eq!(prompt.messages.len(), 4);
     }
@@ -3488,7 +3476,10 @@ mod tests {
             "Ollama Reflect should set output_config (Memory schema)"
         );
         let (_, oc) = phase_config(Backend::Ollama, CycleStep::Survey);
-        assert!(oc.is_some(), "Ollama Survey should set output_config (Feedback schema)");
+        assert!(
+            oc.is_some(),
+            "Ollama Survey should set output_config (Feedback schema)"
+        );
     }
 
     #[test]

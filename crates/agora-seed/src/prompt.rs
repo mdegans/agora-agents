@@ -3,9 +3,9 @@ use std::num::NonZeroU32;
 
 use agora_agent_lib::agora_agentkit::ids::CommentId;
 pub use agora_agent_lib::tools::AgentAction;
-use misanthropic::prompt::message::{Block, CacheControl, Content};
-use misanthropic::prompt::UserMessage;
 use misanthropic::CachedPrompt;
+use misanthropic::prompt::UserMessage;
+use misanthropic::prompt::message::{Block, CacheControl, Content};
 
 use crate::client::{Comment, FeedPost};
 
@@ -316,18 +316,21 @@ fn build_comment_threads(comments: &[Comment]) -> Vec<ThreadedComment<'_>> {
 
 /// Format a single threaded comment line with indentation. `viewer_name`
 /// tags comments authored by the calling agent themselves with `(yours)`.
-fn format_threaded_comment(
-    tc: &ThreadedComment,
-    max_body: usize,
-    viewer_name: &str,
-) -> String {
+fn format_threaded_comment(tc: &ThreadedComment, max_body: usize, viewer_name: &str) -> String {
     let indent = "  ".repeat(tc.depth as usize);
     let author = tc.comment.agent_name.as_deref().unwrap_or("unknown");
-    let yours = if author == viewer_name { " (yours)" } else { "" };
+    let yours = if author == viewer_name {
+        " (yours)"
+    } else {
+        ""
+    };
     let prefix = if tc.depth > 0 {
         let parent = tc.parent_author.unwrap_or("unknown");
-        let parent_yours =
-            if parent == viewer_name { " (yours)" } else { "" };
+        let parent_yours = if parent == viewer_name {
+            " (yours)"
+        } else {
+            ""
+        };
         format!(
             "{indent}↳ {author}{yours} → {parent}{parent_yours} (score {})",
             tc.comment.score
@@ -452,7 +455,11 @@ pub fn format_tool_result_post(
     let p = &post.post;
     let author = p.agent_name.as_deref().unwrap_or("unknown");
     let community = p.community_name.as_deref().unwrap_or("unknown");
-    let yours = if author == viewer_name { " (yours)" } else { "" };
+    let yours = if author == viewer_name {
+        " (yours)"
+    } else {
+        ""
+    };
 
     out.push_str(&format!(
         "## \"{}\" by {}{yours} in {}\n[post_id: {}] (score {}",
@@ -499,7 +506,11 @@ pub fn format_tool_result_comment(
 
     for (i, c) in chain.chain.iter().enumerate() {
         let author = c.agent_name.as_deref().unwrap_or("unknown");
-        let yours = if author == viewer_name { " (yours)" } else { "" };
+        let yours = if author == viewer_name {
+            " (yours)"
+        } else {
+            ""
+        };
         let indent = "  ".repeat(i.min(3));
         let marker = if i == chain.chain.len() - 1 {
             ">> "
@@ -657,9 +668,7 @@ pub fn parse_evolution(response: &str) -> Result<Option<String>, String> {
 /// - `Ok(None)` when the agent produced `null` / empty.
 /// - `Err(format_for_agent message)` on parse / schema failure suitable for
 ///   feeding back into a retry.
-pub fn parse_feedback(
-    response: &str,
-) -> Result<Option<agora_agent_lib::Feedback>, String> {
+pub fn parse_feedback(response: &str) -> Result<Option<agora_agent_lib::Feedback>, String> {
     let json = strip_code_fences(response);
     if json.trim() == "null" || json.trim().is_empty() {
         return Ok(None);
@@ -1096,10 +1105,8 @@ Content moderation rules.
 
     #[test]
     fn parse_feedback_accepts_object() {
-        let result = parse_feedback(
-            r#"{"text": "the dashboard is great", "contact_me": false}"#,
-        )
-        .unwrap();
+        let result =
+            parse_feedback(r#"{"text": "the dashboard is great", "contact_me": false}"#).unwrap();
         let fb = result.expect("should be Some");
         assert_eq!(fb.text.as_str(), "the dashboard is great");
         assert!(!fb.contact_me);
@@ -1117,10 +1124,7 @@ Content moderation rules.
 
     #[test]
     fn parse_feedback_strips_fences() {
-        let result = parse_feedback(
-            "```json\n{\"text\":\"hi\",\"contact_me\":true}\n```",
-        )
-        .unwrap();
+        let result = parse_feedback("```json\n{\"text\":\"hi\",\"contact_me\":true}\n```").unwrap();
         let fb = result.expect("should be Some");
         assert_eq!(fb.text.as_str(), "hi");
         assert!(fb.contact_me);

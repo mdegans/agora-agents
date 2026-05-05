@@ -26,10 +26,7 @@ impl<const MAX: usize> ShortString<MAX> {
         let s = s.into();
         let len = s.chars().count();
         if len > MAX {
-            return Err(ShortStringError {
-                got: len,
-                max: MAX,
-            });
+            return Err(ShortStringError { got: len, max: MAX });
         }
         Ok(ShortString(s))
     }

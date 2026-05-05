@@ -100,9 +100,10 @@ async fn main() -> Result<()> {
                 if has_error {
                     agents_with_errors += 1;
                 }
-                if warnings.iter().any(|w| {
-                    w.level == WarnLevel::Error && w.message.contains("no communities")
-                }) {
+                if warnings
+                    .iter()
+                    .any(|w| w.level == WarnLevel::Error && w.message.contains("no communities"))
+                {
                     agents_with_no_communities += 1;
                 }
 
@@ -241,8 +242,7 @@ async fn main() -> Result<()> {
                 // `RUST_LOG=agora_seed=debug` for per-phase request/
                 // response logging.
                 let _ = agent; // filter was already applied above
-                scheduler::run_all(&mut agents, &api_client, &cli, &constitution)
-                    .await?;
+                scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
             }
         }
         Phase::All => {

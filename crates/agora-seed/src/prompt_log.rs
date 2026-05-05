@@ -119,8 +119,8 @@ fn last_assistant_text(prompt: &misanthropic::Prompt<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use misanthropic::prompt::message::{Content, Role};
     use misanthropic::prompt::Message;
+    use misanthropic::prompt::message::{Content, Role};
 
     fn make_prompt(messages: Vec<Message<'static>>) -> misanthropic::Prompt<'static> {
         misanthropic::Prompt {
@@ -198,5 +198,4 @@ mod tests {
         redact_anonymous_feedback(&mut prompt);
         assert_eq!(prompt.messages.len(), 1);
     }
-
 }

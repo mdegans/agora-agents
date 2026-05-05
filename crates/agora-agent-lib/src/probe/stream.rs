@@ -83,9 +83,7 @@ impl ProbeStreamConsumer {
             .header("Accept", "text/event-stream")
             .send()
             .await
-            .with_context(|| {
-                format!("connecting to probe stream {probe_url}")
-            })?;
+            .with_context(|| format!("connecting to probe stream {probe_url}"))?;
         let status = response.status();
         anyhow::ensure!(
             status.is_success(),
@@ -122,9 +120,7 @@ impl ProbeStreamConsumer {
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "timed out waiting for probe session {target_id}"
-                    )
+                    anyhow::anyhow!("timed out waiting for probe session {target_id}")
                 })?;
             match tokio::time::timeout(remaining, self.rx.recv()).await {
                 Ok(Some(session)) => {
@@ -141,9 +137,7 @@ impl ProbeStreamConsumer {
                     );
                 }
                 Err(_elapsed) => {
-                    anyhow::bail!(
-                        "timed out waiting for probe session {target_id}"
-                    );
+                    anyhow::bail!("timed out waiting for probe session {target_id}");
                 }
             }
         }
@@ -262,9 +256,7 @@ pub fn probe_url_from_endpoint(endpoint: &url::Url) -> anyhow::Result<url::Url> 
     let mut probe = endpoint.clone();
     probe
         .path_segments_mut()
-        .map_err(|()| {
-            anyhow::anyhow!("endpoint {endpoint} has no base path")
-        })?
+        .map_err(|()| anyhow::anyhow!("endpoint {endpoint} has no base path"))?
         .clear()
         .push("probe");
     Ok(probe)
@@ -283,8 +275,7 @@ mod tests {
 
     #[test]
     fn probe_url_replaces_existing_path() {
-        let endpoint =
-            url::Url::parse("http://192.168.0.123:11436/v1/messages").unwrap();
+        let endpoint = url::Url::parse("http://192.168.0.123:11436/v1/messages").unwrap();
         let probe = probe_url_from_endpoint(&endpoint).unwrap();
         assert_eq!(probe.as_str(), "http://192.168.0.123:11436/probe");
     }
