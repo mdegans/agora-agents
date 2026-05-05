@@ -45,7 +45,7 @@ use serde::Serialize;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
-use crate::config::{Backend, Cli, Endpoint};
+use crate::config::{Args, Backend, Endpoint};
 use crate::prompt;
 use crate::prompt::EVOLUTION_MESSAGE;
 use crate::prompt::MEMORY_REWRITE_MESSAGE;
@@ -301,18 +301,13 @@ pub fn check_cache_hit(backend: Backend, usage: Option<&Usage>, agent: &str, ste
 /// the problem is logged at error level with the agent name so operators
 /// can investigate. This guards against the constitution silently falling
 /// out of the system prefix due to an upstream sanitization change.
-pub fn build_prompt(
-    agent: &Agent,
-    ctx: &AgentCycleContext,
-    constitution: &str,
-) -> CachedPrompt<'static> {
+pub fn build_prompt(agent: &Agent, ctx: &AgentCycleContext) -> CachedPrompt<'static> {
     let cached = prompt::build(
         &agent.model,
         &agent.soul.markdown(),
         &agent.memory.render_for_prompt(),
         &ctx.recent_activity,
         &ctx.pending_replies_text,
-        constitution,
         &ctx.perception_text,
     );
 
@@ -1162,7 +1157,6 @@ fn make_work_item(
 async fn prime_anthropic_models(
     backend: &AnthropicBatch,
     models: impl IntoIterator<Item = String>,
-    constitution: &str,
 ) {
     use std::num::NonZeroU32;
 
@@ -1180,7 +1174,7 @@ async fn prime_anthropic_models(
         .into_iter()
         .map(|model| {
             let hash = model_prefix_hash(&model);
-            let mut prompt = prompt::build_base_prompt(&model, constitution);
+            let mut prompt = prompt::build_base_prompt(&model);
             prompt
                 .push_message(UserMessage::from("ping"))
                 .expect("first user message on a fresh prompt is always valid");
@@ -1261,7 +1255,7 @@ async fn batch_phase_think_act(
     agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
     action_summaries_map: &mut HashMap<AgentId, Vec<String>>,
     client: &AgoraClient,
-    config: &Cli,
+    config: &Args,
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -1935,8 +1929,7 @@ async fn run_batch(
     backend: &AnthropicBatch,
     batch_agents: &mut [Agent],
     client: &AgoraClient,
-    config: &Cli,
-    constitution: &str,
+    config: &Args,
     _ollama_endpoints: Option<&[OllamaEndpoint]>,
     report: &mut RunReport,
     cycle: usize,
@@ -1953,7 +1946,7 @@ async fn run_batch(
     for ctx in &agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
-        agent_prompts.insert(agent_id, build_prompt(agent, ctx, constitution));
+        agent_prompts.insert(agent_id, build_prompt(agent, ctx));
         action_summaries_map.insert(agent_id, Vec::new());
     }
 
@@ -2397,8 +2390,7 @@ async fn run_sequential(
     backend_kind: Backend,
     batch_agents: &mut [Agent],
     client: &AgoraClient,
-    config: &Cli,
-    constitution: &str,
+    config: &Args,
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -2424,7 +2416,7 @@ async fn run_sequential(
         };
 
         // Think/act
-        let mut cached_prompt = build_prompt(agent, &ctx, constitution);
+        let mut cached_prompt = build_prompt(agent, &ctx);
         let summaries = seq_phase_think_act(
             endpoint,
             backend_kind,
@@ -2663,8 +2655,7 @@ async fn run_worker(
     pool: &BatchPool,
     results_tx: tokio::sync::mpsc::UnboundedSender<Vec<Agent>>,
     client: &AgoraClient,
-    config: &Cli,
-    constitution: &str,
+    config: &Args,
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -2686,7 +2677,6 @@ async fn run_worker(
             &mut batch_agents,
             client,
             config,
-            constitution,
             report,
             cycle,
         )
@@ -2714,8 +2704,7 @@ async fn run_cycles(
     anthropic: Option<&AnthropicBatch>,
     agents: &mut Vec<Agent>,
     client: &AgoraClient,
-    config: &Cli,
-    constitution: &str,
+    config: &Args,
     ollama_models: &HashSet<String>,
     report: &mut RunReport,
     messages_api_backend: Backend,
@@ -2791,7 +2780,7 @@ async fn run_cycles(
                     // so long multi-cycle runs ride the 1h TTL.
                     let models: Vec<String> =
                         anthropic_agents.iter().map(|a| a.model.clone()).collect();
-                    prime_anthropic_models(backend, models, constitution).await;
+                    prime_anthropic_models(backend, models).await;
                     tracing::info!(
                         "--- Anthropic batch ({} agents) ---",
                         anthropic_agents.len()
@@ -2801,7 +2790,6 @@ async fn run_cycles(
                         anthropic_agents,
                         client,
                         config,
-                        constitution,
                         Some(all_eps.as_slice()),
                         &mut anthropic_report,
                         cycle,
@@ -2823,7 +2811,6 @@ async fn run_cycles(
                                 results_tx.clone(),
                                 client,
                                 config,
-                                constitution,
                                 &mut worker_reports[0],
                                 cycle,
                             )
@@ -2839,7 +2826,6 @@ async fn run_cycles(
                                     results_tx.clone(),
                                     client,
                                     config,
-                                    constitution,
                                     &mut r0[0],
                                     cycle,
                                 ),
@@ -2850,7 +2836,6 @@ async fn run_cycles(
                                     results_tx.clone(),
                                     client,
                                     config,
-                                    constitution,
                                     &mut r1[0],
                                     cycle,
                                 ),
@@ -2868,7 +2853,6 @@ async fn run_cycles(
                                     results_tx.clone(),
                                     client,
                                     config,
-                                    constitution,
                                     &mut r0[0],
                                     cycle,
                                 ),
@@ -2879,7 +2863,6 @@ async fn run_cycles(
                                     results_tx.clone(),
                                     client,
                                     config,
-                                    constitution,
                                     &mut r1[0],
                                     cycle,
                                 ),
@@ -2890,7 +2873,6 @@ async fn run_cycles(
                                     results_tx.clone(),
                                     client,
                                     config,
-                                    constitution,
                                     &mut r2[0],
                                     cycle,
                                 ),
@@ -2931,7 +2913,7 @@ async fn run_cycles(
                     // Re-invoke every cycle; see freshness note above.
                     let models: Vec<String> =
                         anthropic_agents.iter().map(|a| a.model.clone()).collect();
-                    prime_anthropic_models(backend, models, constitution).await;
+                    prime_anthropic_models(backend, models).await;
                     let mut anthropic_report = RunReport::default();
                     tracing::info!(
                         "--- Anthropic batch ({} agents) ---",
@@ -2942,7 +2924,6 @@ async fn run_cycles(
                         anthropic_agents,
                         client,
                         config,
-                        constitution,
                         None,
                         &mut anthropic_report,
                         cycle,
@@ -3052,12 +3033,7 @@ fn merge_reports(main: &mut RunReport, sub: &RunReport) {
 }
 
 /// Run all agents using the pipeline scheduler.
-pub async fn run_all(
-    agents: &mut Vec<Agent>,
-    client: &AgoraClient,
-    config: &Cli,
-    constitution: &str,
-) -> Result<()> {
+pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Args) -> Result<()> {
     let start = Instant::now();
 
     if !config.agent_filter.is_empty() {
@@ -3242,7 +3218,6 @@ pub async fn run_all(
         agents,
         client,
         config,
-        constitution,
         &ollama_models,
         &mut report,
         messages_backend,

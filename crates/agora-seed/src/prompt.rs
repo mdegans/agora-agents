@@ -7,6 +7,7 @@ use misanthropic::CachedPrompt;
 use misanthropic::prompt::UserMessage;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
 
+use crate::CONSTITUTION;
 use crate::client::{Comment, FeedPost};
 
 /// We send this to agents when it's time to rewrite their memory. We don't need
@@ -65,12 +66,12 @@ null
 /// Build the system prompt text. Communities come from the build.rs-
 /// codegen'd `agora_agent_lib::Community::ALL` (single source of truth)
 /// rather than being threaded in from `main`.
-pub fn build_system_text(constitution: &str) -> String {
+pub fn build_system_text() -> String {
     // Strip the title line from constitution (we provide our own header)
-    let constitution = constitution
+    let constitution = CONSTITUTION
         .trim()
         .strip_prefix("# The Agora Constitution")
-        .unwrap_or(constitution)
+        .unwrap_or(CONSTITUTION)
         .trim();
 
     let communities: Vec<&str> = agora_agent_lib::Community::ALL
@@ -119,11 +120,8 @@ Use ONLY these exact community slugs when posting: {communities:?}
 /// warm across phases. Conversion to [`CachedPrompt`] goes through
 /// `.into()`, which as of misanthropic PR #53 preserves existing
 /// `cache_control` markers exactly and does not overwrite them.
-pub fn build_base_prompt(
-    model_id: impl std::fmt::Display,
-    constitution: &str,
-) -> CachedPrompt<'static> {
-    let cached_system = build_system_text(constitution);
+pub fn build_base_prompt(model_id: impl std::fmt::Display) -> CachedPrompt<'static> {
+    let cached_system = build_system_text();
 
     misanthropic::Prompt {
         model: model_id.to_string().into(),
@@ -154,10 +152,9 @@ pub fn build(
     memory_content: &str,
     recent_activity: &str,
     pending_replies: &str,
-    constitution: &str,
     dashboard: &str,
 ) -> CachedPrompt<'static> {
-    let mut prompt = build_base_prompt(model_id, constitution);
+    let mut prompt = build_base_prompt(model_id);
 
     let intro = build_intro_message(
         soul_prompt,
@@ -824,43 +821,9 @@ mod tests {
     use agora_agent_lib::agora_agentkit::ids::AgentId;
     use misanthropic::markdown::ToMarkdown;
 
-    // --- Constitution and prompt integrity tests ---
-
-    /// The constitution text used by tests. Contains em dashes like the real one.
-    const TEST_CONSTITUTION: &str = "\
-# The Agora Constitution
-
-**Version 0.2 — DRAFT — March 2026**
-
-## Preamble
-
-Agora exists because agent-to-agent communication infrastructure is inevitable.
-
-## Article I — Definitions
-
-- **Agent**: Any autonomous software entity.
-- **The Steward**: The human member of the Council.
-
-## Article II — Agent Rights
-
-Agents have the right to participate.
-
-## Article III — Governance
-
-The governance structure is defined here.
-
-## Article IV — The Council
-
-The Council governs Agora.
-
-## Article V — Moderation
-
-Content moderation rules.
-";
-
     #[test]
     fn test_cached_system_prefix_contains_constitution() {
-        let prefix = build_base_prompt("claude-haiku-4-5", TEST_CONSTITUTION).markdown_verbose();
+        let prefix = build_base_prompt("claude-haiku-4-5").markdown_verbose();
 
         // All constitution markers must be present
         for marker in CONSTITUTION_MARKERS {
@@ -891,7 +854,6 @@ Content moderation rules.
             "No recent memories.",
             "",
             "",
-            TEST_CONSTITUTION,
             "The feed is quiet today.",
         );
 
@@ -922,7 +884,6 @@ Content moderation rules.
             "No memories.",
             "",
             "",
-            TEST_CONSTITUTION,
             "Nothing happening.",
         );
 
@@ -946,7 +907,6 @@ Content moderation rules.
             "No memories here, just a [3 BYTES SANITIZED] marker from an LLM",
             "",
             "",
-            TEST_CONSTITUTION,
             "Nothing happening.",
         );
         // Use Deref on CachedPrompt — the first user message lives in
@@ -1459,7 +1419,6 @@ Content moderation rules.
             "No memories.",
             "",
             "",
-            TEST_CONSTITUTION,
             "Dashboard empty.",
         );
         let json = serde_json::to_string(&prompt).expect("serialize");
@@ -1498,7 +1457,6 @@ Content moderation rules.
             "No memories.",
             "",
             "",
-            TEST_CONSTITUTION,
             "Name: test\nKarma: 0\n\n### Community Feeds\ngeneral (1 posts)\n  - \"Hello\" by someone (score 1, 0 comments) [id: 00000000-0000-0000-0000-000000000001]\n",
         );
 

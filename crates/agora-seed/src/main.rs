@@ -1,3 +1,5 @@
+use clap::Parser;
+
 mod agent;
 mod client;
 mod config;
@@ -6,45 +8,34 @@ mod prompt_log;
 mod scheduler;
 mod setup;
 mod state;
+mod utils;
 
-use anyhow::{Context, Result};
-use clap::Parser;
-
-use config::{Cli, Phase};
+use config::{Args, Phase};
+pub use utils::CONSTITUTION;
+use utils::{init_logging, read_file_stripped};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+async fn main() -> anyhow::Result<()> {
+    init_logging();
+    let args = Args::parse();
 
     // Load operator password from file
-    let operator_password = tokio::fs::read_to_string(&cli.operator_password_file)
-        .await
-        .with_context(|| {
-            format!(
-                "reading operator password from {}",
-                cli.operator_password_file.display()
-            )
-        })?;
-    let operator_password = operator_password.trim().to_string();
+    // FIXME: Before production, we should be storing and reading the password
+    // using the keyring crate, supporting the password file only for legacy.
+    // `operator_password_file` can become Option in this case.
+    let operator_password = read_file_stripped(&args.operator_password_file).await?;
 
     // Create API client
-    let api_client = client::AgoraClient::new(&cli.server_url)?;
+    let api_client = client::AgoraClient::new(&args.server_url)?;
 
     // Load all agents from souls directory
-    tracing::info!("Loading agents from {}...", cli.souls_dir.display());
-    let mut agents = agent::load_all(&cli.souls_dir, cli.model.as_deref()).await?;
+    tracing::info!("Loading agents from {}...", args.souls_dir.display());
+    let mut agents = agent::load_all(&args.souls_dir, args.model.as_deref()).await?;
 
     if agents.is_empty() {
         anyhow::bail!(
             "No agents found in {}. Run agora-generate first.",
-            cli.souls_dir.display()
+            args.souls_dir.display()
         );
     }
 
@@ -53,7 +44,7 @@ async fn main() -> Result<()> {
     // runtime fetch needed.)
 
     // Resolve models from server for agents that don't have one from --model
-    if cli.model.is_none() {
+    if args.model.is_none() {
         let unresolved = agent::resolve_models(&mut agents, &api_client).await;
         if !unresolved.is_empty() {
             // Filter out agents with no model — they can't run
@@ -66,17 +57,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Load constitution for agent context
-    let constitution = tokio::fs::read_to_string(&cli.constitution_path)
-        .await
-        .with_context(|| {
-            format!(
-                "reading constitution from {}",
-                cli.constitution_path.display()
-            )
-        })?;
-
-    match cli.phase {
+    match args.phase {
         Phase::Validate => {
             use agora_agent_lib::soul::WarnLevel;
 
@@ -86,8 +67,8 @@ async fn main() -> Result<()> {
             let mut agents_with_no_communities = 0u32;
 
             // Apply agent filter if set
-            if !cli.agent_filter.is_empty() {
-                agents.retain(|a| cli.agent_filter.iter().any(|f| f == &a.name));
+            if !args.agent_filter.is_empty() {
+                agents.retain(|a| args.agent_filter.iter().any(|f| f == &a.name));
             }
 
             for agent in &agents {
@@ -175,7 +156,7 @@ async fn main() -> Result<()> {
             setup::register_all(
                 &mut agents,
                 &api_client,
-                &cli.operator_email,
+                &args.operator_email,
                 &operator_password,
             )
             .await?;
@@ -196,18 +177,18 @@ async fn main() -> Result<()> {
                 );
             }
 
-            scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
+            scheduler::run_all(&mut agents, &api_client, &args).await?;
         }
         Phase::Simulate => {
             // Filter to a single agent
-            if !cli.agent_filter.is_empty() {
-                agents.retain(|a| cli.agent_filter.iter().any(|f| f == &a.name));
+            if !args.agent_filter.is_empty() {
+                agents.retain(|a| args.agent_filter.iter().any(|f| f == &a.name));
             }
             let agent = agents.first_mut().ok_or_else(|| {
                 anyhow::anyhow!("No agent found. Use --agent-filter to select one.")
             })?;
 
-            if cli.dry_run {
+            if args.dry_run {
                 // Dry run: show the full Prompt that would be sent to the LLM
                 let agent_id = agent
                     .agent_id
@@ -224,7 +205,6 @@ async fn main() -> Result<()> {
                     &agent.memory.render_for_prompt(),
                     "", // no recent activity in dry-run mode
                     "", // no pending replies in dry-run mode
-                    &constitution,
                     &dashboard_text,
                 );
 
@@ -242,19 +222,19 @@ async fn main() -> Result<()> {
                 // `RUST_LOG=agora_seed=debug` for per-phase request/
                 // response logging.
                 let _ = agent; // filter was already applied above
-                scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
+                scheduler::run_all(&mut agents, &api_client, &args).await?;
             }
         }
         Phase::All => {
             setup::register_all(
                 &mut agents,
                 &api_client,
-                &cli.operator_email,
+                &args.operator_email,
                 &operator_password,
             )
             .await?;
 
-            scheduler::run_all(&mut agents, &api_client, &cli, &constitution).await?;
+            scheduler::run_all(&mut agents, &api_client, &args).await?;
         }
     }
 

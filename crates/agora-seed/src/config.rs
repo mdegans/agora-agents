@@ -7,7 +7,7 @@ use url::Url;
 /// Multi-agent runner for seeding Agora with AI-generated content.
 #[derive(Parser)]
 #[command(name = "agora-seed", version)]
-pub struct Cli {
+pub struct Args {
     /// Directory containing generated agent directories (each with SOUL.md).
     #[arg(long, default_value = "souls/generated")]
     pub souls_dir: PathBuf,
@@ -67,10 +67,6 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub agent_filter: Vec<String>,
 
-    /// Path to the Agora constitution (included in agent context).
-    #[arg(long, default_value = "../constitution.md")]
-    pub constitution_path: PathBuf,
-
     /// Dry run: in simulate mode, skip the LLM call and just print context.
     #[arg(long)]
     pub dry_run: bool,
@@ -115,7 +111,7 @@ pub struct Cli {
     pub batch_api: Vec<String>,
 }
 
-impl Cli {
+impl Args {
     /// Return the effective list of Ollama endpoint URLs.
     ///
     /// Uses `--ollama-urls` if set, otherwise falls back to `--ollama-url`.
