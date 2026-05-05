@@ -39,7 +39,7 @@ pub struct Args {
     /// Path to a text file listing valid model names, one per line.
     /// Agents whose model_info doesn't match any entry are rejected at startup.
     #[arg(long)]
-    pub valid_models: PathBuf,
+    pub allowed_models: PathBuf,
 
     /// Override deep soul mutation chance (0-100, default 3).
     /// Evolution log chance is separate and unchanged (10% when deep mutation doesn't fire).
@@ -48,11 +48,7 @@ pub struct Args {
 
     /// Only run agents with these exact names (comma-separated).
     #[arg(long, value_delimiter = ',')]
-    pub agent_filter: Vec<String>,
-
-    /// Dry run: in simulate mode, skip the LLM call and just print context.
-    #[arg(long)]
-    pub dry_run: bool,
+    pub allowed_agents: Vec<String>,
 
     /// Force the feedback survey to run (overrides 10% random chance).
     #[arg(long)]
@@ -290,16 +286,9 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug, clap::ValueEnum)]
+#[derive(Clone, Debug, clap::ValueEnum, derive_more::IsVariant)]
 pub enum Phase {
     Register,
     Run,
-    Simulate,
-    /// Validate all SOUL.md files and print a report.
-    Validate,
-    /// Normalize community lines in all SOUL.md files to canonical format.
-    Fix,
-    /// Auto-assign communities to agents that have none, based on personality keywords.
-    AssignCommunities,
     All,
 }

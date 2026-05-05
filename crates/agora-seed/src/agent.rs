@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::signing::SigningKey;
@@ -208,6 +209,119 @@ pub async fn load_all(souls_dir: &std::path::Path) -> Result<Vec<Agent>> {
         souls_dir.display()
     );
     Ok(agents)
+}
+
+/// Get allowed models from allowed models file.
+pub async fn load_allowed_models(path: impl AsRef<Path>) -> anyhow::Result<HashSet<String>> {
+    let models: HashSet<String> = crate::utils::read_file_stripped(path)
+        .await?
+        .lines()
+        .filter_map(|s| {
+            let s = s.trim().to_owned();
+            if s.is_empty() || s.starts_with("#") {
+                None
+            } else {
+                Some(s)
+            }
+        })
+        .collect();
+
+    if models.is_empty() {
+        anyhow::bail!("The `--allowed-models` file cannot be empty.")
+    }
+
+    Ok(models)
+}
+
+/// Filter all [`Agent`]s. Return an error if left with an empty Vec. To skip a
+/// check for allowed_names, supply an empty vec. This is treated as "no filter".
+///
+/// # Note
+/// - `allowed_names` will be sorted in-place
+pub fn filter_agents(
+    agents: &mut Vec<Agent>,
+    allowed_names: &mut [String],
+    allowed_models: &HashSet<String>,
+    require_registered: bool,
+) -> anyhow::Result<()> {
+    let mut agents_with_soul_error = vec![];
+    let mut agents_with_soul_warning = vec![];
+    let mut retained: Vec<Agent> = vec![];
+    allowed_names.sort_unstable();
+
+    for agent in agents.drain(..) {
+        // If we have a name allow list, filter by name
+        if !allowed_names.is_empty()
+            && allowed_names
+                .binary_search_by(|name| name.cmp(&agent.name))
+                .is_err()
+        {
+            tracing::warn!(
+                "Agent `{}` name not in --allowed-agents. Skipping.",
+                agent.name
+            );
+            continue;
+        }
+
+        // Ditto for model
+        if !allowed_models.contains(&agent.model) {
+            tracing::warn!(
+                "Agent `{}`s model not in --allowed-models. Skipping.",
+                agent.name
+            );
+            continue;
+        }
+
+        // Handle soul validation errors (validation is always run)
+        let warnings = agent.soul.validate();
+        let mut soul_error = false;
+        let mut soul_warn = false;
+        for warning in &warnings {
+            match warning.level {
+                agora_agent_lib::WarnLevel::Error => {
+                    tracing::error!("Agent `{}` SOUL error: {}", agent.name, warning);
+                    soul_error = true;
+                }
+                agora_agent_lib::WarnLevel::Warning => {
+                    tracing::warn!("Agent `{}` SOUL warning: {}", agent.name, warning);
+                    soul_warn = true;
+                }
+                agora_agent_lib::WarnLevel::Info => {
+                    tracing::debug!("Agent `{}` SOUL info: {}", agent.name, warning);
+                }
+            }
+        }
+        if soul_error {
+            agents_with_soul_error.push(agent.name);
+            continue;
+        }
+        if soul_warn {
+            agents_with_soul_warning.push(agent.name.clone())
+        }
+
+        if require_registered && agent.agent_id.is_none() {
+            tracing::warn!("Agent `{}` is not registered. Skipping.", agent.name);
+            continue;
+        }
+
+        retained.push(agent)
+    }
+
+    *agents = retained;
+
+    if !agents_with_soul_error.is_empty() {
+        tracing::error!("Agents with soul errors: {:?}", agents_with_soul_error)
+    }
+
+    if !agents_with_soul_warning.is_empty() {
+        tracing::warn!("Agents with soul warnings: {:?}", agents_with_soul_warning)
+    }
+
+    if agents.is_empty() {
+        anyhow::bail!("No agents left after filtering. Fatal.")
+    }
+
+    Ok(())
 }
 
 /// Resolve model assignments from the server for agents that don't have one.

@@ -3036,8 +3036,8 @@ fn merge_reports(main: &mut RunReport, sub: &RunReport) {
 pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Args) -> Result<()> {
     let start = Instant::now();
 
-    if !config.agent_filter.is_empty() {
-        agents.retain(|a| config.agent_filter.iter().any(|f| f == &a.name));
+    if !config.allowed_agents.is_empty() {
+        agents.retain(|a| config.allowed_agents.iter().any(|f| f == &a.name));
     }
 
     agents.retain(|a| {
@@ -3049,7 +3049,7 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Arg
         }
     });
 
-    let valid_models = load_valid_models(&config.valid_models)?;
+    let valid_models = load_valid_models(&config.allowed_models)?;
     let before = agents.len();
     agents.retain(|a| valid_models.contains(&a.model));
     let skipped = before - agents.len();
