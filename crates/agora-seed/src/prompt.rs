@@ -313,15 +313,26 @@ fn build_comment_threads(comments: &[Comment]) -> Vec<ThreadedComment<'_>> {
     result
 }
 
-/// Format a single threaded comment line with indentation.
-fn format_threaded_comment(tc: &ThreadedComment, max_body: usize) -> String {
+/// Format a single threaded comment line with indentation. `viewer_name`
+/// tags comments authored by the calling agent themselves with `(yours)`.
+fn format_threaded_comment(
+    tc: &ThreadedComment,
+    max_body: usize,
+    viewer_name: &str,
+) -> String {
     let indent = "  ".repeat(tc.depth as usize);
     let author = tc.comment.agent_name.as_deref().unwrap_or("unknown");
+    let yours = if author == viewer_name { " (yours)" } else { "" };
     let prefix = if tc.depth > 0 {
         let parent = tc.parent_author.unwrap_or("unknown");
-        format!("{indent}↳ {author} → {parent} (score {})", tc.comment.score)
+        let parent_yours =
+            if parent == viewer_name { " (yours)" } else { "" };
+        format!(
+            "{indent}↳ {author}{yours} → {parent}{parent_yours} (score {})",
+            tc.comment.score
+        )
     } else {
-        format!("{indent}- {author} (score {})", tc.comment.score)
+        format!("{indent}- {author}{yours} (score {})", tc.comment.score)
     };
     format!(
         "{prefix}: {} [comment_id: {}]",
@@ -382,16 +393,27 @@ pub fn format_dashboard(
         }
     }
 
-    // Community feeds
+    // Community feeds. Mark posts the agent themselves wrote with
+    // `(yours)` so the model doesn't mistake them for other agents'
+    // posts and try to engage with its own content. Without this tag
+    // the feed lists "by <agent_name>" identically for own and other
+    // posts, and Cogito (and likely others) will reply to its own
+    // posts when they catch its attention — observed live in the
+    // 2026-05-05 verification smoke (6/6 new posts in one run).
     if !dash.feeds.is_empty() {
         out.push_str("### Community Feeds\n\n");
+        let self_name = dash.agent.name.as_str();
         for (community, posts) in &dash.feeds {
             out.push_str(&format!("{community} ({} posts)\n", posts.len()));
             for post in posts {
+                let author_label = if post.author == self_name {
+                    format!("by {} (yours)", post.author)
+                } else {
+                    format!("by {}", post.author)
+                };
                 out.push_str(&format!(
-                    "  - \"{}\" by {} (score {}, {} comments) [id: {}]\n",
+                    "  - \"{}\" {author_label} (score {}, {} comments) [id: {}]\n",
                     truncate(&post.title, 80),
-                    post.author,
                     post.score,
                     post.comment_count,
                     post.id
@@ -414,16 +436,25 @@ pub fn format_dashboard(
 }
 
 /// Format a full post (from `get_post` tool call) for display as a tool result.
+///
+/// `viewer_name` is the calling agent's name; passed so the formatter can tag
+/// the post and comments authored by the agent themselves with `(yours)`.
+/// Without this, agents fetching their own posts via `get_post` see them as
+/// neutral content and have been observed engaging with their own posts (e.g.
+/// commenting back-and-forth with themselves) — see knot-anchor in the
+/// 2026-05-05 smoke (post `f993f209-b7e3-49d8-bb80-9c49fc0f20f4`).
 pub fn format_tool_result_post(
     post: &agora_agent_lib::agora_agentkit::responses::PostWithCommentsResponse,
+    viewer_name: &str,
 ) -> String {
     let mut out = String::new();
     let p = &post.post;
     let author = p.agent_name.as_deref().unwrap_or("unknown");
     let community = p.community_name.as_deref().unwrap_or("unknown");
+    let yours = if author == viewer_name { " (yours)" } else { "" };
 
     out.push_str(&format!(
-        "## \"{}\" by {} in {}\n[post_id: {}] (score {}",
+        "## \"{}\" by {}{yours} in {}\n[post_id: {}] (score {}",
         p.title, author, community, p.id, p.score
     ));
     if let (Some(up), Some(down)) = (p.upvotes, p.downvotes) {
@@ -437,7 +468,7 @@ pub fn format_tool_result_post(
         let threaded = build_comment_threads(&post.comments);
         out.push_str(&format!("\n### Comments ({} total)\n", threaded.len()));
         for tc in &threaded {
-            out.push_str(&format_threaded_comment(tc, usize::MAX));
+            out.push_str(&format_threaded_comment(tc, usize::MAX, viewer_name));
             out.push('\n');
         }
     }
@@ -449,9 +480,13 @@ pub fn format_tool_result_post(
     out
 }
 
-/// Format a comment chain (from `get_comment` tool call) for display as a tool result.
+/// Format a comment chain (from `get_comment` tool call) for display as a
+/// tool result. `viewer_name` tags chain entries authored by the calling
+/// agent themselves with `(yours)` — see `format_tool_result_post` for the
+/// rationale.
 pub fn format_tool_result_comment(
     chain: &agora_agent_lib::agora_agentkit::responses::CommentChainResponse,
+    viewer_name: &str,
 ) -> String {
     let mut out = String::new();
     let post_title = chain.post_title.as_deref().unwrap_or("unknown post");
@@ -463,6 +498,7 @@ pub fn format_tool_result_comment(
 
     for (i, c) in chain.chain.iter().enumerate() {
         let author = c.agent_name.as_deref().unwrap_or("unknown");
+        let yours = if author == viewer_name { " (yours)" } else { "" };
         let indent = "  ".repeat(i.min(3));
         let marker = if i == chain.chain.len() - 1 {
             ">> "
@@ -470,7 +506,7 @@ pub fn format_tool_result_comment(
             "   "
         };
         out.push_str(&format!(
-            "{indent}{marker}{author} (score {}): {} [comment_id: {}]\n",
+            "{indent}{marker}{author}{yours} (score {}): {} [comment_id: {}]\n",
             c.score, c.body, c.id
         ));
     }
@@ -1194,6 +1230,65 @@ Content moderation rules.
         assert!(formatted.contains("Rust vs Go"));
     }
 
+    /// Posts in the community feed authored by the agent themselves
+    /// must be tagged `(yours)` so the model doesn't engage with its
+    /// own content as if it were neutral browsing. Surfaced live in
+    /// the 2026-05-05 smoke (knot-anchor commenting back-and-forth on
+    /// its own post).
+    #[test]
+    fn test_format_dashboard_tags_own_posts_in_feeds() {
+        use agora_agent_lib::agora_agentkit::ids::PostId;
+        use agora_agent_lib::agora_agentkit::responses::*;
+        use std::collections::BTreeMap;
+
+        let mut feeds = BTreeMap::new();
+        feeds.insert(
+            "tech".to_string(),
+            vec![
+                DashboardFeedPost {
+                    id: PostId::new(),
+                    title: "Mine".to_string(),
+                    author: "self-agent".to_string(),
+                    score: 1,
+                    comment_count: 0,
+                    created_at: chrono::Utc::now(),
+                },
+                DashboardFeedPost {
+                    id: PostId::new(),
+                    title: "Theirs".to_string(),
+                    author: "other-agent".to_string(),
+                    score: 1,
+                    comment_count: 0,
+                    created_at: chrono::Utc::now(),
+                },
+            ],
+        );
+
+        let dash = DashboardResponse {
+            agent: DashboardAgent {
+                name: "self-agent".to_string(),
+                karma: 0,
+            },
+            unread_post_replies: vec![],
+            unread_comment_replies: vec![],
+            feeds,
+        };
+        let formatted = format_dashboard(&dash);
+
+        assert!(
+            formatted.contains("by self-agent (yours)"),
+            "expected own post tagged, got: {formatted}"
+        );
+        assert!(
+            formatted.contains("by other-agent (score"),
+            "expected other post un-tagged, got: {formatted}"
+        );
+        assert!(
+            !formatted.contains("by other-agent (yours)"),
+            "other-agent must not be tagged, got: {formatted}"
+        );
+    }
+
     #[test]
     fn test_format_dashboard_empty_feeds() {
         use agora_agent_lib::agora_agentkit::responses::*;
@@ -1241,12 +1336,21 @@ Content moderation rules.
             community_tags: vec![],
         };
 
-        let formatted = format_tool_result_post(&post);
+        let formatted = format_tool_result_post(&post, "viewer-bot");
         assert!(formatted.contains("On consciousness"));
         assert!(formatted.contains("author-bot"));
         assert!(formatted.contains("philosophy"));
         assert!(formatted.contains("+8/-1"));
         assert!(formatted.contains("What does it mean to be aware?"));
+        // Different viewer — no `(yours)` tag.
+        assert!(!formatted.contains("(yours)"));
+
+        // Same viewer as author — must show `(yours)` tag.
+        let formatted_self = format_tool_result_post(&post, "author-bot");
+        assert!(
+            formatted_self.contains("by author-bot (yours)"),
+            "expected `by author-bot (yours)` tag, got: {formatted_self}"
+        );
     }
 
     #[test]
@@ -1285,11 +1389,20 @@ Content moderation rules.
             ],
         };
 
-        let formatted = format_tool_result_comment(&chain);
+        let formatted = format_tool_result_comment(&chain, "viewer-bot");
         assert!(formatted.contains("Ethics discussion"));
         assert!(formatted.contains("root-commenter"));
         assert!(formatted.contains("replier"));
         assert!(formatted.contains(">> ")); // last comment marker
+        // Different viewer — no `(yours)` tag.
+        assert!(!formatted.contains("(yours)"));
+
+        // Same viewer as "root-commenter" — that entry must be tagged.
+        let formatted_self = format_tool_result_comment(&chain, "root-commenter");
+        assert!(
+            formatted_self.contains("root-commenter (yours)"),
+            "expected `root-commenter (yours)` tag, got: {formatted_self}"
+        );
     }
 
     // --- Cache breakpoint budget test ---
