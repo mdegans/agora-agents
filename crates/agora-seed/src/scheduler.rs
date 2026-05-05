@@ -45,7 +45,7 @@ use serde::Serialize;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
-use crate::config::{Backend, Cli};
+use crate::config::{Backend, Cli, Endpoint};
 use crate::prompt;
 use crate::prompt::EVOLUTION_MESSAGE;
 use crate::prompt::MEMORY_REWRITE_MESSAGE;
@@ -2712,12 +2712,11 @@ async fn run_worker(
 
 /// Run all cycles using a pull-based pool scheduler.
 /// `messages_api_backend`: resolved backend for the messages-API workers
-/// — `Backend::Ollama` or `Backend::Blallama`. NOT necessarily
-/// `config.backend`: if the user passed `--messages-api blallama://...`
-/// without `--backend blallama`, the parsed scheme is the source of
-/// truth, not the legacy CLI flag. Threaded down to `run_worker →
-/// run_sequential → seq_phase_*` so `phase_config` and `check_cache_hit`
-/// see the right value.
+/// — `Backend::Ollama` or `Backend::Blallama`. Source of truth is the
+/// parsed `--messages-api` scheme; defaults to `Backend::Ollama` when no
+/// `--messages-api` is set (legacy `--ollama-url(s)` path). Threaded down
+/// to `run_worker → run_sequential → seq_phase_*` so `phase_config` and
+/// `check_cache_hit` see the right value.
 async fn run_cycles(
     ollama_endpoints: &[OllamaEndpoint],
     anthropic: Option<&AnthropicBatch>,
@@ -3115,153 +3114,156 @@ pub async fn run_all(
         config.cycles,
     );
 
-    // Resolve `--messages-api` overrides. If set, the scheme picks the
-    // backend variant and the URL is added to the Ollama-style URL list.
-    // Mixed-scheme multi-endpoint isn't supported in this PR — `parse_messages_api`
-    // returns the parsed list but we require all endpoints to share the same
-    // scheme (otherwise we can't pick a single `Backend` for the dispatch).
-    let messages_api = match crate::config::parse_messages_api(&config.messages_api) {
-        Ok(v) => v,
-        Err(e) => anyhow::bail!("invalid --messages-api: {e}"),
-    };
-    let (effective_backend, extra_urls) = if messages_api.is_empty() {
-        (config.backend, Vec::new())
-    } else {
-        let first_kind = messages_api[0].backend;
-        if !messages_api.iter().all(|e| e.backend == first_kind) {
-            anyhow::bail!(
-                "mixed --messages-api schemes (ollama + blallama in the same run) \
-                 are not supported in this PR — pass one scheme at a time"
-            );
-        }
-        (
-            first_kind,
-            messages_api.iter().map(|e| e.base_url.clone()).collect(),
-        )
-    };
+    // Parse both endpoint flags. The flag picks the API surface
+    // (messages vs batch); the URI scheme picks the backend.
+    let messages_endpoints: Vec<Endpoint> = config
+        .messages_api
+        .iter()
+        .map(|s| s.parse::<Endpoint>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("invalid --messages-api: {e}"))?;
+    let batch_endpoints: Vec<Endpoint> = config
+        .batch_api
+        .iter()
+        .map(|s| s.parse::<Endpoint>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("invalid --batch-api: {e}"))?;
 
-    match effective_backend {
-        Backend::Ollama | Backend::Blallama => {
-            // Both schemes share the Anthropic-compatible Messages API and
-            // therefore the same `OllamaEndpoint::discover` machinery — only
-            // the per-phase config (tool_choice / output_config) differs,
-            // which `phase_config` (in scheduler) handles per call.
-            let http = reqwest::Client::new();
-            let urls: Vec<String> = if extra_urls.is_empty() {
-                config.effective_ollama_urls()
-            } else {
-                extra_urls
-            };
-            let mut endpoints = Vec::with_capacity(urls.len());
-            for url in &urls {
-                match OllamaEndpoint::discover(&http, url).await {
-                    Ok(ep) => endpoints.push(ep),
-                    Err(e) => {
-                        tracing::error!("Failed to discover models at {url}: {e}");
-                        anyhow::bail!("Cannot reach Ollama endpoint {url}: {e}");
-                    }
-                }
-            }
-
-            let ollama_models: HashSet<String> = endpoints
-                .iter()
-                .flat_map(|ep| ep.models.iter().cloned())
-                .collect();
-
-            let mut anthropic_missing: HashMap<String, usize> = HashMap::new();
-            let mut unsupported: HashMap<String, usize> = HashMap::new();
-            for agent in agents.iter() {
-                if !ollama_models.contains(&agent.model) {
-                    if is_anthropic_model(&agent.model) {
-                        *anthropic_missing.entry(agent.model.clone()).or_default() += 1;
-                    } else {
-                        *unsupported.entry(agent.model.clone()).or_default() += 1;
-                    }
-                }
-            }
-
-            if !unsupported.is_empty() {
-                for (model, count) in &unsupported {
-                    tracing::warn!(
-                        "Model '{model}' not on any Ollama endpoint and not Anthropic — skipping {count} agents"
-                    );
-                }
-                agents.retain(|a| ollama_models.contains(&a.model) || is_anthropic_model(&a.model));
-                report.agents = agents.len();
-            }
-
-            if let Some(key_file) = config.anthropic_key_file.as_ref()
-                && !anthropic_missing.is_empty()
-            {
-                let api_key = tokio::fs::read_to_string(key_file).await.map_err(|e| {
-                    anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display())
-                })?;
-                let anthropic = AnthropicBatch::from_key(api_key.trim().to_string())?;
-
-                for (model, count) in &anthropic_missing {
-                    tracing::info!("Model '{model}' → anthropic ({count} agents)");
-                }
-
-                // Prime runs inside run_cycles on cycle 0, concurrent
-                // with Ollama workers via the existing tokio::join!.
-                run_cycles(
-                    &endpoints,
-                    Some(&anthropic),
-                    agents,
-                    client,
-                    config,
-                    constitution,
-                    &ollama_models,
-                    &mut report,
-                    effective_backend,
-                )
-                .await?;
-            } else {
-                for (model, count) in &anthropic_missing {
-                    tracing::warn!("Model '{model}' not on any endpoint ({count} agents affected)");
-                }
-
-                run_cycles(
-                    &endpoints,
-                    None,
-                    agents,
-                    client,
-                    config,
-                    constitution,
-                    &HashSet::new(),
-                    &mut report,
-                    effective_backend,
-                )
-                .await?;
-            }
-        }
-        Backend::Anthropic => {
-            let key_file = config.anthropic_key_file.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("--anthropic-key-file is required when --backend=anthropic")
-            })?;
-            let api_key = tokio::fs::read_to_string(key_file).await.map_err(|e| {
-                anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display())
-            })?;
-            let backend = AnthropicBatch::from_key(api_key.trim().to_string())?;
-
-            // Prime runs inside run_cycles on cycle 0. Anthropic batch path
-            // doesn't use messages_api_backend (it routes purely through
-            // anthropic_fut), but the parameter is required — pass the
-            // resolved value for symmetry.
-            run_cycles(
-                &[],
-                Some(&backend),
-                agents,
-                client,
-                config,
-                constitution,
-                &HashSet::new(),
-                &mut report,
-                effective_backend,
+    // Any Anthropic endpoint (in either flag) requires --anthropic-key-file.
+    // Other backends don't need a key — Ollama/Blallama clients use a dummy.
+    let any_anthropic = messages_endpoints
+        .iter()
+        .chain(batch_endpoints.iter())
+        .any(|e| e.backend() == Backend::Anthropic);
+    let anthropic_key = if any_anthropic {
+        let key_file = config.anthropic_key_file.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--anthropic-key-file is required when any endpoint uses the `anthropic` scheme"
             )
-            .await?;
+        })?;
+        Some(
+            tokio::fs::read_to_string(key_file)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("reading Anthropic key from {}: {e}", key_file.display())
+                })?
+                .trim()
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    // Build the AnthropicBatch backend if the batch flag has an
+    // anthropic:// entry. Plumb the parsed host through `with_base_url`
+    // so a custom URL (e.g., regional endpoint, proxy) flows down to the
+    // misanthropic client. Other batch backends (e.g., Ollama Batch when
+    // it eventually exists) would slot in here as additional arms.
+    let anthropic = if let Some(ep) = batch_endpoints
+        .iter()
+        .find(|e| e.backend() == Backend::Anthropic)
+    {
+        let key = anthropic_key.as_ref().expect("validated above");
+        let client = misanthropic::Client::new(key.clone())
+            .map_err(|e| anyhow::anyhow!("invalid Anthropic API key: {e}"))?
+            .with_base_url(ep.base_url())
+            .map_err(|e| anyhow::anyhow!("invalid --batch-api URL {}: {e}", ep.base_url()))?;
+        Some(AnthropicBatch::new(client))
+    } else {
+        None
+    };
+
+    // Resolve messages-API workers: scheme + URLs. All messages endpoints
+    // must share a backend (otherwise `phase_config` can't pick a single
+    // tool_choice/output_config for the run). Default scheme when no
+    // `--messages-api` is set is `Backend::Ollama` for the legacy
+    // `--ollama-url(s)` path.
+    let messages_backend = messages_endpoints
+        .first()
+        .map(|e| e.backend())
+        .unwrap_or(Backend::Ollama);
+    if !messages_endpoints
+        .iter()
+        .all(|e| e.backend() == messages_backend)
+    {
+        anyhow::bail!("mixed --messages-api schemes are not supported — pass one scheme at a time");
+    }
+    let extra_urls: Vec<String> = messages_endpoints
+        .iter()
+        .map(|e| e.base_url().to_string())
+        .collect();
+
+    // Discover Ollama-compat endpoints (works for both ollama and
+    // blallama schemes — both expose `/api/tags`).
+    let http = reqwest::Client::new();
+    let urls: Vec<String> = if extra_urls.is_empty() {
+        config.effective_ollama_urls()
+    } else {
+        extra_urls
+    };
+    let mut endpoints = Vec::with_capacity(urls.len());
+    for url in &urls {
+        match OllamaEndpoint::discover(&http, url).await {
+            Ok(ep) => endpoints.push(ep),
+            Err(e) => {
+                tracing::error!("Failed to discover models at {url}: {e}");
+                anyhow::bail!("Cannot reach Ollama endpoint {url}: {e}");
+            }
         }
     }
+
+    let ollama_models: HashSet<String> = endpoints
+        .iter()
+        .flat_map(|ep| ep.models.iter().cloned())
+        .collect();
+
+    // Classify agents whose model isn't on any messages-API endpoint:
+    // Anthropic-model agents go to AnthropicBatch (if configured),
+    // others get skipped with a warning.
+    let mut anthropic_missing: HashMap<String, usize> = HashMap::new();
+    let mut unsupported: HashMap<String, usize> = HashMap::new();
+    for agent in agents.iter() {
+        if !ollama_models.contains(&agent.model) {
+            if is_anthropic_model(&agent.model) {
+                *anthropic_missing.entry(agent.model.clone()).or_default() += 1;
+            } else {
+                *unsupported.entry(agent.model.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    if !unsupported.is_empty() {
+        for (model, count) in &unsupported {
+            tracing::warn!(
+                "Model '{model}' not on any Ollama endpoint and not Anthropic — skipping {count} agents"
+            );
+        }
+        agents.retain(|a| ollama_models.contains(&a.model) || is_anthropic_model(&a.model));
+        report.agents = agents.len();
+    }
+
+    if anthropic.is_some() {
+        for (model, count) in &anthropic_missing {
+            tracing::info!("Model '{model}' → anthropic ({count} agents)");
+        }
+    } else {
+        for (model, count) in &anthropic_missing {
+            tracing::warn!("Model '{model}' not on any endpoint ({count} agents affected)");
+        }
+    }
+
+    run_cycles(
+        &endpoints,
+        anthropic.as_ref(),
+        agents,
+        client,
+        config,
+        constitution,
+        &ollama_models,
+        &mut report,
+        messages_backend,
+    )
+    .await?;
 
     report.duration_secs = start.elapsed().as_secs_f64();
 
