@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use misanthropic::Prompt;
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::prompt::message::{Block, Content, Role};
+use url::Url;
 
 use super::{LlmBackend, SendResponse};
 
@@ -102,10 +103,10 @@ pub async fn send_with_nudge(
 }
 
 /// Create a [`misanthropic::Client`] pointed at an Ollama endpoint.
-pub fn create_ollama_client(base_url: &str) -> Result<misanthropic::Client> {
+pub fn create_ollama_client(base_url: &Url) -> Result<misanthropic::Client> {
     misanthropic::Client::new(DUMMY_KEY.to_string())
         .expect("dummy key is valid length")
-        .with_base_url(base_url)
+        .with_base_url(base_url.as_ref())
         .map_err(|e| anyhow::anyhow!("invalid Ollama URL '{base_url}': {e}"))
 }
 
@@ -117,10 +118,7 @@ pub struct OllamaBackend {
 
 impl OllamaBackend {
     /// Create a new Ollama backend.
-    ///
-    /// `base_url` defaults to `http://localhost:11434` if not specified.
-    pub fn new(base_url: Option<&str>, model: &str) -> Result<Self> {
-        let base = base_url.unwrap_or("http://localhost:11434");
+    pub fn new(base: &Url, model: &str) -> Result<Self> {
         let client = create_ollama_client(base)?;
         Ok(Self {
             client,

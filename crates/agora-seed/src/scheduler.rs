@@ -3126,7 +3126,7 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Arg
         let key = anthropic_key.as_ref().expect("validated above");
         let client = misanthropic::Client::new(key.clone())
             .map_err(|e| anyhow::anyhow!("invalid Anthropic API key: {e}"))?
-            .with_base_url(ep.base_url())
+            .with_base_url(ep.base_url().as_str())
             .map_err(|e| anyhow::anyhow!("invalid --batch-api URL {}: {e}", ep.base_url()))?;
         Some(AnthropicBatch::new(client))
     } else {
@@ -3148,22 +3148,17 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Arg
     {
         anyhow::bail!("mixed --messages-api schemes are not supported — pass one scheme at a time");
     }
-    let extra_urls: Vec<String> = messages_endpoints
+    let urls: Vec<url::Url> = messages_endpoints
         .iter()
-        .map(|e| e.base_url().to_string())
+        .map(|e| e.base_url().clone())
         .collect();
 
     // Discover Ollama-compat endpoints (works for both ollama and
     // blallama schemes — both expose `/api/tags`).
     let http = reqwest::Client::new();
-    let urls: Vec<String> = if extra_urls.is_empty() {
-        config.effective_ollama_urls()
-    } else {
-        extra_urls
-    };
     let mut endpoints = Vec::with_capacity(urls.len());
     for url in &urls {
-        match OllamaEndpoint::discover(&http, url).await {
+        match OllamaEndpoint::discover(&http, url.clone()).await {
             Ok(ep) => endpoints.push(ep),
             Err(e) => {
                 tracing::error!("Failed to discover models at {url}: {e}");

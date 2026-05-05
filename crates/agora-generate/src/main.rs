@@ -37,7 +37,7 @@ struct Cli {
 
     /// Ollama server URL (if using ollama backend).
     #[arg(long, default_value = "http://localhost:11434")]
-    ollama_url: String,
+    ollama_url: url::Url,
 
     /// Path to Anthropic API key file (if using anthropic backend).
     #[arg(long)]
@@ -1078,10 +1078,7 @@ async fn main() -> Result<()> {
         "ollama" => {
             let model = cli.model.as_deref().unwrap_or("llama3.1:8b");
             tracing::info!("Using Ollama backend: {} at {}", model, cli.ollama_url);
-            Box::new(llm::ollama::OllamaBackend::new(
-                Some(&cli.ollama_url),
-                model,
-            )?)
+            Box::new(llm::ollama::OllamaBackend::new(&cli.ollama_url, model)?)
         }
         "anthropic" => {
             let key_file = cli

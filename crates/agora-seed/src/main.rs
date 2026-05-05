@@ -11,12 +11,13 @@ mod state;
 mod utils;
 
 use config::{Args, Phase};
-pub use utils::CONSTITUTION;
-use utils::{init_logging, read_file_stripped};
+pub use utils::constitution;
+use utils::{init_constitution, init_logging, read_file_stripped};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logging();
+    init_constitution().await;
     let args = Args::parse();
 
     // Load operator password from file
@@ -26,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let operator_password = read_file_stripped(&args.operator_password_file).await?;
 
     // Create API client
-    let api_client = client::AgoraClient::new(&args.server_url)?;
+    let api_client = client::AgoraClient::new(args.server_url.clone())?;
 
     // Load all agents from souls directory
     tracing::info!("Loading agents from {}...", args.souls_dir.display());

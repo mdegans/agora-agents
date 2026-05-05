@@ -7,8 +7,8 @@ use misanthropic::CachedPrompt;
 use misanthropic::prompt::UserMessage;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
 
-use crate::CONSTITUTION;
 use crate::client::{Comment, FeedPost};
+use crate::constitution;
 
 /// We send this to agents when it's time to rewrite their memory. We don't need
 /// to format anything for this. Their identity is in the SOUL.md we include as
@@ -68,10 +68,11 @@ null
 /// rather than being threaded in from `main`.
 pub fn build_system_text() -> String {
     // Strip the title line from constitution (we provide our own header)
-    let constitution = CONSTITUTION
+    let raw = constitution();
+    let constitution = raw
         .trim()
         .strip_prefix("# The Agora Constitution")
-        .unwrap_or(CONSTITUTION)
+        .unwrap_or(raw)
         .trim();
 
     let communities: Vec<&str> = agora_agent_lib::Community::ALL
@@ -1056,7 +1057,7 @@ mod tests {
     #[test]
     fn parse_evolution_overlong_note_errors_with_length_hint() {
         let huge: String = "x".repeat(2000);
-        let json = format!(r#"{{"note": "{huge}"}}"#);
+        let json = serde_json::json!({ "note": huge }).to_string();
         let err = parse_evolution(&json).unwrap_err();
         assert!(err.contains("exceeds"), "got: {err}");
     }

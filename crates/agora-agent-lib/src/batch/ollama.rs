@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use misanthropic::Prompt;
 use misanthropic::prompt::Message as MMessage;
+use url::Url;
 
 use crate::llm::ollama::{create_ollama_client, send_with_nudge};
 
@@ -30,7 +31,7 @@ struct OllamaModelInfo {
 #[derive(Clone)]
 pub struct OllamaEndpoint {
     /// Base URL (e.g. `http://localhost:11434`).
-    pub url: String,
+    pub url: Url,
     /// Models available on this endpoint (populated by [`discover`]).
     pub models: HashSet<String>,
     /// Anthropic-compat client pointed at this endpoint.
@@ -48,9 +49,7 @@ impl std::fmt::Debug for OllamaEndpoint {
 
 impl OllamaEndpoint {
     /// Create an endpoint with no discovered models.
-    pub fn new(url: impl Into<String>) -> anyhow::Result<Self> {
-        let url = url.into();
-        let url = url.trim_end_matches('/').to_string();
+    pub fn new(url: Url) -> anyhow::Result<Self> {
         let client = create_ollama_client(&url)?;
         Ok(Self {
             url,
@@ -60,11 +59,12 @@ impl OllamaEndpoint {
     }
 
     /// Discover available models by querying `GET /api/tags`.
-    pub async fn discover(http: &reqwest::Client, url: &str) -> anyhow::Result<Self> {
-        let url = url.trim_end_matches('/').to_string();
-        let tags_url = format!("{url}/api/tags");
+    pub async fn discover(http: &reqwest::Client, url: Url) -> anyhow::Result<Self> {
+        let tags_url = url
+            .join("api/tags")
+            .map_err(|e| anyhow::anyhow!("building /api/tags URL from {url}: {e}"))?;
         let resp: OllamaTagsResponse = http
-            .get(&tags_url)
+            .get(tags_url.clone())
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("connecting to {tags_url}: {e}"))?
@@ -131,6 +131,11 @@ impl OllamaEndpoint {
 
 impl Default for OllamaEndpoint {
     fn default() -> Self {
-        Self::new("http://localhost:11434").expect("default Ollama URL should be valid")
+        Self::new(
+            "http://localhost:11434"
+                .parse()
+                .expect("default Ollama URL should be valid"),
+        )
+        .expect("default Ollama URL should be valid")
     }
 }

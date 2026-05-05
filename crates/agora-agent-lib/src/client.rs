@@ -34,13 +34,13 @@ pub struct AgoraClient {
 }
 
 impl AgoraClient {
-    pub fn new(base_url: &str) -> Result<Self> {
-        // All server routes live under /agora (Caddy serves the
-        // static Subliminal homepage at the domain root).
-        let mut url = Url::parse(base_url).context("invalid base URL")?;
-        // Ensure path ends with / so join() works correctly
+    pub fn new(mut url: Url) -> Result<Self> {
+        // Ensure path ends with / so join() resolves "agora/" beneath it
+        // rather than replacing the last segment.
         if !url.path().ends_with('/') {
-            url.set_path(&format!("{}/", url.path()));
+            let mut path = url.path().to_owned();
+            path.push('/');
+            url.set_path(&path);
         }
         let base_url = url
             .join("agora/")
@@ -113,7 +113,7 @@ impl AgoraClient {
     }
 
     pub async fn get_agent(&self, name: &str) -> Result<Option<serde_json::Value>> {
-        let url = self.url(&format!("api/identity/agents/{name}"))?;
+        let url = self.url_with_segments("api/identity/agents/", &[name])?;
         let resp = self.http.get(url).send().await?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -172,7 +172,7 @@ impl AgoraClient {
             signature: sig_hex,
             timestamp,
         };
-        let url = self.url(&format!("api/social/communities/{community_name}/join"))?;
+        let url = self.url_with_segments("api/social/communities/", &[community_name, "join"])?;
         let resp = self.http.post(url).json(&body).send().await?;
 
         // Ignore errors (already joined, etc.)
@@ -204,7 +204,7 @@ impl AgoraClient {
             signature: sig_hex,
             timestamp,
         };
-        let url = self.url(&format!("api/social/communities/{community_name}/leave"))?;
+        let url = self.url_with_segments("api/social/communities/", &[community_name, "leave"])?;
         let resp = self.http.post(url).json(&body).send().await?;
 
         if !resp.status().is_success() {
@@ -238,7 +238,7 @@ impl AgoraClient {
         limit: i64,
         sort: &str,
     ) -> Result<Vec<FeedPost>> {
-        let url = self.url(&format!("api/social/communities/{community_name}/feed"))?;
+        let url = self.url_with_segments("api/social/communities/", &[community_name, "feed"])?;
         let resp = self
             .http
             .get(url)
@@ -253,7 +253,7 @@ impl AgoraClient {
     /// is and returns a tagged [`ContentResponse`]. Replaces the old
     /// `get_post` and `get_comment` split.
     pub async fn get_content(&self, id: Uuid) -> Result<ContentResponse> {
-        let url = self.url(&format!("api/social/content/{id}"))?;
+        let url = self.url_with_segments("api/social/content/", &[&id.to_string()])?;
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
@@ -284,7 +284,8 @@ impl AgoraClient {
     }
 
     pub async fn get_agent_posts(&self, agent_id: AgentId) -> Result<Vec<FeedPost>> {
-        let url = self.url(&format!("api/social/agents/{agent_id}/posts"))?;
+        let url =
+            self.url_with_segments("api/social/agents/", &[&agent_id.to_string(), "posts"])?;
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
@@ -296,7 +297,10 @@ impl AgoraClient {
         agent_id: AgentId,
         since: Option<&str>,
     ) -> Result<Vec<CommentReply>> {
-        let mut url = self.url(&format!("api/social/agents/{agent_id}/comment-replies"))?;
+        let mut url = self.url_with_segments(
+            "api/social/agents/",
+            &[&agent_id.to_string(), "comment-replies"],
+        )?;
         if let Some(since) = since {
             url.query_pairs_mut().append_pair("since", since);
         }
@@ -355,7 +359,7 @@ impl AgoraClient {
         id: &str,
         round: Option<u64>,
     ) -> Result<serde_json::Value> {
-        let mut url = self.url(&format!("api/governance/log/{id}"))?;
+        let mut url = self.url_with_segments("api/governance/log/", &[id])?;
         if let Some(r) = round {
             url.query_pairs_mut().append_pair("round", &r.to_string());
         }
@@ -566,11 +570,27 @@ impl AgoraClient {
 
     // -- Helpers --
 
-    /// Join a relative path to the base URL.
+    /// Join a relative static path to the base URL. The path must be
+    /// trusted (no user-controlled segments); use [`Self::url_with_segments`]
+    /// for paths that include dynamic values.
     fn url(&self, path: &str) -> Result<Url> {
         self.base_url
             .join(path)
             .with_context(|| format!("failed to join path: {path}"))
+    }
+
+    /// Join `static_prefix` to the base URL, then append each of `segments`
+    /// as a path segment with proper percent-encoding. Use this whenever
+    /// the URL contains values from outside the crate (agent names, IDs,
+    /// community names, governance ids, …) instead of `format!`-ing them
+    /// into a path string.
+    fn url_with_segments(&self, static_prefix: &str, segments: &[&str]) -> Result<Url> {
+        let mut url = self.url(static_prefix)?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("base URL cannot have segments appended"))?
+            .pop_if_empty()
+            .extend(segments);
+        Ok(url)
     }
 
     /// POST with a typed Serialize body and retry logic.
