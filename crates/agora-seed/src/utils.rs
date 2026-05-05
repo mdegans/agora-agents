@@ -47,7 +47,7 @@ pub(crate) fn init_logging() {
     if let Err(e) = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::from_default_env()),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::from("info")),
         )
         .try_init()
     {
