@@ -1670,19 +1670,6 @@ async fn batch_phase_think_act(
         let round_results = match submit_and_poll(backend, work_items).await {
             Ok(results) => results,
             Err(e) => {
-                // Fatal: if think submit fails, agents never got a turn
-                // to act, so `action_summaries_map` stays empty for every
-                // agent. Letting reflect/evolve run anyway feeds an empty
-                // `experience` string into `build_soul_mutation_prompt`,
-                // and the model fills the void with fabricated narrative
-                // — observed 2026-04-18: rime and proof both produced
-                // coherent but invented "recent experience" claims
-                // including attributions to named third-party agents.
-                // That pollution is harder to unwind than a killed run,
-                // so we abort the cycle instead of soft-degrading.
-                //
-                // Reflect/evolve/survey failures further downstream can
-                // still be soft — by then the action log is legit.
                 return Err(e.context(format!(
                     "batch_phase_think_act round {} submit failed; \
                      aborting cycle to prevent hallucinated soul \

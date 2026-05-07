@@ -1,7 +1,14 @@
+use agora_agent_lib::info_payload;
 use anyhow::Context;
+use serde::Serialize;
+use tokio::process::Command;
 use tracing_appender::non_blocking;
 
-use std::{fs::File, path::Path, sync::OnceLock};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 /// Agora constitution embedded at build time. Used as a fallback when the
 /// live fetch hasn't run (tests) or fails (offline / 5xx).
@@ -82,4 +89,71 @@ pub(crate) async fn read_file_stripped(path: impl AsRef<Path>) -> anyhow::Result
         .with_context(|| format!("Reading file: {}", path.as_ref().display()))?
         .trim()
         .to_string())
+}
+
+// Credit to Claude Opus 4.7
+pub async fn walk_up_to_git(start: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
+    let start = tokio::fs::canonicalize(start.as_ref())
+        .await
+        .with_context(|| format!("canonicalizing {}", start.as_ref().display()))?;
+
+    for ancestor in start.ancestors() {
+        if tokio::fs::try_exists(ancestor.join(".git")).await? {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+
+    anyhow::bail!(
+        "no .git directory or file found in any parent of {}",
+        start.display()
+    );
+}
+
+// Credit to Claude Opus 4.7
+pub async fn assert_clean(start: impl AsRef<Path>) -> anyhow::Result<()> {
+    let repo = walk_up_to_git(start).await?;
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["status", "--porcelain", "--", "."])
+        .output()
+        .await
+        .context("running git status")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    if !output.stdout.is_empty() {
+        anyhow::bail!(
+            r#"agents repo has uncommitted changes:
+
+```stdout
+{}
+```
+                                                                                                            
+Commit before launching a seed run so this run's provenance is anchored.
+This includes SOUL.json mutations from prior runs — those need to be committed too, otherwise this run's mutations will overwrite them."#,
+            String::from_utf8_lossy(&output.stdout).trim_end()
+        );
+    }
+
+    let sha = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await?;
+    let git_sha = String::from_utf8(sha.stdout)?.trim().to_string();
+    #[derive(Serialize)]
+    struct GitStatusPorcelain<'a> {
+        git_sha: &'a str,
+    }
+    info_payload!(GitStatusPorcelain { git_sha: &git_sha });
+
+    Ok(())
 }

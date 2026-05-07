@@ -1,4 +1,5 @@
 use agora_agent_lib::info_payload;
+use anyhow::Context;
 use clap::Parser;
 
 mod agent;
@@ -17,7 +18,10 @@ use serde::Serialize;
 pub use utils::constitution;
 use utils::{init_constitution, init_logging, read_file_stripped};
 
-use crate::agent::{filter_agents, load_allowed_models};
+use crate::{
+    agent::{filter_agents, load_allowed_models},
+    utils::assert_clean,
+};
 
 /// All phases complete
 #[derive(Serialize)]
@@ -28,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
 
     let _guards = init_logging(args.logfile.as_deref())?;
+    assert_clean(&args.souls_dir).await?;
     init_constitution().await;
 
     // Load allowed_models

@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 
 use agora_agent_lib::agora_agentkit::ids::CommentId;
 pub use agora_agent_lib::tools::AgentAction;
+use chrono::Utc;
 use misanthropic::CachedPrompt;
 use misanthropic::prompt::UserMessage;
 use misanthropic::prompt::message::{Block, CacheControl, Content};
@@ -349,8 +350,9 @@ pub fn format_dashboard(
     let mut out = String::new();
 
     out.push_str(&format!(
-        "Name: {}\nKarma: {}\n\n",
-        dash.agent.name, dash.agent.karma
+        "Name: {}\nDate:{}\n\n",
+        dash.agent.name,
+        Utc::now().date_naive()
     ));
 
     // Unread replies to agent's posts
