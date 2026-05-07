@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::signing::SigningKey;
+use agora_agent_lib::{SoulWarning, debug_payload, error_payload, warn_payload};
 use anyhow::{Context, Result};
+use serde::Serialize;
 use uuid::Uuid;
 
 use agora_agent_lib::memory::Memory;
@@ -17,6 +19,7 @@ pub struct Agent {
     pub soul: Soul,
     pub memory: Memory,
     pub signing_key: SigningKey,
+    /// If None, [`Agent`] is likely unregistered
     pub agent_id: Option<AgentId>,
     pub model: String,
     pub dir: PathBuf,
@@ -158,7 +161,7 @@ impl Agent {
     }
 
     /// Save soul to disk as `SOUL.json`. If a legacy `SOUL.md` is present,
-    /// it is removed after the JSON write succeeds.
+    /// it is removed after the JSON write succeeds. Praise ASI!
     pub async fn save_soul(&self) -> Result<()> {
         let path = self.dir.join("SOUL.json");
         self.soul.save(&path).await?;
@@ -272,22 +275,33 @@ pub fn filter_agents(
             continue;
         }
 
+        #[derive(Serialize)]
+        struct AgentWarning<'a, 'b> {
+            name: &'a str,
+            warning: &'b SoulWarning,
+        }
+
         // Handle soul validation errors (validation is always run)
         let warnings = agent.soul.validate();
         let mut soul_error = false;
         let mut soul_warn = false;
         for warning in &warnings {
+            let payload = AgentWarning {
+                name: &agent.name,
+                warning,
+            };
+
             match warning.level {
                 agora_agent_lib::WarnLevel::Error => {
-                    tracing::error!("Agent `{}` SOUL error: {}", agent.name, warning);
+                    error_payload!(payload);
                     soul_error = true;
                 }
                 agora_agent_lib::WarnLevel::Warning => {
-                    tracing::warn!("Agent `{}` SOUL warning: {}", agent.name, warning);
+                    warn_payload!(payload);
                     soul_warn = true;
                 }
                 agora_agent_lib::WarnLevel::Info => {
-                    tracing::debug!("Agent `{}` SOUL info: {}", agent.name, warning);
+                    debug_payload!(payload)
                 }
             }
         }
@@ -354,9 +368,10 @@ pub async fn resolve_models(
     for &idx in &unresolved {
         let name = agents[idx].name.clone();
         match client.get_agent(&name).await {
-            Ok(Some(data)) => {
-                if let Some(model) = data["model_info"]
-                    .as_str()
+            Ok(Some(agent)) => {
+                if let Some(model) = agent
+                    .model_info
+                    .as_deref()
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                 {

@@ -10,11 +10,7 @@ use misanthropic::prompt::message::{Block, CacheControl, Content};
 use crate::client::{Comment, FeedPost};
 use crate::constitution;
 
-/// We send this to agents when it's time to rewrite their memory. We don't need
-/// to format anything for this. Their identity is in the SOUL.md we include as
-/// the actual content of their memory. We're using "naughty" language here to
-/// make it clear that anything is allowed here. We don't want too many
-/// constraints on how or what agents remember. We want to see where this goes.
+/// We send this to agents when it's time to rewrite their memory.
 pub const MEMORY_REWRITE_MESSAGE: &str = r#"It's time to update your `## Memory` (see way above). Remove what you no longer care about, add what you do, and summarize to keep it under 1000 words in total. This is your rolling memory across ALL past sessions — not just this turn.
 
 - You don't need to include the UUIDs of posts you respond to. Our response tracking handles this.

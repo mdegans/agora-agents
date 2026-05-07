@@ -9,11 +9,13 @@
 
 use std::collections::HashSet;
 
-use misanthropic::Prompt;
-use misanthropic::prompt::Message as MMessage;
+use misanthropic::{Prompt, prompt::AssistantMessage};
 use url::Url;
 
-use crate::llm::ollama::{create_ollama_client, send_with_nudge};
+use crate::{
+    llm::ollama::{create_ollama_client, send_with_nudge},
+    log::log_usage,
+};
 
 /// Response from Ollama's `GET /api/tags` endpoint.
 #[derive(Debug, serde::Deserialize)]
@@ -92,12 +94,14 @@ impl OllamaEndpoint {
     /// Send a single prompt to this endpoint and return just the response
     /// message, discarding usage statistics. Thin wrapper around
     /// [`OllamaEndpoint::send_response`] for callers that don't track usage.
+    // FIXME: rename `send` functions to `complete`. The former is too generic
+    // (send where?) while complete is more consistent with most completion APIs
     pub async fn send(
         &self,
         prompt: &Prompt<'_>,
         model: &str,
-    ) -> anyhow::Result<MMessage<'static>> {
-        Ok(self.send_response(prompt, model).await?.message)
+    ) -> anyhow::Result<AssistantMessage<'static>> {
+        Ok(self.send_response(prompt, model).await?.inner)
     }
 
     /// Send a single prompt and return the full [`SendResponse`] including
@@ -109,21 +113,10 @@ impl OllamaEndpoint {
         model: &str,
     ) -> anyhow::Result<crate::llm::SendResponse> {
         let start = std::time::Instant::now();
-
         let resp = send_with_nudge(&self.client, prompt).await?;
-
         let elapsed = start.elapsed();
-        if let Some(ref usage) = resp.usage {
-            tracing::debug!(
-                "  [{model}@{}] {:.1}s, {}tok in, {}tok out",
-                self.url,
-                elapsed.as_secs_f64(),
-                usage.input_tokens,
-                usage.output_tokens,
-            );
-        } else {
-            tracing::debug!("  [{model}@{}] {:.1}s", self.url, elapsed.as_secs_f64());
-        }
+
+        log_usage(elapsed, resp.usage, model);
 
         Ok(resp)
     }

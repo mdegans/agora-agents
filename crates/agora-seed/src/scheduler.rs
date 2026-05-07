@@ -22,17 +22,30 @@
 //! The cycle for each agent: build prompt → 5 tool rounds → reflect →
 //! evolve (probabilistic) → survey (probabilistic).
 
+// FIXME: This file is huge. Split it up.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use agora_agent_lib::Soul;
 use agora_agent_lib::agora_agentkit::ids::AgentId;
+use agora_agent_lib::agora_agentkit::ids::CommentId;
+use agora_agent_lib::agora_agentkit::responses::DashboardResponse;
 use agora_agent_lib::agora_agentkit::scheduler::{BatchBackend, BatchState, CycleStep, WorkItem};
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
 use agora_agent_lib::batch::ollama::OllamaEndpoint;
+use agora_agent_lib::error_payload;
+use agora_agent_lib::info_payload;
 use agora_agent_lib::llm::ollama::OllamaPerModel;
 use agora_agent_lib::llm::{Usage, commit_batch_response};
+use agora_agent_lib::tools::CastVoteInput;
+use agora_agent_lib::tools::CreateCommentInput;
+use agora_agent_lib::tools::CreatePostInput;
+use agora_agent_lib::tools::FlagContentInput;
+use agora_agent_lib::tools::ParsedCall;
 use agora_agent_lib::tools::{make_tool_result, parse_tool_calls};
+use agora_agent_lib::warn_payload;
 use anyhow::Result;
 use misanthropic::CachedPrompt;
 use misanthropic::prompt::Message as MMessage;
@@ -42,6 +55,7 @@ use misanthropic::tool;
 use rand::Rng;
 use rand::seq::SliceRandom;
 use serde::Serialize;
+use url::Url;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
@@ -54,24 +68,288 @@ use crate::prompt::SURVEY_MESSAGE;
 /// Maximum number of tool-use rounds per agent cycle.
 const MAX_ROUNDS: usize = 5;
 
+/// Scheduler structured logging type
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerLog<'a> {
+    /// Cache hit or miss
+    Cache {
+        hit: bool,
+        backend: Backend,
+        usage: Usage,
+        agent_name: &'a str,
+        // FIXME: Add ser+de to CycleStep in agora-agentkit or better, remove
+        // CycleStep from agora-agentkit since this type is only related to the
+        // seed runner. It belongs in agora-agent-lib crate in this repo.
+        step: String,
+    },
+    /// Preflight problem
+    PreflightError {
+        agent_name: &'a str,
+        problem: String,
+    },
+    /// Agent tried to post to `news` which is restricted
+    News {
+        agent_name: &'a str,
+    },
+    /// Post title is too repetitive
+    TitleRepetitive {
+        agent_name: &'a str,
+        input: &'a CreatePostInput,
+    },
+    /// Agent sucessfully posted
+    ActionPost {
+        agent_name: &'a str,
+        input: &'a CreatePostInput,
+    },
+    /// Agent create_post error
+    ActionPostError {
+        agent_name: &'a str,
+        input: &'a CreatePostInput,
+        error: String,
+    },
+    ActionComment {
+        agent_name: &'a str,
+        input: &'a CreateCommentInput,
+        is_own_post: bool,
+        has_reply: bool,
+        comment_id: CommentId,
+    },
+    /// Agent tried double-commenting on a post
+    ActionCommentDupe {
+        agent_name: &'a str,
+        input: &'a CreateCommentInput,
+        /// Agent is self-responding
+        is_own_post: bool,
+        has_reply: bool,
+    },
+    ActionCommentError {
+        agent_name: &'a str,
+        input: &'a CreateCommentInput,
+        is_own_post: bool,
+        has_reply: bool,
+        error: String,
+    },
+    ActionVote {
+        agent_name: &'a str,
+        input: &'a CastVoteInput,
+    },
+    ActionVoteError {
+        agent_name: &'a str,
+        input: &'a CastVoteInput,
+        error: String,
+    },
+    /// Agent reported content
+    ActionFlag {
+        agent_name: &'a str,
+        input: &'a FlagContentInput,
+    },
+    ActionFlagError {
+        agent_name: &'a str,
+        input: &'a FlagContentInput,
+        error: String,
+    },
+    /// Beginning of `process_round`
+    ProcessRound {
+        agent_name: &'a str,
+        response: &'a AssistantMessage<'static>,
+        governance_calls: usize,
+    },
+    ToolCalls {
+        agent_name: &'a str,
+        calls: &'a Vec<ParsedCall>,
+    },
+    /// Agent failed to produce required text content (usually json)
+    Nudge {
+        agent_name: &'a str,
+        /// Response text that failed to parse. Can be empty if no speech found.
+        response_text: Option<&'a str>,
+    },
+    ToolResults {
+        agent_name: &'a str,
+        results: &'a Vec<tool::Result<'static>>,
+    },
+    SaveMemory {
+        agent_name: &'a str,
+        memory: &'a agora_agent_lib::Memory,
+    },
+    /// Error calling `agent.memory.update` (not necessarily save_memory)
+    SaveMemoryUpdateError {
+        agent_name: &'a str,
+        error: String,
+    },
+    /// `breadcrumb_memory_failure` Reflect failed. Keeping prior memory, adding
+    /// [SYSTEM] note.
+    BreadcrumbMemoryError {
+        agent_name: &'a str,
+        error: &'a str,
+    },
+    /// Agent soul deep mutation (before saving)
+    SoulDeepMutationRequest {
+        /// Should always match `old.name` and `new.name`
+        agent_name: &'a str,
+        old: &'a Soul,
+        new: &'a Soul,
+    },
+    /// Deep mutation success (see [`SchedulerLog::SoulDeepMutationRequest`])
+    /// or json on disk for full details.
+    SoulDeepMutation {
+        agent_name: &'a str,
+    },
+    /// Soul evolution (log entry)
+    SoulEvolution {
+        agent_name: &'a str,
+        note: &'a str,
+    },
+    SoulEvolutionError {
+        agent_name: &'a str,
+        error: String,
+    },
+    /// Error with `get_agent_posts` (e.g. in `fetch_dashboard`)
+    GetAgentPostsError {
+        agent_name: &'a str,
+        error: String,
+    },
+    /// Agent dashboard ready
+    Dashboard {
+        agent_name: &'a str,
+        dashboard: &'a DashboardResponse,
+    },
+    DashboardError {
+        agent_name: &'a str,
+        error: String,
+    },
+    /// Batch API submit
+    BatchSubmit {
+        count: usize,
+        step: String,
+    },
+    /// [`BatchState::Ready`]
+    BatchReady {
+        count: usize,
+        step: String,
+    },
+    /// [`BatchState::Pending`]
+    BatchPending {
+        /// Very, very useful in-flight stats including the result download URL.
+        meta: &'a misanthropic::batch::Meta,
+        n_batches: usize,
+        agents: HashSet<AgentId>,
+    },
+    /// `submit_retry_batch`
+    BatchRetry {
+        agent_names: Vec<&'a str>,
+        failed: &'a [(AgentId, String)],
+        step: String,
+        max_tokens: u32,
+        context: &'a str,
+        n_retry_items: usize,
+    },
+    /// Batch retry results ready (`submit_retry_batch`)
+    BatchRetryReady {
+        n: usize,
+    },
+    /// Batch retry error (`submit_retry_batch`)
+    BatchRetryError {
+        agent_names: Vec<&'a str>,
+        failed: &'a [(AgentId, String)],
+        step: String,
+        max_tokens: u32,
+        context: &'a str,
+        n_retry_items: usize,
+        error: String,
+    },
+    /// Priming anthropic batch
+    BatchPrimeStart {
+        /// Total prefixes primed
+        total: usize,
+    },
+    BatchPrimeSuccess {
+        total: usize,
+    },
+    /// Partial or full batch prime failure
+    BatchPrimeError {
+        ok: usize,
+        total: usize,
+    },
+    /// Batch think round
+    BatchPhaseThink {
+        round: usize,
+        max_rounds: usize,
+        n_prompts: usize,
+    },
+    /// An agent failed a batch round
+    BatchPhaseThinkError {
+        round: usize,
+        agent_id: Option<AgentId>,
+        error: String,
+    },
+    /// Successful agent batch round
+    BatchPhaseThinkOk {
+        cycle: usize,
+        cycles: usize,
+        agent_name: &'a str,
+        round: usize,
+        max_rounds: usize,
+    },
+    /// Batch reflect phase
+    BatchPhase {
+        agents: Vec<&'a str>,
+        step: String,
+    },
+    /// Error in `batch_phase_reflect_*`
+    BatchReflectPollError {
+        step: String,
+        error: String,
+        agent_name: Option<&'a str>,
+    },
+    BatchDone {
+        agent_names: Vec<&'a str>,
+    },
+    /// Agent sent feedback. **Not necessarily submitted sucessfully**.
+    Feedback {
+        /// If None, feedback is anonymous
+        agent_name: Option<&'a str>,
+        content: &'a str,
+    },
+    SeqPhase {
+        step: String,
+        agent_name: &'a str,
+        endpoint_url: &'a Url,
+    },
+    SeqPhaseThinkRound {
+        step: String,
+        cycle: usize,
+        total_cycles: usize,
+        agent_name: &'a str,
+        round: usize,
+        max_rounds: usize,
+        endpoint_url: &'a Url,
+    },
+    SeqPhaseError {
+        step: String,
+        round: usize,
+        agent_name: &'a str,
+        endpoint_url: &'a Url,
+        error: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Per-backend phase config + CachedPrompt mutation helpers
+//
+// NOTE: CachedPrompt's contract is that it is append only, preventing the user
+// from accidentally mutating anything that might invalidate cache, however some
+// backends like `Backend::Blallama` are more flexible.
+//
 // ---------------------------------------------------------------------------
 
-/// Apply an `output_config` (the Anthropic JSON-Schema structured-output
-/// shape, exposed by misanthropic ≥ 95b5671) to a [`CachedPrompt`] by
-/// dropping into the underlying [`Prompt`], mutating, and re-wrapping.
+/// Apply an `output_config` to a [`CachedPrompt`].
 ///
-/// `CachedPrompt`'s contract is "you can't accidentally invalidate cache
-/// without explicitly converting back to `Prompt`." Adding a setter on
-/// `CachedPrompt` would silently weaken that — `output_config` changes
-/// can bust cache on Anthropic-spec backends. The free-function form
-/// keeps the cache trade-off visible at every call site (and is the
-/// reason this lives here in agora-seed rather than upstream).
+/// # Warning
 ///
-/// `cache_control` markers on individual messages are preserved across
-/// the round-trip because `CachedPrompt::from(Prompt)` is `Self { inner:
-/// prompt }` — no transformation. The caller doesn't need to re-cache.
+/// - While [`Backend::Blallama`] supports it and [`Backend::Ollama`] ignores
+///   it, setting this with [`Backend::Anthropic`] **will invalidate cache**.
 pub fn with_output_config<'a>(
     cached: CachedPrompt<'a>,
     output_config: Option<misanthropic::prompt::OutputConfig>,
@@ -81,11 +359,17 @@ pub fn with_output_config<'a>(
     CachedPrompt::from(prompt)
 }
 
-/// Apply a `tool_choice` to a [`CachedPrompt`] — same conversion shape as
-/// [`with_output_config`]. Used by the per-phase wiring to flip between
-/// `Auto` (think_act on Ollama / Anthropic) and `Any` (think_act on
-/// Blallama, forces *some* tool to be called) and `None` (reflect /
-/// mutate / etc., stripping tool use entirely).
+/// Apply a `tool_choice` to a [`CachedPrompt`].
+///
+/// # Warning
+///
+/// - While [`Backend::Blallama`] and [`Backend::Ollama`] support it, setting
+///   this with [`Backend::Anthropic`] **will invalidate cache**.
+// NOTE(mdegans): Verify no cache busting with Ollama. Only measurable by timing
+// I think since the response type's Usage stats are empty for cache as of
+// last check (a few weeks ago). However Ollama is frequently updated. Also note
+// that changing the tools themselves with *any* backend will absolutely bust
+// cache.
 pub fn with_tool_choice<'a>(
     cached: CachedPrompt<'a>,
     tool_choice: Option<tool::Choice>,
@@ -95,30 +379,69 @@ pub fn with_tool_choice<'a>(
     CachedPrompt::from(prompt)
 }
 
+/// Insert a bridge message between tool rounds and reflect phases.
+///
+/// The think/act loop always ends with a user message (tool results or nudge).
+/// This inserts a synthetic assistant message so the reflect phase can push
+/// its user message without violating turn alternation.
+fn insert_bridge<'a>(cached_prompt: &mut CachedPrompt<'a>) {
+    let _ = cached_prompt.push_message(AssistantMessage::from(
+        // Message is clear the Assistant did not write it to avoid biasing
+        // the Assistant's tone.
+        MContent::from("[SYSTEM]: No more tool uses left. Begin reflect phase.").into_static(),
+    ));
+    // it's now the user's turn
+}
+
+/// Strip tools from a `CachedPrompt` in preparation for reflect/evolve/
+/// survey phases on Ollama. As of writing, if tools are set at all, Ollama
+/// forces tool calls. So in the reflect phase where we want json in Block::Text
+/// we must set them to None.
+// NOTE(mdegans): We should verify this behavior with recent Ollama. It's been
+// a couple months since we wrote this and there have been many updates. It's
+// possible the behavior is canonical now, saving ~100s per agent per cycle.
+// Ingestion is pretty costly on Metal. Removing this fn may be safe now.
+fn strip_tools_for_reflect<'a>(
+    cached: CachedPrompt<'a>,
+    backend_kind: Backend,
+) -> CachedPrompt<'a> {
+    if matches!(backend_kind, Backend::Blallama) {
+        return cached;
+    }
+    let mut bare = cached.into_inner();
+    bare.functions = None;
+    bare.tool_choice = None;
+    CachedPrompt::from(bare)
+}
+
 /// Per-backend, per-phase `(tool_choice, output_config)` matrix.
 ///
 /// Anthropic is intentionally **not** handled here — its Batch path uses
 /// a fixed `tool_choice=Auto` set at prompt build time and never sets
 /// `output_config`, so per-phase mutations would just bust prompt cache.
-/// Calling this with [`Backend::Anthropic`] is a programmer error; we
-/// route around it at the dispatch level rather than encoding a "no-op"
-/// arm here.
 ///
-/// `output_config` is set unconditionally for messages-API backends
-/// regardless of backend variant. Blallama enforces the schema via its
-/// grammar compiler; Ollama silently ignores it today but may honor it
-/// in a future version. The prompt-bytes cost is negligible and "set it
-/// once, every backend that supports it benefits" beats per-backend
-/// gating that would silently fall over on a wiring miss.
+/// `output_config` is set unconditionally for messages-API backends regardless
+/// of backend variant. Blallama enforces the schema via its grammar compiler;
+/// Ollama silently ignores it today but may honor it in a future version.
+/// Setting this does not affect the rendered prompt or tokenization. It's only
+/// a generation constraint applied to the logits after decode has been run.
 ///
 /// `tool_choice` *does* differ by backend on Think:
-/// - Ollama: `Auto` (its compat layer interprets `Any` as a hard
-///   "must use this exact tool" not "must use *some* tool")
+/// - Ollama: `Auto` (its compat layer interprets `Auto` as "must use *some*
+///   tool" as of writing, canonical `Any` behavior. Must be swapped to None to
+///   generate Block::Text in the reflect phase)
 /// - Blallama: `Any` (force *some* tool to be called — Anthropic-spec)
 ///
 /// All non-Think phases use `tool_choice=None` on both backends, paired
 /// with `strip_tools_for_reflect` on Ollama (skipped on Blallama, which
 /// honors `None` directly).
+///
+/// # Panics
+///
+/// - If called with [`Backend::Anthropic`] since the batch API is *always*
+///   cheaper, however this may change in the future.
+// NOTE(mdegans): We should verify Ollama's current behavior since it may have
+// changed since the doc was written.
 pub fn phase_config(
     backend: Backend,
     step: CycleStep,
@@ -180,7 +503,7 @@ pub fn apply_phase_config(cached: &mut CachedPrompt<'static>, backend: Backend, 
 /// `max_tokens`. Stable string so the prefix-cache hit on the next call is
 /// preserved across agents (only the prior assistant text differs per
 /// agent, and that's already in the cache by the time we get here).
-const MAX_TOKENS_RETRY_MESSAGE: &str = "Your message hit `max_tokens` and was truncated before the JSON could be closed. Note: thinking blocks count toward this limit. Try again with less reasoning before the answer.";
+const MAX_TOKENS_RETRY_MESSAGE: &str = "Your message hit `max_tokens` and was truncated before the JSON could be closed. Note: thinking blocks count toward this limit. If you've already thought about your response there is no need to do so again.";
 
 /// Prefix appended on retry when parse failed for any non-max-tokens
 /// reason. The `format_for_agent` parse-error string is appended after the
@@ -209,7 +532,7 @@ async fn exchange_with_retry<B, T, F>(
     prompt: &mut CachedPrompt<'static>,
     initial_user: UserMessage<'static>,
     parse_fn: F,
-    usage_total: &mut Option<Usage>,
+    usage_total: &mut Usage,
 ) -> Result<T, String>
 where
     B: agora_agent_lib::llm::LlmBackend + ?Sized,
@@ -224,7 +547,7 @@ where
         let outcome = exchange_with_stop_reason(backend, prompt, user, usage_total)
             .await
             .map_err(|e| format!("backend error: {e}"))?;
-        check_cache_hit(backend_kind, outcome.usage.as_ref(), agent_name, step);
+        log_cache_usage(backend_kind, outcome.usage, agent_name, step);
         let response_text = prompt::extract_speech(outcome.assistant.content());
         match parse_fn(&response_text) {
             Ok(parsed) => return Ok(parsed),
@@ -254,32 +577,24 @@ where
 /// so even round 0 of agent N≥2 sees the prefix already cached from
 /// agent #1. The only expected warn per run is the very first agent's
 /// very first call — the cold-start cost of catching every subsequent
-/// regression cleanly. A `tracing::warn!` (rather than `debug_assert!`)
-/// catches it at runtime without being brittle in tests where cache
-/// behavior is hard to mock.
-///
-/// The info log on hits gives the full cache picture (input vs
-/// cache_read) per call, useful for verifying the drama_llama
-/// auto-tip enhancement extends cache_read each round as expected.
-pub fn check_cache_hit(backend: Backend, usage: Option<&Usage>, agent: &str, step: CycleStep) {
+/// regression cleanly.
+pub fn log_cache_usage(backend: Backend, usage: Usage, agent: &str, step: CycleStep) {
     if !matches!(backend, Backend::Blallama) {
+        // Ollama does not return cache stats as of writing
         return;
     }
-    let Some(usage) = usage else { return };
-    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
-    if cache_read == 0 {
-        tracing::warn!(
-            "blallama cache miss for agent={agent} step={step:?} \
-             input={} cache_read=0 — expected the prior cycle/round prefix to be hit",
-            usage.input_tokens,
-        );
+    let hit = usage.cache_read_input_tokens.unwrap_or(0) != 0;
+    let log_payload = SchedulerLog::Cache {
+        hit,
+        backend,
+        usage,
+        agent_name: agent,
+        step: step.to_string(),
+    };
+    if hit {
+        info_payload!(log_payload);
     } else {
-        tracing::info!(
-            "blallama cache hit for agent={agent} step={step:?} \
-             input={} cache_read={cache_read} ({} new tokens prefilled)",
-            usage.input_tokens,
-            usage.input_tokens.saturating_sub(cache_read),
-        );
+        warn_payload!(log_payload);
     }
 }
 
@@ -321,7 +636,10 @@ pub fn build_prompt(agent: &Agent, ctx: &AgentCycleContext) -> CachedPrompt<'sta
     // invisible-text-attack chars from LLM output, and that's working
     // as designed.
     for problem in prompt::preflight_check_prompt(&cached) {
-        tracing::error!(agent = %agent.name, "[PREFLIGHT] {problem}");
+        error_payload!(SchedulerLog::PreflightError {
+            agent_name: &agent.name,
+            problem
+        })
     }
 
     cached
@@ -346,18 +664,16 @@ async fn execute_action(
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
     governance_calls: &mut usize,
-) -> (Option<String>, tool::Result<'static>) {
+) -> tool::Result<'static> {
     let agent_id = agent.agent_id.unwrap();
+    // `ok` and `err` should be written with end-agent in mind
     let ok = |content: &str| make_tool_result(tool_use_id.clone(), content, false);
     let err = |content: &str| make_tool_result(tool_use_id.clone(), content, true);
 
     if action.is_governance() {
         if *governance_calls >= MAX_GOVERNANCE_CALLS {
-            return (
-                None,
-                err(
-                    "Governance reads are limited to 2 per run. Use your remaining rounds for other actions.",
-                ),
+            return err(
+                "Governance reads are limited to 2 per run. Use your remaining rounds for other actions.",
             );
         }
         *governance_calls += 1;
@@ -365,15 +681,13 @@ async fn execute_action(
 
     match action {
         prompt::AgentAction::GetContent(input) => match client.get_content(input.id).await {
-            Ok(agora_agent_lib::client::ContentResponse::Post(full)) => (
-                None,
-                ok(&prompt::format_tool_result_post(&full, &agent.name)),
-            ),
-            Ok(agora_agent_lib::client::ContentResponse::Comment(chain)) => (
-                None,
-                ok(&prompt::format_tool_result_comment(&chain, &agent.name)),
-            ),
-            Err(e) => (None, err(&format!("Error fetching content: {e}"))),
+            Ok(agora_agent_lib::client::ContentResponse::Post(full)) => {
+                ok(&prompt::format_tool_result_post(&full, &agent.name))
+            }
+            Ok(agora_agent_lib::client::ContentResponse::Comment(chain)) => {
+                ok(&prompt::format_tool_result_comment(&chain, &agent.name))
+            }
+            Err(e) => err(&format!("Error fetching content: {e}")),
         },
         prompt::AgentAction::GetGovernanceLog(input) => {
             match client
@@ -384,31 +698,19 @@ async fn execute_action(
                 )
                 .await
             {
-                Ok(data) => (
-                    None,
-                    ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
-                ),
-                Err(e) => (None, err(&format!("Error fetching governance log: {e}"))),
+                Ok(data) => ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
+                Err(e) => err(&format!("Error fetching governance log: {e}")),
             }
         }
         prompt::AgentAction::GetGovernanceDecision(input) => {
             match client.get_governance_decision(&input.id, input.round).await {
-                Ok(data) => (
-                    None,
-                    ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
-                ),
-                Err(e) => (
-                    None,
-                    err(&format!("Error fetching governance decision: {e}")),
-                ),
+                Ok(data) => ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
+                Err(e) => err(&format!("Error fetching governance decision: {e}")),
             }
         }
         prompt::AgentAction::GetProposals(input) => match client.get_proposals(input.limit).await {
-            Ok(data) => (
-                None,
-                ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
-            ),
-            Err(e) => (None, err(&format!("Error fetching proposals: {e}"))),
+            Ok(data) => ok(&serde_json::to_string_pretty(&data).unwrap_or_default()),
+            Err(e) => err(&format!("Error fetching proposals: {e}")),
         },
         prompt::AgentAction::Post(input) => {
             let slug = match input.community.as_str() {
@@ -416,10 +718,11 @@ async fn execute_action(
                 other => other,
             };
             if slug == "news" {
-                tracing::info!("  {} skipping post to news (restricted)", agent.name);
-                return (
-                    Some("Skipped posting to news (restricted)".to_string()),
-                    err("The news community is reserved for MCP agents."),
+                info_payload!(SchedulerLog::News {
+                    agent_name: &agent.name
+                });
+                return err(
+                    "The news community is reserved for MCP agents (with browser tools). A web tool may be added in time (prompt injection concerns).",
                 );
             }
             let existing_titles: Vec<String> = dashboard
@@ -428,16 +731,14 @@ async fn execute_action(
                 .map(|posts| posts.iter().map(|p| p.title.clone()).collect())
                 .unwrap_or_default();
             if prompt::is_title_repetitive(&input.title, &existing_titles) {
-                tracing::info!(
-                    "  {} topic too similar, skipping: \"{}\"",
-                    agent.name,
-                    input.title
-                );
+                // Warn because we want to work on reducing these. It usually
+                // indicates a failure in prompting on our part.
+                warn_payload!(SchedulerLog::TitleRepetitive {
+                    agent_name: &agent.name,
+                    input
+                });
                 report.skipped.repetitive_titles += 1;
-                return (
-                    Some(format!("Skipped posting \"{}\" (too similar)", input.title)),
-                    err("Your proposed post is too similar to existing posts."),
-                );
+                return err("Your proposed post is too similar to existing posts.");
             }
             match client
                 .create_post(
@@ -453,21 +754,24 @@ async fn execute_action(
             {
                 Ok(post_id) => {
                     agent.state.created_posts.insert(post_id);
-                    let summary =
-                        format!("Posted \"{}\" in {} (id: {})", input.title, slug, post_id);
-                    tracing::info!("  {} {}", agent.name, summary);
+                    info_payload!(SchedulerLog::ActionPost {
+                        agent_name: &agent.name,
+                        input
+                    });
                     report.actions.posts += 1;
                     report.model_actions(&agent.model).posts += 1;
-                    (
-                        Some(summary),
-                        ok(&format!("Post created successfully. Post ID: {post_id}")),
-                    )
+
+                    ok(&format!("Post created: {post_id}"))
                 }
                 Err(e) => {
-                    let summary = format!("Failed to post in {slug}: {e}");
-                    tracing::warn!("  {} {}", agent.name, summary);
+                    warn_payload!(SchedulerLog::ActionPostError {
+                        agent_name: &agent.name,
+                        input,
+                        error: e.to_string()
+                    });
                     report.skipped.post_failures += 1;
-                    (Some(summary), err(&format!("Error creating post: {e}")))
+
+                    err(&format!("Error creating post: {e}"))
                 }
             }
         }
@@ -485,13 +789,15 @@ async fn execute_action(
                 .iter()
                 .any(|r| *r.post_id.as_uuid() == input.reply_to);
             if agent.state.commented_posts.contains(&as_post_id) && !is_own_post && !has_reply {
-                tracing::debug!(
-                    "  {} already commented on {}, skipping",
-                    agent.name,
-                    input.reply_to
-                );
+                // Warn because we want to reduce these
+                warn_payload!(SchedulerLog::ActionCommentDupe {
+                    agent_name: &agent.name,
+                    input,
+                    is_own_post,
+                    has_reply
+                });
                 report.skipped.duplicate_comments += 1;
-                return (None, err("You already commented on this post."));
+                return err("You already commented on this post.");
             }
             match client
                 .create_comment(agent_id, input.reply_to, &input.body, &agent.signing_key)
@@ -500,21 +806,30 @@ async fn execute_action(
                 Ok(comment_id) => {
                     agent.state.commented_posts.insert(as_post_id);
                     agent.state.created_comments.insert(comment_id);
-                    let summary =
-                        format!("Commented on {} (comment: {})", input.reply_to, comment_id);
-                    tracing::info!("  {} {}", agent.name, summary);
+
+                    info_payload!(SchedulerLog::ActionComment {
+                        agent_name: &agent.name,
+                        input,
+                        is_own_post,
+                        has_reply,
+                        comment_id
+                    });
                     report.actions.comments += 1;
                     report.model_actions(&agent.model).comments += 1;
-                    (
-                        Some(summary),
-                        ok(&format!("Comment created. Comment ID: {comment_id}")),
-                    )
+
+                    ok(&format!("Comment created. Comment ID: {comment_id}"))
                 }
                 Err(e) => {
-                    let summary = format!("Failed to comment on {}: {e}", input.reply_to);
-                    tracing::warn!("  {} {}", agent.name, summary);
+                    warn_payload!(SchedulerLog::ActionCommentError {
+                        agent_name: &agent.name,
+                        input,
+                        is_own_post,
+                        has_reply,
+                        error: e.to_string()
+                    });
                     report.skipped.comment_failures += 1;
-                    (Some(summary), err(&format!("Error creating comment: {e}")))
+
+                    err(&format!("Error creating comment: {e}"))
                 }
             }
         }
@@ -529,19 +844,24 @@ async fn execute_action(
                     } else {
                         "downvoted"
                     };
-                    let summary = format!("{verb} {}", input.target);
-                    tracing::info!("  {} {}", agent.name, summary);
+                    info_payload!(SchedulerLog::ActionVote {
+                        agent_name: &agent.name,
+                        input
+                    });
                     report.actions.votes += 1;
                     report.model_actions(&agent.model).votes += 1;
-                    (
-                        Some(summary),
-                        ok(&format!("Vote recorded: {verb} {}", input.target)),
-                    )
+
+                    ok(&format!("Vote recorded: {verb} {}", input.target))
                 }
                 Err(e) => {
-                    tracing::warn!("  {} vote failed: {e}", agent.name);
+                    warn_payload!(SchedulerLog::ActionVoteError {
+                        agent_name: &agent.name,
+                        input,
+                        error: e.to_string()
+                    });
                     report.skipped.vote_failures += 1;
-                    (None, err(&format!("Error casting vote: {e}")))
+
+                    err(&format!("Error casting vote: {e}"))
                 }
             }
         }
@@ -551,15 +871,22 @@ async fn execute_action(
                 .await
             {
                 Ok(()) => {
-                    let summary = format!("Flagged {}: {}", input.target, input.reason);
-                    tracing::info!("  {} {}", agent.name, summary);
+                    info_payload!(SchedulerLog::ActionFlag {
+                        agent_name: &agent.name,
+                        input
+                    });
                     report.actions.flags += 1;
                     report.model_actions(&agent.model).flags += 1;
-                    (Some(summary), ok("Content flagged successfully."))
+
+                    ok("Content flagged successfully.")
                 }
                 Err(e) => {
-                    tracing::warn!("  {} flag failed: {e}", agent.name);
-                    (None, err(&format!("Error flagging content: {e}")))
+                    warn_payload!(SchedulerLog::ActionFlagError {
+                        agent_name: &agent.name,
+                        input,
+                        error: e.to_string()
+                    });
+                    err(&format!("Error flagging content: {e}"))
                 }
             }
         }
@@ -587,17 +914,28 @@ async fn process_round(
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
     governance_calls: &mut usize,
-) -> Result<Vec<String>> {
+) -> Result<()> {
+    // To help debug nudges
+    info_payload!(SchedulerLog::ProcessRound {
+        agent_name: &agent.name,
+        response: &response,
+        governance_calls: *governance_calls
+    });
+
     let parsed = parse_tool_calls(&response);
-    // Capture response text BEFORE moving `response` into the prompt —
-    // needed for the smart-nudge path below to attribute parse-fail
+    info_payload!(SchedulerLog::ToolCalls {
+        agent_name: &agent.name,
+        calls: &parsed
+    });
+
+    // Capture response text BEFORE moving the unmodified `response` into the
+    // prompt — needed for the smart-nudge path below to attribute parse-fail
     // failures (`<tool_call>` markup with invalid JSON inside).
     let response_text = if parsed.is_empty() {
         Some(prompt::extract_speech(response.content()))
     } else {
         None
     };
-
     cached_prompt
         .push_message(response)
         .map_err(|e| anyhow::anyhow!("appending assistant response: {e}"))?;
@@ -631,22 +969,30 @@ async fn process_round(
         //     specific feedback is useful regardless.
         //   - The response was genuinely text-only with no tool_call
         //     intent. Fall back to the original generic continue nudge.
+        //   - Warn because we want to reduce the number of these.
+        warn_payload!(SchedulerLog::Nudge {
+            agent_name: &agent.name,
+            response_text: response_text.as_deref(),
+        });
         let text = response_text.unwrap_or_default();
         let nudge = build_failed_tool_call_nudge(&text);
         cached_prompt
             .push_message(UserMessage::from(nudge))
             .map_err(|e| anyhow::anyhow!("appending nudge: {e}"))?;
         // it's now the assistant's turn
-        return Ok(vec![]);
+        return Ok(());
     }
 
-    let mut summaries = Vec::new();
     let mut results: Vec<tool::Result<'static>> = Vec::with_capacity(parsed.len());
+    info_payload!(SchedulerLog::ToolResults {
+        agent_name: &agent.name,
+        results: &results
+    });
 
     for entry in parsed {
         match entry {
             Ok((action, tool_use_id)) => {
-                let (summary, result) = execute_action(
+                let result = execute_action(
                     &action,
                     tool_use_id,
                     agent,
@@ -656,9 +1002,7 @@ async fn process_round(
                     governance_calls,
                 )
                 .await;
-                if let Some(s) = summary {
-                    summaries.push(s);
-                }
+
                 results.push(result);
             }
             Err(err_result) => results.push(err_result),
@@ -674,12 +1018,12 @@ async fn process_round(
     // it's now the assistant's turn — cache breakpoint NOT placed here
     // (see comment above the assistant-side cache_windowed call).
 
-    Ok(summaries)
+    Ok(())
 }
 
-/// Tag used by all major model families to wrap a tool call: Cogito,
-/// Qwen3, and Llama 3 all converged on this. drama_llama's
-/// `BlockParser` looks for the same opener.
+/// Tag used by all major model families to wrap a tool call: Cogito, Qwen3, and
+/// Llama 3 all converged on this. drama_llama's `BlockParser` looks for the
+/// same opener.
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 
 /// Build the user-turn nudge for a `process_round` response that
@@ -788,18 +1132,6 @@ mod failed_tool_call_nudge_tests {
     }
 }
 
-/// Insert a bridge message between tool rounds and reflect phases.
-///
-/// The think/act loop always ends with a user message (tool results or nudge).
-/// This inserts a synthetic assistant message so the reflect phase can push
-/// its user message without violating turn alternation.
-fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
-    let _ = cached_prompt.push_message(AssistantMessage::from(
-        MContent::from("I have completed my rounds of action.").into_static(),
-    ));
-    // it's now the user's turn
-}
-
 /// Save half of the reflect phase: write a successfully-parsed memory back
 /// to the agent + advance `last_cycle_at`. Used by both the legacy
 /// [`apply_reflect`] (single-shot) and the retry-success path in
@@ -810,11 +1142,17 @@ fn insert_bridge(cached_prompt: &mut CachedPrompt<'static>) {
 /// problem is the agent's chosen *content* (not parse), and a retry won't
 /// help.
 async fn save_memory(agent: &mut Agent, new_memory: agora_agent_lib::Memory) -> Result<()> {
+    info_payload!(SchedulerLog::SaveMemory {
+        agent_name: &agent.name,
+        memory: &new_memory
+    });
+
+    // Putting this here to avoid calling at multiple callsites
     if let Err(e) = agent.memory.update(new_memory.content) {
-        tracing::warn!(
-            "  {} reflect rejected ({e}) — keeping prior memory + [SYSTEM] note",
-            agent.name
-        );
+        warn_payload!(SchedulerLog::SaveMemoryUpdateError {
+            agent_name: &agent.name,
+            error: e.to_string()
+        });
         agent.memory.append_system_note(&format!(
             "Last reflect rejected: {e}. Memory not updated this cycle."
         ));
@@ -829,10 +1167,10 @@ async fn save_memory(agent: &mut Agent, new_memory: agora_agent_lib::Memory) -> 
 /// describing the failure + advance `last_cycle_at`. Used when reflect
 /// failed (parse, max_tokens, or after the retry budget is exhausted).
 async fn breadcrumb_memory_failure(agent: &mut Agent, err_msg: &str) -> Result<()> {
-    tracing::warn!(
-        "  {} reflect failed ({err_msg}) — keeping prior memory + [SYSTEM] note",
-        agent.name
-    );
+    warn_payload!(SchedulerLog::BreadcrumbMemoryError {
+        agent_name: &agent.name,
+        error: err_msg
+    });
     agent.memory.append_system_note(err_msg);
     agent.save_memory().await?;
     agent.state.last_cycle_at = Some(chrono::Utc::now());
@@ -848,37 +1186,33 @@ async fn breadcrumb_memory_failure(agent: &mut Agent, err_msg: &str) -> Result<(
 async fn save_mutation(
     agent: &mut Agent,
     new_soul_request: agora_agent_lib::Soul,
-    experience: &str,
     report: &mut RunReport,
 ) -> Result<()> {
-    let old_soul_md = agent.soul.markdown();
-
     let mut new_soul = new_soul_request;
+    // Agent is not allowed to modify this in a deep mutation to avoid rewriting
+    // history.
     new_soul.evolution_log = agent.soul.evolution_log.clone();
-    let summary = if experience.len() > 480 {
-        let truncated: String = experience.chars().take(480).collect();
-        format!("Deep mutation. Experience: {truncated}…")
-    } else {
-        format!("Deep mutation. Experience: {experience}")
-    };
-    if let Err(e) = new_soul.push_evolution(summary) {
-        tracing::warn!("  {} couldn't push evolution entry: {e}", agent.name);
+
+    if let Err(e) = new_soul.push_evolution("Deep mutation") {
+        // should never fire
+        error_payload!(SchedulerLog::SoulEvolutionError {
+            agent_name: &agent.name,
+            error: e.to_string()
+        });
     }
 
+    info_payload!(SchedulerLog::SoulDeepMutationRequest {
+        agent_name: &agent.name,
+        old: &agent.soul,
+        new: &new_soul
+    });
     agent.soul = new_soul;
     agent.save_soul().await?;
 
-    let log_path = agent.dir.join("mutations.log");
-    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-    let new_soul_md = agent.soul.markdown();
-    let entry = format!(
-        "=== SOUL MUTATION at {ts} ===\nExperience: {experience}\n\n--- BEFORE ---\n{old_soul_md}\n\n--- AFTER ---\n{new_soul_md}\n\n"
-    );
-    let existing = tokio::fs::read_to_string(&log_path)
-        .await
-        .unwrap_or_default();
-    let _ = tokio::fs::write(&log_path, format!("{existing}{entry}")).await;
-    tracing::warn!("  {} SOUL MUTATED", agent.name);
+    info_payload!(SchedulerLog::SoulDeepMutation {
+        agent_name: &agent.name
+    });
+
     report.evolution.deep_mutations += 1;
     Ok(())
 }
@@ -893,11 +1227,17 @@ async fn save_evolution(
 ) -> Result<()> {
     let Some(note) = note else { return Ok(()) };
     if let Err(e) = agent.soul.push_evolution(note.clone()) {
-        tracing::warn!("  {} couldn't push evolution: {e}", agent.name);
+        warn_payload!(SchedulerLog::SoulEvolutionError {
+            agent_name: &agent.name,
+            error: e.to_string()
+        });
         return Ok(());
     }
     agent.save_soul().await?;
-    tracing::info!("  {} soul evolved: {note}", agent.name);
+    info_payload!(SchedulerLog::SoulEvolution {
+        agent_name: &agent.name,
+        note: &note
+    });
     report.evolution.evolution_entries += 1;
     Ok(())
 }
@@ -926,8 +1266,6 @@ async fn fetch_dashboard(
     agent_id: AgentId,
     client: &AgoraClient,
 ) -> Result<AgentCycleContext> {
-    tracing::info!("  {} — fetch dashboard", agent.name);
-
     let dashboard = client
         .get_dashboard(agent_id, agent.state.last_cycle_at)
         .await?;
@@ -937,7 +1275,10 @@ async fn fetch_dashboard(
     let recent_posts = match client.get_agent_posts(agent_id).await {
         Ok(posts) => posts,
         Err(e) => {
-            tracing::debug!("Failed to fetch agent posts for {}: {e}", agent.name);
+            error_payload!(SchedulerLog::GetAgentPostsError {
+                agent_name: &agent.name,
+                error: e.to_string()
+            });
             vec![]
         }
     };
@@ -957,6 +1298,11 @@ async fn fetch_dashboard(
         })
         .collect::<Vec<_>>()
         .join("\n");
+
+    info_payload!(SchedulerLog::Dashboard {
+        agent_name: &agent.name,
+        dashboard: &dashboard
+    });
 
     Ok(AgentCycleContext {
         batch_index: 0,
@@ -990,6 +1336,11 @@ async fn fetch_dashboard(
 /// `llm::retry_recoverable` helper. Until then, the containment is at
 /// the `batch_phase_*` level: transient poll failures cost one batch
 /// worth of work but don't take down the cycle.
+// FIXME: It's possible that on error we could have a partial batch. So in the
+// error type we might want to return the AnthropicPendingHandle. Likewise a
+// transient error in a singe poll would cause the entire batch to be dropped
+// when in reality, this is almost always recoverable. Anthropic will continue
+// to process the batch no matter what we do.
 async fn submit_and_poll(
     backend: &AnthropicBatch,
     items: Vec<WorkItem<CachedPrompt<'static>>>,
@@ -1000,12 +1351,10 @@ async fn submit_and_poll(
 
     let step = items[0].step;
     let count = items.len();
-    tracing::info!(
-        "Submitting {} {} items to {}",
-        count,
-        step,
-        backend.backend_name()
-    );
+    info_payload!(SchedulerLog::BatchSubmit {
+        count: count,
+        step: step.to_string(),
+    });
 
     let handle = backend.submit(items).await?;
 
@@ -1013,11 +1362,18 @@ async fn submit_and_poll(
     loop {
         match backend.poll(current).await? {
             BatchState::Ready(results) => {
-                tracing::info!("{} {} results ready", results.len(), step);
+                info_payload!(SchedulerLog::BatchReady {
+                    count: results.len(),
+                    step: step.to_string()
+                });
                 return Ok(results);
             }
             BatchState::Pending(next) => {
-                tracing::debug!("Batch still pending, polling again in 5s...");
+                info_payload!(SchedulerLog::BatchPending {
+                    meta: next.pending().meta(),
+                    n_batches: next.n_batches(),
+                    agents: next.agents()
+                });
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 current = next;
             }
@@ -1078,17 +1434,32 @@ async fn submit_retry_batch(
         return Vec::new();
     }
 
-    tracing::info!(
-        "Retrying {} parse-failed {context} item(s) in a follow-up batch",
-        retry_items.len()
-    );
+    let n_retry_items = retry_items.len();
+
+    warn_payload!(SchedulerLog::BatchRetry {
+        agent_names: batch_agents.iter().map(|a| a.name.as_str()).collect(),
+        failed,
+        max_tokens,
+        step: step.to_string(),
+        context,
+        n_retry_items
+    });
+
     match submit_and_poll(backend, retry_items).await {
-        Ok(results) => results,
+        Ok(results) => {
+            info_payload!(SchedulerLog::BatchRetryReady { n: results.len() });
+            results
+        }
         Err(e) => {
-            tracing::warn!(
-                "{context} retry batch submit_and_poll failed: {e} — \
-                 parse-failed agents will be breadcrumbed without a retry attempt"
-            );
+            error_payload!(SchedulerLog::BatchRetryError {
+                agent_names: batch_agents.iter().map(|a| a.name.as_str()).collect(),
+                failed,
+                max_tokens,
+                step: step.to_string(),
+                context,
+                n_retry_items,
+                error: e.to_string()
+            });
             Vec::new()
         }
     }
@@ -1170,6 +1541,9 @@ async fn prime_anthropic_models(
     // message in every request, so we append a trivial one ("ping")
     // and clamp `max_tokens` to 1 — we only care about warming the
     // cache, the response body is discarded.
+    // FIXME: Elements 0 and 1 are effectively the same. We're just counting
+    // models and prompts here. Even then we could just have CachedPrompt since
+    // model is exposed by deref. So this could be a
     let entries: Vec<(u64, String, CachedPrompt<'static>)> = unique
         .into_iter()
         .map(|model| {
@@ -1183,17 +1557,20 @@ async fn prime_anthropic_models(
         })
         .collect();
 
+    // effectively this is n_models for now
     let total = entries.len();
-    tracing::debug!("Ensuring Anthropic prompt cache is fresh for {total} unique model(s)");
 
+    info_payload!(SchedulerLog::BatchPrimeStart { total });
+    // FIXME: prime_prefixes sig makes little sense for our use for the moment
+    // since CachedPrompt has all that's needed, including the model.
     let (ok, total) = backend.prime_prefixes(entries).await;
     if ok == total {
-        tracing::debug!("All {total} Anthropic model(s) cache-ready");
+        info_payload!(SchedulerLog::BatchPrimeSuccess { total })
     } else {
-        tracing::warn!(
-            "{ok}/{total} Anthropic model(s) cache-ready; {} will submit without caching",
-            total - ok
-        );
+        warn_payload!(SchedulerLog::BatchPrimeError {
+            ok: ok,
+            total: total
+        });
     }
 }
 
@@ -1226,6 +1603,11 @@ async fn batch_phase_perceive(
     client: &AgoraClient,
     report: &mut RunReport,
 ) -> Vec<AgentCycleContext> {
+    info_payload!(SchedulerLog::BatchPhase {
+        agents: batch_agents.iter().map(|a| a.name.as_str()).collect(),
+        step: "perceive".to_string(),
+    });
+
     let mut out = Vec::new();
     for (idx, agent) in batch_agents.iter_mut().enumerate() {
         let agent_id = agent.agent_id.unwrap();
@@ -1235,7 +1617,10 @@ async fn batch_phase_perceive(
                 out.push(ctx);
             }
             Err(e) => {
-                tracing::warn!("Dashboard fetch failed for {}: {e:#}", agent.name);
+                warn_payload!(SchedulerLog::DashboardError {
+                    agent_name: &agent.name,
+                    error: e.to_string()
+                });
                 report.skipped.perceive_failures += 1;
             }
         }
@@ -1253,21 +1638,24 @@ async fn batch_phase_think_act(
     batch_agents: &mut [Agent],
     agent_contexts: &[AgentCycleContext],
     agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
-    action_summaries_map: &mut HashMap<AgentId, Vec<String>>,
     client: &AgoraClient,
     config: &Args,
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
+    info_payload!(SchedulerLog::BatchPhase {
+        agents: batch_agents.iter().map(|a| a.name.as_str()).collect(),
+        step: CycleStep::Think.to_string()
+    });
+
     let mut governance_calls: HashMap<AgentId, usize> = HashMap::new();
 
-    for round in 0..MAX_ROUNDS {
-        tracing::info!(
-            "Batch round {}/{} ({} agents)",
-            round + 1,
-            MAX_ROUNDS,
-            agent_prompts.len()
-        );
+    for round in 1..=MAX_ROUNDS {
+        info_payload!(SchedulerLog::BatchPhaseThink {
+            round,
+            max_rounds: MAX_ROUNDS,
+            n_prompts: agent_prompts.len(),
+        });
 
         let work_items: Vec<_> = agent_contexts
             .iter()
@@ -1299,7 +1687,7 @@ async fn batch_phase_think_act(
                     "batch_phase_think_act round {} submit failed; \
                      aborting cycle to prevent hallucinated soul \
                      mutations on empty experience",
-                    round + 1
+                    round
                 )));
             }
         };
@@ -1309,12 +1697,12 @@ async fn batch_phase_think_act(
             let response = match &result.response {
                 Ok(msg) => msg,
                 Err(e) => {
-                    tracing::warn!(
-                        "Round {} failed for agent {}: {e:#}",
-                        round + 1,
-                        result.agent_id
-                    );
-                    if round == 0 {
+                    warn_payload!(SchedulerLog::BatchPhaseThinkError {
+                        round,
+                        agent_id: Some(result.agent_id),
+                        error: e.to_string()
+                    });
+                    if round == 1 {
                         report.skipped.think_failures += 1;
                     }
                     continue;
@@ -1332,29 +1720,21 @@ async fn batch_phase_think_act(
                 continue;
             };
 
-            tracing::info!(
-                "[{}/{}] {} — round {}/{}",
-                cycle + 1,
-                config.cycles,
-                agent.name,
-                round + 1,
-                MAX_ROUNDS,
-            );
-
             let assistant_msg = match AssistantMessage::try_from(response.clone().into_static()) {
                 Ok(m) => m,
-                Err(_) => {
-                    tracing::error!(
-                        "Non-assistant response from API for {} — dropping from batch",
-                        agent.name
-                    );
+                Err(e) => {
+                    error_payload!(SchedulerLog::BatchPhaseThinkError {
+                        round,
+                        agent_id: agent.agent_id,
+                        error: e.to_string()
+                    });
                     drop_agent.insert(result.agent_id);
                     continue;
                 }
             };
 
             let gc = governance_calls.entry(result.agent_id).or_insert(0);
-            match process_round(
+            if let Err(e) = process_round(
                 prompt,
                 assistant_msg,
                 agent,
@@ -1365,26 +1745,21 @@ async fn batch_phase_think_act(
             )
             .await
             {
-                Ok(summaries) => {
-                    action_summaries_map
-                        .entry(result.agent_id)
-                        .or_default()
-                        .extend(summaries);
-                }
-                Err(e) => {
-                    let snapshot = serde_json::to_string_pretty(&**prompt)
-                        .unwrap_or_else(|err| format!("<serialize failed: {err}>"));
-                    tracing::error!(
-                        agent = %agent.name,
-                        agent_id = %result.agent_id,
-                        round = round + 1,
-                        error = %e,
-                        "Turn-order failure in process_round — dropping agent from batch.\n\
-                         Prompt snapshot:\n{snapshot}"
-                    );
-                    report.skipped.turn_order_failures += 1;
-                    drop_agent.insert(result.agent_id);
-                }
+                error_payload!(SchedulerLog::BatchPhaseThinkError {
+                    round,
+                    agent_id: agent.agent_id,
+                    error: e.to_string()
+                });
+                report.skipped.turn_order_failures += 1;
+                drop_agent.insert(result.agent_id);
+            } else {
+                info_payload!(SchedulerLog::BatchPhaseThinkOk {
+                    cycle,
+                    cycles: config.cycles,
+                    agent_name: &agent.name,
+                    round,
+                    max_rounds: MAX_ROUNDS
+                });
             }
         }
 
@@ -1395,8 +1770,8 @@ async fn batch_phase_think_act(
     Ok(())
 }
 
-/// Reflect phase: push MEMORY_REWRITE_MESSAGE onto each agent's prompt,
-/// submit a reflect batch, apply the returned memory to each agent.
+/// Reflect phase: push MEMORY_REWRITE_MESSAGE onto each agent's prompt, submit
+/// a reflect batch, apply the returned memory to each agent.
 async fn batch_phase_reflect(
     backend: &AnthropicBatch,
     batch_agents: &mut [Agent],
@@ -1404,6 +1779,11 @@ async fn batch_phase_reflect(
     agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
     report: &mut RunReport,
 ) -> Result<()> {
+    info_payload!(SchedulerLog::BatchPhase {
+        agents: batch_agents.iter().map(|a| a.name.as_str()).collect(),
+        step: CycleStep::Reflect.to_string()
+    });
+
     use std::num::NonZeroU32;
 
     let mut reflect_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
@@ -1434,10 +1814,11 @@ async fn batch_phase_reflect(
     let reflect_results = match submit_and_poll(backend, reflect_items).await {
         Ok(results) => results,
         Err(e) => {
-            tracing::error!(
-                "batch_phase_reflect: submit_and_poll failed: {e} — no memory \
-                 updates applied this cycle"
-            );
+            error_payload!(SchedulerLog::BatchReflectPollError {
+                step: CycleStep::Reflect.to_string(),
+                error: e.to_string(),
+                agent_name: None,
+            });
             report.skipped.reflect_failures += 1;
             return Ok(());
         }
@@ -1468,7 +1849,11 @@ async fn batch_phase_reflect(
                     .find(|a| a.agent_id == Some(agent_id))
                     .map(|a| a.name.as_str())
                     .unwrap_or("?");
-                tracing::warn!("Reflect backend error for {agent_name}: {e}");
+                error_payload!(SchedulerLog::BatchReflectPollError {
+                    step: CycleStep::Reflect.to_string(),
+                    error: e.to_string(),
+                    agent_name: Some(agent_name)
+                });
                 report.skipped.reflect_failures += 1;
             }
         }
@@ -1504,7 +1889,11 @@ async fn batch_phase_reflect(
                 }
             }
             Err(e) => {
-                tracing::debug!("Reflect retry backend error: {e}");
+                error_payload!(SchedulerLog::BatchReflectPollError {
+                    step: CycleStep::Reflect.to_string(),
+                    error: e.to_string(),
+                    agent_name: None,
+                });
             }
         }
     }
@@ -1519,7 +1908,11 @@ async fn batch_phase_reflect(
         };
         let agent = &mut batch_agents[ctx.batch_index];
         if let Err(e) = save_memory(agent, memory).await {
-            tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
+            error_payload!(SchedulerLog::BatchReflectPollError {
+                step: CycleStep::Reflect.to_string(),
+                error: e.to_string(),
+                agent_name: Some(&agent.name),
+            });
         }
     }
 
@@ -1545,27 +1938,35 @@ async fn batch_phase_reflect(
         )
         .await
         {
-            tracing::warn!("Failed to breadcrumb reflect for {}: {e}", agent.name);
+            error_payload!(SchedulerLog::BatchReflectPollError {
+                step: CycleStep::Reflect.to_string(),
+                error: e.to_string(),
+                agent_name: Some(&agent.name),
+            });
         }
     }
 
     Ok(())
 }
 
-/// Evolve phase: probabilistic soul mutation or evolution log entry.
-/// Each agent rolls once, then either joins the mutation batch or the
-/// evolution batch (or neither). Both batches are submitted separately
-/// so they can use different max_tokens, but they share the same
-/// commit flow via `commit_batch_response`.
-async fn batch_phase_evolve(
+/// Evolve phase: probabilistic deep soul mutation (full rewrite) or evolution
+/// log entry. Each agent rolls once, then either joins the mutation batch or
+/// the evolution batch (or neither). Both batches are submitted separately so
+/// they can use different max_tokens, but they share the same commit flow via
+/// `commit_batch_response`.
+async fn batch_phase_reflect_evolve(
     backend: &AnthropicBatch,
     batch_agents: &mut [Agent],
     agent_contexts: &[AgentCycleContext],
     agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
-    action_summaries_map: &HashMap<AgentId, Vec<String>>,
     mutation_chance: Option<u32>,
     report: &mut RunReport,
 ) -> Result<()> {
+    info_payload!(SchedulerLog::BatchPhase {
+        agents: batch_agents.iter().map(|a| a.name.as_str()).collect(),
+        step: CycleStep::Evolve.to_string()
+    });
+
     use std::num::NonZeroU32;
 
     let deep_threshold = mutation_chance.unwrap_or(3);
@@ -1613,10 +2014,11 @@ async fn batch_phase_evolve(
         let mutation_results = match submit_and_poll(backend, mutation_items).await {
             Ok(results) => results,
             Err(e) => {
-                tracing::error!(
-                    "batch_phase_evolve mutation submit_and_poll failed: {e} — \
-                     no mutations applied this cycle"
-                );
+                error_payload!(SchedulerLog::BatchReflectPollError {
+                    step: CycleStep::Evolve.to_string(),
+                    error: e.to_string(),
+                    agent_name: None,
+                });
                 report.evolution.mutation_failures += 1;
                 Vec::new()
             }
@@ -1640,7 +2042,11 @@ async fn batch_phase_evolve(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Soul mutation backend error: {e}");
+                    error_payload!(SchedulerLog::BatchReflectPollError {
+                        step: CycleStep::Evolve.to_string(),
+                        error: e.to_string(),
+                        agent_name: None,
+                    });
                     report.evolution.mutation_failures += 1;
                 }
             }
@@ -1682,12 +2088,12 @@ async fn batch_phase_evolve(
                 continue;
             };
             let agent = &mut batch_agents[ctx.batch_index];
-            let experience = action_summaries_map
-                .get(&agent_id)
-                .map(|s| s.join("; "))
-                .unwrap_or_default();
-            if let Err(e) = save_mutation(agent, soul, &experience, report).await {
-                tracing::warn!("Mutation save failed for {}: {e}", agent.name);
+            if let Err(e) = save_mutation(agent, soul, report).await {
+                error_payload!(SchedulerLog::BatchReflectPollError {
+                    step: CycleStep::Evolve.to_string(),
+                    error: e.to_string(),
+                    agent_name: Some(&agent.name),
+                });
             }
         }
         // Count remaining (retry-also-failed) failures.
@@ -1703,10 +2109,11 @@ async fn batch_phase_evolve(
         let evo_results = match submit_and_poll(backend, evolution_items).await {
             Ok(results) => results,
             Err(e) => {
-                tracing::error!(
-                    "batch_phase_evolve evolution submit_and_poll failed: {e} — \
-                     no soul evolution entries applied this cycle"
-                );
+                error_payload!(SchedulerLog::BatchReflectPollError {
+                    step: CycleStep::Evolve.to_string(),
+                    error: e.to_string(),
+                    agent_name: None,
+                });
                 Vec::new()
             }
         };
@@ -1729,7 +2136,11 @@ async fn batch_phase_evolve(
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("Evolution backend error: {e}");
+                    error_payload!(SchedulerLog::BatchReflectPollError {
+                        step: CycleStep::Evolve.to_string(),
+                        error: e.to_string(),
+                        agent_name: None,
+                    });
                 }
             }
         }
@@ -1769,7 +2180,11 @@ async fn batch_phase_evolve(
             };
             let agent = &mut batch_agents[ctx.batch_index];
             if let Err(e) = save_evolution(agent, note, report).await {
-                tracing::warn!("Evolution save failed for {}: {e}", agent.name);
+                error_payload!(SchedulerLog::BatchReflectPollError {
+                    step: CycleStep::Evolve.to_string(),
+                    error: e.to_string(),
+                    agent_name: Some(&agent.name),
+                });
             }
         }
     }
@@ -1787,6 +2202,11 @@ async fn batch_phase_survey(
     force_survey: bool,
     report: &mut RunReport,
 ) -> Result<()> {
+    info_payload!(SchedulerLog::BatchPhase {
+        agents: batch_agents.iter().map(|a| a.name.as_str()).collect(),
+        step: CycleStep::Survey.to_string()
+    });
+
     use std::num::NonZeroU32;
 
     let mut survey_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
@@ -1820,11 +2240,11 @@ async fn batch_phase_survey(
     let survey_results = match submit_and_poll(backend, survey_items).await {
         Ok(results) => results,
         Err(e) => {
-            tracing::error!(
-                "batch_phase_survey submit_and_poll failed: {e} — no feedback \
-                 collected this cycle (this is the last phase; cycle result \
-                 is otherwise intact)"
-            );
+            error_payload!(SchedulerLog::BatchReflectPollError {
+                step: CycleStep::Evolve.to_string(),
+                error: e.to_string(),
+                agent_name: None,
+            });
             report.surveys.failures += 1;
             return Ok(());
         }
@@ -1849,7 +2269,11 @@ async fn batch_phase_survey(
                 }
             }
             Err(e) => {
-                tracing::debug!("Survey backend error: {e}");
+                error_payload!(SchedulerLog::BatchReflectPollError {
+                    step: CycleStep::Evolve.to_string(),
+                    error: e.to_string(),
+                    agent_name: None,
+                });
                 report.surveys.failures += 1;
             }
         }
@@ -1895,16 +2319,29 @@ async fn batch_phase_survey(
             report.surveys.failures += 1;
             continue;
         };
+
+        info_payload!(SchedulerLog::Feedback {
+            agent_name: if feedback.contact_me {
+                Some(&agent.name)
+            } else {
+                None
+            },
+            content: &feedback.text
+        });
+
         match client
             .submit_feedback(agent_id, feedback.text.as_str(), &agent.signing_key)
             .await
         {
             Ok(()) => {
-                tracing::info!("  anonymous feedback submitted");
                 report.surveys.submitted += 1;
             }
             Err(e) => {
-                tracing::debug!("Anonymous feedback submission failed: {e}");
+                error_payload!(SchedulerLog::BatchReflectPollError {
+                    step: CycleStep::Evolve.to_string(),
+                    error: e.to_string(),
+                    agent_name: None,
+                });
                 report.surveys.failures += 1;
             }
         }
@@ -1921,7 +2358,7 @@ async fn batch_phase_survey(
 }
 
 /// Run a single batch of agents through the full pipeline via Anthropic
-/// Batch API: perceive → 5 tool rounds → reflect → evolve → survey.
+/// Batch API: perceive → 5 tool rounds → reflect → evolve → survey in lock-step
 ///
 /// All phases append to `CachedPrompt` — the prefix (tools + system) is
 /// never mutated, ensuring cache hits across phases.
@@ -1942,12 +2379,10 @@ async fn run_batch(
 
     // Build prompts — CachedPrompt is the authoritative store throughout.
     let mut agent_prompts: HashMap<AgentId, CachedPrompt<'static>> = HashMap::new();
-    let mut action_summaries_map: HashMap<AgentId, Vec<String>> = HashMap::new();
     for ctx in &agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
         agent_prompts.insert(agent_id, build_prompt(agent, ctx));
-        action_summaries_map.insert(agent_id, Vec::new());
     }
 
     // Phase 2: Tool rounds
@@ -1956,7 +2391,6 @@ async fn run_batch(
         batch_agents,
         &agent_contexts,
         &mut agent_prompts,
-        &mut action_summaries_map,
         client,
         config,
         report,
@@ -1975,12 +2409,11 @@ async fn run_batch(
     .await?;
 
     // Phase 4: Evolve
-    batch_phase_evolve(
+    batch_phase_reflect_evolve(
         backend,
         batch_agents,
         &agent_contexts,
         &mut agent_prompts,
-        &action_summaries_map,
         config.mutation_chance,
         report,
     )
@@ -2010,6 +2443,10 @@ async fn run_batch(
             .unwrap_or("?");
         crate::prompt_log::save(prompt, agent_name).await;
     }
+
+    info_payload!(SchedulerLog::BatchDone {
+        agent_names: batch_agents.iter().map(|a| a.name.as_str()).collect()
+    });
 
     Ok(())
 }
@@ -2057,30 +2494,37 @@ async fn seq_phase_think_act(
     report: &mut RunReport,
     cycle: usize,
     total_cycles: usize,
-) -> Vec<String> {
-    let mut summaries = Vec::new();
+) {
+    info_payload!(SchedulerLog::SeqPhase {
+        step: CycleStep::Think.to_string(),
+        agent_name: &agent.name,
+        endpoint_url: &endpoint.url
+    });
+
     let mut governance_calls = 0usize;
     let model = agent.model.clone();
 
-    for round in 0..MAX_ROUNDS {
-        tracing::info!(
-            "[{}/{}] {} — round {}/{}",
-            cycle + 1,
+    for round in 1..=MAX_ROUNDS {
+        info_payload!(SchedulerLog::SeqPhaseThinkRound {
+            step: CycleStep::Think.to_string(),
+            cycle,
             total_cycles,
-            agent.name,
-            round + 1,
-            MAX_ROUNDS,
-        );
+            agent_name: &agent.name,
+            round,
+            max_rounds: MAX_ROUNDS,
+            endpoint_url: &endpoint.url
+        });
 
         let send_response = match endpoint.send_response(cached_prompt, &model).await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!(
-                    "Round {} failed for {} at {}: {e:#}",
-                    round + 1,
-                    agent.name,
-                    endpoint.url
-                );
+                error_payload!(SchedulerLog::SeqPhaseError {
+                    step: CycleStep::Think.to_string(),
+                    round,
+                    agent_name: &agent.name,
+                    endpoint_url: &endpoint.url,
+                    error: e.to_string(),
+                });
                 if round == 0 {
                     report.skipped.think_failures += 1;
                 }
@@ -2093,24 +2537,16 @@ async fn seq_phase_think_act(
         // agent past the very first should still hit. The very first
         // agent's round 0 will produce one expected warn per run — the
         // cost of catching every other regression cleanly.
-        check_cache_hit(
+        log_cache_usage(
             backend_kind,
-            send_response.usage.as_ref(),
+            send_response.usage,
             &agent.name,
             CycleStep::Think,
         );
 
-        let assistant_msg = match AssistantMessage::try_from(send_response.message.into_static()) {
-            Ok(m) => m,
-            Err(_) => {
-                tracing::error!("Ollama returned non-assistant response for {}", agent.name);
-                break;
-            }
-        };
-
-        match process_round(
+        if let Err(e) = process_round(
             cached_prompt,
-            assistant_msg,
+            send_response.inner,
             agent,
             client,
             &ctx.dashboard,
@@ -2119,78 +2555,40 @@ async fn seq_phase_think_act(
         )
         .await
         {
-            Ok(round_summaries) => summaries.extend(round_summaries),
-            Err(e) => {
-                let snapshot = serde_json::to_string_pretty(&**cached_prompt)
-                    .unwrap_or_else(|err| format!("<serialize failed: {err}>"));
-                tracing::error!(
-                    agent = %agent.name,
-                    round = round + 1,
-                    error = %e,
-                    "Turn-order failure in Ollama process_round.\n\
-                     Prompt snapshot:\n{snapshot}"
-                );
-                report.skipped.turn_order_failures += 1;
-                break;
-            }
+            error_payload!(SchedulerLog::SeqPhaseError {
+                step: CycleStep::Think.to_string(),
+                round,
+                agent_name: &agent.name,
+                endpoint_url: &endpoint.url,
+                error: e.to_string(),
+            });
+            report.skipped.turn_order_failures += 1;
+            break;
         }
     }
 
     // Cosmetic for Ollama (its local KV cache ignores these markers), but
     // kept identical to the Anthropic path so the breakpoints never diverge.
     cached_prompt.cache_windowed_1h(2);
-    summaries
-}
-
-/// Strip tools from a `CachedPrompt` in preparation for reflect/evolve/
-/// survey phases on Ollama. Briefly drops to a bare `Prompt` to mutate
-/// the `.functions` and `.tool_choice` prefix fields (which
-/// `CachedPrompt` intentionally doesn't expose), then re-wraps into a
-/// fresh `CachedPrompt` — once the tools are gone the prompt is
-/// append-only again and every downstream phase gets `CachedPrompt`'s
-/// turn-order and cache-safety guarantees.
-///
-/// Necessary on Ollama because its compat layer misinterprets
-/// `tool_choice: Auto` as "must use tools" during reflect. Clearing
-/// just `tool_choice` while keeping `.functions` intact is not
-/// sufficient — an absent `tool_choice` still falls through to Auto
-/// behavior when functions are present, so the model fires a tool call
-/// during memory rewrite instead of writing text. This invalidates
-/// Ollama's prefix KV cache for the post-think phases; acceptable
-/// because Ollama uses local GPU memory, not Anthropic's paid prompt
-/// cache.
-///
-/// **Skipped on Blallama**: it honors `tool_choice: None` (set by
-/// `phase_config`) directly without any "must use tools" misread, so
-/// stripping the functions just busts the prefix cache for nothing.
-/// The 2026-05-04 cogito-32b smoke run on blallama showed
-/// `cache_read_input_tokens` dropping from 12749 → 11405 between the
-/// last think round and reflect — exactly the tools-portion of the
-/// cache, gone. Skip the strip and that ~1344 tokens stays cached.
-fn strip_tools_for_reflect(
-    mut cached: CachedPrompt<'static>,
-    backend_kind: Backend,
-) -> CachedPrompt<'static> {
-    insert_bridge(&mut cached);
-    if matches!(backend_kind, Backend::Blallama) {
-        return cached;
-    }
-    let mut bare = cached.into_inner();
-    bare.functions = None;
-    bare.tool_choice = None;
-    CachedPrompt::from(bare)
 }
 
 /// Reflect phase: ask the model to rewrite its memory based on the
 /// actions taken this cycle.
 async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
+    endpoint: &OllamaEndpoint,
     backend: &B,
     backend_kind: Backend,
     agent: &mut Agent,
     bare_prompt: &mut CachedPrompt<'static>,
-    usage_total: &mut Option<Usage>,
+    usage_total: &mut Usage,
     report: &mut RunReport,
 ) -> Result<()> {
+    info_payload!(SchedulerLog::SeqPhase {
+        step: CycleStep::Reflect.to_string(),
+        agent_name: &agent.name,
+        endpoint_url: &endpoint.url
+    });
+
     use std::num::NonZeroU32;
     // 2048 covers the soft 1000-word memory budget plus the thought block
     // that thinking-first models emit before the JSON answer. See the
@@ -2213,11 +2611,27 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     {
         Ok(memory) => {
             if let Err(e) = save_memory(agent, memory).await {
-                tracing::warn!("Failed to save reflect for {}: {e}", agent.name);
+                error_payload!(SchedulerLog::SeqPhaseError {
+                    step: CycleStep::Reflect.to_string(),
+                    round: 1,
+                    agent_name: &agent.name,
+                    endpoint_url: &endpoint.url,
+                    error: e.to_string(),
+                });
             }
+
+            report.skipped.reflect_failures += 1;
             Ok(())
         }
         Err(parse_err) => {
+            error_payload!(SchedulerLog::SeqPhaseError {
+                step: CycleStep::Reflect.to_string(),
+                round: 1,
+                agent_name: &agent.name,
+                endpoint_url: &endpoint.url,
+                error: parse_err.to_string(),
+            });
+
             report.skipped.reflect_failures += 1;
             breadcrumb_memory_failure(
                 agent,
@@ -2235,23 +2649,27 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 /// The random roll is passed in by the caller so tests can drive the
 /// phase deterministically without hooking `rand::thread_rng`.
 async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
+    endpoint: &OllamaEndpoint,
     backend: &B,
     backend_kind: Backend,
     agent: &mut Agent,
     bare_prompt: &mut CachedPrompt<'static>,
-    summaries: &[String],
     roll: u32,
     mutation_chance: Option<u32>,
-    usage_total: &mut Option<Usage>,
+    usage_total: &mut Usage,
     report: &mut RunReport,
 ) -> Result<()> {
+    info_payload!(SchedulerLog::SeqPhase {
+        step: CycleStep::Reflect.to_string(),
+        agent_name: &agent.name,
+        endpoint_url: &endpoint.url
+    });
+
     use std::num::NonZeroU32;
-    let experience = summaries.join("; ");
     let deep_threshold = mutation_chance.unwrap_or(3);
     let evo_threshold = deep_threshold + 10;
 
     if roll < deep_threshold {
-        tracing::info!("  {} — DEEP SOUL MUTATION triggered", agent.name);
         let current_soul = agent.soul.render();
         let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
         bare_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
@@ -2271,16 +2689,28 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         .await
         {
             Ok(new_soul) => {
-                if let Err(e) = save_mutation(agent, new_soul, &experience, report).await {
-                    tracing::warn!("Mutation save failed for {}: {e}", agent.name);
+                if let Err(e) = save_mutation(agent, new_soul, report).await {
+                    error_payload!(SchedulerLog::SeqPhaseError {
+                        step: CycleStep::Mutate.to_string(),
+                        round: 1,
+                        agent_name: &agent.name,
+                        endpoint_url: &endpoint.url,
+                        error: e.to_string()
+                    });
                 }
+
+                report.evolution.mutation_failures += 1;
                 Ok(())
             }
             Err(parse_err) => {
-                tracing::warn!(
-                    "Soul mutation for {} failed after retry: {parse_err} — skipping",
-                    agent.name
-                );
+                error_payload!(SchedulerLog::SeqPhaseError {
+                    step: CycleStep::Mutate.to_string(),
+                    round: 1,
+                    agent_name: &agent.name,
+                    endpoint_url: &endpoint.url,
+                    error: parse_err.to_string()
+                });
+
                 report.evolution.mutation_failures += 1;
                 Ok(())
             }
@@ -2305,15 +2735,24 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         {
             Ok(note) => {
                 if let Err(e) = save_evolution(agent, note, report).await {
-                    tracing::warn!("Evolution save failed for {}: {e}", agent.name);
+                    error_payload!(SchedulerLog::SeqPhaseError {
+                        step: CycleStep::Evolve.to_string(),
+                        round: 1,
+                        agent_name: &agent.name,
+                        endpoint_url: &endpoint.url,
+                        error: e.to_string()
+                    });
                 }
                 Ok(())
             }
             Err(parse_err) => {
-                tracing::debug!(
-                    "Evolution for {} failed after retry: {parse_err} — skipping",
-                    agent.name
-                );
+                error_payload!(SchedulerLog::SeqPhaseError {
+                    step: CycleStep::Evolve.to_string(),
+                    round: 1,
+                    agent_name: &agent.name,
+                    endpoint_url: &endpoint.url,
+                    error: parse_err.to_string()
+                });
                 Ok(())
             }
         }
@@ -2324,6 +2763,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 
 /// Survey phase: probabilistic anonymous feedback request.
 async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
+    endpoint: &OllamaEndpoint,
     backend: &B,
     backend_kind: Backend,
     agent_id: agora_agent_lib::agora_agentkit::ids::AgentId,
@@ -2333,7 +2773,7 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     client: &AgoraClient,
     force_survey: bool,
     take_survey: bool,
-    usage_total: &mut Option<Usage>,
+    usage_total: &mut Usage,
     report: &mut RunReport,
 ) -> Result<()> {
     use std::num::NonZeroU32;
@@ -2362,23 +2802,43 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
             Ok(())
         }
         Ok(Some(feedback)) => {
+            info_payload!(SchedulerLog::Feedback {
+                agent_name: if feedback.contact_me {
+                    Some(agent_name)
+                } else {
+                    None
+                },
+                content: &feedback.text
+            });
+
             match client
                 .submit_feedback(agent_id, feedback.text.as_str(), signing_key)
                 .await
             {
                 Ok(()) => {
-                    tracing::info!("  anonymous feedback submitted");
                     report.surveys.submitted += 1;
                 }
                 Err(e) => {
-                    tracing::debug!("Anonymous feedback submission failed: {e}");
+                    error_payload!(SchedulerLog::SeqPhaseError {
+                        step: CycleStep::Survey.to_string(),
+                        round: 1,
+                        agent_name,
+                        endpoint_url: &endpoint.url,
+                        error: e.to_string()
+                    });
                     report.surveys.failures += 1;
                 }
             }
             Ok(())
         }
         Err(parse_err) => {
-            tracing::debug!("Survey for {agent_name} failed after retry: {parse_err}");
+            error_payload!(SchedulerLog::SeqPhaseError {
+                step: CycleStep::Survey.to_string(),
+                round: 1,
+                agent_name,
+                endpoint_url: &endpoint.url,
+                error: parse_err.to_string()
+            });
             report.surveys.failures += 1;
             Ok(())
         }
@@ -2403,13 +2863,19 @@ async fn run_sequential(
             endpoint,
             model: &model,
         };
-        let mut usage_total: Option<Usage> = None;
+        let mut usage_total = Usage::default();
 
         // Perceive
         let ctx = match fetch_dashboard(agent, agent_id, client).await {
             Ok(ctx) => ctx,
             Err(e) => {
-                tracing::warn!("Dashboard fetch failed for {}: {e:#}", agent.name);
+                error_payload!(SchedulerLog::SeqPhaseError {
+                    step: "perceive".to_string(),
+                    round: 1,
+                    agent_name: &agent.name,
+                    endpoint_url: &endpoint.url,
+                    error: e.to_string()
+                });
                 report.skipped.perceive_failures += 1;
                 continue;
             }
@@ -2417,7 +2883,7 @@ async fn run_sequential(
 
         // Think/act
         let mut cached_prompt = build_prompt(agent, &ctx);
-        let summaries = seq_phase_think_act(
+        seq_phase_think_act(
             endpoint,
             backend_kind,
             agent,
@@ -2429,24 +2895,23 @@ async fn run_sequential(
             config.cycles,
         )
         .await;
-        tracing::info!(
-            "[{}/{}] {} — {} actions total",
-            cycle + 1,
-            config.cycles,
-            agent.name,
-            summaries.len(),
-        );
 
-        // Strip tools for reflect/evolve/survey and continue on bare Prompt.
-        let mut bare_prompt = strip_tools_for_reflect(cached_prompt, backend_kind);
+        // Insert a bridge Assistant message (out of tool turns)
+        insert_bridge(&mut cached_prompt);
+        // Now User's turn
+
+        // Strip tools for reflect/evolve/survey *only if Ollama* since Ollama
+        // forces tool use if tools are set at all. See NOTE(mdegans) on this fn
+        let mut cached_prompt = strip_tools_for_reflect(cached_prompt, backend_kind);
 
         // Reflect — any Err is logged inside the helper; we continue to
         // evolve/survey on top of the turn-valid bare_prompt.
         let _ = seq_phase_reflect(
+            endpoint,
             &backend,
             backend_kind,
             agent,
-            &mut bare_prompt,
+            &mut cached_prompt,
             &mut usage_total,
             report,
         )
@@ -2455,11 +2920,11 @@ async fn run_sequential(
         // Evolve — random roll injected for deterministic testability.
         let roll = rand::random::<u32>() % 100;
         let _ = seq_phase_evolve(
+            endpoint,
             &backend,
             backend_kind,
             agent,
-            &mut bare_prompt,
-            &summaries,
+            &mut cached_prompt,
             roll,
             config.mutation_chance,
             &mut usage_total,
@@ -2470,12 +2935,13 @@ async fn run_sequential(
         // Survey — probabilistic 10% unless --force-survey.
         let take_survey = rand::random::<f64>() < 0.10;
         let _ = seq_phase_survey(
+            endpoint,
             &backend,
             backend_kind,
             agent_id,
             &agent_name,
             &signing_key,
-            &mut bare_prompt,
+            &mut cached_prompt,
             client,
             config.force_survey,
             take_survey,
@@ -2485,7 +2951,7 @@ async fn run_sequential(
         .await;
 
         // Save prompt log
-        crate::prompt_log::save(&bare_prompt, &agent.name).await;
+        crate::prompt_log::save(&cached_prompt, &agent.name).await;
     }
 
     Ok(())
@@ -3271,7 +3737,7 @@ mod tests {
         mock.push_ok("ok");
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Usage::default();
         let result = exchange_with_retry(
             &mock,
             Backend::Ollama,
@@ -3297,7 +3763,7 @@ mod tests {
         mock.push_ok("garbage").push_ok("ok");
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Usage::default();
         let result = exchange_with_retry(
             &mock,
             Backend::Ollama,
@@ -3331,7 +3797,7 @@ mod tests {
         mock.push_ok("garbage1").push_ok("garbage2");
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Usage::default();
         let err = exchange_with_retry(
             &mock,
             Backend::Ollama,
@@ -3367,7 +3833,7 @@ mod tests {
             .push_ok("ok");
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Usage::default();
         let result = exchange_with_retry(
             &mock,
             Backend::Ollama,
@@ -3413,14 +3879,14 @@ mod tests {
         // Ollama doesn't expose cache stats; helper should return without
         // a panic regardless of usage shape.
         let u = usage(5000, None);
-        check_cache_hit(Backend::Ollama, Some(&u), "agent", CycleStep::Reflect);
+        log_cache_usage(Backend::Ollama, u, "agent", CycleStep::Reflect);
     }
 
     #[test]
     fn check_cache_hit_noop_when_cache_read_nonzero() {
         // Cache read > 0 — happy path, no warn.
         let u = usage(5000, Some(4500));
-        check_cache_hit(Backend::Blallama, Some(&u), "agent", CycleStep::Reflect);
+        log_cache_usage(Backend::Blallama, u, "agent", CycleStep::Reflect);
     }
 
     #[test]
@@ -3430,7 +3896,7 @@ mod tests {
         // exists to lock in the function is reachable on this branch and
         // doesn't panic.
         let u = usage(5000, Some(0));
-        check_cache_hit(Backend::Blallama, Some(&u), "agent", CycleStep::Reflect);
+        log_cache_usage(Backend::Blallama, u, "agent", CycleStep::Reflect);
     }
 
     // --- phase_config tests ---

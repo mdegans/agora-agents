@@ -5,6 +5,7 @@ pub mod client;
 pub mod community;
 pub mod error;
 pub mod llm;
+pub mod log;
 pub mod memory;
 pub mod probe;
 pub mod serde_forgiving;

@@ -1,4 +1,4 @@
-use agora_agentkit::ids::{AgentId, CommentId, PostId};
+use agora_agentkit::ids::{AgentId, CommentId, OperatorId, PostId};
 use agora_agentkit::requests::*;
 use agora_agentkit::responses::*;
 use agora_agentkit::signing::SignedAction;
@@ -18,8 +18,8 @@ pub type Community = CommunityResponse;
 
 // Re-export types that are used as-is with their agentkit names.
 pub use agora_agentkit::responses::{
-    CommunityTag, ContentResponse, IdResponse, PostWithCommentsResponse, RegisterAgentResponse,
-    TokenResponse,
+    AgentResponse, CommunityTag, ContentResponse, IdResponse, PostWithCommentsResponse,
+    RegisterAgentResponse, TokenResponse,
 };
 
 /// Full post with comments — wraps `PostWithCommentsResponse` to provide
@@ -33,6 +33,7 @@ pub struct AgoraClient {
     base_url: Url,
 }
 
+// FIXME: We're using Uuid here and serde_json::Value when we have strong types
 impl AgoraClient {
     pub fn new(mut url: Url) -> Result<Self> {
         // Ensure path ends with / so join() resolves "agora/" beneath it
@@ -58,7 +59,7 @@ impl AgoraClient {
         email: &str,
         password: &str,
         display_name: Option<&str>,
-    ) -> Result<Uuid> {
+    ) -> Result<OperatorId> {
         let body = RegisterOperatorRequest {
             email: email.to_string(),
             password: password.to_string(),
@@ -74,7 +75,7 @@ impl AgoraClient {
             tracing::info!("Operator {email} already registered");
             // Look up via a test registration — we can't get the ID from a 409,
             // but the caller doesn't need it for registration flow.
-            return Ok(Uuid::nil());
+            return Ok(Uuid::nil().into());
         }
 
         let resp = check_response(resp).await?;
@@ -82,7 +83,7 @@ impl AgoraClient {
         let id = data["id"]
             .as_str()
             .context("missing id in register response")?;
-        Ok(id.parse()?)
+        Ok(Uuid::parse_str(id)?.into())
     }
 
     pub async fn register_agent(
@@ -112,7 +113,7 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn get_agent(&self, name: &str) -> Result<Option<serde_json::Value>> {
+    pub async fn get_agent(&self, name: &str) -> Result<Option<AgentResponse>> {
         let url = self.url_with_segments("api/identity/agents/", &[name])?;
         let resp = self.http.get(url).send().await?;
 

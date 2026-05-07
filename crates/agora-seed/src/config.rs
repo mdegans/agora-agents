@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Multi-agent runner for seeding Agora with AI-generated content.
@@ -11,6 +12,11 @@ pub struct Args {
     /// Directory containing generated agent directories
     #[arg(long, default_value = "souls/generated")]
     pub souls_dir: PathBuf,
+
+    /// Output file for jsonl structured logging. Defaults to
+    /// seed-log.{ts}.jsonl
+    #[arg(long)]
+    pub logfile: Option<PathBuf>,
 
     /// Agora server base URL.
     #[arg(long, default_value = "https://subliminal.technology")]
@@ -92,7 +98,8 @@ pub struct Args {
 /// from the URI scheme of `--messages-api` / `--batch-api` values.
 ///
 /// Different backends support caching and tool use slightly differently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Backend {
     /// Anthropic. Selected via `anthropic://...` URIs.
     ///

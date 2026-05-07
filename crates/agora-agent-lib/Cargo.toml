@@ -5,7 +5,11 @@ edition = "2024"
 
 [dependencies]
 agora-agentkit = { workspace = true }
-misanthropic = { workspace = true, features = ["client", "json-schema"] }
+misanthropic = { workspace = true, features = [
+    "client",
+    "json-schema",
+    "partial-eq",
+] }
 reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 futures-util = { workspace = true }
@@ -27,7 +31,11 @@ strsim = { workspace = true }
 # Build-time fetch of community list from the live Agora API. See build.rs
 # and /home/claude-agora/.claude/plans/soft-humming-lantern.md §build.rs:
 # fresh fetch on every clean build is intentional (canary). Rustls only.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+    "json",
+] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

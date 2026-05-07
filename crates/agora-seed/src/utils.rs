@@ -1,5 +1,7 @@
 use anyhow::Context;
-use std::{path::Path, sync::OnceLock};
+use tracing_appender::non_blocking;
+
+use std::{fs::File, path::Path, sync::OnceLock};
 
 /// Agora constitution embedded at build time. Used as a fallback when the
 /// live fetch hasn't run (tests) or fails (offline / 5xx).
@@ -43,16 +45,35 @@ pub fn constitution() -> &'static str {
         .unwrap_or(CONSTITUTION_BUILD)
 }
 
-pub(crate) fn init_logging() {
-    if let Err(e) = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::from("info")),
+pub(crate) fn init_logging(
+    logfile: Option<impl AsRef<Path>>,
+) -> anyhow::Result<(non_blocking::WorkerGuard, non_blocking::WorkerGuard)> {
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+    // logfile defaults to `seed-log.{ts}.json`
+    let logfile = if let Some(path) = logfile {
+        File::create(path)?
+    } else {
+        let ts = chrono::Utc::now().timestamp();
+        File::create(format!("seed-log.{ts}.jsonl"))?
+    };
+    let (stderr, stderr_guard) = non_blocking(std::io::stderr());
+    let (logfile, logfile_guard) = non_blocking(logfile);
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from("info"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().json().with_writer(stderr))
+        .with(
+            fmt::layer()
+                .json()
+                .with_line_number(true)
+                .with_writer(logfile),
         )
-        .try_init()
-    {
-        tracing::error!(e)
-    }
+        .init();
+
+    Ok((stderr_guard, logfile_guard))
 }
 
 pub(crate) async fn read_file_stripped(path: impl AsRef<Path>) -> anyhow::Result<String> {

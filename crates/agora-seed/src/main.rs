@@ -1,8 +1,10 @@
+use agora_agent_lib::info_payload;
 use clap::Parser;
 
 mod agent;
 mod client;
 mod config;
+pub mod log;
 mod prompt;
 mod prompt_log;
 mod scheduler;
@@ -11,16 +13,22 @@ mod state;
 mod utils;
 
 use config::{Args, Phase};
+use serde::Serialize;
 pub use utils::constitution;
 use utils::{init_constitution, init_logging, read_file_stripped};
 
 use crate::agent::{filter_agents, load_allowed_models};
 
+/// All phases complete
+#[derive(Serialize)]
+pub struct Done;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging();
-    init_constitution().await;
     let mut args = Args::parse();
+
+    let _guards = init_logging(args.logfile.as_deref())?;
+    init_constitution().await;
 
     // Load allowed_models
     let allowed_models = load_allowed_models(&args.allowed_models).await?;
@@ -84,6 +92,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    tracing::info!("Done!");
+    info_payload!(Done);
     Ok(())
 }

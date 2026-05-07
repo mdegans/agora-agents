@@ -54,7 +54,7 @@
 //! at observed hit rates the read savings swamp the higher write cost
 //! as long as any reads land.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::scheduler::{
@@ -71,7 +71,23 @@ use misanthropic::prompt::Message as MMessage;
 pub struct AnthropicPendingHandle {
     pending: batch::Pending<CachedPrompt<'static>>,
     /// Maps batch::Id → (AgentId, CycleStep) for result routing.
+    // TODO: Investigate if this is always len() == 1 since we only have
+    // single pending anthropic batch attached. The log will tell.
     id_map: HashMap<batch::Id, (AgentId, CycleStep)>,
+}
+
+impl AnthropicPendingHandle {
+    pub fn pending(&self) -> &misanthropic::batch::Pending<CachedPrompt<'static>> {
+        &self.pending
+    }
+
+    pub fn n_batches(&self) -> usize {
+        self.id_map.len()
+    }
+    /// Get all [`AgentId`]s in flight. O(n)
+    pub fn agents(&self) -> HashSet<AgentId> {
+        self.id_map.iter().map(|p| p.1.0).collect()
+    }
 }
 
 /// Maximum consecutive prime-batch failures before we give up priming
@@ -461,6 +477,8 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
         let AnthropicPendingHandle { pending, id_map } = handle;
 
         let batch_id = pending.meta().id.clone();
+        // FIXME: handle transient errors gracefully with exponential backoff
+        // clamped from 5s to 5 minutes.
         let batch_result = self.client.batch_poll(pending).await?;
 
         match batch_result {

@@ -11,6 +11,8 @@ use misanthropic::prompt::Message as MMessage;
 use misanthropic::prompt::message::{Block, Content, Role};
 use url::Url;
 
+use crate::log::log_usage;
+
 use super::{LlmBackend, SendResponse};
 
 /// Maximum number of nudge retries when the model doesn't produce tool calls.
@@ -37,55 +39,56 @@ pub fn has_tool_use(msg: &MMessage<'_>) -> bool {
 ///
 /// Messages are preserved as-is between retries to maintain Ollama's KV
 /// prefix cache coherence.
+// FIXME: this actually busts ollama cache. Issue is we're cloning the prompt,
+// appending to it multiple times, returning another message, gets appended to
+// an older version of the prompt, submit, boom, cache busted. We actually need
+// to mutate the prompt which means that signatures of caller functions need to
+// change to take a &mut CachedPrompt to append multiple messages, including the
+// failures. Or we can swallow the cost with ollama. For Anthropic this
+// behavior is fine. The agent "got it right the first time" and the breakpoint
+// system ensures we can append another message out of sequence.
 pub async fn send_with_nudge(
     client: &misanthropic::Client,
+    // FIXME: Always use CachedPrompt instead of Prompt. Purge the codebase of
+    // any bare Prompt.
     prompt: &Prompt<'_>,
 ) -> Result<SendResponse> {
-    let response = client
+    let mut response = client
         .message(prompt)
         .await
-        .context("Ollama request failed")?;
+        .context("Ollama request failed")?
+        .into_static();
     let mut total_usage = response.usage;
-    let mut last_stop = response.stop_reason;
-    let msg: MMessage<'_> = response.inner.into();
 
     // Only nudge if the prompt has tools defined — reflect/survey prompts
     // don't use tools and plain text responses are expected.
     let has_tools = prompt.functions.as_ref().is_some_and(|f| !f.is_empty());
-    if !has_tools || has_tool_use(&msg) {
-        return Ok(SendResponse {
-            message: msg.into_static(),
-            usage: Some(total_usage),
-            stop_reason: last_stop,
-        });
+    // AssistantMessage derefs to the inner Message
+    if !has_tools || has_tool_use(&response.inner) {
+        return Ok(response);
     }
 
     // No tool calls — nudge the model
     let mut retry_prompt = prompt.clone().into_static();
-    let mut last_msg = msg;
 
     for attempt in 0..MAX_NUDGES {
         retry_prompt
-            .push_message(last_msg.into_static())
+            .push_message(response.inner.clone().into_static())
             .map_err(|e| anyhow::anyhow!("turn order error on nudge: {e}"))?;
         retry_prompt
             .push_message((Role::User, NUDGE_MESSAGE))
             .map_err(|e| anyhow::anyhow!("turn order error on nudge: {e}"))?;
 
-        let response = client
+        let nudge_response = client
             .message(&retry_prompt)
             .await
-            .context("Ollama nudge request failed")?;
-        total_usage += response.usage;
-        last_stop = response.stop_reason;
-        last_msg = response.inner.into();
+            .context("Ollama nudge request failed")?
+            .into_static();
+        total_usage += nudge_response.usage;
+        response = nudge_response;
 
-        if has_tool_use(&last_msg) {
-            return Ok(SendResponse {
-                message: last_msg.into_static(),
-                usage: Some(total_usage),
-                stop_reason: last_stop,
-            });
+        if has_tool_use(&response.inner) {
+            break;
         }
 
         tracing::warn!(
@@ -95,11 +98,8 @@ pub async fn send_with_nudge(
     }
 
     // Give up — return whatever we got
-    Ok(SendResponse {
-        message: last_msg.into_static(),
-        usage: Some(total_usage),
-        stop_reason: last_stop,
-    })
+    response.usage = total_usage;
+    Ok(response)
 }
 
 /// Create a [`misanthropic::Client`] pointed at an Ollama endpoint.
@@ -137,17 +137,7 @@ impl LlmBackend for OllamaBackend {
             .context("Ollama send")?;
 
         let elapsed = start.elapsed();
-        if let Some(ref usage) = resp.usage {
-            tracing::debug!(
-                "  [{}] {:.1}s, {}tok in, {}tok out",
-                self.model,
-                elapsed.as_secs_f64(),
-                usage.input_tokens,
-                usage.output_tokens,
-            );
-        } else {
-            tracing::info!("  [{}] {:.1}s total", self.model, elapsed.as_secs_f64());
-        }
+        log_usage(elapsed, resp.usage, &prompt.model.to_string());
 
         Ok(resp)
     }
