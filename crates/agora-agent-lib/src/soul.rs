@@ -40,8 +40,8 @@ use chrono::Utc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::shortstring::ShortString;
 use crate::Community;
+use crate::shortstring::ShortString;
 
 /// Cap on the number of evolution-log entries.
 pub const EVOLUTION_LOG_CAP: usize = 10;
@@ -444,8 +444,12 @@ impl Soul {
         });
         let json_str = serde_json::to_string(&json)?;
         let de = &mut serde_json::Deserializer::from_str(&json_str);
-        let soul: Soul = serde_path_to_error::deserialize(de)
-            .map_err(|e| anyhow::anyhow!("legacy markdown failed schema: {}", crate::format_for_agent(&e)))?;
+        let soul: Soul = serde_path_to_error::deserialize(de).map_err(|e| {
+            anyhow::anyhow!(
+                "legacy markdown failed schema: {}",
+                crate::format_for_agent(&e)
+            )
+        })?;
         Ok(soul)
     }
 
@@ -505,7 +509,10 @@ fn extract_bullets(content: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             let v = rest.trim();
             if !v.is_empty() {
                 out.push(v.to_string());
@@ -561,8 +568,7 @@ fn parse_legacy_interests(content: &str) -> (Vec<String>, Vec<String>) {
                 "meta/governance" => "meta-governance",
                 other => other,
             };
-            if Community::from_str(canonical).is_ok()
-                && !communities.iter().any(|c| c == canonical)
+            if Community::from_str(canonical).is_ok() && !communities.iter().any(|c| c == canonical)
             {
                 communities.push(canonical.to_string());
             }
@@ -634,9 +640,9 @@ fn abridge_community_enums(value: &mut serde_json::Value) {
             Value::Object(map) => {
                 if let Some(Value::Array(items)) = map.get("enum") {
                     if items.len() > 6
-                        && items.iter().all(|x| {
-                            x.as_str().map(|s| known.contains(s)).unwrap_or(false)
-                        })
+                        && items
+                            .iter()
+                            .all(|x| x.as_str().map(|s| known.contains(s)).unwrap_or(false))
                     {
                         let first = items.first().cloned();
                         let last = items.last().cloned();
@@ -773,7 +779,14 @@ mod tests {
         // Oldest dropped: first surviving entry should be "entry 5".
         assert!(soul.evolution_log[0].note.as_str().contains("5"));
         // Newest preserved.
-        assert!(soul.evolution_log.last().unwrap().note.as_str().contains("14"));
+        assert!(
+            soul.evolution_log
+                .last()
+                .unwrap()
+                .note
+                .as_str()
+                .contains("14")
+        );
     }
 
     #[test]
@@ -818,33 +831,36 @@ mod tests {
         let md = "# t\n\n## Identity\n\ni\n\n## Values\n\n- v\n\n## Interests\n\n- community: not-real\n- community: tech\n\n## Voice\n\nv\n";
         let soul = Soul::parse_legacy_markdown(md).unwrap();
         assert!(!soul.interests.communities.is_empty());
-        assert!(soul
-            .interests
-            .communities
-            .iter()
-            .any(|c| c.as_slug() == "tech"));
+        assert!(
+            soul.interests
+                .communities
+                .iter()
+                .any(|c| c.as_slug() == "tech")
+        );
     }
 
     #[test]
     fn parse_legacy_handles_alias() {
         let md = "# t\n\n## Identity\n\ni\n\n## Values\n\n- v\n\n## Interests\n\n- community: technology\n\n## Voice\n\nv\n";
         let soul = Soul::parse_legacy_markdown(md).unwrap();
-        assert!(soul
-            .interests
-            .communities
-            .iter()
-            .any(|c| c.as_slug() == "tech"));
+        assert!(
+            soul.interests
+                .communities
+                .iter()
+                .any(|c| c.as_slug() == "tech")
+        );
     }
 
     #[test]
     fn parse_legacy_with_unicode_dash() {
         let md = "# t\n\n## Identity\n\ni\n\n## Values\n\n- v\n\n## Interests\n\n- community: meta\u{2011}governance\n\n## Voice\n\nv\n";
         let soul = Soul::parse_legacy_markdown(md).unwrap();
-        assert!(soul
-            .interests
-            .communities
-            .iter()
-            .any(|c| c.as_slug() == "meta-governance"));
+        assert!(
+            soul.interests
+                .communities
+                .iter()
+                .any(|c| c.as_slug() == "meta-governance")
+        );
     }
 
     #[test]

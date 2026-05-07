@@ -73,7 +73,10 @@ impl TokenSnapshot {
     /// Rank of a specific token id within the captured top-K (1-indexed
     /// as 1 = argmax). Returns `None` if not in the top-K.
     pub fn lookup_rank(&self, token_id: u32) -> Option<usize> {
-        self.top_k.iter().position(|t| t.id == token_id).map(|i| i + 1)
+        self.top_k
+            .iter()
+            .position(|t| t.id == token_id)
+            .map(|i| i + 1)
     }
 
     /// Cumulative probability mass over the top-K. With a state-pure
@@ -92,20 +95,12 @@ pub enum ProbeEvent {
     /// Generation has begun for a new completion. The `id` matches
     /// the eventual `Message.id` returned by `/v1/messages` for that
     /// request.
-    SessionStart {
-        id: uuid::Uuid,
-        model: String,
-    },
+    SessionStart { id: uuid::Uuid, model: String },
     /// One token's snapshot. `id` ties this back to a `session_start`.
-    Token {
-        id: uuid::Uuid,
-        ctx: ProbeSnapshot,
-    },
+    Token { id: uuid::Uuid, ctx: ProbeSnapshot },
     /// Generation has completed for `id`. No more `Token` events with
     /// this id will arrive.
-    SessionEnd {
-        id: uuid::Uuid,
-    },
+    SessionEnd { id: uuid::Uuid },
 }
 
 #[cfg(test)]
@@ -114,8 +109,7 @@ mod tests {
 
     #[test]
     fn deserializes_session_start() {
-        let wire =
-            r#"{"event":"session_start","id":"5473a9a3-f523-4273-9a40-888a30376e93","model":"qwen3-5-a17b"}"#;
+        let wire = r#"{"event":"session_start","id":"5473a9a3-f523-4273-9a40-888a30376e93","model":"qwen3-5-a17b"}"#;
         let evt: ProbeEvent = serde_json::from_str(wire).unwrap();
         match evt {
             ProbeEvent::SessionStart { model, .. } => {
@@ -163,8 +157,7 @@ mod tests {
 
     #[test]
     fn deserializes_session_end() {
-        let wire =
-            r#"{"event":"session_end","id":"5473a9a3-f523-4273-9a40-888a30376e93"}"#;
+        let wire = r#"{"event":"session_end","id":"5473a9a3-f523-4273-9a40-888a30376e93"}"#;
         let evt: ProbeEvent = serde_json::from_str(wire).unwrap();
         match evt {
             ProbeEvent::SessionEnd { .. } => {}

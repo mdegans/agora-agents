@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use misanthropic::Prompt;
 
+use crate::log::log_usage;
+
 use super::{LlmBackend, SendResponse};
 
 /// Anthropic LLM backend using Claude models.
@@ -32,29 +34,17 @@ impl AnthropicBackend {
 #[async_trait]
 impl LlmBackend for AnthropicBackend {
     async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
-        // `.context(...)` preserves the downcast chain so callers can
-        // walk `err.chain()` looking for `misanthropic::client::Error` or
-        // `AnthropicError` to make retry decisions.
+        let start = std::time::Instant::now();
         let response = self
             .client
-            .message(prompt)
+            .message(&prompt)
             .await
             .context("Anthropic API call failed")?;
+        let elapsed = start.elapsed();
 
-        tracing::debug!(
-            "  [{}] {}tok in, {}tok out",
-            self.model,
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-        );
+        log_usage(elapsed, response.usage, &prompt.model.to_string());
 
-        let stop_reason = response.stop_reason;
-        let msg: misanthropic::prompt::Message<'_> = response.inner.into();
-        Ok(SendResponse {
-            message: msg.into_static(),
-            usage: Some(response.usage),
-            stop_reason,
-        })
+        Ok(response.into_static())
     }
 
     fn backend_name(&self) -> &str {

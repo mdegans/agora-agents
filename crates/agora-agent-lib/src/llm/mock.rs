@@ -10,6 +10,8 @@ use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use misanthropic::response::Usage;
+use uuid::Uuid;
 
 use super::{LlmBackend, MContent, MMessage, MRole, Prompt, SendResponse, StopReason};
 
@@ -51,11 +53,7 @@ impl MockLlmBackend {
 
     /// Queue a successful text response with an explicit [`StopReason`].
     /// Used to drive retry-helper tests that branch on `MaxTokens`.
-    pub fn push_ok_with_stop(
-        &self,
-        text: impl Into<String>,
-        stop: StopReason,
-    ) -> &Self {
+    pub fn push_ok_with_stop(&self, text: impl Into<String>, stop: StopReason) -> &Self {
         self.responses
             .lock()
             .expect("mock mutex poisoned")
@@ -100,12 +98,17 @@ impl LlmBackend for MockLlmBackend {
             .pop_front();
         match next {
             Some(Response::OkText(text, stop_reason)) => Ok(SendResponse {
-                message: MMessage {
+                inner: MMessage {
                     role: MRole::Assistant,
                     content: MContent::from(text.as_str()).into_static(),
-                },
-                usage: None,
+                }
+                .try_into()
+                .unwrap(), // is Assistant role, can't panic
+                usage: Usage::default(),
                 stop_reason,
+                id: Uuid::new_v4().to_string().into(),
+                model: "fake_model".into(),
+                stop_sequence: None,
             }),
             Some(Response::Err(mut slot)) => {
                 Err(slot.take().expect("mock: error slot already consumed"))
@@ -132,8 +135,8 @@ mod tests {
         let mock = MockLlmBackend::new("test");
         mock.push_ok("hello world");
         let resp = mock.send(&Prompt::default()).await.unwrap();
-        assert_eq!(resp.message.role, MRole::Assistant);
-        assert_eq!(resp.message.content.to_string(), "hello world");
+        assert_eq!(resp.inner.role, MRole::Assistant); // type guarantee in misanthropic
+        assert_eq!(resp.inner.content.to_string(), "hello world");
         assert_eq!(mock.remaining(), 0);
     }
 
@@ -183,13 +186,13 @@ mod tests {
         assert_eq!(mock.remaining(), 3);
 
         let first = mock.send(&Prompt::default()).await.unwrap();
-        assert_eq!(first.message.content.to_string(), "first");
+        assert_eq!(first.inner.content.to_string(), "first");
 
         let second = mock.send(&Prompt::default()).await.unwrap_err();
         assert!(second.to_string().contains("second"));
 
         let third = mock.send(&Prompt::default()).await.unwrap();
-        assert_eq!(third.message.content.to_string(), "third");
+        assert_eq!(third.inner.content.to_string(), "third");
 
         assert_eq!(mock.remaining(), 0);
     }

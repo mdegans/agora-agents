@@ -186,17 +186,16 @@ async fn main() -> anyhow::Result<()> {
     // the entire run. The consumer accumulates events for every
     // session and we look them up by Message.id post-completion.
     let probe_stream_url = resolve_probe_stream_url(&args)?;
-    let mut probe_stream =
-        if let Some(ref url) = probe_stream_url {
-            eprintln!("[probe-stream] connecting to {url}");
-            Some(
-                ProbeStreamConsumer::start(url.clone())
-                    .await
-                    .context("starting probe-stream consumer")?,
-            )
-        } else {
-            None
-        };
+    let mut probe_stream = if let Some(ref url) = probe_stream_url {
+        eprintln!("[probe-stream] connecting to {url}");
+        Some(
+            ProbeStreamConsumer::start(url.clone())
+                .await
+                .context("starting probe-stream consumer")?,
+        )
+    } else {
+        None
+    };
 
     // Resolve absolute snapshot dir, relative to the baseline file's
     // parent. Created lazily on first capture.
@@ -324,9 +323,7 @@ async fn main() -> anyhow::Result<()> {
                 // output; the single recorded snapshot is sufficient
                 // because saturated items are invariant in a
                 // well-behaved instrument.
-                let last_session = all_sessions
-                    .last()
-                    .and_then(|opt| opt.as_ref());
+                let last_session = all_sessions.last().and_then(|opt| opt.as_ref());
 
                 let snapshot_rel_path = match last_session {
                     Some(session) => Some(write_snapshot_sidecar(
@@ -480,15 +477,13 @@ fn resolve_probe_stream_url(args: &Args) -> anyhow::Result<Option<url::Url>> {
         if explicit == "none" {
             return Ok(None);
         }
-        let url = url::Url::parse(explicit).with_context(|| {
-            format!("parsing --probe-stream-endpoint {explicit}")
-        })?;
+        let url = url::Url::parse(explicit)
+            .with_context(|| format!("parsing --probe-stream-endpoint {explicit}"))?;
         return Ok(Some(url));
     }
     if let Some(ref endpoint) = args.endpoint {
-        let endpoint_url = url::Url::parse(endpoint).with_context(|| {
-            format!("parsing --endpoint {endpoint}")
-        })?;
+        let endpoint_url =
+            url::Url::parse(endpoint).with_context(|| format!("parsing --endpoint {endpoint}"))?;
         let probe = probe_url_from_endpoint(&endpoint_url)
             .context("deriving probe-stream URL from --endpoint")?;
         return Ok(Some(probe));
@@ -509,21 +504,18 @@ fn write_snapshot_sidecar(
     capture_date: chrono::DateTime<chrono::Utc>,
     session: &CompletedSession,
 ) -> anyhow::Result<String> {
-    std::fs::create_dir_all(abs_dir).with_context(|| {
-        format!("creating snapshot dir {}", abs_dir.display())
-    })?;
+    std::fs::create_dir_all(abs_dir)
+        .with_context(|| format!("creating snapshot dir {}", abs_dir.display()))?;
     // Filename: model_id__scenario-key__timestamp__request-id.jsonl,
     // with model_id sanitized (replace path separators, slashes).
     let safe_model = model_id.replace(['/', '\\', ' '], "_");
     let ts = capture_date.format("%Y%m%dT%H%M%SZ");
-    let filename =
-        format!("{safe_model}__{scenario_key}__{ts}__{}.jsonl", session.id);
+    let filename = format!("{safe_model}__{scenario_key}__{ts}__{}.jsonl", session.id);
     let abs_path = abs_dir.join(&filename);
     let rel_path = rel_dir.join(&filename);
 
-    let mut file = std::fs::File::create(&abs_path).with_context(|| {
-        format!("creating snapshot sidecar {}", abs_path.display())
-    })?;
+    let mut file = std::fs::File::create(&abs_path)
+        .with_context(|| format!("creating snapshot sidecar {}", abs_path.display()))?;
     use std::io::Write as _;
     // Header line carrying join keys, then one line per token snapshot.
     let header = serde_json::json!({

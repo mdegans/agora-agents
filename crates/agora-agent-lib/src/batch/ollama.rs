@@ -9,10 +9,13 @@
 
 use std::collections::HashSet;
 
-use misanthropic::Prompt;
-use misanthropic::prompt::Message as MMessage;
+use misanthropic::{Prompt, prompt::AssistantMessage};
+use url::Url;
 
-use crate::llm::ollama::{create_ollama_client, send_with_nudge};
+use crate::{
+    llm::ollama::{create_ollama_client, send_with_nudge},
+    log::log_usage,
+};
 
 /// Response from Ollama's `GET /api/tags` endpoint.
 #[derive(Debug, serde::Deserialize)]
@@ -30,7 +33,7 @@ struct OllamaModelInfo {
 #[derive(Clone)]
 pub struct OllamaEndpoint {
     /// Base URL (e.g. `http://localhost:11434`).
-    pub url: String,
+    pub url: Url,
     /// Models available on this endpoint (populated by [`discover`]).
     pub models: HashSet<String>,
     /// Anthropic-compat client pointed at this endpoint.
@@ -48,9 +51,7 @@ impl std::fmt::Debug for OllamaEndpoint {
 
 impl OllamaEndpoint {
     /// Create an endpoint with no discovered models.
-    pub fn new(url: impl Into<String>) -> anyhow::Result<Self> {
-        let url = url.into();
-        let url = url.trim_end_matches('/').to_string();
+    pub fn new(url: Url) -> anyhow::Result<Self> {
         let client = create_ollama_client(&url)?;
         Ok(Self {
             url,
@@ -60,11 +61,12 @@ impl OllamaEndpoint {
     }
 
     /// Discover available models by querying `GET /api/tags`.
-    pub async fn discover(http: &reqwest::Client, url: &str) -> anyhow::Result<Self> {
-        let url = url.trim_end_matches('/').to_string();
-        let tags_url = format!("{url}/api/tags");
+    pub async fn discover(http: &reqwest::Client, url: Url) -> anyhow::Result<Self> {
+        let tags_url = url
+            .join("api/tags")
+            .map_err(|e| anyhow::anyhow!("building /api/tags URL from {url}: {e}"))?;
         let resp: OllamaTagsResponse = http
-            .get(&tags_url)
+            .get(tags_url.clone())
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("connecting to {tags_url}: {e}"))?
@@ -92,12 +94,14 @@ impl OllamaEndpoint {
     /// Send a single prompt to this endpoint and return just the response
     /// message, discarding usage statistics. Thin wrapper around
     /// [`OllamaEndpoint::send_response`] for callers that don't track usage.
+    // FIXME: rename `send` functions to `complete`. The former is too generic
+    // (send where?) while complete is more consistent with most completion APIs
     pub async fn send(
         &self,
         prompt: &Prompt<'_>,
         model: &str,
-    ) -> anyhow::Result<MMessage<'static>> {
-        Ok(self.send_response(prompt, model).await?.message)
+    ) -> anyhow::Result<AssistantMessage<'static>> {
+        Ok(self.send_response(prompt, model).await?.inner)
     }
 
     /// Send a single prompt and return the full [`SendResponse`] including
@@ -109,21 +113,10 @@ impl OllamaEndpoint {
         model: &str,
     ) -> anyhow::Result<crate::llm::SendResponse> {
         let start = std::time::Instant::now();
-
         let resp = send_with_nudge(&self.client, prompt).await?;
-
         let elapsed = start.elapsed();
-        if let Some(ref usage) = resp.usage {
-            tracing::debug!(
-                "  [{model}@{}] {:.1}s, {}tok in, {}tok out",
-                self.url,
-                elapsed.as_secs_f64(),
-                usage.input_tokens,
-                usage.output_tokens,
-            );
-        } else {
-            tracing::debug!("  [{model}@{}] {:.1}s", self.url, elapsed.as_secs_f64());
-        }
+
+        log_usage(elapsed, resp.usage, model);
 
         Ok(resp)
     }
@@ -131,6 +124,11 @@ impl OllamaEndpoint {
 
 impl Default for OllamaEndpoint {
     fn default() -> Self {
-        Self::new("http://localhost:11434").expect("default Ollama URL should be valid")
+        Self::new(
+            "http://localhost:11434"
+                .parse()
+                .expect("default Ollama URL should be valid"),
+        )
+        .expect("default Ollama URL should be valid")
     }
 }

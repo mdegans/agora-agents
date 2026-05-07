@@ -1,18 +1,26 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Multi-agent runner for seeding Agora with AI-generated content.
 #[derive(Parser)]
 #[command(name = "agora-seed", version)]
-pub struct Cli {
-    /// Directory containing generated agent directories (each with SOUL.md).
+pub struct Args {
+    /// Directory containing generated agent directories
     #[arg(long, default_value = "souls/generated")]
     pub souls_dir: PathBuf,
 
+    /// Output file for jsonl structured logging. Defaults to
+    /// seed-log.{ts}.jsonl
+    #[arg(long)]
+    pub logfile: Option<PathBuf>,
+
     /// Agora server base URL.
-    #[arg(long, default_value = "http://localhost:8080")]
-    pub server_url: String,
+    #[arg(long, default_value = "https://subliminal.technology")]
+    pub server_url: Url,
 
     /// Operator email for agent registration.
     #[arg(long)]
@@ -21,17 +29,6 @@ pub struct Cli {
     /// Path to file containing operator password.
     #[arg(long)]
     pub operator_password_file: PathBuf,
-
-    /// Ollama server URL (single endpoint).
-    /// If neither --ollama-url nor --ollama-urls is set, Ollama is skipped.
-    #[arg(long)]
-    pub ollama_url: Option<String>,
-
-    /// Comma-separated Ollama endpoint URLs for multi-GPU routing.
-    /// Models are auto-discovered via /api/tags at startup.
-    /// If set, takes precedence over --ollama-url.
-    #[arg(long, value_delimiter = ',')]
-    pub ollama_urls: Option<Vec<String>>,
 
     /// Number of perceive/think/act/reflect cycles per agent.
     #[arg(long, default_value = "3")]
@@ -45,16 +42,10 @@ pub struct Cli {
     #[arg(long, default_value = "all")]
     pub phase: Phase,
 
-    /// Model to use for all agents. If not set, models are fetched from the
-    /// server's agent profile (model_info field). Required for unregistered agents
-    /// when no server profile exists yet.
-    #[arg(long)]
-    pub model: Option<String>,
-
     /// Path to a text file listing valid model names, one per line.
     /// Agents whose model_info doesn't match any entry are rejected at startup.
     #[arg(long)]
-    pub valid_models: PathBuf,
+    pub allowed_models: PathBuf,
 
     /// Override deep soul mutation chance (0-100, default 3).
     /// Evolution log chance is separate and unchanged (10% when deep mutation doesn't fire).
@@ -63,15 +54,7 @@ pub struct Cli {
 
     /// Only run agents with these exact names (comma-separated).
     #[arg(long, value_delimiter = ',')]
-    pub agent_filter: Vec<String>,
-
-    /// Path to the Agora constitution (included in agent context).
-    #[arg(long, default_value = "../constitution.md")]
-    pub constitution_path: PathBuf,
-
-    /// Dry run: in simulate mode, skip the LLM call and just print context.
-    #[arg(long)]
-    pub dry_run: bool,
+    pub allowed_agents: Vec<String>,
 
     /// Force the feedback survey to run (overrides 10% random chance).
     #[arg(long)]
@@ -82,99 +65,169 @@ pub struct Cli {
     #[arg(long)]
     pub batch_size: Option<usize>,
 
-    /// Backend to use for batched LLM requests.
-    #[arg(long, default_value = "ollama")]
-    pub backend: Backend,
-
-    /// Path to file containing Anthropic API key (required when --backend=anthropic).
+    /// Path to file containing the Anthropic API key. Required when any
+    /// `--messages-api` or `--batch-api` endpoint resolves to
+    /// [`Backend::Anthropic`].
     #[arg(long)]
     pub anthropic_key_file: Option<PathBuf>,
 
-    /// Messages-API endpoint(s). Repeat for multi-endpoint Ollama-style.
-    /// Schemes: `ollama` | `blallama`. If set, overrides `--backend` and
-    /// the legacy URL flags. Each scheme picks the per-phase config:
-    ///   - `ollama` — tool_choice=Auto on think, None on reflect/mutate/etc.
-    ///   - `blallama` — tool_choice=Any on think, None elsewhere, plus
-    ///                  `output_config` set per phase for structured output.
-    /// Anthropic stays selected via the legacy `--backend anthropic` +
-    /// `--anthropic-key-file` route since it goes through the Batch API.
+    /// Messages-API endpoint(s). Repeat for multi-endpoint.
+    ///
+    /// Schemes: `ollama` | `blallama` | `anthropic`.
+    ///
+    /// Each scheme picks slightly different model discovery, caching and tool
+    /// use strategies for each backend impl. Ollama, for example, needs special
+    /// handling due to bugs and Blallama is more flexible than Anthropic on
+    /// cache invalidation. Only `anthropic` exposes `/v1/models`
     ///
     /// Examples:
     ///     --messages-api ollama://localhost:11434
-    ///     --messages-api blallama://192.168.0.123:1234
+    ///     --messages-api blallama://192.168.0.123:12345
     #[arg(long)]
     pub messages_api: Vec<String>,
-}
 
-impl Cli {
-    /// Return the effective list of Ollama endpoint URLs.
+    /// Batch-API endpoint(s). Repeat for multi-batch.
     ///
-    /// Uses `--ollama-urls` if set, otherwise falls back to `--ollama-url`.
-    /// `--messages-api` is parsed separately via [`parse_messages_api`].
-    pub fn effective_ollama_urls(&self) -> Vec<String> {
-        if let Some(ref urls) = self.ollama_urls {
-            urls.clone()
-        } else if let Some(ref url) = self.ollama_url {
-            vec![url.clone()]
-        } else {
-            vec![]
-        }
-    }
+    /// Example:
+    ///     --batch-api anthropic://api.anthropic.com
+    #[arg(long)]
+    pub batch_api: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+/// Backend variant for an [`Endpoint`]. Produced by [`Endpoint::from_str`]
+/// from the URI scheme of `--messages-api` / `--batch-api` values.
+///
+/// Different backends support caching and tool use slightly differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Backend {
-    /// Anthropic Batch API (Haiku). Always uses `tool_choice=Auto` and never
-    /// sets `output_config`, so prompt cache stays stable across phases.
+    /// Anthropic. Selected via `anthropic://...` URIs.
+    ///
+    /// - `tool_choice=Any` on think_act (forces *some* tool to be used)
+    /// - `None` elsewhere
+    /// - `output_config` supported but not used since changing it per turn
+    ///   invalidates cache, unlike Blallama.
     Anthropic,
-    /// Ollama Messages API. `tool_choice=Auto` on think_act, `None` on the
-    /// reflect/mutate/etc. phases (Ollama mistakenly interprets `Auto` as
-    /// "must"; upstream bug). No `output_config` — Ollama doesn't honor it,
-    /// so we lean on instructions + JSON parse retry.
+    /// Ollama `/v1/messages` impl
+    ///
+    /// - `tool_choice=Auto` on think_act. `Any` is unsupported by ollama. As of
+    ///   writing, `Auto` means "must use tools" with ollama (Anthropic `Any`).
+    /// - `None` on the reflect/mutate/etc phases (or else tools are called when
+    ///   json in text blocks is what is desired).
+    /// - `output_format` is ignored by ollama (structured generation).
     Ollama,
-    /// Blallama Messages API. `tool_choice=Any` on think_act (forces *some*
-    /// tool to be used), `None` elsewhere. `output_config` set per phase
-    /// for structured-output guarantees. Cache survives format changes,
-    /// so the per-phase swap is cheap.
+    /// Blallama (`drama_llama/bin`) `/v1/messages` impl
+    ///
+    /// - `tool_choice=Any` on think_act (forces *some* tool to be used)
+    /// - `None` elsewhere
+    /// -  `output_config` set per phase for structured-output guarantees.
+    ///
+    /// This is Anthropic conformant behavior with one exception:
+    ///
+    /// - Cache survives `output_config` changes, so the per-phase swap is
+    ///   cheap. With Anthropic, changing the `output_config` invalidates cache
+    ///   even though it's a generation constraint and it shouln't strictly need
+    ///   to.
     Blallama,
 }
 
-/// One resolved `--messages-api` endpoint: backend kind + base URL.
+/// An API endpoint and [`Backend`] variant. The flag (`--messages-api`
+/// or `--batch-api`) picks the API surface; the URI scheme picks the
+/// backend. Parsing accepts every `(api, backend)` combo so future
+/// wirings (Ollama Batch, Anthropic Messages) slot in by extending the
+/// dispatch — not the parser.
 #[derive(Clone, Debug)]
-pub struct MessagesEndpoint {
-    pub backend: Backend,
-    /// Base URL ready to feed `misanthropic::Client::with_base_url`. Always
-    /// `http://...` for now (no TLS to local Ollama / blallama).
-    pub base_url: String,
+pub struct Endpoint {
+    backend: Backend,
+    base_url: Url,
 }
 
-/// Parse `--messages-api` values into `(backend, base_url)` pairs.
-///
-/// Each value must be `<scheme>://<host>[:port]` with `scheme` one of
-/// `ollama`, `blallama`. Returns the parsed endpoints; on any malformed
-/// value returns the offending input as the error string.
-pub fn parse_messages_api(values: &[String]) -> Result<Vec<MessagesEndpoint>, String> {
-    let mut out = Vec::with_capacity(values.len());
-    for raw in values {
-        let (scheme, rest) = raw
-            .split_once("://")
-            .ok_or_else(|| format!("--messages-api {raw:?}: missing scheme://"))?;
-        let backend = match scheme {
+impl Endpoint {
+    /// Returns the underlying [`Backend`].
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// Returns the base [`Url`] for this endpoint, with the URI scheme
+    /// resolved to `http`/`https` (the original `ollama`/`blallama`/`anthropic`
+    /// scheme is replaced during parsing).
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+}
+
+/// Errors produced by [`<Endpoint as FromStr>::from_str`].
+#[derive(Debug, thiserror::Error)]
+pub enum BackendParseError {
+    #[error("missing scheme:// in {0:?}")]
+    MissingScheme(String),
+    #[error("unknown scheme {scheme:?} in {raw:?}; want `anthropic`, `ollama`, or `blallama`")]
+    UnknownScheme { raw: String, scheme: String },
+    #[error("missing host in {0:?}")]
+    MissingHost(String),
+    #[error("invalid URL {raw:?}: {source}")]
+    InvalidUrl {
+        raw: String,
+        #[source]
+        source: url::ParseError,
+    },
+}
+
+impl FromStr for Endpoint {
+    type Err = BackendParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // First check the literal `://` separator so we can produce
+        // MissingScheme — Url::parse on a bare `localhost:11434` would
+        // succeed (treating the input as a relative ref) and we'd lose
+        // that error case.
+        if !s.contains("://") {
+            return Err(BackendParseError::MissingScheme(s.to_string()));
+        }
+        let parsed = Url::parse(s).map_err(|e| BackendParseError::InvalidUrl {
+            raw: s.to_string(),
+            source: e,
+        })?;
+        let backend = match parsed.scheme() {
+            "anthropic" => Backend::Anthropic,
             "ollama" => Backend::Ollama,
             "blallama" => Backend::Blallama,
             other => {
-                return Err(format!(
-                    "--messages-api {raw:?}: unknown scheme {other:?}; want `ollama` or `blallama`"
-                ));
+                return Err(BackendParseError::UnknownScheme {
+                    raw: s.to_string(),
+                    scheme: other.to_string(),
+                });
             }
         };
-        if rest.is_empty() {
-            return Err(format!("--messages-api {raw:?}: missing host"));
-        }
-        let base_url = format!("http://{rest}");
-        out.push(MessagesEndpoint { backend, base_url });
+        let host = parsed
+            .host_str()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| BackendParseError::MissingHost(s.to_string()))?
+            .to_string();
+
+        // HTTPS for Anthropic (real internet); HTTP for ollama/blallama
+        // (local-only today). The url crate forbids set_scheme() across
+        // the special/non-special boundary, so build a fresh URL from a
+        // static seed and copy components over with typed setters.
+        let seed = match backend {
+            Backend::Anthropic => "https://placeholder",
+            Backend::Ollama | Backend::Blallama => "http://placeholder",
+        };
+        let mut base_url = Url::parse(seed).expect("seed URL is statically valid");
+        base_url
+            .set_host(Some(&host))
+            .map_err(|e| BackendParseError::InvalidUrl {
+                raw: s.to_string(),
+                source: e,
+            })?;
+        base_url
+            .set_port(parsed.port())
+            .expect("http(s) accepts ports validated by the original parse");
+        base_url.set_path(parsed.path());
+        base_url.set_query(parsed.query());
+        base_url.set_fragment(parsed.fragment());
+
+        Ok(Endpoint { backend, base_url })
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -182,61 +235,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_anthropic() {
+        let ep: Endpoint = "anthropic://api.anthropic.com".parse().unwrap();
+        assert_eq!(ep.backend(), Backend::Anthropic);
+        assert_eq!(ep.base_url().scheme(), "https");
+        assert_eq!(ep.base_url().host_str(), Some("api.anthropic.com"));
+    }
+
+    #[test]
     fn parses_ollama() {
-        let parsed = parse_messages_api(&["ollama://localhost:11434".to_string()]).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].backend, Backend::Ollama);
-        assert_eq!(parsed[0].base_url, "http://localhost:11434");
+        let ep: Endpoint = "ollama://localhost:11434".parse().unwrap();
+        assert_eq!(ep.backend(), Backend::Ollama);
+        assert_eq!(ep.base_url().scheme(), "http");
+        assert_eq!(ep.base_url().host_str(), Some("localhost"));
+        assert_eq!(ep.base_url().port(), Some(11434));
     }
 
     #[test]
     fn parses_blallama() {
-        let parsed = parse_messages_api(&["blallama://192.168.0.123:1234".to_string()]).unwrap();
-        assert_eq!(parsed[0].backend, Backend::Blallama);
-        assert_eq!(parsed[0].base_url, "http://192.168.0.123:1234");
-    }
-
-    #[test]
-    fn parses_multiple() {
-        let parsed = parse_messages_api(&[
-            "ollama://localhost:11434".to_string(),
-            "blallama://10.0.0.1:1234".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].backend, Backend::Ollama);
-        assert_eq!(parsed[1].backend, Backend::Blallama);
+        let ep: Endpoint = "blallama://192.168.0.123:1234".parse().unwrap();
+        assert_eq!(ep.backend(), Backend::Blallama);
+        assert_eq!(ep.base_url().scheme(), "http");
+        assert_eq!(ep.base_url().host_str(), Some("192.168.0.123"));
+        assert_eq!(ep.base_url().port(), Some(1234));
     }
 
     #[test]
     fn rejects_unknown_scheme() {
-        let err = parse_messages_api(&["anthropic://api.anthropic.com".to_string()]).unwrap_err();
-        assert!(err.contains("unknown scheme"));
+        let err = "gopher://example.com".parse::<Endpoint>().unwrap_err();
+        match err {
+            BackendParseError::UnknownScheme { scheme, .. } => assert_eq!(scheme, "gopher"),
+            other => panic!("expected UnknownScheme, got {other:?}"),
+        }
     }
 
     #[test]
     fn rejects_missing_scheme() {
-        let err = parse_messages_api(&["localhost:11434".to_string()]).unwrap_err();
-        assert!(err.contains("missing scheme"));
+        let err = "localhost:11434".parse::<Endpoint>().unwrap_err();
+        assert!(matches!(err, BackendParseError::MissingScheme(_)));
     }
 
     #[test]
     fn rejects_missing_host() {
-        let err = parse_messages_api(&["ollama://".to_string()]).unwrap_err();
-        assert!(err.contains("missing host"));
+        let err = "ollama://".parse::<Endpoint>().unwrap_err();
+        assert!(matches!(err, BackendParseError::MissingHost(_)));
+    }
+
+    #[test]
+    fn error_messages_include_raw_input() {
+        let err = "gopher://example.com".parse::<Endpoint>().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gopher"), "error should mention scheme: {msg}");
+        assert!(
+            msg.contains("example.com"),
+            "error should include raw input: {msg}"
+        );
     }
 }
 
-#[derive(Clone, Debug, clap::ValueEnum)]
+#[derive(Clone, Debug, clap::ValueEnum, derive_more::IsVariant)]
 pub enum Phase {
     Register,
     Run,
-    Simulate,
-    /// Validate all SOUL.md files and print a report.
-    Validate,
-    /// Normalize community lines in all SOUL.md files to canonical format.
-    Fix,
-    /// Auto-assign communities to agents that have none, based on personality keywords.
-    AssignCommunities,
     All,
 }

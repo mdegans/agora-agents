@@ -21,22 +21,7 @@ pub use misanthropic::prompt::message::Role as MRole;
 pub use misanthropic::prompt::{AssistantMessage, UserMessage};
 pub use misanthropic::response::{StopReason, Usage};
 
-/// Response from an LLM backend, including the converted prompt message
-/// and optional usage statistics from the API.
-#[derive(Debug)]
-pub struct SendResponse {
-    /// The assistant's response, already converted to a prompt message
-    /// suitable for appending to the conversation.
-    pub message: MMessage<'static>,
-    /// Token usage stats (populated by Anthropic; Ollama compat may vary).
-    pub usage: Option<Usage>,
-    /// Why the model stopped generating. `None` if the backend doesn't
-    /// surface it. The retry path uses this to tell `MaxTokens` truncation
-    /// (give the model a hint about thinking budget) apart from a normal
-    /// `EndTurn` that produced unparseable JSON (give the model the parse
-    /// error verbatim).
-    pub stop_reason: Option<StopReason>,
-}
+pub type SendResponse = misanthropic::response::Message<'static>;
 
 /// A message in a conversation (simple text-only representation).
 ///
@@ -105,7 +90,7 @@ pub trait LlmBackend: Send + Sync {
         }
 
         let SendResponse {
-            message: response, ..
+            inner: response, ..
         } = self.send(&prompt).await?;
         // Filter out Block::Thought and <think>/<thinking> XML tags.
         // Ollama models (especially qwen) may return chain-of-thought
@@ -141,16 +126,6 @@ impl LlmBackend for Box<dyn LlmBackend> {
 // Exchange helpers — transactional user→assistant round-trips
 // ---------------------------------------------------------------------------
 
-/// Accumulate a single [`Usage`] into a running total. Identity on `None`.
-pub fn accumulate_usage(total: &mut Option<Usage>, delta: Option<Usage>) {
-    if let Some(d) = delta {
-        *total = Some(match total.take() {
-            Some(acc) => acc + d,
-            None => d,
-        });
-    }
-}
-
 // Re-export is_recoverable from agora-agentkit::retry. This was local
 // here until we extracted it so both the main agora workspace
 // (agora-appeals) and this workspace could share one copy.
@@ -185,7 +160,7 @@ pub struct ExchangeOutcome {
     pub stop_reason: Option<StopReason>,
     /// Per-call usage (also accumulated into the running `usage_total`
     /// passed to `exchange_with_stop_reason`).
-    pub usage: Option<Usage>,
+    pub usage: Usage,
 }
 
 /// Push a user message, call the backend (retrying once on recoverable
@@ -213,7 +188,7 @@ pub async fn exchange<B: LlmBackend + ?Sized>(
     backend: &B,
     prompt: &mut CachedPrompt<'static>,
     user: UserMessage<'static>,
-    usage_total: &mut Option<Usage>,
+    usage_total: &mut Usage,
 ) -> Result<AssistantMessage<'static>> {
     exchange_with_stop_reason(backend, prompt, user, usage_total)
         .await
@@ -229,7 +204,7 @@ pub async fn exchange_with_stop_reason<B: LlmBackend + ?Sized>(
     backend: &B,
     prompt: &mut CachedPrompt<'static>,
     user: UserMessage<'static>,
-    usage_total: &mut Option<Usage>,
+    usage_total: &mut Usage,
 ) -> Result<ExchangeOutcome> {
     prompt
         .push_message(user)
@@ -313,17 +288,16 @@ pub use agora_agentkit::retry::retry_recoverable;
 fn commit_exchange_result_full(
     prompt: &mut CachedPrompt<'static>,
     result: Result<SendResponse>,
-    usage_total: &mut Option<Usage>,
+    usage_total: &mut Usage,
 ) -> Result<ExchangeOutcome> {
     match result {
         Ok(SendResponse {
-            message,
+            inner: assistant,
             usage,
             stop_reason,
+            ..
         }) => {
-            accumulate_usage(usage_total, usage);
-            let assistant = AssistantMessage::try_from(message.into_static())
-                .expect("backend guarantees assistant role");
+            *usage_total += usage;
             prompt
                 .push_message(assistant.clone())
                 .expect("exchange: assistant after user — turn order is a programmer bug");
@@ -385,7 +359,7 @@ mod exchange_tests {
         let mock = MockLlmBackend::new("test");
         mock.push_ok("hello from the backend");
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Default::default();
 
         let assistant = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
             .await
@@ -406,7 +380,7 @@ mod exchange_tests {
         mock.push_err_str("boom").push_err_str("still boom");
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Default::default();
 
         let err = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
             .await
@@ -442,7 +416,7 @@ mod exchange_tests {
         mock.push_err(recoverable).push_ok("second-attempt-ok");
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Default::default();
 
         let assistant = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
             .await
@@ -465,7 +439,7 @@ mod exchange_tests {
         mock.push_err(non_recoverable);
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Default::default();
 
         let err = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
             .await
@@ -496,7 +470,7 @@ mod exchange_tests {
         mock.push_err(e1).push_err(e2);
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Default::default();
 
         let err = exchange(&mock, &mut prompt, UserMessage::from("hi"), &mut usage)
             .await
@@ -513,7 +487,7 @@ mod exchange_tests {
         mock.push_ok("reply 1").push_ok("reply 2");
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Default::default();
 
         exchange(&mock, &mut prompt, UserMessage::from("ask 1"), &mut usage)
             .await
@@ -538,7 +512,7 @@ mod exchange_tests {
         mock.push_err(e1).push_ok("recovered");
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Default::default();
 
         // Non-recoverable error: only one send attempted, synthetic
         // assistant appended.
@@ -585,7 +559,7 @@ mod exchange_tests {
         }
 
         let mut prompt = fresh_cached();
-        let mut usage = None;
+        let mut usage = Default::default();
 
         for phase_name in phases.iter() {
             let user_text = format!("{phase_name} request");

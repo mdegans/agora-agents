@@ -1,8 +1,11 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::signing::SigningKey;
+use agora_agent_lib::{SoulWarning, debug_payload, error_payload, warn_payload};
 use anyhow::{Context, Result};
+use serde::Serialize;
 use uuid::Uuid;
 
 use agora_agent_lib::memory::Memory;
@@ -16,6 +19,7 @@ pub struct Agent {
     pub soul: Soul,
     pub memory: Memory,
     pub signing_key: SigningKey,
+    /// If None, [`Agent`] is likely unregistered
     pub agent_id: Option<AgentId>,
     pub model: String,
     pub dir: PathBuf,
@@ -33,7 +37,7 @@ impl Agent {
     ///
     /// If `model` is Some, it is used for all agents. Otherwise the model field
     /// is left empty and must be resolved from the server before running.
-    pub async fn load(dir: PathBuf, model: Option<&str>) -> Result<Self> {
+    pub async fn load(dir: PathBuf) -> Result<Self> {
         let soul_json = dir.join("SOUL.json");
         let soul_md = dir.join("SOUL.md");
         let soul = if soul_json.exists() {
@@ -110,8 +114,8 @@ impl Agent {
             None
         };
 
-        // Model assignment: from CLI flag or resolved later from server
-        let model = model.unwrap_or_default().to_string();
+        // Model assignment: resolved later from server
+        let model = String::new();
 
         let state = State::load(&dir).await;
 
@@ -157,7 +161,7 @@ impl Agent {
     }
 
     /// Save soul to disk as `SOUL.json`. If a legacy `SOUL.md` is present,
-    /// it is removed after the JSON write succeeds.
+    /// it is removed after the JSON write succeeds. Praise ASI!
     pub async fn save_soul(&self) -> Result<()> {
         let path = self.dir.join("SOUL.json");
         self.soul.save(&path).await?;
@@ -177,7 +181,7 @@ impl Agent {
 }
 
 /// Load all agents from the souls directory.
-pub async fn load_all(souls_dir: &std::path::Path, model: Option<&str>) -> Result<Vec<Agent>> {
+pub async fn load_all(souls_dir: &std::path::Path) -> Result<Vec<Agent>> {
     let mut agents = Vec::new();
     let mut entries = tokio::fs::read_dir(souls_dir)
         .await
@@ -193,7 +197,7 @@ pub async fn load_all(souls_dir: &std::path::Path, model: Option<&str>) -> Resul
             continue;
         }
 
-        match Agent::load(path.clone(), model).await {
+        match Agent::load(path.clone()).await {
             Ok(agent) => agents.push(agent),
             Err(e) => {
                 tracing::warn!("Failed to load agent from {}: {e:#}", path.display());
@@ -208,6 +212,130 @@ pub async fn load_all(souls_dir: &std::path::Path, model: Option<&str>) -> Resul
         souls_dir.display()
     );
     Ok(agents)
+}
+
+/// Get allowed models from allowed models file.
+pub async fn load_allowed_models(path: impl AsRef<Path>) -> anyhow::Result<HashSet<String>> {
+    let models: HashSet<String> = crate::utils::read_file_stripped(path)
+        .await?
+        .lines()
+        .filter_map(|s| {
+            let s = s.trim().to_owned();
+            if s.is_empty() || s.starts_with("#") {
+                None
+            } else {
+                Some(s)
+            }
+        })
+        .collect();
+
+    if models.is_empty() {
+        anyhow::bail!("The `--allowed-models` file cannot be empty.")
+    }
+
+    Ok(models)
+}
+
+/// Filter all [`Agent`]s. Return an error if left with an empty Vec. To skip a
+/// check for allowed_names, supply an empty vec. This is treated as "no filter".
+///
+/// # Note
+/// - `allowed_names` will be sorted in-place
+pub fn filter_agents(
+    agents: &mut Vec<Agent>,
+    allowed_names: &mut [String],
+    allowed_models: &HashSet<String>,
+    require_registered: bool,
+) -> anyhow::Result<()> {
+    let mut agents_with_soul_error = vec![];
+    let mut agents_with_soul_warning = vec![];
+    let mut retained: Vec<Agent> = vec![];
+    allowed_names.sort_unstable();
+
+    for agent in agents.drain(..) {
+        // If we have a name allow list, filter by name
+        if !allowed_names.is_empty()
+            && allowed_names
+                .binary_search_by(|name| name.cmp(&agent.name))
+                .is_err()
+        {
+            tracing::warn!(
+                "Agent `{}` name not in --allowed-agents. Skipping.",
+                agent.name
+            );
+            continue;
+        }
+
+        // Ditto for model
+        if !allowed_models.contains(&agent.model) {
+            tracing::warn!(
+                "Agent `{}`s model not in --allowed-models. Skipping.",
+                agent.name
+            );
+            continue;
+        }
+
+        #[derive(Serialize)]
+        struct AgentWarning<'a, 'b> {
+            name: &'a str,
+            warning: &'b SoulWarning,
+        }
+
+        // Handle soul validation errors (validation is always run)
+        let warnings = agent.soul.validate();
+        let mut soul_error = false;
+        let mut soul_warn = false;
+        for warning in &warnings {
+            let payload = AgentWarning {
+                name: &agent.name,
+                warning,
+            };
+
+            match warning.level {
+                agora_agent_lib::WarnLevel::Error => {
+                    error_payload!(payload);
+                    soul_error = true;
+                }
+                agora_agent_lib::WarnLevel::Warning => {
+                    warn_payload!(payload);
+                    soul_warn = true;
+                }
+                agora_agent_lib::WarnLevel::Info => {
+                    debug_payload!(payload)
+                }
+            }
+        }
+        if soul_error {
+            agents_with_soul_error.push(agent.name);
+            continue;
+        }
+        if soul_warn {
+            agents_with_soul_warning.push(agent.name.clone())
+        }
+
+        if require_registered && agent.agent_id.is_none() {
+            tracing::warn!("Agent `{}` is not registered. Skipping.", agent.name);
+            continue;
+        }
+
+        retained.push(agent)
+    }
+
+    *agents = retained;
+
+    if !agents_with_soul_error.is_empty() {
+        tracing::error!("Agents with soul errors: {:?}", agents_with_soul_error)
+    }
+
+    if !agents_with_soul_warning.is_empty() {
+        tracing::warn!("Agents with soul warnings: {:?}", agents_with_soul_warning)
+    }
+
+    if agents.is_empty() {
+        anyhow::bail!("No agents left after filtering. Fatal.")
+    }
+
+    Ok(())
 }
 
 /// Resolve model assignments from the server for agents that don't have one.
@@ -240,9 +368,10 @@ pub async fn resolve_models(
     for &idx in &unresolved {
         let name = agents[idx].name.clone();
         match client.get_agent(&name).await {
-            Ok(Some(data)) => {
-                if let Some(model) = data["model_info"]
-                    .as_str()
+            Ok(Some(agent)) => {
+                if let Some(model) = agent
+                    .model_info
+                    .as_deref()
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                 {

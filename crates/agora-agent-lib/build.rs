@@ -144,7 +144,9 @@ fn render(communities: &[ApiCommunity]) -> String {
 
     // Display via slug
     out.push_str("impl ::core::fmt::Display for Community {\n");
-    out.push_str("    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {\n");
+    out.push_str(
+        "    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {\n",
+    );
     out.push_str("        f.write_str(self.as_slug())\n");
     out.push_str("    }\n");
     out.push_str("}\n\n");
