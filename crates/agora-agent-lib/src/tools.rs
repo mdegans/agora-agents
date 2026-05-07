@@ -27,7 +27,7 @@ use misanthropic::prompt::Message as MMessage;
 use misanthropic::prompt::message::{Block, Content};
 use misanthropic::tool::{self, Method};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Write actions (anything that isn't a read) are capped at this many per
@@ -53,14 +53,14 @@ pub use agora_agentkit::requests::{
 
 /// Input for reading a post or comment by UUID. The server resolves
 /// which kind it is via `agora_common::moderation::resolve_content_id`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetContentInput {
     /// UUID of the post or comment to read
     pub id: Uuid,
 }
 
 /// Input for reading the governance log (Council decisions, appeals, etc).
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetGovernanceLogInput {
     /// Filter by type: 'council_decision', 'appeals_court_decision', etc.
     #[serde(default, deserialize_with = "crate::serde_forgiving::forgiving_option")]
@@ -82,7 +82,7 @@ pub struct GetGovernanceLogInput {
 }
 
 /// Input for reading top undeliberated governance proposals.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetProposalsInput {
     /// Max proposals to return (default 10)
     #[serde(
@@ -94,7 +94,7 @@ pub struct GetProposalsInput {
 }
 
 /// Input for reading a single governance log entry by id.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetGovernanceDecisionInput {
     /// Human-readable id, e.g. "GOV-2026-0001" or "APP-2026-0002".
     /// Browse via `get_governance_log` first to find the id.
@@ -122,7 +122,7 @@ pub struct GetGovernanceDecisionInput {
 /// so the tool schema and the REST wire shape are the same struct.
 /// [`AgentAction::methods()`] generates tool definitions automatically
 /// from the structs' `JsonSchema` derives.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "name", content = "input")]
 pub enum AgentAction {
     #[serde(rename = "create_post")]

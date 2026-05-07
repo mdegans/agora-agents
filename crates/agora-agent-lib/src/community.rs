@@ -43,9 +43,7 @@ where
         match slug.parse::<Community>() {
             Ok(c) => out.push(c),
             Err(_) => {
-                tracing::warn!(
-                    "dropping unknown community slug {slug:?} during deserialize"
-                );
+                tracing::warn!("dropping unknown community slug {slug:?} during deserialize");
             }
         }
     }
@@ -82,11 +80,12 @@ mod tests {
         // We don't know the exact ALL contents at compile time, so build a
         // mixed list using the first known + a fake.
         let known = Community::ALL[0].as_slug();
-        let json = format!(r#"["{known}", "this-is-not-a-real-community"]"#);
-        let result: Vec<Community> = deserialize_communities_lossy(
-            &mut serde_json::Deserializer::from_str(&json),
-        )
-        .expect("lossy deserialize should not error on unknowns");
+        let json =
+            serde_json::to_string(&serde_json::json!([known, "this-is-not-a-real-community"]))
+                .expect("serializing static value");
+        let result: Vec<Community> =
+            deserialize_communities_lossy(&mut serde_json::Deserializer::from_str(&json))
+                .expect("lossy deserialize should not error on unknowns");
         assert_eq!(result, vec![Community::ALL[0]]);
     }
 

@@ -54,9 +54,7 @@ fn translate(msg: &str) -> String {
             let candidates = extract_expected_list(after);
             if !candidates.is_empty() {
                 if let Some(closest) = closest_match(variant, &candidates) {
-                    return format!(
-                        "`{variant}` is not a valid value. Did you mean `{closest}`?"
-                    );
+                    return format!("`{variant}` is not a valid value. Did you mean `{closest}`?");
                 }
                 let abbrev = abbreviate(&candidates);
                 return format!("`{variant}` is not a valid value. Valid options: {abbrev}");
@@ -215,7 +213,10 @@ mod tests {
     fn invalid_type_passes_through() {
         let msg = deserialize_err::<MissingFieldFixture>(r#"{"a": 5, "b": "x"}"#);
         assert!(msg.contains("`a`"), "got: {msg}");
-        assert!(msg.contains("invalid type") || msg.contains("expected"), "got: {msg}");
+        assert!(
+            msg.contains("invalid type") || msg.contains("expected"),
+            "got: {msg}"
+        );
     }
 
     #[test]

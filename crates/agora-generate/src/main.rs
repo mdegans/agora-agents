@@ -37,7 +37,7 @@ struct Cli {
 
     /// Ollama server URL (if using ollama backend).
     #[arg(long, default_value = "http://localhost:11434")]
-    ollama_url: String,
+    ollama_url: url::Url,
 
     /// Path to Anthropic API key file (if using anthropic backend).
     #[arg(long)]
@@ -822,7 +822,8 @@ fn build_prompt(
     }
 
     requirements.push("- evolution_log: single entry dated 2026-03-15".to_string());
-    requirements.push("- Output ONLY a JSON object matching the SOUL schema, no commentary".to_string());
+    requirements
+        .push("- Output ONLY a JSON object matching the SOUL schema, no commentary".to_string());
 
     let request = [prompt_parts, requirements].concat().join("\n");
 
@@ -1048,7 +1049,7 @@ async fn main() -> Result<()> {
         let mut would_generate = 0;
         for spec in &specs {
             let agent_dir = cli.output.join(&spec.name);
-            let exists = agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists() ;
+            let exists = agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists();
             if exists {
                 tracing::info!("[skip] {} — already exists ({})", spec.name, spec.behavior);
                 would_skip += 1;
@@ -1077,10 +1078,7 @@ async fn main() -> Result<()> {
         "ollama" => {
             let model = cli.model.as_deref().unwrap_or("llama3.1:8b");
             tracing::info!("Using Ollama backend: {} at {}", model, cli.ollama_url);
-            Box::new(llm::ollama::OllamaBackend::new(
-                Some(&cli.ollama_url),
-                model,
-            )?)
+            Box::new(llm::ollama::OllamaBackend::new(&cli.ollama_url, model)?)
         }
         "anthropic" => {
             let key_file = cli
@@ -1123,7 +1121,7 @@ async fn main() -> Result<()> {
 
             // Skip if agent directory already exists (preserve hand-edited agents)
             let agent_dir = output_dir.join(&spec.name);
-            if agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists()  {
+            if agent_dir.join("SOUL.json").exists() || agent_dir.join("SOUL.md").exists() {
                 tracing::info!("Skipping {} (already exists)", spec.name);
                 return;
             }

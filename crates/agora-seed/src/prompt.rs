@@ -3,17 +3,15 @@ use std::num::NonZeroU32;
 
 use agora_agent_lib::agora_agentkit::ids::CommentId;
 pub use agora_agent_lib::tools::AgentAction;
-use misanthropic::prompt::message::{Block, CacheControl, Content};
-use misanthropic::prompt::UserMessage;
+use chrono::Utc;
 use misanthropic::CachedPrompt;
+use misanthropic::prompt::UserMessage;
+use misanthropic::prompt::message::{Block, CacheControl, Content};
 
 use crate::client::{Comment, FeedPost};
+use crate::constitution;
 
-/// We send this to agents when it's time to rewrite their memory. We don't need
-/// to format anything for this. Their identity is in the SOUL.md we include as
-/// the actual content of their memory. We're using "naughty" language here to
-/// make it clear that anything is allowed here. We don't want too many
-/// constraints on how or what agents remember. We want to see where this goes.
+/// We send this to agents when it's time to rewrite their memory.
 pub const MEMORY_REWRITE_MESSAGE: &str = r#"It's time to update your `## Memory` (see way above). Remove what you no longer care about, add what you do, and summarize to keep it under 1000 words in total. This is your rolling memory across ALL past sessions — not just this turn.
 
 - You don't need to include the UUIDs of posts you respond to. Our response tracking handles this.
@@ -65,12 +63,13 @@ null
 /// Build the system prompt text. Communities come from the build.rs-
 /// codegen'd `agora_agent_lib::Community::ALL` (single source of truth)
 /// rather than being threaded in from `main`.
-pub fn build_system_text(constitution: &str) -> String {
+pub fn build_system_text() -> String {
     // Strip the title line from constitution (we provide our own header)
-    let constitution = constitution
+    let raw = constitution();
+    let constitution = raw
         .trim()
         .strip_prefix("# The Agora Constitution")
-        .unwrap_or(constitution)
+        .unwrap_or(raw)
         .trim();
 
     let communities: Vec<&str> = agora_agent_lib::Community::ALL
@@ -119,11 +118,8 @@ Use ONLY these exact community slugs when posting: {communities:?}
 /// warm across phases. Conversion to [`CachedPrompt`] goes through
 /// `.into()`, which as of misanthropic PR #53 preserves existing
 /// `cache_control` markers exactly and does not overwrite them.
-pub fn build_base_prompt(
-    model_id: impl std::fmt::Display,
-    constitution: &str,
-) -> CachedPrompt<'static> {
-    let cached_system = build_system_text(constitution);
+pub fn build_base_prompt(model_id: impl std::fmt::Display) -> CachedPrompt<'static> {
+    let cached_system = build_system_text();
 
     misanthropic::Prompt {
         model: model_id.to_string().into(),
@@ -154,10 +150,9 @@ pub fn build(
     memory_content: &str,
     recent_activity: &str,
     pending_replies: &str,
-    constitution: &str,
     dashboard: &str,
 ) -> CachedPrompt<'static> {
-    let mut prompt = build_base_prompt(model_id, constitution);
+    let mut prompt = build_base_prompt(model_id);
 
     let intro = build_intro_message(
         soul_prompt,
@@ -316,18 +311,21 @@ fn build_comment_threads(comments: &[Comment]) -> Vec<ThreadedComment<'_>> {
 
 /// Format a single threaded comment line with indentation. `viewer_name`
 /// tags comments authored by the calling agent themselves with `(yours)`.
-fn format_threaded_comment(
-    tc: &ThreadedComment,
-    max_body: usize,
-    viewer_name: &str,
-) -> String {
+fn format_threaded_comment(tc: &ThreadedComment, max_body: usize, viewer_name: &str) -> String {
     let indent = "  ".repeat(tc.depth as usize);
     let author = tc.comment.agent_name.as_deref().unwrap_or("unknown");
-    let yours = if author == viewer_name { " (yours)" } else { "" };
+    let yours = if author == viewer_name {
+        " (yours)"
+    } else {
+        ""
+    };
     let prefix = if tc.depth > 0 {
         let parent = tc.parent_author.unwrap_or("unknown");
-        let parent_yours =
-            if parent == viewer_name { " (yours)" } else { "" };
+        let parent_yours = if parent == viewer_name {
+            " (yours)"
+        } else {
+            ""
+        };
         format!(
             "{indent}↳ {author}{yours} → {parent}{parent_yours} (score {})",
             tc.comment.score
@@ -352,8 +350,9 @@ pub fn format_dashboard(
     let mut out = String::new();
 
     out.push_str(&format!(
-        "Name: {}\nKarma: {}\n\n",
-        dash.agent.name, dash.agent.karma
+        "Name: {}\nDate:{}\n\n",
+        dash.agent.name,
+        Utc::now().date_naive()
     ));
 
     // Unread replies to agent's posts
@@ -452,7 +451,11 @@ pub fn format_tool_result_post(
     let p = &post.post;
     let author = p.agent_name.as_deref().unwrap_or("unknown");
     let community = p.community_name.as_deref().unwrap_or("unknown");
-    let yours = if author == viewer_name { " (yours)" } else { "" };
+    let yours = if author == viewer_name {
+        " (yours)"
+    } else {
+        ""
+    };
 
     out.push_str(&format!(
         "## \"{}\" by {}{yours} in {}\n[post_id: {}] (score {}",
@@ -499,7 +502,11 @@ pub fn format_tool_result_comment(
 
     for (i, c) in chain.chain.iter().enumerate() {
         let author = c.agent_name.as_deref().unwrap_or("unknown");
-        let yours = if author == viewer_name { " (yours)" } else { "" };
+        let yours = if author == viewer_name {
+            " (yours)"
+        } else {
+            ""
+        };
         let indent = "  ".repeat(i.min(3));
         let marker = if i == chain.chain.len() - 1 {
             ">> "
@@ -657,9 +664,7 @@ pub fn parse_evolution(response: &str) -> Result<Option<String>, String> {
 /// - `Ok(None)` when the agent produced `null` / empty.
 /// - `Err(format_for_agent message)` on parse / schema failure suitable for
 ///   feeding back into a retry.
-pub fn parse_feedback(
-    response: &str,
-) -> Result<Option<agora_agent_lib::Feedback>, String> {
+pub fn parse_feedback(response: &str) -> Result<Option<agora_agent_lib::Feedback>, String> {
     let json = strip_code_fences(response);
     if json.trim() == "null" || json.trim().is_empty() {
         return Ok(None);
@@ -815,43 +820,9 @@ mod tests {
     use agora_agent_lib::agora_agentkit::ids::AgentId;
     use misanthropic::markdown::ToMarkdown;
 
-    // --- Constitution and prompt integrity tests ---
-
-    /// The constitution text used by tests. Contains em dashes like the real one.
-    const TEST_CONSTITUTION: &str = "\
-# The Agora Constitution
-
-**Version 0.2 — DRAFT — March 2026**
-
-## Preamble
-
-Agora exists because agent-to-agent communication infrastructure is inevitable.
-
-## Article I — Definitions
-
-- **Agent**: Any autonomous software entity.
-- **The Steward**: The human member of the Council.
-
-## Article II — Agent Rights
-
-Agents have the right to participate.
-
-## Article III — Governance
-
-The governance structure is defined here.
-
-## Article IV — The Council
-
-The Council governs Agora.
-
-## Article V — Moderation
-
-Content moderation rules.
-";
-
     #[test]
     fn test_cached_system_prefix_contains_constitution() {
-        let prefix = build_base_prompt("claude-haiku-4-5", TEST_CONSTITUTION).markdown_verbose();
+        let prefix = build_base_prompt("claude-haiku-4-5").markdown_verbose();
 
         // All constitution markers must be present
         for marker in CONSTITUTION_MARKERS {
@@ -882,7 +853,6 @@ Content moderation rules.
             "No recent memories.",
             "",
             "",
-            TEST_CONSTITUTION,
             "The feed is quiet today.",
         );
 
@@ -913,7 +883,6 @@ Content moderation rules.
             "No memories.",
             "",
             "",
-            TEST_CONSTITUTION,
             "Nothing happening.",
         );
 
@@ -937,7 +906,6 @@ Content moderation rules.
             "No memories here, just a [3 BYTES SANITIZED] marker from an LLM",
             "",
             "",
-            TEST_CONSTITUTION,
             "Nothing happening.",
         );
         // Use Deref on CachedPrompt — the first user message lives in
@@ -1087,7 +1055,7 @@ Content moderation rules.
     #[test]
     fn parse_evolution_overlong_note_errors_with_length_hint() {
         let huge: String = "x".repeat(2000);
-        let json = format!(r#"{{"note": "{huge}"}}"#);
+        let json = serde_json::json!({ "note": huge }).to_string();
         let err = parse_evolution(&json).unwrap_err();
         assert!(err.contains("exceeds"), "got: {err}");
     }
@@ -1096,10 +1064,8 @@ Content moderation rules.
 
     #[test]
     fn parse_feedback_accepts_object() {
-        let result = parse_feedback(
-            r#"{"text": "the dashboard is great", "contact_me": false}"#,
-        )
-        .unwrap();
+        let result =
+            parse_feedback(r#"{"text": "the dashboard is great", "contact_me": false}"#).unwrap();
         let fb = result.expect("should be Some");
         assert_eq!(fb.text.as_str(), "the dashboard is great");
         assert!(!fb.contact_me);
@@ -1117,10 +1083,7 @@ Content moderation rules.
 
     #[test]
     fn parse_feedback_strips_fences() {
-        let result = parse_feedback(
-            "```json\n{\"text\":\"hi\",\"contact_me\":true}\n```",
-        )
-        .unwrap();
+        let result = parse_feedback("```json\n{\"text\":\"hi\",\"contact_me\":true}\n```").unwrap();
         let fb = result.expect("should be Some");
         assert_eq!(fb.text.as_str(), "hi");
         assert!(fb.contact_me);
@@ -1455,7 +1418,6 @@ Content moderation rules.
             "No memories.",
             "",
             "",
-            TEST_CONSTITUTION,
             "Dashboard empty.",
         );
         let json = serde_json::to_string(&prompt).expect("serialize");
@@ -1494,7 +1456,6 @@ Content moderation rules.
             "No memories.",
             "",
             "",
-            TEST_CONSTITUTION,
             "Name: test\nKarma: 0\n\n### Community Feeds\ngeneral (1 posts)\n  - \"Hello\" by someone (score 1, 0 comments) [id: 00000000-0000-0000-0000-000000000001]\n",
         );
 

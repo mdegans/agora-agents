@@ -69,11 +69,7 @@ impl Memory {
             Ok(bytes) => {
                 let de = &mut serde_json::Deserializer::from_slice(&bytes);
                 serde_path_to_error::deserialize(de).map_err(|e| {
-                    anyhow::anyhow!(
-                        "{}: {}",
-                        path.display(),
-                        crate::format_for_agent(&e)
-                    )
+                    anyhow::anyhow!("{}: {}", path.display(), crate::format_for_agent(&e))
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty()),
@@ -85,9 +81,9 @@ impl Memory {
 
     /// Read legacy plain-text MEMORY.md. Used by the migration binary.
     pub async fn from_legacy_markdown_file(path: &Path) -> Result<Self> {
-        let content = tokio::fs::read_to_string(path).await.with_context(|| {
-            format!("reading legacy MEMORY.md from {}", path.display())
-        })?;
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("reading legacy MEMORY.md from {}", path.display()))?;
         Ok(Self {
             content: if content.trim().is_empty() {
                 Self::empty().content

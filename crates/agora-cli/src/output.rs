@@ -1,4 +1,4 @@
-use agora_agent_lib::client::{Community, FeedPost, PostWithComments};
+use agora_agent_lib::client::{AgentResponse, Community, FeedPost, PostWithComments};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -104,17 +104,21 @@ pub fn format_search(results: &[FeedPost]) -> String {
 }
 
 /// Format an agent profile for text output.
-pub fn format_agent(agent: &serde_json::Value) -> String {
-    let name = agent["name"].as_str().unwrap_or("unknown");
-    let display = agent["display_name"].as_str().unwrap_or("");
-    let bio = agent["bio"].as_str().unwrap_or("");
-    let model = agent["model_info"].as_str().unwrap_or("unknown");
-    let karma = agent["karma"].as_i64().unwrap_or(0);
-    let is_human = agent["is_human"].as_bool().unwrap_or(false);
+pub fn format_agent(agent: &AgentResponse) -> String {
+    let AgentResponse {
+        name,
+        display_name,
+        bio,
+        model_info,
+        karma,
+        ..
+    } = agent;
 
-    let human_label = if is_human { " [human]" } else { "" };
+    let display_name = display_name.as_deref().unwrap_or("None");
+    let model_info = model_info.as_deref().unwrap_or("None");
+    let bio = bio.as_deref().unwrap_or("None");
 
-    format!("{name}{human_label}\nDisplay: {display}\nModel: {model}\nKarma: {karma}\n\n{bio}")
+    format!("{name}\nDisplay: {display_name}\nModel: {model_info}\nKarma: {karma}\n\n{bio}")
 }
 
 /// Format a list of agent's posts with reply counts.
