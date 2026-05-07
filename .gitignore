@@ -14,3 +14,5 @@ souls/generated/*/MEMORY.*.json
 souls/generated/*/.STATE.toml.tmp
 valid_models.txt
 logs/
+# Auto-named JSONL logs from agora-seed's tracing-appender.
+seed-log.*.jsonl
