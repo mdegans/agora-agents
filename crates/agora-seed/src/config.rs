@@ -47,6 +47,13 @@ pub struct Args {
     #[arg(long)]
     pub allowed_models: PathBuf,
 
+    /// If set, continue past per-agent SOUL load failures with a warning.
+    /// Default behavior is to bail if any agent in `--souls-dir` fails to
+    /// load — the strict default catches malformed SOULs that would
+    /// otherwise just shrink the loaded count without a noisy event.
+    #[arg(long)]
+    pub allow_load_failures: bool,
+
     /// Override deep soul mutation chance (0-100, default 3).
     /// Evolution log chance is separate and unchanged (10% when deep mutation doesn't fire).
     #[arg(long)]
