@@ -13,6 +13,6 @@ souls/generated/*/MEMORY.json
 souls/generated/*/MEMORY.*.json
 souls/generated/*/.STATE.toml.tmp
 valid_models.txt
+# Default logfile dir for agora-seed. The runner mkdirs and writes
+# `logs/seed-log.{ts}.jsonl` here when no `--logfile` is given.
 logs/
-# Auto-named JSONL logs from agora-seed's tracing-appender.
-seed-log.*.jsonl

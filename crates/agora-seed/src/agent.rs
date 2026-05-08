@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use agora_agent_lib::agora_agentkit::ids::AgentId;
 use agora_agent_lib::signing::SigningKey;
-use agora_agent_lib::{SoulWarning, debug_payload, error_payload, warn_payload};
+use agora_agent_lib::{SoulWarning, debug_payload, error_payload, info_payload, warn_payload};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use uuid::Uuid;
@@ -181,8 +181,28 @@ impl Agent {
 }
 
 /// Load all agents from the souls directory.
-pub async fn load_all(souls_dir: &std::path::Path) -> Result<Vec<Agent>> {
+///
+/// Per-directory parse failures emit a structured `LoadFailure` event at
+/// error level. After the directory walk, a `LoadSummary` event reports the
+/// `dirs / loaded / failed` count. If `allow_failures` is false (the
+/// default — see `--allow-load-failures`), any failure causes a bail so
+/// silent SOUL drops can't shrink the loaded count unnoticed.
+pub async fn load_all(souls_dir: &std::path::Path, allow_failures: bool) -> Result<Vec<Agent>> {
+    #[derive(Serialize)]
+    struct LoadFailure<'a> {
+        path: &'a str,
+        error: &'a str,
+    }
+    #[derive(Serialize)]
+    struct LoadSummary<'a> {
+        souls_dir: &'a str,
+        dirs: usize,
+        loaded: usize,
+        failed: usize,
+    }
+
     let mut agents = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     let mut entries = tokio::fs::read_dir(souls_dir)
         .await
         .with_context(|| format!("reading souls directory {}", souls_dir.display()))?;
@@ -200,17 +220,38 @@ pub async fn load_all(souls_dir: &std::path::Path) -> Result<Vec<Agent>> {
         match Agent::load(path.clone()).await {
             Ok(agent) => agents.push(agent),
             Err(e) => {
-                tracing::warn!("Failed to load agent from {}: {e:#}", path.display());
+                let path_str = path.display().to_string();
+                let err_str = format!("{e:#}");
+                error_payload!(LoadFailure {
+                    path: &path_str,
+                    error: &err_str,
+                });
+                failures.push(path_str);
             }
         }
     }
 
     agents.sort_by(|a, b| a.name.cmp(&b.name));
-    tracing::info!(
-        "Loaded {} agents from {}",
-        agents.len(),
-        souls_dir.display()
-    );
+
+    let dirs = agents.len() + failures.len();
+    let souls_dir_str = souls_dir.display().to_string();
+    info_payload!(LoadSummary {
+        souls_dir: &souls_dir_str,
+        dirs,
+        loaded: agents.len(),
+        failed: failures.len(),
+    });
+
+    if !failures.is_empty() && !allow_failures {
+        anyhow::bail!(
+            "{} agent(s) failed to load from {}. Pass --allow-load-failures \
+             to continue with a partial load, or fix the failing SOUL \
+             files. See LoadFailure events above.",
+            failures.len(),
+            souls_dir.display(),
+        );
+    }
+
     Ok(agents)
 }
 

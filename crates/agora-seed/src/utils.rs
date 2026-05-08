@@ -57,12 +57,16 @@ pub(crate) fn init_logging(
 ) -> anyhow::Result<(non_blocking::WorkerGuard, non_blocking::WorkerGuard)> {
     use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-    // logfile defaults to `seed-log.{ts}.json`
+    // Default lands under `logs/` so the auto-named jsonl doesn't trip the
+    // assert_clean preflight. `logs/` is gitignored in the agents repo. When
+    // invoked via the parent justfile cwd is `agents/` so this resolves to
+    // `agents/logs/seed-log.{ts}.jsonl`.
     let logfile = if let Some(path) = logfile {
         File::create(path)?
     } else {
+        std::fs::create_dir_all("logs").context("creating logs/ directory")?;
         let ts = chrono::Utc::now().timestamp();
-        File::create(format!("seed-log.{ts}.jsonl"))?
+        File::create(format!("logs/seed-log.{ts}.jsonl"))?
     };
     let (stderr, stderr_guard) = non_blocking(std::io::stderr());
     let (logfile, logfile_guard) = non_blocking(logfile);
@@ -135,10 +139,35 @@ pub async fn assert_clean(start: impl AsRef<Path>) -> anyhow::Result<()> {
 ```stdout
 {}
 ```
-                                                                                                            
+
 Commit before launching a seed run so this run's provenance is anchored.
 This includes SOUL.json mutations from prior runs — those need to be committed too, otherwise this run's mutations will overwrite them."#,
             String::from_utf8_lossy(&output.stdout).trim_end()
+        );
+    }
+
+    let branch_output = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .await
+        .context("running git rev-parse --abbrev-ref HEAD")?;
+    if !branch_output.status.success() {
+        anyhow::bail!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&branch_output.stderr)
+        );
+    }
+    let branch = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
+    if branch != "main" {
+        anyhow::bail!(
+            "agents repo is on branch {branch:?}, not `main`. Switch to main \
+             before launching a seed run so this run's mutations are \
+             attributable to canonical history.\n\nA detached HEAD reports as \
+             \"HEAD\" and is also rejected."
         );
     }
 
