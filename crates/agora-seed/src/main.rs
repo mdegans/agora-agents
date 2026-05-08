@@ -1,5 +1,4 @@
 use agora_agent_lib::info_payload;
-use anyhow::Context;
 use clap::Parser;
 
 mod agent;

@@ -17,7 +17,7 @@
 //!
 //! Two execution paths share common functions:
 //! - **Anthropic**: Batches of agents submitted phase-by-phase in parallel
-//! - **Ollama**: Sequential per-agent via OllamaEndpoint::send()
+//! - **Ollama**: Sequential per-agent via MessagesClient::send()
 //!
 //! The cycle for each agent: build prompt → 5 tool rounds → reflect →
 //! evolve (probabilistic) → survey (probabilistic).
@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agora_agent_lib::Soul;
@@ -34,10 +35,11 @@ use agora_agent_lib::agora_agentkit::ids::CommentId;
 use agora_agent_lib::agora_agentkit::responses::DashboardResponse;
 use agora_agent_lib::agora_agentkit::scheduler::{BatchBackend, BatchState, CycleStep, WorkItem};
 use agora_agent_lib::batch::anthropic::AnthropicBatch;
-use agora_agent_lib::batch::ollama::OllamaEndpoint;
 use agora_agent_lib::error_payload;
 use agora_agent_lib::info_payload;
-use agora_agent_lib::llm::ollama::OllamaPerModel;
+use agora_agent_lib::llm::messages::Backend;
+use agora_agent_lib::llm::messages::MessagesClient;
+use agora_agent_lib::llm::messages::MessagesPerModel;
 use agora_agent_lib::llm::{Usage, commit_batch_response};
 use agora_agent_lib::tools::CastVoteInput;
 use agora_agent_lib::tools::CreateCommentInput;
@@ -59,7 +61,7 @@ use url::Url;
 
 use crate::agent::Agent;
 use crate::client::AgoraClient;
-use crate::config::{Args, Backend, Endpoint};
+use crate::config::{Args, Endpoint};
 use crate::prompt;
 use crate::prompt::EVOLUTION_MESSAGE;
 use crate::prompt::MEMORY_REWRITE_MESSAGE;
@@ -2354,7 +2356,7 @@ async fn run_batch(
     batch_agents: &mut [Agent],
     client: &AgoraClient,
     config: &Args,
-    _ollama_endpoints: Option<&[OllamaEndpoint]>,
+    _ollama_endpoints: Option<&[Arc<MessagesClient>]>,
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
@@ -2457,7 +2459,7 @@ async fn run_batch(
 // Sequential (Ollama) phase functions
 // ---------------------------------------------------------------------------
 //
-// The Ollama path runs one agent at a time through a shared OllamaEndpoint
+// The Ollama path runs one agent at a time through a shared MessagesClient
 // (local or LAN GPU). Each phase is a small async fn that takes the prompt
 // by `&mut` and funnels its single LLM round-trip through `exchange`
 // — which guarantees turn-order safety whether the backend succeeds,
@@ -2467,12 +2469,12 @@ async fn run_batch(
 /// endpoint, driving `process_round` to execute actions and append tool
 /// results. Returns the accumulated action summaries.
 ///
-/// This phase uses the raw `OllamaEndpoint::send_response` path directly
+/// This phase uses the raw `MessagesClient::send_response` path directly
 /// (not `exchange`) because the tool-round loop has its own turn-order
 /// invariants via `process_round`, which already handles tool_use →
 /// tool_result pairing and the error-recovery hole for us.
 async fn seq_phase_think_act(
-    endpoint: &OllamaEndpoint,
+    endpoint: &MessagesClient,
     backend_kind: Backend,
     agent: &mut Agent,
     ctx: &AgentCycleContext,
@@ -2562,7 +2564,7 @@ async fn seq_phase_think_act(
 /// Reflect phase: ask the model to rewrite its memory based on the
 /// actions taken this cycle.
 async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
-    endpoint: &OllamaEndpoint,
+    endpoint: &MessagesClient,
     backend: &B,
     backend_kind: Backend,
     agent: &mut Agent,
@@ -2636,7 +2638,7 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 /// The random roll is passed in by the caller so tests can drive the
 /// phase deterministically without hooking `rand::thread_rng`.
 async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
-    endpoint: &OllamaEndpoint,
+    endpoint: &MessagesClient,
     backend: &B,
     backend_kind: Backend,
     agent: &mut Agent,
@@ -2750,7 +2752,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 
 /// Survey phase: probabilistic anonymous feedback request.
 async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
-    endpoint: &OllamaEndpoint,
+    endpoint: &MessagesClient,
     backend: &B,
     backend_kind: Backend,
     agent_id: agora_agent_lib::agora_agentkit::ids::AgentId,
@@ -2833,7 +2835,7 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
 }
 
 async fn run_sequential(
-    endpoint: &OllamaEndpoint,
+    endpoint: &Arc<MessagesClient>,
     backend_kind: Backend,
     batch_agents: &mut [Agent],
     client: &AgoraClient,
@@ -2846,9 +2848,9 @@ async fn run_sequential(
         let model = agent.model.clone();
         let agent_name = agent.name.clone();
         let signing_key = agent.signing_key.clone();
-        let backend = OllamaPerModel {
-            endpoint,
-            model: &model,
+        let backend = MessagesPerModel {
+            client: Arc::clone(endpoint),
+            model: model.clone(),
         };
         let mut usage_total = Usage::default();
 
@@ -3023,7 +3025,7 @@ struct BatchPool {
 }
 
 impl BatchPool {
-    fn new(batches: Vec<(String, Vec<Agent>)>, endpoints: &[OllamaEndpoint]) -> Self {
+    fn new(batches: Vec<(String, Vec<Agent>)>, endpoints: &[Arc<MessagesClient>]) -> Self {
         let mut model_counts: HashMap<String, usize> = HashMap::new();
         for ep in endpoints {
             for model in &ep.models {
@@ -3052,7 +3054,7 @@ impl BatchPool {
 
     fn next_for(
         &self,
-        endpoint: &OllamaEndpoint,
+        endpoint: &MessagesClient,
         last_model: Option<&str>,
     ) -> Option<(String, Vec<Agent>)> {
         let mut pool = self.batches.lock().unwrap();
@@ -3101,10 +3103,11 @@ impl BatchPool {
 }
 
 /// Endpoint worker: pulls batches from the shared pool, processes each
-/// through the full pipeline sequentially.
+/// through the full pipeline sequentially. Reads `backend_kind` off the
+/// endpoint so each worker uses its own backend dialect — no shared
+/// `messages_api_backend` parameter.
 async fn run_worker(
-    endpoint: &OllamaEndpoint,
-    backend_kind: Backend,
+    endpoint: &Arc<MessagesClient>,
     pool: &BatchPool,
     results_tx: tokio::sync::mpsc::UnboundedSender<Vec<Agent>>,
     client: &AgoraClient,
@@ -3112,6 +3115,7 @@ async fn run_worker(
     report: &mut RunReport,
     cycle: usize,
 ) -> Result<()> {
+    let backend_kind = endpoint.backend;
     let mut batches_done = 0usize;
     let mut last_model: Option<String> = None;
     while let Some((model, mut batch_agents)) = pool.next_for(endpoint, last_model.as_deref()) {
@@ -3146,24 +3150,23 @@ async fn run_worker(
 }
 
 /// Run all cycles using a pull-based pool scheduler.
-/// `messages_api_backend`: resolved backend for the messages-API workers
-/// — `Backend::Ollama` or `Backend::Blallama`. Source of truth is the
-/// parsed `--messages-api` scheme; defaults to `Backend::Ollama` when no
-/// `--messages-api` is set (legacy `--ollama-url(s)` path). Threaded down
-/// to `run_worker → run_sequential → seq_phase_*` so `phase_config` and
-/// `check_cache_hit` see the right value.
+///
+/// Each endpoint in `ollama_endpoints` carries its own [`Backend`] variant;
+/// `run_worker` reads it from the endpoint and threads it down to
+/// `run_sequential → seq_phase_*` so `phase_config` and `check_cache_hit`
+/// see the right value. This means heterogeneous topologies (e.g. one
+/// Ollama endpoint + one Blallama endpoint, concurrent) Just Work.
 async fn run_cycles(
-    ollama_endpoints: &[OllamaEndpoint],
+    ollama_endpoints: &[Arc<MessagesClient>],
     anthropic: Option<&AnthropicBatch>,
     agents: &mut Vec<Agent>,
     client: &AgoraClient,
     config: &Args,
     ollama_models: &HashSet<String>,
     report: &mut RunReport,
-    messages_api_backend: Backend,
 ) -> Result<()> {
     let batch_size = config.batch_size.unwrap_or(50);
-    let all_endpoints: Vec<OllamaEndpoint> = ollama_endpoints.to_vec();
+    let all_endpoints: Vec<Arc<MessagesClient>> = ollama_endpoints.to_vec();
 
     for cycle in 0..config.cycles {
         tracing::info!("=== Cycle {}/{} ===", cycle + 1, config.cycles);
@@ -3259,7 +3262,6 @@ async fn run_cycles(
                         1 => {
                             run_worker(
                                 &ollama_endpoints[0],
-                                messages_api_backend,
                                 &pool,
                                 results_tx.clone(),
                                 client,
@@ -3274,7 +3276,6 @@ async fn run_cycles(
                             let (a, b) = tokio::join!(
                                 run_worker(
                                     &ollama_endpoints[0],
-                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -3284,7 +3285,6 @@ async fn run_cycles(
                                 ),
                                 run_worker(
                                     &ollama_endpoints[1],
-                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -3301,7 +3301,6 @@ async fn run_cycles(
                             let (a, b, c) = tokio::join!(
                                 run_worker(
                                     &ollama_endpoints[0],
-                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -3311,7 +3310,6 @@ async fn run_cycles(
                                 ),
                                 run_worker(
                                     &ollama_endpoints[1],
-                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -3321,7 +3319,6 @@ async fn run_cycles(
                                 ),
                                 run_worker(
                                     &ollama_endpoints[2],
-                                    messages_api_backend,
                                     &pool,
                                     results_tx.clone(),
                                     client,
@@ -3586,36 +3583,20 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Arg
         None
     };
 
-    // Resolve messages-API workers: scheme + URLs. All messages endpoints
-    // must share a backend (otherwise `phase_config` can't pick a single
-    // tool_choice/output_config for the run). Default scheme when no
-    // `--messages-api` is set is `Backend::Ollama` for the legacy
-    // `--ollama-url(s)` path.
-    let messages_backend = messages_endpoints
-        .first()
-        .map(|e| e.backend())
-        .unwrap_or(Backend::Ollama);
-    if !messages_endpoints
-        .iter()
-        .all(|e| e.backend() == messages_backend)
-    {
-        anyhow::bail!("mixed --messages-api schemes are not supported — pass one scheme at a time");
-    }
-    let urls: Vec<url::Url> = messages_endpoints
-        .iter()
-        .map(|e| e.base_url().clone())
-        .collect();
-
-    // Discover Ollama-compat endpoints (works for both ollama and
-    // blallama schemes — both expose `/api/tags`).
+    // Resolve messages-API workers: each `Endpoint` carries its own
+    // `Backend` variant from the URI scheme. Heterogeneous mixes
+    // (ollama:// + blallama://, etc.) are supported — each worker reads
+    // its own backend off its endpoint at dispatch time.
     let http = reqwest::Client::new();
-    let mut endpoints = Vec::with_capacity(urls.len());
-    for url in &urls {
-        match OllamaEndpoint::discover(&http, url.clone()).await {
-            Ok(ep) => endpoints.push(ep),
+    let mut endpoints: Vec<Arc<MessagesClient>> = Vec::with_capacity(messages_endpoints.len());
+    for ep in &messages_endpoints {
+        let url = ep.base_url().clone();
+        let backend = ep.backend();
+        match MessagesClient::discover(&http, url.clone(), backend).await {
+            Ok(client) => endpoints.push(Arc::new(client)),
             Err(e) => {
                 tracing::error!("Failed to discover models at {url}: {e}");
-                anyhow::bail!("Cannot reach Ollama endpoint {url}: {e}");
+                anyhow::bail!("Cannot reach messages-API endpoint {url}: {e}");
             }
         }
     }
@@ -3668,7 +3649,6 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Arg
         config,
         &ollama_models,
         &mut report,
-        messages_backend,
     )
     .await?;
 
