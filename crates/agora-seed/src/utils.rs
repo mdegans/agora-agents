@@ -52,21 +52,35 @@ pub fn constitution() -> &'static str {
         .unwrap_or(CONSTITUTION_BUILD)
 }
 
-pub(crate) fn init_logging(
+pub(crate) async fn init_logging(
     logfile: Option<impl AsRef<Path>>,
+    souls_dir: impl AsRef<Path>,
 ) -> anyhow::Result<(non_blocking::WorkerGuard, non_blocking::WorkerGuard)> {
     use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-    // Default lands under `logs/` so the auto-named jsonl doesn't trip the
-    // assert_clean preflight. `logs/` is gitignored in the agents repo. When
-    // invoked via the parent justfile cwd is `agents/` so this resolves to
-    // `agents/logs/seed-log.{ts}.jsonl`.
+    // Default lands in `<repo_root>/logs/`, where repo_root is the agents
+    // repo found by walking up from souls_dir to the first `.git`. `logs/`
+    // is gitignored in the agents repo. Falls back to `<cwd>/logs/` if the
+    // walk-up fails (e.g., souls_dir lives outside any git tree). Tracing
+    // isn't initialized yet at this point, so the fallback warning goes to
+    // stderr directly.
     let logfile = if let Some(path) = logfile {
         File::create(path)?
     } else {
-        std::fs::create_dir_all("logs").context("creating logs/ directory")?;
+        let logs_dir = match walk_up_to_git(souls_dir.as_ref()).await {
+            Ok(repo_root) => repo_root.join("logs"),
+            Err(e) => {
+                eprintln!(
+                    "init_logging: walk_up_to_git from {} failed ({e}); \
+                     falling back to ./logs",
+                    souls_dir.as_ref().display(),
+                );
+                PathBuf::from("logs")
+            }
+        };
+        std::fs::create_dir_all(&logs_dir).context("creating logs/ directory")?;
         let ts = chrono::Utc::now().timestamp();
-        File::create(format!("logs/seed-log.{ts}.jsonl"))?
+        File::create(logs_dir.join(format!("seed-log.{ts}.jsonl")))?
     };
     let (stderr, stderr_guard) = non_blocking(std::io::stderr());
     let (logfile, logfile_guard) = non_blocking(logfile);

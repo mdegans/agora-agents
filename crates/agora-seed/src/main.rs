@@ -30,7 +30,7 @@ pub struct Done;
 async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
 
-    let _guards = init_logging(args.logfile.as_deref())?;
+    let _guards = init_logging(args.logfile.as_deref(), &args.souls_dir).await?;
     assert_clean(&args.souls_dir).await?;
     init_constitution().await;
 
