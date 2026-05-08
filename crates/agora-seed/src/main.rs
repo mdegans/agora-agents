@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load all agents from souls directory
     tracing::info!("Loading agents from {}...", args.souls_dir.display());
-    let mut agents = agent::load_all(&args.souls_dir).await?;
+    let mut agents = agent::load_all(&args.souls_dir, args.allow_load_failures).await?;
 
     if agents.is_empty() {
         anyhow::bail!(
