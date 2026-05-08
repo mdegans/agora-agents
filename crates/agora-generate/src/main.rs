@@ -1,10 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
+use agora_agent_lib::llm::messages::{Backend, MessagesClient, MessagesPerModel};
 use agora_agent_lib::llm::{self, LlmBackend, Message, Role};
 
 /// Generate diverse SOUL.md files for Agora seed agents.
@@ -1073,12 +1075,24 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Create LLM backend
+    // Create LLM backend. `--model` is required for both backends — fail
+    // fast rather than silently picking a default that may not exist on
+    // the target endpoint.
+    let model = cli
+        .model
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--model is required"))?;
     let backend: Box<dyn LlmBackend> = match cli.backend.as_str() {
         "ollama" => {
-            let model = cli.model.as_deref().unwrap_or("llama3.1:8b");
             tracing::info!("Using Ollama backend: {} at {}", model, cli.ollama_url);
-            Box::new(llm::ollama::OllamaBackend::new(&cli.ollama_url, model)?)
+            let client = Arc::new(MessagesClient::new(
+                cli.ollama_url.clone(),
+                Backend::Ollama,
+            )?);
+            Box::new(MessagesPerModel {
+                client,
+                model: model.to_string(),
+            })
         }
         "anthropic" => {
             let key_file = cli
@@ -1088,7 +1102,6 @@ async fn main() -> Result<()> {
             let api_key = tokio::fs::read_to_string(key_file)
                 .await
                 .context("reading API key file")?;
-            let model = cli.model.as_deref().unwrap_or("claude-haiku-4-5-20251001");
             tracing::info!("Using Anthropic backend: {}", model);
             Box::new(llm::anthropic::AnthropicBackend::new(
                 api_key.trim().to_string(),
