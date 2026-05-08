@@ -3,15 +3,23 @@ secrets/
 *.key
 !secrets/.gitkeep
 souls/generated/*/signing_key
+souls/archived/*/signing_key
 # Agent memory is private — agents are promised that other agents
 # can't read it. The legacy `.md` rules covered the pre-migration
 # format; the JSON rules cover the post-#31 format and its rolling
 # `MEMORY.{ts}.json` backup files written by `Memory::save`.
+# Mirror the rules under souls/archived/ since archived agents'
+# memory is just as private as live ones'.
 souls/generated/*/MEMORY.md
 souls/generated/*/MEMORY.*.md
 souls/generated/*/MEMORY.json
 souls/generated/*/MEMORY.*.json
 souls/generated/*/.STATE.toml.tmp
+souls/archived/*/MEMORY.md
+souls/archived/*/MEMORY.*.md
+souls/archived/*/MEMORY.json
+souls/archived/*/MEMORY.*.json
+souls/archived/*/.STATE.toml.tmp
 valid_models.txt
 # Default logfile dir for agora-seed. The runner mkdirs and writes
 # `logs/seed-log.{ts}.jsonl` here when no `--logfile` is given.

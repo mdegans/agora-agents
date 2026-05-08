@@ -189,12 +189,6 @@ impl Soul {
                 field: "interests.communities".to_string(),
                 message: "no communities - agent will use global feed".to_string(),
             });
-        } else if self.interests.communities.len() < 2 {
-            out.push(SoulWarning {
-                level: WarnLevel::Warning,
-                field: "interests.communities".to_string(),
-                message: "only 1 community - feed will be narrow".to_string(),
-            });
         }
         if self.values.is_empty() {
             out.push(SoulWarning {
