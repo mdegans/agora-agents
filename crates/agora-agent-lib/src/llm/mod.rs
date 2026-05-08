@@ -6,8 +6,8 @@
 //! the full prompt/message types.
 
 pub mod anthropic;
+pub mod messages;
 pub mod mock;
-pub mod ollama;
 
 use anyhow::Result;
 use async_trait::async_trait;

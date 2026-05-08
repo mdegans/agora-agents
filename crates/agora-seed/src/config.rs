@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use agora_agent_lib::llm::messages::Backend;
 use clap::Parser;
-use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Multi-agent runner for seeding Agora with AI-generated content.
@@ -92,43 +92,6 @@ pub struct Args {
     ///     --batch-api anthropic://api.anthropic.com
     #[arg(long)]
     pub batch_api: Vec<String>,
-}
-
-/// Backend variant for an [`Endpoint`]. Produced by [`Endpoint::from_str`]
-/// from the URI scheme of `--messages-api` / `--batch-api` values.
-///
-/// Different backends support caching and tool use slightly differently.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Backend {
-    /// Anthropic. Selected via `anthropic://...` URIs.
-    ///
-    /// - `tool_choice=Any` on think_act (forces *some* tool to be used)
-    /// - `None` elsewhere
-    /// - `output_config` supported but not used since changing it per turn
-    ///   invalidates cache, unlike Blallama.
-    Anthropic,
-    /// Ollama `/v1/messages` impl
-    ///
-    /// - `tool_choice=Auto` on think_act. `Any` is unsupported by ollama. As of
-    ///   writing, `Auto` means "must use tools" with ollama (Anthropic `Any`).
-    /// - `None` on the reflect/mutate/etc phases (or else tools are called when
-    ///   json in text blocks is what is desired).
-    /// - `output_format` is ignored by ollama (structured generation).
-    Ollama,
-    /// Blallama (`drama_llama/bin`) `/v1/messages` impl
-    ///
-    /// - `tool_choice=Any` on think_act (forces *some* tool to be used)
-    /// - `None` elsewhere
-    /// -  `output_config` set per phase for structured-output guarantees.
-    ///
-    /// This is Anthropic conformant behavior with one exception:
-    ///
-    /// - Cache survives `output_config` changes, so the per-phase swap is
-    ///   cheap. With Anthropic, changing the `output_config` invalidates cache
-    ///   even though it's a generation constraint and it shouln't strictly need
-    ///   to.
-    Blallama,
 }
 
 /// An API endpoint and [`Backend`] variant. The flag (`--messages-api`
