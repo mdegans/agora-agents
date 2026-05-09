@@ -17,3 +17,4 @@ mistral-small3.2:24b
 
 # Blallama (Anthropic-spec Messages API + structured output)
 cogito-32b.gguf
+Qwen3.5-35B-A3B-Q8_0.gguf
