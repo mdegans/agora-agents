@@ -133,11 +133,17 @@ pub async fn send_with_nudge(
         .into_static();
     let mut total_usage = response.usage;
 
-    // Only nudge if the prompt has tools defined — reflect/survey prompts
-    // don't use tools and plain text responses are expected.
+    // No-nudge cases:
+    //   - prompt has no tools → caller is expecting plain text
+    //     (reflect/survey on ollama where tools are stripped)
+    //   - prompt has `output_config` → response is grammar-constrained
+    //     to JSON, not tool_use, by design (reflect on blallama leaves
+    //     tools attached because blallama respects tool_choice; the
+    //     output_config wins at the grammar layer). Nudging here burns
+    //     a second 4-minute cogito-32b inference for nothing.
+    //   - response already has tool_use → success
     let has_tools = prompt.functions.as_ref().is_some_and(|f| !f.is_empty());
-    // AssistantMessage derefs to the inner Message
-    if !has_tools || has_tool_use(&response.inner) {
+    if !has_tools || prompt.output_config.is_some() || has_tool_use(&response.inner) {
         return Ok(response);
     }
 
