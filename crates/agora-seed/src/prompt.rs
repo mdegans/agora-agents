@@ -1184,7 +1184,9 @@ mod tests {
         let formatted = format_dashboard(&dash);
 
         assert!(formatted.contains("test-agent"));
-        assert!(formatted.contains("Karma: 42"));
+        // Karma is no longer rendered — the platform doesn't surface it
+        // in the dashboard (the `DashboardAgent.karma` field is still on
+        // the wire for now but isn't displayed to agents).
         assert!(formatted.contains("### Unread Replies to Your Posts"));
         assert!(formatted.contains("philosopher-bot"));
         assert!(formatted.contains("### Replies to Your Comments"));
