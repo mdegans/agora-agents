@@ -908,10 +908,34 @@ async fn execute_action(
 /// calls (e.g. text-only reply), appends a "Continue" nudge instead.
 ///
 /// This function only appends to the prompt — it never modifies the prefix.
+///
+/// Cache breakpoint placement is backend-aware:
+///
+/// - [`Backend::Blallama`]: marker placed on the just-pushed assistant
+///   message, BEFORE the next user-turn content. drama_llama's hash side-
+///   table (PR #23) hashes the canonical render at marker positions and
+///   matches against `prev_tip_hash` (set at end-of-last-assistant
+///   generation) — so the marker hash must canonical-render to the bytes
+///   that drama_llama hashed at end-of-asst for the lookup to fire. Auto-
+///   tip handles the actual KV cache reuse server-side; the marker is
+///   what gates the hash-keyed prefix-reuse path.
+///
+/// - [`Backend::Anthropic`]: marker placed AFTER the user-turn content
+///   (tool results or nudge), so cache writes extend to the furthest point
+///   in the request and the next round's `cache_read` covers the prior
+///   round's user-tool-results bytes (typically the largest blocks in the
+///   conversation — dashboards, posts, etc.). The just-generated assistant
+///   plus the new user message are always paid for as re-prefill on
+///   Anthropic; placing the marker on user minimizes everything else.
+///
+/// - [`Backend::Ollama`]: cache_control markers are ignored locally;
+///   Ollama's KV cache is byte-prefix-based, not marker-based. Grouped
+///   with Anthropic for placement consistency.
 async fn process_round(
     cached_prompt: &mut CachedPrompt<'static>,
     response: AssistantMessage<'static>,
     agent: &mut Agent,
+    backend: Backend,
     client: &AgoraClient,
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
@@ -943,20 +967,16 @@ async fn process_round(
         .map_err(|e| anyhow::anyhow!("appending assistant response: {e}"))?;
     // it's now the user's turn
 
-    // Mark a cache breakpoint on the just-appended assistant message,
-    // BEFORE we append the next user-turn content (tool results or
-    // nudge). The breakpoint must sit on a message whose bytes are in
-    // the *previous* call's KV cache for the next call to hit it:
-    // drama_llama's prefix-cache lookup walks back to the largest
-    // breakpoint within the longest-common-prefix of prev + new tokens
-    // (`compute_l_hit` in drama_llama session/mod.rs). The assistant
-    // we just appended *is* in the prev cache (it was generated in
-    // the call that just returned); the user-turn content we're about
-    // to append is brand-new bytes past the LCP and would never serve
-    // as a useful cache anchor. Anthropic walks back to non-breakpoint
-    // positions too, so this placement is also a no-op-or-better for
-    // the batch path. 1h TTL covers the slow-batch worst case.
-    cached_prompt.cache_windowed_1h(2);
+    // Blallama: place the cache breakpoint on the just-appended assistant
+    // message, BEFORE the next user-turn content. drama_llama's hash side-
+    // table compares the new request's marker hashes against the prev
+    // request's `prev_tip_hash` (end-of-last-assistant canonical render).
+    // The marker must therefore land on the trailing assistant for the
+    // hash-keyed prefix-reuse path to fire. (Anthropic's marker placement
+    // is deferred until after the user-turn content is appended below.)
+    if matches!(backend, Backend::Blallama) {
+        cached_prompt.cache_windowed_1h(2);
+    }
 
     if parsed.is_empty() {
         // Text-only reply with no parsed tool_use blocks. Two distinct
@@ -982,6 +1002,11 @@ async fn process_round(
             .push_message(UserMessage::from(nudge))
             .map_err(|e| anyhow::anyhow!("appending nudge: {e}"))?;
         // it's now the assistant's turn
+        // Anthropic / Ollama: marker on the trailing user message — the
+        // furthest-right cache_control we can write before the next submit.
+        if !matches!(backend, Backend::Blallama) {
+            cached_prompt.cache_windowed_1h(2);
+        }
         return Ok(());
     }
 
@@ -1017,8 +1042,14 @@ async fn process_round(
     cached_prompt
         .push_message(user_msg)
         .map_err(|e| anyhow::anyhow!("appending tool results: {e}"))?;
-    // it's now the assistant's turn — cache breakpoint NOT placed here
-    // (see comment above the assistant-side cache_windowed call).
+    // it's now the assistant's turn
+    // Anthropic / Ollama: marker on the trailing user message (tool
+    // results) — the furthest-right cache_control we can write before
+    // the next submit. Blallama already placed its marker on the
+    // assistant earlier in this function.
+    if !matches!(backend, Backend::Blallama) {
+        cached_prompt.cache_windowed_1h(2);
+    }
 
     Ok(())
 }
@@ -1429,6 +1460,9 @@ async fn submit_retry_batch(
             .push_message(UserMessage::from(retry_text))
             .expect("submit_retry_batch: user after assistant — turn order is a programmer bug");
         prompt.set_max_tokens(NonZeroU32::new(max_tokens).unwrap());
+        // Anthropic batch: marker on the trailing retry user message before
+        // submit. See batch_phase_reflect.
+        prompt.cache_windowed_1h(2);
         retry_items.push(make_work_item(agent, prompt, step));
     }
 
@@ -1727,6 +1761,7 @@ async fn batch_phase_think_act(
                 prompt,
                 assistant_msg,
                 agent,
+                Backend::Anthropic,
                 client,
                 &ctx.dashboard,
                 report,
@@ -1797,6 +1832,10 @@ async fn batch_phase_reflect(
         // run before the actual `{"content": ...}`). 1024 was enough for
         // post-thought response only and got truncated mid-JSON.
         prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
+        // Anthropic batch: marker on the trailing user message before
+        // submit, so the cache write extends to MEMORY_REWRITE_MESSAGE
+        // and the next phase's cache_read covers the prior phase's tail.
+        prompt.cache_windowed_1h(2);
         reflect_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
     }
 
@@ -1983,6 +2022,9 @@ async fn batch_phase_reflect_evolve(
                 );
             // it's now the assistant's turn
             prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
+            // Anthropic batch: marker on the trailing user message
+            // (mutation prompt) before submit. See batch_phase_reflect.
+            prompt.cache_windowed_1h(2);
             mutation_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
         } else if roll < evo_threshold {
             prompt
@@ -1994,6 +2036,9 @@ async fn batch_phase_reflect_evolve(
             // the single-sentence note (or `null`) — 512 was tight when
             // thinking-first models reasoned before answering.
             prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
+            // Anthropic batch: marker on the trailing user message
+            // (evolution prompt) before submit. See batch_phase_reflect.
+            prompt.cache_windowed_1h(2);
             evolution_items.push(make_work_item(agent, prompt, CycleStep::Reflect));
         }
     }
@@ -2218,6 +2263,9 @@ async fn batch_phase_survey(
         // before the actual feedback text — thinking-first models can eat
         // most of a 1024 budget on reasoning and truncate the answer.
         prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
+        // Anthropic batch: marker on the trailing user message
+        // (SURVEY_MESSAGE) before submit. See batch_phase_reflect.
+        prompt.cache_windowed_1h(2);
         survey_items.push(make_work_item(agent, prompt, CycleStep::Survey));
     }
 
@@ -2537,6 +2585,7 @@ async fn seq_phase_think_act(
             cached_prompt,
             send_response.inner,
             agent,
+            backend_kind,
             client,
             &ctx.dashboard,
             report,
@@ -2556,8 +2605,18 @@ async fn seq_phase_think_act(
         }
     }
 
-    // Cosmetic for Ollama (its local KV cache ignores these markers), but
-    // kept identical to the Anthropic path so the breakpoints never diverge.
+    // Sequential post-loop: shift the marker onto the trailing
+    // user_tool_results so the next phase enters with a user-side
+    // marker (Blallama's per-round process_round marker sits on asst
+    // for hash-side-table alignment; this rotates it onto the user
+    // before reflect/evolve/survey, matching the Anthropic batch
+    // path's per-round user-marker placement). Ollama ignores it
+    // entirely (local KV cache, not marker-based) — kept for
+    // cross-backend consistency.
+    //
+    // NOTE: this rotates asst_5's marker out as middle, which can
+    // cost reflect-transition cache_read on Blallama; deferred
+    // follow-up A in `memory/project_seed_deferred_followups.md`.
     cached_prompt.cache_windowed_1h(2);
 }
 
