@@ -561,17 +561,22 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
                 let uncached = total_usage.input_tokens as u128;
                 let total_input = read + created + uncached;
                 if total_input > 0 {
-                    let hit_pct = (read as f64 / total_input as f64) * 100.0;
+                    let hit_rate = read as f64 / total_input as f64;
                     tracing::info!(
-                        "Batch {batch_id} cache: {hit_pct:.1}% hit ({ok_count} items, \
-                         {read} read, {created} created, {uncached} uncached, \
-                         {out} out)",
-                        out = total_usage.output_tokens,
+                        batch_id = %batch_id,
+                        hit_rate = hit_rate,
+                        ok_count = ok_count,
+                        cache_read = read as u64,
+                        cache_created = created as u64,
+                        uncached_input = uncached as u64,
+                        output = total_usage.output_tokens,
+                        "batch complete"
                     );
                 } else {
                     tracing::debug!(
-                        "Batch {batch_id} complete but no input tokens reported \
-                         ({ok_count} items)"
+                        batch_id = %batch_id,
+                        ok_count = ok_count,
+                        "batch complete but no input tokens reported"
                     );
                 }
 

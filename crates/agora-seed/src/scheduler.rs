@@ -77,6 +77,10 @@ pub enum SchedulerLog<'a> {
     /// Cache hit or miss
     Cache {
         hit: bool,
+        /// Cache read fraction = `cache_read / (cache_read + cache_created + uncached_input)`,
+        /// in the [0.0, 1.0] range. 0.0 on a fresh prefix, → 1.0 once
+        /// the prefix is fully cached.
+        hit_rate: f64,
         backend: Backend,
         usage: Usage,
         agent_name: &'a str,
@@ -581,13 +585,31 @@ where
 /// very first call — the cold-start cost of catching every subsequent
 /// regression cleanly.
 pub fn log_cache_usage(backend: Backend, usage: Usage, agent: &str, step: CycleStep) {
-    if !matches!(backend, Backend::Blallama) {
-        // Ollama does not return cache stats as of writing
+    if matches!(backend, Backend::Ollama) {
+        // Ollama's Anthropic-compat API does not return cache stats as of
+        // writing — nothing to log. Both Anthropic and Blallama populate
+        // `cache_read_input_tokens` / `cache_creation_input_tokens` and
+        // get full structured logs.
         return;
     }
-    let hit = usage.cache_read_input_tokens.unwrap_or(0) != 0;
+    let read = usage.cache_read_input_tokens.unwrap_or(0);
+    let created = usage.cache_creation_input_tokens.unwrap_or(0);
+    let uncached = usage.input_tokens;
+    let total_input = read + created + uncached;
+    let hit = read != 0;
+    // Hit rate over total input (not just cacheable input). 0.0 on a
+    // cold prefix; → 1.0 once the prefix is fully cached. `created` tokens
+    // count toward the denominator because they're paid for as new cache
+    // writes — including them keeps the metric stable across the
+    // priming → steady-state transition.
+    let hit_rate = if total_input > 0 {
+        read as f64 / total_input as f64
+    } else {
+        0.0
+    };
     let log_payload = SchedulerLog::Cache {
         hit,
+        hit_rate,
         backend,
         usage,
         agent_name: agent,
