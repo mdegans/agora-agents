@@ -50,13 +50,6 @@ pub async fn save(
 
     tracing::info!("{agent_name} prompt saved: {}", path.display());
 
-    // Pretty-print markdown at debug level. Prompt implements ToMarkdown
-    // via the `markdown` feature.
-    {
-        use misanthropic::markdown::ToMarkdown;
-        tracing::debug!("{agent_name} prompt:\n{}", prompt.markdown_verbose());
-    }
-
     Some(path)
 }
 

@@ -2696,9 +2696,8 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                     endpoint_url: &endpoint.url,
                     error: e.to_string(),
                 });
+                report.skipped.reflect_failures += 1;
             }
-
-            report.skipped.reflect_failures += 1;
             Ok(())
         }
         Err(parse_err) => {
