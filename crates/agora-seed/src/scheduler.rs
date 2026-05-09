@@ -2584,9 +2584,8 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     // matching comment in `batch_phase_reflect`.
     bare_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
     apply_phase_config(bare_prompt, backend_kind, CycleStep::Reflect);
-    bare_prompt.cache_windowed_1h(2);
 
-    match exchange_with_retry(
+    let result = exchange_with_retry(
         backend,
         backend_kind,
         &agent.name,
@@ -2596,8 +2595,17 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         prompt::parse_memory_rewrite,
         usage_total,
     )
-    .await
-    {
+    .await;
+
+    // Marker on the just-received reflect response — mirrors the
+    // think-loop pattern at line 959 (cache_windowed AFTER the
+    // model-generated assistant lands in the prompt). Calling it
+    // BEFORE `exchange_with_retry` would have rotated the marker
+    // onto the synthetic `insert_bridge` assistant, dropping the
+    // prior phase's tip-aligned marker as middle.
+    bare_prompt.cache_windowed_1h(2);
+
+    match result {
         Ok(memory) => {
             if let Err(e) = save_memory(agent, memory).await {
                 error_payload!(SchedulerLog::SeqPhaseError {
@@ -2663,9 +2671,8 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         let mutation_text = prompt::build_soul_mutation_prompt(&agent.name, &current_soul);
         bare_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
         apply_phase_config(bare_prompt, backend_kind, CycleStep::Mutate);
-        bare_prompt.cache_windowed_1h(2);
 
-        match exchange_with_retry(
+        let result = exchange_with_retry(
             backend,
             backend_kind,
             &agent.name,
@@ -2675,8 +2682,14 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
             prompt::parse_soul_mutation,
             usage_total,
         )
-        .await
-        {
+        .await;
+
+        // Marker after the model response lands — see seq_phase_reflect
+        // for the rationale (avoid rotating the marker onto the
+        // synthetic bridge assistant).
+        bare_prompt.cache_windowed_1h(2);
+
+        match result {
             Ok(new_soul) => {
                 if let Err(e) = save_mutation(agent, new_soul, report).await {
                     error_payload!(SchedulerLog::SeqPhaseError {
@@ -2708,9 +2721,8 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         // 1024 covers a thought block + single-sentence note (or `null`).
         bare_prompt.set_max_tokens(NonZeroU32::new(1024).unwrap());
         apply_phase_config(bare_prompt, backend_kind, CycleStep::Evolve);
-        bare_prompt.cache_windowed_1h(2);
 
-        match exchange_with_retry(
+        let result = exchange_with_retry(
             backend,
             backend_kind,
             &agent.name,
@@ -2720,8 +2732,12 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
             prompt::parse_evolution,
             usage_total,
         )
-        .await
-        {
+        .await;
+
+        // Marker after the model response lands — see seq_phase_reflect.
+        bare_prompt.cache_windowed_1h(2);
+
+        match result {
             Ok(note) => {
                 if let Err(e) = save_evolution(agent, note, report).await {
                     error_payload!(SchedulerLog::SeqPhaseError {
@@ -2772,9 +2788,8 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     // 2048 to cover thinking-block budget before the actual feedback text.
     bare_prompt.set_max_tokens(NonZeroU32::new(2048).unwrap());
     apply_phase_config(bare_prompt, backend_kind, CycleStep::Survey);
-    bare_prompt.cache_windowed_1h(2);
 
-    match exchange_with_retry(
+    let result = exchange_with_retry(
         backend,
         backend_kind,
         agent_name,
@@ -2784,8 +2799,12 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
         prompt::parse_feedback,
         usage_total,
     )
-    .await
-    {
+    .await;
+
+    // Marker after the model response lands — see seq_phase_reflect.
+    bare_prompt.cache_windowed_1h(2);
+
+    match result {
         Ok(None) => {
             report.surveys.skipped_empty += 1;
             Ok(())
