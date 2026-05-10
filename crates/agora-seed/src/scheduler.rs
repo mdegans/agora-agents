@@ -2554,6 +2554,16 @@ async fn seq_phase_think_act(
     cycle: usize,
     total_cycles: usize,
 ) {
+    // Apply the per-backend Think tool_choice. Blallama needs Choice::Any
+    // for drama_llama to compile a JSON tool grammar; Auto (the default
+    // carried over from build_base_prompt) leaves the model unconstrained,
+    // which is fine for models that emit JSON natively (Cogito) but lets
+    // Qwen-Coder-lineage models fall back to their trained
+    // <function=...><parameter=...> XML form, which the agora-side
+    // parser doesn't recognize. The matrix was defined in phase_config since
+    // PR #34 but never wired here. Idempotent for Ollama (Auto == default).
+    apply_phase_config(cached_prompt, backend_kind, CycleStep::Think);
+
     info_payload!(SchedulerLog::SeqPhase {
         step: CycleStep::Think.to_string(),
         agent_name: &agent.name,
@@ -3990,6 +4000,46 @@ mod tests {
         let (tc_blallama, _) = phase_config(Backend::Blallama, CycleStep::Think);
         assert!(matches!(tc_ollama, Some(tool::Choice::Auto)));
         assert!(matches!(tc_blallama, Some(tool::Choice::Any)));
+    }
+
+    #[test]
+    fn apply_phase_config_blallama_think_sets_choice_any() {
+        // Regression: from PR #34 until this fix, the Think entry point
+        // never invoked apply_phase_config, so Blallama prompts went on the
+        // wire with tool_choice=Auto (carried over from build_base_prompt)
+        // instead of Any. drama_llama only compiles a JSON tool grammar
+        // when Any is set; Auto leaves the model free to emit any shape,
+        // which is why Qwen-Coder-lineage GGUFs produced un-parseable
+        // <function=...><parameter=...> XML tool calls.
+        let mut cached = CachedPrompt::from(Prompt {
+            tool_choice: Some(tool::Choice::Auto),
+            ..Default::default()
+        });
+        apply_phase_config(&mut cached, Backend::Blallama, CycleStep::Think);
+        let inner = cached.into_inner();
+        assert!(
+            matches!(inner.tool_choice, Some(tool::Choice::Any)),
+            "Blallama Think must set tool_choice=Any; got {:?}",
+            inner.tool_choice
+        );
+    }
+
+    #[test]
+    fn apply_phase_config_ollama_think_keeps_choice_auto() {
+        // Sister test: Ollama's compat layer interprets Auto as "must use
+        // *some* tool" (canonical Any behavior), so the Think matrix says
+        // Auto for Ollama. Verify that's what we get.
+        let mut cached = CachedPrompt::from(Prompt {
+            tool_choice: Some(tool::Choice::Auto),
+            ..Default::default()
+        });
+        apply_phase_config(&mut cached, Backend::Ollama, CycleStep::Think);
+        let inner = cached.into_inner();
+        assert!(
+            matches!(inner.tool_choice, Some(tool::Choice::Auto)),
+            "Ollama Think must set tool_choice=Auto; got {:?}",
+            inner.tool_choice
+        );
     }
 
     #[test]
