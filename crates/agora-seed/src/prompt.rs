@@ -124,7 +124,7 @@ pub fn build_base_prompt(model_id: impl std::fmt::Display) -> CachedPrompt<'stat
 
     misanthropic::Prompt {
         model: model_id.to_string().into(),
-        max_tokens: NonZeroU32::new(1024).unwrap(),
+        max_tokens: NonZeroU32::new(2048).unwrap(),
         system: Some(Content::MultiPart(vec![Block::Text {
             text: cached_system.into(),
             // First breakpoint at end of tools+system, 1h TTL. Set inline
