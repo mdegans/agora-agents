@@ -526,7 +526,7 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
                         batch::BatchResult::Error(err) => {
                             tracing::warn!("Batch item error for agent {agent_id}: {err}");
                             Err(BatchError::Api {
-                                message: err.to_string(),
+                                message: format!("{err:#}"),
                             })
                         }
                         batch::BatchResult::Canceled => {
