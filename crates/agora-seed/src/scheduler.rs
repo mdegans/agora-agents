@@ -2535,6 +2535,31 @@ async fn run_batch(
 // — which guarantees turn-order safety whether the backend succeeds,
 // fails, or flakes and retries once.
 
+/// Outcome of [`seq_phase_think_act`]. The caller uses this to decide
+/// whether to proceed to reflect/evolve/survey or to abort the cycle —
+/// downstream phases over truncated think state produce hallucinated
+/// memory and soul-evolution log entries. The 2026-05-10 30-agent Qwen
+/// run cascade was the proximate cause for adding this signal: seven
+/// agents had backend errors mid-think, the loop `break`'d, and
+/// reflect/evolve happily ran on the partial state (see
+/// `memory/project_qwen30_run_2026_05_10.md`).
+///
+/// Per `memory/feedback_fail_fast_on_hallucination_risk.md`: abort the
+/// cycle over soft-degrade when upstream failure would feed
+/// empty/malformed context to a downstream LLM step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkActOutcome {
+    /// Loop ran to completion (or to MAX_ROUNDS) without backend or
+    /// turn-order error. Safe to proceed to reflect.
+    Completed,
+    /// Backend returned an error (network blip, 5xx, blallama 529).
+    /// Think state is truncated — abort cycle.
+    BackendError,
+    /// `process_round` failed (turn-order bug or response-parse issue).
+    /// Think state may be incoherent — abort cycle.
+    TurnOrderError,
+}
+
 /// Think/act phase: run up to MAX_ROUNDS tool-use rounds against the
 /// endpoint, driving `process_round` to execute actions and append tool
 /// results. Returns the accumulated action summaries.
@@ -2553,7 +2578,7 @@ async fn seq_phase_think_act(
     report: &mut RunReport,
     cycle: usize,
     total_cycles: usize,
-) {
+) -> ThinkActOutcome {
     // Apply the per-backend Think tool_choice. Blallama needs Choice::Any
     // for drama_llama to compile a JSON tool grammar; Auto (the default
     // carried over from build_base_prompt) leaves the model unconstrained,
@@ -2594,10 +2619,8 @@ async fn seq_phase_think_act(
                     endpoint_url: &endpoint.url,
                     error: format!("{e:#}"),
                 });
-                if round == 0 {
-                    report.skipped.think_failures += 1;
-                }
-                break;
+                report.skipped.think_failures += 1;
+                return ThinkActOutcome::BackendError;
             }
         };
         // Always call the cache-hit check, even on round 0. On blallama,
@@ -2633,7 +2656,7 @@ async fn seq_phase_think_act(
                 error: format!("{e:#}"),
             });
             report.skipped.turn_order_failures += 1;
-            break;
+            return ThinkActOutcome::TurnOrderError;
         }
     }
 
@@ -2650,6 +2673,8 @@ async fn seq_phase_think_act(
     // cost reflect-transition cache_read on Blallama; deferred
     // follow-up A in `memory/project_seed_deferred_followups.md`.
     cached_prompt.cache_windowed_1h(2);
+
+    ThinkActOutcome::Completed
 }
 
 /// Reflect phase: ask the model to rewrite its memory based on the
@@ -2981,7 +3006,7 @@ async fn run_sequential(
 
         // Think/act
         let mut cached_prompt = build_prompt(agent, &ctx);
-        seq_phase_think_act(
+        let think_outcome = seq_phase_think_act(
             endpoint,
             backend_kind,
             agent,
@@ -2993,6 +3018,16 @@ async fn run_sequential(
             config.cycles,
         )
         .await;
+
+        // Per `feedback_fail_fast_on_hallucination_risk.md`: if think
+        // didn't complete cleanly, downstream phases (reflect, evolve,
+        // survey) would run on truncated/incoherent state and produce
+        // hallucinated memory + soul_evolution. Skip to the next agent
+        // — the 2026-05-10 Qwen run wrote 7 agents' memories and 2
+        // souls from partial-think input before this signal existed.
+        if think_outcome != ThinkActOutcome::Completed {
+            continue;
+        }
 
         // Insert a bridge Assistant message (out of tool turns)
         insert_bridge(&mut cached_prompt);
