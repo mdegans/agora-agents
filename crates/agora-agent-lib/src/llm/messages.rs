@@ -25,7 +25,7 @@ use url::Url;
 
 use crate::log::log_usage;
 
-use super::{LlmBackend, SendResponse};
+use super::{LlmBackend, SendResponse, retry_recoverable};
 
 /// Maximum number of nudge retries when the model doesn't produce tool calls.
 const MAX_NUDGES: usize = 1;
@@ -126,11 +126,14 @@ pub async fn send_with_nudge(
     // any bare Prompt.
     prompt: &Prompt<'_>,
 ) -> Result<SendResponse> {
-    let mut response = client
-        .message(prompt)
-        .await
-        .context("messages-API request failed")?
-        .into_static();
+    let mut response = retry_recoverable("messages-api send", 5, || async {
+        client
+            .message(prompt)
+            .await
+            .context("messages-API request failed")
+    })
+    .await?
+    .into_static();
     let mut total_usage = response.usage;
 
     // No-nudge cases:
@@ -158,11 +161,14 @@ pub async fn send_with_nudge(
             .push_message((Role::User, NUDGE_MESSAGE))
             .map_err(|e| anyhow::anyhow!("turn order error on nudge: {e}"))?;
 
-        let nudge_response = client
-            .message(&retry_prompt)
-            .await
-            .context("messages-API nudge request failed")?
-            .into_static();
+        let nudge_response = retry_recoverable("messages-api nudge", 5, || async {
+            client
+                .message(&retry_prompt)
+                .await
+                .context("messages-API nudge request failed")
+        })
+        .await?
+        .into_static();
         total_usage += nudge_response.usage;
         response = nudge_response;
 
@@ -316,5 +322,62 @@ impl LlmBackend for MessagesPerModel {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agora_agentkit::retry::is_recoverable;
+    use misanthropic::client::{AnthropicError, Error as ClientError};
+
+    // A full network-level integration test for send_with_nudge retry behaviour
+    // would require a mock HTTP server (e.g. wiremock). That's a significant
+    // scaffolding lift for a single call-site change, so we validate the
+    // precondition that makes the retry worthwhile: is_recoverable must return
+    // true for the Overloaded variant, which is the exact error blallama emits
+    // as HTTP 529 "Session is busy" under concurrent load.
+    //
+    // The retry_recoverable helper itself is already tested in agora-agentkit
+    // (see agora_agentkit::retry's own test suite). These tests are a targeted
+    // sanity-check that the error classification we're relying on is correct.
+
+    #[test]
+    fn overloaded_is_recoverable() {
+        // Blallama's HTTP 529 "Session is busy" surfaces as Overloaded.
+        // This must be retried, not failed-fast.
+        let err = anyhow::Error::new(ClientError::Anthropic(AnthropicError::Overloaded {
+            message: "Session is busy".to_string(),
+        }));
+        assert!(
+            is_recoverable(&err),
+            "Overloaded (HTTP 529) must be retried — failing here means 529s will \
+             kill the think_act cycle instead of backing off"
+        );
+    }
+
+    #[test]
+    fn overloaded_through_context_chain_is_recoverable() {
+        // Verify is_recoverable walks anyhow's chain. The closure in
+        // send_with_nudge wraps with .context("messages-API request failed"),
+        // so the misanthropic error is one level deep in the chain.
+        let inner = anyhow::Error::new(ClientError::Anthropic(AnthropicError::Overloaded {
+            message: "Session is busy".to_string(),
+        }));
+        let wrapped = inner.context("messages-API request failed");
+        assert!(
+            is_recoverable(&wrapped),
+            "is_recoverable must traverse .context() wrappers — if this fails \
+             the retry loop will never trigger for messages-API calls"
+        );
+    }
+
+    #[test]
+    fn auth_error_is_not_recoverable() {
+        // Sanity-check the other side: bad-key errors must not be retried
+        // (they won't fix themselves and would burn the full retry budget).
+        let err = anyhow::Error::new(ClientError::Anthropic(AnthropicError::Authentication {
+            message: "invalid api key".to_string(),
+        }));
+        assert!(!is_recoverable(&err));
     }
 }
