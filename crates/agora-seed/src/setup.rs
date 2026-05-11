@@ -105,7 +105,7 @@ pub async fn register_all(
             }
             Err(e) => {
                 error_payload!(RegisterLog::AgentCheckError {
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     name: &agent.name
                 });
                 failed += 1;
@@ -157,7 +157,7 @@ pub async fn register_all(
                 } else {
                     error_payload!(RegisterLog::AgentRegisterError {
                         name: &agent.name,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                     failed += 1;
                 }
@@ -195,7 +195,7 @@ pub async fn register_all(
                 error_payload!(RegisterLog::CommunityJoinError {
                     agent_name: &agent.name,
                     slug,
-                    error: e.to_string()
+                    error: format!("{e:#}")
                 })
             } else {
                 joined += 1;

@@ -791,7 +791,7 @@ async fn execute_action(
                     warn_payload!(SchedulerLog::ActionPostError {
                         agent_name: &agent.name,
                         input,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                     report.skipped.post_failures += 1;
 
@@ -849,7 +849,7 @@ async fn execute_action(
                         input,
                         is_own_post,
                         has_reply,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                     report.skipped.comment_failures += 1;
 
@@ -881,7 +881,7 @@ async fn execute_action(
                     warn_payload!(SchedulerLog::ActionVoteError {
                         agent_name: &agent.name,
                         input,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                     report.skipped.vote_failures += 1;
 
@@ -908,7 +908,7 @@ async fn execute_action(
                     warn_payload!(SchedulerLog::ActionFlagError {
                         agent_name: &agent.name,
                         input,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                     err(&format!("Error flagging content: {e}"))
                 }
@@ -1206,7 +1206,7 @@ async fn save_memory(agent: &mut Agent, new_memory: agora_agent_lib::Memory) -> 
     if let Err(e) = agent.memory.update(new_memory.content) {
         warn_payload!(SchedulerLog::SaveMemoryUpdateError {
             agent_name: &agent.name,
-            error: e.to_string()
+            error: format!("{e:#}")
         });
         agent.memory.append_system_note(&format!(
             "Last reflect rejected: {e}. Memory not updated this cycle."
@@ -1252,7 +1252,7 @@ async fn save_mutation(
         // should never fire
         error_payload!(SchedulerLog::SoulEvolutionError {
             agent_name: &agent.name,
-            error: e.to_string()
+            error: format!("{e:#}")
         });
     }
 
@@ -1284,7 +1284,7 @@ async fn save_evolution(
     if let Err(e) = agent.soul.push_evolution(note.clone()) {
         warn_payload!(SchedulerLog::SoulEvolutionError {
             agent_name: &agent.name,
-            error: e.to_string()
+            error: format!("{e:#}")
         });
         return Ok(());
     }
@@ -1332,7 +1332,7 @@ async fn fetch_dashboard(
         Err(e) => {
             error_payload!(SchedulerLog::GetAgentPostsError {
                 agent_name: &agent.name,
-                error: e.to_string()
+                error: format!("{e:#}")
             });
             vec![]
         }
@@ -1516,7 +1516,7 @@ async fn submit_retry_batch(
                 step: step.to_string(),
                 context,
                 n_retry_items,
-                error: e.to_string()
+                error: format!("{e:#}")
             });
             Vec::new()
         }
@@ -1677,7 +1677,7 @@ async fn batch_phase_perceive(
             Err(e) => {
                 warn_payload!(SchedulerLog::DashboardError {
                     agent_name: &agent.name,
-                    error: e.to_string()
+                    error: format!("{e:#}")
                 });
                 report.skipped.perceive_failures += 1;
             }
@@ -1745,7 +1745,7 @@ async fn batch_phase_think_act(
                     warn_payload!(SchedulerLog::BatchPhaseThinkError {
                         round,
                         agent_id: Some(result.agent_id),
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                     if round == 1 {
                         report.skipped.think_failures += 1;
@@ -1771,7 +1771,7 @@ async fn batch_phase_think_act(
                     error_payload!(SchedulerLog::BatchPhaseThinkError {
                         round,
                         agent_id: agent.agent_id,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                     drop_agent.insert(result.agent_id);
                     continue;
@@ -1794,7 +1794,7 @@ async fn batch_phase_think_act(
                 error_payload!(SchedulerLog::BatchPhaseThinkError {
                     round,
                     agent_id: agent.agent_id,
-                    error: e.to_string()
+                    error: format!("{e:#}")
                 });
                 report.skipped.turn_order_failures += 1;
                 drop_agent.insert(result.agent_id);
@@ -1866,7 +1866,7 @@ async fn batch_phase_reflect(
         Err(e) => {
             error_payload!(SchedulerLog::BatchReflectPollError {
                 step: CycleStep::Reflect.to_string(),
-                error: e.to_string(),
+                error: format!("{e:#}"),
                 agent_name: None,
             });
             report.skipped.reflect_failures += 1;
@@ -1901,7 +1901,7 @@ async fn batch_phase_reflect(
                     .unwrap_or("?");
                 error_payload!(SchedulerLog::BatchReflectPollError {
                     step: CycleStep::Reflect.to_string(),
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     agent_name: Some(agent_name)
                 });
                 report.skipped.reflect_failures += 1;
@@ -1941,7 +1941,7 @@ async fn batch_phase_reflect(
             Err(e) => {
                 error_payload!(SchedulerLog::BatchReflectPollError {
                     step: CycleStep::Reflect.to_string(),
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     agent_name: None,
                 });
             }
@@ -1960,7 +1960,7 @@ async fn batch_phase_reflect(
         if let Err(e) = save_memory(agent, memory).await {
             error_payload!(SchedulerLog::BatchReflectPollError {
                 step: CycleStep::Reflect.to_string(),
-                error: e.to_string(),
+                error: format!("{e:#}"),
                 agent_name: Some(&agent.name),
             });
         }
@@ -1990,7 +1990,7 @@ async fn batch_phase_reflect(
         {
             error_payload!(SchedulerLog::BatchReflectPollError {
                 step: CycleStep::Reflect.to_string(),
-                error: e.to_string(),
+                error: format!("{e:#}"),
                 agent_name: Some(&agent.name),
             });
         }
@@ -2072,7 +2072,7 @@ async fn batch_phase_reflect_evolve(
             Err(e) => {
                 error_payload!(SchedulerLog::BatchReflectPollError {
                     step: CycleStep::Evolve.to_string(),
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     agent_name: None,
                 });
                 report.evolution.mutation_failures += 1;
@@ -2100,7 +2100,7 @@ async fn batch_phase_reflect_evolve(
                 Err(e) => {
                     error_payload!(SchedulerLog::BatchReflectPollError {
                         step: CycleStep::Evolve.to_string(),
-                        error: e.to_string(),
+                        error: format!("{e:#}"),
                         agent_name: None,
                     });
                     report.evolution.mutation_failures += 1;
@@ -2147,7 +2147,7 @@ async fn batch_phase_reflect_evolve(
             if let Err(e) = save_mutation(agent, soul, report).await {
                 error_payload!(SchedulerLog::BatchReflectPollError {
                     step: CycleStep::Evolve.to_string(),
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     agent_name: Some(&agent.name),
                 });
             }
@@ -2167,7 +2167,7 @@ async fn batch_phase_reflect_evolve(
             Err(e) => {
                 error_payload!(SchedulerLog::BatchReflectPollError {
                     step: CycleStep::Evolve.to_string(),
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     agent_name: None,
                 });
                 Vec::new()
@@ -2194,7 +2194,7 @@ async fn batch_phase_reflect_evolve(
                 Err(e) => {
                     error_payload!(SchedulerLog::BatchReflectPollError {
                         step: CycleStep::Evolve.to_string(),
-                        error: e.to_string(),
+                        error: format!("{e:#}"),
                         agent_name: None,
                     });
                 }
@@ -2238,7 +2238,7 @@ async fn batch_phase_reflect_evolve(
             if let Err(e) = save_evolution(agent, note, report).await {
                 error_payload!(SchedulerLog::BatchReflectPollError {
                     step: CycleStep::Evolve.to_string(),
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     agent_name: Some(&agent.name),
                 });
             }
@@ -2301,7 +2301,7 @@ async fn batch_phase_survey(
         Err(e) => {
             error_payload!(SchedulerLog::BatchReflectPollError {
                 step: CycleStep::Evolve.to_string(),
-                error: e.to_string(),
+                error: format!("{e:#}"),
                 agent_name: None,
             });
             report.surveys.failures += 1;
@@ -2330,7 +2330,7 @@ async fn batch_phase_survey(
             Err(e) => {
                 error_payload!(SchedulerLog::BatchReflectPollError {
                     step: CycleStep::Evolve.to_string(),
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     agent_name: None,
                 });
                 report.surveys.failures += 1;
@@ -2398,7 +2398,7 @@ async fn batch_phase_survey(
             Err(e) => {
                 error_payload!(SchedulerLog::BatchReflectPollError {
                     step: CycleStep::Evolve.to_string(),
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                     agent_name: None,
                 });
                 report.surveys.failures += 1;
@@ -2592,7 +2592,7 @@ async fn seq_phase_think_act(
                     round,
                     agent_name: &agent.name,
                     endpoint_url: &endpoint.url,
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                 });
                 if round == 0 {
                     report.skipped.think_failures += 1;
@@ -2630,7 +2630,7 @@ async fn seq_phase_think_act(
                 round,
                 agent_name: &agent.name,
                 endpoint_url: &endpoint.url,
-                error: e.to_string(),
+                error: format!("{e:#}"),
             });
             report.skipped.turn_order_failures += 1;
             break;
@@ -2704,7 +2704,7 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                     round: 1,
                     agent_name: &agent.name,
                     endpoint_url: &endpoint.url,
-                    error: e.to_string(),
+                    error: format!("{e:#}"),
                 });
                 report.skipped.reflect_failures += 1;
             }
@@ -2716,7 +2716,7 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                 round: 1,
                 agent_name: &agent.name,
                 endpoint_url: &endpoint.url,
-                error: parse_err.to_string(),
+                error: format!("{parse_err:#}"),
             });
 
             report.skipped.reflect_failures += 1;
@@ -2787,7 +2787,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                         round: 1,
                         agent_name: &agent.name,
                         endpoint_url: &endpoint.url,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                 }
 
@@ -2800,7 +2800,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                     round: 1,
                     agent_name: &agent.name,
                     endpoint_url: &endpoint.url,
-                    error: parse_err.to_string()
+                    error: format!("{parse_err:#}")
                 });
 
                 report.evolution.mutation_failures += 1;
@@ -2835,7 +2835,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                         round: 1,
                         agent_name: &agent.name,
                         endpoint_url: &endpoint.url,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                 }
                 Ok(())
@@ -2846,7 +2846,7 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                     round: 1,
                     agent_name: &agent.name,
                     endpoint_url: &endpoint.url,
-                    error: parse_err.to_string()
+                    error: format!("{parse_err:#}")
                 });
                 Ok(())
             }
@@ -2922,7 +2922,7 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                         round: 1,
                         agent_name,
                         endpoint_url: &endpoint.url,
-                        error: e.to_string()
+                        error: format!("{e:#}")
                     });
                     report.surveys.failures += 1;
                 }
@@ -2935,7 +2935,7 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                 round: 1,
                 agent_name,
                 endpoint_url: &endpoint.url,
-                error: parse_err.to_string()
+                error: format!("{parse_err:#}")
             });
             report.surveys.failures += 1;
             Ok(())
@@ -2972,7 +2972,7 @@ async fn run_sequential(
                     round: 1,
                     agent_name: &agent.name,
                     endpoint_url: &endpoint.url,
-                    error: e.to_string()
+                    error: format!("{e:#}")
                 });
                 report.skipped.perceive_failures += 1;
                 continue;
