@@ -2816,7 +2816,6 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
                     });
                 }
 
-                report.evolution.mutation_failures += 1;
                 Ok(())
             }
             Err(parse_err) => {
