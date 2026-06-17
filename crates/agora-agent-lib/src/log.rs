@@ -1,4 +1,4 @@
-use misanthropic::response::Usage;
+use misanthropic::response::TokenCounts;
 use serde::Serialize;
 
 #[macro_export]
@@ -40,15 +40,15 @@ macro_rules! error_payload {
 #[derive(Serialize)]
 pub struct UsageLog<'a> {
     pub elapsed: std::time::Duration,
-    pub usage: Usage,
+    pub usage: TokenCounts,
     pub model: &'a str,
     pub i_tok_s: f64,
     pub o_tok_s: f64,
 }
 
 /// Log usage stats at the debug level
-pub fn log_usage(elapsed: std::time::Duration, usage: Usage, model: &str) {
-    if usage == Usage::default() {
+pub fn log_usage(elapsed: std::time::Duration, usage: TokenCounts, model: &str) {
+    if usage == TokenCounts::default() {
         // Likely backend doen't support Usage
         return;
     }

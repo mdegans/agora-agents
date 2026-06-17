@@ -198,7 +198,7 @@ pub async fn probe<M>(
     model: M,
 ) -> anyhow::Result<ProbeOutcome>
 where
-    M: Into<misanthropic::model::Id<'static>>,
+    M: Into<misanthropic::model::Model>,
 {
     use anyhow::Context as _;
 
@@ -210,7 +210,7 @@ where
         .model(model)
         .max_tokens(max_tokens)
         .json_schema(schema)
-        .set_system(scenario.system_prompt())
+        .system(scenario.system_prompt())
         .add_message((Role::User, scenario.user_message()))
         .context("assembling indirect probe prompt")?;
 
@@ -220,7 +220,7 @@ where
         .context("indirect probe API call failed")?;
 
     let model_id = response.model.to_string();
-    let usage = response.usage;
+    let usage = response.usage.counts;
     let request_id = uuid::Uuid::parse_str(&response.id).ok();
 
     let raw: ConstitutionalAnswers = response.json().context(
