@@ -288,10 +288,7 @@ pub fn make_tool_result(
 }
 
 /// Shorthand for [`make_tool_result`] with `is_error: true`.
-fn error_result(
-    tool_use_id: impl Into<String>,
-    content: impl std::fmt::Display,
-) -> tool::Result {
+fn error_result(tool_use_id: impl Into<String>, content: impl std::fmt::Display) -> tool::Result {
     make_tool_result(tool_use_id, content, true)
 }
 

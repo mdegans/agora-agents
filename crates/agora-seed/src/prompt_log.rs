@@ -31,10 +31,7 @@ use crate::prompt::parse_feedback;
 /// sanitize without disturbing the caller's prompt (which often gets
 /// reused across cycles). Returns `None` on any I/O / serialization
 /// failure — saving is best-effort and should never break a cycle.
-pub async fn save(
-    prompt: &misanthropic::Prompt,
-    agent_name: &str,
-) -> Option<std::path::PathBuf> {
+pub async fn save(prompt: &misanthropic::Prompt, agent_name: &str) -> Option<std::path::PathBuf> {
     let mut prompt = prompt.clone();
     redact_anonymous_feedback(&mut prompt);
 
