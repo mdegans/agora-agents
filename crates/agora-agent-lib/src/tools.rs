@@ -23,9 +23,10 @@
 
 use std::borrow::Cow;
 
+#[cfg(test)]
 use misanthropic::prompt::Message as MMessage;
 use misanthropic::prompt::message::{Block, Content};
-use misanthropic::tool::{self, Method};
+use misanthropic::tool::{self, CustomMethodDef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -168,7 +169,7 @@ impl AgentAction {
     /// Tool definitions for LLM prompts, auto-generated from input struct schemas.
     ///
     /// The last method has `cache_control` set for Anthropic prompt caching.
-    pub fn methods() -> Vec<Method<'static>> {
+    pub fn methods() -> Vec<CustomMethodDef> {
         vec![
             Self::method::<CreatePostInput>(
                 "create_post",
@@ -225,7 +226,7 @@ impl AgentAction {
     /// Uses `inline_subschemas` to flatten all `$ref`s, then strips
     /// `$schema`, `$defs`, `title`, and `description` since the Anthropic API
     /// expects a plain `{"type": "object", "properties": ...}` format.
-    fn method<T: JsonSchema>(name: &str, description: &str) -> Method<'static> {
+    fn method<T: JsonSchema>(name: &str, description: &str) -> CustomMethodDef {
         let mut settings = schemars::generate::SchemaSettings::default();
         settings.inline_subschemas = true;
         let generator = settings.into_generator();
@@ -249,12 +250,14 @@ impl AgentAction {
                 obj.insert("required".to_string(), serde_json::json!([]));
             }
         }
-        Method {
+        CustomMethodDef {
             name: name.to_string().into(),
             description: description.to_string().into(),
             schema,
             cache_control: None,
             strict: Some(false),
+            defer_loading: None,
+            allowed_callers: None,
         }
     }
 }
@@ -263,7 +266,7 @@ impl AgentAction {
 /// ready-to-push error [`tool::Result`] that preserves the call id so the
 /// assistant turn's tool_use blocks always match up with tool_result blocks
 /// in the following user turn.
-pub type ParsedCall = Result<(AgentAction, String), tool::Result<'static>>;
+pub type ParsedCall = Result<(AgentAction, String), tool::Result>;
 
 /// Build a [`tool::Result`] without the `Cow::Owned` / `Content::SinglePart`
 /// boilerplate at every call site.
@@ -275,7 +278,7 @@ pub fn make_tool_result(
     tool_use_id: impl Into<String>,
     content: impl std::fmt::Display,
     is_error: bool,
-) -> tool::Result<'static> {
+) -> tool::Result {
     tool::Result {
         tool_use_id: Cow::Owned(tool_use_id.into()),
         content: content.to_string().into(),
@@ -288,14 +291,14 @@ pub fn make_tool_result(
 fn error_result(
     tool_use_id: impl Into<String>,
     content: impl std::fmt::Display,
-) -> tool::Result<'static> {
+) -> tool::Result {
     make_tool_result(tool_use_id, content, true)
 }
 
 /// Parse a single [`tool::Use`] into an [`AgentAction`] or an `is_error`
 /// [`tool::Result`] carrying the serde error for the agent to read and
 /// correct on its next turn.
-pub fn parse_tool_call(call: &tool::Use<'_>) -> ParsedCall {
+pub fn parse_tool_call(call: &tool::Use) -> ParsedCall {
     let tagged = serde_json::json!({"name": call.name, "input": call.input});
     match serde_json::from_value::<AgentAction>(tagged) {
         Ok(action) => Ok((action, call.id.to_string())),
@@ -322,17 +325,15 @@ pub fn parse_tool_call(call: &tool::Use<'_>) -> ParsedCall {
 /// Write actions are capped at [`WRITE_ACTION_CAP`]; reads are unlimited.
 /// Over-cap writes surface as `is_error` results rather than being dropped,
 /// so the agent learns what happened and can retry next round.
-pub fn parse_tool_calls(message: &MMessage<'_>) -> Vec<ParsedCall> {
-    let blocks = match &message.content {
-        Content::MultiPart(blocks) => blocks.as_slice(),
-        Content::SinglePart(text) => {
-            tracing::debug!(
-                "Model returned plain text instead of tool use: {:.200}",
-                text
-            );
-            return vec![];
-        }
-    };
+pub fn parse_tool_calls(content: &Content) -> Vec<ParsedCall> {
+    let blocks = content.0.as_slice();
+    if !blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })) {
+        tracing::debug!(
+            "Model returned plain text instead of tool use: {:.200}",
+            content
+        );
+        return vec![];
+    }
 
     let mut write_count = 0usize;
     blocks
@@ -469,8 +470,8 @@ mod tests {
     }
 
     /// Build a mock response message with tool use blocks.
-    fn mock_tool_response(calls: Vec<(&str, serde_json::Value)>) -> MMessage<'static> {
-        let blocks: Vec<Block<'static>> = calls
+    fn mock_tool_response(calls: Vec<(&str, serde_json::Value)>) -> MMessage {
+        let blocks: Vec<Block> = calls
             .into_iter()
             .enumerate()
             .map(|(i, (name, input))| Block::ToolUse {
@@ -479,12 +480,13 @@ mod tests {
                     name: Cow::Owned(name.to_string()),
                     input,
                     cache_control: None,
+                    caller: None,
                 },
             })
             .collect();
         MMessage {
             role: Role::Assistant,
-            content: Content::MultiPart(blocks),
+            content: Content(blocks),
         }
     }
 
@@ -499,7 +501,7 @@ mod tests {
             }),
         )]);
 
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg.content)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();
@@ -526,7 +528,7 @@ mod tests {
             }),
         )]);
 
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg.content)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();
@@ -553,7 +555,7 @@ mod tests {
             }),
         )]);
 
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg.content)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();
@@ -577,7 +579,7 @@ mod tests {
             }),
         )]);
 
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg.content)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();
@@ -607,7 +609,7 @@ mod tests {
             ("cast_vote", vote(target2)),
             ("cast_vote", vote(target3)),
         ]);
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg.content)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();
@@ -628,7 +630,7 @@ mod tests {
             ("cast_vote", vote(target3)),
             ("cast_vote", vote(target4)),
         ]);
-        let parsed = parse_tool_calls(&msg);
+        let parsed = parse_tool_calls(&msg.content);
         // 3 ok + 1 err — the 4th call is surfaced as an is_error tool::Result
         // instead of being silently dropped, so the tool_use/tool_result
         // pairing stays 1:1.
@@ -646,7 +648,7 @@ mod tests {
             // reply_to is required and must be a valid UUID
             serde_json::json!({"reply_to": "not-a-uuid", "body": "hi"}),
         )]);
-        let parsed = parse_tool_calls(&msg);
+        let parsed = parse_tool_calls(&msg.content);
         assert_eq!(parsed.len(), 1);
         let err = parsed[0].as_ref().unwrap_err();
         assert!(err.is_error);
@@ -669,7 +671,7 @@ mod tests {
                 serde_json::json!({"id": content_id.to_string()}),
             ),
         ]);
-        let parsed = parse_tool_calls(&msg);
+        let parsed = parse_tool_calls(&msg.content);
         assert_eq!(parsed.len(), 2);
         // First is a parse error, id preserved
         let err = parsed[0].as_ref().unwrap_err();
@@ -692,7 +694,7 @@ mod tests {
                 }),
             ),
         ]);
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg.content)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();
@@ -703,9 +705,9 @@ mod tests {
     fn extract_from_text_only_message() {
         let msg = MMessage {
             role: Role::Assistant,
-            content: Content::SinglePart("Just some text".into()),
+            content: Content::text("Just some text"),
         };
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg.content)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();
@@ -719,7 +721,7 @@ mod tests {
             "get_content",
             serde_json::json!({"id": content_id.to_string()}),
         )]);
-        let actions: Vec<AgentAction> = parse_tool_calls(&msg)
+        let actions: Vec<AgentAction> = parse_tool_calls(&msg.content)
             .into_iter()
             .filter_map(|r| r.ok().map(|(a, _)| a))
             .collect();

@@ -32,7 +32,7 @@ use crate::prompt::parse_feedback;
 /// reused across cycles). Returns `None` on any I/O / serialization
 /// failure — saving is best-effort and should never break a cycle.
 pub async fn save(
-    prompt: &misanthropic::Prompt<'_>,
+    prompt: &misanthropic::Prompt,
     agent_name: &str,
 ) -> Option<std::path::PathBuf> {
     let mut prompt = prompt.clone();
@@ -66,7 +66,7 @@ pub async fn save(
 /// Uses [`parse_feedback`] (lenient: strips ```json fences) to match the
 /// runtime parse path — if the agent wrapped the JSON in fences, redact
 /// still fires.
-fn redact_anonymous_feedback(prompt: &mut misanthropic::Prompt<'_>) {
+fn redact_anonymous_feedback(prompt: &mut misanthropic::Prompt) {
     let Some(last_text) = last_assistant_text(prompt) else {
         return;
     };
@@ -81,32 +81,27 @@ fn redact_anonymous_feedback(prompt: &mut misanthropic::Prompt<'_>) {
     let _ = prompt.messages.pop();
 }
 
-/// Best-effort plain-text extract of the last assistant message, looking
-/// through SinglePart and MultiPart text blocks. Returns `None` if the
-/// last message isn't an assistant turn or has no text content.
-fn last_assistant_text(prompt: &misanthropic::Prompt<'_>) -> Option<String> {
-    use misanthropic::prompt::message::{Block, Content, Role};
+/// Best-effort plain-text extract of the last assistant message,
+/// concatenating its text blocks. Returns `None` if the last message
+/// isn't an assistant turn or has no text content.
+fn last_assistant_text(prompt: &misanthropic::Prompt) -> Option<String> {
+    use misanthropic::prompt::message::{Block, Role};
 
     let last = prompt.messages.last()?;
     if last.role != Role::Assistant {
         return None;
     }
-    match &last.content {
-        Content::SinglePart(text) => Some(text.to_string()),
-        Content::MultiPart(blocks) => {
-            // Concatenate any text blocks; ignore tool_use/tool_result.
-            let mut out = String::new();
-            for block in blocks {
-                if let Block::Text { text, .. } = block {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(text);
-                }
+    // Concatenate any text blocks; ignore tool_use/tool_result.
+    let mut out = String::new();
+    for block in &last.content.0 {
+        if let Block::Text { text, .. } = block {
+            if !out.is_empty() {
+                out.push('\n');
             }
-            if out.is_empty() { None } else { Some(out) }
+            out.push_str(text.as_ref());
         }
     }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[cfg(test)]
@@ -115,7 +110,7 @@ mod tests {
     use misanthropic::prompt::Message;
     use misanthropic::prompt::message::{Content, Role};
 
-    fn make_prompt(messages: Vec<Message<'static>>) -> misanthropic::Prompt<'static> {
+    fn make_prompt(messages: Vec<Message>) -> misanthropic::Prompt {
         misanthropic::Prompt {
             messages,
             ..Default::default()
@@ -132,11 +127,11 @@ mod tests {
         let mut prompt = make_prompt(vec![
             Message {
                 role: Role::User,
-                content: Content::SinglePart("anonymous feedback please".into()),
+                content: Content::text("anonymous feedback please"),
             },
             Message {
                 role: Role::Assistant,
-                content: Content::SinglePart(feedback.into()),
+                content: Content::text(feedback),
             },
         ]);
         redact_anonymous_feedback(&mut prompt);
@@ -153,11 +148,11 @@ mod tests {
         let mut prompt = make_prompt(vec![
             Message {
                 role: Role::User,
-                content: Content::SinglePart("anonymous feedback please".into()),
+                content: Content::text("anonymous feedback please"),
             },
             Message {
                 role: Role::Assistant,
-                content: Content::SinglePart(feedback.into()),
+                content: Content::text(feedback),
             },
         ]);
         redact_anonymous_feedback(&mut prompt);
@@ -169,11 +164,11 @@ mod tests {
         let mut prompt = make_prompt(vec![
             Message {
                 role: Role::User,
-                content: Content::SinglePart("any feedback?".into()),
+                content: Content::text("any feedback?"),
             },
             Message {
                 role: Role::Assistant,
-                content: Content::SinglePart("the seed runner crashes sometimes".into()),
+                content: Content::text("the seed runner crashes sometimes"),
             },
         ]);
         redact_anonymous_feedback(&mut prompt);
@@ -186,7 +181,7 @@ mod tests {
     fn redact_noop_when_last_is_user() {
         let mut prompt = make_prompt(vec![Message {
             role: Role::User,
-            content: Content::SinglePart("hello".into()),
+            content: Content::text("hello"),
         }]);
         redact_anonymous_feedback(&mut prompt);
         assert_eq!(prompt.messages.len(), 1);

@@ -358,7 +358,7 @@ fn build_client(args: &Args) -> anyhow::Result<Client> {
         let placeholder_key = "x".repeat(108);
         let client = Client::new(placeholder_key)
             .context("constructing local client")?
-            .with_base_url(endpoint)
+            .base_url(endpoint)
             .context("setting base_url for local endpoint")?;
         Ok(client)
     } else {

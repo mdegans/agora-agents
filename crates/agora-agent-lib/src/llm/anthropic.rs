@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use misanthropic::Prompt;
-use misanthropic::prompt::message::{Content, Role};
+use misanthropic::prompt::message::Role;
 
 use crate::log::log_usage;
 
@@ -38,7 +38,7 @@ impl AnthropicBackend {
 
 #[async_trait]
 impl LlmBackend for AnthropicBackend {
-    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
+    async fn send(&self, prompt: &Prompt) -> Result<SendResponse> {
         assert_prompt_invariants(prompt);
 
         let start = std::time::Instant::now();
@@ -49,9 +49,9 @@ impl LlmBackend for AnthropicBackend {
             .context("Anthropic API call failed")?;
         let elapsed = start.elapsed();
 
-        log_usage(elapsed, response.usage, &prompt.model.to_string());
+        log_usage(elapsed, response.usage.counts, &prompt.model.to_string());
 
-        Ok(response.into_static())
+        Ok(response)
     }
 
     fn backend_name(&self) -> &str {
@@ -67,7 +67,7 @@ impl LlmBackend for AnthropicBackend {
 /// mis-cache) if violated. `assert!` (not `debug_assert!`) so the panic
 /// reaches release builds — a wasted-prefill or 4xx round-trip is more
 /// expensive than the check.
-fn assert_prompt_invariants(prompt: &Prompt<'_>) {
+fn assert_prompt_invariants(prompt: &Prompt) {
     let count = count_cache_breakpoints(prompt);
     assert!(
         count <= MAX_CACHE_CONTROLS_PER_REQUEST,
@@ -80,22 +80,15 @@ fn assert_prompt_invariants(prompt: &Prompt<'_>) {
     // cached at all. A missing marker here turns every request into a
     // full-price prefill.
     match &prompt.system {
-        Some(Content::MultiPart(blocks)) => {
-            let last = blocks.last().expect(
-                "system Content::MultiPart with zero blocks is a misanthropic-side \
+        Some(content) => {
+            let last = content.0.last().expect(
+                "system Content with zero blocks is a misanthropic-side \
                  invariant violation",
             );
             assert!(
                 last.is_cached(),
                 "Prompt::system's last block must carry a cache_control marker \
                  to cache the system+tools prefix",
-            );
-        }
-        Some(Content::SinglePart(_)) => {
-            panic!(
-                "Prompt::system is SinglePart — has no cache_control slot, so \
-                 the system+tools prefix cannot be cached. Construct system via \
-                 a MultiPart Content with cache_control on the last block.",
             );
         }
         None => {
@@ -165,23 +158,19 @@ fn assert_prompt_invariants(prompt: &Prompt<'_>) {
 }
 
 /// Total `cache_control` markers across `tools` + `system` + `messages`.
-fn count_cache_breakpoints(prompt: &Prompt<'_>) -> usize {
+fn count_cache_breakpoints(prompt: &Prompt) -> usize {
     let mut count = 0;
 
-    if let Some(tools) = &prompt.functions {
-        count += tools.iter().filter(|t| t.cache_control.is_some()).count();
+    if let Some(tools) = &prompt.tools {
+        count += tools.iter().filter(|t| t.is_cached()).count();
     }
 
-    if let Some(system) = &prompt.system
-        && let Content::MultiPart(blocks) = system
-    {
-        count += blocks.iter().filter(|b| b.is_cached()).count();
+    if let Some(system) = &prompt.system {
+        count += system.0.iter().filter(|b| b.is_cached()).count();
     }
 
     for msg in &prompt.messages {
-        if let Content::MultiPart(blocks) = &msg.content {
-            count += blocks.iter().filter(|b| b.is_cached()).count();
-        }
+        count += msg.content.0.iter().filter(|b| b.is_cached()).count();
     }
 
     count

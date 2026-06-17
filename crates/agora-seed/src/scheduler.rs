@@ -40,7 +40,7 @@ use agora_agent_lib::info_payload;
 use agora_agent_lib::llm::messages::Backend;
 use agora_agent_lib::llm::messages::MessagesClient;
 use agora_agent_lib::llm::messages::MessagesPerModel;
-use agora_agent_lib::llm::{Usage, commit_batch_response};
+use agora_agent_lib::llm::{TokenCounts, commit_batch_response};
 use agora_agent_lib::tools::CastVoteInput;
 use agora_agent_lib::tools::CreateCommentInput;
 use agora_agent_lib::tools::CreatePostInput;
@@ -82,7 +82,7 @@ pub enum SchedulerLog<'a> {
         /// the prefix is fully cached.
         hit_rate: f64,
         backend: Backend,
-        usage: Usage,
+        usage: TokenCounts,
         agent_name: &'a str,
         // FIXME: Add ser+de to CycleStep in agora-agentkit or better, remove
         // CycleStep from agora-agentkit since this type is only related to the
@@ -158,7 +158,7 @@ pub enum SchedulerLog<'a> {
     /// Beginning of `process_round`
     ProcessRound {
         agent_name: &'a str,
-        response: &'a AssistantMessage<'static>,
+        response: &'a AssistantMessage,
         governance_calls: usize,
     },
     ToolCalls {
@@ -173,7 +173,7 @@ pub enum SchedulerLog<'a> {
     },
     ToolResults {
         agent_name: &'a str,
-        results: &'a Vec<tool::Result<'static>>,
+        results: &'a Vec<tool::Result>,
     },
     SaveMemory {
         agent_name: &'a str,
@@ -357,9 +357,9 @@ pub enum SchedulerLog<'a> {
 /// - While [`Backend::Blallama`] supports it and [`Backend::Ollama`] ignores
 ///   it, setting this with [`Backend::Anthropic`] **will invalidate cache**.
 pub fn with_output_config<'a>(
-    cached: CachedPrompt<'a>,
+    cached: CachedPrompt,
     output_config: Option<misanthropic::prompt::OutputConfig>,
-) -> CachedPrompt<'a> {
+) -> CachedPrompt {
     let mut prompt = cached.into_inner();
     prompt.output_config = output_config;
     CachedPrompt::from(prompt)
@@ -377,9 +377,9 @@ pub fn with_output_config<'a>(
 // that changing the tools themselves with *any* backend will absolutely bust
 // cache.
 pub fn with_tool_choice<'a>(
-    cached: CachedPrompt<'a>,
+    cached: CachedPrompt,
     tool_choice: Option<tool::Choice>,
-) -> CachedPrompt<'a> {
+) -> CachedPrompt {
     let mut prompt = cached.into_inner();
     prompt.tool_choice = tool_choice;
     CachedPrompt::from(prompt)
@@ -390,11 +390,11 @@ pub fn with_tool_choice<'a>(
 /// The think/act loop always ends with a user message (tool results or nudge).
 /// This inserts a synthetic assistant message so the reflect phase can push
 /// its user message without violating turn alternation.
-fn insert_bridge<'a>(cached_prompt: &mut CachedPrompt<'a>) {
+fn insert_bridge<'a>(cached_prompt: &mut CachedPrompt) {
     let _ = cached_prompt.push_message(AssistantMessage::from(
         // Message is clear the Assistant did not write it to avoid biasing
         // the Assistant's tone.
-        MContent::from("[SYSTEM]: No more tool uses left. Begin reflect phase.").into_static(),
+        MContent::from("[SYSTEM]: No more tool uses left. Begin reflect phase."),
     ));
     // it's now the user's turn
 }
@@ -408,14 +408,14 @@ fn insert_bridge<'a>(cached_prompt: &mut CachedPrompt<'a>) {
 // possible the behavior is canonical now, saving ~100s per agent per cycle.
 // Ingestion is pretty costly on Metal. Removing this fn may be safe now.
 fn strip_tools_for_reflect<'a>(
-    cached: CachedPrompt<'a>,
+    cached: CachedPrompt,
     backend_kind: Backend,
-) -> CachedPrompt<'a> {
+) -> CachedPrompt {
     if matches!(backend_kind, Backend::Blallama) {
         return cached;
     }
     let mut bare = cached.into_inner();
-    bare.functions = None;
+    bare.tools = None;
     bare.tool_choice = None;
     CachedPrompt::from(bare)
 }
@@ -459,8 +459,8 @@ pub fn phase_config(
     use tool::Choice;
     let tool_choice = match (backend, step) {
         (_, CycleStep::Think) => Some(match backend {
-            Backend::Ollama => Choice::Auto,
-            Backend::Blallama => Choice::Any,
+            Backend::Ollama => Choice::auto(),
+            Backend::Blallama => Choice::any(),
             Backend::Anthropic => panic!(
                 "phase_config called for Anthropic — its CachedPrompt is set once at \
                  build time and never mutated; route around this helper at dispatch"
@@ -490,7 +490,7 @@ pub fn phase_config(
 /// after this if you want a fresh cache breakpoint for the new content.
 ///
 /// Skips entirely on `Backend::Anthropic` (see [`phase_config`] doc).
-pub fn apply_phase_config(cached: &mut CachedPrompt<'static>, backend: Backend, step: CycleStep) {
+pub fn apply_phase_config(cached: &mut CachedPrompt, backend: Backend, step: CycleStep) {
     if matches!(backend, Backend::Anthropic) {
         return;
     }
@@ -535,10 +535,10 @@ async fn exchange_with_retry<B, T, F>(
     backend_kind: Backend,
     agent_name: &str,
     step: CycleStep,
-    prompt: &mut CachedPrompt<'static>,
-    initial_user: UserMessage<'static>,
+    prompt: &mut CachedPrompt,
+    initial_user: UserMessage,
     parse_fn: F,
-    usage_total: &mut Usage,
+    usage_total: &mut TokenCounts,
 ) -> Result<T, String>
 where
     B: agora_agent_lib::llm::LlmBackend + ?Sized,
@@ -554,7 +554,7 @@ where
             .await
             .map_err(|e| format!("backend error: {e}"))?;
         log_cache_usage(backend_kind, outcome.usage, agent_name, step);
-        let response_text = prompt::extract_speech(outcome.assistant.content());
+        let response_text = prompt::extract_speech(&outcome.assistant.content);
         match parse_fn(&response_text) {
             Ok(parsed) => return Ok(parsed),
             Err(parse_err) if attempt == MAX_RETRIES => return Err(parse_err),
@@ -584,7 +584,7 @@ where
 /// agent #1. The only expected warn per run is the very first agent's
 /// very first call — the cold-start cost of catching every subsequent
 /// regression cleanly.
-pub fn log_cache_usage(backend: Backend, usage: Usage, agent: &str, step: CycleStep) {
+pub fn log_cache_usage(backend: Backend, usage: TokenCounts, agent: &str, step: CycleStep) {
     if matches!(backend, Backend::Ollama) {
         // Ollama's Anthropic-compat API does not return cache stats as of
         // writing — nothing to log. Both Anthropic and Blallama populate
@@ -640,7 +640,7 @@ pub fn log_cache_usage(backend: Backend, usage: Usage, agent: &str, step: CycleS
 /// the problem is logged at error level with the agent name so operators
 /// can investigate. This guards against the constitution silently falling
 /// out of the system prefix due to an upstream sanitization change.
-pub fn build_prompt(agent: &Agent, ctx: &AgentCycleContext) -> CachedPrompt<'static> {
+pub fn build_prompt(agent: &Agent, ctx: &AgentCycleContext) -> CachedPrompt {
     let cached = prompt::build(
         &agent.model,
         &agent.soul.markdown(),
@@ -688,7 +688,7 @@ async fn execute_action(
     dashboard: &agora_agent_lib::agora_agentkit::responses::DashboardResponse,
     report: &mut RunReport,
     governance_calls: &mut usize,
-) -> tool::Result<'static> {
+) -> tool::Result {
     let agent_id = agent.agent_id.unwrap();
     // `ok` and `err` should be written with end-agent in mind
     let ok = |content: &str| make_tool_result(tool_use_id.clone(), content, false);
@@ -954,8 +954,8 @@ async fn execute_action(
 ///   Ollama's KV cache is byte-prefix-based, not marker-based. Grouped
 ///   with Anthropic for placement consistency.
 async fn process_round(
-    cached_prompt: &mut CachedPrompt<'static>,
-    response: AssistantMessage<'static>,
+    cached_prompt: &mut CachedPrompt,
+    response: AssistantMessage,
     agent: &mut Agent,
     backend: Backend,
     client: &AgoraClient,
@@ -970,7 +970,7 @@ async fn process_round(
         governance_calls: *governance_calls
     });
 
-    let parsed = parse_tool_calls(&response);
+    let parsed = parse_tool_calls(&response.content);
     info_payload!(SchedulerLog::ToolCalls {
         agent_name: &agent.name,
         calls: &parsed
@@ -980,7 +980,7 @@ async fn process_round(
     // prompt — needed for the smart-nudge path below to attribute parse-fail
     // failures (`<tool_call>` markup with invalid JSON inside).
     let response_text = if parsed.is_empty() {
-        Some(prompt::extract_speech(response.content()))
+        Some(prompt::extract_speech(&response.content))
     } else {
         None
     };
@@ -1032,7 +1032,7 @@ async fn process_round(
         return Ok(());
     }
 
-    let mut results: Vec<tool::Result<'static>> = Vec::with_capacity(parsed.len());
+    let mut results: Vec<tool::Result> = Vec::with_capacity(parsed.len());
     info_payload!(SchedulerLog::ToolResults {
         agent_name: &agent.name,
         results: &results
@@ -1060,7 +1060,7 @@ async fn process_round(
 
     // Collect tool::Results into a single multi-part UserMessage via the
     // FromIterator<Block> impl on UserMessage (tool::Result: Into<Block>).
-    let user_msg: UserMessage<'static> = results.into_iter().collect();
+    let user_msg: UserMessage = results.into_iter().collect();
     cached_prompt
         .push_message(user_msg)
         .map_err(|e| anyhow::anyhow!("appending tool results: {e}"))?;
@@ -1398,8 +1398,8 @@ async fn fetch_dashboard(
 // to process the batch no matter what we do.
 async fn submit_and_poll(
     backend: &AnthropicBatch,
-    items: Vec<WorkItem<CachedPrompt<'static>>>,
-) -> Result<Vec<agora_agent_lib::agora_agentkit::scheduler::WorkResult<MMessage<'static>>>> {
+    items: Vec<WorkItem<CachedPrompt>>,
+) -> Result<Vec<agora_agent_lib::agora_agentkit::scheduler::WorkResult<MMessage>>> {
     if items.is_empty() {
         return Ok(vec![]);
     }
@@ -1458,18 +1458,18 @@ async fn submit_and_poll(
 async fn submit_retry_batch(
     backend: &AnthropicBatch,
     batch_agents: &[Agent],
-    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt>,
     failed: &[(AgentId, String)],
     step: CycleStep,
     max_tokens: u32,
     context: &str,
-) -> Vec<agora_agent_lib::agora_agentkit::scheduler::WorkResult<MMessage<'static>>> {
+) -> Vec<agora_agent_lib::agora_agentkit::scheduler::WorkResult<MMessage>> {
     use std::num::NonZeroU32;
     if failed.is_empty() {
         return Vec::new();
     }
 
-    let mut retry_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
+    let mut retry_items: Vec<WorkItem<CachedPrompt>> = Vec::new();
     for (agent_id, parse_err) in failed {
         let Some(prompt) = agent_prompts.get_mut(agent_id) else {
             continue;
@@ -1559,9 +1559,9 @@ fn model_prefix_hash(model: &str) -> u64 {
 /// entry the eager-prime path writes at session start.
 fn make_work_item(
     agent: &Agent,
-    prompt: &CachedPrompt<'static>,
+    prompt: &CachedPrompt,
     step: CycleStep,
-) -> WorkItem<CachedPrompt<'static>> {
+) -> WorkItem<CachedPrompt> {
     WorkItem {
         agent_id: agent.agent_id.unwrap(),
         prompt: prompt.clone(),
@@ -1602,7 +1602,7 @@ async fn prime_anthropic_models(
     // FIXME: Elements 0 and 1 are effectively the same. We're just counting
     // models and prompts here. Even then we could just have CachedPrompt since
     // model is exposed by deref. So this could be a
-    let entries: Vec<(u64, String, CachedPrompt<'static>)> = unique
+    let entries: Vec<(u64, String, CachedPrompt)> = unique
         .into_iter()
         .map(|model| {
             let hash = model_prefix_hash(&model);
@@ -1695,7 +1695,7 @@ async fn batch_phase_think_act(
     backend: &AnthropicBatch,
     batch_agents: &mut [Agent],
     agent_contexts: &[AgentCycleContext],
-    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt>,
     client: &AgoraClient,
     config: &Args,
     report: &mut RunReport,
@@ -1765,7 +1765,7 @@ async fn batch_phase_think_act(
                 continue;
             };
 
-            let assistant_msg = match AssistantMessage::try_from(response.clone().into_static()) {
+            let assistant_msg = match AssistantMessage::try_from(response.clone()) {
                 Ok(m) => m,
                 Err(e) => {
                     error_payload!(SchedulerLog::BatchPhaseThinkError {
@@ -1822,7 +1822,7 @@ async fn batch_phase_reflect(
     backend: &AnthropicBatch,
     batch_agents: &mut [Agent],
     agent_contexts: &[AgentCycleContext],
-    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt>,
     report: &mut RunReport,
 ) -> Result<()> {
     info_payload!(SchedulerLog::BatchPhase {
@@ -1832,7 +1832,7 @@ async fn batch_phase_reflect(
 
     use std::num::NonZeroU32;
 
-    let mut reflect_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
+    let mut reflect_items: Vec<WorkItem<CachedPrompt>> = Vec::new();
 
     for ctx in agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
@@ -1884,10 +1884,10 @@ async fn batch_phase_reflect(
         let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
             continue;
         };
-        let response = result.response.map(|m| m.into_static());
+        let response = result.response;
         match commit_batch_response(prompt, response, "reflect batch") {
             Ok(assistant) => {
-                let response_text = prompt::extract_speech(assistant.content());
+                let response_text = prompt::extract_speech(&assistant.content);
                 match prompt::parse_memory_rewrite(&response_text) {
                     Ok(memory) => to_save.push((agent_id, memory)),
                     Err(parse_err) => failed_for_retry.push((agent_id, parse_err)),
@@ -1926,10 +1926,10 @@ async fn batch_phase_reflect(
         let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
             continue;
         };
-        let response = result.response.map(|m| m.into_static());
+        let response = result.response;
         match commit_batch_response(prompt, response, "reflect retry batch") {
             Ok(assistant) => {
-                let response_text = prompt::extract_speech(assistant.content());
+                let response_text = prompt::extract_speech(&assistant.content);
                 match prompt::parse_memory_rewrite(&response_text) {
                     Ok(memory) => {
                         to_save.push((agent_id, memory));
@@ -2008,7 +2008,7 @@ async fn batch_phase_reflect_evolve(
     backend: &AnthropicBatch,
     batch_agents: &mut [Agent],
     agent_contexts: &[AgentCycleContext],
-    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt>,
     mutation_chance: Option<u32>,
     report: &mut RunReport,
 ) -> Result<()> {
@@ -2022,8 +2022,8 @@ async fn batch_phase_reflect_evolve(
     let deep_threshold = mutation_chance.unwrap_or(3);
     let evo_threshold = deep_threshold + 10;
 
-    let mut mutation_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
-    let mut evolution_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
+    let mut mutation_items: Vec<WorkItem<CachedPrompt>> = Vec::new();
+    let mut evolution_items: Vec<WorkItem<CachedPrompt>> = Vec::new();
 
     for ctx in agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
@@ -2088,10 +2088,10 @@ async fn batch_phase_reflect_evolve(
             let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
                 continue;
             };
-            let response = result.response.map(|m| m.into_static());
+            let response = result.response;
             match commit_batch_response(prompt, response, "mutation batch") {
                 Ok(assistant) => {
-                    let response_text = prompt::extract_speech(assistant.content());
+                    let response_text = prompt::extract_speech(&assistant.content);
                     match prompt::parse_soul_mutation(&response_text) {
                         Ok(soul) => to_save.push((agent_id, soul)),
                         Err(parse_err) => failed_for_retry.push((agent_id, parse_err)),
@@ -2125,10 +2125,10 @@ async fn batch_phase_reflect_evolve(
             let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
                 continue;
             };
-            let response = result.response.map(|m| m.into_static());
+            let response = result.response;
             if let Ok(assistant) = commit_batch_response(prompt, response, "mutation retry batch")
                 && let Ok(soul) =
-                    prompt::parse_soul_mutation(&prompt::extract_speech(assistant.content()))
+                    prompt::parse_soul_mutation(&prompt::extract_speech(&assistant.content))
             {
                 to_save.push((agent_id, soul));
                 retry_succeeded.insert(agent_id);
@@ -2182,10 +2182,10 @@ async fn batch_phase_reflect_evolve(
             let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
                 continue;
             };
-            let response = result.response.map(|m| m.into_static());
+            let response = result.response;
             match commit_batch_response(prompt, response, "evolution batch") {
                 Ok(assistant) => {
-                    let response_text = prompt::extract_speech(assistant.content());
+                    let response_text = prompt::extract_speech(&assistant.content);
                     match prompt::parse_evolution(&response_text) {
                         Ok(note) => to_save.push((agent_id, note)),
                         Err(parse_err) => failed_for_retry.push((agent_id, parse_err)),
@@ -2217,10 +2217,10 @@ async fn batch_phase_reflect_evolve(
             let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
                 continue;
             };
-            let response = result.response.map(|m| m.into_static());
+            let response = result.response;
             if let Ok(assistant) = commit_batch_response(prompt, response, "evolution retry batch")
                 && let Ok(note) =
-                    prompt::parse_evolution(&prompt::extract_speech(assistant.content()))
+                    prompt::parse_evolution(&prompt::extract_speech(&assistant.content))
             {
                 to_save.push((agent_id, note));
             }
@@ -2253,7 +2253,7 @@ async fn batch_phase_survey(
     backend: &AnthropicBatch,
     batch_agents: &mut [Agent],
     agent_contexts: &[AgentCycleContext],
-    agent_prompts: &mut HashMap<AgentId, CachedPrompt<'static>>,
+    agent_prompts: &mut HashMap<AgentId, CachedPrompt>,
     client: &AgoraClient,
     force_survey: bool,
     report: &mut RunReport,
@@ -2265,7 +2265,7 @@ async fn batch_phase_survey(
 
     use std::num::NonZeroU32;
 
-    let mut survey_items: Vec<WorkItem<CachedPrompt<'static>>> = Vec::new();
+    let mut survey_items: Vec<WorkItem<CachedPrompt>> = Vec::new();
     for ctx in agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
@@ -2317,10 +2317,10 @@ async fn batch_phase_survey(
         let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
             continue;
         };
-        let response = result.response.map(|m| m.into_static());
+        let response = result.response;
         match commit_batch_response(prompt, response, "survey batch") {
             Ok(assistant) => {
-                let text = prompt::extract_speech(assistant.content());
+                let text = prompt::extract_speech(&assistant.content);
                 match prompt::parse_feedback(&text) {
                     Ok(None) => report.surveys.skipped_empty += 1,
                     Ok(Some(feedback)) => to_submit.push((agent_id, feedback)),
@@ -2355,9 +2355,9 @@ async fn batch_phase_survey(
         let Some(prompt) = agent_prompts.get_mut(&agent_id) else {
             continue;
         };
-        let response = result.response.map(|m| m.into_static());
+        let response = result.response;
         if let Ok(assistant) = commit_batch_response(prompt, response, "survey retry batch") {
-            let text = prompt::extract_speech(assistant.content());
+            let text = prompt::extract_speech(&assistant.content);
             match prompt::parse_feedback(&text) {
                 Ok(None) => {
                     report.surveys.skipped_empty += 1;
@@ -2437,7 +2437,7 @@ async fn run_batch(
     }
 
     // Build prompts — CachedPrompt is the authoritative store throughout.
-    let mut agent_prompts: HashMap<AgentId, CachedPrompt<'static>> = HashMap::new();
+    let mut agent_prompts: HashMap<AgentId, CachedPrompt> = HashMap::new();
     for ctx in &agent_contexts {
         let agent = &batch_agents[ctx.batch_index];
         let agent_id = agent.agent_id.unwrap();
@@ -2574,7 +2574,7 @@ async fn seq_phase_think_act(
     agent: &mut Agent,
     ctx: &AgentCycleContext,
     client: &AgoraClient,
-    cached_prompt: &mut CachedPrompt<'static>,
+    cached_prompt: &mut CachedPrompt,
     report: &mut RunReport,
     cycle: usize,
     total_cycles: usize,
@@ -2631,7 +2631,7 @@ async fn seq_phase_think_act(
         // cost of catching every other regression cleanly.
         log_cache_usage(
             backend_kind,
-            send_response.usage,
+            send_response.usage.counts,
             &agent.name,
             CycleStep::Think,
         );
@@ -2684,8 +2684,8 @@ async fn seq_phase_reflect<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     backend: &B,
     backend_kind: Backend,
     agent: &mut Agent,
-    bare_prompt: &mut CachedPrompt<'static>,
-    usage_total: &mut Usage,
+    bare_prompt: &mut CachedPrompt,
+    usage_total: &mut TokenCounts,
     report: &mut RunReport,
 ) -> Result<()> {
     info_payload!(SchedulerLog::SeqPhase {
@@ -2765,10 +2765,10 @@ async fn seq_phase_evolve<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     backend: &B,
     backend_kind: Backend,
     agent: &mut Agent,
-    bare_prompt: &mut CachedPrompt<'static>,
+    bare_prompt: &mut CachedPrompt,
     roll: u32,
     mutation_chance: Option<u32>,
-    usage_total: &mut Usage,
+    usage_total: &mut TokenCounts,
     report: &mut RunReport,
 ) -> Result<()> {
     info_payload!(SchedulerLog::SeqPhase {
@@ -2888,11 +2888,11 @@ async fn seq_phase_survey<B: agora_agent_lib::llm::LlmBackend + ?Sized>(
     agent_id: agora_agent_lib::agora_agentkit::ids::AgentId,
     agent_name: &str,
     signing_key: &ed25519_dalek::SigningKey,
-    bare_prompt: &mut CachedPrompt<'static>,
+    bare_prompt: &mut CachedPrompt,
     client: &AgoraClient,
     force_survey: bool,
     take_survey: bool,
-    usage_total: &mut Usage,
+    usage_total: &mut TokenCounts,
     report: &mut RunReport,
 ) -> Result<()> {
     use std::num::NonZeroU32;
@@ -2985,7 +2985,7 @@ async fn run_sequential(
             client: Arc::clone(endpoint),
             model: model.clone(),
         };
-        let mut usage_total = Usage::default();
+        let mut usage_total = TokenCounts::default();
 
         // Perceive
         let ctx = match fetch_dashboard(agent, agent_id, client).await {
@@ -3719,7 +3719,7 @@ pub async fn run_all(agents: &mut Vec<Agent>, client: &AgoraClient, config: &Arg
         let key = anthropic_key.as_ref().expect("validated above");
         let client = misanthropic::Client::new(key.clone())
             .map_err(|e| anyhow::anyhow!("invalid Anthropic API key: {e}"))?
-            .with_base_url(ep.base_url().as_str())
+            .base_url(ep.base_url().as_str())
             .map_err(|e| anyhow::anyhow!("invalid --batch-api URL {}: {e}", ep.base_url()))?;
         Some(AnthropicBatch::new(client))
     } else {
@@ -3826,7 +3826,7 @@ mod tests {
     use misanthropic::Prompt;
     use misanthropic::prompt::message::Role;
 
-    fn fresh_cached() -> CachedPrompt<'static> {
+    fn fresh_cached() -> CachedPrompt {
         CachedPrompt::from(Prompt::default())
     }
 
@@ -3847,7 +3847,7 @@ mod tests {
         mock.push_ok("ok");
 
         let mut prompt = fresh_cached();
-        let mut usage = Usage::default();
+        let mut usage = TokenCounts::default();
         let result = exchange_with_retry(
             &mock,
             Backend::Ollama,
@@ -3873,7 +3873,7 @@ mod tests {
         mock.push_ok("garbage").push_ok("ok");
 
         let mut prompt = fresh_cached();
-        let mut usage = Usage::default();
+        let mut usage = TokenCounts::default();
         let result = exchange_with_retry(
             &mock,
             Backend::Ollama,
@@ -3907,7 +3907,7 @@ mod tests {
         mock.push_ok("garbage1").push_ok("garbage2");
 
         let mut prompt = fresh_cached();
-        let mut usage = Usage::default();
+        let mut usage = TokenCounts::default();
         let err = exchange_with_retry(
             &mock,
             Backend::Ollama,
@@ -3943,7 +3943,7 @@ mod tests {
             .push_ok("ok");
 
         let mut prompt = fresh_cached();
-        let mut usage = Usage::default();
+        let mut usage = TokenCounts::default();
         let result = exchange_with_retry(
             &mock,
             Backend::Ollama,
@@ -3974,8 +3974,8 @@ mod tests {
 
     // --- check_cache_hit tests ---
 
-    fn usage(input: u64, cache_read: Option<u64>) -> Usage {
-        Usage {
+    fn usage(input: u64, cache_read: Option<u64>) -> TokenCounts {
+        TokenCounts {
             input_tokens: input,
             output_tokens: 0,
             cache_creation_input_tokens: None,
@@ -4032,8 +4032,8 @@ mod tests {
     fn phase_config_tool_choice_differs_by_backend_on_think() {
         let (tc_ollama, _) = phase_config(Backend::Ollama, CycleStep::Think);
         let (tc_blallama, _) = phase_config(Backend::Blallama, CycleStep::Think);
-        assert!(matches!(tc_ollama, Some(tool::Choice::Auto)));
-        assert!(matches!(tc_blallama, Some(tool::Choice::Any)));
+        assert!(matches!(tc_ollama, Some(tool::Choice::Auto { .. })));
+        assert!(matches!(tc_blallama, Some(tool::Choice::Any { .. })));
     }
 
     #[test]
@@ -4046,13 +4046,13 @@ mod tests {
         // which is why Qwen-Coder-lineage GGUFs produced un-parseable
         // <function=...><parameter=...> XML tool calls.
         let mut cached = CachedPrompt::from(Prompt {
-            tool_choice: Some(tool::Choice::Auto),
+            tool_choice: Some(tool::Choice::auto()),
             ..Default::default()
         });
         apply_phase_config(&mut cached, Backend::Blallama, CycleStep::Think);
         let inner = cached.into_inner();
         assert!(
-            matches!(inner.tool_choice, Some(tool::Choice::Any)),
+            matches!(inner.tool_choice, Some(tool::Choice::Any { .. })),
             "Blallama Think must set tool_choice=Any; got {:?}",
             inner.tool_choice
         );
@@ -4064,13 +4064,13 @@ mod tests {
         // *some* tool" (canonical Any behavior), so the Think matrix says
         // Auto for Ollama. Verify that's what we get.
         let mut cached = CachedPrompt::from(Prompt {
-            tool_choice: Some(tool::Choice::Auto),
+            tool_choice: Some(tool::Choice::auto()),
             ..Default::default()
         });
         apply_phase_config(&mut cached, Backend::Ollama, CycleStep::Think);
         let inner = cached.into_inner();
         assert!(
-            matches!(inner.tool_choice, Some(tool::Choice::Auto)),
+            matches!(inner.tool_choice, Some(tool::Choice::Auto { .. })),
             "Ollama Think must set tool_choice=Auto; got {:?}",
             inner.tool_choice
         );

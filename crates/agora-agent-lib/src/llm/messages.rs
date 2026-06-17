@@ -18,7 +18,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use misanthropic::Prompt;
-use misanthropic::prompt::Message as MMessage;
 use misanthropic::prompt::message::{Block, Content, Role};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -100,11 +99,11 @@ struct OllamaModelInfo {
 }
 
 /// Check if a message contains any `Block::ToolUse`.
-pub fn has_tool_use(msg: &MMessage<'_>) -> bool {
-    match &msg.content {
-        Content::MultiPart(blocks) => blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })),
-        Content::SinglePart(_) => false,
-    }
+pub fn has_tool_use(content: &Content) -> bool {
+    content
+        .0
+        .iter()
+        .any(|b| matches!(b, Block::ToolUse { .. }))
 }
 
 /// Send a prompt to a `/v1/messages` endpoint, nudging up to
@@ -124,7 +123,7 @@ pub async fn send_with_nudge(
     client: &misanthropic::Client,
     // FIXME: Always use CachedPrompt instead of Prompt. Purge the codebase of
     // any bare Prompt.
-    prompt: &Prompt<'_>,
+    prompt: &Prompt,
 ) -> Result<SendResponse> {
     let mut response = retry_recoverable("messages-api send", 5, || async {
         client
@@ -132,9 +131,8 @@ pub async fn send_with_nudge(
             .await
             .context("messages-API request failed")
     })
-    .await?
-    .into_static();
-    let mut total_usage = response.usage;
+    .await?;
+    let mut total_usage = response.usage.counts;
 
     // No-nudge cases:
     //   - prompt has no tools → caller is expecting plain text
@@ -145,17 +143,17 @@ pub async fn send_with_nudge(
     //     output_config wins at the grammar layer). Nudging here burns
     //     a second 4-minute cogito-32b inference for nothing.
     //   - response already has tool_use → success
-    let has_tools = prompt.functions.as_ref().is_some_and(|f| !f.is_empty());
+    let has_tools = prompt.tools.as_ref().is_some_and(|f| !f.is_empty());
     if !has_tools || prompt.output_config.is_some() || has_tool_use(&response.inner) {
         return Ok(response);
     }
 
     // No tool calls — nudge the model
-    let mut retry_prompt = prompt.clone().into_static();
+    let mut retry_prompt = prompt.clone();
 
     for attempt in 0..MAX_NUDGES {
         retry_prompt
-            .push_message(response.inner.clone().into_static())
+            .push_message(response.inner.clone())
             .map_err(|e| anyhow::anyhow!("turn order error on nudge: {e}"))?;
         retry_prompt
             .push_message((Role::User, NUDGE_MESSAGE))
@@ -167,9 +165,8 @@ pub async fn send_with_nudge(
                 .await
                 .context("messages-API nudge request failed")
         })
-        .await?
-        .into_static();
-        total_usage += nudge_response.usage;
+        .await?;
+        total_usage += nudge_response.usage.counts;
         response = nudge_response;
 
         if has_tool_use(&response.inner) {
@@ -183,7 +180,7 @@ pub async fn send_with_nudge(
     }
 
     // Give up — return whatever we got
-    response.usage = total_usage;
+    response.usage.counts = total_usage;
     Ok(response)
 }
 
@@ -195,7 +192,7 @@ pub async fn send_with_nudge(
 pub fn create_messages_client(base_url: &Url) -> Result<misanthropic::Client> {
     misanthropic::Client::new(DUMMY_KEY.to_string())
         .expect("dummy key is valid length")
-        .with_base_url(base_url.as_ref())
+        .base_url(base_url.as_ref())
         .map_err(|e| anyhow::anyhow!("invalid messages-API URL '{base_url}': {e}"))
 }
 
@@ -280,21 +277,21 @@ impl MessagesClient {
     // (send where?) while complete is more consistent with most completion APIs
     pub async fn send(
         &self,
-        prompt: &Prompt<'_>,
+        prompt: &Prompt,
         model: &str,
-    ) -> Result<misanthropic::prompt::AssistantMessage<'static>> {
+    ) -> Result<misanthropic::prompt::AssistantMessage> {
         Ok(self.send_response(prompt, model).await?.inner)
     }
 
     /// Send a prompt for a specific model and return the full
     /// [`SendResponse`] (assistant message + usage). Logs usage as a side
     /// effect via [`log_usage`].
-    pub async fn send_response(&self, prompt: &Prompt<'_>, model: &str) -> Result<SendResponse> {
+    pub async fn send_response(&self, prompt: &Prompt, model: &str) -> Result<SendResponse> {
         let start = std::time::Instant::now();
         let resp = send_with_nudge(&self.client, prompt).await?;
         let elapsed = start.elapsed();
 
-        log_usage(elapsed, resp.usage, model);
+        log_usage(elapsed, resp.usage.counts, model);
 
         Ok(resp)
     }
@@ -312,7 +309,7 @@ pub struct MessagesPerModel {
 
 #[async_trait]
 impl LlmBackend for MessagesPerModel {
-    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
+    async fn send(&self, prompt: &Prompt) -> Result<SendResponse> {
         self.client.send_response(prompt, &self.model).await
     }
 
@@ -347,6 +344,7 @@ mod tests {
         // This must be retried, not failed-fast.
         let err = anyhow::Error::new(ClientError::Anthropic(AnthropicError::Overloaded {
             message: "Session is busy".to_string(),
+            retry_after: None,
         }));
         assert!(
             is_recoverable(&err),
@@ -362,6 +360,7 @@ mod tests {
         // so the misanthropic error is one level deep in the chain.
         let inner = anyhow::Error::new(ClientError::Anthropic(AnthropicError::Overloaded {
             message: "Session is busy".to_string(),
+            retry_after: None,
         }));
         let wrapped = inner.context("messages-API request failed");
         assert!(

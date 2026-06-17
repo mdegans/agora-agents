@@ -19,9 +19,9 @@ pub use misanthropic::prompt::Message as MMessage;
 pub use misanthropic::prompt::message::Content as MContent;
 pub use misanthropic::prompt::message::Role as MRole;
 pub use misanthropic::prompt::{AssistantMessage, UserMessage};
-pub use misanthropic::response::{StopReason, Usage};
+pub use misanthropic::response::{StopReason, TokenCounts, Usage};
 
-pub type SendResponse = misanthropic::response::Message<'static>;
+pub type SendResponse = misanthropic::response::Message;
 
 /// A message in a conversation (simple text-only representation).
 ///
@@ -49,7 +49,7 @@ pub trait LlmBackend: Send + Sync {
     /// This is the primary method backends must implement. The returned
     /// [`SendResponse`] contains the assistant message (for appending to the
     /// conversation) and optional token usage statistics.
-    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse>;
+    async fn send(&self, prompt: &Prompt) -> Result<SendResponse>;
 
     /// Name of the backend for logging.
     fn backend_name(&self) -> &str;
@@ -70,12 +70,12 @@ pub trait LlmBackend: Send + Sync {
     ) -> Result<String> {
         use std::num::NonZeroU32;
 
-        let model_id: misanthropic::model::Id<'_> = self.model_id().into();
+        let model_id: misanthropic::model::Model = self.model_id().to_string().into();
 
         let mut prompt = Prompt {
             model: model_id,
             max_tokens: NonZeroU32::new(max_tokens).unwrap_or(NonZeroU32::new(1024).unwrap()),
-            system: Some(MContent::text(system_prompt)),
+            system: Some(MContent::text(system_prompt.to_string())),
             ..Default::default()
         };
 
@@ -109,7 +109,7 @@ pub trait LlmBackend: Send + Sync {
 // Allow calling LlmBackend methods on Box<dyn LlmBackend>.
 #[async_trait]
 impl LlmBackend for Box<dyn LlmBackend> {
-    async fn send(&self, prompt: &Prompt<'_>) -> Result<SendResponse> {
+    async fn send(&self, prompt: &Prompt) -> Result<SendResponse> {
         (**self).send(prompt).await
     }
 
@@ -136,7 +136,7 @@ pub use agora_agentkit::retry::is_recoverable;
 /// Written in first-person so the agent's reflect phase reads it as its
 /// own voice rather than an injected system note. Keep it short and
 /// factual — the agent may reflect on it.
-fn synthetic_error_reply(err: &anyhow::Error) -> AssistantMessage<'static> {
+fn synthetic_error_reply(err: &anyhow::Error) -> AssistantMessage {
     AssistantMessage::from(
         MContent::from(
             format!(
@@ -144,8 +144,7 @@ fn synthetic_error_reply(err: &anyhow::Error) -> AssistantMessage<'static> {
                  This turn is lost; I will acknowledge the disruption and continue.",
             )
             .as_str(),
-        )
-        .into_static(),
+        ),
     )
 }
 
@@ -156,11 +155,11 @@ fn synthetic_error_reply(err: &anyhow::Error) -> AssistantMessage<'static> {
 /// `cache_read_input_tokens` directly rather than the running total).
 #[derive(Debug)]
 pub struct ExchangeOutcome {
-    pub assistant: AssistantMessage<'static>,
+    pub assistant: AssistantMessage,
     pub stop_reason: Option<StopReason>,
-    /// Per-call usage (also accumulated into the running `usage_total`
+    /// Per-call token counts (also accumulated into the running `usage_total`
     /// passed to `exchange_with_stop_reason`).
-    pub usage: Usage,
+    pub usage: TokenCounts,
 }
 
 /// Push a user message, call the backend (retrying once on recoverable
@@ -186,10 +185,10 @@ pub struct ExchangeOutcome {
 /// turn state before calling `exchange`.
 pub async fn exchange<B: LlmBackend + ?Sized>(
     backend: &B,
-    prompt: &mut CachedPrompt<'static>,
-    user: UserMessage<'static>,
-    usage_total: &mut Usage,
-) -> Result<AssistantMessage<'static>> {
+    prompt: &mut CachedPrompt,
+    user: UserMessage,
+    usage_total: &mut TokenCounts,
+) -> Result<AssistantMessage> {
     exchange_with_stop_reason(backend, prompt, user, usage_total)
         .await
         .map(|o| o.assistant)
@@ -202,9 +201,9 @@ pub async fn exchange<B: LlmBackend + ?Sized>(
 /// invariants as `exchange` for prompt/turn state.
 pub async fn exchange_with_stop_reason<B: LlmBackend + ?Sized>(
     backend: &B,
-    prompt: &mut CachedPrompt<'static>,
-    user: UserMessage<'static>,
-    usage_total: &mut Usage,
+    prompt: &mut CachedPrompt,
+    user: UserMessage,
+    usage_total: &mut TokenCounts,
 ) -> Result<ExchangeOutcome> {
     prompt
         .push_message(user)
@@ -233,10 +232,10 @@ pub async fn exchange_with_stop_reason<B: LlmBackend + ?Sized>(
 /// non-assistant-turn state before invoking this helper. Fix the
 /// caller; errors should never pass silently.
 pub fn commit_batch_response<E: std::fmt::Display>(
-    prompt: &mut CachedPrompt<'static>,
-    response: std::result::Result<MMessage<'static>, E>,
+    prompt: &mut CachedPrompt,
+    response: std::result::Result<MMessage, E>,
     context: &str,
-) -> Result<AssistantMessage<'static>> {
+) -> Result<AssistantMessage> {
     match response {
         Ok(message) => {
             let assistant =
@@ -263,7 +262,7 @@ pub fn commit_batch_response<E: std::fmt::Display>(
 /// Single backend call plus one retry if the error is recoverable.
 async fn send_with_retry<B: LlmBackend + ?Sized>(
     backend: &B,
-    prompt: &Prompt<'_>,
+    prompt: &Prompt,
 ) -> Result<SendResponse> {
     let attempt = backend.send(prompt).await;
     if let Err(ref e) = attempt
@@ -286,9 +285,9 @@ pub use agora_agentkit::retry::retry_recoverable;
 /// On `Ok`: appends the real assistant. On `Err`: appends a synthetic
 /// assistant carrying the error text so the prompt stays turn-valid.
 fn commit_exchange_result_full(
-    prompt: &mut CachedPrompt<'static>,
+    prompt: &mut CachedPrompt,
     result: Result<SendResponse>,
-    usage_total: &mut Usage,
+    usage_total: &mut TokenCounts,
 ) -> Result<ExchangeOutcome> {
     match result {
         Ok(SendResponse {
@@ -297,7 +296,7 @@ fn commit_exchange_result_full(
             stop_reason,
             ..
         }) => {
-            *usage_total += usage;
+            *usage_total += usage.counts;
             prompt
                 .push_message(assistant.clone())
                 .expect("exchange: assistant after user — turn order is a programmer bug");
@@ -305,7 +304,7 @@ fn commit_exchange_result_full(
             Ok(ExchangeOutcome {
                 assistant,
                 stop_reason,
-                usage,
+                usage: usage.counts,
             })
         }
         Err(e) => {
@@ -328,12 +327,12 @@ mod exchange_tests {
 
     /// Build a fresh `CachedPrompt` ending in an assistant-turn state
     /// (i.e. ready to receive a user message).
-    fn fresh_cached() -> CachedPrompt<'static> {
+    fn fresh_cached() -> CachedPrompt {
         CachedPrompt::from(Prompt::default())
     }
 
     /// Extract the sequence of roles in the prompt, for turn-order assertions.
-    fn roles(p: &CachedPrompt<'static>) -> Vec<MRole> {
+    fn roles(p: &CachedPrompt) -> Vec<MRole> {
         p.messages.iter().map(|m| m.role).collect()
     }
 
@@ -365,7 +364,7 @@ mod exchange_tests {
             .await
             .unwrap();
 
-        assert_eq!(assistant.content().to_string(), "hello from the backend");
+        assert_eq!(assistant.content.to_string(), "hello from the backend");
         assert_alternating(&roles(&prompt));
         assert_eq!(roles(&prompt).len(), 2);
         assert_eq!(mock.remaining(), 0);
@@ -422,7 +421,7 @@ mod exchange_tests {
             .await
             .unwrap();
 
-        assert_eq!(assistant.content().to_string(), "second-attempt-ok");
+        assert_eq!(assistant.content.to_string(), "second-attempt-ok");
         assert_eq!(mock.remaining(), 0);
         assert_alternating(&roles(&prompt));
     }
@@ -461,10 +460,12 @@ mod exchange_tests {
         // both fail, no further attempts.
         let e1: anyhow::Error = ClientError::Anthropic(AnthropicError::Overloaded {
             message: "first overload".into(),
+            retry_after: None,
         })
         .into();
         let e2: anyhow::Error = ClientError::Anthropic(AnthropicError::Overloaded {
             message: "second overload".into(),
+            retry_after: None,
         })
         .into();
         mock.push_err(e1).push_err(e2);
@@ -524,7 +525,7 @@ mod exchange_tests {
         let ok = exchange(&mock, &mut prompt, UserMessage::from("ask 2"), &mut usage)
             .await
             .unwrap();
-        assert_eq!(ok.content().to_string(), "recovered");
+        assert_eq!(ok.content.to_string(), "recovered");
 
         let r = roles(&prompt);
         assert_eq!(r.len(), 4);
@@ -586,12 +587,12 @@ mod exchange_tests {
 
         let msg = MMessage {
             role: MRole::Assistant,
-            content: MContent::from("batch response").into_static(),
+            content: MContent::from("batch response"),
         };
         let assistant =
             commit_batch_response::<String>(&mut prompt, Ok(msg), "reflect batch").unwrap();
 
-        assert_eq!(assistant.content().to_string(), "batch response");
+        assert_eq!(assistant.content.to_string(), "batch response");
         let r = roles(&prompt);
         assert_eq!(r.len(), 2);
         assert_alternating(&r);
@@ -651,7 +652,8 @@ mod exchange_tests {
         ))));
         assert!(is_recoverable(&anyhowed(ClientError::Anthropic(
             AnthropicError::Overloaded {
-                message: "overload".into()
+                message: "overload".into(),
+                retry_after: None,
             },
         ))));
     }
@@ -660,7 +662,8 @@ mod exchange_tests {
     fn is_recoverable_anthropic_429_retries() {
         assert!(is_recoverable(&anyhowed(ClientError::Anthropic(
             AnthropicError::RateLimit {
-                message: "slow down".into()
+                message: "slow down".into(),
+                retry_after: None,
             },
         ))));
     }
@@ -773,6 +776,7 @@ mod exchange_tests {
             if n < 2 {
                 Err(ClientError::Anthropic(AnthropicError::Overloaded {
                     message: format!("overload attempt {n}"),
+                    retry_after: None,
                 })
                 .into())
             } else {
@@ -792,6 +796,7 @@ mod exchange_tests {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ClientError::Anthropic(AnthropicError::Overloaded {
                 message: "forever".into(),
+                retry_after: None,
             })
             .into())
         })

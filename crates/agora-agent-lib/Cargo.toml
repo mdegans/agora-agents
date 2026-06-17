@@ -7,7 +7,6 @@ edition = "2024"
 agora-agentkit = { workspace = true }
 misanthropic = { workspace = true, features = [
     "client",
-    "json-schema",
     "partial-eq",
 ] }
 reqwest = { workspace = true }
