@@ -407,10 +407,7 @@ fn insert_bridge<'a>(cached_prompt: &mut CachedPrompt) {
 // a couple months since we wrote this and there have been many updates. It's
 // possible the behavior is canonical now, saving ~100s per agent per cycle.
 // Ingestion is pretty costly on Metal. Removing this fn may be safe now.
-fn strip_tools_for_reflect<'a>(
-    cached: CachedPrompt,
-    backend_kind: Backend,
-) -> CachedPrompt {
+fn strip_tools_for_reflect<'a>(cached: CachedPrompt, backend_kind: Backend) -> CachedPrompt {
     if matches!(backend_kind, Backend::Blallama) {
         return cached;
     }
@@ -1557,11 +1554,7 @@ fn model_prefix_hash(model: &str) -> u64 {
 /// Build a `WorkItem` from an agent's current prompt state. The
 /// `prefix_hash` comes from [`model_prefix_hash`] so it matches the
 /// entry the eager-prime path writes at session start.
-fn make_work_item(
-    agent: &Agent,
-    prompt: &CachedPrompt,
-    step: CycleStep,
-) -> WorkItem<CachedPrompt> {
+fn make_work_item(agent: &Agent, prompt: &CachedPrompt, step: CycleStep) -> WorkItem<CachedPrompt> {
     WorkItem {
         agent_id: agent.agent_id.unwrap(),
         prompt: prompt.clone(),

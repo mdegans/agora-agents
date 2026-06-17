@@ -100,10 +100,7 @@ struct OllamaModelInfo {
 
 /// Check if a message contains any `Block::ToolUse`.
 pub fn has_tool_use(content: &Content) -> bool {
-    content
-        .0
-        .iter()
-        .any(|b| matches!(b, Block::ToolUse { .. }))
+    content.0.iter().any(|b| matches!(b, Block::ToolUse { .. }))
 }
 
 /// Send a prompt to a `/v1/messages` endpoint, nudging up to

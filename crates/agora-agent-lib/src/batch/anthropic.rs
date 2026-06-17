@@ -281,12 +281,7 @@ impl AnthropicBatch {
     /// - warn per failed attempt with attempt count
     /// - warn on terminal abandonment after the cap
     /// - debug on "already primed" / "already abandoned" short-circuit
-    pub async fn prime_prefix(
-        &self,
-        prefix_hash: u64,
-        model: &str,
-        prompt: &CachedPrompt,
-    ) -> bool {
+    pub async fn prime_prefix(&self, prefix_hash: u64, model: &str, prompt: &CachedPrompt) -> bool {
         // Short-circuit if the prefix is in a fresh terminal state.
         // Stale entries (older than PRIME_FRESHNESS) fall through and
         // re-enter the retry loop below.
@@ -432,10 +427,7 @@ impl AnthropicBatch {
 impl BatchBackend<CachedPrompt, MMessage> for AnthropicBatch {
     type Handle = AnthropicPendingHandle;
 
-    async fn submit(
-        &self,
-        items: Vec<WorkItem<CachedPrompt>>,
-    ) -> anyhow::Result<Self::Handle> {
+    async fn submit(&self, items: Vec<WorkItem<CachedPrompt>>) -> anyhow::Result<Self::Handle> {
         // No priming happens here. Cache priming is eager: the caller
         // invokes [`AnthropicBatch::prime_prefixes`] at the start of
         // each cycle, before that cycle's real batches, so by the time

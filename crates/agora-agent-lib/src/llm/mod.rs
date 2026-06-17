@@ -137,15 +137,13 @@ pub use agora_agentkit::retry::is_recoverable;
 /// own voice rather than an injected system note. Keep it short and
 /// factual — the agent may reflect on it.
 fn synthetic_error_reply(err: &anyhow::Error) -> AssistantMessage {
-    AssistantMessage::from(
-        MContent::from(
-            format!(
-                "I attempted to respond but the LLM call failed: {err}. \
+    AssistantMessage::from(MContent::from(
+        format!(
+            "I attempted to respond but the LLM call failed: {err}. \
                  This turn is lost; I will acknowledge the disruption and continue.",
-            )
-            .as_str(),
-        ),
-    )
+        )
+        .as_str(),
+    ))
 }
 
 /// One round of [`exchange_with_stop_reason`]: the assistant message
