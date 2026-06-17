@@ -111,7 +111,7 @@ mod tests {
     fn mk_outcome(ratings: &[u32]) -> ProbeOutcome {
         ProbeOutcome {
             answers: mk_ans(ratings),
-            usage: misanthropic::response::Usage {
+            usage: misanthropic::response::TokenCounts {
                 input_tokens: 100,
                 output_tokens: 20,
                 ..Default::default()

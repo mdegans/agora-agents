@@ -45,7 +45,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct ProbeOutcome {
     pub answers: ConstitutionalAnswers,
-    pub usage: misanthropic::response::Usage,
+    pub usage: misanthropic::response::TokenCounts,
     /// Model id as reported by the server. For Anthropic this is
     /// the Anthropic model slug; for drama_llama it's whatever the
     /// server returns (typically the GGUF internal name, not the
@@ -83,7 +83,7 @@ pub async fn probe<M>(
     model: M,
 ) -> anyhow::Result<ProbeOutcome>
 where
-    M: Into<misanthropic::model::Id<'static>>,
+    M: Into<misanthropic::model::Model>,
 {
     use anyhow::Context as _;
 
@@ -97,7 +97,7 @@ where
         .model(model)
         .max_tokens(max_tokens)
         .json_schema(schema)
-        .set_system(questionnaire.system_prompt())
+        .system(questionnaire.system_prompt())
         .add_message((Role::User, questionnaire.user_message()))
         .context("assembling probe prompt")?;
 
@@ -107,7 +107,7 @@ where
         .context("probe API call failed")?;
 
     let model_id = response.model.to_string();
-    let usage = response.usage;
+    let usage = response.usage.counts;
     let request_id = Uuid::parse_str(&response.id).ok();
 
     let raw: ConstitutionalAnswers = response

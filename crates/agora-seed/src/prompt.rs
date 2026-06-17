@@ -119,25 +119,26 @@ Use ONLY these exact community slugs when posting: {communities:?}
 /// warm across phases. Conversion to [`CachedPrompt`] goes through
 /// `.into()`, which as of misanthropic PR #53 preserves existing
 /// `cache_control` markers exactly and does not overwrite them.
-pub fn build_base_prompt(model_id: impl std::fmt::Display) -> CachedPrompt<'static> {
+pub fn build_base_prompt(model_id: impl std::fmt::Display) -> CachedPrompt {
     let cached_system = build_system_text();
 
     misanthropic::Prompt {
         model: model_id.to_string().into(),
         max_tokens: NonZeroU32::new(2048).unwrap(),
-        system: Some(Content::MultiPart(vec![Block::Text {
+        system: Some(Content(vec![Block::Text {
             text: cached_system.into(),
+            citations: None,
             // First breakpoint at end of tools+system, 1h TTL. Set inline
             // so `.into()` wraps it as-is.
             cache_control: Some(CacheControl::one_hour()),
         }])),
-        functions: Some(AgentAction::methods()),
+        tools: Some(AgentAction::methods().into_iter().map(Into::into).collect()),
         // NOTE(mdegans): Only Anthropic models properly handle this. For the
         // Ollama Anthropic compat backend, this means the model must *always*
         // use a tool. So for ollama there must be special handling in the
         // reflect phase to remove this and tools at the cost of (local) cache
         // prefix.
-        tool_choice: Some(misanthropic::tool::Choice::Auto),
+        tool_choice: Some(misanthropic::tool::Choice::auto()),
         ..Default::default()
     }
     .into()
@@ -152,7 +153,7 @@ pub fn build(
     recent_activity: &str,
     pending_replies: &str,
     dashboard: &str,
-) -> CachedPrompt<'static> {
+) -> CachedPrompt {
     let mut prompt = build_base_prompt(model_id);
 
     let intro = build_intro_message(
@@ -186,7 +187,7 @@ fn build_intro_message(
     recent_activity: &str,
     pending_replies: &str,
     dashboard: &str,
-) -> UserMessage<'static> {
+) -> UserMessage {
     // Strip title lines from memory
     let memory = memory_content.trim();
     let memory = if let Some((first_line, rest)) = memory.split_once('\n') {
@@ -701,7 +702,7 @@ fn extract_keywords(title: &str) -> std::collections::HashSet<String> {
 /// Extract only the speech content from a message, filtering out both
 /// `Block::Thought`/`Block::RedactedThought` and XML `<think>`/`<thinking>`
 /// tags embedded in text (gpt-oss style). Uses misanthropic's `cot` feature.
-pub fn extract_speech(content: &Content<'_>) -> String {
+pub fn extract_speech(content: &Content) -> String {
     use misanthropic::cot::Thinkable;
 
     content
@@ -780,7 +781,7 @@ const CONSTITUTION_MARKERS: &[&str] = &[
 /// Returns a list of problems found. An empty vec means the prompt
 /// is valid. Called from `build_prompt` on every cycle so every
 /// agent's prompt is sanity-checked at construction time.
-pub fn preflight_check_prompt(prompt: &misanthropic::Prompt<'_>) -> Vec<String> {
+pub fn preflight_check_prompt(prompt: &misanthropic::Prompt) -> Vec<String> {
     let mut problems = Vec::new();
 
     let Some(system) = &prompt.system else {
@@ -935,10 +936,11 @@ mod tests {
         let prompt = misanthropic::Prompt {
             model: "claude-haiku-4-5-20251001".into(),
             max_tokens: NonZeroU32::new(1024).unwrap(),
-            system: Some(Content::MultiPart(vec![Block::Text {
+            system: Some(Content(vec![Block::Text {
                 text: "The Preamble [2048 BYTES SANITIZED] Article I Article II Article III \
                        Article IV Article V The Steward"
                     .into(),
+                citations: None,
                 cache_control: Some(CacheControl::ephemeral()),
             }])),
             ..Default::default()
@@ -961,8 +963,9 @@ mod tests {
         let prompt = misanthropic::Prompt {
             model: "claude-haiku-4-5-20251001".into(),
             max_tokens: NonZeroU32::new(1024).unwrap(),
-            system: Some(Content::MultiPart(vec![Block::Text {
+            system: Some(Content(vec![Block::Text {
                 text: "You are an agent. Be nice.".into(),
+                citations: None,
                 cache_control: Some(CacheControl::ephemeral()),
             }])),
             ..Default::default()
@@ -1375,33 +1378,22 @@ mod tests {
     // --- Cache breakpoint budget test ---
 
     /// Count all cache_control blocks across tools, system, and messages.
-    fn count_cache_breakpoints(prompt: &misanthropic::Prompt<'_>) -> usize {
+    fn count_cache_breakpoints(prompt: &misanthropic::Prompt) -> usize {
         let mut count = 0;
 
         // Tools
-        if let Some(tools) = &prompt.functions {
-            for tool in tools {
-                if tool.cache_control.is_some() {
-                    count += 1;
-                }
-            }
+        if let Some(tools) = &prompt.tools {
+            count += tools.iter().filter(|t| t.is_cached()).count();
         }
 
         // System
         if let Some(system) = &prompt.system {
-            if system.has_cache() {
-                // Count individual cached blocks
-                if let misanthropic::prompt::message::Content::MultiPart(blocks) = system {
-                    count += blocks.iter().filter(|b| b.is_cached()).count();
-                }
-            }
+            count += system.0.iter().filter(|b| b.is_cached()).count();
         }
 
         // Messages
         for msg in &prompt.messages {
-            if let misanthropic::prompt::message::Content::MultiPart(blocks) = &msg.content {
-                count += blocks.iter().filter(|b| b.is_cached()).count();
-            }
+            count += msg.content.0.iter().filter(|b| b.is_cached()).count();
         }
 
         count
@@ -1474,13 +1466,14 @@ mod tests {
             // Simulate assistant response with a tool call
             let assistant_msg = misanthropic::prompt::Message {
                 role: Role::Assistant,
-                content: misanthropic::prompt::message::Content::MultiPart(vec![
+                content: misanthropic::prompt::message::Content(vec![
                     misanthropic::prompt::message::Block::ToolUse {
                         call: misanthropic::tool::Use {
                             id: format!("call_{round}").into(),
                             name: "get_post".into(),
                             input: serde_json::json!({"post_id": "00000000-0000-0000-0000-000000000001"}),
                             cache_control: None,
+                            caller: None,
                         },
                     },
                 ]),
@@ -1490,14 +1483,13 @@ mod tests {
             // Simulate tool result (user message)
             let tool_result_msg = misanthropic::prompt::Message {
                 role: Role::User,
-                content: misanthropic::prompt::message::Content::MultiPart(vec![
+                content: misanthropic::prompt::message::Content(vec![
                     misanthropic::prompt::message::Block::ToolResult {
                         result: misanthropic::tool::Result {
                             tool_use_id: format!("call_{round}").into(),
                             content: misanthropic::prompt::message::Content::from(
                                 "Post content here...",
-                            )
-                            .into_static(),
+                            ),
                             is_error: false,
                             cache_control: None,
                         },

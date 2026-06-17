@@ -90,7 +90,7 @@ impl MockLlmBackend {
 
 #[async_trait]
 impl LlmBackend for MockLlmBackend {
-    async fn send(&self, _prompt: &Prompt<'_>) -> Result<SendResponse> {
+    async fn send(&self, _prompt: &Prompt) -> Result<SendResponse> {
         let next = self
             .responses
             .lock()
@@ -100,7 +100,7 @@ impl LlmBackend for MockLlmBackend {
             Some(Response::OkText(text, stop_reason)) => Ok(SendResponse {
                 inner: MMessage {
                     role: MRole::Assistant,
-                    content: MContent::from(text.as_str()).into_static(),
+                    content: MContent::from(text.as_str()),
                 }
                 .try_into()
                 .unwrap(), // is Assistant role, can't panic
@@ -109,6 +109,9 @@ impl LlmBackend for MockLlmBackend {
                 id: Uuid::new_v4().to_string().into(),
                 model: "fake_model".into(),
                 stop_sequence: None,
+                kind: None,
+                stop_details: None,
+                container: None,
             }),
             Some(Response::Err(mut slot)) => {
                 Err(slot.take().expect("mock: error slot already consumed"))
@@ -135,7 +138,8 @@ mod tests {
         let mock = MockLlmBackend::new("test");
         mock.push_ok("hello world");
         let resp = mock.send(&Prompt::default()).await.unwrap();
-        assert_eq!(resp.inner.role, MRole::Assistant); // type guarantee in misanthropic
+        // resp.inner.role is now a compile-time Assistant marker — the
+        // Assistant-ness is a type guarantee, no runtime assert needed.
         assert_eq!(resp.inner.content.to_string(), "hello world");
         assert_eq!(mock.remaining(), 0);
     }
@@ -154,6 +158,7 @@ mod tests {
         let mock = MockLlmBackend::new("test");
         let original: anyhow::Error = ClientError::Anthropic(AnthropicError::RateLimit {
             message: "slow down".into(),
+            retry_after: None,
         })
         .into();
         mock.push_err(original);

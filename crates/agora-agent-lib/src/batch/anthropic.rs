@@ -69,7 +69,7 @@ use misanthropic::prompt::Message as MMessage;
 /// Holds the misanthropic pending batch state and a mapping from
 /// batch IDs back to agent IDs and cycle steps.
 pub struct AnthropicPendingHandle {
-    pending: batch::Pending<CachedPrompt<'static>>,
+    pending: batch::Pending<CachedPrompt>,
     /// Maps batch::Id → (AgentId, CycleStep) for result routing.
     // TODO: Investigate if this is always len() == 1 since we only have
     // single pending anthropic batch attached. The log will tell.
@@ -77,7 +77,7 @@ pub struct AnthropicPendingHandle {
 }
 
 impl AnthropicPendingHandle {
-    pub fn pending(&self) -> &misanthropic::batch::Pending<CachedPrompt<'static>> {
+    pub fn pending(&self) -> &misanthropic::batch::Pending<CachedPrompt> {
         &self.pending
     }
 
@@ -193,8 +193,8 @@ impl AnthropicBatch {
     async fn prime_via_batch(
         &self,
         model: &str,
-        prompt: &CachedPrompt<'static>,
-    ) -> anyhow::Result<misanthropic::response::Usage> {
+        prompt: &CachedPrompt,
+    ) -> anyhow::Result<misanthropic::response::TokenCounts> {
         let mut pending = self
             .client
             .batch([prompt])
@@ -243,7 +243,7 @@ impl AnthropicBatch {
             .ok_or_else(|| anyhow::anyhow!("prime batch for model {model} returned no results"))?;
 
         match result {
-            batch::BatchResult::Ok(msg) => Ok(msg.usage),
+            batch::BatchResult::Ok(msg) => Ok(msg.usage.counts),
             batch::BatchResult::Error(e) => {
                 anyhow::bail!("prime batch item for model {model} errored: {e}")
             }
@@ -285,7 +285,7 @@ impl AnthropicBatch {
         &self,
         prefix_hash: u64,
         model: &str,
-        prompt: &CachedPrompt<'static>,
+        prompt: &CachedPrompt,
     ) -> bool {
         // Short-circuit if the prefix is in a fresh terminal state.
         // Stale entries (older than PRIME_FRESHNESS) fall through and
@@ -416,7 +416,7 @@ impl AnthropicBatch {
     /// don't actually observe in practice.
     pub async fn prime_prefixes(
         &self,
-        entries: Vec<(u64, String, CachedPrompt<'static>)>,
+        entries: Vec<(u64, String, CachedPrompt)>,
     ) -> (usize, usize) {
         let total = entries.len();
         let mut ok = 0usize;
@@ -429,12 +429,12 @@ impl AnthropicBatch {
     }
 }
 
-impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
+impl BatchBackend<CachedPrompt, MMessage> for AnthropicBatch {
     type Handle = AnthropicPendingHandle;
 
     async fn submit(
         &self,
-        items: Vec<WorkItem<CachedPrompt<'static>>>,
+        items: Vec<WorkItem<CachedPrompt>>,
     ) -> anyhow::Result<Self::Handle> {
         // No priming happens here. Cache priming is eager: the caller
         // invokes [`AnthropicBatch::prime_prefixes`] at the start of
@@ -473,7 +473,7 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
     async fn poll(
         &self,
         handle: Self::Handle,
-    ) -> anyhow::Result<BatchState<MMessage<'static>, Self::Handle>> {
+    ) -> anyhow::Result<BatchState<MMessage, Self::Handle>> {
         let AnthropicPendingHandle { pending, id_map } = handle;
 
         let batch_id = pending.meta().id.clone();
@@ -501,8 +501,8 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
                 let mut results = Vec::new();
                 // Aggregate usage across all succeeded items so we can
                 // compute and log the cache hit rate for this batch.
-                // `Usage: Default + AddAssign + Copy` so summation is trivial.
-                let mut total_usage = misanthropic::response::Usage::default();
+                // `TokenCounts: Default + AddAssign + Copy` so summation is trivial.
+                let mut total_usage = misanthropic::response::TokenCounts::default();
                 let mut ok_count = 0usize;
 
                 // Decompose to get owned results
@@ -516,12 +516,12 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
 
                     let response = match result {
                         batch::BatchResult::Ok(response_message) => {
-                            total_usage += response_message.usage;
+                            total_usage += response_message.usage.counts;
                             ok_count += 1;
                             // response::Message.inner -> prompt::AssistantMessage
                             // -> Into<prompt::Message>
-                            let msg: MMessage<'_> = response_message.inner.into();
-                            Ok(msg.into_static())
+                            let msg: MMessage = response_message.inner.into();
+                            Ok(msg)
                         }
                         batch::BatchResult::Error(err) => {
                             tracing::warn!("Batch item error for agent {agent_id}: {err}");
@@ -585,7 +585,7 @@ impl BatchBackend<CachedPrompt<'static>, MMessage<'static>> for AnthropicBatch {
         }
     }
 
-    async fn count_tokens(&self, _prompt: &CachedPrompt<'static>) -> anyhow::Result<Option<u32>> {
+    async fn count_tokens(&self, _prompt: &CachedPrompt) -> anyhow::Result<Option<u32>> {
         // TODO: Use misanthropic::Client::count_tokens once available.
         // CachedPrompt derefs to &Prompt which count_tokens accepts.
         Ok(None)

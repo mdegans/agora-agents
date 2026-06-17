@@ -10,7 +10,7 @@ agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", featur
 ] }
 
 # LLM backends
-misanthropic = { git = "https://github.com/mdegans/misanthropic", branch = "dev", features = [
+misanthropic = { version = "1.0.0-alpha.3", features = [
     "batch",
     "cot",
     "markdown",
