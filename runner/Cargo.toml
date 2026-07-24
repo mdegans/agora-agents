@@ -12,7 +12,7 @@ publish = false
 [workspace]
 
 [dependencies]
-agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "5039038916824e551aee1e17858ab73b1df5b990", features = [
+agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "92911b052b18d554687486767968283b3359f269", features = [
     "seed",
     "fs-storage",
     "retry",
@@ -25,6 +25,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 dirs = "5"
 url = "2"
 uuid = "1"
