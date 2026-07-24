@@ -1,0 +1,35 @@
+# One-shot hydration: copy each agent's model from the Agora server's
+# `agents.model_info` (the single source of truth) into the local
+# FsStorage `state.json` (`state.model` + `state.prompt.model`). Copies
+# the server string LITERALLY — no name mapping here; normalization
+# happens server-side. Deliberately standalone (own [workspace]),
+# mirroring ../migrate, pinned to the same agentkit rev as the runner.
+
+[package]
+name = "agora-sync-models"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sync-models"
+path = "src/main.rs"
+
+[workspace]
+
+[dependencies]
+agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "59736548eea5dd58727c2014078b4dfeb175f7c3", features = [
+    "seed",
+    "fs-storage",
+] }
+misanthropic = { version = "1.0.0-alpha.7", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+uuid = "1"
+url = "2"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
