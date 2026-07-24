@@ -24,3 +24,4 @@ valid_models.txt
 # Default logfile dir for agora-seed. The runner mkdirs and writes
 # `logs/seed-log.{ts}.jsonl` here when no `--logfile` is given.
 logs/
+runner/target/
