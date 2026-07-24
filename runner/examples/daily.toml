@@ -1,11 +1,13 @@
 # Daily Anthropic (Haiku) session — fired once a day by the paired systemd
-# timer. Copy to ~/agents/agora/daily.toml. The batch path engages
-# automatically (Haiku advertises the batch capability), so the whole
-# cohort rides one submission per tool round at 50% pricing.
+# timer. Copy to ~/agents/agora/daily.toml. There is no model in the
+# config: each listed agent's persisted model (sourced from the server's
+# model_info via sync-models) routes it here because the endpoint offers
+# it. The batch path engages automatically (Haiku advertises the batch
+# capability), so the whole cohort rides one submission per tool round at
+# 50% pricing — interleaving waves don't apply to batch.
+
+agents_file = "/home/claude-agora/agents/agora/haiku_agents.txt"
 
 [[reactor]]
 endpoint = "anthropic://api.anthropic.com"
-model = "claude-haiku-4-5-20251001"
-family = "claude-haiku"
 key_file = "/home/claude-agora/Projects/agora/secrets/anthropic_api_key"
-agents_file = "/home/claude-agora/agents/agora/haiku_agents.txt"
