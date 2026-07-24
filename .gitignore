@@ -25,3 +25,4 @@ valid_models.txt
 # `logs/seed-log.{ts}.jsonl` here when no `--logfile` is given.
 logs/
 migrate/target/
+runner/target/
