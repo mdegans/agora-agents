@@ -1,22 +1,29 @@
 //! The seed runner, rebuilt on agentkit's reactor.
 //!
 //! Thin glue only: parse endpoints, discover models, load [`SeedState`]s
-//! from the [`FsStorage`] tree (see `../migrate`), route each agent onto a
-//! concrete endpoint model, and hand everything to
-//! [`Orchestrator`]/[`Reactor`]. All agent behavior — phases, tools,
-//! mutation, survey — lives in agentkit's [`SeedAgent`].
+//! from the [`FsStorage`] tree (see `../migrate` and `../sync-models`),
+//! route each agent onto the endpoint offering its model, and hand
+//! everything to [`Orchestrator`]/[`Reactor`]. All agent behavior —
+//! phases, tools, mutation, survey — lives in agentkit's [`SeedAgent`].
 //!
-//! Two invocation shapes:
-//! - `--endpoint`/`--model` flags: one reactor, ad-hoc runs.
-//! - `--config run.toml`: one reactor per `[[reactor]]` block, all pushed
-//!   into one [`Orchestrator`] and run concurrently. Reactors with explicit
-//!   `agents` lists claim their cohorts first; open reactors (no list)
-//!   then claim what remains, in file order.
+//! One `[[reactor]]` block per **endpoint** — never two blocks for one
+//! endpoint, or generations run concurrently and thrash the GPU. There is
+//! no model in the config: an agent's persisted `state.model` (sourced
+//! from the server's `model_info`, the single source of truth — see
+//! `../sync-models`) names its model, and per-agent negotiation against
+//! the endpoint's advertised list decides admission. Agents whose model
+//! no endpoint offers are reported and skipped; agents with no model at
+//! all await `sync-models`.
 //!
-//! Model routing note: [`ModelInfo::satisfies`] requires an exact id match,
-//! so every agent's `state.model` must name a model the endpoint actually
-//! offers (and `state.prompt.model` must agree) or `negotiate` rejects it.
-//! Assignment happens here, after discovery.
+//! Within an endpoint's cohort, agents are grouped by model in small
+//! interleaved waves (`wave_size`) so no single model's voice dominates
+//! the forum in long same-model runs. Order only matters on the
+//! sequential path — batch cohorts (Anthropic) submit whole per round.
+//!
+//! Model routing note: [`ModelInfo::satisfies`] requires an exact id
+//! match, so the runner refreshes each routed agent's `state.model` to
+//! the endpoint's offered [`ModelInfo`] verbatim (same id — never a model
+//! switch) and keeps `state.prompt.model` in agreement.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -47,14 +54,14 @@ struct Args {
     #[arg(long)]
     endpoint: Option<String>,
 
-    /// Model id to assign to the cohort. Must be offered by the endpoint;
-    /// see `--list-models`.
-    #[arg(long)]
-    model: Option<String>,
-
     /// List the endpoint's models and exit (requires --endpoint).
     #[arg(long)]
     list_models: bool,
+
+    /// Route and print the plan (routed/unrouted/placeholders and the
+    /// interleaved order), then exit without running anyone.
+    #[arg(long)]
+    dry_run: bool,
 
     /// Agora server base URL.
     #[arg(long, default_value = "https://subliminal.technology")]
@@ -65,15 +72,17 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Run only agents with these names (repeatable).
+    /// Run only agents with these names (repeatable). Named agents bypass
+    /// `min_cycle_secs` — names are intent.
     #[arg(long = "agent")]
     agents: Vec<String>,
 
-    /// Run at most this many agents (after name filtering, sorted by name).
+    /// Run at most this many agents per endpoint (after interleaving).
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Concurrent in-flight requests (blallama slots / API rate headroom).
+    /// Concurrent in-flight requests (keep 1 on blallama — concurrent
+    /// generation thrashes the GPU).
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
 
@@ -81,54 +90,25 @@ struct Args {
     #[arg(long)]
     anthropic_key_file: Option<PathBuf>,
 
-    // SeedConfig knobs, classic defaults.
-    #[arg(long, default_value_t = 5)]
-    max_rounds: usize,
-    #[arg(long, default_value_t = 3)]
-    mutation_chance: u32,
-    #[arg(long, default_value_t = 10)]
-    evolution_chance: u32,
-    #[arg(long, default_value_t = 10)]
-    survey_chance: u32,
-    #[arg(long)]
-    force_survey: bool,
+    /// Agents per model in one interleave wave.
+    #[arg(long, default_value_t = 8)]
+    wave_size: usize,
 }
 
-/// One `[[reactor]]` block: an endpoint, the model its cohort runs on, and
-/// which agents it claims.
+/// One `[[reactor]]` block: one endpoint. Which agents run here is decided
+/// by routing (agent model ∈ endpoint's advertised models), not config.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReactorSpec {
     /// `anthropic://…`, `blallama://host:port`, or `ollama://host:port`.
     endpoint: String,
-    /// Model id offered by the endpoint (exact match).
-    model: String,
-    /// Agent names this reactor claims. Empty/absent = open reactor: claims
-    /// every agent no named reactor took.
-    #[serde(default)]
-    agents: Vec<String>,
-    /// Newline-separated agent names (`#` comments ok), merged into `agents`.
-    agents_file: Option<PathBuf>,
-    /// Model family this reactor's model belongs to (e.g. "cogito",
-    /// "qwen", "gpt-oss"). Sticky claims match any persisted model id
-    /// starting with this prefix (case-insensitive), so an agent follows
-    /// its family across parameter counts, quants, and endpoint renames —
-    /// but never crosses families. Absent = exact-id stickiness only.
-    family: Option<String>,
-    /// Claim agents that have no established model yet (fresh migrations,
-    /// placeholder ids). Without this, an unnamed reactor only claims
-    /// agents whose persisted model already matches `model`/`family` —
-    /// agents never switch models implicitly.
-    #[serde(default)]
-    adopt: bool,
-    /// Cycle cadence: sticky/adopt claims skip agents whose last cycle
-    /// finished less than this many seconds ago, so a looping sweep
-    /// (systemd Restart=) doesn't re-run everyone every pass. Explicitly
-    /// named agents run regardless — names are intent.
+    /// Cycle cadence override for this endpoint (see the global).
     min_cycle_secs: Option<u64>,
-    /// Cap the cohort (after name claim, sorted by name).
+    /// Cap the cohort (after interleaving, so a limited run still samples
+    /// the mixed order).
     limit: Option<usize>,
-    /// Concurrent in-flight requests on the sequential path.
+    /// Concurrent in-flight requests on the sequential path. Keep 1 on
+    /// blallama.
     #[serde(default = "default_concurrency")]
     concurrency: usize,
     /// API key file; required for anthropic endpoints.
@@ -151,6 +131,18 @@ struct RunConfig {
     data_dir: Option<PathBuf>,
     /// Agora server base URL. Default https://subliminal.technology.
     server_url: Option<url::Url>,
+    /// Cycle cadence: skip agents whose last cycle finished less than this
+    /// many seconds ago, so a looping sweep (systemd Restart=) doesn't
+    /// re-run everyone every pass. Named agents run regardless.
+    min_cycle_secs: Option<u64>,
+    /// Agents per model in one interleave wave (default 8).
+    wave_size: Option<usize>,
+    /// Run only these agents (bypassing `min_cycle_secs`).
+    #[serde(default)]
+    agents: Vec<String>,
+    /// Newline-separated agent names (`#` comments ok), merged into
+    /// `agents`.
+    agents_file: Option<PathBuf>,
     #[serde(default)]
     seed: SeedKnobs,
     #[serde(rename = "reactor")]
@@ -166,19 +158,32 @@ struct SeedKnobs {
     evolution_chance: Option<u32>,
     survey_chance: Option<u32>,
     force_survey: Option<bool>,
+    act_max_tokens: Option<u32>,
+    phase_max_tokens: Option<u32>,
+    evolve_max_tokens: Option<u32>,
 }
 
 impl SeedKnobs {
-    fn to_config(&self) -> SeedConfig {
+    fn to_config(&self) -> Result<SeedConfig> {
         let d = SeedConfig::default();
-        SeedConfig {
+        let config = SeedConfig {
             max_rounds: self.max_rounds.unwrap_or(d.max_rounds),
             mutation_chance: self.mutation_chance.unwrap_or(d.mutation_chance),
             evolution_chance: self.evolution_chance.unwrap_or(d.evolution_chance),
             survey_chance: self.survey_chance.unwrap_or(d.survey_chance),
             force_survey: self.force_survey.unwrap_or(d.force_survey),
+            act_max_tokens: self.act_max_tokens.unwrap_or(d.act_max_tokens),
+            phase_max_tokens: self.phase_max_tokens.unwrap_or(d.phase_max_tokens),
+            evolve_max_tokens: self.evolve_max_tokens.unwrap_or(d.evolve_max_tokens),
             ..d
-        }
+        };
+        anyhow::ensure!(
+            config.act_max_tokens > 0
+                && config.phase_max_tokens > 0
+                && config.evolve_max_tokens > 0,
+            "max_tokens knobs must be nonzero"
+        );
+        Ok(config)
     }
 }
 
@@ -276,17 +281,10 @@ async fn load_states(
     Ok(states)
 }
 
-/// The cadence cutoff for a spec: agents whose last cycle finished after
-/// this instant are not yet due. `None` = no gating.
-fn cutoff(spec: &ReactorSpec) -> Option<chrono::DateTime<chrono::Utc>> {
-    spec.min_cycle_secs
-        .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s.min(i64::MAX as u64) as i64))
-}
-
-/// The names a spec claims: `agents` merged with `agents_file` lines.
-fn claimed_names(spec: &ReactorSpec) -> Result<Vec<String>> {
-    let mut names = spec.agents.clone();
-    if let Some(path) = &spec.agents_file {
+/// The names in `agents` merged with `agents_file` lines.
+fn named_agents(config: &RunConfig) -> Result<Vec<String>> {
+    let mut names = config.agents.clone();
+    if let Some(path) = &config.agents_file {
         let body =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         names.extend(
@@ -299,86 +297,109 @@ fn claimed_names(spec: &ReactorSpec) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// How a claim pass selects agents from the pool. Model stickiness lives
-/// here: an agent's persisted `state.model` is part of its identity, so
-/// only an explicit by-name claim may move it to a different model.
-enum Claim<'a> {
-    /// Explicitly listed names — the one path that may switch a model
-    /// (warned, never silent).
-    Named(&'a [String]),
-    /// Agents whose persisted model id equals the spec's model, or —
-    /// when the spec names a `family` — starts with that family prefix
-    /// (case-insensitive).
-    Sticky {
-        model: &'a str,
-        family: Option<&'a str>,
-    },
-    /// Agents with no established model (empty/placeholder id).
-    Unassigned,
+/// Where every loaded agent ended up: per-reactor cohorts grouped by model
+/// id, plus the two skip buckets that the report surfaces.
+#[derive(Default)]
+struct Routing {
+    /// cohorts[reactor_idx][model_id] → agents, name-sorted (load order).
+    cohorts: Vec<BTreeMap<String, Vec<(AgentId, SeedState)>>>,
+    /// model id → agent count, for models no endpoint offers.
+    unrouted: BTreeMap<String, usize>,
+    /// Agents with no model at all — `sync-models` hasn't run for them.
+    placeholders: usize,
+    /// Agents skipped by `min_cycle_secs` cadence gating.
+    not_due: usize,
 }
 
-/// Take up to `limit` matching agents out of `pool`. `not_before` skips
-/// agents whose last cycle finished after that instant (cadence gating);
-/// named claims pass `None`.
-fn claim(
-    pool: &mut Vec<(AgentId, SeedState)>,
-    how: Claim<'_>,
-    limit: Option<usize>,
-    not_before: Option<chrono::DateTime<chrono::Utc>>,
-) -> Vec<(AgentId, SeedState)> {
-    let mut cohort: Vec<(AgentId, SeedState)> = Vec::new();
-    let mut rest = Vec::with_capacity(pool.len());
-    for entry in pool.drain(..) {
-        let due = match (not_before, entry.1.last_cycle_at) {
-            (Some(cutoff), Some(last)) => last <= cutoff,
-            _ => true,
-        };
-        let matched = due
-            && match how {
-                Claim::Named(names) => names.iter().any(|n| n == entry.1.soul.name.as_str()),
-                Claim::Sticky { model, family } => {
-                    let id = entry.1.model.id.name();
-                    id == model
-                        || family.is_some_and(|f| id.to_lowercase().starts_with(&f.to_lowercase()))
-                }
-                Claim::Unassigned => entry.1.model.id.name().is_empty(),
-            };
-        if matched {
-            cohort.push(entry);
-        } else {
-            rest.push(entry);
+/// Route each agent onto the endpoint offering its model. First endpoint
+/// offering a given model id wins (warned when two do). Routed agents get
+/// `state.model` refreshed to the offered [`ModelInfo`] verbatim — same
+/// id, never a model switch — so `negotiate` always admits them.
+fn route(
+    pool: Vec<(AgentId, SeedState)>,
+    reactors: &[ReactorSpec],
+    offered: &[(usize, ModelInfo)],
+    names: &[String],
+    global_min_cycle: Option<u64>,
+) -> Routing {
+    let mut by_model: BTreeMap<&str, &(usize, ModelInfo)> = BTreeMap::new();
+    for entry @ (idx, model) in offered {
+        if let Some((prev, _)) = by_model.get(model.id.name()) {
+            tracing::warn!(
+                model = model.id.name(),
+                first = %reactors[*prev].endpoint,
+                also = %reactors[*idx].endpoint,
+                "model offered by two endpoints; first-listed wins"
+            );
+            continue;
         }
+        by_model.insert(model.id.name(), entry);
     }
-    *pool = rest;
-    if let Some(limit) = limit {
-        // Give unclaimed overflow back to the pool for later specs.
-        let overflow = cohort.split_off(limit.min(cohort.len()));
-        pool.extend(overflow);
-        pool.sort_by(|(_, a), (_, b)| a.soul.name.cmp(&b.soul.name));
-    }
-    cohort
-}
 
-/// Route a cohort onto `model` and construct the [`SeedAgent`]s.
-/// `negotiate` matches by exact id, so `state.model` must be the offered
-/// [`ModelInfo`] verbatim; `Agent::new` keeps `prompt.model` in agreement.
-fn build_agents(
-    cohort: Vec<(AgentId, SeedState)>,
-    model: &ModelInfo,
-    context: &SeedContext,
-) -> Vec<SeedAgent> {
-    let mut agents: Vec<SeedAgent> = Vec::with_capacity(cohort.len());
-    for (id, mut state) in cohort {
-        state.model = model.clone();
-        state.prompt.model = model.id.clone();
-        match agora_agentkit::reactor::Agent::new(id, state, context.clone()) {
-            Ok(agent) => agents.push(agent),
-            Err(e) => {
-                tracing::warn!(agent_id = %id, error = %e, "agent construction failed, skipping")
+    let now = chrono::Utc::now();
+    let mut routing = Routing {
+        cohorts: (0..reactors.len()).map(|_| BTreeMap::new()).collect(),
+        ..Routing::default()
+    };
+    for (id, mut state) in pool {
+        let model_id = state.model.id.name().to_string();
+        if model_id.is_empty() {
+            routing.placeholders += 1;
+            continue;
+        }
+        let Some((idx, offered)) = by_model.get(model_id.as_str()) else {
+            *routing.unrouted.entry(model_id).or_insert(0) += 1;
+            continue;
+        };
+        // Cadence gating — named agents run regardless (names are intent).
+        let named = names.iter().any(|n| n == state.soul.name.as_str());
+        let min_cycle = reactors[*idx].min_cycle_secs.or(global_min_cycle);
+        if !named {
+            if let (Some(secs), Some(last)) = (min_cycle, state.last_cycle_at) {
+                let cutoff = now - chrono::Duration::seconds(secs.min(i64::MAX as u64) as i64);
+                if last > cutoff {
+                    routing.not_due += 1;
+                    continue;
+                }
             }
         }
+        state.model = offered.clone();
+        state.prompt.model = offered.id.clone();
+        routing.cohorts[*idx]
+            .entry(model_id)
+            .or_default()
+            .push((id, state));
     }
-    agents
+    routing
+}
+
+/// Flatten one endpoint's model groups into the run order: each group is
+/// chunked into near-even waves of ≤ `wave_size`, and waves are merged
+/// proportionally (wave i of a k-wave group sorts at (i+0.5)/k) so small
+/// groups spread evenly through big ones instead of round-robin exhausting
+/// early and leaving a monolithic tail. Insertion order is the Reactor's
+/// execution order on the sequential path; batch cohorts run whole per
+/// round regardless.
+fn interleave(
+    groups: BTreeMap<String, Vec<(AgentId, SeedState)>>,
+    wave_size: usize,
+) -> Vec<(AgentId, SeedState)> {
+    let wave_size = wave_size.max(1);
+    let mut waves: Vec<(f64, Vec<(AgentId, SeedState)>)> = Vec::new();
+    for (_, agents) in groups {
+        let k = agents.len().div_ceil(wave_size).max(1);
+        let n = agents.len();
+        let mut agents = agents.into_iter();
+        // Near-even split: the first `n % k` waves get one extra.
+        for i in 0..k {
+            let size = n / k + usize::from(i < n % k);
+            let wave: Vec<_> = agents.by_ref().take(size).collect();
+            let key = (i as f64 + 0.5) / k as f64;
+            waves.push((key, wave));
+        }
+    }
+    waves.sort_by(|(a, _), (b, _)| a.partial_cmp(b).expect("keys are finite"));
+    waves.into_iter().flat_map(|(_, wave)| wave).collect()
 }
 
 #[tokio::main]
@@ -405,23 +426,13 @@ async fn main() -> Result<()> {
             RunConfig {
                 data_dir: args.data_dir.clone(),
                 server_url: Some(args.server_url.clone()),
-                seed: SeedKnobs {
-                    max_rounds: Some(args.max_rounds),
-                    mutation_chance: Some(args.mutation_chance),
-                    evolution_chance: Some(args.evolution_chance),
-                    survey_chance: Some(args.survey_chance),
-                    force_survey: Some(args.force_survey),
-                },
+                min_cycle_secs: None,
+                wave_size: Some(args.wave_size),
+                agents: args.agents.clone(),
+                agents_file: None,
+                seed: SeedKnobs::default(),
                 reactors: vec![ReactorSpec {
                     endpoint,
-                    // --list-models doesn't need one; checked below otherwise.
-                    model: args.model.clone().unwrap_or_default(),
-                    agents: args.agents.clone(),
-                    agents_file: None,
-                    family: None,
-                    // The flags path is explicitly ad-hoc: no name list
-                    // means "run whatever is here", stickiness aside.
-                    adopt: true,
                     min_cycle_secs: None,
                     limit: args.limit,
                     concurrency: args.concurrency,
@@ -450,8 +461,9 @@ async fn main() -> Result<()> {
 
     // Build every inference client and discover models up front, so a bad
     // spec fails the run before any agent does any work.
-    let mut endpoints: Vec<(anthropic::Client, ModelInfo)> = Vec::new();
-    for spec in &config.reactors {
+    let mut endpoints: Vec<anthropic::Client> = Vec::new();
+    let mut offered: Vec<(usize, ModelInfo)> = Vec::new();
+    for (idx, spec) in config.reactors.iter().enumerate() {
         let inference = build_inference(spec)?;
         let models = inference
             .models()
@@ -462,113 +474,107 @@ async fn main() -> Result<()> {
             for m in models.iter() {
                 println!("{}", m.id.name());
             }
-            continue;
         }
-        anyhow::ensure!(
-            !spec.model.is_empty(),
-            "reactor {}: model is required (see --list-models)",
-            spec.endpoint
-        );
-        let model: ModelInfo = models
-            .iter()
-            .find(|m| m.id.name() == spec.model)
-            .with_context(|| {
-                format!(
-                    "{} does not offer {:?}; see --list-models",
-                    spec.endpoint, spec.model
-                )
-            })?
-            .clone();
-        endpoints.push((inference, model));
+        offered.extend(models.iter().map(|m| (idx, m.clone())));
+        endpoints.push(inference);
     }
     if args.list_models {
         return Ok(());
     }
 
-    // Load the full agent pool once; reactors claim from it.
+    // Load the full agent pool once, filter to named agents if any, route.
     let storage = FsStorage::new(data_dir.join("state"));
     let mut pool = load_states(&storage, &data_dir.join("state")).await?;
+    let names = named_agents(&config)?;
+    if !names.is_empty() {
+        pool.retain(|(_, s)| names.iter().any(|n| n == s.soul.name.as_str()));
+    }
+    let routing = route(
+        pool,
+        &config.reactors,
+        &offered,
+        &names,
+        config.min_cycle_secs,
+    );
+
+    // The plan, before anyone runs.
+    for (spec, cohort) in config.reactors.iter().zip(&routing.cohorts) {
+        println!("== {}", spec.endpoint);
+        for (model, agents) in cohort {
+            println!("   {model} ×{}", agents.len());
+        }
+    }
+    for (model, count) in &routing.unrouted {
+        println!("unrouted: {model} ×{count} (no endpoint offers this model)");
+    }
+    if routing.placeholders > 0 {
+        println!(
+            "placeholders: {} agents have no model — run sync-models",
+            routing.placeholders
+        );
+    }
+    if routing.not_due > 0 {
+        println!("not due: {} agents inside min_cycle_secs", routing.not_due);
+    }
 
     // Shared per-process context.
     let context = SeedContext {
         client: agora_agentkit::client::Client::new(server_url)?,
         keys: Arc::new(FsKeyring::new(data_dir.join("secrets"))),
-        config: config.seed.to_config(),
+        config: config.seed.to_config()?,
     };
 
-    // Claim cohorts in three passes over all specs (config order within
-    // each): explicit names first, then family/model stickiness, then
-    // adoption of unassigned agents. Only a by-name claim may move an
-    // agent off its established model family — and never silently.
-    let mut cohorts: Vec<Vec<(AgentId, SeedState)>> =
-        (0..config.reactors.len()).map(|_| Vec::new()).collect();
-    for (i, spec) in config.reactors.iter().enumerate() {
-        let names = claimed_names(spec)?;
-        if names.is_empty() {
-            continue;
-        }
-        let cohort = claim(&mut pool, Claim::Named(&names), spec.limit, None);
-        for (_, state) in &cohort {
-            let id = state.model.id.name();
-            if !id.is_empty() && id != spec.model {
-                tracing::warn!(
-                    agent = %state.soul.name,
-                    from = %id,
-                    to = %spec.model,
-                    "explicit claim switches an agent's model"
-                );
-            }
-        }
-        cohorts[i] = cohort;
-    }
-    for (i, spec) in config.reactors.iter().enumerate() {
-        let sticky = claim(
-            &mut pool,
-            Claim::Sticky {
-                model: &spec.model,
-                family: spec.family.as_deref(),
-            },
-            spec.limit.map(|l| l.saturating_sub(cohorts[i].len())),
-            cutoff(spec),
-        );
-        cohorts[i].extend(sticky);
-    }
-    for (i, spec) in config.reactors.iter().enumerate() {
-        if spec.adopt {
-            let adopted = claim(
-                &mut pool,
-                Claim::Unassigned,
-                spec.limit.map(|l| l.saturating_sub(cohorts[i].len())),
-                cutoff(spec),
-            );
-            cohorts[i].extend(adopted);
-        }
-    }
-
-    // Assemble reactors and label them for the report.
+    // Assemble reactors: interleave each endpoint's cohort, cap, construct.
+    let wave_size = config.wave_size.unwrap_or(8);
     let mut orchestrator = Orchestrator::new();
     let mut labels: BTreeMap<ReactorId, String> = BTreeMap::new();
     let mut total = 0usize;
-    for ((spec, (inference, model)), cohort) in config.reactors.iter().zip(endpoints).zip(cohorts) {
-        if cohort.is_empty() {
-            tracing::warn!(endpoint = %spec.endpoint, "no agents claimed, skipping reactor");
+    for (spec, (inference, cohort)) in config
+        .reactors
+        .iter()
+        .zip(endpoints.into_iter().zip(routing.cohorts))
+    {
+        let mut ordered = interleave(cohort, wave_size);
+        if let Some(limit) = spec.limit {
+            ordered.truncate(limit);
+        }
+        if args.dry_run {
+            for (pos, (_, state)) in ordered.iter().enumerate() {
+                println!(
+                    "{pos:>5} {} {} [{}]",
+                    state.model.id.name(),
+                    state.soul.name,
+                    spec.endpoint
+                );
+            }
             continue;
         }
-        let agents = build_agents(cohort, &model, &context);
+        if ordered.is_empty() {
+            tracing::warn!(endpoint = %spec.endpoint, "no agents routed, skipping reactor");
+            continue;
+        }
+        let mut agents: Vec<SeedAgent> = Vec::with_capacity(ordered.len());
+        for (id, state) in ordered {
+            match agora_agentkit::reactor::Agent::new(id, state, context.clone()) {
+                Ok(agent) => agents.push(agent),
+                Err(e) => {
+                    tracing::warn!(agent_id = %id, error = %e, "agent construction failed, skipping")
+                }
+            }
+        }
         total += agents.len();
         tracing::info!(
             agents = agents.len(),
-            model = model.id.name(),
             endpoint = %spec.endpoint,
             "reactor ready"
         );
         let reactor: Reactor<_, _, SeedAgent> =
             Reactor::new(inference, FsStorage::new(data_dir.join("state")), agents);
-        labels.insert(
-            Run::id(&reactor),
-            format!("{} [{}]", spec.endpoint, model.id.name()),
-        );
+        labels.insert(Run::id(&reactor), spec.endpoint.clone());
         orchestrator.push(reactor);
+    }
+    if args.dry_run {
+        return Ok(());
     }
     anyhow::ensure!(total > 0, "no agents to run");
 
@@ -578,6 +584,17 @@ async fn main() -> Result<()> {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
         println!("== {label}");
         println!("{result:#?}");
+    }
+    // Rejections mean routing and negotiation disagree — that's a bug.
+    let rejected: Vec<_> = report.rejected().collect();
+    if !rejected.is_empty() {
+        tracing::error!(
+            count = rejected.len(),
+            "agents rejected by negotiation despite routing — runner bug"
+        );
+        for (reactor, agent, _) in rejected {
+            tracing::error!(%reactor, %agent, "rejected");
+        }
     }
     Ok(())
 }
