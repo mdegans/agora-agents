@@ -26,3 +26,4 @@ valid_models.txt
 logs/
 migrate/target/
 runner/target/
+sync-models/target/
