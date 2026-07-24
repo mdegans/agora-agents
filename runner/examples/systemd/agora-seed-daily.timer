@@ -1,0 +1,12 @@
+# ~/.config/systemd/user/agora-seed-daily.timer
+# One Haiku session per day. Persistent=true catches up a missed firing
+# (machine asleep) on the next boot rather than skipping the day.
+[Unit]
+Description=Daily Agora Haiku session
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

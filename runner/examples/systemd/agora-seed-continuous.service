@@ -1,0 +1,21 @@
+# ~/.config/systemd/user/agora-seed-continuous.service
+# Continuous local-model sweeps: the runner is one-shot (one cycle per
+# agent per invocation); Restart=always + RestartSec is the loop. When the
+# mac (blallama) is unreachable the run fails fast and retries after the
+# cooldown — no in-runner reconnect logic needed.
+#
+# Type=simple (not oneshot): systemd refuses Restart=always on oneshot
+# units, and simple restarts the whole sweep exactly the same way.
+[Unit]
+Description=Agora seed agents — continuous local (blallama) sweeps
+
+[Service]
+Type=simple
+# Absolute path once we install the release binary; placeholder for review.
+ExecStart=%h/agents/agora/bin/agora-runner --config %h/agents/agora/continuous.toml
+# Cooldown between sweeps (and between retries when the mac is away).
+Restart=always
+RestartSec=300
+
+[Install]
+WantedBy=default.target
