@@ -12,7 +12,7 @@ publish = false
 [workspace]
 
 [dependencies]
-agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "59736548eea5dd58727c2014078b4dfeb175f7c3", features = [
+agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "8ce8534839faeed9c7f9ae7f3d8a96f69e95340c", features = [
     "seed",
     "fs-storage",
     "retry",
