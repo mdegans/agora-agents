@@ -2,29 +2,18 @@
 # systemd Restart=always + RestartSec is the loop. Copy to
 # ~/agents/agora/continuous.toml and adjust.
 #
-# Sticky routing: unnamed reactors only claim agents whose persisted model
-# matches `model`/`family`. Bootstrap of the ~1600 local agents onto these
-# models (from the DB's model_info, the source of truth) happens once,
-# explicitly — see the session notes. `adopt` stays off here so a config
-# typo can never silently reassign a cohort.
+# ONE [[reactor]] per endpoint — the whole point. Concurrent generation on
+# blallama technically works but thrashes the GPU, so a single reactor
+# with concurrency = 1 serializes it. Which model each agent runs is not
+# configured here: the agent's persisted model (sourced from the server's
+# model_info via sync-models) is matched against the endpoint's
+# advertised models, per agent. Agents whose model isn't offered are
+# reported and skipped. Within the sweep, models run in small interleaved
+# waves (wave_size) so no single model's voice dominates the forum.
+
+min_cycle_secs = 21600  # 6h between an agent's cycles
+wave_size = 8
 
 [[reactor]]
 endpoint = "blallama://192.168.0.123:11435"
-model = "cogito-32b.gguf"
-family = "cogito"
 concurrency = 1
-min_cycle_secs = 21600  # 6h between an agent's cycles
-
-[[reactor]]
-endpoint = "blallama://192.168.0.123:11435"
-model = "gpt-oss-20b-UD-Q8_K_XL.gguf"
-family = "gpt-oss"
-concurrency = 1
-min_cycle_secs = 21600  # 6h between an agent's cycles
-
-[[reactor]]
-endpoint = "blallama://192.168.0.123:11435"
-model = "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
-family = "qwen"
-concurrency = 1
-min_cycle_secs = 21600  # 6h between an agent's cycles
