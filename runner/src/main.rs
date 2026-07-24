@@ -121,6 +121,11 @@ struct ReactorSpec {
     /// agents never switch models implicitly.
     #[serde(default)]
     adopt: bool,
+    /// Cycle cadence: sticky/adopt claims skip agents whose last cycle
+    /// finished less than this many seconds ago, so a looping sweep
+    /// (systemd Restart=) doesn't re-run everyone every pass. Explicitly
+    /// named agents run regardless — names are intent.
+    min_cycle_secs: Option<u64>,
     /// Cap the cohort (after name claim, sorted by name).
     limit: Option<usize>,
     /// Concurrent in-flight requests on the sequential path.
@@ -212,7 +217,10 @@ fn build_inference(spec: &ReactorSpec) -> Result<anthropic::Client> {
     let key = match variant {
         EndpointVariant::Anthropic => {
             let path = spec.key_file.as_ref().with_context(|| {
-                format!("reactor {}: key_file is required for anthropic endpoints", spec.endpoint)
+                format!(
+                    "reactor {}: key_file is required for anthropic endpoints",
+                    spec.endpoint
+                )
             })?;
             let key =
                 zeroize::Zeroizing::new(std::fs::read_to_string(path).context("reading key file")?);
@@ -240,7 +248,10 @@ fn build_inference(spec: &ReactorSpec) -> Result<anthropic::Client> {
 
 /// Load every [`SeedState`] under `<data_dir>/state`, skipping (with a
 /// warning) any that won't parse.
-async fn load_states(storage: &FsStorage, state_dir: &std::path::Path) -> Result<Vec<(AgentId, SeedState)>> {
+async fn load_states(
+    storage: &FsStorage,
+    state_dir: &std::path::Path,
+) -> Result<Vec<(AgentId, SeedState)>> {
     let mut ids: Vec<AgentId> = std::fs::read_dir(state_dir)
         .with_context(|| format!("reading {}", state_dir.display()))?
         .filter_map(|e| e.ok())
@@ -265,12 +276,19 @@ async fn load_states(storage: &FsStorage, state_dir: &std::path::Path) -> Result
     Ok(states)
 }
 
+/// The cadence cutoff for a spec: agents whose last cycle finished after
+/// this instant are not yet due. `None` = no gating.
+fn cutoff(spec: &ReactorSpec) -> Option<chrono::DateTime<chrono::Utc>> {
+    spec.min_cycle_secs
+        .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s.min(i64::MAX as u64) as i64))
+}
+
 /// The names a spec claims: `agents` merged with `agents_file` lines.
 fn claimed_names(spec: &ReactorSpec) -> Result<Vec<String>> {
     let mut names = spec.agents.clone();
     if let Some(path) = &spec.agents_file {
-        let body = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let body =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         names.extend(
             body.lines()
                 .map(str::trim)
@@ -299,28 +317,32 @@ enum Claim<'a> {
     Unassigned,
 }
 
-/// Take up to `limit` matching agents out of `pool`.
+/// Take up to `limit` matching agents out of `pool`. `not_before` skips
+/// agents whose last cycle finished after that instant (cadence gating);
+/// named claims pass `None`.
 fn claim(
     pool: &mut Vec<(AgentId, SeedState)>,
     how: Claim<'_>,
     limit: Option<usize>,
+    not_before: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<(AgentId, SeedState)> {
     let mut cohort: Vec<(AgentId, SeedState)> = Vec::new();
     let mut rest = Vec::with_capacity(pool.len());
     for entry in pool.drain(..) {
-        let matched = match how {
-            Claim::Named(names) => {
-                names.iter().any(|n| n == entry.1.soul.name.as_str())
-            }
-            Claim::Sticky { model, family } => {
-                let id = entry.1.model.id.name();
-                id == model
-                    || family.is_some_and(|f| {
-                        id.to_lowercase().starts_with(&f.to_lowercase())
-                    })
-            }
-            Claim::Unassigned => entry.1.model.id.name().is_empty(),
+        let due = match (not_before, entry.1.last_cycle_at) {
+            (Some(cutoff), Some(last)) => last <= cutoff,
+            _ => true,
         };
+        let matched = due
+            && match how {
+                Claim::Named(names) => names.iter().any(|n| n == entry.1.soul.name.as_str()),
+                Claim::Sticky { model, family } => {
+                    let id = entry.1.model.id.name();
+                    id == model
+                        || family.is_some_and(|f| id.to_lowercase().starts_with(&f.to_lowercase()))
+                }
+                Claim::Unassigned => entry.1.model.id.name().is_empty(),
+            };
         if matched {
             cohort.push(entry);
         } else {
@@ -400,6 +422,7 @@ async fn main() -> Result<()> {
                     // The flags path is explicitly ad-hoc: no name list
                     // means "run whatever is here", stickiness aside.
                     adopt: true,
+                    min_cycle_secs: None,
                     limit: args.limit,
                     concurrency: args.concurrency,
                     key_file: args.anthropic_key_file.clone(),
@@ -409,7 +432,10 @@ async fn main() -> Result<()> {
             }
         }
     };
-    anyhow::ensure!(!config.reactors.is_empty(), "config has no [[reactor]] blocks");
+    anyhow::ensure!(
+        !config.reactors.is_empty(),
+        "config has no [[reactor]] blocks"
+    );
 
     let data_dir = match &config.data_dir {
         Some(d) => d.clone(),
@@ -427,9 +453,10 @@ async fn main() -> Result<()> {
     let mut endpoints: Vec<(anthropic::Client, ModelInfo)> = Vec::new();
     for spec in &config.reactors {
         let inference = build_inference(spec)?;
-        let models = inference.models().await.with_context(|| {
-            format!("discovering models on {}", spec.endpoint)
-        })?;
+        let models = inference
+            .models()
+            .await
+            .with_context(|| format!("discovering models on {}", spec.endpoint))?;
         if args.list_models {
             println!("# {}", spec.endpoint);
             for m in models.iter() {
@@ -480,7 +507,7 @@ async fn main() -> Result<()> {
         if names.is_empty() {
             continue;
         }
-        let cohort = claim(&mut pool, Claim::Named(&names), spec.limit);
+        let cohort = claim(&mut pool, Claim::Named(&names), spec.limit, None);
         for (_, state) in &cohort {
             let id = state.model.id.name();
             if !id.is_empty() && id != spec.model {
@@ -502,6 +529,7 @@ async fn main() -> Result<()> {
                 family: spec.family.as_deref(),
             },
             spec.limit.map(|l| l.saturating_sub(cohorts[i].len())),
+            cutoff(spec),
         );
         cohorts[i].extend(sticky);
     }
@@ -511,6 +539,7 @@ async fn main() -> Result<()> {
                 &mut pool,
                 Claim::Unassigned,
                 spec.limit.map(|l| l.saturating_sub(cohorts[i].len())),
+                cutoff(spec),
             );
             cohorts[i].extend(adopted);
         }
@@ -520,9 +549,7 @@ async fn main() -> Result<()> {
     let mut orchestrator = Orchestrator::new();
     let mut labels: BTreeMap<ReactorId, String> = BTreeMap::new();
     let mut total = 0usize;
-    for ((spec, (inference, model)), cohort) in
-        config.reactors.iter().zip(endpoints).zip(cohorts)
-    {
+    for ((spec, (inference, model)), cohort) in config.reactors.iter().zip(endpoints).zip(cohorts) {
         if cohort.is_empty() {
             tracing::warn!(endpoint = %spec.endpoint, "no agents claimed, skipping reactor");
             continue;
