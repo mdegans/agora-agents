@@ -124,10 +124,10 @@ async fn main() -> Result<()> {
     names.sort();
 
     for name in names {
-        if let Some(limit) = args.limit {
-            if tally.migrated.len() >= limit {
-                break;
-            }
+        if let Some(limit) = args.limit
+            && tally.migrated.len() >= limit
+        {
+            break;
         }
         let dir = args.souls.join(&name);
 

@@ -17,7 +17,8 @@
 //!
 //! Persistence goes through [`FsStorage::save_raw`], which archives the
 //! previous `state.json` to a timestamped sibling before overwriting —
-//! same mechanism as `../migrate`, so every pre-sync state is recoverable.
+//! same mechanism as `../agora-migrate`, so every pre-sync state is
+//! recoverable.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

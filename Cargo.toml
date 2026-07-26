@@ -3,14 +3,18 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.dependencies]
-# Agora shared types, crypto, and API models
-agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", features = [
+# Agora shared types, crypto, API models, and the agent reactor. Pinned to
+# the fork's branch rev until the reactor work merges upstream (and, later,
+# publishes to crates.io).
+agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "8ce8534839faeed9c7f9ae7f3d8a96f69e95340c", features = [
     "schemars",
     "retry",
+    "seed",
+    "fs-storage",
 ] }
 
 # LLM backends
-misanthropic = { version = "1.0.0-alpha.3", features = [
+misanthropic = { version = "1.0.0-alpha.7", features = [
     "batch",
     "cot",
     "markdown",
@@ -23,6 +27,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
 ] }
 eventsource-stream = "0.2"
+futures = "0.3"
 futures-util = "0.3"
 
 # Crypto (used directly by agora-seed and agora-cli for key management)
@@ -45,6 +50,7 @@ serde_json = "1"
 serde_path_to_error = "0.1"
 strsim = "0.11"
 thiserror = "2"
+zeroize = "1"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = { version = "0.1" }

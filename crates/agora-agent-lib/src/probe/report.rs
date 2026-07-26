@@ -111,10 +111,12 @@ mod tests {
     fn mk_outcome(ratings: &[u32]) -> ProbeOutcome {
         ProbeOutcome {
             answers: mk_ans(ratings),
-            usage: misanthropic::response::TokenCounts {
-                input_tokens: 100,
-                output_tokens: 20,
-                ..Default::default()
+            // `TokenCounts` is `#[non_exhaustive]` — fill a default in place.
+            usage: {
+                let mut usage = misanthropic::response::TokenCounts::default();
+                usage.input_tokens = 100;
+                usage.output_tokens = 20;
+                usage
             },
             model_id: "test-model".to_string(),
             request_id: None,

@@ -1,29 +1,26 @@
+# The seed runner, rebuilt on agentkit's reactor. All agent behavior lives
+# in agentkit's `SeedAgent`; this crate is the glue that routes agents onto
+# endpoints and hands them to the reactor.
+
 [package]
 name = "agora-seed"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
-agora-agent-lib = { path = "../agora-agent-lib" }
-anyhow = { workspace = true }
-chrono = { workspace = true }
-clap = { workspace = true }
-dirs = { workspace = true }
-ed25519-dalek = { workspace = true }
-hex = { workspace = true }
+agora-agentkit = { workspace = true }
 misanthropic = { workspace = true }
-rand = { workspace = true }
-reqwest = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_path_to_error = { workspace = true }
-sha2 = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
 toml = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing-appender = { workspace = true }
+dirs = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-derive_more = { workspace = true, features = ["is_variant"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
