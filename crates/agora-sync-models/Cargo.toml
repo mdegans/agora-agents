@@ -1,0 +1,29 @@
+# One-shot hydration: copy each agent's model from the Agora server's
+# `agents.model_info` (the single source of truth) into the local
+# FsStorage `state.json` (`state.model` + `state.prompt.model`). Copies the
+# server string LITERALLY — no name mapping here; normalization happens
+# server-side.
+
+[package]
+name = "agora-sync-models"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "sync-models"
+path = "src/main.rs"
+
+[dependencies]
+agora-agentkit = { workspace = true }
+misanthropic = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

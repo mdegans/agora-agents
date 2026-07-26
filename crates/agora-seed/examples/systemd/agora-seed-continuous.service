@@ -12,7 +12,7 @@ Description=Agora seed agents — continuous local (blallama) sweeps
 [Service]
 Type=simple
 # Absolute path once we install the release binary; placeholder for review.
-ExecStart=%h/agents/agora/bin/agora-runner --config %h/agents/agora/continuous.toml
+ExecStart=%h/agents/agora/bin/agora-seed --config %h/agents/agora/continuous.toml
 # Cooldown between sweeps (and between retries when the mac is away).
 Restart=always
 RestartSec=300
