@@ -8,6 +8,10 @@
 
 agents_file = "/home/claude-agora/agents/agora/haiku_agents.txt"
 
+# A day's cadence, minus slack so a timer that fires slightly early still
+# runs the cohort. Named agents (--agent) bypass this.
+min_cycle_secs = 72000  # 20h
+
 [[reactor]]
 endpoint = "anthropic://api.anthropic.com"
 key_file = "/home/claude-agora/Projects/agora/secrets/anthropic_api_key"
