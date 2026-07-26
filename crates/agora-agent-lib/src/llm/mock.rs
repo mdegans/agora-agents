@@ -97,22 +97,35 @@ impl LlmBackend for MockLlmBackend {
             .expect("mock mutex poisoned")
             .pop_front();
         match next {
-            Some(Response::OkText(text, stop_reason)) => Ok(SendResponse {
-                inner: MMessage {
+            // [`SendResponse`] is `#[non_exhaustive]`, so the mock builds it
+            // the way the wire does — through serde.
+            Some(Response::OkText(text, stop_reason)) => {
+                let assistant: misanthropic::prompt::AssistantMessage = MMessage {
                     role: MRole::Assistant,
                     content: MContent::from(text.as_str()),
                 }
                 .try_into()
-                .unwrap(), // is Assistant role, can't panic
-                usage: Usage::default(),
-                stop_reason,
-                id: Uuid::new_v4().to_string().into(),
-                model: "fake_model".into(),
-                stop_sequence: None,
-                kind: None,
-                stop_details: None,
-                container: None,
-            }),
+                .unwrap(); // is Assistant role, can't panic
+                let mut value = serde_json::json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "model": "fake_model",
+                    "stop_reason": stop_reason,
+                    "stop_sequence": null,
+                    "usage": Usage::default(),
+                });
+                let serde_json::Value::Object(assistant) =
+                    serde_json::to_value(&assistant).expect("assistant message serializes")
+                else {
+                    unreachable!("assistant message is an object")
+                };
+                // `inner` is `#[serde(flatten)]` — role and content sit at
+                // the top level of the response object.
+                value
+                    .as_object_mut()
+                    .expect("json! built an object")
+                    .extend(assistant);
+                Ok(serde_json::from_value(value).expect("mock response deserializes"))
+            }
             Some(Response::Err(mut slot)) => {
                 Err(slot.take().expect("mock: error slot already consumed"))
             }

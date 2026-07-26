@@ -407,20 +407,20 @@ async fn read_clean_memory_backup(dir: &Path) -> Option<(u64, String)> {
         let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if let Some(rest) = name.strip_prefix("MEMORY.") {
-            if let Some(ts_str) = rest.strip_suffix(".md") {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    backups.push((ts, p));
-                }
-            }
+        if let Some(rest) = name.strip_prefix("MEMORY.")
+            && let Some(ts_str) = rest.strip_suffix(".md")
+            && let Ok(ts) = ts_str.parse::<u64>()
+        {
+            backups.push((ts, p));
         }
     }
-    backups.sort_by(|a, b| b.0.cmp(&a.0));
+    backups.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (ts, path) in backups {
-        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            if find_soul_leakage(&content).is_none() && !content.trim().is_empty() {
-                return Some((ts, content));
-            }
+        if let Ok(content) = tokio::fs::read_to_string(&path).await
+            && find_soul_leakage(&content).is_none()
+            && !content.trim().is_empty()
+        {
+            return Some((ts, content));
         }
     }
     None

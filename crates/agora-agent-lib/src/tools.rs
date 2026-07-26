@@ -250,15 +250,11 @@ impl AgentAction {
                 obj.insert("required".to_string(), serde_json::json!([]));
             }
         }
-        CustomMethodDef {
-            name: name.to_string().into(),
-            description: description.to_string().into(),
-            schema,
-            cache_control: None,
-            strict: Some(false),
-            defer_loading: None,
-            allowed_callers: None,
-        }
+        CustomMethodDef::builder(name.to_string())
+            .description(description.to_string())
+            .schema(schema)
+            .strict(false)
+            .build_unchecked()
     }
 }
 

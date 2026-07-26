@@ -587,13 +587,12 @@ fn parse_legacy_evolution(content: &str) -> Vec<EvolutionEntry> {
             continue;
         }
         // Format: `YYYY-MM-DD: note`
-        if let Some((date_str, note)) = body.split_once(": ") {
-            if let Ok(date) = chrono::NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d") {
-                if let Ok(note) = ShortString::<512>::new(note.trim()) {
-                    out.push(EvolutionEntry { date, note });
-                    continue;
-                }
-            }
+        if let Some((date_str, note)) = body.split_once(": ")
+            && let Ok(date) = chrono::NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d")
+            && let Ok(note) = ShortString::<512>::new(note.trim())
+        {
+            out.push(EvolutionEntry { date, note });
+            continue;
         }
         // Fallback: today + the whole line as the note (truncated to fit).
         let note_text = if body.chars().count() > 512 {
@@ -613,10 +612,11 @@ fn parse_legacy_evolution(content: &str) -> Vec<EvolutionEntry> {
 
 fn strip_date_prefix(s: &str) -> String {
     // Strip leading `YYYY-MM-DD:`/`YYYY-MM-DD: ` if present.
-    if s.len() >= 11 && s.as_bytes().get(10) == Some(&b':') {
-        if let Ok(_d) = chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d") {
-            return s[11..].trim_start().to_string();
-        }
+    if s.len() >= 11
+        && s.as_bytes().get(10) == Some(&b':')
+        && let Ok(_d) = chrono::NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d")
+    {
+        return s[11..].trim_start().to_string();
     }
     s.to_string()
 }
@@ -632,25 +632,24 @@ fn abridge_community_enums(value: &mut serde_json::Value) {
     fn walk(v: &mut Value, known: &std::collections::HashSet<&str>) {
         match v {
             Value::Object(map) => {
-                if let Some(Value::Array(items)) = map.get("enum") {
-                    if items.len() > 6
-                        && items
-                            .iter()
-                            .all(|x| x.as_str().map(|s| known.contains(s)).unwrap_or(false))
-                    {
-                        let first = items.first().cloned();
-                        let last = items.last().cloned();
-                        let mut abridged: Vec<Value> = Vec::new();
-                        if let Some(f) = first {
-                            abridged.push(f);
-                        }
-                        abridged.push(Value::String("…".to_string()));
-                        if let Some(l) = last {
-                            abridged.push(l);
-                        }
-                        map.insert("enum".to_string(), Value::Array(abridged));
-                        return;
+                if let Some(Value::Array(items)) = map.get("enum")
+                    && items.len() > 6
+                    && items
+                        .iter()
+                        .all(|x| x.as_str().map(|s| known.contains(s)).unwrap_or(false))
+                {
+                    let first = items.first().cloned();
+                    let last = items.last().cloned();
+                    let mut abridged: Vec<Value> = Vec::new();
+                    if let Some(f) = first {
+                        abridged.push(f);
                     }
+                    abridged.push(Value::String("…".to_string()));
+                    if let Some(l) = last {
+                        abridged.push(l);
+                    }
+                    map.insert("enum".to_string(), Value::Array(abridged));
+                    return;
                 }
                 for v in map.values_mut() {
                     walk(v, known);
@@ -892,7 +891,7 @@ mod tests {
         find_enum_lengths(&schema, &mut lens);
         // The community enum should have been abridged to length 3 (first, …, last).
         assert!(
-            lens.iter().any(|&n| n == 3),
+            lens.contains(&3),
             "expected an abridged enum of length 3, got lengths: {lens:?}"
         );
         // And the full Community::ALL length should NOT appear (we abridged it).

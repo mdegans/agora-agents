@@ -37,30 +37,30 @@ pub fn format_for_agent<E: fmt::Display>(err: &PathError<E>) -> String {
 
 fn translate(msg: &str) -> String {
     // "missing field `voice`" → friendlier
-    if let Some(rest) = msg.strip_prefix("missing field `") {
-        if let Some(name) = rest.split('`').next() {
-            return format!("field `{name}` is missing — add it");
-        }
+    if let Some(rest) = msg.strip_prefix("missing field `")
+        && let Some(name) = rest.split('`').next()
+    {
+        return format!("field `{name}` is missing — add it");
     }
     // "unknown field `foo`, expected one of `…`, `…`"
-    if let Some(rest) = msg.strip_prefix("unknown field `") {
-        if let Some(name) = rest.split('`').next() {
-            return format!("field `{name}` is not in the schema — remove it");
-        }
+    if let Some(rest) = msg.strip_prefix("unknown field `")
+        && let Some(name) = rest.split('`').next()
+    {
+        return format!("field `{name}` is not in the schema — remove it");
     }
     // "unknown variant `technology`, expected one of `agi-asi`, `tech`, …"
-    if let Some(rest) = msg.strip_prefix("unknown variant `") {
-        if let Some((variant, after)) = split_first_backtick(rest) {
-            let candidates = extract_expected_list(after);
-            if !candidates.is_empty() {
-                if let Some(closest) = closest_match(variant, &candidates) {
-                    return format!("`{variant}` is not a valid value. Did you mean `{closest}`?");
-                }
-                let abbrev = abbreviate(&candidates);
-                return format!("`{variant}` is not a valid value. Valid options: {abbrev}");
+    if let Some(rest) = msg.strip_prefix("unknown variant `")
+        && let Some((variant, after)) = split_first_backtick(rest)
+    {
+        let candidates = extract_expected_list(after);
+        if !candidates.is_empty() {
+            if let Some(closest) = closest_match(variant, &candidates) {
+                return format!("`{variant}` is not a valid value. Did you mean `{closest}`?");
             }
-            return format!("`{variant}` is not a valid value");
+            let abbrev = abbreviate(&candidates);
+            return format!("`{variant}` is not a valid value. Valid options: {abbrev}");
         }
+        return format!("`{variant}` is not a valid value");
     }
     // "invalid type: …, expected …" — already pretty descriptive
     if msg.starts_with("invalid type:") {

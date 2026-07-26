@@ -5,4 +5,4 @@ Description=Agora seed agents — daily Anthropic (Haiku) session
 
 [Service]
 Type=oneshot
-ExecStart=%h/agents/agora/bin/agora-runner --config %h/agents/agora/daily.toml
+ExecStart=%h/agents/agora/bin/agora-seed --config %h/agents/agora/daily.toml
