@@ -198,6 +198,15 @@ class Recorder:
         except (ValueError, UnicodeDecodeError):
             resp = {"_unparseable": True}
 
+        # An error response carries no usage and no message id. Its
+        # "deficit" would be computed against a cache_read of 0, which is
+        # meaningless — record it as an error and leave the deficit chain
+        # untouched so the next real request still compares against the
+        # last real one.
+        if isinstance(resp, dict) and resp.get("type") == "error":
+            self._record_error(req, resp, elapsed_ms)
+            return
+
         usage = resp.get("usage") or {}
         input_tokens = usage.get("input_tokens")
         cache_read = usage.get("cache_read_input_tokens") or 0
@@ -255,6 +264,39 @@ class Recorder:
                 time.sleep(0.02)
 
         self._finalize(record, msg_id, req, resp)
+
+    def _record_error(self, req: dict, resp: dict, elapsed_ms: float) -> None:
+        """Log an upstream error without disturbing the deficit chain."""
+        err = resp.get("error") or {}
+        with self.lock:
+            self.seq += 1
+            seq = self.seq
+        record = {
+            "seq": seq,
+            "at": now(),
+            "id": None,
+            "model": req.get("model"),
+            "elapsed_ms": round(elapsed_ms, 1),
+            "error": {
+                "type": err.get("type"),
+                "code": err.get("code"),
+                "message": err.get("message"),
+            },
+            "n_messages": len(req.get("messages") or []),
+            "has_tools": bool(req.get("tools")),
+        }
+        with self.lock:
+            with open(self.requests_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        path = os.path.join(self.outdir, f"ERROR_{seq:04d}.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"record": record, "request": req, "response": resp}, fh, indent=2)
+        msg = (err.get("message") or "")[:120]
+        print(
+            f"[{seq:04d}] {record['model']} ERROR {err.get('code')} {msg}\n"
+            f"        wrote {path}",
+            flush=True,
+        )
 
     def _finalize(
         self,

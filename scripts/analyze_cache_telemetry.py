@@ -37,14 +37,30 @@ import json
 import sys
 
 
-def load_chains(path: str) -> list[list[dict]]:
-    """Split a flat request log into per-conversation chains."""
+def load_chains(path: str) -> tuple[list[list[dict]], list[dict]]:
+    """Split a flat request log into per-conversation chains.
+
+    Returns (chains, errors). Upstream error responses carry no usage and
+    no message id, so they are pulled out rather than chained — including
+    them would compute a deficit against a cache_read of 0 and fabricate
+    a collapse that never happened.
+    """
     rows = []
+    errors = []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
-            if line:
-                rows.append(json.loads(line))
+            if not line:
+                continue
+            row = json.loads(line)
+            usage = row.get("usage") or {}
+            # `input_tokens is None` catches error rows written by older
+            # proxy versions, which emitted a usage dict full of nulls
+            # rather than an explicit error field.
+            if row.get("error") or usage.get("input_tokens") is None:
+                errors.append(row)
+            else:
+                rows.append(row)
 
     chains: list[list[dict]] = []
     current: list[dict] = []
@@ -57,17 +73,18 @@ def load_chains(path: str) -> list[list[dict]]:
             current.append(r)
     if current:
         chains.append(current)
-    return chains
+    return chains, errors
 
 
 def analyze(path: str) -> dict:
-    chains = load_chains(path)
+    chains, errors = load_chains(path)
     rows = [r for c in chains for r in c]
 
     transitions = 0
     positives: list[tuple[int, int]] = []
     compounding: list[int] = []
     pinned: list[int] = []
+    stalled: list[tuple[int, int]] = []
 
     per_chain = []
     for i, chain in enumerate(chains):
@@ -95,6 +112,27 @@ def analyze(path: str) -> dict:
         if len(run) >= 3:
             compounding.append(i)
 
+        # Stalled read: cache_read advances by only a token or two while
+        # input_tokens grows by far more. This is a sharper detector than
+        # any deficit threshold, because the deficit's magnitude depends
+        # on how much the prompt happened to grow, while the advance is
+        # an invariant of the failure. drama_llama#85 described an advance
+        # of exactly 3 on cogito — the last 3 tokens of the render, where
+        # the generation prompt / assistant header sits. Observed
+        # 2026-07-27: near-zero advances occur on Qwen and gpt-oss too, so
+        # this is not cogito-specific; cogito differs in how large a
+        # deficit the stall produces, not in the stall itself.
+        for a, b in zip(chain, chain[1:]):
+            ra = a["usage"].get("cache_read_input_tokens")
+            rb = b["usage"].get("cache_read_input_tokens")
+            ia = a["usage"].get("input_tokens") or 0
+            if ra is None or rb is None:
+                continue
+            advance = rb - ra
+            grew = ia - ra
+            if 0 <= advance <= 8 and grew > 100:
+                stalled.append((i, advance))
+
         # Pinned read: identical cache_read on consecutive requests while
         # input_tokens grows.
         for a, b in zip(chain, chain[1:]):
@@ -119,11 +157,13 @@ def analyze(path: str) -> dict:
         "positives": positives,
         "compounding": sorted(set(compounding)),
         "pinned": sorted(set(pinned)),
+        "stalled": stalled,
         "total_input": tot_in,
         "total_read": tot_read,
         "hit_rate": (100.0 * tot_read / tot_in) if tot_in else 0.0,
         "per_chain": per_chain,
         "model": next((r.get("model") for r in rows if r.get("model")), None),
+        "errors": errors,
     }
 
 
@@ -150,8 +190,28 @@ def report(a: dict, verbose: bool) -> None:
             f"   PINNED cache_read in chain(s) {a['pinned']} "
             "— tail not retained as the conversation grows"
         )
-    if not a["compounding"] and not a["pinned"]:
-        print("   no compounding runs, no pinned reads")
+    if a["stalled"]:
+        adv = sorted({v for _, v in a["stalled"]})
+        print(
+            f"   STALLED    {len(a['stalled'])} transition(s) where cache_read "
+            f"advanced by only {adv} tokens while the prompt grew >100"
+        )
+        print(
+            "              (a near-zero advance recurs across all model "
+            "families, not just cogito;"
+        )
+        print(
+            "               what differs is the resulting deficit's "
+            "magnitude, not the advance)"
+        )
+    if not a["compounding"] and not a["pinned"] and not a["stalled"]:
+        print("   no compounding runs, no pinned or stalled reads")
+    if a["errors"]:
+        print(f"   ERRORS     {len(a['errors'])} upstream error response(s):")
+        for e in a["errors"]:
+            err = e.get("error") or {}
+            msg = (err.get("message") or "")[:100]
+            print(f"     seq {e.get('seq')}: {err.get('code')} {msg}")
 
     if verbose:
         print()
