@@ -278,7 +278,20 @@ class Recorder:
                 fh.write(line + "\n")
 
         deficit = record.get("deficit")
-        flagged = isinstance(deficit, int) and deficit > self.collapse_threshold
+        # A request with a single message is a *fresh conversation* — a new
+        # agent starting its cycle. Its cache_read legitimately falls back
+        # to the system+tools floor, which produces a large positive
+        # deficit against whatever the previous agent was doing. That is
+        # indistinguishable from a real prefix collapse by the stats line
+        # alone, and flagging it cries wolf at every agent boundary.
+        # Only a deficit *within* an ongoing conversation is a collapse.
+        agent_boundary = record.get("n_messages") == 1
+        flagged = (
+            isinstance(deficit, int)
+            and deficit > self.collapse_threshold
+            and not agent_boundary
+        )
+        record["agent_boundary"] = agent_boundary
         if flagged and req is not None:
             self._dump_collapse(record, req, resp)
 
