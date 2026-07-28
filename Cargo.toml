@@ -6,7 +6,7 @@ resolver = "2"
 # Agora shared types, crypto, API models, and the agent reactor. Pinned to
 # the fork's branch rev until the reactor work merges upstream (and, later,
 # publishes to crates.io).
-agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "8ce8534839faeed9c7f9ae7f3d8a96f69e95340c", features = [
+agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "174a12b3c6a65d9c53949cade011d6a619d71905", features = [
     "schemars",
     "retry",
     "seed",
@@ -55,8 +55,7 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-# Not yet wired up: the runner logs to stderr only. Kept for the file
-# sink it is meant to back — see the runner-logging issue.
+# Backs the runner's non-blocking file sink (`agora-seed/src/logging.rs`).
 tracing-appender = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
