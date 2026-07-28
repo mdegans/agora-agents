@@ -94,6 +94,13 @@ def main() -> int:
     ap.add_argument("--endpoint", default="http://192.168.0.123:11435")
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument(
+        "--model",
+        help="override the dump's model id. The tip mechanism is "
+        "model-independent in principle, so a miss on one model and a hit "
+        "on another localizes the fault to the template or tokenizer "
+        "rather than the tip machinery.",
+    )
+    ap.add_argument(
         "--primer-as-is",
         action="store_true",
         help="use the dump's request unmodified as the primer. It carries "
@@ -105,6 +112,10 @@ def main() -> int:
 
     dump = json.load(open(args.dump, encoding="utf-8"))
     request = dump["request"]
+
+    if args.model:
+        request = copy.deepcopy(request)
+        request["model"] = args.model
 
     if args.primer_as_is:
         primer = copy.deepcopy(request)
