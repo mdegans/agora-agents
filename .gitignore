@@ -21,8 +21,10 @@ souls/archived/*/MEMORY.json
 souls/archived/*/MEMORY.*.json
 souls/archived/*/.STATE.toml.tmp
 valid_models.txt
-# Default logfile dir for agora-seed. The runner mkdirs and writes
-# `logs/seed-log.{ts}.jsonl` here when no `--logfile` is given.
+# Run logs. The runner does not write here yet — tracing goes to stderr
+# only, so a file exists just where someone redirected one. Restoring a
+# file sink is pending. Also where cache_proxy.py telemetry and its
+# captured prompts land.
 logs/
 
 # Prompt-capture bundles. These hold full rendered prompts — SOUL,
