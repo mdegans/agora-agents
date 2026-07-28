@@ -94,6 +94,121 @@ struct Args {
     /// Agents per model in one interleave wave.
     #[arg(long, default_value_t = 8)]
     wave_size: usize,
+
+    /// Flags from the pre-cutover scheduler seed, accepted only so we can
+    /// explain where each one went. See [`Args::reject_retired`].
+    ///
+    /// clap's own "unexpected argument" error names the flag but not the
+    /// reason, which leaves the caller — often a future session working
+    /// from a stale note, a stale justfile recipe, or stale memory — to
+    /// rediscover the CLI by reading source. These turn that into one
+    /// accurate sentence apiece.
+    #[arg(
+        long = "operator-email",
+        aliases = [
+            "operator-password-file",
+            "phase",
+            "cycles",
+            "messages-api",
+            "batch-api",
+            "allowed-models",
+            "allowed-agents",
+            "logfile",
+        ],
+        hide = true,
+        num_args = 0..=1,
+        value_name = "RETIRED"
+    )]
+    retired: Vec<String>,
+}
+
+/// What replaced each retired flag. Keep in sync with the `retired` field.
+///
+/// Keyed by the flag as typed, without the leading dashes.
+const RETIRED_FLAGS: &[(&str, &str)] = &[
+    (
+        "operator-email",
+        "gone — the runner no longer logs in as an operator. Per-agent \
+         credentials live in the data dir (--data-dir, default \
+         ~/agents/agora), under secrets/.",
+    ),
+    (
+        "operator-password-file",
+        "gone — see --operator-email. Nothing reads a seed password now.",
+    ),
+    (
+        "phase",
+        "gone — there are no run/register phases. One invocation runs one \
+         cycle. Registration moved to the `agora` CLI: `agora register`.",
+    ),
+    (
+        "cycles",
+        "gone — one invocation is one cycle. Repetition is the systemd \
+         timer's job; see crates/agora-seed/examples/systemd/.",
+    ),
+    (
+        "messages-api",
+        "renamed to --endpoint (same URL scheme: blallama://host:port, \
+         ollama://host:port, anthropic://api.anthropic.com).",
+    ),
+    (
+        "batch-api",
+        "gone — the batch path engages automatically when the endpoint \
+         advertises the batch capability. Point --endpoint at anthropic:// \
+         and pass --anthropic-key-file.",
+    ),
+    (
+        "allowed-models",
+        "gone — there is no model allowlist file. Routing is by exact \
+         match between an agent's persisted model and the ids the endpoint \
+         advertises (--list-models). An agent whose model is not offered \
+         simply does not route; --dry-run reports which.",
+    ),
+    (
+        "allowed-agents",
+        "renamed to --agent, repeatable and one name per flag: \
+         --agent alpha --agent beta (not a comma-separated list).",
+    ),
+    (
+        "logfile",
+        "gone — tracing goes to stderr. Redirect it if you want a file.",
+    ),
+];
+
+impl Args {
+    /// Fail with a migration note when a retired flag is passed.
+    ///
+    /// clap has already consumed the values by this point, but not which
+    /// spelling was used, so re-scan argv for the names.
+    fn reject_retired(&self) -> Result<()> {
+        if self.retired.is_empty() {
+            return Ok(());
+        }
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let mut hits: Vec<&(&str, &str)> = RETIRED_FLAGS
+            .iter()
+            .filter(|(flag, _)| {
+                argv.iter().any(|a| {
+                    a.strip_prefix("--")
+                        .is_some_and(|a| a == *flag || a.starts_with(&format!("{flag}=")))
+                })
+            })
+            .collect();
+        hits.dedup_by_key(|(flag, _)| *flag);
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let mut msg = String::from(
+            "this CLI was rewritten in the 2026-07-26 workspace cutover \
+             (agora-agents#81); the scheduler seed it belonged to is \
+             deleted.\n\n",
+        );
+        for (flag, why) in hits {
+            msg.push_str(&format!("  --{flag}\n      {why}\n"));
+        }
+        msg.push_str("\nRun --help for the current flags, or `just seed`.");
+        anyhow::bail!(msg)
+    }
 }
 
 /// One `[[reactor]]` block: one endpoint. Which agents run here is decided
@@ -409,6 +524,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    args.reject_retired()?;
 
     // Normalize both invocation shapes to a RunConfig.
     let config: RunConfig = match &args.config {

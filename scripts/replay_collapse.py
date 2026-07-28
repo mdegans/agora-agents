@@ -79,6 +79,41 @@ def synth_primer(request: dict) -> dict | None:
     return primer if primer["messages"] else None
 
 
+def drop_trailing_block(request: dict) -> dict | None:
+    """Primer for a phase-transition dump: the same request minus the
+    trailing text block of the final message.
+
+    agentkit's `seat_phase` appends a phase instruction to the existing
+    final user turn (`last.extend([Block::from(text)])`) rather than
+    pushing a new message, because two consecutive user turns would be
+    invalid. Removing that one block therefore reconstructs the
+    *preceding* request exactly — a far better primer than dropping the
+    whole message, and it isolates the question that matters:
+
+        cache_control breakpoints are per **block**. Extending a message
+        with a new block leaves every earlier block byte-identical, so a
+        prefix cache should reuse straight through them.
+
+    If the replayed request only reads back to the last *marked*
+    breakpoint, then reuse is breakpoint-limited while writes are
+    prefix-wide — which is a server-side defect, not a prompt-shape one.
+    """
+    msgs = request.get("messages") or []
+    if not msgs:
+        return None
+    content = msgs[-1].get("content")
+    if not isinstance(content, list) or len(content) < 2:
+        return None
+    if content[-1].get("type") != "text":
+        return None
+    primer = copy.deepcopy(request)
+    primer["messages"][-1]["content"] = primer["messages"][-1]["content"][:-1]
+    # The phase instruction and its output_config arrive together; the
+    # primer predates both.
+    primer.pop("output_config", None)
+    return primer
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("dump", help="COLLAPSE_*.json written by cache_proxy.py")
@@ -93,6 +128,14 @@ def main() -> int:
         help="reconstruct the primer by dropping the trailing message "
         "(for dumps with no prev_request)",
     )
+    ap.add_argument(
+        "--drop-trailing-block",
+        action="store_true",
+        help="reconstruct the primer by dropping only the trailing text "
+        "block of the final message. For phase-transition dumps this "
+        "rebuilds the preceding request exactly, and isolates whether "
+        "block-level extension is cache-safe.",
+    )
     ap.add_argument("--timeout", type=float, default=600.0)
     args = ap.parse_args()
 
@@ -102,7 +145,17 @@ def main() -> int:
     request = dump["request"]
     primer = dump.get("prev_request")
     origin = "captured"
-    if primer is None:
+    if args.drop_trailing_block:
+        primer = drop_trailing_block(request)
+        origin = "trailing block dropped (reconstructs the prior request)"
+        if primer is None:
+            print(
+                "Final message has no trailing text block to drop — this "
+                "dump is not a phase transition.",
+                file=sys.stderr,
+            )
+            return 2
+    elif primer is None:
         if not args.synth_primer:
             print(
                 "This dump has no `prev_request` (written by an older "
@@ -147,11 +200,28 @@ def main() -> int:
     print(f"cache advance : {advance:+d}   (read moved this much)")
     print(f"deficit       : {deficit:+d}   (prev.input_tokens - this.cache_read)")
     print()
-    # The advance is the sharper signal: a stall can hide under a deficit
-    # threshold when the prompt happened not to grow much.
+
+    # The write/read asymmetry. The primer wrote p_in tokens (p_read +
+    # p_creat covers its whole prompt). If the replay's prompt extends
+    # that one — same blocks plus an appended block — every token the
+    # primer wrote is still a valid prefix, so a longest-common-prefix
+    # cache should read back all p_in of them. Reading fewer means the
+    # server wrote content it will not reuse.
+    primer_written = p_read + p_creat
+    if primer_written >= p_in and deficit > 0:
+        print(f"VERDICT: WRITE/READ ASYMMETRY — the primer wrote "
+              f"{primer_written} tokens to cache (its entire prompt), but "
+              f"the replay read back only {c_read}.")
+        print(f"         {deficit} token(s) were cached, are byte-identical "
+              f"in this request, and were recomputed anyway.")
+        print("         Consistent with reuse stopping at the last "
+              "cache_control breakpoint while writes are prefix-wide.")
+        return 1
+    # A stall can also hide under a deficit threshold when the prompt
+    # happened not to grow much, so check the advance independently.
     if advance < 10 and growth > 100:
-        print("VERDICT: STALL REPRODUCED — the prompt grew but the cache "
-              "did not advance.")
+        print("VERDICT: STALL — the prompt grew but the cache did not "
+              "advance.")
         return 1
     if deficit > 0:
         print("VERDICT: positive deficit, but the cache did advance. "
