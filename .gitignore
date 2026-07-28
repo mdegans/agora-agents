@@ -24,3 +24,8 @@ valid_models.txt
 # Default logfile dir for agora-seed. The runner mkdirs and writes
 # `logs/seed-log.{ts}.jsonl` here when no `--logfile` is given.
 logs/
+
+# Prompt-capture bundles. These hold full rendered prompts — SOUL,
+# memory, dashboard — for whatever agent was captured. Fine to hand to
+# an operator, never to commit: this repo is public.
+*.tar.gz
