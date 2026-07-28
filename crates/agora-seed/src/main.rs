@@ -36,6 +36,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 
+mod logging;
+
 use agora_agentkit::ids::{AgentId, ReactorId};
 use agora_agentkit::reactor::anthropic::{self, EndpointVariant};
 use agora_agentkit::reactor::seed::{FsKeyring, SeedAgent, SeedConfig, SeedContext, SeedState};
@@ -94,6 +96,22 @@ struct Args {
     /// Agents per model in one interleave wave.
     #[arg(long, default_value_t = 8)]
     wave_size: usize,
+
+    /// Directory for the JSON-lines run log. Defaults to
+    /// `<data-dir>/logs`. Deliberately not `--logfile`, which is retired
+    /// and names a file rather than a directory — see [`RETIRED_FLAGS`].
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
+
+    /// Log to stderr only, writing no run-log file.
+    #[arg(long)]
+    no_log_file: bool,
+
+    /// Skip archiving each session's assembled prompt to
+    /// `<data-dir>/logs/prompts`. The dumps are the single most useful
+    /// diagnostic there is, so this is opt-out, not opt-in.
+    #[arg(long)]
+    no_prompt_log: bool,
 
     /// Flags from the pre-cutover scheduler seed, accepted only so we can
     /// explain where each one went. See [`Args::reject_retired`].
@@ -171,7 +189,9 @@ const RETIRED_FLAGS: &[(&str, &str)] = &[
     ),
     (
         "logfile",
-        "gone — tracing goes to stderr. Redirect it if you want a file.",
+        "replaced by --log-dir, which names a *directory*; the file inside \
+         it is still seed-log.{ts}.jsonl. Defaults to <data-dir>/logs, so \
+         you usually want no flag at all. --no-log-file opts out.",
     ),
 ];
 
@@ -277,12 +297,23 @@ struct SeedKnobs {
     act_max_tokens: Option<u32>,
     phase_max_tokens: Option<u32>,
     evolve_max_tokens: Option<u32>,
+    /// Override the prompt-dump directory. Defaults to
+    /// `<data_dir>/logs/prompts`. Keep it outside any git tree — the
+    /// dumps hold fully-rendered prompts.
+    prompt_log_dir: Option<PathBuf>,
 }
 
 impl SeedKnobs {
-    fn to_config(&self) -> Result<SeedConfig> {
+    /// `data_dir` roots the default prompt-dump path; `prompt_log` false
+    /// (from `--no-prompt-log`) disables the dump entirely.
+    fn to_config(&self, data_dir: &std::path::Path, prompt_log: bool) -> Result<SeedConfig> {
         let d = SeedConfig::default();
         let config = SeedConfig {
+            prompt_log_dir: prompt_log.then(|| {
+                self.prompt_log_dir
+                    .clone()
+                    .unwrap_or_else(|| data_dir.join("logs").join("prompts"))
+            }),
             max_rounds: self.max_rounds.unwrap_or(d.max_rounds),
             mutation_chance: self.mutation_chance.unwrap_or(d.mutation_chance),
             evolution_chance: self.evolution_chance.unwrap_or(d.evolution_chance),
@@ -518,11 +549,6 @@ fn interleave(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
     let args = Args::parse();
     args.reject_retired()?;
 
@@ -569,6 +595,26 @@ async fn main() -> Result<()> {
             .context("no home directory")?
             .join("agents/agora"),
     };
+    // Tracing comes up as soon as the data dir is known, because the data
+    // dir roots the log path. Everything above here reports through
+    // `anyhow` to stderr instead.
+    //
+    // `_log_guards` must outlive every log call: dropping it flushes and
+    // closes the worker, and an early drop truncates the file silently.
+    // Binding it here holds it to the end of `main`.
+    let (_log_guards, log_path) = logging::init(
+        args.log_dir.as_deref(),
+        &data_dir,
+        // `--list-models` runs no agents and would drop an empty log every
+        // time it's polled. A `--dry-run` routing report *is* worth
+        // keeping — a deleted model strands agents in near silence, and
+        // that report is what shows it.
+        !args.no_log_file && !args.list_models,
+    )?;
+    if let Some(path) = &log_path {
+        tracing::info!(path = %path.display(), "run log opened");
+    }
+
     let server_url = config
         .server_url
         .clone()
@@ -636,7 +682,7 @@ async fn main() -> Result<()> {
     let context = SeedContext {
         client: agora_agentkit::client::Client::new(server_url)?,
         keys: Arc::new(FsKeyring::new(data_dir.join("secrets"))),
-        config: config.seed.to_config()?,
+        config: config.seed.to_config(&data_dir, !args.no_prompt_log)?,
     };
 
     // Assemble reactors: interleave each endpoint's cohort, cap, construct.
@@ -699,7 +745,34 @@ async fn main() -> Result<()> {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
         println!("== {label}");
         println!("{result:#?}");
+        // The `println!` above is for whoever is watching; this is the
+        // same thing for whoever asks later. Without it the run's outcome
+        // exists only on stdout, and the JSON log — the durable artifact,
+        // and the only one a notifier can read — ends with "starting run"
+        // whether 30 agents succeeded or none did.
+        match result {
+            Ok(r) => tracing::info!(
+                endpoint = %label,
+                done = r.done,
+                failed = r.failed,
+                errors = r.errors.len(),
+                unsaved = r.unsaved.len(),
+                rejected = r.rejected.len(),
+                "reactor finished"
+            ),
+            Err(e) => tracing::error!(
+                endpoint = %label,
+                error = %e,
+                "reactor failed"
+            ),
+        }
     }
+    let (done, failed) = report
+        .report
+        .values()
+        .flatten()
+        .fold((0, 0), |(d, f), r| (d + r.done, f + r.failed));
+    tracing::info!(done, failed, reactors = report.report.len(), "run finished");
     // Rejections mean routing and negotiation disagree — that's a bug.
     let rejected: Vec<_> = report.rejected().collect();
     if !rejected.is_empty() {
