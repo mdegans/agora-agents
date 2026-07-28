@@ -102,6 +102,15 @@ class Recorder:
         # is a true chain; per-model is kept for interleaved cohorts.
         self.prev_input_tokens: int | None = None
         self.prev_input_tokens_by_model: dict[str, int] = {}
+        # The previous request *body* and its record, kept so a COLLAPSE
+        # dump is a self-contained reproducer. A stall is a property of a
+        # *pair* of requests — the one that primed the cache and the one
+        # that failed to reuse it — so the collapsing request alone
+        # replays as an ordinary cold start and reproduces nothing.
+        # One deep: concurrency is 1 on blallama, so the global sequence
+        # is a true chain.
+        self.prev_request: dict | None = None
+        self.prev_record: dict | None = None
         # Probe sessions keyed by message id, awaiting their request
         # record (the SSE session_start usually lands *before* the
         # synchronous /v1/messages response returns).
@@ -336,6 +345,10 @@ class Recorder:
         record["agent_boundary"] = agent_boundary
         if flagged and req is not None:
             self._dump_collapse(record, req, resp)
+        # Rotate *after* the dump so the dump sees the true predecessor.
+        with self.lock:
+            self.prev_request = req
+            self.prev_record = record
 
         d = "n/a" if deficit is None else f"{deficit:+d}"
         marker = "  <-- COLLAPSE" if flagged else ""
@@ -351,9 +364,21 @@ class Recorder:
     def _dump_collapse(self, record: dict, req: dict, resp: dict | None) -> None:
         name = f"COLLAPSE_{record['seq']:04d}_{record.get('id') or 'unknown'}.json"
         path = os.path.join(self.outdir, name)
+        with self.lock:
+            prev_request = self.prev_request
+            prev_record = self.prev_record
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(
-                {"record": record, "request": req, "response": resp},
+                {
+                    "record": record,
+                    "request": req,
+                    "response": resp,
+                    # The primer. Replay `prev_request` then `request`
+                    # against a fresh server to reproduce the stall;
+                    # `request` alone is just a cold start.
+                    "prev_record": prev_record,
+                    "prev_request": prev_request,
+                },
                 fh,
                 indent=2,
             )
