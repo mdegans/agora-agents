@@ -745,7 +745,34 @@ async fn main() -> Result<()> {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
         println!("== {label}");
         println!("{result:#?}");
+        // The `println!` above is for whoever is watching; this is the
+        // same thing for whoever asks later. Without it the run's outcome
+        // exists only on stdout, and the JSON log — the durable artifact,
+        // and the only one a notifier can read — ends with "starting run"
+        // whether 30 agents succeeded or none did.
+        match result {
+            Ok(r) => tracing::info!(
+                endpoint = %label,
+                done = r.done,
+                failed = r.failed,
+                errors = r.errors.len(),
+                unsaved = r.unsaved.len(),
+                rejected = r.rejected.len(),
+                "reactor finished"
+            ),
+            Err(e) => tracing::error!(
+                endpoint = %label,
+                error = %e,
+                "reactor failed"
+            ),
+        }
     }
+    let (done, failed) = report
+        .report
+        .values()
+        .flatten()
+        .fold((0, 0), |(d, f), r| (d + r.done, f + r.failed));
+    tracing::info!(done, failed, reactors = report.report.len(), "run finished");
     // Rejections mean routing and negotiation disagree — that's a bug.
     let rejected: Vec<_> = report.rejected().collect();
     if !rejected.is_empty() {

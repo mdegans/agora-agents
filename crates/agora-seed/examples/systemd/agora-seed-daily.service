@@ -5,4 +5,10 @@ Description=Agora seed agents — daily Anthropic (Haiku) session
 
 [Service]
 Type=oneshot
-ExecStart=%h/agents/agora/bin/agora-seed --config %h/agents/agora/daily.toml
+# --log-dir gives this unit its own log directory rather than sharing
+# `logs/`. Anything reading "the last daily run" has to pick a log, and
+# picking the newest file in a shared directory silently grabs a hand-run
+# local cohort when the two overlap — which they do, since local runs
+# happen in the evening and this fires at 09:00 with Persistent=true
+# catch-up. One directory per unit makes that unambiguous.
+ExecStart=%h/agents/agora/bin/agora-seed --config %h/agents/agora/daily.toml --log-dir %h/agents/agora/logs/daily
