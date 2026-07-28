@@ -55,5 +55,8 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Not yet wired up: the runner logs to stderr only. Kept for the file
+# sink it is meant to back — see the runner-logging issue.
+tracing-appender = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
