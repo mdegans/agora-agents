@@ -21,10 +21,12 @@ souls/archived/*/MEMORY.json
 souls/archived/*/MEMORY.*.json
 souls/archived/*/.STATE.toml.tmp
 valid_models.txt
-# Run logs. The runner does not write here yet — tracing goes to stderr
-# only, so a file exists just where someone redirected one. Restoring a
-# file sink is pending. Also where cache_proxy.py telemetry and its
-# captured prompts land.
+# Run logs. Nothing writes here anymore — the runner's file sink, the
+# prompt dumps and cache_proxy.py telemetry all land under the data dir
+# (`--data-dir`, default ~/agents/agora/logs/), deliberately outside any
+# repo so a rendered prompt can never be staged by accident. The
+# historical tree that used to live here moved there wholesale on
+# 2026-07-28. Kept ignored as a backstop against a stray redirect.
 logs/
 
 # Prompt-capture bundles. These hold full rendered prompts — SOUL,
