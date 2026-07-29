@@ -49,8 +49,16 @@ Usage:
 Output (in --outdir, default ./cache_telemetry):
 
     requests.jsonl   one record per /v1/messages round-trip
-    COLLAPSE_<n>_<id>.json   full request+response dump whenever the
+    turns/NNNN_<id>.json     EVERY request+response, verbatim, in order
+    COLLAPSE_<n>_<id>.json   the same, plus its primer, whenever the
                              deficit exceeds --collapse-threshold
+
+A COLLAPSE dump is a *pair* — the request that primed the cache and the
+one that failed to reuse it — which reproduces a single stall in
+isolation. `turns/` exists because that is not always enough: a stall
+that only manifests after N turns of accumulated session state needs the
+whole ordered sequence, and only the full sequence can answer "was the
+prefix already wrong three turns earlier". Replay with `replay_session.py`.
 """
 
 from __future__ import annotations
@@ -91,10 +99,17 @@ class Recorder:
     both touch this.
     """
 
-    def __init__(self, outdir: str, collapse_threshold: int, full_probe: bool):
+    def __init__(
+        self,
+        outdir: str,
+        collapse_threshold: int,
+        full_probe: bool,
+        dump_turns: bool = True,
+    ):
         self.outdir = outdir
         self.collapse_threshold = collapse_threshold
         self.full_probe = full_probe
+        self.dump_turns = dump_turns
         self.lock = threading.Lock()
         self.seq = 0
         # Previous request's input_tokens, globally and per model. The
@@ -119,6 +134,9 @@ class Recorder:
         self.pending: dict[str, dict] = {}
         os.makedirs(outdir, exist_ok=True)
         self.requests_path = os.path.join(outdir, "requests.jsonl")
+        self.turns_dir = os.path.join(outdir, "turns")
+        if dump_turns:
+            os.makedirs(self.turns_dir, exist_ok=True)
 
     # -- probe side ---------------------------------------------------
 
@@ -314,6 +332,23 @@ class Recorder:
         req: dict | None = None,
         resp: dict | None = None,
     ) -> None:
+        # A request with a single message is a *fresh conversation* — a new
+        # agent starting its cycle. Its cache_read legitimately falls back
+        # to the system+tools floor, which produces a large positive
+        # deficit against whatever the previous agent was doing. That is
+        # indistinguishable from a real prefix collapse by the stats line
+        # alone, and flagging it cries wolf at every agent boundary.
+        # Only a deficit *within* an ongoing conversation is a collapse.
+        #
+        # This MUST be stamped onto the record before requests.jsonl is
+        # written. It used to be set afterwards, so the field existed in
+        # memory but never reached the file, and every downstream analysis
+        # had to re-derive it from n_messages — or forget to, and report
+        # agent boundaries as collapses. Measured 2026-07-29 that mistake
+        # inflates the apparent collapse rate from 11% to 25%.
+        agent_boundary = record.get("n_messages") == 1
+        record["agent_boundary"] = agent_boundary
+
         with self.lock:
             probe = self._summarize_probe(msg_id) if msg_id else None
             record["probe"] = probe
@@ -329,22 +364,15 @@ class Recorder:
                 fh.write(line + "\n")
 
         deficit = record.get("deficit")
-        # A request with a single message is a *fresh conversation* — a new
-        # agent starting its cycle. Its cache_read legitimately falls back
-        # to the system+tools floor, which produces a large positive
-        # deficit against whatever the previous agent was doing. That is
-        # indistinguishable from a real prefix collapse by the stats line
-        # alone, and flagging it cries wolf at every agent boundary.
-        # Only a deficit *within* an ongoing conversation is a collapse.
-        agent_boundary = record.get("n_messages") == 1
         flagged = (
             isinstance(deficit, int)
             and deficit > self.collapse_threshold
             and not agent_boundary
         )
-        record["agent_boundary"] = agent_boundary
         if flagged and req is not None:
             self._dump_collapse(record, req, resp)
+        if self.dump_turns and req is not None:
+            self._dump_turn(record, req, resp)
         # Rotate *after* the dump so the dump sees the true predecessor.
         with self.lock:
             self.prev_request = req
@@ -383,6 +411,24 @@ class Recorder:
                 indent=2,
             )
         print(f"        wrote {path}", flush=True)
+
+    def _dump_turn(self, record: dict, req: dict, resp: dict | None) -> None:
+        """Write every turn verbatim, so a whole session replays front to back.
+
+        A COLLAPSE dump is a *pair* — primer plus the request that missed —
+        which is enough to reproduce one stall in isolation. It is not
+        enough to reproduce a stall that only manifests after N turns of
+        accumulated session state, and it cannot answer "was the prefix
+        already wrong three turns earlier". For that the full ordered
+        sequence is the only sufficient artifact.
+
+        Files are `turns/NNNN_<id>.json`, zero-padded so a plain glob sorts
+        into request order.
+        """
+        name = f"{record['seq']:04d}_{record.get('id') or 'unknown'}.json"
+        path = os.path.join(self.turns_dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"record": record, "request": req, "response": resp}, fh, indent=2)
 
 
 def make_handler(upstream: str, recorder: Recorder):
@@ -522,9 +568,21 @@ def main() -> int:
     ap.add_argument(
         "--no-probe", action="store_true", help="skip the /probe SSE subscription"
     )
+    ap.add_argument(
+        "--no-dump-turns",
+        action="store_true",
+        help="do not write turns/NNNN_<id>.json for every request "
+        "(on by default: a COLLAPSE pair reproduces one stall, but only "
+        "the full ordered sequence replays a whole session)",
+    )
     args = ap.parse_args()
 
-    recorder = Recorder(args.outdir, args.collapse_threshold, args.full_probe)
+    recorder = Recorder(
+        args.outdir,
+        args.collapse_threshold,
+        args.full_probe,
+        dump_turns=not args.no_dump_turns,
+    )
     stop = threading.Event()
 
     if not args.no_probe:
