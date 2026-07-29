@@ -33,3 +33,6 @@ logs/
 # memory, dashboard — for whatever agent was captured. Fine to hand to
 # an operator, never to commit: this repo is public.
 *.tar.gz
+
+# Python bytecode from the operational sidecar scripts
+__pycache__/
