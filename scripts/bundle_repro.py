@@ -49,11 +49,11 @@ Not excluding them inflates the apparent miss rate from ~11% to ~25%.
 
 ## Layout
 
-    pairs/COLLAPSE_*.json   primer + the request that missed, self-contained
-    turns/NNNN_<id>.json    EVERY request+response in capture order
-    requests.jsonl          one telemetry record per round-trip, no bodies
-    replay_session.py       replay tool
-    README.md               this file
+    pairs/<run>/COLLAPSE_*.json   primer + the request that missed
+    turns/<run>/NNNN_<id>.json    EVERY request+response in capture order
+    telemetry/<run>.jsonl         one record per round-trip, no bodies
+    replay_session.py             replay tool
+    README.md                     this file
 
 A pair reproduces one stall in isolation. `turns/` is here because that is
 not always enough — a stall that only manifests after N turns of
@@ -68,11 +68,11 @@ then:
     # one pair — primer, then the request that should have hit
     ./replay_session.py --pair pairs/{first_pair} --endpoint http://127.0.0.1:11435
 
-    # the whole session, front to back
-    ./replay_session.py --turns turns --endpoint http://127.0.0.1:11435
+    # a whole session, front to back (pick a run directory)
+    ./replay_session.py --turns turns/<run> --endpoint http://127.0.0.1:11435
 
     # one model's turns only
-    ./replay_session.py --turns turns --model '{first_model}' --endpoint ...
+    ./replay_session.py --turns turns/<run> --model '{first_model}' --endpoint ...
 
 Exit status is 1 if any miss reproduced, so it can gate a bisect.
 
@@ -92,19 +92,30 @@ where `orig` was positive, the build under test has fixed it.
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--telemetry", required=True, help="a telemetry_<tag> directory")
+    ap.add_argument(
+        "--telemetry",
+        required=True,
+        action="append",
+        help="a telemetry_<tag> directory; repeat to bundle several runs "
+        "(their files are namespaced by directory name so they cannot collide)",
+    )
     ap.add_argument("--out", required=True, help="output .tar.gz path")
     ap.add_argument("--notes", default="", help="free text appended to the README")
     args = ap.parse_args()
 
-    tel = os.path.abspath(args.telemetry)
-    if not os.path.isdir(tel):
-        print(f"no such telemetry dir: {tel}", file=sys.stderr)
-        return 2
+    tels = []
+    for t in args.telemetry:
+        t = os.path.abspath(t)
+        if not os.path.isdir(t):
+            print(f"no such telemetry dir: {t}", file=sys.stderr)
+            return 2
+        tels.append(t)
 
-    pairs = sorted(glob.glob(os.path.join(tel, "COLLAPSE_*.json")))
-    turns = sorted(glob.glob(os.path.join(tel, "turns", "*.json")))
-    reqs = os.path.join(tel, "requests.jsonl")
+    # (source_path, tag) so multi-run bundles stay unambiguous.
+    pairs = [(p, os.path.basename(t)) for t in tels
+             for p in sorted(glob.glob(os.path.join(t, "COLLAPSE_*.json")))]
+    turns = [(p, os.path.basename(t)) for t in tels
+             for p in sorted(glob.glob(os.path.join(t, "turns", "*.json")))]
     here = os.path.dirname(os.path.abspath(__file__))
 
     if not pairs and not turns:
@@ -116,13 +127,35 @@ def main() -> int:
         return 2
 
     # Build the miss table from the pairs, which are already boundary-filtered.
+    # `shape` is the load-bearing column: it says how this request's message
+    # list differs from its primer's, which is what localises the bug.
     rows = []
-    for p in pairs:
+    for p, tag in pairs:
         d = json.load(open(p))
         r = d.get("record") or {}
         u = r.get("usage") or {}
+        pm = (d.get("prev_request") or {}).get("messages") or []
+        cm = (d.get("request") or {}).get("messages") or []
+        div = None
+        for i in range(min(len(pm), len(cm))):
+            if json.dumps(pm[i], sort_keys=True) != json.dumps(cm[i], sort_keys=True):
+                div = i
+                break
+        if div is None:
+            shape = (
+                f"appended {len(cm)-len(pm)} new msg(s)"
+                if len(cm) > len(pm)
+                else "identical prefix"
+            )
+        else:
+            a, b = pm[div].get("content"), cm[div].get("content")
+            na = len(a) if isinstance(a, list) else 1
+            nb = len(b) if isinstance(b, list) else 1
+            last = " (LAST)" if div == len(cm) - 1 else ""
+            shape = f"msg[{div}]{last} {pm[div].get('role')}: {na}->{nb} blocks"
         rows.append(
-            "| `{f}` | {model} | {nmsg} | {stop} | {deficit:+d} | {inp} | {read} |".format(
+            "| `{tag}/{f}` | {model} | {nmsg} | {stop} | {deficit:+d} | {inp} | {read} | {shape} |".format(
+                tag=tag,
                 f=os.path.basename(p),
                 model=(r.get("model") or "?").replace(".gguf", ""),
                 nmsg=r.get("n_messages", "?"),
@@ -130,34 +163,39 @@ def main() -> int:
                 deficit=r.get("deficit_same_model") or r.get("deficit") or 0,
                 inp=u.get("input_tokens", "?"),
                 read=u.get("cache_read_input_tokens", "?"),
+                shape=shape,
             )
         )
     miss_table = (
-        "| file | model | n_msg | stop_reason | deficit | input | cache_read |\n"
-        "|---|---|---|---|---|---|---|\n" + "\n".join(rows)
+        "| file | model | n_msg | stop_reason | deficit | input | cache_read | shape vs primer |\n"
+        "|---|---|---|---|---|---|---|---|\n" + "\n".join(rows)
         if rows
         else "_No flagged collapses in this capture (turn capture only)._"
     )
 
     first_model = "?"
     if turns:
-        d = json.load(open(turns[0]))
-        first_model = (d.get("request") or {}).get("model", "?")
+        first_model = (json.load(open(turns[0][0])).get("request") or {}).get("model", "?")
     elif pairs:
-        first_model = (json.load(open(pairs[0])).get("record") or {}).get("model", "?")
+        first_model = (json.load(open(pairs[0][0])).get("record") or {}).get("model", "?")
 
-    stamp = os.path.basename(tel)
+    stamp = ", ".join(os.path.basename(t) for t in tels)
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, "repro")
-        os.makedirs(os.path.join(root, "pairs"), exist_ok=True)
-        for p in pairs:
-            shutil.copy2(p, os.path.join(root, "pairs", os.path.basename(p)))
-        if turns:
-            os.makedirs(os.path.join(root, "turns"), exist_ok=True)
-            for t in turns:
-                shutil.copy2(t, os.path.join(root, "turns", os.path.basename(t)))
-        if os.path.exists(reqs):
-            shutil.copy2(reqs, os.path.join(root, "requests.jsonl"))
+        for p, tag in pairs:
+            dest = os.path.join(root, "pairs", tag)
+            os.makedirs(dest, exist_ok=True)
+            shutil.copy2(p, os.path.join(dest, os.path.basename(p)))
+        for t, tag in turns:
+            dest = os.path.join(root, "turns", tag)
+            os.makedirs(dest, exist_ok=True)
+            shutil.copy2(t, os.path.join(dest, os.path.basename(t)))
+        for t in tels:
+            reqs = os.path.join(t, "requests.jsonl")
+            if os.path.exists(reqs):
+                dest = os.path.join(root, "telemetry")
+                os.makedirs(dest, exist_ok=True)
+                shutil.copy2(reqs, os.path.join(dest, f"{os.path.basename(t)}.jsonl"))
         replay = os.path.join(here, "replay_session.py")
         if os.path.exists(replay):
             shutil.copy2(replay, os.path.join(root, "replay_session.py"))
@@ -166,7 +204,7 @@ def main() -> int:
             fh.write(
                 README.format(
                     stamp=stamp,
-                    first_pair=os.path.basename(pairs[0]) if pairs else "<none>",
+                    first_pair=(pairs[0][1] + "/" + os.path.basename(pairs[0][0])) if pairs else "<none>",
                     first_model=first_model,
                     miss_table=miss_table,
                     notes=args.notes or "_none_",
