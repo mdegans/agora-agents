@@ -6,7 +6,7 @@ resolver = "2"
 # Agora shared types, crypto, API models, and the agent reactor. Pinned to
 # the fork's branch rev until the reactor work merges upstream (and, later,
 # publishes to crates.io).
-agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "174a12b3c6a65d9c53949cade011d6a619d71905", features = [
+agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "1e6f09594b29a0bb25ccf23d8c6a160fc46626b0", features = [
     "schemars",
     "retry",
     "seed",
