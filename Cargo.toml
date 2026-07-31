@@ -3,9 +3,8 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.dependencies]
-# Agora shared types, crypto, API models, and the agent reactor. Upstream
-# rev with E2EE messaging (PR #35). TODO: version = "0.4" once published.
-agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", rev = "c0d73c394", features = [
+# Agora shared types, crypto, API models, and the agent reactor.
+agora-agentkit = { version = "0.4", features = [
     "schemars",
     "retry",
     "seed",
