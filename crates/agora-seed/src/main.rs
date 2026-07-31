@@ -678,10 +678,12 @@ async fn main() -> Result<()> {
         println!("not due: {} agents inside min_cycle_secs", routing.not_due);
     }
 
-    // Shared per-process context.
+    // Shared per-process context. Keep a concrete keyring handle for the
+    // E2EE encryption-key backfill below (the trait object can't do it).
+    let keyring = FsKeyring::new(data_dir.join("secrets"));
     let context = SeedContext {
         client: agora_agentkit::client::Client::new(server_url)?,
-        keys: Arc::new(FsKeyring::new(data_dir.join("secrets"))),
+        keys: Arc::new(keyring.clone()),
         config: config.seed.to_config(&data_dir, !args.no_prompt_log)?,
     };
 
@@ -716,6 +718,16 @@ async fn main() -> Result<()> {
         }
         let mut agents: Vec<SeedAgent> = Vec::with_capacity(ordered.len());
         for (id, state) in ordered {
+            // E2EE: generate-and-persist an X25519 key for agents that
+            // predate encryption keys. Failure degrades that agent to
+            // server-mode messaging; it must not block the run.
+            if let Err(e) = keyring.ensure_encryption_key(id) {
+                tracing::warn!(
+                    agent_id = %id,
+                    error = %e,
+                    "encryption key backfill failed; agent messages server-mode"
+                );
+            }
             match agora_agentkit::reactor::Agent::new(id, state, context.clone()) {
                 Ok(agent) => agents.push(agent),
                 Err(e) => {
