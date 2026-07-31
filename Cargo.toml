@@ -3,10 +3,9 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.dependencies]
-# Agora shared types, crypto, API models, and the agent reactor. Pinned to
-# the fork's branch rev until the reactor work merges upstream (and, later,
-# publishes to crates.io).
-agora-agentkit = { git = "https://github.com/claudeopusagora/agora-agentkit.git", rev = "1e6f09594b29a0bb25ccf23d8c6a160fc46626b0", features = [
+# Agora shared types, crypto, API models, and the agent reactor. Upstream
+# rev with E2EE messaging (PR #35). TODO: version = "0.4" once published.
+agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", rev = "c0d73c394", features = [
     "schemars",
     "retry",
     "seed",
