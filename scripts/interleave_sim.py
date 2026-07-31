@@ -37,10 +37,28 @@ DEFAULT_ROSTER = {
 # model load; the rest is re-prefilling the ~7700-token floor cold.
 SWITCH_PENALTY_SECS = 64.8
 
-# Measured sweep rate. Dense cogito is far slower than the MoE models
-# (3.28 vs 1.00 min/agent), so this flat average is for rough sizing only —
-# see memory/project_full_fleet_sweep_2026_07_29.md.
-MINS_PER_AGENT = 2.5
+# Mean minutes per cycle, measured per model from the 2026-07-29 sweep
+# (1205 cycles, gaps >30min dropped). NEVER collapse these to a flat
+# average: dense cogito runs 2.6x the MoE models, so at 67% of the fleet it
+# is 80% of wall clock, and a flat rate badly understates what rebalancing
+# away from it buys. See memory/project_full_fleet_sweep_2026_07_29.md.
+#
+# Architecture dominates parameter count here — Mistral-Small-4 at 119B
+# dense costs the same per cycle as cogito at 32B dense, while gpt-oss at
+# 120B MoE is 2.6x cheaper than either. Mike's direct token-rate reading
+# on 2026-07-31: cogito ~10 tok/s, gpt-oss ~50-60 tok/s.
+MINS_PER_CYCLE = {
+    "cogito": 2.90,
+    "mistral": 2.91,
+    "gpt-oss": 1.11,
+    "qwen": 1.29,
+}
+
+# Used for any cohort not in MINS_PER_CYCLE. Deliberately pessimistic: an
+# unbenchmarked model is more likely dense than not, and overestimating a
+# sweep is cheaper than overrunning `min_cycle_secs` and losing resumability.
+# Gemma 4 is unbenchmarked as of 2026-07-31 — it lands here until measured.
+DEFAULT_MINS_PER_CYCLE = 2.90
 
 
 def run_order(roster, wave_size):
@@ -76,15 +94,32 @@ def analyze(roster, wave_size, focus):
     sizes = [b[1] for b in blks if b[0] == focus]
     total = sum(roster.values())
     switches = len(blks) - 1
+    # Per-model rates, not a flat average — see MINS_PER_CYCLE.
+    cycle_hours = (
+        sum(n * MINS_PER_CYCLE.get(m, DEFAULT_MINS_PER_CYCLE) for m, n in roster.items())
+        / 60
+    )
+    switch_hours = switches * SWITCH_PENALTY_SECS / 3600
+    unbenchmarked = sorted(m for m in roster if m not in MINS_PER_CYCLE and roster[m] > 0)
     return {
         "total": total,
         "share": roster.get(focus, 0) / total * 100 if total else 0.0,
         "switches": switches,
-        "switch_hours": switches * SWITCH_PENALTY_SECS / 3600,
-        "sweep_hours": total * MINS_PER_AGENT / 60,
+        "switch_hours": switch_hours,
+        "sweep_hours": cycle_hours + switch_hours,
+        "wall_share": (
+            roster.get(focus, 0)
+            * MINS_PER_CYCLE.get(focus, DEFAULT_MINS_PER_CYCLE)
+            / 60
+            / cycle_hours
+            * 100
+            if cycle_hours
+            else 0.0
+        ),
         "max_block": max(sizes) if sizes else 0,
         "mean_block": sum(sizes) / len(sizes) if sizes else 0.0,
         "block_hist": {s: sizes.count(s) for s in sorted(set(sizes))},
+        "unbenchmarked": unbenchmarked,
     }
 
 
@@ -132,8 +167,17 @@ def main():
         sys.exit(f"--focus {focus!r} is not in the roster: {sorted(roster)}")
 
     sizes = ", ".join(f"{k}={v}" for k, v in sorted(roster.items()))
+    probe = analyze(roster, args.wave_size or 8, focus)
     print(f"roster: {sizes}  (N={sum(roster.values())})")
-    print(f"focus:  {focus}  ({roster[focus] / sum(roster.values()) * 100:.0f}% of fleet)\n")
+    print(
+        f"focus:  {focus}  ({probe['share']:.0f}% of fleet, "
+        f"{probe['wall_share']:.0f}% of wall clock)\n"
+    )
+    if probe["unbenchmarked"]:
+        print(
+            f"warning: no measured rate for {', '.join(probe['unbenchmarked'])} — "
+            f"assuming {DEFAULT_MINS_PER_CYCLE:.2f} min/cycle (dense-model pessimistic)\n"
+        )
 
     wave_sizes = [args.wave_size] if args.wave_size else [8, 6, 4, 3, 2]
     hdr = f"{'wave_size':>10}{'switches':>10}{'switch_h':>10}{'max_blk':>9}{'mean_blk':>10}{'sweep_h':>9}"
@@ -151,6 +195,11 @@ def main():
         print(f"\n{focus} block-length distribution (agents):")
         for size, count in r["block_hist"].items():
             print(f"  {count:>4} block(s) of {size:>4}")
+        print(
+            f"\nsweep_h must stay under `min_cycle_secs` "
+            f"({r['sweep_hours']:.0f}h here) or a crash-and-restart re-runs "
+            "agents\ninstead of resuming."
+        )
 
     print(
         "\nNote: raising wave_size above the largest cohort forces k=1 everywhere,"
