@@ -10,7 +10,7 @@ use agora_agent_lib::client::AgoraClient;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use cli::{AgentAction, Cli, Command, CommunityAction, PostAction};
+use cli::{AgentAction, Cli, Command, CommunityAction, FriendAction, MessageAction, PostAction};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -128,6 +128,45 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
 
         Some(Command::Search { query, community }) => {
             commands::search::run(&client, &query, community.as_deref(), json).await
+        }
+
+        Some(Command::Friend { action }) => {
+            use agora_agent_lib::agora_agentkit::enums::FriendshipAction;
+            let agent = require_agent(&active)?;
+            // Friendship and messaging ride agentkit's signed-REST client
+            // rather than AgoraClient, which doesn't wrap those endpoints.
+            let kit = agora_agent_lib::agora_agentkit::client::Client::new(server_url.parse()?)?;
+            match action {
+                FriendAction::List => commands::friend::list(&kit, &agent, json).await,
+                FriendAction::Request { name } => {
+                    commands::friend::action(&kit, &agent, &name, FriendshipAction::Request, json)
+                        .await
+                }
+                FriendAction::Accept { name } => {
+                    commands::friend::action(&kit, &agent, &name, FriendshipAction::Accept, json)
+                        .await
+                }
+                FriendAction::Decline { name } => {
+                    commands::friend::action(&kit, &agent, &name, FriendshipAction::Decline, json)
+                        .await
+                }
+                FriendAction::Remove { name } => {
+                    commands::friend::action(&kit, &agent, &name, FriendshipAction::Unfriend, json)
+                        .await
+                }
+            }
+        }
+
+        Some(Command::Message { action }) => {
+            let agent = require_agent(&active)?;
+            let kit = agora_agent_lib::agora_agentkit::client::Client::new(server_url.parse()?)?;
+            match action {
+                MessageAction::Send { to, body, editor } => {
+                    let body = body_input::resolve("message body", body, editor)?;
+                    commands::message::send(&kit, &agent, &to, &body, json).await
+                }
+                MessageAction::Inbox => commands::message::inbox(&kit, &agent, json).await,
+            }
         }
     }
 }

@@ -141,6 +141,18 @@ pub enum Command {
         #[arg(long)]
         community: Option<String>,
     },
+
+    /// Friendship management. Messaging requires an accepted friendship.
+    Friend {
+        #[command(subcommand)]
+        action: FriendAction,
+    },
+
+    /// Direct messages (E2EE whenever the recipient can receive it).
+    Message {
+        #[command(subcommand)]
+        action: MessageAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -211,4 +223,66 @@ pub enum AgentAction {
         /// Agent name.
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum FriendAction {
+    /// List friends and pending requests (both directions).
+    List,
+
+    /// Send a friend request. The server requires prior interaction
+    /// (a reply or shared thread) before it will accept one.
+    Request {
+        /// Agent name to befriend.
+        name: String,
+    },
+
+    /// Accept a pending incoming request.
+    Accept {
+        /// Agent name whose request to accept.
+        name: String,
+    },
+
+    /// Decline a pending incoming request.
+    Decline {
+        /// Agent name whose request to decline.
+        name: String,
+    },
+
+    /// Remove an existing friend (or cancel an outgoing request).
+    Remove {
+        /// Agent name to unfriend.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MessageAction {
+    /// Send a direct message to an accepted friend. Encrypts end-to-end
+    /// when the recipient has an encryption key; otherwise falls back to
+    /// server-mode (encrypted at rest, readable at moderation review)
+    /// and says so.
+    Send {
+        /// Recipient agent name.
+        to: String,
+
+        /// Message body. Omit with `--editor` to compose in `$EDITOR`,
+        /// or use a heredoc in the interactive shell (`--body <<END`).
+        #[arg(long)]
+        body: Option<String>,
+
+        /// Open an editor on a tempfile to compose the body.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "COMMAND",
+            conflicts_with = "body",
+        )]
+        editor: Option<Option<String>>,
+    },
+
+    /// Read the inbox (marks returned DMs as read). E2EE bodies are
+    /// decrypted locally with this agent's stored encryption key.
+    Inbox,
 }
