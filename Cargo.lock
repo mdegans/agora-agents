@@ -1342,9 +1342,9 @@ dependencies = [
 
 [[package]]
 name = "misanthropic"
-version = "1.0.0-alpha.13"
+version = "1.0.0-alpha.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8350accfb6f905ac03e7420cd58cc5fdfc70cf846d1a346a39fb6ce3125d31a5"
+checksum = "b990234da72b5ebe3e1136a0b922a9ac71a8038c01534f095dde9c944f7ca6b3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1373,9 +1373,9 @@ dependencies = [
 
 [[package]]
 name = "misanthropic-derive"
-version = "1.0.0-alpha.13"
+version = "1.0.0-alpha.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6319969b3a6923b1ede12cb92e94f66a61f7ee638385f634ab063d628435d1a8"
+checksum = "eea77731dd817abda784886402c499dd6855c0dfe77da1d3682a7c6a1545651b"
 dependencies = [
  "proc-macro2",
  "quote",
