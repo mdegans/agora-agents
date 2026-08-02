@@ -78,10 +78,6 @@ fn compose_in_editor(label: &str, override_cmd: Option<&str>) -> Result<String> 
         .arg(&path)
         .status()
         .with_context(|| format!("failed to spawn editor `{editor_cmd}`"))?;
-    if !status.success() {
-        let _ = std::fs::remove_file(&path);
-        return Err(anyhow!("editor exited with status {status}"));
-    }
 
     // Read the file back, strip leading comment lines, trim trailing
     // whitespace. Delete the tempfile either way.
@@ -91,12 +87,27 @@ fn compose_in_editor(label: &str, override_cmd: Option<&str>) -> Result<String> 
         .read_to_string(&mut contents)?;
     let _ = std::fs::remove_file(&path);
 
-    let cleaned = strip_leading_comments(&contents);
+    body_from_edit(label, status.success(), &contents)
+}
+
+/// Decide the body from what the editor session left behind.
+///
+/// The exit status is deliberately *not* the abort signal: vim can exit
+/// non-zero after a successful `:wq` (e.g. a failed command earlier in
+/// the session), which used to discard a saved body. Saved content is
+/// the signal of intent — quit-without-write (`:q!`, `:cq`) leaves the
+/// header-only tempfile, which strips to empty and aborts. A non-zero
+/// exit with content is downgraded to a warning.
+fn body_from_edit(label: &str, exit_ok: bool, contents: &str) -> Result<String> {
+    let cleaned = strip_leading_comments(contents);
     let trimmed = cleaned.trim_end();
     if trimmed.is_empty() {
         return Err(anyhow!(
             "{label} is empty after editing — aborted (save a non-empty file to submit)"
         ));
+    }
+    if !exit_ok {
+        eprintln!("warning: editor exited non-zero; using the saved {label} anyway");
     }
     Ok(trimmed.to_string())
 }
@@ -140,6 +151,25 @@ mod tests {
     fn strip_leading_comments_all_headers_returns_empty() {
         let input = "# only\n# headers\n";
         assert_eq!(strip_leading_comments(input), "");
+    }
+
+    #[test]
+    fn nonzero_exit_with_saved_content_still_submits() {
+        let body = body_from_edit("test body", false, "# header\n\nsaved despite vim goof\n");
+        assert_eq!(body.unwrap(), "saved despite vim goof");
+    }
+
+    #[test]
+    fn nonzero_exit_with_unwritten_file_aborts() {
+        // `:q!` / `:cq` leave the instructional header untouched.
+        let err = body_from_edit("test body", false, "# Write your test body here.\n\n");
+        assert!(err.unwrap_err().to_string().contains("empty after editing"));
+    }
+
+    #[test]
+    fn clean_exit_with_empty_file_aborts() {
+        let err = body_from_edit("test body", true, "");
+        assert!(err.unwrap_err().to_string().contains("empty after editing"));
     }
 
     #[test]
