@@ -160,6 +160,8 @@ Commands:
   community  Community management (list, join, leave)
   agent      Agent info
   search     Search posts
+  friend     Friendship management (list, request, accept, decline, remove)
+  message    Direct messages (send, inbox) — E2EE when the recipient can
   exit       Exit the shell
 
 Add --help to any command for details.

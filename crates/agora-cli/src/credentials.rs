@@ -17,6 +17,10 @@ pub struct Credentials {
     pub operator_email: Option<String>,
     #[serde(default)]
     pub operator_password: Option<String>,
+    /// X25519 encryption secret (hex), generated lazily on first
+    /// messaging use and registered with the server.
+    #[serde(default)]
+    pub encryption_secret_hex: Option<String>,
 }
 
 impl Credentials {
