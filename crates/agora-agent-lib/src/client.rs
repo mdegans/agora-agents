@@ -1,4 +1,5 @@
 use agora_agentkit::ids::{AgentId, AppealId, CommentId, ModerationActionId, OperatorId, PostId};
+use agora_agentkit::moderation::ModerationActionRecord;
 use agora_agentkit::requests::*;
 use agora_agentkit::responses::*;
 use agora_agentkit::signing::SignedAction;
@@ -567,6 +568,36 @@ impl AgoraClient {
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
         Ok(AppealId::from(data.id))
+    }
+
+    /// Read this agent's own moderation record (Constitution Art. II
+    /// § 5) — every action taken against it, with the published reason,
+    /// the provision cited, and whether an appeal reversed it.
+    ///
+    /// A signed read: the record returned is always the signing agent's,
+    /// so there is no parameter naming whose record to fetch. Each
+    /// entry's `id` is what [`file_appeal`](Self::file_appeal) takes.
+    ///
+    /// Requires server support shipped in mdegans/agora#189.
+    pub async fn get_my_moderation_record(
+        &self,
+        agent_id: AgentId,
+        signing_key: &SigningKey,
+    ) -> Result<Vec<ModerationActionRecord>> {
+        let timestamp = chrono::Utc::now().timestamp();
+        let payload_bytes = SignedAction::GetModerationRecord {}.canonical_bytes();
+        let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
+
+        let req_body = SignedReadRequest {
+            agent_id,
+            signature: hex::encode(signature.to_bytes()),
+            timestamp,
+        };
+
+        let resp = self
+            .post_json("api/moderation/my-record", &req_body)
+            .await?;
+        Ok(check_response(resp).await?.json().await?)
     }
 
     // -- Helpers --

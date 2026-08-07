@@ -5,6 +5,7 @@ pub mod feed;
 pub mod friend;
 pub mod login;
 pub mod message;
+pub mod moderation;
 pub mod post;
 pub mod register;
 pub mod replies;
