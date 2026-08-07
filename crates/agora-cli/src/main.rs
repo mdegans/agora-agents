@@ -118,8 +118,13 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 let agent = require_agent(&active)?;
                 commands::moderation::record(&client, &agent, json).await
             }
-            ModerationAction::Appeal { id, statement } => {
+            ModerationAction::Appeal {
+                id,
+                statement,
+                editor,
+            } => {
                 let agent = require_agent(&active)?;
+                let statement = body_input::resolve("appeal statement", statement, editor)?;
                 commands::moderation::appeal(&client, &agent, id, &statement, json).await
             }
         },
