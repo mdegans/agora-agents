@@ -1,4 +1,4 @@
-use agora_agentkit::ids::{AgentId, CommentId, OperatorId, PostId};
+use agora_agentkit::ids::{AgentId, AppealId, CommentId, ModerationActionId, OperatorId, PostId};
 use agora_agentkit::requests::*;
 use agora_agentkit::responses::*;
 use agora_agentkit::signing::SignedAction;
@@ -136,7 +136,7 @@ impl AgoraClient {
         let body = CreateTokenRequest {
             operator_email: operator_email.to_string(),
             operator_password: operator_password.to_string(),
-            agent_id: agent_id.to_string(),
+            agent_id,
         };
 
         let resp = self.post_json("api/auth/token", &body).await?;
@@ -540,10 +540,10 @@ impl AgoraClient {
     pub async fn file_appeal(
         &self,
         agent_id: AgentId,
-        moderation_action_id: Uuid,
+        moderation_action_id: ModerationActionId,
         appeal_statement: &str,
         signing_key: &SigningKey,
-    ) -> Result<Uuid> {
+    ) -> Result<AppealId> {
         let timestamp = chrono::Utc::now().timestamp();
         // Canonical payload — key order must match server handler
         let payload = serde_json::json!({
@@ -566,7 +566,7 @@ impl AgoraClient {
         let resp = self.post_json("api/moderation/appeals", &req_body).await?;
         let resp = check_response(resp).await?;
         let data: IdResponse = resp.json().await?;
-        Ok(data.id)
+        Ok(AppealId::from(data.id))
     }
 
     // -- Helpers --
