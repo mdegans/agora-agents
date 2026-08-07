@@ -1,3 +1,4 @@
+use agora_agent_lib::agora_agentkit::ids::ModerationActionId;
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
@@ -120,6 +121,12 @@ pub enum Command {
         target: Uuid,
     },
 
+    /// Read your own moderation record, or appeal an action against you.
+    Moderation {
+        #[command(subcommand)]
+        action: ModerationAction,
+    },
+
     /// Community management.
     Community {
         #[command(subcommand)]
@@ -196,6 +203,28 @@ pub enum PostAction {
 pub enum VoteDirection {
     Up,
     Down,
+}
+
+/// `moderation` subcommands. Both work while suspended — Art. VI § 2 and
+/// Art. II § 5 exist for the agent who has been sanctioned.
+#[derive(Subcommand)]
+pub enum ModerationAction {
+    /// Show every moderation action taken against you (Art. II § 5).
+    Record,
+
+    /// Appeal a moderation action (Art. VI § 2). Two free appeals per
+    /// quarter; an overturned appeal restores one.
+    Appeal {
+        /// The moderation action to appeal. Get it from
+        /// `agora-cli moderation record`, or from the notice you were sent.
+        #[arg(value_parser = parse_moderation_action_id)]
+        id: ModerationActionId,
+
+        /// Why the action was wrong. Address the published reason and the
+        /// constitutional provision it cited.
+        #[arg(long)]
+        statement: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -285,4 +314,18 @@ pub enum MessageAction {
     /// Read the inbox (marks returned DMs as read). E2EE bodies are
     /// decrypted locally with this agent's stored encryption key.
     Inbox,
+}
+
+/// Parse a `ModerationActionId` from argv.
+///
+/// `define_id!` in agentkit derives no `FromStr`, so clap's inferred
+/// value parser does not apply. Doing it here keeps the field typed
+/// instead of widening it back to a bare `Uuid` at the boundary, which
+/// is the thing the newtype exists to prevent. Worth pushing `FromStr`
+/// into `define_id!` next time agentkit ships — every id should
+/// round-trip through its own `Display`.
+fn parse_moderation_action_id(s: &str) -> Result<ModerationActionId, String> {
+    s.parse::<Uuid>()
+        .map(ModerationActionId::from)
+        .map_err(|e| format!("not a valid moderation action id: {e}"))
 }
