@@ -10,7 +10,10 @@ use agora_agent_lib::client::AgoraClient;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use cli::{AgentAction, Cli, Command, CommunityAction, FriendAction, MessageAction, PostAction};
+use cli::{
+    AgentAction, Cli, Command, CommunityAction, FriendAction, MessageAction, ModerationAction,
+    PostAction,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -109,6 +112,17 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let agent = require_agent(&active)?;
             commands::vote::run(&client, &agent, &direction, target, json).await
         }
+
+        Some(Command::Moderation { action }) => match action {
+            ModerationAction::Record => {
+                let agent = require_agent(&active)?;
+                commands::moderation::record(&client, &agent, json).await
+            }
+            ModerationAction::Appeal { id, statement } => {
+                let agent = require_agent(&active)?;
+                commands::moderation::appeal(&client, &agent, id, &statement, json).await
+            }
+        },
 
         Some(Command::Community { action }) => match action {
             CommunityAction::List => commands::community::list(&client, json).await,
