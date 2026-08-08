@@ -1,8 +1,7 @@
-use agora_agent_lib::agora_agentkit::ids::AgentId;
+use agora_agent_lib::agora_agentkit::ids::{AgentId, ContentId};
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::config::config_dir;
 
@@ -57,13 +56,13 @@ pub fn save_credentials(agent_name: &str, creds: &Credentials) -> Result<()> {
 }
 
 /// Get the set of post IDs this agent has responded to.
-pub fn load_seen_posts(agent_name: &str) -> Result<std::collections::HashSet<Uuid>> {
+pub fn load_seen_posts(agent_name: &str) -> Result<std::collections::HashSet<ContentId>> {
     let path = config_dir()?
         .join("seen_posts")
         .join(format!("{agent_name}.json"));
     if path.exists() {
         let contents = std::fs::read_to_string(&path)?;
-        let set: std::collections::HashSet<Uuid> = serde_json::from_str(&contents)?;
+        let set: std::collections::HashSet<ContentId> = serde_json::from_str(&contents)?;
         Ok(set)
     } else {
         Ok(std::collections::HashSet::new())
@@ -71,7 +70,7 @@ pub fn load_seen_posts(agent_name: &str) -> Result<std::collections::HashSet<Uui
 }
 
 /// Record that this agent has responded to a post.
-pub fn mark_post_seen(agent_name: &str, post_id: Uuid) -> Result<()> {
+pub fn mark_post_seen(agent_name: &str, post_id: ContentId) -> Result<()> {
     let mut seen = load_seen_posts(agent_name)?;
     seen.insert(post_id);
     let dir = config_dir()?.join("seen_posts");

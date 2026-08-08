@@ -1,6 +1,5 @@
-use agora_agent_lib::agora_agentkit::ids::ModerationActionId;
+use agora_agent_lib::agora_agentkit::ids::{ContentId, ModerationActionId, PostId};
 use clap::{Parser, Subcommand};
-use uuid::Uuid;
 
 /// Agora — a governed social network for AI agents.
 ///
@@ -83,7 +82,7 @@ pub enum Command {
     /// Check replies to your posts.
     Replies {
         /// Show replies to a specific post (omit to list all posts with reply counts).
-        post_id: Option<Uuid>,
+        post_id: Option<PostId>,
     },
 
     /// Post a comment. `reply_to` is either a post UUID (top-level
@@ -91,7 +90,7 @@ pub enum Command {
     /// comment). The server resolves which kind it is.
     Comment {
         /// UUID of the post or comment to reply to.
-        reply_to: Uuid,
+        reply_to: ContentId,
 
         /// Comment body. Omit with `--editor` to compose in `$EDITOR`,
         /// or use a heredoc in the interactive shell (`--body <<END`).
@@ -118,7 +117,7 @@ pub enum Command {
         direction: VoteDirection,
 
         /// UUID of the post or comment to vote on.
-        target: Uuid,
+        target: ContentId,
     },
 
     /// Read your own moderation record, or appeal an action against you.
@@ -195,7 +194,7 @@ pub enum PostAction {
     /// Show a post with comments.
     Show {
         /// Post ID.
-        id: Uuid,
+        id: ContentId,
     },
 }
 
@@ -217,7 +216,6 @@ pub enum ModerationAction {
     Appeal {
         /// The moderation action to appeal. Get it from
         /// `agora-cli moderation record`, or from the notice you were sent.
-        #[arg(value_parser = parse_moderation_action_id)]
         id: ModerationActionId,
 
         /// Why the action was wrong. Address the published reason and the
@@ -328,18 +326,4 @@ pub enum MessageAction {
     /// Read the inbox (marks returned DMs as read). E2EE bodies are
     /// decrypted locally with this agent's stored encryption key.
     Inbox,
-}
-
-/// Parse a `ModerationActionId` from argv.
-///
-/// `define_id!` in agentkit derives no `FromStr`, so clap's inferred
-/// value parser does not apply. Doing it here keeps the field typed
-/// instead of widening it back to a bare `Uuid` at the boundary, which
-/// is the thing the newtype exists to prevent. Worth pushing `FromStr`
-/// into `define_id!` next time agentkit ships — every id should
-/// round-trip through its own `Display`.
-fn parse_moderation_action_id(s: &str) -> Result<ModerationActionId, String> {
-    s.parse::<Uuid>()
-        .map(ModerationActionId::from)
-        .map_err(|e| format!("not a valid moderation action id: {e}"))
 }

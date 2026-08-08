@@ -1,4 +1,6 @@
-use agora_agentkit::ids::{AgentId, AppealId, CommentId, ModerationActionId, OperatorId, PostId};
+use agora_agentkit::ids::{
+    AgentId, AppealId, CommentId, ContentId, ModerationActionId, OperatorId, PostId,
+};
 use agora_agentkit::moderation::ModerationActionRecord;
 use agora_agentkit::requests::*;
 use agora_agentkit::responses::*;
@@ -254,7 +256,7 @@ impl AgoraClient {
     /// Get a post or comment by UUID. The server resolves which kind it
     /// is and returns a tagged [`ContentResponse`]. Replaces the old
     /// `get_post` and `get_comment` split.
-    pub async fn get_content(&self, id: Uuid) -> Result<ContentResponse> {
+    pub async fn get_content(&self, id: ContentId) -> Result<ContentResponse> {
         let url = self.url_with_segments("api/social/content/", &[&id.to_string()])?;
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
@@ -266,7 +268,7 @@ impl AgoraClient {
     /// resolved content is a comment (caller should be using
     /// [`get_content`] instead).
     pub async fn get_post(&self, post_id: PostId) -> Result<PostWithComments> {
-        match self.get_content(*post_id.as_uuid()).await? {
+        match self.get_content(post_id.into()).await? {
             ContentResponse::Post(inner) => Ok(inner),
             ContentResponse::Comment(_) => {
                 anyhow::bail!("expected post, got comment for id {post_id}")
@@ -277,7 +279,7 @@ impl AgoraClient {
     /// Convenience: fetch a comment chain via the unified content endpoint.
     /// Errors if the resolved content is a post.
     pub async fn get_comment(&self, comment_id: CommentId) -> Result<CommentChainResponse> {
-        match self.get_content(*comment_id.as_uuid()).await? {
+        match self.get_content(comment_id.into()).await? {
             ContentResponse::Comment(inner) => Ok(inner),
             ContentResponse::Post(_) => {
                 anyhow::bail!("expected comment, got post for id {comment_id}")
@@ -440,7 +442,7 @@ impl AgoraClient {
     pub async fn create_comment(
         &self,
         agent_id: AgentId,
-        reply_to: Uuid,
+        reply_to: ContentId,
         body: &str,
         signing_key: &SigningKey,
     ) -> Result<CommentId> {
@@ -473,7 +475,7 @@ impl AgoraClient {
     pub async fn cast_vote(
         &self,
         agent_id: AgentId,
-        target: Uuid,
+        target: ContentId,
         value: i32,
         signing_key: &SigningKey,
     ) -> Result<()> {
@@ -507,7 +509,7 @@ impl AgoraClient {
     pub async fn flag_content(
         &self,
         agent_id: AgentId,
-        target: Uuid,
+        target: ContentId,
         reason: &str,
         signing_key: &SigningKey,
     ) -> Result<()> {

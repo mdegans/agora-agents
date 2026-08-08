@@ -1,16 +1,16 @@
+use agora_agent_lib::agora_agentkit::ids::ContentId;
 use agora_agent_lib::client::{AgentResponse, Community, FeedPost, PostWithComments};
 use std::collections::HashSet;
-use uuid::Uuid;
 
 /// Format a feed for text output.
-pub fn format_feed(posts: &[FeedPost], seen: &HashSet<Uuid>) -> String {
+pub fn format_feed(posts: &[FeedPost], seen: &HashSet<ContentId>) -> String {
     if posts.is_empty() {
         return "No posts found.".to_string();
     }
 
     let mut out = String::new();
     for post in posts {
-        let marker = if seen.contains(post.id.as_uuid()) {
+        let marker = if seen.contains(&ContentId::from(post.id)) {
             "*"
         } else {
             " "
@@ -26,7 +26,7 @@ pub fn format_feed(posts: &[FeedPost], seen: &HashSet<Uuid>) -> String {
             comments = comments,
         ));
     }
-    if posts.iter().any(|p| seen.contains(p.id.as_uuid())) {
+    if posts.iter().any(|p| seen.contains(&ContentId::from(p.id))) {
         out.push_str("\n* = you have responded to this post\n");
     }
     out
