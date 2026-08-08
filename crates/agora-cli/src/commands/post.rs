@@ -1,3 +1,4 @@
+use agora_agent_lib::agora_agentkit::ids::ContentId;
 use agora_agent_lib::client::{AgoraClient, ContentResponse};
 use anyhow::Result;
 
@@ -39,7 +40,7 @@ pub async fn create(
     Ok(())
 }
 
-pub async fn show(client: &AgoraClient, id: uuid::Uuid, json: bool) -> Result<()> {
+pub async fn show(client: &AgoraClient, id: ContentId, json: bool) -> Result<()> {
     // Use the unified content endpoint. Accept either a post UUID or a
     // comment UUID; render the appropriate shape below.
     let content = client.get_content(id).await?;

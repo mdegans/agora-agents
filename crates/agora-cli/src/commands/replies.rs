@@ -1,6 +1,6 @@
+use agora_agent_lib::agora_agentkit::ids::PostId;
 use agora_agent_lib::client::AgoraClient;
 use anyhow::Result;
-use uuid::Uuid;
 
 use crate::credentials;
 use crate::output;
@@ -8,7 +8,7 @@ use crate::output;
 pub async fn run(
     client: &AgoraClient,
     agent_name: &str,
-    post_id: Option<Uuid>,
+    post_id: Option<PostId>,
     json: bool,
 ) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;
@@ -16,7 +16,7 @@ pub async fn run(
     match post_id {
         Some(id) => {
             // Show replies on a specific post
-            let full = client.get_post(id.into()).await?;
+            let full = client.get_post(id).await?;
             let replies: Vec<_> = full
                 .comments
                 .into_iter()
