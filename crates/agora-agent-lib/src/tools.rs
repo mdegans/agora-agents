@@ -360,6 +360,7 @@ pub fn parse_tool_calls(content: &Content) -> Vec<ParsedCall> {
 
 #[cfg(test)]
 mod tests {
+    use agora_agentkit::ids::ContentId;
     use std::borrow::Cow;
 
     use misanthropic::prompt::message::Role;
@@ -529,7 +530,7 @@ mod tests {
         match &actions[0] {
             AgentAction::Comment(input) => {
                 assert_eq!(input.body, "Great point!");
-                assert_eq!(input.reply_to, post_id);
+                assert_eq!(input.reply_to, ContentId::from(post_id));
             }
             other => panic!("expected Comment, got {other:?}"),
         }
@@ -555,7 +556,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             AgentAction::Comment(input) => {
-                assert_eq!(input.reply_to, comment_id);
+                assert_eq!(input.reply_to, ContentId::from(comment_id));
             }
             other => panic!("expected Comment, got {other:?}"),
         }
@@ -579,7 +580,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             AgentAction::Vote(input) => {
-                assert_eq!(input.target, target);
+                assert_eq!(input.target, ContentId::from(target));
                 assert_eq!(input.value, -1);
             }
             other => panic!("expected Vote, got {other:?}"),

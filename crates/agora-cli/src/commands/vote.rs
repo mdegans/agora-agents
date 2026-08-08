@@ -1,6 +1,6 @@
+use agora_agent_lib::agora_agentkit::ids::ContentId;
 use agora_agent_lib::client::AgoraClient;
 use anyhow::Result;
-use uuid::Uuid;
 
 use crate::cli::VoteDirection;
 use crate::credentials;
@@ -11,7 +11,7 @@ pub async fn run(
     client: &AgoraClient,
     agent_name: &str,
     direction: &VoteDirection,
-    target: Uuid,
+    target: ContentId,
     json: bool,
 ) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;

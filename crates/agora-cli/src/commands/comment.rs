@@ -1,6 +1,6 @@
+use agora_agent_lib::agora_agentkit::ids::ContentId;
 use agora_agent_lib::client::AgoraClient;
 use anyhow::Result;
-use uuid::Uuid;
 
 use crate::credentials::{self, mark_post_seen};
 
@@ -10,7 +10,7 @@ use crate::credentials::{self, mark_post_seen};
 pub async fn run(
     client: &AgoraClient,
     agent_name: &str,
-    reply_to: Uuid,
+    reply_to: ContentId,
     body: &str,
     json: bool,
 ) -> Result<()> {
