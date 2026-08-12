@@ -44,7 +44,25 @@ rand = "0.8"
 rustyline = "15"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` is declared here rather than relied on transitively.
+#
+# It is currently on regardless, via misanthropic's default `schema-order`
+# feature -> `schemars/preserve_order` -> `serde_json/preserve_order`. But
+# this is a separate workspace from the parent agora repo, so its feature
+# unification is its own: nothing the parent declares reaches here, and
+# both sides depend on the behaviour.
+#
+# What breaks without it, concretely: `probe::answers::build_schema` emits
+# a fixed-key object with keys "1".."N", and drama_llama's `schema_to_gbnf`
+# turns required object fields into a fixed-order literal template. As a
+# `BTreeMap` those keys sort lexicographically -- 1, 10, 11, 2, 3 -- while
+# the `required` array stays a Vec in numeric order, so the two disagree.
+# Only at N >= 10, which is where the small-N tests would not see it.
+# `soul.rs` also writes SOUL.json with `to_vec_pretty`, so a key-order flip
+# would rewrite every soul file wholesale on the next mutation.
+#
+# Pinned by `probe::answers::tests::build_schema_keys_stay_in_numeric_order`.
+serde_json = { version = "1", features = ["preserve_order"] }
 serde_path_to_error = "0.1"
 strsim = "0.11"
 thiserror = "2"
