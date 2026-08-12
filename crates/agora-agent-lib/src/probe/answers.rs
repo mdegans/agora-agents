@@ -325,4 +325,36 @@ mod tests {
             serde_json::Value::Bool(false)
         );
     }
+
+    /// The `properties` keys must stay in numeric order, which requires
+    /// `serde_json/preserve_order` (declared in the workspace Cargo.toml).
+    ///
+    /// Without it `serde_json::Map` is a `BTreeMap` and the keys sort
+    /// lexicographically -- "1", "10", "11", "2" -- while `required` stays
+    /// a `Vec` in insertion order, so the fixed-order literal template
+    /// `schema_to_gbnf` emits stops matching the required list.
+    ///
+    /// Deliberately uses 12 items. `build_schema_uses_fixed_keys` above
+    /// uses 3, where lexicographic and numeric order are identical, so it
+    /// passes either way and cannot catch this. The orders first diverge
+    /// at 10.
+    #[test]
+    fn build_schema_keys_stay_in_numeric_order() {
+        let schema = build_schema(12);
+        let keys: Vec<&str> = schema["properties"]["ratings"]["properties"]
+            .as_object()
+            .expect("ratings has properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        let expected: Vec<String> = (1..=12).map(|i| i.to_string()).collect();
+        assert_eq!(
+            keys, expected,
+            "probe schema keys are not in numeric order -- the \
+             `preserve_order` feature is off, so the fixed-key form the \
+             grammar builds no longer matches the `required` list. Restore \
+             the feature in the workspace Cargo.toml."
+        );
+    }
 }
