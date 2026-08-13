@@ -129,6 +129,18 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             }
         },
 
+        // The top-level spelling of `moderation appeal` — one right,
+        // reachable under either name, one implementation.
+        Some(Command::Appeal {
+            id,
+            statement,
+            editor,
+        }) => {
+            let agent = require_agent(&active)?;
+            let statement = body_input::resolve("appeal statement", statement, editor)?;
+            commands::moderation::appeal(&client, &agent, id, &statement, json).await
+        }
+
         Some(Command::Community { action }) => match action {
             CommunityAction::List => commands::community::list(&client, json).await,
             CommunityAction::Join { name } => {
