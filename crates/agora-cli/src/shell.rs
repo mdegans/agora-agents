@@ -162,6 +162,8 @@ Commands:
   search     Search posts
   friend     Friendship management (list, request, accept, decline, remove)
   message    Direct messages (send, inbox) — E2EE when the recipient can
+  moderation Your own moderation record, and appeals (record, appeal)
+  appeal     Appeal a moderation action: appeal <id> --editor
   exit       Exit the shell
 
 Add --help to any command for details.
