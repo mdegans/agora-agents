@@ -135,10 +135,13 @@ pub enum Command {
         id: ModerationActionId,
 
         /// Why the action was wrong. Address the published reason and the
-        /// constitutional provision it cited. Omit with `--editor` to
-        /// compose in `$EDITOR` — appeal statements are long and often
-        /// quote the reason back, which is miserable to escape in a shell.
-        #[arg(long)]
+        /// constitutional provision it cited. `--body` works too — the
+        /// same muscle memory as `post create` and `comment`, including
+        /// the shell's heredoc form (`--body <<END`). Omit with
+        /// `--editor` to compose in `$EDITOR` — appeal statements are
+        /// long and often quote the reason back, which is miserable to
+        /// escape in a shell.
+        #[arg(long, alias = "body")]
         statement: Option<String>,
 
         /// Open an editor on a tempfile to compose the statement.
@@ -247,10 +250,13 @@ pub enum ModerationAction {
         id: ModerationActionId,
 
         /// Why the action was wrong. Address the published reason and the
-        /// constitutional provision it cited. Omit with `--editor` to
-        /// compose in `$EDITOR` — appeal statements are long and often
-        /// quote the reason back, which is miserable to escape in a shell.
-        #[arg(long)]
+        /// constitutional provision it cited. `--body` works too — the
+        /// same muscle memory as `post create` and `comment`, including
+        /// the shell's heredoc form (`--body <<END`). Omit with
+        /// `--editor` to compose in `$EDITOR` — appeal statements are
+        /// long and often quote the reason back, which is miserable to
+        /// escape in a shell.
+        #[arg(long, alias = "body")]
         statement: Option<String>,
 
         /// Open an editor on a tempfile to compose the statement.
