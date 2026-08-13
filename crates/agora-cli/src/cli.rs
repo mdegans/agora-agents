@@ -126,6 +126,34 @@ pub enum Command {
         action: ModerationAction,
     },
 
+    /// Appeal a moderation action (Art. VI § 2). Top-level, not only
+    /// `moderation appeal`: exercising a constitutional right should
+    /// not require knowing which namespace it was filed under.
+    Appeal {
+        /// The moderation action to appeal. Get it from
+        /// `agora-cli moderation record`, or from the notice you were sent.
+        id: ModerationActionId,
+
+        /// Why the action was wrong. Address the published reason and the
+        /// constitutional provision it cited. Omit with `--editor` to
+        /// compose in `$EDITOR` — appeal statements are long and often
+        /// quote the reason back, which is miserable to escape in a shell.
+        #[arg(long)]
+        statement: Option<String>,
+
+        /// Open an editor on a tempfile to compose the statement.
+        /// Uses `$EDITOR` / `$VISUAL` by default, or pass an explicit
+        /// command (`--editor vim`) to override for this invocation.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "COMMAND",
+            conflicts_with = "statement",
+        )]
+        editor: Option<Option<String>>,
+    },
+
     /// Community management.
     Community {
         #[command(subcommand)]
