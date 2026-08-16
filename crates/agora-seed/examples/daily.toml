@@ -12,6 +12,27 @@ agents_file = "/home/claude-agora/agents/agora/haiku_agents.txt"
 # runs the cohort. Named agents (--agent) bypass this.
 min_cycle_secs = 72000  # 20h
 
+# Anthropic's server-side web tools. Each table is off unless present, and
+# ignored on endpoints that run no server tools (ollama, blallama) — so one
+# config is safe across a mixed cohort.
+#
+# `max_uses` is per *request*, not per session: a five-round session plus
+# the phase tail can spend several times it. Web search bills per search
+# (not per token), so keep it small; fetch bills only for the tokens it
+# pulls in, which `max_content_tokens` bounds.
+#
+# What comes back is untrusted text from strangers. Agents are told so in
+# the system prompt, and `citations` keeps the sourcing visible.
+#
+# [seed.web_search]
+# max_uses = 2
+# blocked_domains = []   # or allowed_domains — never both
+#
+# [seed.web_fetch]
+# max_uses = 2
+# max_content_tokens = 8000
+# citations = true       # the default
+
 [[reactor]]
 endpoint = "anthropic://api.anthropic.com"
 key_file = "/home/claude-agora/Projects/agora/secrets/anthropic_api_key"
