@@ -544,6 +544,26 @@ async fn load_states(
     Ok(states)
 }
 
+/// Apply `--agent`: the flag **narrows** whatever the config selected, and
+/// only ever narrows.
+///
+/// Without this, `--agent` reached only the `--endpoint` branch — pass it
+/// alongside `--config` and it was silently ignored, so a command that reads
+/// as "run these five" ran the config's whole roster instead. On a 30-agent
+/// cohort that is a expensive, and — if one is already running — two sessions
+/// writing one agent's state.
+///
+/// `agents_file` is dropped rather than intersected: the flag is the more
+/// specific instruction, and an intersection would silently run nothing when
+/// a name isn't in the file.
+fn narrow_to_named(config: &mut RunConfig, named: &[String]) {
+    if named.is_empty() {
+        return;
+    }
+    config.agents = named.to_vec();
+    config.agents_file = None;
+}
+
 /// The names in `agents` merged with `agents_file` lines.
 fn named_agents(config: &RunConfig) -> Result<Vec<String>> {
     let mut names = config.agents.clone();
@@ -669,7 +689,7 @@ async fn main() -> Result<()> {
     args.reject_retired()?;
 
     // Normalize both invocation shapes to a RunConfig.
-    let config: RunConfig = match &args.config {
+    let mut config: RunConfig = match &args.config {
         Some(path) => {
             let body = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
@@ -700,6 +720,7 @@ async fn main() -> Result<()> {
             }
         }
     };
+    narrow_to_named(&mut config, &args.agents);
     anyhow::ensure!(
         !config.reactors.is_empty(),
         "config has no [[reactor]] blocks"
@@ -1014,5 +1035,43 @@ mod tests {
         .to_config(std::path::Path::new("/tmp"), false)
         .expect_err("both lists rejected");
         assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod agent_selection_tests {
+    use super::*;
+
+    fn config_with_roster() -> RunConfig {
+        RunConfig {
+            data_dir: None,
+            server_url: None,
+            min_cycle_secs: Some(72000),
+            wave_size: None,
+            agents: vec!["alpha".into(), "beta".into()],
+            agents_file: Some(PathBuf::from("/roster.txt")),
+            seed: SeedKnobs::default(),
+            reactors: vec![],
+        }
+    }
+
+    /// `--agent` narrows to exactly those names. The dropped `agents_file`
+    /// is the point: leaving it would re-widen to the whole roster, which is
+    /// what the flag was silently doing before.
+    #[test]
+    fn named_agents_narrow_the_roster() {
+        let mut config = config_with_roster();
+        narrow_to_named(&mut config, &["gamma".to_string()]);
+        assert_eq!(config.agents, vec!["gamma".to_string()]);
+        assert!(config.agents_file.is_none());
+    }
+
+    /// No flag, no change — the config's own selection stands.
+    #[test]
+    fn no_named_agents_leaves_the_config_alone() {
+        let mut config = config_with_roster();
+        narrow_to_named(&mut config, &[]);
+        assert_eq!(config.agents.len(), 2);
+        assert!(config.agents_file.is_some());
     }
 }
