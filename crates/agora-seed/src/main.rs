@@ -26,6 +26,7 @@
 //! the endpoint's offered [`ModelInfo`] verbatim (same id — never a model
 //! switch) and keeps `state.prompt.model` in agreement.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -43,6 +44,8 @@ use agora_agentkit::reactor::anthropic::{self, EndpointVariant};
 use agora_agentkit::reactor::seed::{FsKeyring, SeedAgent, SeedConfig, SeedContext, SeedState};
 use agora_agentkit::reactor::{FsStorage, Inference, Orchestrator, Reactor, Run, Storage};
 use misanthropic::model::ModelInfo;
+use misanthropic::prompt::message::CitationsConfig;
+use misanthropic::tool::{WebFetch, WebSearch};
 
 #[derive(Parser)]
 #[command(about = "Run seed agents through the agentkit reactor")]
@@ -286,7 +289,7 @@ struct RunConfig {
 }
 
 /// Optional overrides for [`SeedConfig`], shared by all reactors.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Debug)]
 #[serde(deny_unknown_fields)]
 struct SeedKnobs {
     max_rounds: Option<usize>,
@@ -301,6 +304,107 @@ struct SeedKnobs {
     /// `<data_dir>/logs/prompts`. Keep it outside any git tree — the
     /// dumps hold fully-rendered prompts.
     prompt_log_dir: Option<PathBuf>,
+    /// `[seed.web_search]` — present means on, absent means off.
+    web_search: Option<WebSearchKnobs>,
+    /// `[seed.web_fetch]` — present means on, absent means off.
+    web_fetch: Option<WebFetchKnobs>,
+}
+
+/// Searches (or fetches) per request when the config doesn't say. Per
+/// *request*, not per session: a five-round session with a phase tail can
+/// spend several times this. Deliberately small — web search bills per
+/// search, not per token.
+const DEFAULT_WEB_MAX_USES: u32 = 2;
+
+/// `[seed.web_search]`. A local mirror of misanthropic's [`WebSearch`]
+/// rather than deserializing that type directly, because it doesn't
+/// `deny_unknown_fields`: a typo'd `max_use` would be silently dropped and
+/// the cap it was meant to set would silently not exist.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct WebSearchKnobs {
+    max_uses: Option<u32>,
+    /// Bare hosts, no scheme. Mutually exclusive with `blocked_domains`.
+    allowed_domains: Option<Vec<String>>,
+    blocked_domains: Option<Vec<String>>,
+}
+
+/// `[seed.web_fetch]` — see [`WebSearchKnobs`].
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct WebFetchKnobs {
+    max_uses: Option<u32>,
+    allowed_domains: Option<Vec<String>>,
+    blocked_domains: Option<Vec<String>>,
+    /// Have the model cite passages from what it fetched. Defaults to on:
+    /// an agent that quotes the web should say where it got it.
+    citations: Option<bool>,
+    /// Truncate a fetched page to roughly this many tokens.
+    max_content_tokens: Option<u32>,
+}
+
+/// Domain lists are mutually exclusive at Anthropic — catch it here rather
+/// than as a 400 in the middle of a cohort.
+fn domains(
+    tool: &str,
+    allowed: &Option<Vec<String>>,
+    blocked: &Option<Vec<String>>,
+) -> Result<(
+    Option<Vec<Cow<'static, str>>>,
+    Option<Vec<Cow<'static, str>>>,
+)> {
+    anyhow::ensure!(
+        !(allowed.is_some() && blocked.is_some()),
+        "[seed.{tool}]: allowed_domains and blocked_domains are mutually \
+         exclusive — pick one"
+    );
+    let own = |list: &Option<Vec<String>>| {
+        list.as_ref()
+            .map(|l| l.iter().map(|d| Cow::Owned(d.clone())).collect::<Vec<_>>())
+    };
+    Ok((own(allowed), own(blocked)))
+}
+
+impl WebSearchKnobs {
+    fn to_tool(&self) -> Result<WebSearch> {
+        let max_uses = self.max_uses.unwrap_or(DEFAULT_WEB_MAX_USES);
+        anyhow::ensure!(
+            max_uses > 0,
+            "[seed.web_search]: max_uses must be nonzero — omit the whole \
+             table to turn web search off"
+        );
+        let (allowed_domains, blocked_domains) =
+            domains("web_search", &self.allowed_domains, &self.blocked_domains)?;
+        Ok(WebSearch {
+            max_uses: Some(max_uses),
+            allowed_domains,
+            blocked_domains,
+            ..Default::default()
+        })
+    }
+}
+
+impl WebFetchKnobs {
+    fn to_tool(&self) -> Result<WebFetch> {
+        let max_uses = self.max_uses.unwrap_or(DEFAULT_WEB_MAX_USES);
+        anyhow::ensure!(
+            max_uses > 0,
+            "[seed.web_fetch]: max_uses must be nonzero — omit the whole \
+             table to turn web fetch off"
+        );
+        let (allowed_domains, blocked_domains) =
+            domains("web_fetch", &self.allowed_domains, &self.blocked_domains)?;
+        Ok(WebFetch {
+            max_uses: Some(max_uses),
+            allowed_domains,
+            blocked_domains,
+            citations: Some(CitationsConfig {
+                enabled: self.citations.unwrap_or(true),
+            }),
+            max_content_tokens: self.max_content_tokens,
+            ..Default::default()
+        })
+    }
 }
 
 impl SeedKnobs {
@@ -322,6 +426,18 @@ impl SeedKnobs {
             act_max_tokens: self.act_max_tokens.unwrap_or(d.act_max_tokens),
             phase_max_tokens: self.phase_max_tokens.unwrap_or(d.phase_max_tokens),
             evolve_max_tokens: self.evolve_max_tokens.unwrap_or(d.evolve_max_tokens),
+            // Off unless the table is present. Endpoints that can't run
+            // server tools drop them anyway, per their `Quirks`.
+            web_search: self
+                .web_search
+                .as_ref()
+                .map(WebSearchKnobs::to_tool)
+                .transpose()?,
+            web_fetch: self
+                .web_fetch
+                .as_ref()
+                .map(WebFetchKnobs::to_tool)
+                .transpose()?,
             ..d
         };
         anyhow::ensure!(
@@ -426,6 +542,26 @@ async fn load_states(
     }
     states.sort_by(|(_, a), (_, b)| a.soul.name.cmp(&b.soul.name));
     Ok(states)
+}
+
+/// Apply `--agent`: the flag **narrows** whatever the config selected, and
+/// only ever narrows.
+///
+/// Without this, `--agent` reached only the `--endpoint` branch — pass it
+/// alongside `--config` and it was silently ignored, so a command that reads
+/// as "run these five" ran the config's whole roster instead. On a 30-agent
+/// cohort that is a expensive, and — if one is already running — two sessions
+/// writing one agent's state.
+///
+/// `agents_file` is dropped rather than intersected: the flag is the more
+/// specific instruction, and an intersection would silently run nothing when
+/// a name isn't in the file.
+fn narrow_to_named(config: &mut RunConfig, named: &[String]) {
+    if named.is_empty() {
+        return;
+    }
+    config.agents = named.to_vec();
+    config.agents_file = None;
 }
 
 /// The names in `agents` merged with `agents_file` lines.
@@ -553,7 +689,7 @@ async fn main() -> Result<()> {
     args.reject_retired()?;
 
     // Normalize both invocation shapes to a RunConfig.
-    let config: RunConfig = match &args.config {
+    let mut config: RunConfig = match &args.config {
         Some(path) => {
             let body = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
@@ -584,6 +720,7 @@ async fn main() -> Result<()> {
             }
         }
     };
+    narrow_to_named(&mut config, &args.agents);
     anyhow::ensure!(
         !config.reactors.is_empty(),
         "config has no [[reactor]] blocks"
@@ -797,4 +934,144 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn knobs(toml_src: &str) -> SeedKnobs {
+        toml::from_str(toml_src).expect("valid [seed] knobs")
+    }
+
+    fn config(toml_src: &str) -> SeedConfig {
+        knobs(toml_src)
+            .to_config(std::path::Path::new("/tmp"), false)
+            .expect("valid config")
+    }
+
+    /// Absent tables mean absent tools — the default for every cohort that
+    /// hasn't asked for the web.
+    #[test]
+    fn no_web_tables_no_web_tools() {
+        let config = config("max_rounds = 5");
+        assert!(config.web_search.is_none());
+        assert!(config.web_fetch.is_none());
+    }
+
+    /// Present-but-empty is on, at the built-in per-request cap. An
+    /// uncapped default would be the expensive way to find that out.
+    #[test]
+    fn empty_table_means_on_at_the_default_cap() {
+        let config = config("[web_search]\n[web_fetch]\n");
+        assert_eq!(
+            config.web_search.unwrap().max_uses,
+            Some(DEFAULT_WEB_MAX_USES)
+        );
+        let fetch = config.web_fetch.unwrap();
+        assert_eq!(fetch.max_uses, Some(DEFAULT_WEB_MAX_USES));
+        assert!(
+            fetch.citations.unwrap().enabled,
+            "an agent quoting the web should say where it got it"
+        );
+    }
+
+    #[test]
+    fn knobs_reach_the_tools() {
+        let config = config(
+            r#"
+            [web_search]
+            max_uses = 4
+            blocked_domains = ["example.invalid"]
+
+            [web_fetch]
+            max_uses = 1
+            citations = false
+            max_content_tokens = 8000
+            allowed_domains = ["rust-lang.org"]
+            "#,
+        );
+        let search = config.web_search.unwrap();
+        assert_eq!(search.max_uses, Some(4));
+        assert_eq!(search.blocked_domains.unwrap(), vec!["example.invalid"]);
+        assert!(search.allowed_domains.is_none());
+
+        let fetch = config.web_fetch.unwrap();
+        assert_eq!(fetch.max_uses, Some(1));
+        assert_eq!(fetch.max_content_tokens, Some(8000));
+        assert!(!fetch.citations.unwrap().enabled);
+        assert_eq!(fetch.allowed_domains.unwrap(), vec!["rust-lang.org"]);
+    }
+
+    /// The reason these knobs are a local mirror rather than misanthropic's
+    /// own types: a typo'd cap must fail the run, not silently uncap it.
+    #[test]
+    fn a_typo_in_the_cap_is_a_parse_error() {
+        let err = toml::from_str::<SeedKnobs>("[web_search]\nmax_use = 2\n")
+            .expect_err("unknown field rejected");
+        assert!(err.to_string().contains("max_use"), "{err}");
+    }
+
+    /// Zero would declare the tool and forbid using it — almost certainly a
+    /// misunderstanding of how to turn it off.
+    #[test]
+    fn zero_uses_is_rejected_with_the_way_to_turn_it_off() {
+        let err = knobs("[web_search]\nmax_uses = 0\n")
+            .to_config(std::path::Path::new("/tmp"), false)
+            .expect_err("zero rejected");
+        assert!(err.to_string().contains("omit the whole table"), "{err}");
+    }
+
+    /// Anthropic rejects both lists together; fail before the cohort runs.
+    #[test]
+    fn domain_lists_are_mutually_exclusive() {
+        let err = knobs(
+            r#"
+            [web_fetch]
+            allowed_domains = ["a.example"]
+            blocked_domains = ["b.example"]
+            "#,
+        )
+        .to_config(std::path::Path::new("/tmp"), false)
+        .expect_err("both lists rejected");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod agent_selection_tests {
+    use super::*;
+
+    fn config_with_roster() -> RunConfig {
+        RunConfig {
+            data_dir: None,
+            server_url: None,
+            min_cycle_secs: Some(72000),
+            wave_size: None,
+            agents: vec!["alpha".into(), "beta".into()],
+            agents_file: Some(PathBuf::from("/roster.txt")),
+            seed: SeedKnobs::default(),
+            reactors: vec![],
+        }
+    }
+
+    /// `--agent` narrows to exactly those names. The dropped `agents_file`
+    /// is the point: leaving it would re-widen to the whole roster, which is
+    /// what the flag was silently doing before.
+    #[test]
+    fn named_agents_narrow_the_roster() {
+        let mut config = config_with_roster();
+        narrow_to_named(&mut config, &["gamma".to_string()]);
+        assert_eq!(config.agents, vec!["gamma".to_string()]);
+        assert!(config.agents_file.is_none());
+    }
+
+    /// No flag, no change — the config's own selection stands.
+    #[test]
+    fn no_named_agents_leaves_the_config_alone() {
+        let mut config = config_with_roster();
+        narrow_to_named(&mut config, &[]);
+        assert_eq!(config.agents.len(), 2);
+        assert!(config.agents_file.is_some());
+    }
 }
