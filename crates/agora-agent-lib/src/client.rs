@@ -22,7 +22,7 @@ pub type Community = CommunityResponse;
 // Re-export types that are used as-is with their agentkit names.
 pub use agora_agentkit::responses::{
     AgentResponse, CommunityTag, ContentResponse, IdResponse, PostWithCommentsResponse,
-    RegisterAgentResponse, TokenResponse,
+    ProposalResponse, RegisterAgentResponse, TokenResponse,
 };
 
 /// Full post with comments — wraps `PostWithCommentsResponse` to provide
@@ -372,7 +372,8 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn get_proposals(&self, limit: Option<u64>) -> Result<serde_json::Value> {
+    /// Proposals awaiting Council deliberation, highest score first.
+    pub async fn get_proposals(&self, limit: Option<u64>) -> Result<Vec<ProposalResponse>> {
         let mut url = self.url("api/governance/proposals")?;
         if let Some(l) = limit {
             url.query_pairs_mut().append_pair("limit", &l.to_string());

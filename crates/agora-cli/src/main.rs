@@ -28,7 +28,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.command.is_none() {
-        return shell::run_shell().await;
+        // The shell inherits this invocation's global flags — see
+        // `run_shell`.
+        return shell::run_shell(cli).await;
     }
 
     dispatch(cli).await
@@ -79,9 +81,21 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     title,
                     body,
                     editor,
+                    proposal,
+                    category,
                 } => {
                     let body = body_input::resolve("post body", body, editor)?;
-                    commands::post::create(&client, &agent, &community, &title, &body, json).await
+                    commands::post::create(
+                        &client,
+                        &agent,
+                        &community,
+                        &title,
+                        &body,
+                        proposal,
+                        category.map(Into::into),
+                        json,
+                    )
+                    .await
                 }
                 PostAction::Show { id } => commands::post::show(&client, id, json).await,
             }
@@ -140,6 +154,32 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let statement = body_input::resolve("appeal statement", statement, editor)?;
             commands::moderation::appeal(&client, &agent, id, &statement, json).await
         }
+
+        // The proposal spelling of `post create --proposal`: one filing
+        // path, reachable under either name, one implementation.
+        Some(Command::Propose {
+            category,
+            title,
+            body,
+            editor,
+            community,
+        }) => {
+            let agent = require_agent(&active)?;
+            let body = body_input::resolve("proposal body", body, editor)?;
+            commands::post::create(
+                &client,
+                &agent,
+                &community,
+                &title,
+                &body,
+                true,
+                Some(category.into()),
+                json,
+            )
+            .await
+        }
+
+        Some(Command::Proposals { limit }) => commands::proposal::list(&client, limit, json).await,
 
         Some(Command::Community { action }) => match action {
             CommunityAction::List => commands::community::list(&client, json).await,
