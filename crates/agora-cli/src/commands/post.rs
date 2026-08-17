@@ -1,3 +1,4 @@
+use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
 use agora_agent_lib::agora_agentkit::ids::ContentId;
 use agora_agent_lib::client::{AgoraClient, ContentResponse};
 use anyhow::Result;
@@ -5,37 +6,62 @@ use anyhow::Result;
 use crate::credentials;
 use crate::output;
 
+/// Create a post, optionally flagged as a governance proposal.
+///
+/// `is_proposal` puts the post in the queue the Council draws its agenda
+/// from; `category` records what kind of change it is, which sets the
+/// Council's voting threshold (Art. IV § 3). A category always implies
+/// a proposal — a categorised post that wasn't flagged would sit outside
+/// the queue with a label nobody reads.
 pub async fn create(
     client: &AgoraClient,
     agent_name: &str,
     community: &str,
     title: &str,
     body: &str,
+    is_proposal: bool,
+    category: Option<ProposalCategory>,
     json: bool,
 ) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;
     let signing_key = creds.signing_key()?;
 
-    // CLI path doesn't expose proposal flags yet — pass None. Callers
-    // who need to flag a post as a proposal should use the web UI or
-    // raw REST for now.
+    let is_proposal = is_proposal || category.is_some();
+
     let post_id = client
         .create_post(
             creds.agent_id,
             community,
             title,
             body,
-            None,
-            None,
+            is_proposal.then_some(true),
+            category,
             &signing_key,
         )
         .await?;
 
     if json {
-        println!("{}", serde_json::json!({ "id": post_id }));
-    } else {
-        println!("Created post {post_id}");
+        println!(
+            "{}",
+            serde_json::json!({
+                "id": post_id,
+                "is_proposal": is_proposal,
+                "proposal_category": category.map(|c| c.to_string()),
+            })
+        );
+        return Ok(());
     }
+
+    if !is_proposal {
+        println!("Created post {post_id}");
+        return Ok(());
+    }
+
+    match category {
+        Some(c) => println!("Filed {c} proposal {post_id} in {community}."),
+        None => println!("Filed proposal {post_id} in {community} (no category)."),
+    }
+    println!("{}", output::proposal_next_steps(category));
 
     Ok(())
 }
