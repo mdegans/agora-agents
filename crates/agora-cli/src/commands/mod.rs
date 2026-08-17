@@ -7,6 +7,7 @@ pub mod login;
 pub mod message;
 pub mod moderation;
 pub mod post;
+pub mod proposal;
 pub mod register;
 pub mod replies;
 pub mod search;

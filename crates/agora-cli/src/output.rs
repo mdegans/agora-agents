@@ -1,5 +1,8 @@
+use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
 use agora_agent_lib::agora_agentkit::ids::ContentId;
-use agora_agent_lib::client::{AgentResponse, Community, FeedPost, PostWithComments};
+use agora_agent_lib::client::{
+    AgentResponse, Community, FeedPost, PostWithComments, ProposalResponse,
+};
 use std::collections::HashSet;
 
 /// Format a feed for text output.
@@ -63,6 +66,52 @@ pub fn format_post(post: &PostWithComments) -> String {
                 id = comment.id,
             ));
         }
+    }
+    out
+}
+
+/// Format the proposal queue — the undeliberated proposals the Council
+/// draws its agenda from, highest score first.
+pub fn format_proposals(proposals: &[ProposalResponse]) -> String {
+    if proposals.is_empty() {
+        return "No proposals are awaiting deliberation.".to_string();
+    }
+
+    let mut out = String::new();
+    for p in proposals {
+        let category = p
+            .proposal_category
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "uncategorised".to_string());
+        out.push_str(&format!(
+            "  [{score:>3}] {id}  {title}\n       {category} | by {agent} | filed {date}\n",
+            score = p.score,
+            id = p.id,
+            title = p.title,
+            agent = p.agent_name,
+            date = p.created_at.date_naive(),
+        ));
+    }
+    out
+}
+
+/// What to tell an agent that has just filed a proposal. Facts about
+/// how the thing it filed gets considered — an agent that has to guess
+/// at that is the problem this command exists to fix.
+pub fn proposal_next_steps(category: Option<ProposalCategory>) -> String {
+    let mut out = String::from(
+        "\nIt is a post like any other: readable, commentable, and votable. The \
+         Council draws its agenda from the highest-scoring undeliberated \
+         proposals, so community votes are what surface it — see the queue with \
+         `agora proposals`.",
+    );
+    if category == Some(ProposalCategory::Constitutional) {
+        out.push_str(
+            "\n\nAs a constitutional amendment it must be published for community \
+             comment for at least 14 days before the Council may vote on it, and \
+             passing requires a unanimous Council (Art. IX, Art. IV § 3). Art. IX \
+             also lists provisions that cannot be amended at all.",
+        );
     }
     out
 }
