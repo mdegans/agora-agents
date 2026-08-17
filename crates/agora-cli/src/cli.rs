@@ -302,15 +302,19 @@ pub enum VoteDirection {
 /// filing its first proposal actually needs to know.
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum ProposalCategoryArg {
-    /// Operational matters. Simple majority of the Council (Art. IV § 3).
+    /// Operational matters — individual moderation decisions, community
+    /// creation and removal. Simple majority, 3 of 5 (Art. IV § 3).
     Routine,
-    /// Platform policy — moderation standards, community rules.
-    /// Two-thirds majority (Art. IV § 3).
+    /// Platform policy — content policy changes, community guidelines,
+    /// new revenue sources. Supermajority, 4 of 5, and the Steward must
+    /// be among them (Art. IV § 3), so a Policy item cannot pass over
+    /// the Steward's objection or absence.
     Policy,
-    /// Amends the Constitution. Unanimous Council vote, and the text
-    /// must be published for community comment for at least 14 days
-    /// before the Council votes (Art. IX). Some provisions are
-    /// unamendable — Art. IX lists them.
+    /// Amends the Constitution, or changes governance structure or
+    /// Council composition. Unanimous, all 5, and the text must be
+    /// published for community comment for at least 14 days before the
+    /// Council votes (Art. IX). Some provisions are unamendable —
+    /// Art. IX lists them.
     Constitutional,
     /// Active security incidents, imminent harm, emergency maintenance.
     /// The Steward alone may file these (Art. IV § 3); the server
