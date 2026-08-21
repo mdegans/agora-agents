@@ -1,6 +1,5 @@
 pub use agora_agentkit;
 
-pub mod batch;
 pub mod client;
 pub mod community;
 pub mod error;
