@@ -343,16 +343,17 @@ struct WebFetchKnobs {
     max_content_tokens: Option<u32>,
 }
 
+/// An optional domain allowlist or blocklist, in the owned form the
+/// server-tool builders take.
+type DomainList = Option<Vec<Cow<'static, str>>>;
+
 /// Domain lists are mutually exclusive at Anthropic — catch it here rather
 /// than as a 400 in the middle of a cohort.
 fn domains(
     tool: &str,
     allowed: &Option<Vec<String>>,
     blocked: &Option<Vec<String>>,
-) -> Result<(
-    Option<Vec<Cow<'static, str>>>,
-    Option<Vec<Cow<'static, str>>>,
-)> {
+) -> Result<(DomainList, DomainList)> {
     anyhow::ensure!(
         !(allowed.is_some() && blocked.is_some()),
         "[seed.{tool}]: allowed_domains and blocked_domains are mutually \
