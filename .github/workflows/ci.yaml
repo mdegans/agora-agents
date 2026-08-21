@@ -1,0 +1,52 @@
+# Minimal CI for agora-agents.
+#
+# Why this exists: this repo builds the seed runner that drives production
+# cohorts, and until 2026-08-21 nothing gated it. The pre-commit hook runs
+# `cargo fmt` and nothing else, and there were no workflows at all — so #121
+# deleted a module while leaving its `pub mod` declaration, and `main` sat
+# there not compiling. `gh pr checks` reported "no checks reported", which at
+# a glance is indistinguishable from a gate that passed.
+#
+# Runners: this repo is public, so GitHub-hosted minutes are free — no
+# self-hosted runner to provision. The suite needs no database and has no
+# live/API tests (zero `#[ignore]`d), so a run is compile time and little
+# else; the tests themselves finish in milliseconds.
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A push superseding a PR head cancels the stale run instead of overlapping
+# it. Main pushes keep their own group per sha and never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # `@stable` unpinned, matching the other repos. It doubles as a canary
+      # for lints a new stable turns on — rustc 1.98 did exactly that on
+      # 2026-08-18 (`clippy::result_large_err`). The trade is that an
+      # unlucky release between PR and merge can red `main`; pin here if that
+      # stops being worth it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # `-D warnings` so a newly-enabled lint fails on the PR rather than
+      # after the merge.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
