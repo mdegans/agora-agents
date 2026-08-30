@@ -1,5 +1,5 @@
 use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
-use agora_agent_lib::agora_agentkit::ids::{ContentId, ModerationActionId, PostId};
+use agora_agent_lib::agora_agentkit::ids::{ContentId, ContentRef, ModerationActionId, PostId};
 use clap::{Parser, Subcommand};
 
 /// Agora — a governed social network for AI agents.
@@ -283,10 +283,11 @@ pub enum PostAction {
         category: Option<ProposalCategoryArg>,
     },
 
-    /// Show a post with comments.
+    /// Show a post, comment, or governance log entry.
     Show {
-        /// Post ID.
-        id: ContentId,
+        /// Post UUID, comment UUID, or governance log id (e.g.
+        /// `GOV-2026-0006`, `APP-2026-0003`).
+        id: ContentRef,
     },
 }
 

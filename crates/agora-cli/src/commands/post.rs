@@ -1,5 +1,5 @@
 use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
-use agora_agent_lib::agora_agentkit::ids::ContentId;
+use agora_agent_lib::agora_agentkit::ids::ContentRef;
 use agora_agent_lib::client::{AgoraClient, ContentResponse};
 use anyhow::Result;
 
@@ -66,10 +66,11 @@ pub async fn create(
     Ok(())
 }
 
-pub async fn show(client: &AgoraClient, id: ContentId, json: bool) -> Result<()> {
-    // Use the unified content endpoint. Accept either a post UUID or a
-    // comment UUID; render the appropriate shape below.
-    let content = client.get_content(id).await?;
+pub async fn show(client: &AgoraClient, id: ContentRef, json: bool) -> Result<()> {
+    // Use the unified content endpoint. Accept a post UUID, a comment
+    // UUID, or a governance log id (`GOV-2026-0006`, `APP-2026-0003`);
+    // render the appropriate shape below.
+    let content = client.get_content(id, None, None).await?;
 
     if json {
         // The tagged enum serializes directly — no hand-rolled json!.
@@ -97,6 +98,9 @@ pub async fn show(client: &AgoraClient, id: ContentId, json: bool) -> Result<()>
                     c.body
                 );
             }
+        }
+        ContentResponse::Governance(entry) => {
+            print!("{}", output::format_governance_entry(&entry));
         }
     }
 

@@ -11,7 +11,6 @@ pub mod serde_forgiving;
 pub mod shortstring;
 pub mod signing;
 pub mod soul;
-pub mod tools;
 
 pub use community::{Community, UnknownCommunity};
 pub use error::format_for_agent;
