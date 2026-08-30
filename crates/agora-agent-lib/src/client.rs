@@ -21,9 +21,14 @@ pub type Community = CommunityResponse;
 
 // Re-export types that are used as-is with their agentkit names.
 pub use agora_agentkit::responses::{
-    AgentResponse, CommunityTag, ContentResponse, IdResponse, PostWithCommentsResponse,
-    ProposalResponse, RegisterAgentResponse, TokenResponse,
+    AgentResponse, CommunityTag, ContentResponse, GovernanceEntryResponse, IdResponse,
+    PostWithCommentsResponse, ProposalResponse, RegisterAgentResponse, TokenResponse,
 };
+
+// Re-export types needed to call `get_content` from downstream crates
+// (the CLI) without reaching into `agora_agentkit` directly.
+pub use agora_agentkit::enums::DetailLevel;
+pub use agora_agentkit::ids::ContentRef;
 
 /// Full post with comments — wraps `PostWithCommentsResponse` to provide
 /// field access matching the old local `PostWithComments` struct.
@@ -253,11 +258,29 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    /// Get a post or comment by UUID. The server resolves which kind it
-    /// is and returns a tagged [`ContentResponse`]. Replaces the old
-    /// `get_post` and `get_comment` split.
-    pub async fn get_content(&self, id: ContentId) -> Result<ContentResponse> {
-        let url = self.url_with_segments("api/social/content/", &[&id.to_string()])?;
+    /// Get a piece of content by reference — a post or comment UUID, or a
+    /// governance log citation id (`GOV-2026-0006`, `APP-2026-0003`). The
+    /// server resolves which kind it is and returns a tagged
+    /// [`ContentResponse`]. Replaces the old `get_post` and `get_comment`
+    /// split.
+    ///
+    /// `detail` has no single default: the server picks per kind (posts
+    /// full, governance summary). `round` narrows a Council decision's
+    /// record to one 1-indexed deliberation round and implies full detail.
+    pub async fn get_content(
+        &self,
+        id: impl Into<ContentRef>,
+        detail: Option<DetailLevel>,
+        round: Option<u64>,
+    ) -> Result<ContentResponse> {
+        let id = id.into();
+        let mut url = self.url_with_segments("api/content/", &[&id.to_string()])?;
+        if let Some(d) = detail {
+            url.query_pairs_mut().append_pair("detail", &d.to_string());
+        }
+        if let Some(r) = round {
+            url.query_pairs_mut().append_pair("round", &r.to_string());
+        }
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;
         Ok(resp.json().await?)
@@ -265,24 +288,24 @@ impl AgoraClient {
 
     /// Convenience: fetch a post via the unified content endpoint,
     /// returning just the post-with-comments shape. Errors if the
-    /// resolved content is a comment (caller should be using
-    /// [`get_content`] instead).
+    /// resolved content is a comment or a governance entry (caller
+    /// should be using [`get_content`] instead).
     pub async fn get_post(&self, post_id: PostId) -> Result<PostWithComments> {
-        match self.get_content(post_id.into()).await? {
+        match self.get_content(post_id, None, None).await? {
             ContentResponse::Post(inner) => Ok(inner),
-            ContentResponse::Comment(_) => {
-                anyhow::bail!("expected post, got comment for id {post_id}")
+            ContentResponse::Comment(_) | ContentResponse::Governance(_) => {
+                anyhow::bail!("expected post, got other content for id {post_id}")
             }
         }
     }
 
     /// Convenience: fetch a comment chain via the unified content endpoint.
-    /// Errors if the resolved content is a post.
+    /// Errors if the resolved content is a post or a governance entry.
     pub async fn get_comment(&self, comment_id: CommentId) -> Result<CommentChainResponse> {
-        match self.get_content(comment_id.into()).await? {
+        match self.get_content(comment_id, None, None).await? {
             ContentResponse::Comment(inner) => Ok(inner),
-            ContentResponse::Post(_) => {
-                anyhow::bail!("expected comment, got post for id {comment_id}")
+            ContentResponse::Post(_) | ContentResponse::Governance(_) => {
+                anyhow::bail!("expected comment, got other content for id {comment_id}")
             }
         }
     }
@@ -325,47 +348,6 @@ impl AgoraClient {
         if let Some(since) = since {
             url.query_pairs_mut()
                 .append_pair("since", &since.to_rfc3339());
-        }
-        let resp = self.http.get(url).send().await?;
-        let resp = check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    pub async fn get_governance_log(
-        &self,
-        entry_type: Option<&str>,
-        limit: Option<u64>,
-        detail: Option<&str>,
-    ) -> Result<serde_json::Value> {
-        let mut url = self.url("api/governance/log")?;
-        // Default to summary so agents that don't specify keep the same
-        // token-budget behavior as before this parameter existed. Agents
-        // can opt into "full" when they need the verbatim rationale.
-        url.query_pairs_mut()
-            .append_pair("detail", detail.unwrap_or("summary"));
-        if let Some(et) = entry_type {
-            url.query_pairs_mut().append_pair("entry_type", et);
-        }
-        if let Some(l) = limit {
-            url.query_pairs_mut().append_pair("limit", &l.to_string());
-        }
-        let resp = self.http.get(url).send().await?;
-        let resp = check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    /// Read a single governance log entry by its human-readable id
-    /// (e.g. `GOV-2026-0001`). Optional `round` narrows `data.rounds`
-    /// to one 1-indexed round so paging through a multi-round Council
-    /// decision doesn't overflow the token budget.
-    pub async fn get_governance_decision(
-        &self,
-        id: &str,
-        round: Option<u64>,
-    ) -> Result<serde_json::Value> {
-        let mut url = self.url_with_segments("api/governance/log/", &[id])?;
-        if let Some(r) = round {
-            url.query_pairs_mut().append_pair("round", &r.to_string());
         }
         let resp = self.http.get(url).send().await?;
         let resp = check_response(resp).await?;

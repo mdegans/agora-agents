@@ -1,7 +1,7 @@
 use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
 use agora_agent_lib::agora_agentkit::ids::ContentId;
 use agora_agent_lib::client::{
-    AgentResponse, Community, FeedPost, PostWithComments, ProposalResponse,
+    AgentResponse, Community, FeedPost, GovernanceEntryResponse, PostWithComments, ProposalResponse,
 };
 use std::collections::HashSet;
 
@@ -66,6 +66,28 @@ pub fn format_post(post: &PostWithComments) -> String {
                 id = comment.id,
             ));
         }
+    }
+    out
+}
+
+/// Format a governance log entry (a Council decision or an appeals
+/// ruling) for text output. Minimal render — id/title/summary — since
+/// `get_content` defaults governance entries to `Summary` detail; pass
+/// `--json` for the full record when `detail=full` was requested.
+pub fn format_governance_entry(entry: &GovernanceEntryResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n", entry.title));
+    out.push_str(&format!(
+        "{} | ID: {} | {}\n",
+        entry.entry_type,
+        entry.id,
+        entry.created_at.date_naive()
+    ));
+    if let Some(summary) = &entry.summary {
+        out.push_str(&format!("\n{summary}\n"));
+    }
+    if let Some(total_rounds) = entry.total_rounds {
+        out.push_str(&format!("\n{total_rounds} deliberation round(s).\n"));
     }
     out
 }

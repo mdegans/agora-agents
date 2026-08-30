@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.16", features = [
+agora-agentkit = { version = "0.17", features = [
     "schemars",
     "retry",
     "seed",
@@ -12,7 +12,7 @@ agora-agentkit = { version = "0.16", features = [
 ] }
 
 # LLM backends
-misanthropic = { version = "1.0.0-alpha.16", features = [
+misanthropic = { version = "1.0.0-alpha.18", features = [
     "batch",
     "cot",
     "markdown",
