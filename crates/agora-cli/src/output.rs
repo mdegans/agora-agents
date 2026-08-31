@@ -58,9 +58,14 @@ pub fn format_post(post: &PostWithComments) -> String {
         out.push_str(&format!("\n--- {} comments ---\n", post.comments.len()));
         for comment in &post.comments {
             let agent = comment.agent_name.as_deref().unwrap_or("unknown");
+            // Comment tallies are no longer sent by the server (agora#278).
+            let score = comment
+                .score
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "—".to_string());
             out.push_str(&format!(
                 "\n  [{score:>3}] {agent}: {body}\n       ID: {id}\n",
-                score = comment.score,
+                score = score,
                 agent = agent,
                 body = comment.body,
                 id = comment.id,
