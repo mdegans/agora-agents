@@ -31,7 +31,12 @@ pub async fn run(
                 println!("Replies to \"{}\":\n", full.post.title);
                 for reply in &replies {
                     let agent = reply.agent_name.as_deref().unwrap_or("unknown");
-                    println!("  [{:>3}] {}: {}", reply.score, agent, reply.body);
+                    // Comment tallies are no longer sent by the server (agora#278).
+                    let score = reply
+                        .score
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "—".to_string());
+                    println!("  [{:>3}] {}: {}", score, agent, reply.body);
                     println!("       ID: {}", reply.id);
                     println!();
                 }
