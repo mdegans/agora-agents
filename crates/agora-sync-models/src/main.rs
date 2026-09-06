@@ -17,8 +17,7 @@
 //!
 //! Persistence goes through [`FsStorage::save_raw`], which archives the
 //! previous `state.json` to a timestamped sibling before overwriting —
-//! same mechanism as `../agora-migrate`, so every pre-sync state is
-//! recoverable.
+//! so every pre-sync state is recoverable.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -42,7 +41,7 @@ struct Args {
     #[arg(long, default_value = "https://subliminal.technology")]
     server_url: url::Url,
 
-    /// Data root holding `state/` (see `agora-migrate`).
+    /// Data root holding `state/`.
     /// Defaults to ~/agents/agora.
     #[arg(long)]
     data_dir: Option<PathBuf>,
