@@ -1,11 +1,10 @@
 //! The seed runner, rebuilt on agentkit's reactor.
 //!
 //! Thin glue only: parse endpoints, discover models, load [`SeedState`]s
-//! from the [`FsStorage`] tree (see `../agora-migrate` and
-//! `../agora-sync-models`), route each agent onto the endpoint offering
-//! its model, and hand
-//! everything to [`Orchestrator`]/[`Reactor`]. All agent behavior —
-//! phases, tools, mutation, survey — lives in agentkit's [`SeedAgent`].
+//! from the [`FsStorage`] tree (see `../agora-sync-models`), route each
+//! agent onto the endpoint offering its model, and hand everything to
+//! [`Orchestrator`]/[`Reactor`]. All agent behavior — phases, tools,
+//! mutation, survey — lives in agentkit's [`SeedAgent`].
 //!
 //! One `[[reactor]]` block per **endpoint** — never two blocks for one
 //! endpoint, or generations run concurrently and thrash the GPU. There is
@@ -73,7 +72,7 @@ struct Args {
     #[arg(long, default_value = "https://subliminal.technology")]
     server_url: url::Url,
 
-    /// Data root holding `state/` and `secrets/` (see `agora-migrate`).
+    /// Data root holding `state/` and `secrets/`.
     /// Defaults to ~/agents/agora.
     #[arg(long)]
     data_dir: Option<PathBuf>,
