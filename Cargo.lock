@@ -109,23 +109,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agora-migrate"
-version = "0.1.0"
-dependencies = [
- "agora-agentkit",
- "anyhow",
- "chrono",
- "clap",
- "dirs",
- "misanthropic",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "uuid",
-]
-
-[[package]]
 name = "agora-seed"
 version = "0.1.0"
 dependencies = [
