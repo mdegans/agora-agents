@@ -82,6 +82,13 @@ struct Args {
     #[arg(long = "agent")]
     agents: Vec<String>,
 
+    /// Run only agents whose persisted model id is one of these
+    /// (repeatable; exact match against the id the endpoint advertises,
+    /// the same rule routing uses). Narrows the config's `models`. Unlike
+    /// `--agent` this does not bypass `min_cycle_secs`.
+    #[arg(long = "model")]
+    models: Vec<String>,
+
     /// Run at most this many agents per endpoint (after interleaving).
     #[arg(long)]
     limit: Option<usize>,
@@ -281,6 +288,12 @@ struct RunConfig {
     /// Newline-separated agent names (`#` comments ok), merged into
     /// `agents`.
     agents_file: Option<PathBuf>,
+    /// Run only agents whose persisted model id is listed (exact match,
+    /// the same rule routing uses). Empty means every model. This shapes
+    /// the roster and nothing else: unlike `agents`, listed models still
+    /// honour `min_cycle_secs`, so a looping sweep stays paced.
+    #[serde(default)]
+    models: Vec<String>,
     #[serde(default)]
     seed: SeedKnobs,
     #[serde(rename = "reactor")]
@@ -564,6 +577,25 @@ fn narrow_to_named(config: &mut RunConfig, named: &[String]) {
     config.agents_file = None;
 }
 
+/// Apply `--model`: like [`narrow_to_named`], the flag replaces the
+/// config's `models` allowlist rather than widening it. No flag leaves the
+/// config's list alone.
+fn narrow_to_models(config: &mut RunConfig, models: &[String]) {
+    if models.is_empty() {
+        return;
+    }
+    config.models = models.to_vec();
+}
+
+/// Whether `model_id` passes the `models` allowlist. An empty list allows
+/// everything; otherwise the id must match a listed one exactly — the same
+/// exact-match rule routing applies against an endpoint's advertised ids,
+/// so a near-miss here fails the same way it would there (visibly, in the
+/// plan's `excluded` line) rather than silently widening.
+fn model_allowed(models: &[String], model_id: &str) -> bool {
+    models.is_empty() || models.iter().any(|m| m == model_id)
+}
+
 /// The names in `agents` merged with `agents_file` lines.
 fn named_agents(config: &RunConfig) -> Result<Vec<String>> {
     let mut names = config.agents.clone();
@@ -588,6 +620,8 @@ struct Routing {
     cohorts: Vec<BTreeMap<String, Vec<(AgentId, SeedState)>>>,
     /// model id → agent count, for models no endpoint offers.
     unrouted: BTreeMap<String, usize>,
+    /// model id → agent count, for models the `models` allowlist leaves out.
+    excluded: BTreeMap<String, usize>,
     /// Agents with no model at all — `sync-models` hasn't run for them.
     placeholders: usize,
     /// Agents skipped by `min_cycle_secs` cadence gating.
@@ -603,6 +637,7 @@ fn route(
     reactors: &[ReactorSpec],
     offered: &[(usize, ModelInfo)],
     names: &[String],
+    models: &[String],
     global_min_cycle: Option<u64>,
 ) -> Routing {
     let mut by_model: BTreeMap<&str, &(usize, ModelInfo)> = BTreeMap::new();
@@ -628,6 +663,12 @@ fn route(
         let model_id = state.model.id.name().to_string();
         if model_id.is_empty() {
             routing.placeholders += 1;
+            continue;
+        }
+        // The allowlist is checked before routing so an excluded model is
+        // reported as excluded whether or not an endpoint offers it.
+        if !model_allowed(models, &model_id) {
+            *routing.excluded.entry(model_id).or_insert(0) += 1;
             continue;
         }
         let Some((idx, offered)) = by_model.get(model_id.as_str()) else {
@@ -707,6 +748,7 @@ async fn main() -> Result<()> {
                 wave_size: Some(args.wave_size),
                 agents: args.agents.clone(),
                 agents_file: None,
+                models: args.models.clone(),
                 seed: SeedKnobs::default(),
                 reactors: vec![ReactorSpec {
                     endpoint,
@@ -721,6 +763,7 @@ async fn main() -> Result<()> {
         }
     };
     narrow_to_named(&mut config, &args.agents);
+    narrow_to_models(&mut config, &args.models);
     anyhow::ensure!(
         !config.reactors.is_empty(),
         "config has no [[reactor]] blocks"
@@ -792,6 +835,7 @@ async fn main() -> Result<()> {
         &config.reactors,
         &offered,
         &names,
+        &config.models,
         config.min_cycle_secs,
     );
 
@@ -804,6 +848,9 @@ async fn main() -> Result<()> {
     }
     for (model, count) in &routing.unrouted {
         println!("unrouted: {model} ×{count} (no endpoint offers this model)");
+    }
+    for (model, count) in &routing.excluded {
+        println!("excluded: {model} ×{count} (not in the `models` allowlist)");
     }
     if routing.placeholders > 0 {
         println!(
@@ -1050,9 +1097,49 @@ mod agent_selection_tests {
             wave_size: None,
             agents: vec!["alpha".into(), "beta".into()],
             agents_file: Some(PathBuf::from("/roster.txt")),
+            models: vec!["cogito-32b.gguf".into()],
             seed: SeedKnobs::default(),
             reactors: vec![],
         }
+    }
+
+    /// `--model` replaces the config's allowlist, exactly as `--agent`
+    /// replaces the roster; no flag leaves it alone.
+    #[test]
+    fn model_flag_narrows_the_allowlist() {
+        let mut config = config_with_roster();
+        narrow_to_models(&mut config, &["Qwen3.6.gguf".to_string()]);
+        assert_eq!(config.models, vec!["Qwen3.6.gguf"]);
+
+        let mut config = config_with_roster();
+        narrow_to_models(&mut config, &[]);
+        assert_eq!(config.models, vec!["cogito-32b.gguf"]);
+    }
+
+    /// Exact match, same as routing: a substring or case variant of a
+    /// listed id is excluded, not quietly admitted.
+    #[test]
+    fn allowlist_is_exact_and_empty_means_everyone() {
+        let list = vec!["Qwen3.6-35B-A3B-UD-IQ4_XS.gguf".to_string()];
+        assert!(model_allowed(&list, "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"));
+        assert!(!model_allowed(&list, "Qwen3.6"));
+        assert!(!model_allowed(&list, "qwen3.6-35b-a3b-ud-iq4_xs.gguf"));
+        assert!(!model_allowed(&list, "cogito-32b.gguf"));
+        assert!(model_allowed(&[], "cogito-32b.gguf"));
+    }
+
+    /// The TOML key parses to the same list the flag sets, and is
+    /// optional — every existing config has no `models` key.
+    #[test]
+    fn models_key_parses_and_defaults_empty() {
+        let with: RunConfig = toml::from_str(
+            "models = [\"a.gguf\", \"b.gguf\"]\n[[reactor]]\nendpoint = \"blallama://h:1\"\n",
+        )
+        .unwrap();
+        assert_eq!(with.models, vec!["a.gguf", "b.gguf"]);
+        let without: RunConfig =
+            toml::from_str("[[reactor]]\nendpoint = \"blallama://h:1\"\n").unwrap();
+        assert!(without.models.is_empty());
     }
 
     /// `--agent` narrows to exactly those names. The dropped `agents_file`
