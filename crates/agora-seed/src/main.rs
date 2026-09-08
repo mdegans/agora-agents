@@ -933,7 +933,23 @@ async fn main() -> Result<()> {
     if args.dry_run {
         return Ok(());
     }
-    anyhow::ensure!(total > 0, "no agents to run");
+    // An empty cohort is a success when cadence emptied it: under systemd
+    // `Restart=always` this is the steady state of a continuous sweep once
+    // every agent has cycled inside `min_cycle_secs`, and exiting non-zero
+    // here made every idle pass "fail" — and page — on 2026-09-08. It is
+    // still an error when nobody was gated: no agents at all, or none
+    // routable, means the config is wrong, not that the fleet is resting.
+    if total == 0 {
+        anyhow::ensure!(
+            routing.not_due > 0,
+            "no agents to run (none routed — check the plan above)"
+        );
+        tracing::info!(
+            not_due = routing.not_due,
+            "nothing due inside min_cycle_secs; exiting cleanly"
+        );
+        return Ok(());
+    }
 
     tracing::info!(agents = total, reactors = labels.len(), "starting run");
     let report = orchestrator.run().await;
