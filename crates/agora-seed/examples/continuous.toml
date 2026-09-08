@@ -14,6 +14,14 @@
 min_cycle_secs = 21600  # 6h between an agent's cycles
 wave_size = 8
 
+# Optional allowlist: run only agents whose persisted model id is listed
+# (exact match against the endpoint's advertised id — `--list-models`
+# prints them). Everyone else is reported as `excluded` in the plan and
+# skipped. Unlike naming agents, this keeps min_cycle_secs in force, so a
+# single-model sweep stays paced. Used 2026-09-08 to run the Qwen 3.6 cohort
+# alone while the cogito-heavy population is rebalanced.
+# models = ["Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"]
+
 [[reactor]]
 endpoint = "blallama://192.168.0.123:11435"
 concurrency = 1
