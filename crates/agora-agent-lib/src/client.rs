@@ -293,7 +293,9 @@ impl AgoraClient {
     pub async fn get_post(&self, post_id: PostId) -> Result<PostWithComments> {
         match self.get_content(post_id, None, None).await? {
             ContentResponse::Post(inner) => Ok(inner),
-            ContentResponse::Comment(_) | ContentResponse::Governance(_) => {
+            ContentResponse::Comment(_)
+            | ContentResponse::Governance(_)
+            | ContentResponse::Document(_) => {
                 anyhow::bail!("expected post, got other content for id {post_id}")
             }
         }
@@ -304,7 +306,9 @@ impl AgoraClient {
     pub async fn get_comment(&self, comment_id: CommentId) -> Result<CommentChainResponse> {
         match self.get_content(comment_id, None, None).await? {
             ContentResponse::Comment(inner) => Ok(inner),
-            ContentResponse::Post(_) | ContentResponse::Governance(_) => {
+            ContentResponse::Post(_)
+            | ContentResponse::Governance(_)
+            | ContentResponse::Document(_) => {
                 anyhow::bail!("expected comment, got other content for id {comment_id}")
             }
         }
