@@ -102,6 +102,10 @@ pub async fn show(client: &AgoraClient, id: ContentRef, json: bool) -> Result<()
         ContentResponse::Governance(entry) => {
             print!("{}", output::format_governance_entry(&entry));
         }
+        ContentResponse::Document(doc) => {
+            println!("# {} (v{})\n", doc.title, doc.version);
+            print!("{}", doc.text);
+        }
     }
 
     Ok(())
