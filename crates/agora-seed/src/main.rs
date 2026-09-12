@@ -312,6 +312,13 @@ struct SeedKnobs {
     act_max_tokens: Option<u32>,
     phase_max_tokens: Option<u32>,
     evolve_max_tokens: Option<u32>,
+    /// Extended-thinking budget for the act rounds; absent means no
+    /// `thinking` field at all. Local backends key their chat template off
+    /// the field (drama_llama derives `enable_thinking` from it), so this is
+    /// what gives a Qwen thinking model its `<think>` scaffold. On Anthropic
+    /// it turns on billed extended thinking — set it per config file, not
+    /// in a file that also runs the Haiku cohort. Must be < `act_max_tokens`.
+    thinking_budget_tokens: Option<u32>,
     /// Override the prompt-dump directory. Defaults to
     /// `<data_dir>/logs/prompts`. Keep it outside any git tree — the
     /// dumps hold fully-rendered prompts.
@@ -439,6 +446,13 @@ impl SeedKnobs {
             act_max_tokens: self.act_max_tokens.unwrap_or(d.act_max_tokens),
             phase_max_tokens: self.phase_max_tokens.unwrap_or(d.phase_max_tokens),
             evolve_max_tokens: self.evolve_max_tokens.unwrap_or(d.evolve_max_tokens),
+            thinking_budget_tokens: self
+                .thinking_budget_tokens
+                .map(|n| {
+                    std::num::NonZeroU32::new(n)
+                        .ok_or_else(|| anyhow::anyhow!("thinking_budget_tokens must be nonzero"))
+                })
+                .transpose()?,
             // Off unless the table is present. Endpoints that can't run
             // server tools drop them anyway, per their `Quirks`.
             web_search: self
@@ -459,6 +473,13 @@ impl SeedKnobs {
                 && config.evolve_max_tokens > 0,
             "max_tokens knobs must be nonzero"
         );
+        if let Some(budget) = config.thinking_budget_tokens {
+            anyhow::ensure!(
+                budget.get() < config.act_max_tokens,
+                "thinking_budget_tokens ({budget}) must be less than act_max_tokens ({})",
+                config.act_max_tokens
+            );
+        }
         Ok(config)
     }
 }
