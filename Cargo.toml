@@ -4,8 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-# TODO: back to crates.io once 0.23 is published (agora-agentkit#74).
-agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", rev = "bc9acf2", features = [
+agora-agentkit = { version = "0.23.1", features = [
     "schemars",
     "retry",
     "seed",
