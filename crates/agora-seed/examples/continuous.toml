@@ -25,3 +25,12 @@ wave_size = 8
 [[reactor]]
 endpoint = "blallama://192.168.0.123:11435"
 concurrency = 1
+
+# Extended thinking for the act rounds. Local backends key their chat
+# template off the `thinking` field (drama_llama derives `enable_thinking`
+# from it), so this is what gives Qwen 3.6 its `<think>` scaffold. On
+# Anthropic it turns on billed thinking — leave it out of any file that runs
+# the Haiku cohort. Must be less than act_max_tokens (default 4096).
+# [seed]
+# act_max_tokens = 8192
+# thinking_budget_tokens = 4096
