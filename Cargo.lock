@@ -41,8 +41,8 @@ dependencies = [
 
 [[package]]
 name = "agora-agentkit"
-version = "0.23.0"
-source = "git+https://github.com/mdegans/agora-agentkit.git?rev=b0813ab01579ed80906534624555ef4b5e80cd71#b0813ab01579ed80906534624555ef4b5e80cd71"
+version = "0.23.1"
+source = "git+https://github.com/mdegans/agora-agentkit.git?rev=bc9acf2#bc9acf2deaf19b3f9027ef00b6955d727b2dea6d"
 dependencies = [
  "anyhow",
  "async-trait",
