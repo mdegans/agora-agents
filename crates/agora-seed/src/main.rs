@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 
+mod govlog;
 mod logging;
 
 use agora_agentkit::ids::{AgentId, ReactorId};
@@ -891,6 +892,11 @@ async fn main() -> Result<()> {
         keys: Arc::new(keyring.clone()),
         config: config.seed.to_config(&data_dir, !args.no_prompt_log)?,
     };
+
+    // The reference client verifies the governance log every run
+    // (agora#127): signatures, chain, and the head entry's content.
+    // A dry run verifies too — it is read-only and worth knowing.
+    govlog::verify(&context.client, &data_dir).await;
 
     // Assemble reactors: interleave each endpoint's cohort, cap, construct.
     let wave_size = config.wave_size.unwrap_or(8);
