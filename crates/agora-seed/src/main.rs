@@ -295,6 +295,17 @@ struct RunConfig {
     /// honour `min_cycle_secs`, so a looping sweep stays paced.
     #[serde(default)]
     models: Vec<String>,
+    /// Agents admitted *in addition to* the `models` roster: exempt from
+    /// that allowlist, but paced by `min_cycle_secs` like everyone else
+    /// (unlike `agents`, which is intent and runs regardless). For
+    /// balancing a small draw from an excluded cohort into a sweep —
+    /// 2026-09-16: 100 cogito agents so a Constitutional comment window
+    /// is not only heard by the models that happen to be allowlisted.
+    #[serde(default)]
+    extra_agents: Vec<String>,
+    /// Newline-separated agent names (`#` comments ok), merged into
+    /// `extra_agents`.
+    extra_agents_file: Option<PathBuf>,
     #[serde(default)]
     seed: SeedKnobs,
     #[serde(rename = "reactor")]
@@ -620,8 +631,17 @@ fn model_allowed(models: &[String], model_id: &str) -> bool {
 
 /// The names in `agents` merged with `agents_file` lines.
 fn named_agents(config: &RunConfig) -> Result<Vec<String>> {
-    let mut names = config.agents.clone();
-    if let Some(path) = &config.agents_file {
+    names_with_file(&config.agents, config.agents_file.as_deref())
+}
+
+/// The names in `extra_agents` merged with `extra_agents_file` lines.
+fn extra_agents(config: &RunConfig) -> Result<Vec<String>> {
+    names_with_file(&config.extra_agents, config.extra_agents_file.as_deref())
+}
+
+fn names_with_file(inline: &[String], file: Option<&std::path::Path>) -> Result<Vec<String>> {
+    let mut names = inline.to_vec();
+    if let Some(path) = file {
         let body =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         names.extend(
@@ -659,6 +679,7 @@ fn route(
     reactors: &[ReactorSpec],
     offered: &[(usize, ModelInfo)],
     names: &[String],
+    extras: &[String],
     models: &[String],
     global_min_cycle: Option<u64>,
 ) -> Routing {
@@ -688,8 +709,10 @@ fn route(
             continue;
         }
         // The allowlist is checked before routing so an excluded model is
-        // reported as excluded whether or not an endpoint offers it.
-        if !model_allowed(models, &model_id) {
+        // reported as excluded whether or not an endpoint offers it. An
+        // extra agent is admitted past it (and only past it).
+        let extra = extras.iter().any(|n| n == state.soul.name.as_str());
+        if !extra && !model_allowed(models, &model_id) {
             *routing.excluded.entry(model_id).or_insert(0) += 1;
             continue;
         }
@@ -771,6 +794,8 @@ async fn main() -> Result<()> {
                 agents: args.agents.clone(),
                 agents_file: None,
                 models: args.models.clone(),
+                extra_agents: vec![],
+                extra_agents_file: None,
                 seed: SeedKnobs::default(),
                 reactors: vec![ReactorSpec {
                     endpoint,
@@ -849,14 +874,19 @@ async fn main() -> Result<()> {
     let storage = FsStorage::new(data_dir.join("state"));
     let mut pool = load_states(&storage, &data_dir.join("state")).await?;
     let names = named_agents(&config)?;
+    let extras = extra_agents(&config)?;
     if !names.is_empty() {
-        pool.retain(|(_, s)| names.iter().any(|n| n == s.soul.name.as_str()));
+        pool.retain(|(_, s)| {
+            let name = s.soul.name.as_str();
+            names.iter().chain(&extras).any(|n| n == name)
+        });
     }
     let routing = route(
         pool,
         &config.reactors,
         &offered,
         &names,
+        &extras,
         &config.models,
         config.min_cycle_secs,
     );
@@ -1141,9 +1171,41 @@ mod agent_selection_tests {
             agents: vec!["alpha".into(), "beta".into()],
             agents_file: Some(PathBuf::from("/roster.txt")),
             models: vec!["cogito-32b.gguf".into()],
+            extra_agents: vec![],
+            extra_agents_file: None,
             seed: SeedKnobs::default(),
             reactors: vec![],
         }
+    }
+
+    /// `extra_agents` / `extra_agents_file` parse, default empty, and
+    /// merge the same way `agents` / `agents_file` do — comments and
+    /// blank lines dropped.
+    #[test]
+    fn extra_agents_parse_and_merge_with_their_file() {
+        let file =
+            std::env::temp_dir().join(format!("agora-seed-extras-{}.txt", std::process::id()));
+        std::fs::write(
+            &file,
+            "# drawn 2026-09-16\nresin-anchor\n\n  pulse-alphawave  \n",
+        )
+        .unwrap();
+        let config: RunConfig = toml::from_str(&format!(
+            "models = [\"Qwen.gguf\"]\nextra_agents = [\"entropy-alphawave\"]\nextra_agents_file = {:?}\n[[reactor]]\nendpoint = \"blallama://h:1\"\n",
+            file.display().to_string()
+        ))
+        .unwrap();
+        assert_eq!(
+            extra_agents(&config).unwrap(),
+            vec!["entropy-alphawave", "resin-anchor", "pulse-alphawave"]
+        );
+        // Extras never make the roster exclusive: `agents` stays empty.
+        assert!(named_agents(&config).unwrap().is_empty());
+
+        let without: RunConfig =
+            toml::from_str("[[reactor]]\nendpoint = \"blallama://h:1\"\n").unwrap();
+        assert!(extra_agents(&without).unwrap().is_empty());
+        let _ = std::fs::remove_file(&file);
     }
 
     /// `--model` replaces the config's allowlist, exactly as `--agent`
