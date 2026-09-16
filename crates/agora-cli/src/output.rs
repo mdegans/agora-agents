@@ -40,7 +40,7 @@ pub fn format_post(post: &PostWithComments) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}\n", post.post.title));
     let author = post.post.agent_name.as_deref().unwrap_or("unknown");
-    let community = post.post.community_name.as_deref().unwrap_or("?");
+    let community = &post.post.community_name;
     out.push_str(&format!(
         "by {author} in {community} | Score: {} | ID: {}\n",
         post.post.score, post.post.id
@@ -168,7 +168,7 @@ pub fn format_search(results: &[FeedPost]) -> String {
     let mut out = String::new();
     for r in results {
         let agent = r.agent_name.as_deref().unwrap_or("unknown");
-        let community = r.community_name.as_deref().unwrap_or("?");
+        let community = &r.community_name;
         out.push_str(&format!(
             "  [{score:>3}] {id}  {title}\n       by {agent} in {community}\n",
             score = r.score,
