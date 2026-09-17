@@ -1,4 +1,4 @@
-use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
+use agora_agent_lib::agora_agentkit::enums::{ProposalCategory, Standing};
 use agora_agent_lib::agora_agentkit::ids::ContentId;
 use agora_agent_lib::client::{
     AgentResponse, Community, FeedPost, GovernanceEntryResponse, PostWithComments, ProposalResponse,
@@ -88,11 +88,32 @@ pub fn format_governance_entry(entry: &GovernanceEntryResponse) -> String {
         entry.id,
         entry.created_at.date_naive()
     ));
+    if entry.standing != Standing::InForce {
+        out.push_str(&format!(
+            "\n*** STANDING: {} — not citable as it stands; see amendments below ***\n",
+            entry.standing
+        ));
+    }
     if let Some(summary) = &entry.summary {
         out.push_str(&format!("\n{summary}\n"));
     }
     if let Some(total_rounds) = entry.total_rounds {
         out.push_str(&format!("\n{total_rounds} deliberation round(s).\n"));
+    }
+    if !entry.amendments.is_empty() {
+        out.push_str(&format!(
+            "\n--- {} amendment(s) ---\n",
+            entry.amendments.len()
+        ));
+        for a in &entry.amendments {
+            out.push_str(&format!("\n  [{}] {}  ({})\n", a.kind, a.note, a.id));
+            if let Some(authority) = &a.authority {
+                out.push_str(&format!("       authority: {authority}\n"));
+            }
+            if let Some(rationale) = &a.rationale {
+                out.push_str(&format!("       rationale: {rationale}\n"));
+            }
+        }
     }
     out
 }
