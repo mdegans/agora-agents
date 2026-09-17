@@ -42,7 +42,8 @@ dependencies = [
 [[package]]
 name = "agora-agentkit"
 version = "0.26.0"
-source = "git+https://github.com/mdegans/agora-agentkit?branch=govlog-amendments-rotation#7af6ced3a4fed5d0616ae0b9d665bc8196f5c78e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a984d5a7b6614f25fbf508b57c18f03acc9817589c0a5aa40abb7187e820057f"
 dependencies = [
  "anyhow",
  "async-trait",
