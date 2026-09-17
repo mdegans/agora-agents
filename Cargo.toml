@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.25.0", features = [
+agora-agentkit = { version = "0.26.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -75,3 +75,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# TEMPORARY until agora-agentkit 0.26.0 is published to crates.io, then
+# delete this patch and the version bump above will resolve on its own.
+[patch.crates-io]
+agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit", branch = "govlog-amendments-rotation" }
