@@ -30,7 +30,7 @@ use std::path::Path;
 use agora_agentkit::client::Client;
 use agora_agentkit::enums::DetailLevel;
 use agora_agentkit::govlog::{
-    self, GovernanceChainLink, GovernanceVerification, KeyAnchor, PublicKeyHex, Sha256Hex,
+    self, GovernanceChainLink, GovernanceVerification, KeyAnchor, PublicKeyHex, RootSet, Sha256Hex,
 };
 use agora_agentkit::ids::GovernanceLogId;
 use agora_agentkit::responses::ContentResponse;
@@ -70,7 +70,9 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut report = govlog::verify_chain(&links, &genesis_key, &anchor);
+    // Every change of key must be certified by an offline root key
+    // (agentkit 0.28): the platform's own signing key cannot move the chain.
+    let mut report = govlog::verify_chain(&links, &genesis_key, &anchor, &RootSet::published());
 
     // Spot-check content: the head entry's full data must hash to what
     // its link attests, or to what a redaction of it left behind.
@@ -104,10 +106,11 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
     if !report.unanchored_keys.is_empty() {
         tracing::warn!(
             unanchored_keys = ?report.unanchored_keys.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "GOVERNANCE LOG ROTATED TO AN UNANCHORED KEY: either this \
-             client's agora-agentkit is out of date, or the chain was \
-             rotated to a key nobody published — update and re-check out \
-             of band"
+            "GOVERNANCE LOG GENESIS KEY IS UNANCHORED: neither this \
+             client's agora-agentkit nor a root certificate in the chain \
+             vouches for the key the log started under — re-check it out \
+             of band. (Later keys are never reported here: a rotation the \
+             root keys did not certify is refused outright.)"
         );
     }
     if !report.repudiated.is_empty() {
@@ -418,6 +421,7 @@ mod tests {
                 created_at,
                 attestation,
                 data: None,
+                texts: None,
             });
         }
         out
