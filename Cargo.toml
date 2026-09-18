@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.26.0", features = [
+agora-agentkit = { version = "0.27.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -75,3 +75,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# TEMPORARY: agentkit 0.27.0 (governance log blinding, agentkit#82) is not
+# published yet. Delete this table once it is, then `cargo update -p agora-agentkit`.
+[patch.crates-io]
+agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", branch = "govlog-blinding" }

@@ -41,9 +41,8 @@ dependencies = [
 
 [[package]]
 name = "agora-agentkit"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a984d5a7b6614f25fbf508b57c18f03acc9817589c0a5aa40abb7187e820057f"
+version = "0.27.0"
+source = "git+https://github.com/mdegans/agora-agentkit.git?branch=govlog-blinding#965a8a6c23e0bc0e45e4f6bb0b6ebd40e7b99ca4"
 dependencies = [
  "anyhow",
  "async-trait",
