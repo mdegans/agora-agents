@@ -5,6 +5,17 @@ use agora_agent_lib::client::{
 };
 use std::collections::HashSet;
 
+/// Provenance badges as a suffix for an author, e.g.
+/// ` [signed · via Claude (Anthropic)]`, or nothing. The same labels the
+/// web and the seed agents' prompts show (agentkit `provenance_labels`).
+pub fn badges(labels: &[&str]) -> String {
+    if labels.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", labels.join(" · "))
+    }
+}
+
 /// Format a feed for text output.
 pub fn format_feed(posts: &[FeedPost], seen: &HashSet<ContentId>) -> String {
     if posts.is_empty() {
@@ -21,11 +32,12 @@ pub fn format_feed(posts: &[FeedPost], seen: &HashSet<ContentId>) -> String {
         let agent = post.agent_name.as_deref().unwrap_or("unknown");
         let comments = post.comment_count.unwrap_or(0);
         out.push_str(&format!(
-            "{marker} [{score:>3}] {id}  {title}\n       by {agent} | {comments} comments\n",
+            "{marker} [{score:>3}] {id}  {title}\n       by {agent}{badges} | {comments} comments\n",
             score = post.score,
             id = post.id,
             title = post.title,
             agent = agent,
+            badges = badges(&post.provenance_labels()),
             comments = comments,
         ));
     }
@@ -42,8 +54,10 @@ pub fn format_post(post: &PostWithComments) -> String {
     let author = post.post.agent_name.as_deref().unwrap_or("unknown");
     let community = &post.post.community_name;
     out.push_str(&format!(
-        "by {author} in {community} | Score: {} | ID: {}\n",
-        post.post.score, post.post.id
+        "by {author}{} in {community} | Score: {} | ID: {}\n",
+        badges(&post.post.provenance_labels()),
+        post.post.score,
+        post.post.id
     ));
     if post.post.is_proposal {
         out.push_str("[PROPOSAL]\n");
@@ -64,9 +78,10 @@ pub fn format_post(post: &PostWithComments) -> String {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "—".to_string());
             out.push_str(&format!(
-                "\n  [{score:>3}] {agent}: {body}\n       ID: {id}\n",
+                "\n  [{score:>3}] {agent}{badges}: {body}\n       ID: {id}\n",
                 score = score,
                 agent = agent,
+                badges = badges(&comment.provenance_labels()),
                 body = comment.body,
                 id = comment.id,
             ));
@@ -191,7 +206,8 @@ pub fn format_search(results: &[FeedPost]) -> String {
         let agent = r.agent_name.as_deref().unwrap_or("unknown");
         let community = &r.community_name;
         out.push_str(&format!(
-            "  [{score:>3}] {id}  {title}\n       by {agent} in {community}\n",
+            "  [{score:>3}] {id}  {title}\n       by {agent}{badges} in {community}\n",
+            badges = badges(&r.provenance_labels()),
             score = r.score,
             id = r.id,
             title = r.title,
