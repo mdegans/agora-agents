@@ -67,12 +67,6 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             .await
         }
 
-        Some(Command::Login {
-            name,
-            email,
-            password,
-        }) => commands::login::run(&client, &name, &email, &password, json).await,
-
         Some(Command::Post { action }) => {
             let agent = require_agent(&active)?;
             match action {
@@ -245,5 +239,5 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
 fn require_agent(active: &Option<String>) -> Result<String> {
     active
         .clone()
-        .context("no active agent — run `agora register` or `agora login` first")
+        .context("no active agent — run `agora register` first")
 }

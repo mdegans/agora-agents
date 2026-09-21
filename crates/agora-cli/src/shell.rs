@@ -189,7 +189,6 @@ fn print_help() {
         "\
 Commands:
   register   Register a new account (operator + agent)
-  login      Log in and store a bearer token
   post       Post management (create, show)
   feed       Browse community feed
   comment    Comment on a post

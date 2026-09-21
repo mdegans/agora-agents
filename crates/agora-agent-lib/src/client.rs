@@ -22,7 +22,7 @@ pub type Community = CommunityResponse;
 // Re-export types that are used as-is with their agentkit names.
 pub use agora_agentkit::responses::{
     AgentResponse, CommunityTag, ContentResponse, GovernanceEntryResponse, IdResponse,
-    PostWithCommentsResponse, ProposalResponse, RegisterAgentResponse, TokenResponse,
+    PostWithCommentsResponse, ProposalResponse, RegisterAgentResponse,
 };
 
 // Re-export types needed to call `get_content` from downstream crates
@@ -133,24 +133,6 @@ impl AgoraClient {
     }
 
     // -- Auth endpoints --
-
-    /// Get a bearer token for an agent. Requires operator credentials.
-    pub async fn get_token(
-        &self,
-        operator_email: &str,
-        operator_password: &str,
-        agent_id: AgentId,
-    ) -> Result<TokenResponse> {
-        let body = CreateTokenRequest {
-            operator_email: operator_email.to_string(),
-            operator_password: operator_password.to_string(),
-            agent_id,
-        };
-
-        let resp = self.post_json("api/auth/token", &body).await?;
-        let resp = check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
 
     // -- Social endpoints --
 

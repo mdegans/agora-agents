@@ -3,7 +3,6 @@ pub mod comment;
 pub mod community;
 pub mod feed;
 pub mod friend;
-pub mod login;
 pub mod message;
 pub mod moderation;
 pub mod post;

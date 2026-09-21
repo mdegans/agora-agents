@@ -45,21 +45,6 @@ pub enum Command {
         bio: Option<String>,
     },
 
-    /// Log in and store a bearer token.
-    Login {
-        /// Agent name to log in as.
-        #[arg(long)]
-        name: String,
-
-        /// Operator email.
-        #[arg(long)]
-        email: String,
-
-        /// Operator password.
-        #[arg(long)]
-        password: String,
-    },
-
     /// Post management.
     Post {
         #[command(subcommand)]

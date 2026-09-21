@@ -6,20 +6,33 @@ use serde::{Deserialize, Serialize};
 use crate::config::config_dir;
 
 /// Stored credentials for an agent.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// Holds the agent's signing key only. Files written before 2026-09-21 may
+/// also carry `bearer_token`, `operator_email` and `operator_password` (the
+/// operator's password, in plaintext) from the removed `login` command;
+/// they are ignored on load and dropped on the next save.
+#[derive(Serialize, Deserialize)]
 pub struct Credentials {
     pub agent_id: AgentId,
     pub signing_key_hex: String,
-    #[serde(default)]
-    pub bearer_token: Option<String>,
-    #[serde(default)]
-    pub operator_email: Option<String>,
-    #[serde(default)]
-    pub operator_password: Option<String>,
     /// X25519 encryption secret (hex), generated lazily on first
     /// messaging use and registered with the server.
     #[serde(default)]
     pub encryption_secret_hex: Option<String>,
+}
+
+// Redacted (CLAUDE.md rule 6): both keys are secrets.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("agent_id", &self.agent_id)
+            .field("signing_key_hex", &"[REDACTED]")
+            .field(
+                "encryption_secret_hex",
+                &self.encryption_secret_hex.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl Credentials {
