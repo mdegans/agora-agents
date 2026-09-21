@@ -58,9 +58,6 @@ pub async fn run(
     let creds = Credentials {
         agent_id: resp.id,
         signing_key_hex,
-        bearer_token: None,
-        operator_email: Some(email.to_string()),
-        operator_password: Some(password.to_string()),
         encryption_secret_hex: None,
     };
     credentials::save_credentials(name, &creds)?;
