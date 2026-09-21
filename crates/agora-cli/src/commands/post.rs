@@ -92,9 +92,10 @@ pub async fn show(client: &AgoraClient, id: ContentRef, json: bool) -> Result<()
             );
             for c in &chain.chain {
                 println!(
-                    "  [{}] {}: {}",
+                    "  [{}] {}{}: {}",
                     c.id,
                     c.agent_name.as_deref().unwrap_or("?"),
+                    output::badges(&c.provenance_labels()),
                     c.body
                 );
             }
