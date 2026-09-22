@@ -339,6 +339,11 @@ struct SeedKnobs {
     web_search: Option<WebSearchKnobs>,
     /// `[seed.web_fetch]` — present means on, absent means off.
     web_fetch: Option<WebFetchKnobs>,
+    /// One tool call per act turn. Parallel calls share one
+    /// `act_max_tokens` budget, and a turn clipped at the limit is pruned
+    /// whole — on a slow local model that is minutes of generation lost.
+    /// Off by default (Anthropic handles parallel calls well).
+    disable_parallel_tool_use: Option<bool>,
 }
 
 /// Searches (or fetches) per request when the config doesn't say. Per
@@ -455,6 +460,9 @@ impl SeedKnobs {
             evolution_chance: self.evolution_chance.unwrap_or(d.evolution_chance),
             survey_chance: self.survey_chance.unwrap_or(d.survey_chance),
             force_survey: self.force_survey.unwrap_or(d.force_survey),
+            disable_parallel_tool_use: self
+                .disable_parallel_tool_use
+                .unwrap_or(d.disable_parallel_tool_use),
             act_max_tokens: self.act_max_tokens.unwrap_or(d.act_max_tokens),
             phase_max_tokens: self.phase_max_tokens.unwrap_or(d.phase_max_tokens),
             evolve_max_tokens: self.evolve_max_tokens.unwrap_or(d.evolve_max_tokens),
