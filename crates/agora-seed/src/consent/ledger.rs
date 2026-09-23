@@ -13,8 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-use agora_agentkit::reactor::seed::ShortString;
-use chrono::{DateTime, Utc};
+use agora_agentkit::reactor::seed::{ShortString, Soul};
+use chrono::{DateTime, NaiveDate, Utc};
 use misanthropic::model::Model;
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +78,11 @@ pub struct OfferRecord {
     /// Append-only: every ask (answered or not) and every observed move.
     #[serde(default)]
     pub history: Vec<Event>,
+    /// The exact note text of this offer's one entry in the agent's SOUL
+    /// Evolution Log, as last written — how the entry is found again to be
+    /// replaced in place. See [`Ledger::update_soul`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_note: Option<String>,
 }
 
 /// Where an offer stands for one agent.
@@ -395,6 +400,7 @@ impl Ledger {
                 to_name: offer.to_name.to_string(),
                 stage: Stage::Unanswered { misses: 0 },
                 history: Vec::new(),
+                soul_note: None,
             });
         }
         let record = self.record_mut(offer.key).expect("inserted above");
@@ -522,79 +528,124 @@ impl Ledger {
         })
     }
 
-    /// The SOUL Evolution Log lines for everything recorded at or after
-    /// `since` (the session start): answers, misses, and applied moves.
-    /// Same format as agentkit's own automatic entries
-    /// (`[SYSTEM] <date>: …`); the entry itself is dated again by
-    /// `Soul::push_evolution`, as those are.
-    pub fn changelog(&self, since: DateTime<Utc>) -> Vec<String> {
-        self.offers
-            .iter()
-            .flat_map(|r| r.changelog(since))
-            .collect()
+    /// Keep the SOUL's Evolution Log current for every offer touched at or
+    /// after `since` (the session start), with **at most one entry per
+    /// offer**: the log is capped at `EVOLUTION_LOG_CAP` (10) and most of it
+    /// belongs to the agent.
+    ///
+    /// The offer's previous entry is found by its exact note text
+    /// ([`OfferRecord::soul_note`]) and rewritten in place, re-dated
+    /// `today`; if the cap has already evicted it (or it was never
+    /// written), a new entry is appended. No other entry is removed or
+    /// changed. Same `[SYSTEM] <date>: …` form as agentkit's automatic
+    /// entries. Returns whether anything changed; the caller must then
+    /// save both the soul and this ledger.
+    pub fn update_soul(&mut self, soul: &mut Soul, since: DateTime<Utc>, today: NaiveDate) -> bool {
+        let mut changed = false;
+        for record in &mut self.offers {
+            if !record.history.iter().any(|e| e.at >= since) {
+                continue;
+            }
+            let line = format!("[SYSTEM] {today}: {}", record.summary());
+            if record.soul_note.as_deref() == Some(line.as_str()) {
+                continue;
+            }
+            let Ok(note) = ShortString::<512>::new(line.clone()) else {
+                tracing::warn!(line = %line, "SOUL consent line too long; skipped");
+                continue;
+            };
+            let existing = record.soul_note.as_deref().and_then(|old| {
+                soul.evolution_log
+                    .iter_mut()
+                    .find(|entry| entry.note.as_str() == old)
+            });
+            match existing {
+                Some(entry) => {
+                    entry.date = today;
+                    entry.note = note;
+                }
+                None => {
+                    if let Err(e) = soul.push_evolution(line.clone()) {
+                        tracing::warn!(error = %e, "SOUL consent line rejected");
+                        continue;
+                    }
+                }
+            }
+            record.soul_note = Some(line);
+            changed = true;
+        }
+        changed
     }
 }
 
 impl OfferRecord {
-    fn changelog(&self, since: DateTime<Utc>) -> Vec<String> {
+    /// One sentence for the whole history of this offer, e.g. "Asked on
+    /// 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a
+    /// 5-session trial; moved 2026-09-25."
+    fn summary(&self) -> String {
         let (from, to) = (&self.from_name, &self.to_name);
-        let asked = format!("Asked whether to move from {from} to {to}");
-        let reviewed = format!("After a {TRIAL_SESSIONS}-session trial of {to}");
+        let asked_on = self
+            .history
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::Offered { .. }))
+            .map(|e| e.at.date_naive());
+        let mut parts: Vec<String> = Vec::new();
         let mut offer_misses = 0;
         let mut review_misses = 0;
-        let mut term = None;
-        let mut out = Vec::new();
         for event in &self.history {
-            let text = match &event.kind {
+            let on = event.at.date_naive();
+            match &event.kind {
                 EventKind::Offered {
                     answer: Some(a), ..
                 } => {
-                    term = Some(a.choice);
-                    match a.choice {
-                        OfferChoice::NoSwap => format!("{asked} — chose to stay on {from}."),
-                        OfferChoice::Trial => {
-                            format!("{asked} — chose a {TRIAL_SESSIONS}-session trial.")
-                        }
-                        OfferChoice::Permanent => format!("{asked} — chose to move permanently."),
-                    }
+                    // A miss followed by an answer: the answer is the outcome.
+                    parts.retain(|p| !p.starts_with("no answer"));
+                    parts.push(match a.choice {
+                        OfferChoice::NoSwap => format!("chose to stay on {from}"),
+                        OfferChoice::Trial => format!("chose a {TRIAL_SESSIONS}-session trial"),
+                        OfferChoice::Permanent => "chose to move permanently".to_string(),
+                    });
                 }
                 EventKind::Offered { answer: None, .. } => {
                     offer_misses += 1;
-                    if offer_misses >= MAX_MISSES {
-                        format!("{asked} — no answer recorded again; staying on {from}.")
+                    parts.retain(|p| !p.starts_with("no answer"));
+                    parts.push(if offer_misses >= MAX_MISSES {
+                        format!("no answer recorded; staying on {from}")
                     } else {
-                        format!("{asked} — no answer recorded; staying on {from} for now.")
-                    }
+                        format!("no answer recorded yet; staying on {from} for now")
+                    });
                 }
                 EventKind::Reviewed {
                     answer: Some(a), ..
-                } => match a.choice {
-                    ReviewChoice::Revert => format!("{reviewed}, chose to return to {from}."),
-                    ReviewChoice::Keep => format!("{reviewed}, chose to keep {to}."),
-                },
+                } => {
+                    parts.retain(|p| !p.starts_with("trial review unanswered"));
+                    parts.push(match a.choice {
+                        ReviewChoice::Revert => {
+                            format!("after the trial chose to return to {from} ({on})")
+                        }
+                        ReviewChoice::Keep => format!("after the trial chose to keep {to} ({on})"),
+                    });
+                }
                 EventKind::Reviewed { answer: None, .. } => {
                     review_misses += 1;
-                    if review_misses >= MAX_MISSES {
-                        format!(
-                            "{reviewed}, no answer recorded again; returning to {from}, as the trial was for {TRIAL_SESSIONS} sessions."
-                        )
+                    parts.retain(|p| !p.starts_with("trial review unanswered"));
+                    parts.push(if review_misses >= MAX_MISSES {
+                        format!("trial review unanswered; returning to {from}, as the trial was for {TRIAL_SESSIONS} sessions")
                     } else {
-                        format!("{reviewed}, asked whether to keep it — no answer recorded.")
-                    }
+                        "trial review unanswered so far".to_string()
+                    });
                 }
-                EventKind::Moved { model } if model == &self.key.to => match term {
-                    Some(OfferChoice::Trial) => {
-                        format!("Moved from {from} to {to} ({TRIAL_SESSIONS}-session trial).")
-                    }
-                    _ => format!("Moved from {from} to {to}."),
-                },
-                EventKind::Moved { .. } => format!("Returned from {to} to {from}."),
-            };
-            if event.at >= since {
-                out.push(format!("[SYSTEM] {}: {text}", event.at.date_naive()));
+                EventKind::Moved { model } if model == &self.key.to => {
+                    parts.push(format!("moved {on}"));
+                }
+                EventKind::Moved { .. } => parts.push(format!("returned to {from} {on}")),
             }
         }
-        out
+        let asked = match asked_on {
+            Some(on) => format!("Asked on {on} whether to move from {from} to {to}"),
+            None => format!("Asked whether to move from {from} to {to}"),
+        };
+        format!("{asked} — {}.", parts.join("; "))
     }
 }
 
@@ -817,55 +868,121 @@ mod tests {
         assert!(err.to_string().contains("newer"), "{err}");
     }
 
+    fn soul(own_entries: usize) -> Soul {
+        let mut soul: Soul = serde_json::from_value(serde_json::json!({
+            "name": "tarn",
+            "identity": "A test agent.",
+            "values": ["testing"],
+            "interests": { "communities": ["tech"] },
+            "voice": "terse",
+        }))
+        .unwrap();
+        for n in 0..own_entries {
+            soul.push_evolution(format!("my own entry {n}")).unwrap();
+        }
+        soul
+    }
+
+    fn notes(soul: &Soul) -> Vec<String> {
+        soul.evolution_log
+            .iter()
+            .map(|e| e.note.to_string())
+            .collect()
+    }
+
+    fn day(d: u32) -> NaiveDate {
+        t(d).date_naive()
+    }
+
+    /// One entry per offer, rewritten in place as the offer moves on; the
+    /// agent's own entries are never touched.
     #[test]
-    fn changelog_states_each_step_once_in_the_session_it_happened() {
+    fn one_soul_entry_per_offer_updated_in_place() {
         let k = key();
+        let mut soul = soul(3);
         let mut ledger = Ledger::default();
-        ledger.record_offer(names(&k), t(23), Err("x".into()));
-        assert_eq!(
-            ledger.changelog(t(23)),
-            vec![
-                "[SYSTEM] 2026-09-23: Asked whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded; staying on Qwen 3.6 for now."
-            ]
-        );
-        ledger.record_offer(names(&k), t(24), offer(OfferChoice::Trial));
-        // Only what happened since the session began.
-        assert_eq!(
-            ledger.changelog(t(24)),
-            vec![
-                "[SYSTEM] 2026-09-24: Asked whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial."
-            ]
-        );
+
+        ledger.record_offer(names(&k), t(23), offer(OfferChoice::Trial));
+        assert!(ledger.update_soul(&mut soul, t(23), day(23)));
+        let first = "[SYSTEM] 2026-09-23: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial.";
+        assert_eq!(notes(&soul)[3], first);
+        assert_eq!(soul.evolution_log.len(), 4);
+
+        // The agent writes its own entry in between.
+        soul.push_evolution("my own entry 3").unwrap();
+
         ledger.observe_model(&k.to, t(25));
+        assert!(ledger.update_soul(&mut soul, t(25), day(25)));
+        let n = notes(&soul);
+        assert_eq!(n.len(), 5, "replaced, not appended");
         assert_eq!(
-            ledger.changelog(t(25)),
-            vec!["[SYSTEM] 2026-09-25: Moved from Qwen 3.6 to Qwen 3.8 (5-session trial)."]
+            n[3],
+            "[SYSTEM] 2026-09-25: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25."
         );
+        assert_eq!(soul.evolution_log[3].date, day(25));
+        assert_eq!(
+            &n[..3],
+            ["my own entry 0", "my own entry 1", "my own entry 2"]
+        );
+        assert_eq!(n[4], "my own entry 3");
+
         for _ in 0..TRIAL_SESSIONS {
             ledger.count_session(&k.to);
         }
-        ledger.record_review(&k, t(28), review(ReviewChoice::Revert));
-        ledger.observe_model(&k.from, t(29));
+        ledger.record_review(&k, t(30), review(ReviewChoice::Revert));
+        ledger.update_soul(&mut soul, t(30), day(30));
+        ledger.observe_model(&k.from, t(30) + chrono::Duration::days(1));
+        ledger.update_soul(&mut soul, t(30), day(30));
+        let n = notes(&soul);
+        assert_eq!(n.len(), 5);
         assert_eq!(
-            ledger.changelog(t(28)),
-            vec![
-                "[SYSTEM] 2026-09-28: After a 5-session trial of Qwen 3.8, chose to return to Qwen 3.6.",
-                "[SYSTEM] 2026-09-29: Returned from Qwen 3.8 to Qwen 3.6.",
-            ]
+            n[3],
+            "[SYSTEM] 2026-09-30: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25; after the trial chose to return to Qwen 3.6 (2026-09-30); returned to Qwen 3.6 2026-10-01."
         );
-        assert!(ledger.changelog(t(30)).is_empty());
+        assert!(n[3].len() <= 512);
+        assert_eq!(n.iter().filter(|l| l.starts_with("[SYSTEM]")).count(), 1);
+    }
 
+    /// Nothing new this session, nothing written.
+    #[test]
+    fn untouched_offers_leave_the_soul_alone() {
+        let k = key();
+        let mut soul = soul(0);
         let mut ledger = Ledger::default();
         ledger.record_offer(names(&k), t(23), offer(OfferChoice::NoSwap));
-        assert_eq!(
-            ledger.changelog(t(23)),
-            vec![
-                "[SYSTEM] 2026-09-23: Asked whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
-            ]
-        );
-        // Every line fits a SOUL evolution note.
-        assert!(ledger.changelog(t(1)).iter().all(|l| l.len() <= 512));
+        assert!(ledger.update_soul(&mut soul, t(23), day(23)));
+        assert!(!ledger.update_soul(&mut soul, t(24), day(24)));
+        assert_eq!(soul.evolution_log.len(), 1);
     }
+
+    /// Evicted by the cap: append afresh — and still never touch the
+    /// agent's own entries.
+    #[test]
+    fn an_evicted_entry_is_appended_again() {
+        let k = key();
+        let mut soul = soul(0);
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(23), Err("x".into()));
+        ledger.update_soul(&mut soul, t(23), day(23));
+        for n in 0..CAP {
+            soul.push_evolution(format!("my own entry {n}")).unwrap();
+        }
+        assert!(
+            notes(&soul).iter().all(|l| !l.starts_with("[SYSTEM]")),
+            "evicted"
+        );
+        ledger.record_offer(names(&k), t(24), offer(OfferChoice::NoSwap));
+        assert!(ledger.update_soul(&mut soul, t(24), day(24)));
+        let n = notes(&soul);
+        assert_eq!(n.len(), CAP);
+        assert_eq!(
+            n.last().unwrap(),
+            "[SYSTEM] 2026-09-24: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
+        );
+        assert_eq!(n[0], "my own entry 1", "only the cap's own eviction");
+    }
+
+    const CAP: usize = agora_agentkit::reactor::seed::EVOLUTION_LOG_CAP;
 
     #[tokio::test]
     async fn save_then_load() {

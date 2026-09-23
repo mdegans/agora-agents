@@ -18,13 +18,15 @@
 //! attempts run out it is no answer (= stay), recorded and warned, and the
 //! ledger decides whether to ask again next session (once).
 //!
-//! **SOUL changelog.** Each recorded answer and each applied move adds one
-//! automatic `[SYSTEM]` line to the SOUL's Evolution Log — the place
-//! agentkit already notes deep mutations — so the agent knows what it
-//! chose. Never its memory. The wrapper has no mutable access to the inner
-//! agent's state, so at teardown (after the inner teardown, before the
-//! reactor persists) it takes a copy of that state with the lines appended
-//! and serves the copy from [`Agent::state`], which is what gets saved.
+//! **SOUL changelog.** Each offer keeps exactly one automatic `[SYSTEM]`
+//! entry in the SOUL's Evolution Log — the place agentkit already notes
+//! deep mutations — summarising where it stands, rewritten in place as it
+//! moves on (the log is capped at 10 and mostly the agent's own), so the
+//! agent knows what it chose. Never its memory. The wrapper has no mutable
+//! access to the inner agent's state, so at teardown (after the inner
+//! teardown, before the reactor persists) it takes a copy of that state
+//! with the entry updated and serves the copy from [`Agent::state`], which
+//! is what gets saved.
 
 use std::sync::Arc;
 
@@ -383,11 +385,17 @@ where
         Ok(Control::Done(Outcome::Complete))
     }
 
-    /// Copy the inner state with this session's changelog lines appended to
-    /// the SOUL's Evolution Log. `None` when there is nothing to add.
-    fn patch_soul(&self) -> Option<SeedState> {
-        let lines = self.ledger.as_ref()?.changelog(self.started);
-        if lines.is_empty() {
+    /// Copy the inner state with this session's consent line(s) written
+    /// into the SOUL's Evolution Log — one entry per offer, replaced in
+    /// place (see [`Ledger::update_soul`]). `None` when nothing changed.
+    fn patch_soul(&mut self) -> Option<SeedState> {
+        let started = self.started;
+        let ledger = self.ledger.as_mut()?;
+        if !ledger
+            .offers
+            .iter()
+            .any(|r| r.history.iter().any(|e| e.at >= started))
+        {
             return None;
         }
         // `SeedState` isn't `Clone`; its serde form is exactly what the
@@ -400,20 +408,16 @@ where
                 tracing::error!(
                     agent_id = %self.inner.id(),
                     error = %e,
-                    "could not copy state for the SOUL changelog; lines dropped"
+                    "could not copy state for the SOUL consent line; skipped"
                 );
                 return None;
             }
         };
-        for line in lines {
-            if let Err(e) = state.soul.push_evolution(line) {
-                tracing::warn!(
-                    agent_id = %self.inner.id(),
-                    error = %e,
-                    "SOUL changelog line rejected"
-                );
-            }
+        if !ledger.update_soul(&mut state.soul, started, Utc::now().date_naive()) {
+            return None;
         }
+        // The ledger now remembers the line's exact text.
+        self.dirty = true;
         Some(state)
     }
 }
@@ -984,11 +988,11 @@ mod tests {
         };
         assert!(failure.contains("after 3 attempts"), "{failure}");
         assert!(h.queue().is_empty());
+        let today = Utc::now().date_naive();
         assert_eq!(
             evolution_notes(&agent).last().unwrap(),
             &format!(
-                "[SYSTEM] {}: Asked whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded; staying on Qwen 3.6 for now.",
-                Utc::now().date_naive()
+                "[SYSTEM] {today}: Asked on {today} whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded yet; staying on Qwen 3.6 for now."
             )
         );
     }
@@ -1060,7 +1064,7 @@ mod tests {
         assert_eq!(notes.len(), before + 1);
         assert!(
             notes.last().unwrap().ends_with(
-                "Asked whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
+                "whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
             ),
             "{notes:?}"
         );

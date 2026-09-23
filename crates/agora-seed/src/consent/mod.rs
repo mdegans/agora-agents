@@ -15,9 +15,9 @@
 //!   tail (reflect → mutate/evolve → survey) it leaves untouched, and asks
 //!   one more question after it: the offer, or a trial's review.
 //! - [`ledger`] — the per-agent record, `state/<agent_id>/model_consent.json`.
-//!   Never the agent's memory. Each answer and each applied move also
-//!   gets one automatic `[SYSTEM]` line in the SOUL's Evolution Log, the
-//!   same place agentkit notes a deep mutation.
+//!   Never the agent's memory. Each offer also keeps one automatic
+//!   `[SYSTEM]` entry in the SOUL's Evolution Log (the same place agentkit
+//!   notes a deep mutation), rewritten in place as the offer moves on.
 //! - [`queue`] — the changes agents asked for, for the Steward to apply
 //!   with `set_model` + `sync-models`.
 //!
