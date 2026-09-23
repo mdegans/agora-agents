@@ -125,7 +125,14 @@ where
     /// ask whatever is due. `None` means nothing is — the session ends.
     async fn close(&mut self) -> Result<Option<Control>, A::Error> {
         let model = self.model();
-        let offer_key = self.rt.offer.as_ref().map(|o| o.key());
+        // An allowlisted offer simply isn't on the table for anyone else.
+        let name = &self.inner.state().soul.name;
+        let offer_key = self
+            .rt
+            .offer
+            .as_ref()
+            .filter(|o| o.admits(name))
+            .map(|o| o.key());
         let Some(ledger) = self.ledger.as_mut() else {
             return Ok(None);
         };
@@ -146,6 +153,7 @@ where
                     to_name: offer.target_name(),
                     description: &offer.description,
                     remind,
+                    limited: offer.is_limited(),
                 });
                 self.seat_question(due, content, text::offer_schema())
                     .map(Some)
@@ -430,7 +438,7 @@ mod tests {
     use crate::consent::ledger::{OfferKey, Stage, TRIAL_SESSIONS, Term};
     use crate::consent::queue::QueueEntry;
     use crate::consent::{ConsentConfig, ConsentRuntime, OfferConfig};
-    use agora_agentkit::reactor::seed::SeedError;
+    use agora_agentkit::reactor::seed::{SeedError, ShortString};
     use misanthropic::model::{Kind, Model};
 
     const OLD: &str = "Qwen3.6.gguf";
@@ -531,6 +539,10 @@ mod tests {
 
     impl Harness {
         fn new(tag: &str) -> Self {
+            Self::with_allowlist(tag, None)
+        }
+
+        fn with_allowlist(tag: &str, agents: Option<&[&str]>) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "agora-seed-consent-agent-{tag}-{}",
                 std::process::id()
@@ -543,6 +555,12 @@ mod tests {
                     from_name: Some("Qwen 3.6".into()),
                     to_name: Some("Qwen 3.8".into()),
                     description: "Qwen 3.8 is denser and slower.".into(),
+                    agents: agents.map(|names| {
+                        names
+                            .iter()
+                            .map(|n| ShortString::new(*n).unwrap())
+                            .collect()
+                    }),
                 }),
                 remind: false,
             };
@@ -645,6 +663,36 @@ mod tests {
         let queue = h.queue();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].change.to, Model::from(NEW));
+    }
+
+    /// Staging: under an allowlist only listed agents are asked, and the
+    /// question says "you", not "every agent on …".
+    #[tokio::test]
+    async fn an_allowlisted_offer_asks_only_listed_agents() {
+        let h = Harness::with_allowlist("unlisted", Some(&["aegis", "sentinel"]));
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "tarn is on the from-model but not listed"
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(!Ledger::path(&h.rt.state_dir.join(h.id.to_string())).exists());
+
+        let h = Harness::with_allowlist("listed", Some(&["aegis", "tarn"]));
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Continue
+        );
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains("You are being asked whether you would like to move to **Qwen 3.8**."),
+            "{q}"
+        );
+        assert!(!q.contains("Every agent"), "{q}");
     }
 
     #[tokio::test]

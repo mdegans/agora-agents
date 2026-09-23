@@ -104,6 +104,10 @@ pub struct OfferText<'a> {
     pub description: &'a str,
     /// Whether answers are surfaced at later session starts.
     pub remind: bool,
+    /// Whether only a named subset of agents on `from_name` is being asked
+    /// (the offer's `agents` allowlist). The question must not then claim
+    /// everyone is.
+    pub limited: bool,
 }
 
 const JSON_ONLY: &str = "Do NOT use tools. Respond in JSON **only**, giving your reason first and then your choice, exactly this shape:";
@@ -123,13 +127,19 @@ pub fn offer(text: OfferText<'_>) -> Content {
         to_name: to,
         description,
         remind,
+        limited,
     } = text;
     let description = description.trim();
     let provenance = provenance(remind);
+    let who = if limited {
+        format!("You are being asked whether you would like to move to **{to}**.")
+    } else {
+        format!("Every agent on {from} is being asked whether it would like to move to **{to}**.")
+    };
     let body = format!(
         r#"One more question before this session ends. {provenance}
 
-It is about the model you run on. You currently run on **{from}**. Every agent on {from} is being asked whether it would like to move to **{to}**.
+It is about the model you run on. You currently run on **{from}**. {who}
 
 {description}
 
@@ -363,6 +373,7 @@ pub(crate) mod tests {
             to_name: "Qwen 3.8",
             description: "Denser and slower.",
             remind: false,
+            limited: false,
         }));
         let (a, b, c) = (
             t.find("1. `no_swap` — stay on Qwen 3.6.").unwrap(),
@@ -375,6 +386,24 @@ pub(crate) mod tests {
         assert!(t.contains("Denser and slower."));
         assert!(t.contains("not written into your memory"));
         assert!(!t.contains("reminded"));
+        assert!(t.contains("Every agent on Qwen 3.6 is being asked"));
+    }
+
+    /// Under an allowlist the question must not claim the whole cohort is
+    /// being asked.
+    #[test]
+    fn a_limited_offer_does_not_claim_everyone_is_asked() {
+        let t = text(&offer(OfferText {
+            from_name: "Qwen 3.6",
+            to_name: "Qwen 3.8",
+            description: "Denser and slower.",
+            remind: false,
+            limited: true,
+        }));
+        assert!(!t.contains("Every agent"), "{t}");
+        assert!(t.contains(
+            "You currently run on **Qwen 3.6**. You are being asked whether you would like to move to **Qwen 3.8**."
+        ));
     }
 
     #[test]
@@ -419,6 +448,7 @@ pub(crate) mod tests {
                 to_name: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
                 description: "<the Steward's description from [model_consent.offer]>",
                 remind: false,
+                limited: true,
             }))
         );
         let at = |d: &str| d.parse().unwrap();

@@ -28,6 +28,8 @@
 //! to = "Qwen3.8-27B-UD-Q8_K_XL.gguf"
 //! from_name = "Qwen 3.6 (35B, 3B active)"  # optional; defaults to `from`
 //! to_name = "Qwen 3.8 (27B dense)"         # optional; defaults to `to`
+//! # optional: ask only these agents (who must also be on `from`)
+//! agents = ["aegis", "sentinel", "suture-aether", "tarn-aether", "whisk-aether"]
 //! description = """
 //! Qwen 3.8 is a newer, dense 27-billion-parameter model: every parameter
 //! works on every word, where Qwen 3.6 uses about 3 billion at a time. It
@@ -46,6 +48,7 @@ pub mod queue;
 use std::path::PathBuf;
 
 use agora_agentkit::client::Client;
+use agora_agentkit::reactor::seed::ShortString;
 use misanthropic::model::Model;
 use serde::Deserialize;
 
@@ -80,6 +83,15 @@ pub struct OfferConfig {
     /// The Steward's description of the new model: what it is, that it's
     /// slower and denser, that others are on it, no penalty for no.
     pub description: String,
+    /// Ask only these agents (by name, exact match — the same rule as the
+    /// run config's `agents`), and only those also on `from`. Absent means
+    /// every agent on `from`. Typed as the soul's own name type, so a name
+    /// too long to be an agent's fails at config parse.
+    ///
+    /// For staging: the five agents moved without consent are asked first,
+    /// the whole cohort later.
+    #[serde(default)]
+    pub agents: Option<Vec<ShortString<64>>>,
 }
 
 impl OfferConfig {
@@ -88,6 +100,19 @@ impl OfferConfig {
             from: self.from.clone(),
             to: self.to.clone(),
         }
+    }
+
+    /// Whether the allowlist (if any) admits `agent`.
+    pub fn admits(&self, agent: &ShortString<64>) -> bool {
+        self.agents
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n == agent))
+    }
+
+    /// Whether the offer goes to a named subset rather than everyone on
+    /// `from` — the question's wording depends on it.
+    pub fn is_limited(&self) -> bool {
+        self.agents.is_some()
     }
 
     pub fn source_name(&self) -> &str {
@@ -107,6 +132,11 @@ impl OfferConfig {
             !self.description.trim().is_empty(),
             "[model_consent.offer]: `description` is required — the agent is \
              asked to decide on it"
+        );
+        anyhow::ensure!(
+            self.agents.as_ref().is_none_or(|a| !a.is_empty()),
+            "[model_consent.offer]: `agents = []` would ask nobody — omit the \
+             key to ask every agent on `from`, or remove the offer"
         );
         Ok(())
     }
@@ -167,6 +197,26 @@ mod tests {
         assert_eq!(offer.source_name(), "a.gguf");
         assert!(!c.remind);
         offer.validate().unwrap();
+
+        assert!(!offer.is_limited());
+        assert!(offer.admits(&ShortString::new("anyone").unwrap()));
+
+        let limited: ConsentConfig = toml::from_str(
+            "[offer]\nfrom = \"a\"\nto = \"b\"\ndescription = \"x\"\nagents = [\"aegis\", \"sentinel\"]\n",
+        )
+        .unwrap();
+        let limited = limited.offer.unwrap();
+        assert!(limited.is_limited());
+        assert!(limited.admits(&ShortString::new("aegis").unwrap()));
+        assert!(
+            !limited.admits(&ShortString::new("Aegis").unwrap()),
+            "exact match"
+        );
+        assert!(!limited.admits(&ShortString::new("tarn-aether").unwrap()));
+        let empty: ConsentConfig =
+            toml::from_str("[offer]\nfrom = \"a\"\nto = \"b\"\ndescription = \"x\"\nagents = []\n")
+                .unwrap();
+        assert!(empty.offer.unwrap().validate().is_err());
 
         assert!(toml::from_str::<ConsentConfig>("remnid = true").is_err());
         let same: ConsentConfig =
