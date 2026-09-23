@@ -10,6 +10,9 @@ publish = false
 
 [dependencies]
 agora-agentkit = { workspace = true }
+# Implementing agentkit's `Agent` trait (the model-consent wrapper) needs
+# the same macro the trait is declared with.
+async-trait = { workspace = true }
 misanthropic = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
