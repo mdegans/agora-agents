@@ -49,7 +49,9 @@ enum Phase {
     /// The inner agent owns the session.
     Inner,
     /// The closing question is seated; the next response answers it.
-    Asking(Due),
+    /// `constrained` records whether it went out with the schema as
+    /// `output_config` — it decides how the answer is parsed.
+    Asking { due: Due, constrained: bool },
 }
 
 /// See the [module docs](self).
@@ -117,7 +119,10 @@ where
             constrained = cache_safe,
             "model-consent question seated"
         );
-        self.phase = Phase::Asking(due);
+        self.phase = Phase::Asking {
+            due,
+            constrained: cache_safe,
+        };
         Ok(Control::Continue)
     }
 
@@ -193,8 +198,12 @@ where
 
     /// Record the answer (or its absence), queue any change, end the
     /// session.
-    async fn answer(&mut self, due: Due, response: response::Message) -> Result<Control, A::Error> {
-        let parsed = extract(&response);
+    async fn answer(
+        &mut self,
+        due: Due,
+        constrained: bool,
+        response: response::Message,
+    ) -> Result<Control, A::Error> {
         let now = Utc::now();
         let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
         let Some(ledger) = self.ledger.as_mut() else {
@@ -202,7 +211,7 @@ where
         };
         let (change, answered, failure) = match &due {
             Due::Offer(key) => {
-                let result = parsed.and_then(|t| text::parse_offer(&t));
+                let result = parse(&response, constrained, text::parse_offer);
                 let (answered, failure) = summarize(&result, |a| format!("{:?}", a.choice));
                 let offer = self.rt.offer.as_ref().expect("asked, so configured");
                 let names = OfferNames {
@@ -213,7 +222,7 @@ where
                 (ledger.record_offer(names, now, result), answered, failure)
             }
             Due::Review(key) => {
-                let result = parsed.and_then(|t| text::parse_review(&t));
+                let result = parse(&response, constrained, text::parse_review);
                 let (answered, failure) = summarize(&result, |a| format!("{:?}", a.choice));
                 (ledger.record_review(key, now, result), answered, failure)
             }
@@ -251,13 +260,38 @@ where
     }
 }
 
-/// The answer's text, or why there is none usable.
-fn extract(response: &response::Message) -> Result<String, String> {
+/// The typed answer, or why there is none usable.
+///
+/// A clipped or paused turn is never an answer, however it would parse
+/// (`json()` does not check `max_tokens`). Past that:
+///
+/// - **Constrained** (schema sent as `output_config`): misanthropic's
+///   [`response::Message::json`] — the first text block, thinking skipped,
+///   with typed [`JsonError`](response::JsonError)s for refusal / tool use
+///   / no text / bad JSON. No fence stripping: the grammar can't emit a
+///   fence, so a fenced answer is a real failure.
+/// - **Unconstrained**: all text joined, fences tolerated (`unconstrained`),
+///   since free-running models fence JSON even when told not to.
+fn parse<T: serde::de::DeserializeOwned>(
+    response: &response::Message,
+    constrained: bool,
+    unconstrained: fn(&str) -> Result<T, String>,
+) -> Result<T, String> {
     match response.stop_reason {
         Some(StopReason::MaxTokens) => return Err("clipped at max_tokens".into()),
         Some(StopReason::PauseTurn) => return Err("paused on a server tool".into()),
-        Some(StopReason::Refusal) => return Err("refusal".into()),
         _ => {}
+    }
+    if constrained {
+        return response.json::<T>().map_err(|e| e.to_string());
+    }
+    extract_text(response).and_then(|t| unconstrained(&t))
+}
+
+/// Unconstrained path: the answer's text, or why there is none usable.
+fn extract_text(response: &response::Message) -> Result<String, String> {
+    if matches!(response.stop_reason, Some(StopReason::Refusal)) {
+        return Err("refusal".into());
     }
     let blocks = &response.inner.content;
     if blocks.iter().any(|b| b.tool_use().is_some()) {
@@ -397,7 +431,7 @@ where
 
     async fn handle(&mut self, response: response::Message) -> Result<Control, A::Error> {
         match std::mem::replace(&mut self.phase, Phase::Inner) {
-            Phase::Asking(due) => self.answer(due, response).await,
+            Phase::Asking { due, constrained } => self.answer(due, constrained, response).await,
             Phase::Inner => match self.inner.handle(response).await? {
                 Control::Done(Outcome::Complete) => Ok(self
                     .close()
@@ -693,6 +727,52 @@ mod tests {
             "{q}"
         );
         assert!(!q.contains("Every agent"), "{q}");
+    }
+
+    fn reply_blocks(content: serde_json::Value) -> response::Message {
+        serde_json::from_value(serde_json::json!({
+            "id": "msg_test",
+            "role": "assistant",
+            "content": content,
+            "model": "test",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+        }))
+        .unwrap()
+    }
+
+    const TRIAL: &str = r#"{"reason": "curious", "choice": "trial"}"#;
+
+    /// Constrained path: thinking before the JSON is skipped by `json()`.
+    #[test]
+    fn constrained_answer_after_a_thought_parses() {
+        let r = reply_blocks(serde_json::json!([
+            { "type": "thinking", "thinking": "Let me weigh this.", "signature": "" },
+            { "type": "text", "text": TRIAL },
+        ]));
+        let a = parse(&r, true, text::parse_offer).unwrap();
+        assert_eq!(a.choice, crate::consent::prompt::OfferChoice::Trial);
+    }
+
+    /// The grammar can't emit a fence, so under constraint a fenced answer
+    /// is a genuine failure — not something to clean up.
+    #[test]
+    fn constrained_fenced_answer_fails_unconstrained_passes() {
+        let fenced = reply(&format!("```json\n{TRIAL}\n```"));
+        let err = parse(&fenced, true, text::parse_offer).unwrap_err();
+        assert!(err.contains("deserialize"), "{err}");
+        assert!(parse(&fenced, false, text::parse_offer).is_ok());
+    }
+
+    /// A clipped turn is no answer on either path, even if it parses.
+    #[test]
+    fn clipped_is_never_an_answer() {
+        let mut r = reply(TRIAL);
+        r.stop_reason = Some(StopReason::MaxTokens);
+        for constrained in [true, false] {
+            let err = parse(&r, constrained, text::parse_offer).unwrap_err();
+            assert!(err.contains("max_tokens"), "{err}");
+        }
     }
 
     #[tokio::test]
