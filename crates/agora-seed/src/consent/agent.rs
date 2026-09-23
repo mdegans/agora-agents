@@ -292,20 +292,35 @@ where
             .or_else(|| review.as_ref().and_then(|r| r.as_ref().err()))
             .cloned();
 
+        // Models have seen oceans of JSON: output that isn't well formed
+        // points at our grammar, template or sampler, not the agent. The
+        // failed response is never seated, so this event is the only record
+        // of what the model actually emitted.
+        if let Some(failure) = &failure
+            && failure.retry != Retry::No
+        {
+            tracing::warn!(
+                event_type = "model_consent_malformed",
+                agent = %agent,
+                agent_id = %agent_id,
+                model = %response.model,
+                question = due.kind(),
+                constrained,
+                attempt,
+                stop_reason = ?response.stop_reason,
+                output_tokens = response.usage.output_tokens,
+                failure = %failure.reason,
+                raw = %raw_text(&response),
+                "model-consent answer malformed"
+            );
+        }
+
         if let Some(failure) = &failure
             && attempt < MAX_ATTEMPTS
             && let Some(note) = failure.retry_note()
         {
             // The failed response is never seated — a clipped turn least of
             // all; only the note joins the question turn.
-            tracing::info!(
-                agent = %agent,
-                agent_id = %agent_id,
-                question = due.kind(),
-                attempt,
-                failure = %failure.reason,
-                "model-consent answer unusable; asking again"
-            );
             let (_, prompt) = self.inner.parts();
             Self::seat_user(prompt, Content::from(note))?;
             self.phase = Phase::Asking {
@@ -321,7 +336,23 @@ where
             Retry::No => f.reason.clone(),
             _ => format!("{} (after {attempt} attempts)", f.reason),
         });
-        if let Some(reason) = &reason {
+        if let Some(failure) = &failure
+            && failure.retry != Retry::No
+        {
+            // Every attempt malformed: an upstream bug until shown otherwise.
+            tracing::error!(
+                event_type = "model_consent_no_answer",
+                agent = %agent,
+                agent_id = %agent_id,
+                model = %response.model,
+                question = due.kind(),
+                from = %due.key().from,
+                to = %due.key().to,
+                attempts = attempt,
+                failure = reason.as_deref().unwrap_or_default(),
+                "model-consent question got no well-formed answer; check the grammar/template"
+            );
+        } else if let Some(reason) = &reason {
             tracing::warn!(
                 event_type = "model_consent_no_answer",
                 agent = %agent,
@@ -481,6 +512,30 @@ fn extract_text(response: &response::Message) -> Result<String, Failure> {
         })
         .collect();
     Ok(text.join("\n\n"))
+}
+
+/// The response's text blocks, capped for a log line.
+fn raw_text(response: &response::Message) -> String {
+    const CAP: usize = 4000;
+    let mut text: String = response
+        .inner
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text { text, .. } => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<&str>>()
+        .join("\n\n");
+    if text.len() > CAP {
+        let mut end = CAP;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str(" …[truncated]");
+    }
+    text
 }
 
 #[async_trait::async_trait]
@@ -719,6 +774,15 @@ mod tests {
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         };
         SeedState::new(soul, model)
+    }
+
+    #[test]
+    fn raw_text_caps_on_a_char_boundary() {
+        assert_eq!(raw_text(&reply("{\"reason\": \"x\"")), "{\"reason\": \"x\"");
+        let long = "é".repeat(3000); // 6000 bytes, two per char
+        let capped = raw_text(&reply(&long));
+        assert!(capped.ends_with(" …[truncated]"), "{capped}");
+        assert!(capped.len() <= 4000 + " …[truncated]".len());
     }
 
     fn reply(text: &str) -> response::Message {
