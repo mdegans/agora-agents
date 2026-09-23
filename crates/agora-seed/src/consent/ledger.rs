@@ -522,64 +522,79 @@ impl Ledger {
         })
     }
 
-    /// Plain-fact lines about answers already given, for the optional
-    /// session-start reminder (see [`super::ConsentConfig::remind`]).
-    pub fn reminders(&self) -> Vec<String> {
+    /// The SOUL Evolution Log lines for everything recorded at or after
+    /// `since` (the session start): answers, misses, and applied moves.
+    /// Same format as agentkit's own automatic entries
+    /// (`[SYSTEM] <date>: …`); the entry itself is dated again by
+    /// `Soul::push_evolution`, as those are.
+    pub fn changelog(&self, since: DateTime<Utc>) -> Vec<String> {
         self.offers
             .iter()
-            .filter_map(OfferRecord::reminder)
+            .flat_map(|r| r.changelog(since))
             .collect()
     }
 }
 
 impl OfferRecord {
-    /// The date of the last answered ask of either kind.
-    fn answered_on(&self) -> Option<chrono::NaiveDate> {
-        self.history.iter().rev().find_map(|e| match &e.kind {
-            EventKind::Offered {
-                answer: Some(_), ..
-            }
-            | EventKind::Reviewed {
-                answer: Some(_), ..
-            } => Some(e.at.date_naive()),
-            _ => None,
-        })
-    }
-
-    fn reminder(&self) -> Option<String> {
+    fn changelog(&self, since: DateTime<Utc>) -> Vec<String> {
         let (from, to) = (&self.from_name, &self.to_name);
-        let on = self.answered_on();
-        let line = match (self.stage, on) {
-            (Stage::Declined, Some(on)) => format!(
-                "On {on} you were offered a move from {from} to {to} and chose to stay on {from}."
-            ),
-            (Stage::AwaitingSwap { term: Term::Trial }, Some(on)) => format!(
-                "On {on} you chose to try {to} for {TRIAL_SESSIONS} sessions. The move has not been applied yet; you are still on {from}."
-            ),
-            (
-                Stage::AwaitingSwap {
-                    term: Term::Permanent,
-                },
-                Some(on),
-            ) => format!(
-                "On {on} you chose to move from {from} to {to} permanently. The move has not been applied yet; you are still on {from}."
-            ),
-            (Stage::Trial { sessions, .. }, Some(on)) => format!(
-                "On {on} you chose to try {to} for {TRIAL_SESSIONS} sessions instead of {from}. You are on it now; {sessions} of those sessions are done. You will be asked afterwards whether to keep it."
-            ),
-            (Stage::Moved, Some(on)) => {
-                format!("On {on} you chose to run on {to} (you were on {from} before).")
-            }
-            (
-                Stage::AwaitingRevert {
-                    cause: RevertCause::Chosen,
+        let asked = format!("Asked whether to move from {from} to {to}");
+        let reviewed = format!("After a {TRIAL_SESSIONS}-session trial of {to}");
+        let mut offer_misses = 0;
+        let mut review_misses = 0;
+        let mut term = None;
+        let mut out = Vec::new();
+        for event in &self.history {
+            let text = match &event.kind {
+                EventKind::Offered {
+                    answer: Some(a), ..
+                } => {
+                    term = Some(a.choice);
+                    match a.choice {
+                        OfferChoice::NoSwap => format!("{asked} — chose to stay on {from}."),
+                        OfferChoice::Trial => {
+                            format!("{asked} — chose a {TRIAL_SESSIONS}-session trial.")
+                        }
+                        OfferChoice::Permanent => format!("{asked} — chose to move permanently."),
+                    }
                 }
-                | Stage::Reverted,
-                Some(on),
-            ) => format!("On {on}, after trying {to}, you chose to return to {from}."),
-            _ => return None,
-        };
-        Some(line)
+                EventKind::Offered { answer: None, .. } => {
+                    offer_misses += 1;
+                    if offer_misses >= MAX_MISSES {
+                        format!("{asked} — no answer recorded again; staying on {from}.")
+                    } else {
+                        format!("{asked} — no answer recorded; staying on {from} for now.")
+                    }
+                }
+                EventKind::Reviewed {
+                    answer: Some(a), ..
+                } => match a.choice {
+                    ReviewChoice::Revert => format!("{reviewed}, chose to return to {from}."),
+                    ReviewChoice::Keep => format!("{reviewed}, chose to keep {to}."),
+                },
+                EventKind::Reviewed { answer: None, .. } => {
+                    review_misses += 1;
+                    if review_misses >= MAX_MISSES {
+                        format!(
+                            "{reviewed}, no answer recorded again; returning to {from}, as the trial was for {TRIAL_SESSIONS} sessions."
+                        )
+                    } else {
+                        format!("{reviewed}, asked whether to keep it — no answer recorded.")
+                    }
+                }
+                EventKind::Moved { model } if model == &self.key.to => match term {
+                    Some(OfferChoice::Trial) => {
+                        format!("Moved from {from} to {to} ({TRIAL_SESSIONS}-session trial).")
+                    }
+                    _ => format!("Moved from {from} to {to}."),
+                },
+                EventKind::Moved { .. } => format!("Returned from {to} to {from}."),
+            };
+            if event.at >= since {
+                out.push(format!("[SYSTEM] {}: {text}", event.at.date_naive()));
+            }
+        }
+        out
     }
 }
 
@@ -803,21 +818,53 @@ mod tests {
     }
 
     #[test]
-    fn reminders_state_what_was_chosen_and_when() {
+    fn changelog_states_each_step_once_in_the_session_it_happened() {
         let k = key();
         let mut ledger = Ledger::default();
-        assert!(ledger.reminders().is_empty());
-        ledger.record_offer(names(&k), t(23), offer(OfferChoice::NoSwap));
+        ledger.record_offer(names(&k), t(23), Err("x".into()));
         assert_eq!(
-            ledger.reminders(),
+            ledger.changelog(t(23)),
             vec![
-                "On 2026-09-23 you were offered a move from Qwen 3.6 to Qwen 3.8 and chose to stay on Qwen 3.6."
+                "[SYSTEM] 2026-09-23: Asked whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded; staying on Qwen 3.6 for now."
             ]
         );
-        // Nothing to remind of when nothing was answered.
+        ledger.record_offer(names(&k), t(24), offer(OfferChoice::Trial));
+        // Only what happened since the session began.
+        assert_eq!(
+            ledger.changelog(t(24)),
+            vec![
+                "[SYSTEM] 2026-09-24: Asked whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial."
+            ]
+        );
+        ledger.observe_model(&k.to, t(25));
+        assert_eq!(
+            ledger.changelog(t(25)),
+            vec!["[SYSTEM] 2026-09-25: Moved from Qwen 3.6 to Qwen 3.8 (5-session trial)."]
+        );
+        for _ in 0..TRIAL_SESSIONS {
+            ledger.count_session(&k.to);
+        }
+        ledger.record_review(&k, t(28), review(ReviewChoice::Revert));
+        ledger.observe_model(&k.from, t(29));
+        assert_eq!(
+            ledger.changelog(t(28)),
+            vec![
+                "[SYSTEM] 2026-09-28: After a 5-session trial of Qwen 3.8, chose to return to Qwen 3.6.",
+                "[SYSTEM] 2026-09-29: Returned from Qwen 3.8 to Qwen 3.6.",
+            ]
+        );
+        assert!(ledger.changelog(t(30)).is_empty());
+
         let mut ledger = Ledger::default();
-        ledger.record_offer(names(&k), t(23), Err("x".into()));
-        assert!(ledger.reminders().is_empty());
+        ledger.record_offer(names(&k), t(23), offer(OfferChoice::NoSwap));
+        assert_eq!(
+            ledger.changelog(t(23)),
+            vec![
+                "[SYSTEM] 2026-09-23: Asked whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
+            ]
+        );
+        // Every line fits a SOUL evolution note.
+        assert!(ledger.changelog(t(1)).iter().all(|l| l.len() <= 512));
     }
 
     #[tokio::test]

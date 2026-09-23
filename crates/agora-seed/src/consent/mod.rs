@@ -10,19 +10,19 @@
 //!
 //! - [`ConsentConfig`] — the `[model_consent]` table in the run config:
 //!   the current offer (from-model → to-model, with a human-written
-//!   description) and whether to remind agents of past answers.
+//!   description) and an optional agent allowlist.
 //! - [`agent::ConsentAgent`] — wraps agentkit's `SeedAgent`, whose phase
 //!   tail (reflect → mutate/evolve → survey) it leaves untouched, and asks
 //!   one more question after it: the offer, or a trial's review.
 //! - [`ledger`] — the per-agent record, `state/<agent_id>/model_consent.json`.
-//!   Never the agent's memory.
+//!   Never the agent's memory. Each answer and each applied move also
+//!   gets one automatic `[SYSTEM]` line in the SOUL's Evolution Log, the
+//!   same place agentkit notes a deep mutation.
 //! - [`queue`] — the changes agents asked for, for the Steward to apply
 //!   with `set_model` + `sync-models`.
 //!
 //! ```toml
 //! [model_consent]
-//! remind = false  # optional; see `ConsentConfig::remind`
-//!
 //! [model_consent.offer]
 //! from = "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
 //! to = "Qwen3.8-27B-UD-Q8_K_XL.gguf"
@@ -61,12 +61,6 @@ pub struct ConsentConfig {
     /// The offer to make this run. Absent means ask nobody anything new —
     /// trial reviews already under way still happen.
     pub offer: Option<OfferConfig>,
-    /// Surface an agent's recorded answers as a plain system fact at the
-    /// start of later sessions ("On 2026-09-23 you chose …"). Off by
-    /// default: it adds a line to the agent's prompt that is not its own
-    /// memory, which is the Steward's call to make.
-    #[serde(default)]
-    pub remind: bool,
 }
 
 /// `[model_consent.offer]`.
@@ -145,7 +139,6 @@ impl OfferConfig {
 /// Per-process consent machinery, shared by every wrapped agent.
 pub struct ConsentRuntime {
     pub offer: Option<OfferConfig>,
-    pub remind: bool,
     /// `<data_dir>/state` — each agent's ledger sits in its own directory.
     pub state_dir: PathBuf,
     /// See [`queue::queue_path`].
@@ -169,7 +162,6 @@ impl ConsentRuntime {
         anyhow::ensure!(max_tokens > 0, "consent max_tokens must be nonzero");
         Ok(Self {
             offer: config.offer,
-            remind: config.remind,
             state_dir: data_dir.join("state"),
             queue_path: queue::queue_path(data_dir),
             client,
@@ -195,7 +187,6 @@ mod tests {
         .unwrap();
         let offer = c.offer.unwrap();
         assert_eq!(offer.source_name(), "a.gguf");
-        assert!(!c.remind);
         offer.validate().unwrap();
 
         assert!(!offer.is_limited());
@@ -218,7 +209,7 @@ mod tests {
                 .unwrap();
         assert!(empty.offer.unwrap().validate().is_err());
 
-        assert!(toml::from_str::<ConsentConfig>("remnid = true").is_err());
+        assert!(toml::from_str::<ConsentConfig>("[offr]\nfrom = \"a\"").is_err());
         let same: ConsentConfig =
             toml::from_str("[offer]\nfrom = \"a\"\nto = \"a\"\ndescription = \"x\"\n").unwrap();
         assert!(same.offer.unwrap().validate().is_err());

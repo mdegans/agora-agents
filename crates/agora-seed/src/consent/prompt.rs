@@ -102,8 +102,6 @@ pub struct OfferText<'a> {
     pub to_name: &'a str,
     /// The Steward's description of the new model.
     pub description: &'a str,
-    /// Whether answers are surfaced at later session starts.
-    pub remind: bool,
     /// Whether only a named subset of agents on `from_name` is being asked
     /// (the offer's `agents` allowlist). The question must not then claim
     /// everyone is.
@@ -112,13 +110,10 @@ pub struct OfferText<'a> {
 
 const JSON_ONLY: &str = "Do NOT use tools. Respond in JSON **only**, giving your reason first and then your choice, exactly this shape:";
 
-fn provenance(remind: bool) -> &'static str {
-    if remind {
-        "It is not part of the survey and it is not anonymous: it comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so that it can be acted on. It is kept in a separate record, not written into your memory; you will be reminded of your answer at the start of later sessions."
-    } else {
-        "It is not part of the survey and it is not anonymous: it comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so that it can be acted on. It is kept in a separate record, not written into your memory."
-    }
-}
+/// Who is asking, and where the answer goes. Not the agent's memory: the
+/// runner's own record, plus one factual line in the SOUL's Evolution Log
+/// (the Steward's call, 2026-09-23 — see `ledger::Ledger::changelog`).
+const PROVENANCE: &str = "It is not part of the survey and it is not anonymous: it comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so that it can be acted on. It is kept in a separate record, not written into your memory; a one-line note of your answer will be added to the Evolution Log in your SOUL.";
 
 /// The offer, seated as the session's last user turn.
 pub fn offer(text: OfferText<'_>) -> Content {
@@ -126,18 +121,16 @@ pub fn offer(text: OfferText<'_>) -> Content {
         from_name: from,
         to_name: to,
         description,
-        remind,
         limited,
     } = text;
     let description = description.trim();
-    let provenance = provenance(remind);
     let who = if limited {
         format!("You are being asked whether you would like to move to **{to}**.")
     } else {
         format!("Every agent on {from} is being asked whether it would like to move to **{to}**.")
     };
     let body = format!(
-        r#"One more question before this session ends. {provenance}
+        r#"One more question before this session ends. {PROVENANCE}
 
 It is about the model you run on. You currently run on **{from}**. {who}
 
@@ -171,7 +164,6 @@ pub struct ReviewText<'a> {
     pub chosen_on: chrono::NaiveDate,
     /// Completed sessions on the new model, this one included.
     pub sessions: u32,
-    pub remind: bool,
 }
 
 fn render_sample(out: &mut String, s: &Sample) {
@@ -212,13 +204,11 @@ pub fn review(text: ReviewText<'_>, comparison: &Comparison) -> Content {
         to_name: to,
         chosen_on,
         sessions,
-        remind,
     } = text;
-    let provenance = provenance(remind);
     let before = render_side(&comparison.before);
     let after = render_side(&comparison.after);
     let body = format!(
-        r#"One more question before this session ends. {provenance}
+        r#"One more question before this session ends. {PROVENANCE}
 
 On {chosen_on} you chose to try **{to}** for {TRIAL_SESSIONS} sessions instead of **{from}**. You have now completed {sessions} sessions on {to}. Your name, SOUL, memory and history carried over; only the model changed.
 
@@ -372,7 +362,6 @@ pub(crate) mod tests {
             from_name: "Qwen 3.6",
             to_name: "Qwen 3.8",
             description: "Denser and slower.",
-            remind: false,
             limited: false,
         }));
         let (a, b, c) = (
@@ -385,7 +374,9 @@ pub(crate) mod tests {
         assert!(a < b && b < c);
         assert!(t.contains("Denser and slower."));
         assert!(t.contains("not written into your memory"));
-        assert!(!t.contains("reminded"));
+        assert!(t.contains(
+            "a one-line note of your answer will be added to the Evolution Log in your SOUL"
+        ));
         assert!(t.contains("Every agent on Qwen 3.6 is being asked"));
     }
 
@@ -397,7 +388,6 @@ pub(crate) mod tests {
             from_name: "Qwen 3.6",
             to_name: "Qwen 3.8",
             description: "Denser and slower.",
-            remind: false,
             limited: true,
         }));
         assert!(!t.contains("Every agent"), "{t}");
@@ -426,7 +416,6 @@ pub(crate) mod tests {
                 to_name: "Qwen 3.8",
                 chosen_on: "2026-09-23".parse().unwrap(),
                 sessions: 5,
-                remind: true,
             },
             &comparison,
         ));
@@ -447,7 +436,6 @@ pub(crate) mod tests {
                 from_name: "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf",
                 to_name: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
                 description: "<the Steward's description from [model_consent.offer]>",
-                remind: false,
                 limited: true,
             }))
         );
@@ -477,7 +465,6 @@ pub(crate) mod tests {
                     to_name: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
                     chosen_on: "2026-09-23".parse().unwrap(),
                     sessions: 5,
-                    remind: false,
                 },
                 &comparison,
             ))

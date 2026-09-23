@@ -8,12 +8,23 @@
 //! answered and, if anonymous, already redacted from the transcript). If
 //! the ledger says a question is due, the wrapper seats it as the next
 //! user turn on the *same* conversation — the prefix is reused, not
-//! rebuilt, so on blallama the cache carries the whole session — and ends
-//! the session after the one answer.
+//! rebuilt, so on blallama the cache carries the whole session.
 //!
-//! One attempt per session, no in-session retry: a clipped, tool-calling
-//! or unparseable answer is recorded as no answer (= stay) and the ledger
-//! decides whether to ask again next session (once).
+//! **Retries.** An answer that can't be used — unparseable, a tool call
+//! instead of an answer, or clipped at `max_tokens` — is not seated (as
+//! the seed phases prune failed turns); the error is appended to the
+//! question turn and the agent tries again, up to [`MAX_ATTEMPTS`] in all.
+//! An explicit refusal is taken as no answer without a retry. Once
+//! attempts run out it is no answer (= stay), recorded and warned, and the
+//! ledger decides whether to ask again next session (once).
+//!
+//! **SOUL changelog.** Each recorded answer and each applied move adds one
+//! automatic `[SYSTEM]` line to the SOUL's Evolution Log — the place
+//! agentkit already notes deep mutations — so the agent knows what it
+//! chose. Never its memory. The wrapper has no mutable access to the inner
+//! agent's state, so at teardown (after the inner teardown, before the
+//! reactor persists) it takes a copy of that state with the lines appended
+//! and serves the copy from [`Agent::state`], which is what gets saved.
 
 use std::sync::Arc;
 
@@ -21,12 +32,12 @@ use agora_agentkit::ids::{AgentId, CommentId};
 use agora_agentkit::reactor::inference::Quirks;
 use agora_agentkit::reactor::seed::SeedState;
 use agora_agentkit::reactor::{Agent, Control, Outcome};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use misanthropic::model::ModelInfo;
 use misanthropic::prompt::Prompt;
 use misanthropic::prompt::message::{Block, Content, Role};
 use misanthropic::prompt::output::OutputConfig;
-use misanthropic::response::{self, StopReason};
+use misanthropic::response::{self, JsonError, StopReason};
 use misanthropic::tool::{Notifications, ToolBox};
 
 use super::ConsentRuntime;
@@ -34,6 +45,9 @@ use super::comparison;
 use super::ledger::{Due, Ledger, OfferNames};
 use super::prompt::{self as text, OfferText, ReviewText};
 use super::queue::{self, QueueEntry};
+
+/// Answers per question per session: the first plus two retries.
+pub const MAX_ATTEMPTS: u32 = 3;
 
 /// [`Agent::Context`] for a [`ConsentAgent`]: the inner agent's context
 /// plus the shared consent runtime.
@@ -50,8 +64,56 @@ enum Phase {
     Inner,
     /// The closing question is seated; the next response answers it.
     /// `constrained` records whether it went out with the schema as
-    /// `output_config` — it decides how the answer is parsed.
-    Asking { due: Due, constrained: bool },
+    /// `output_config` — it decides how the answer is parsed. `attempt`
+    /// counts from 1.
+    Asking {
+        due: Due,
+        constrained: bool,
+        attempt: u32,
+    },
+}
+
+/// Why an answer couldn't be used, and whether it's worth another try.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Failure {
+    reason: String,
+    retry: Retry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// Clipped at `max_tokens`: ask again, more briefly.
+    Clipped,
+    /// Unparseable, or a tool call instead of an answer.
+    Unusable,
+    /// An explicit refusal (or a paused server tool): no answer, no retry.
+    No,
+}
+
+impl Failure {
+    fn new(reason: impl Into<String>, retry: Retry) -> Self {
+        Self {
+            reason: reason.into(),
+            retry,
+        }
+    }
+
+    /// The note appended to the question turn before another attempt.
+    fn retry_note(&self) -> Option<String> {
+        match self.retry {
+            Retry::Clipped => Some(
+                "Your answer was cut off at the length limit and discarded. Answer again, \
+                 more briefly — JSON only, in exactly the shape above."
+                    .to_string(),
+            ),
+            Retry::Unusable => Some(format!(
+                "Your answer could not be used ({}). Answer again — JSON only, in exactly \
+                 the shape above, and do not use tools.",
+                self.reason
+            )),
+            Retry::No => None,
+        }
+    }
 }
 
 /// See the [module docs](self).
@@ -64,6 +126,12 @@ pub struct ConsentAgent<A> {
     ledger: Option<Ledger>,
     dirty: bool,
     phase: Phase,
+    /// When this session began; ledger events at or after it become SOUL
+    /// changelog lines.
+    started: DateTime<Utc>,
+    /// The inner state with the changelog lines appended, built at
+    /// teardown. Served by [`Agent::state`] once present.
+    patched: Option<SeedState>,
 }
 
 impl<A> ConsentAgent<A>
@@ -122,6 +190,7 @@ where
         self.phase = Phase::Asking {
             due,
             constrained: cache_safe,
+            attempt: 1,
         };
         Ok(Control::Continue)
     }
@@ -145,7 +214,6 @@ where
         let Some(due) = ledger.due(&model, offer_key.as_ref()) else {
             return Ok(None);
         };
-        let remind = self.rt.remind;
         match &due {
             Due::Offer(_) => {
                 let offer = self
@@ -157,7 +225,6 @@ where
                     from_name: offer.source_name(),
                     to_name: offer.target_name(),
                     description: &offer.description,
-                    remind,
                     limited: offer.is_limited(),
                 });
                 self.seat_question(due, content, text::offer_schema())
@@ -186,7 +253,6 @@ where
                         to_name: &to_name,
                         chosen_on,
                         sessions,
-                        remind,
                     },
                     &sample,
                 );
@@ -196,52 +262,110 @@ where
         }
     }
 
-    /// Record the answer (or its absence), queue any change, end the
-    /// session.
+    /// One response to the question: parse it; on a retryable failure with
+    /// attempts left, relay the error and go again; otherwise record the
+    /// answer (or its absence), queue any change, and end the session.
     async fn answer(
         &mut self,
         due: Due,
         constrained: bool,
+        attempt: u32,
         response: response::Message,
     ) -> Result<Control, A::Error> {
         let now = Utc::now();
         let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
-        let Some(ledger) = self.ledger.as_mut() else {
+        if self.ledger.is_none() {
             return Ok(Control::Done(Outcome::Complete));
+        }
+        let (offer, review) = match &due {
+            Due::Offer(_) => (Some(parse(&response, constrained, text::parse_offer)), None),
+            Due::Review(_) => (
+                None,
+                Some(parse(&response, constrained, text::parse_review)),
+            ),
         };
-        let (change, answered, failure) = match &due {
-            Due::Offer(key) => {
-                let result = parse(&response, constrained, text::parse_offer);
-                let (answered, failure) = summarize(&result, |a| format!("{:?}", a.choice));
+        let failure = offer
+            .as_ref()
+            .and_then(|r| r.as_ref().err())
+            .or_else(|| review.as_ref().and_then(|r| r.as_ref().err()))
+            .cloned();
+
+        if let Some(failure) = &failure
+            && attempt < MAX_ATTEMPTS
+            && let Some(note) = failure.retry_note()
+        {
+            // The failed response is never seated — a clipped turn least of
+            // all; only the note joins the question turn.
+            tracing::info!(
+                agent = %agent,
+                agent_id = %agent_id,
+                question = due.kind(),
+                attempt,
+                failure = %failure.reason,
+                "model-consent answer unusable; asking again"
+            );
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(prompt, Content::from(note))?;
+            self.phase = Phase::Asking {
+                due,
+                constrained,
+                attempt: attempt + 1,
+            };
+            return Ok(Control::Continue);
+        }
+
+        // Final: an answer, a refusal, or attempts exhausted.
+        let reason = failure.as_ref().map(|f| match f.retry {
+            Retry::No => f.reason.clone(),
+            _ => format!("{} (after {attempt} attempts)", f.reason),
+        });
+        if let Some(reason) = &reason {
+            tracing::warn!(
+                event_type = "model_consent_no_answer",
+                agent = %agent,
+                agent_id = %agent_id,
+                question = due.kind(),
+                from = %due.key().from,
+                to = %due.key().to,
+                attempts = attempt,
+                failure = %reason,
+                "model-consent question got no usable answer; recorded as no answer"
+            );
+        }
+        let ledger = self.ledger.as_mut().expect("checked above");
+        let (change, answered) = match (&due, offer, review) {
+            (Due::Offer(key), Some(result), _) => {
+                let answered = result.as_ref().ok().map(|a| format!("{:?}", a.choice));
+                let result = result.map_err(|_| reason.clone().unwrap_or_default());
                 let offer = self.rt.offer.as_ref().expect("asked, so configured");
                 let names = OfferNames {
                     key,
                     from_name: offer.source_name(),
                     to_name: offer.target_name(),
                 };
-                (ledger.record_offer(names, now, result), answered, failure)
+                (ledger.record_offer(names, now, result), answered)
             }
-            Due::Review(key) => {
-                let result = parse(&response, constrained, text::parse_review);
-                let (answered, failure) = summarize(&result, |a| format!("{:?}", a.choice));
-                (ledger.record_review(key, now, result), answered, failure)
+            (Due::Review(key), _, Some(result)) => {
+                let answered = result.as_ref().ok().map(|a| format!("{:?}", a.choice));
+                let result = result.map_err(|_| reason.clone().unwrap_or_default());
+                (ledger.record_review(key, now, result), answered)
             }
+            _ => unreachable!("parsed for the question asked"),
         };
         self.dirty = true;
-        tracing::info!(
-            event_type = "model_consent_answer",
-            agent = %agent,
-            agent_id = %agent_id,
-            question = due.kind(),
-            from = %due.key().from,
-            to = %due.key().to,
-            choice = answered.as_deref(),
-            failure = failure.as_deref(),
-            "model-consent answer recorded"
-        );
-        // A usable answer joins the transcript (the prompt log keeps it);
-        // an unusable one is left out, as the seed phases do.
-        if answered.is_some() {
+        if let Some(choice) = &answered {
+            tracing::info!(
+                event_type = "model_consent_answer",
+                agent = %agent,
+                agent_id = %agent_id,
+                question = due.kind(),
+                from = %due.key().from,
+                to = %due.key().to,
+                attempts = attempt,
+                choice = %choice,
+                "model-consent answer recorded"
+            );
+            // A usable answer joins the transcript (the prompt log keeps it).
             let (_, prompt) = self.inner.parts();
             if let Err(e) = prompt.push_message(response.inner) {
                 tracing::warn!(agent_id = %agent_id, error = %e, "consent answer not seated");
@@ -258,6 +382,40 @@ where
         }
         Ok(Control::Done(Outcome::Complete))
     }
+
+    /// Copy the inner state with this session's changelog lines appended to
+    /// the SOUL's Evolution Log. `None` when there is nothing to add.
+    fn patch_soul(&self) -> Option<SeedState> {
+        let lines = self.ledger.as_ref()?.changelog(self.started);
+        if lines.is_empty() {
+            return None;
+        }
+        // `SeedState` isn't `Clone`; its serde form is exactly what the
+        // reactor persists, so a round trip is a faithful copy.
+        let copy =
+            serde_json::to_value(self.inner.state()).and_then(serde_json::from_value::<SeedState>);
+        let mut state = match copy {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(
+                    agent_id = %self.inner.id(),
+                    error = %e,
+                    "could not copy state for the SOUL changelog; lines dropped"
+                );
+                return None;
+            }
+        };
+        for line in lines {
+            if let Err(e) = state.soul.push_evolution(line) {
+                tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    error = %e,
+                    "SOUL changelog line rejected"
+                );
+            }
+        }
+        Some(state)
+    }
 }
 
 /// The typed answer, or why there is none usable.
@@ -267,35 +425,49 @@ where
 ///
 /// - **Constrained** (schema sent as `output_config`): misanthropic's
 ///   [`response::Message::json`] — the first text block, thinking skipped,
-///   with typed [`JsonError`](response::JsonError)s for refusal / tool use
-///   / no text / bad JSON. No fence stripping: the grammar can't emit a
-///   fence, so a fenced answer is a real failure.
+///   with typed [`JsonError`]s for refusal / tool use / no text / bad JSON.
+///   No fence stripping: the grammar can't emit a fence, so a fenced answer
+///   is a real failure.
 /// - **Unconstrained**: all text joined, fences tolerated (`unconstrained`),
 ///   since free-running models fence JSON even when told not to.
 fn parse<T: serde::de::DeserializeOwned>(
     response: &response::Message,
     constrained: bool,
     unconstrained: fn(&str) -> Result<T, String>,
-) -> Result<T, String> {
+) -> Result<T, Failure> {
     match response.stop_reason {
-        Some(StopReason::MaxTokens) => return Err("clipped at max_tokens".into()),
-        Some(StopReason::PauseTurn) => return Err("paused on a server tool".into()),
+        Some(StopReason::MaxTokens) => {
+            return Err(Failure::new("clipped at max_tokens", Retry::Clipped));
+        }
+        Some(StopReason::PauseTurn) => {
+            return Err(Failure::new("paused on a server tool", Retry::No));
+        }
         _ => {}
     }
     if constrained {
-        return response.json::<T>().map_err(|e| e.to_string());
+        return response.json::<T>().map_err(|e| {
+            let retry = match e {
+                JsonError::Refusal => Retry::No,
+                _ => Retry::Unusable,
+            };
+            Failure::new(e.to_string(), retry)
+        });
     }
-    extract_text(response).and_then(|t| unconstrained(&t))
+    extract_text(response)
+        .and_then(|t| unconstrained(&t).map_err(|e| Failure::new(e, Retry::Unusable)))
 }
 
 /// Unconstrained path: the answer's text, or why there is none usable.
-fn extract_text(response: &response::Message) -> Result<String, String> {
+fn extract_text(response: &response::Message) -> Result<String, Failure> {
     if matches!(response.stop_reason, Some(StopReason::Refusal)) {
-        return Err("refusal".into());
+        return Err(Failure::new("refusal", Retry::No));
     }
     let blocks = &response.inner.content;
     if blocks.iter().any(|b| b.tool_use().is_some()) {
-        return Err("called a tool instead of answering".into());
+        return Err(Failure::new(
+            "called a tool instead of answering",
+            Retry::Unusable,
+        ));
     }
     let text: Vec<&str> = blocks
         .iter()
@@ -305,17 +477,6 @@ fn extract_text(response: &response::Message) -> Result<String, String> {
         })
         .collect();
     Ok(text.join("\n\n"))
-}
-
-/// `(choice, failure)` for the log line.
-fn summarize<T>(
-    result: &Result<T, String>,
-    choice: impl Fn(&T) -> String,
-) -> (Option<String>, Option<String>) {
-    match result {
-        Ok(a) => (Some(choice(a)), None),
-        Err(e) => (None, Some(e.clone())),
-    }
 }
 
 #[async_trait::async_trait]
@@ -334,6 +495,8 @@ where
             ledger: None,
             dirty: false,
             phase: Phase::Inner,
+            started: Utc::now(),
+            patched: None,
         })
     }
 
@@ -341,8 +504,10 @@ where
         self.inner.id()
     }
 
+    /// The inner state — or, after teardown added SOUL changelog lines, the
+    /// patched copy, which is what the reactor persists.
     fn state(&self) -> &SeedState {
-        self.inner.state()
+        self.patched.as_ref().unwrap_or_else(|| self.inner.state())
     }
 
     fn prompt(&self) -> &Prompt {
@@ -373,9 +538,10 @@ where
         self.inner.prime_prompt()
     }
 
-    /// Inner init, then the ledger: load it, note any change the Steward
-    /// has applied since last session, and (if configured) remind.
+    /// Inner init, then the ledger: load it and note any change the
+    /// Steward has applied since last session.
     async fn on_init(&mut self) -> Result<(), A::Error> {
+        self.started = Utc::now();
         self.inner.on_init().await?;
         let dir = self.agent_dir();
         let mut ledger = match Ledger::load(&dir).await {
@@ -401,14 +567,6 @@ where
                 "queued model change observed as applied"
             );
         }
-        if self.rt.remind {
-            let lines = ledger.reminders();
-            if !lines.is_empty() {
-                let note = format!("[system] {}", lines.join(" "));
-                let (_, prompt) = self.inner.parts();
-                Self::seat_user(prompt, Content::from(note))?;
-            }
-        }
         self.ledger = Some(ledger);
         Ok(())
     }
@@ -431,7 +589,11 @@ where
 
     async fn handle(&mut self, response: response::Message) -> Result<Control, A::Error> {
         match std::mem::replace(&mut self.phase, Phase::Inner) {
-            Phase::Asking { due, constrained } => self.answer(due, constrained, response).await,
+            Phase::Asking {
+                due,
+                constrained,
+                attempt,
+            } => self.answer(due, constrained, attempt, response).await,
             Phase::Inner => match self.inner.handle(response).await? {
                 Control::Done(Outcome::Complete) => Ok(self
                     .close()
@@ -443,9 +605,11 @@ where
     }
 
     /// Inner teardown (which archives the transcript, question included),
-    /// then the ledger, if anything changed.
+    /// then the SOUL changelog (served by [`state`](Agent::state) for the
+    /// reactor's save, which follows teardown), then the ledger.
     async fn on_teardown(&mut self) -> Result<(), A::Error> {
         let result = self.inner.on_teardown().await;
+        self.patched = self.patch_soul();
         let dir = self.agent_dir();
         if self.dirty
             && let Some(ledger) = &mut self.ledger
@@ -596,7 +760,6 @@ mod tests {
                             .collect()
                     }),
                 }),
-                remind: false,
             };
             // Nothing listens on the discard port: the review sample's
             // fetches fail fast and it comes back empty.
@@ -760,7 +923,8 @@ mod tests {
     fn constrained_fenced_answer_fails_unconstrained_passes() {
         let fenced = reply(&format!("```json\n{TRIAL}\n```"));
         let err = parse(&fenced, true, text::parse_offer).unwrap_err();
-        assert!(err.contains("deserialize"), "{err}");
+        assert!(err.reason.contains("deserialize"), "{err:?}");
+        assert_eq!(err.retry, Retry::Unusable);
         assert!(parse(&fenced, false, text::parse_offer).is_ok());
     }
 
@@ -771,12 +935,25 @@ mod tests {
         r.stop_reason = Some(StopReason::MaxTokens);
         for constrained in [true, false] {
             let err = parse(&r, constrained, text::parse_offer).unwrap_err();
-            assert!(err.contains("max_tokens"), "{err}");
+            assert!(err.reason.contains("max_tokens"), "{err:?}");
+            assert_eq!(err.retry, Retry::Clipped);
         }
     }
 
+    fn evolution_notes(agent: &ConsentAgent<Fake>) -> Vec<String> {
+        agent
+            .state()
+            .soul
+            .evolution_log
+            .iter()
+            .map(|e| e.note.to_string())
+            .collect()
+    }
+
+    /// Three unusable answers: each relayed back and retried in the same
+    /// session, then recorded as no answer (= stay), nothing queued.
     #[tokio::test]
-    async fn unparseable_is_no_answer_and_nothing_queued() {
+    async fn unparseable_is_retried_twice_then_no_answer() {
         let h = Harness::new("miss");
         let mut agent = h.agent(OLD, false);
         agent.on_init().await.unwrap();
@@ -785,14 +962,124 @@ mod tests {
             agent.prompt().output_config.is_none(),
             "not cache-safe: unconstrained"
         );
+        let len = agent.prompt().messages.len();
+        for attempt in 1..MAX_ATTEMPTS {
+            let control = agent.handle(reply("Sure, I'd love to try!")).await.unwrap();
+            assert_eq!(control, Control::Continue, "attempt {attempt} retried");
+            assert_eq!(
+                agent.prompt().messages.len(),
+                len,
+                "failed answer not seated"
+            );
+            assert!(last_user_text(&agent).contains("Your answer could not be used"));
+        }
         let control = agent.handle(reply("Sure, I'd love to try!")).await.unwrap();
         assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+        let ledger = h.ledger().await;
+        assert_eq!(ledger.offers[0].stage, Stage::Unanswered { misses: 1 });
+        let failure = match &ledger.offers[0].history[0].kind {
+            crate::consent::ledger::EventKind::Offered { failure, .. } => failure.clone().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert!(failure.contains("after 3 attempts"), "{failure}");
+        assert!(h.queue().is_empty());
+        assert_eq!(
+            evolution_notes(&agent).last().unwrap(),
+            &format!(
+                "[SYSTEM] {}: Asked whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded; staying on Qwen 3.6 for now.",
+                Utc::now().date_naive()
+            )
+        );
+    }
+
+    /// A clipped attempt is pruned, the agent is told, and a good second
+    /// attempt counts.
+    #[tokio::test]
+    async fn clipped_then_answered() {
+        let h = Harness::new("clipped");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        let len = agent.prompt().messages.len();
+        let mut clipped = reply(r#"{"reason": "Well, let me think about th"#);
+        clipped.stop_reason = Some(StopReason::MaxTokens);
+        assert_eq!(agent.handle(clipped).await.unwrap(), Control::Continue);
+        assert_eq!(
+            agent.prompt().messages.len(),
+            len,
+            "clipped turn not seated"
+        );
+        assert!(last_user_text(&agent).contains("cut off at the length limit"));
+        let control = agent
+            .handle(reply(r#"{"reason": "brief", "choice": "no_swap"}"#))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+        assert_eq!(h.ledger().await.offers[0].stage, Stage::Declined);
+    }
+
+    /// An explicit refusal is no answer at once: no retry.
+    #[tokio::test]
+    async fn refusal_is_no_answer_without_retry() {
+        let h = Harness::new("refusal");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        let mut refusal = reply("I'd rather not.");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
         agent.on_teardown().await.unwrap();
         assert_eq!(
             h.ledger().await.offers[0].stage,
             Stage::Unanswered { misses: 1 }
         );
-        assert!(h.queue().is_empty());
+    }
+
+    /// The answer lands in the SOUL's Evolution Log (via the state the
+    /// reactor persists after teardown) — and memory is untouched.
+    #[tokio::test]
+    async fn answer_is_noted_in_the_soul_changelog_not_memory() {
+        let h = Harness::new("changelog");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        let memory = agent.state().memory.content.clone();
+        let before = evolution_notes(&agent).len();
+        agent.handle(reply("done")).await.unwrap();
+        agent
+            .handle(reply(r#"{"reason": "home", "choice": "no_swap"}"#))
+            .await
+            .unwrap();
+        assert_eq!(evolution_notes(&agent).len(), before, "not before teardown");
+        agent.on_teardown().await.unwrap();
+        let notes = evolution_notes(&agent);
+        assert_eq!(notes.len(), before + 1);
+        assert!(
+            notes.last().unwrap().ends_with(
+                "Asked whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
+            ),
+            "{notes:?}"
+        );
+        assert!(notes.last().unwrap().starts_with("[SYSTEM] "));
+        assert_eq!(agent.state().memory.content, memory);
+        // What the reactor saves is the patched state.
+        let saved = serde_json::to_value(agent.state()).unwrap();
+        assert!(saved.to_string().contains("chose to stay on Qwen 3.6"));
+    }
+
+    /// Nothing recorded, nothing added: the inner state is served as is.
+    #[tokio::test]
+    async fn no_question_no_changelog() {
+        let h = Harness::new("quiet");
+        let mut agent = h.agent("cogito-32b.gguf", true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert!(agent.patched.is_none());
     }
 
     #[tokio::test]
