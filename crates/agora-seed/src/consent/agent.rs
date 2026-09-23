@@ -178,7 +178,15 @@ where
         let max_tokens = self.rt.max_tokens;
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
-        prompt.output_config = cache_safe.then(|| OutputConfig::json_schema(schema));
+        // Keep the session's effort (agentkit 0.39 `thinking_effort`):
+        // thinking stays adaptive, and without it the answer would think at
+        // the model's default.
+        let effort = prompt.output_config.as_ref().and_then(|c| c.effort.clone());
+        prompt.output_config = match (cache_safe, effort) {
+            (true, Some(effort)) => Some(OutputConfig::json_schema(schema).with_effort(effort)),
+            (true, None) => Some(OutputConfig::json_schema(schema)),
+            (false, effort) => effort.map(OutputConfig::effort),
+        };
         Self::seat_user(prompt, content)?;
         tracing::info!(
             agent = %self.inner.state().soul.name,

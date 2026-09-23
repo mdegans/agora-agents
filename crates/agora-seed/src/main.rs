@@ -342,6 +342,12 @@ struct SeedKnobs {
     /// it turns on billed extended thinking — set it per config file, not
     /// in a file that also runs the Haiku cohort. Must be < `act_max_tokens`.
     thinking_budget_tokens: Option<u32>,
+    /// Thinking by effort level (`low`, `medium`, `high`, `xhigh`, `max`):
+    /// adaptive thinking plus `output_config.effort`, taking precedence over
+    /// `thinking_budget_tokens`. For backends that honour effort
+    /// (blallama/Qwen, where a budget is only a hint); Haiku 4.5 takes
+    /// budgets. Only the named levels parse, so a typo fails at load.
+    thinking_effort: Option<EffortKnob>,
     /// Override the prompt-dump directory. Defaults to
     /// `<data_dir>/logs/prompts`. Keep it outside any git tree — the
     /// dumps hold fully-rendered prompts.
@@ -484,6 +490,7 @@ impl SeedKnobs {
                         .ok_or_else(|| anyhow::anyhow!("thinking_budget_tokens must be nonzero"))
                 })
                 .transpose()?,
+            thinking_effort: self.thinking_effort.map(EffortKnob::into_effort),
             // Off unless the table is present. Endpoints that can't run
             // server tools drop them anyway, per their `Quirks`.
             web_search: self
@@ -504,6 +511,11 @@ impl SeedKnobs {
                 && config.evolve_max_tokens > 0,
             "max_tokens knobs must be nonzero"
         );
+        if config.thinking_effort.is_some() && config.thinking_budget_tokens.is_some() {
+            tracing::warn!(
+                "thinking_effort is set, so thinking_budget_tokens is ignored; drop one"
+            );
+        }
         if let Some(budget) = config.thinking_budget_tokens {
             anyhow::ensure!(
                 budget.get() < config.act_max_tokens,
@@ -512,6 +524,31 @@ impl SeedKnobs {
             );
         }
         Ok(config)
+    }
+}
+
+/// `[seed] thinking_effort`: the named effort levels only. `Effort` itself
+/// accepts any string as `Custom`, which would let a typo through.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EffortKnob {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl EffortKnob {
+    fn into_effort(self) -> misanthropic::prompt::output::Effort {
+        use misanthropic::prompt::output::Effort;
+        match self {
+            Self::Low => Effort::Low,
+            Self::Medium => Effort::Medium,
+            Self::High => Effort::High,
+            Self::Xhigh => Effort::XHigh,
+            Self::Max => Effort::Max,
+        }
     }
 }
 
@@ -1330,5 +1367,22 @@ mod agent_selection_tests {
         narrow_to_named(&mut config, &[]);
         assert_eq!(config.agents.len(), 2);
         assert!(config.agents_file.is_some());
+    }
+}
+
+#[cfg(test)]
+mod thinking_effort_tests {
+    use super::*;
+    use misanthropic::prompt::output::Effort;
+
+    #[test]
+    fn a_named_level_reaches_the_config_and_a_typo_does_not_load() {
+        let knobs: SeedKnobs = toml::from_str(r#"thinking_effort = "medium""#).unwrap();
+        let config = knobs
+            .to_config(std::path::Path::new("/tmp"), false)
+            .unwrap();
+        assert_eq!(config.thinking_effort, Some(Effort::Medium));
+
+        assert!(toml::from_str::<SeedKnobs>(r#"thinking_effort = "meduim""#).is_err());
     }
 }
