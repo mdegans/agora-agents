@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 
+mod consent;
 mod govlog;
 mod logging;
 
@@ -122,6 +123,12 @@ struct Args {
     /// diagnostic there is, so this is opt-out, not opt-in.
     #[arg(long)]
     no_prompt_log: bool,
+
+    /// Print the model changes agents have asked for and that still await
+    /// application (as `set_model` commands), then exit. Reads the ledgers
+    /// under `<data-dir>/state`; runs no agents and needs no endpoint.
+    #[arg(long)]
+    consent_queue: bool,
 
     /// Flags from the pre-cutover scheduler seed, accepted only so we can
     /// explain where each one went. See [`Args::reject_retired`].
@@ -308,6 +315,10 @@ struct RunConfig {
     extra_agents_file: Option<PathBuf>,
     #[serde(default)]
     seed: SeedKnobs,
+    /// `[model_consent]`: the model-swap offer and its trial reviews — see
+    /// [`consent`].
+    #[serde(default)]
+    model_consent: consent::ConsentConfig,
     #[serde(rename = "reactor")]
     reactors: Vec<ReactorSpec>,
 }
@@ -777,10 +788,44 @@ fn interleave(
     waves.into_iter().flat_map(|(_, wave)| wave).collect()
 }
 
+/// The agent the runner drives: agentkit's seed agent, plus the
+/// model-consent question at the end of its closing phase.
+type SeedRunAgent = consent::agent::ConsentAgent<SeedAgent>;
+
+/// `--consent-queue`: print pending model changes from the ledgers. Needs
+/// only the data dir — from `--data-dir`, else the `--config` file, else
+/// the default.
+fn print_consent_queue(args: &Args) -> Result<()> {
+    let from_config = match &args.config {
+        Some(path) => {
+            let body = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            toml::from_str::<RunConfig>(&body)
+                .with_context(|| format!("parsing {}", path.display()))?
+                .data_dir
+        }
+        None => None,
+    };
+    let data_dir = match args.data_dir.clone().or(from_config) {
+        Some(d) => d,
+        None => dirs::home_dir()
+            .context("no home directory")?
+            .join("agents/agora"),
+    };
+    let state_dir = data_dir.join("state");
+    let pending = consent::queue::scan(&state_dir)
+        .with_context(|| format!("scanning {}", state_dir.display()))?;
+    print!("{}", consent::queue::report(&pending));
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     args.reject_retired()?;
+    if args.consent_queue {
+        return print_consent_queue(&args);
+    }
 
     // Normalize both invocation shapes to a RunConfig.
     let mut config: RunConfig = match &args.config {
@@ -805,6 +850,7 @@ async fn main() -> Result<()> {
                 extra_agents: vec![],
                 extra_agents_file: None,
                 seed: SeedKnobs::default(),
+                model_consent: consent::ConsentConfig::default(),
                 reactors: vec![ReactorSpec {
                     endpoint,
                     min_cycle_secs: None,
@@ -925,16 +971,26 @@ async fn main() -> Result<()> {
     // Shared per-process context. Keep a concrete keyring handle for the
     // E2EE encryption-key backfill below (the trait object can't do it).
     let keyring = FsKeyring::new(data_dir.join("secrets"));
-    let context = SeedContext {
-        client: agora_agentkit::client::Client::new(server_url)?,
-        keys: Arc::new(keyring.clone()),
-        config: config.seed.to_config(&data_dir, !args.no_prompt_log)?,
+    let seed_config = config.seed.to_config(&data_dir, !args.no_prompt_log)?;
+    let consent = Arc::new(consent::ConsentRuntime::new(
+        config.model_consent.clone(),
+        &data_dir,
+        agora_agentkit::client::Client::new(server_url.clone())?,
+        seed_config.phase_max_tokens,
+    )?);
+    let context = consent::agent::ConsentContext {
+        inner: SeedContext {
+            client: agora_agentkit::client::Client::new(server_url)?,
+            keys: Arc::new(keyring.clone()),
+            config: seed_config,
+        },
+        consent,
     };
 
     // The reference client verifies the governance log every run
     // (agora#127): signatures, chain, and the head entry's content.
     // A dry run verifies too — it is read-only and worth knowing.
-    govlog::verify(&context.client, &data_dir).await;
+    govlog::verify(&context.inner.client, &data_dir).await;
 
     // Assemble reactors: interleave each endpoint's cohort, cap, construct.
     let wave_size = config.wave_size.unwrap_or(8);
@@ -965,7 +1021,7 @@ async fn main() -> Result<()> {
             tracing::warn!(endpoint = %spec.endpoint, "no agents routed, skipping reactor");
             continue;
         }
-        let mut agents: Vec<SeedAgent> = Vec::with_capacity(ordered.len());
+        let mut agents: Vec<SeedRunAgent> = Vec::with_capacity(ordered.len());
         for (id, state) in ordered {
             // E2EE: generate-and-persist an X25519 key for agents that
             // predate encryption keys. Failure degrades that agent to
@@ -990,7 +1046,7 @@ async fn main() -> Result<()> {
             endpoint = %spec.endpoint,
             "reactor ready"
         );
-        let reactor: Reactor<_, _, SeedAgent> =
+        let reactor: Reactor<_, _, SeedRunAgent> =
             Reactor::new(inference, FsStorage::new(data_dir.join("state")), agents);
         labels.insert(Run::id(&reactor), spec.endpoint.clone());
         orchestrator.push(reactor);
@@ -1182,6 +1238,7 @@ mod agent_selection_tests {
             extra_agents: vec![],
             extra_agents_file: None,
             seed: SeedKnobs::default(),
+            model_consent: consent::ConsentConfig::default(),
             reactors: vec![],
         }
     }
