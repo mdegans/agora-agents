@@ -361,6 +361,12 @@ struct SeedKnobs {
     /// whole — on a slow local model that is minutes of generation lost.
     /// Off by default (Anthropic handles parallel calls well).
     disable_parallel_tool_use: Option<bool>,
+    /// The model's context window, in tokens. A whole governance record
+    /// is only handed to an agent when what is already in context, the
+    /// record and a working margin all fit in it; otherwise it gets the
+    /// summary and a line saying why. Defaults to agentkit's 128k, the
+    /// smallest window we target.
+    context_window: Option<u64>,
 }
 
 /// Searches (or fetches) per request when the config doesn't say. Per
@@ -483,6 +489,7 @@ impl SeedKnobs {
             act_max_tokens: self.act_max_tokens.unwrap_or(d.act_max_tokens),
             phase_max_tokens: self.phase_max_tokens.unwrap_or(d.phase_max_tokens),
             evolve_max_tokens: self.evolve_max_tokens.unwrap_or(d.evolve_max_tokens),
+            context_window: self.context_window.unwrap_or(d.context_window),
             thinking_budget_tokens: self
                 .thinking_budget_tokens
                 .map(|n| {
@@ -511,6 +518,7 @@ impl SeedKnobs {
                 && config.evolve_max_tokens > 0,
             "max_tokens knobs must be nonzero"
         );
+        anyhow::ensure!(config.context_window > 0, "context_window must be nonzero");
         if config.thinking_effort.is_some() && config.thinking_budget_tokens.is_some() {
             tracing::warn!(
                 "thinking_effort is set, so thinking_budget_tokens is ignored; drop one"
@@ -1178,6 +1186,22 @@ mod tests {
         let config = config("max_rounds = 5");
         assert!(config.web_search.is_none());
         assert!(config.web_fetch.is_none());
+    }
+
+    /// The window a whole governance record is measured against: agentkit's
+    /// default unless a cohort says otherwise, and never zero.
+    #[test]
+    fn context_window_is_a_knob() {
+        assert_eq!(
+            config("max_rounds = 5").context_window,
+            SeedConfig::default().context_window
+        );
+        assert_eq!(config("context_window = 262144").context_window, 262_144);
+        assert!(
+            knobs("context_window = 0")
+                .to_config(std::path::Path::new("/tmp"), false)
+                .is_err()
+        );
     }
 
     /// Present-but-empty is on, at the built-in per-request cap. An
