@@ -530,23 +530,24 @@ impl Ledger {
 
     /// Keep the SOUL's Evolution Log current for every offer touched at or
     /// after `since` (the session start), with **at most one entry per
-    /// offer**: the log is capped at `EVOLUTION_LOG_CAP` (10) and most of it
+    /// offer**: the log is capped at `EVOLUTION_LOG_CAP` (50) and most of it
     /// belongs to the agent.
     ///
     /// The offer's previous entry is found by its exact note text
-    /// ([`OfferRecord::soul_note`]) and rewritten in place, re-dated
-    /// `today`; if the cap has already evicted it (or it was never
-    /// written), a new entry is appended. No other entry is removed or
-    /// changed. Same `[SYSTEM] <date>: …` form as agentkit's automatic
-    /// entries. Returns whether anything changed; the caller must then
-    /// save both the soul and this ledger.
+    /// ([`OfferRecord::soul_note`], which may be in the older dated form)
+    /// and rewritten in place, re-dated `today`; if the cap has already
+    /// evicted it (or it was never written), a new entry is appended. No
+    /// other entry is removed or changed. The note is `[SYSTEM] …` without
+    /// a date: the entry carries its own and renders as `- {date}: {note}`.
+    /// Returns whether anything changed; the caller must then save both the
+    /// soul and this ledger.
     pub fn update_soul(&mut self, soul: &mut Soul, since: DateTime<Utc>, today: NaiveDate) -> bool {
         let mut changed = false;
         for record in &mut self.offers {
             if !record.history.iter().any(|e| e.at >= since) {
                 continue;
             }
-            let line = format!("[SYSTEM] {today}: {}", record.summary());
+            let line = format!("[SYSTEM] {}", record.summary());
             if record.soul_note.as_deref() == Some(line.as_str()) {
                 continue;
             }
@@ -904,7 +905,7 @@ mod tests {
 
         ledger.record_offer(names(&k), t(23), offer(OfferChoice::Trial));
         assert!(ledger.update_soul(&mut soul, t(23), day(23)));
-        let first = "[SYSTEM] 2026-09-23: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial.";
+        let first = "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial.";
         assert_eq!(notes(&soul)[3], first);
         assert_eq!(soul.evolution_log.len(), 4);
 
@@ -917,7 +918,7 @@ mod tests {
         assert_eq!(n.len(), 5, "replaced, not appended");
         assert_eq!(
             n[3],
-            "[SYSTEM] 2026-09-25: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25."
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25."
         );
         assert_eq!(soul.evolution_log[3].date, day(25));
         assert_eq!(
@@ -937,10 +938,36 @@ mod tests {
         assert_eq!(n.len(), 5);
         assert_eq!(
             n[3],
-            "[SYSTEM] 2026-09-30: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25; after the trial chose to return to Qwen 3.6 (2026-09-30); returned to Qwen 3.6 2026-10-01."
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25; after the trial chose to return to Qwen 3.6 (2026-09-30); returned to Qwen 3.6 2026-10-01."
         );
         assert!(n[3].len() <= 512);
         assert_eq!(n.iter().filter(|l| l.starts_with("[SYSTEM]")).count(), 1);
+    }
+
+    /// Entries written before 2026-09-25 carry a second date inside the note
+    /// (`[SYSTEM] 2026-09-23: …`). They're still found by their exact text
+    /// and rewritten in place, in the undated form.
+    #[test]
+    fn a_dated_legacy_entry_is_rewritten_in_place() {
+        let k = key();
+        let mut soul = soul(2);
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(23), offer(OfferChoice::Trial));
+        let legacy = "[SYSTEM] 2026-09-23: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial.";
+        soul.push_evolution(legacy).unwrap();
+        soul.push_evolution("my own entry 2").unwrap();
+        ledger.offers[0].soul_note = Some(legacy.to_string());
+
+        ledger.observe_model(&k.to, t(25));
+        assert!(ledger.update_soul(&mut soul, t(25), day(25)));
+        let n = notes(&soul);
+        assert_eq!(n.len(), 4, "replaced, not appended");
+        assert_eq!(
+            n[2],
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25."
+        );
+        assert_eq!(soul.evolution_log[2].date, day(25));
+        assert_eq!(n[3], "my own entry 2");
     }
 
     /// Nothing new this session, nothing written.
@@ -977,7 +1004,7 @@ mod tests {
         assert_eq!(n.len(), CAP);
         assert_eq!(
             n.last().unwrap(),
-            "[SYSTEM] 2026-09-24: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
         );
         assert_eq!(n[0], "my own entry 1", "only the cap's own eviction");
     }
