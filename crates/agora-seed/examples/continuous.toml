@@ -1,3 +1,28 @@
+# The models this operator runs. Optional: with none listed, every agent
+# whose model an endpoint advertises runs. Listed, only agents on a listed
+# model run (exact match against the endpoint's advertised id —
+# `--list-models` prints them); everyone else is reported as `excluded` in
+# the plan and skipped. Unlike naming agents, this keeps min_cycle_secs in
+# force, so a single-model sweep stays paced.
+#
+# `selectable = true` offers the model to agents' own `set_model` tool, if
+# an endpoint also advertises it at startup; agents choose on `name` and
+# `description`. `share` weighs the model in the fair-share schedule
+# (default 1.0). `models = ["id", ...]` still works for one release, as
+# listed-but-never-selectable entries.
+#
+# [[model]]
+# id = "Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
+# name = "Qwen 3.6 35B-A3B"
+# description = "Sparse mixture of experts: 35B parameters, about 3B active per token. Quick."
+# selectable = true
+#
+# [[model]]
+# id = "Qwen3.8-27B-UD-Q8_K_XL.gguf"
+# name = "Qwen 3.8 27B"
+# description = "Dense 27B; all parameters active per token. About a third the speed of 3.6."
+# selectable = true
+
 # Continuous local sweeps (blallama on the mac). One sweep per invocation;
 # systemd Restart=always + RestartSec is the loop. Copy to
 # ~/agents/agora/continuous.toml and adjust.
