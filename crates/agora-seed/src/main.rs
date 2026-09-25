@@ -15,10 +15,12 @@
 //! no endpoint offers are reported and skipped; agents with no model at
 //! all await `sync-models`.
 //!
-//! Within an endpoint's cohort, agents are grouped by model in small
-//! interleaved waves (`wave_size`) so no single model's voice dominates
-//! the forum in long same-model runs. Order only matters on the
-//! sequential path — batch cohorts (Anthropic) submit whole per round.
+//! Within a local endpoint's cohort, [`schedule`] decides who runs and in
+//! what order: equal shares of writes among the endpoint's models over a
+//! trailing week, in waves of at most `wave_size` per model, bounded by a
+//! per-model wall-clock ceiling (`[schedule]`). Batch cohorts (Anthropic)
+//! submit whole per round, so they keep the plain proportional
+//! [`interleave`].
 //!
 //! Model routing note: [`ModelInfo::satisfies`] requires an exact id
 //! match, so the runner refreshes each routed agent's `state.model` to
@@ -26,7 +28,7 @@
 //! switch) and keeps `state.prompt.model` in agreement.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,12 +41,13 @@ use serde::Deserialize;
 mod consent;
 mod govlog;
 mod logging;
+mod schedule;
 
 use agora_agentkit::ids::{AgentId, ReactorId};
 use agora_agentkit::reactor::anthropic::{self, EndpointVariant};
 use agora_agentkit::reactor::seed::{FsKeyring, SeedAgent, SeedConfig, SeedContext, SeedState};
 use agora_agentkit::reactor::{FsStorage, Inference, Orchestrator, Reactor, Run, Storage};
-use misanthropic::model::ModelInfo;
+use misanthropic::model::{Model, ModelInfo};
 use misanthropic::prompt::message::CitationsConfig;
 use misanthropic::tool::{WebFetch, WebSearch};
 
@@ -319,6 +322,10 @@ struct RunConfig {
     /// [`consent`].
     #[serde(default)]
     model_consent: consent::ConsentConfig,
+    /// `[schedule]`: fair share of writes among a local endpoint's models
+    /// — see [`schedule`]. Absent means the defaults.
+    #[serde(default)]
+    schedule: schedule::ScheduleConfig,
     #[serde(rename = "reactor")]
     reactors: Vec<ReactorSpec>,
 }
@@ -833,6 +840,100 @@ fn interleave(
     waves.into_iter().flat_map(|(_, wave)| wave).collect()
 }
 
+/// The scheduler's ledgers, read once per run (see [`schedule::ledger`]).
+struct Ledgers {
+    writes: Vec<schedule::ledger::WriteRecord>,
+    sessions: Vec<schedule::ledger::SessionRecord>,
+    now: chrono::DateTime<chrono::Utc>,
+}
+
+impl Ledgers {
+    /// Read both ledgers under `data_dir`, as far back as either window
+    /// reaches. An unreadable ledger plans as empty, with a warning:
+    /// fair share degrades to oldest-first rotation, and the run goes on.
+    fn load(data_dir: &std::path::Path, config: &schedule::ScheduleConfig) -> Self {
+        use schedule::ledger::{self, SESSIONS_FILE, WRITES_FILE};
+        let now = chrono::Utc::now();
+        let since = now
+            - chrono::Duration::days(i64::from(config.share_window_days)).max(
+                chrono::Duration::hours(i64::from(config.ceiling_window_hours)),
+            );
+        fn load_one<T: for<'de> Deserialize<'de>>(
+            path: &std::path::Path,
+            since: chrono::DateTime<chrono::Utc>,
+            at: impl Fn(&T) -> chrono::DateTime<chrono::Utc>,
+        ) -> Vec<T> {
+            match ledger::read(path, since, at) {
+                Ok((records, bad)) => {
+                    if bad > 0 {
+                        tracing::warn!(path = %path.display(), bad, "skipped unparseable ledger lines");
+                    }
+                    records
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "ledger unreadable; planning without it");
+                    Vec::new()
+                }
+            }
+        }
+        Self {
+            writes: load_one(
+                &data_dir.join(WRITES_FILE),
+                since,
+                |r: &ledger::WriteRecord| r.at,
+            ),
+            sessions: load_one(
+                &data_dir.join(SESSIONS_FILE),
+                since,
+                |r: &ledger::SessionRecord| r.at,
+            ),
+            now,
+        }
+    }
+}
+
+/// Order one local endpoint's due agents by [`schedule::plan`]. The
+/// adapter between routing's cohort shape and the planner's plain inputs.
+///
+/// Every model's `share` is 1.0 until the operator's model table lands
+/// (`[[model]] share`), when it is passed through here.
+fn fair_share(
+    cohort: BTreeMap<String, Vec<(AgentId, SeedState)>>,
+    offered: &BTreeSet<Model>,
+    ledgers: &Ledgers,
+    wave_size: usize,
+    config: &schedule::ScheduleConfig,
+) -> (Vec<(AgentId, SeedState)>, schedule::Plan) {
+    let mut groups: BTreeMap<Model, Vec<schedule::Candidate>> = BTreeMap::new();
+    let mut by_id: BTreeMap<AgentId, (AgentId, SeedState)> = BTreeMap::new();
+    for (model, agents) in cohort {
+        let candidates = groups.entry(schedule::model_id(&model)).or_default();
+        for (id, state) in agents {
+            candidates.push(schedule::Candidate {
+                id,
+                last_cycle_at: state.last_cycle_at,
+            });
+            by_id.insert(id, (id, state));
+        }
+    }
+    let models: BTreeSet<Model> = groups.keys().cloned().collect();
+    let stats = schedule::model_stats(
+        &models,
+        offered,
+        &ledgers.writes,
+        &ledgers.sessions,
+        ledgers.now,
+        config,
+    );
+    let plan = schedule::plan(&groups, &BTreeMap::new(), &stats, wave_size, config);
+    let ordered = plan
+        .order
+        .iter()
+        .filter_map(|id| by_id.remove(id))
+        .collect();
+    (ordered, plan)
+}
+
 /// The agent the runner drives: agentkit's seed agent, plus the
 /// model-consent question at the end of its closing phase.
 type SeedRunAgent = consent::agent::ConsentAgent<SeedAgent>;
@@ -896,6 +997,7 @@ async fn main() -> Result<()> {
                 extra_agents_file: None,
                 seed: SeedKnobs::default(),
                 model_consent: consent::ConsentConfig::default(),
+                schedule: schedule::ScheduleConfig::default(),
                 reactors: vec![ReactorSpec {
                     endpoint,
                     min_cycle_secs: None,
@@ -914,6 +1016,7 @@ async fn main() -> Result<()> {
         !config.reactors.is_empty(),
         "config has no [[reactor]] blocks"
     );
+    config.schedule.validate()?;
 
     let data_dir = match &config.data_dir {
         Some(d) => d.clone(),
@@ -936,6 +1039,9 @@ async fn main() -> Result<()> {
         // keeping — a deleted model strands agents in near silence, and
         // that report is what shows it.
         !args.no_log_file && !args.list_models,
+        // The scheduler's ledgers record what agents do; a run that drives
+        // none has nothing to add.
+        !args.dry_run && !args.list_models,
     )?;
     if let Some(path) = &log_path {
         tracing::info!(path = %path.display(), "run log opened");
@@ -1037,17 +1143,37 @@ async fn main() -> Result<()> {
     // A dry run verifies too — it is read-only and worth knowing.
     govlog::verify(&context.inner.client, &data_dir).await;
 
-    // Assemble reactors: interleave each endpoint's cohort, cap, construct.
+    // Assemble reactors: order each endpoint's cohort, cap, construct.
     let wave_size = config.wave_size.unwrap_or(8);
+    let ledgers = Ledgers::load(&data_dir, &config.schedule);
     let mut orchestrator = Orchestrator::new();
     let mut labels: BTreeMap<ReactorId, String> = BTreeMap::new();
     let mut total = 0usize;
-    for (spec, (inference, cohort)) in config
+    for (idx, (spec, (inference, cohort))) in config
         .reactors
         .iter()
         .zip(endpoints.into_iter().zip(routing.cohorts))
+        .enumerate()
     {
-        let mut ordered = interleave(cohort, wave_size);
+        let mut ordered = match parse_endpoint(&spec.endpoint)?.0 {
+            // Batch cohorts submit whole per round: order is moot, and
+            // Haiku is outside the local fair-share pool by design.
+            EndpointVariant::Anthropic => interleave(cohort, wave_size),
+            _ => {
+                let offered: BTreeSet<Model> = offered
+                    .iter()
+                    .filter(|(i, _)| *i == idx)
+                    .map(|(_, m)| m.id.clone())
+                    .collect();
+                let (ordered, plan) =
+                    fair_share(cohort, &offered, &ledgers, wave_size, &config.schedule);
+                if args.dry_run {
+                    print!("{}", plan.report());
+                }
+                plan.log(&spec.endpoint, config.schedule.ceiling);
+                ordered
+            }
+        };
         if let Some(limit) = spec.limit {
             ordered.truncate(limit);
         }
@@ -1300,6 +1426,7 @@ mod agent_selection_tests {
             extra_agents_file: None,
             seed: SeedKnobs::default(),
             model_consent: consent::ConsentConfig::default(),
+            schedule: schedule::ScheduleConfig::default(),
             reactors: vec![],
         }
     }
