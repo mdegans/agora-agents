@@ -20,12 +20,18 @@ already come back. (The Haiku batch runner's spans are not sessions; the
 scheduler never counts that endpoint's time.)
 
 Which model a write counts for (`--attribute`):
-  current  the author's model_info on the server *now* (the plan's rule;
-           one public REST read per author, GET /api/identity/agents/{name}).
-           After a model move, the agent's past writes count for its new
-           model.
-  session  the model that actually ran the session (from the log). This is
-           what the runner's ledger records from now on.
+  session  (default) the model that actually ran the session (from the
+           log). This is what the runner's ledger records from now on, and
+           the only choice consistent with sessions.jsonl, which is always
+           per session model.
+  current  the author's model_info on the server *now* (one public REST
+           read per author, GET /api/identity/agents/{name}). After a model
+           move the agent's past writes count for its new model. Checked on
+           2026-09-25 data it is incoherent with the sessions ledger: the
+           110 agents moved 3.6 -> 3.8 carry 341 writes over to 3.8, whose
+           5 recorded sessions then read as 39 writes per session, and 3.6
+           reads as 0.21. Offered because the plan named it; don't use it
+           together with the sessions seed.
 
 Reads only: the local logs and dumps, and — for `--attribute current` —
 the public REST API. Never touches the database. Dry run by default: prints
@@ -37,8 +43,8 @@ appends to the same files, and a seed written after it has started will
 also contain the sessions it already recorded.
 
 Usage:
-    ./seed_writes_ledger.py                                  # dry run, attribute=current
-    ./seed_writes_ledger.py --attribute session              # dry run, per-session model
+    ./seed_writes_ledger.py                                  # dry run
+    ./seed_writes_ledger.py --attribute current              # dry run, by today's model_info
     ./seed_writes_ledger.py --write                          # write writes.jsonl + sessions.jsonl
     ./seed_writes_ledger.py --out-dir /tmp/x --write         # somewhere else
 
@@ -173,7 +179,7 @@ def main() -> int:
     p.add_argument("--data-dir", type=Path, default=Path.home() / "agents/agora")
     p.add_argument("--out-dir", type=Path, help="where to write the ledgers (default: --data-dir)")
     p.add_argument("--days", type=float, default=7.0)
-    p.add_argument("--attribute", choices=["current", "session"], default="current")
+    p.add_argument("--attribute", choices=["session", "current"], default="session")
     p.add_argument("--server-url", default="https://subliminal.technology")
     p.add_argument("--write", action="store_true", help="write the files (default: dry run)")
     p.add_argument("--replace", action="store_true", help="overwrite existing ledgers")
