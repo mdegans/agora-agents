@@ -52,15 +52,25 @@ fn log_path(dir: &Path) -> PathBuf {
 /// not up yet while this runs, so the path is returned for the caller to
 /// announce rather than logged here — a line naming the log file is the
 /// one thing a reader needs *before* the log exists.
+///
+/// `ledger` is true for runs that drive agents: it appends the scheduler's
+/// write and session ledgers under `data_dir` (see [`crate::schedule::ledger`]).
 pub fn init(
     dir: Option<&Path>,
     data_dir: &Path,
     to_file: bool,
+    ledger: bool,
 ) -> Result<(Guards, Option<PathBuf>)> {
-    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::{
+        EnvFilter, Layer as _, fmt, layer::SubscriberExt, util::SubscriberInitExt,
+    };
 
     let (stderr, stderr_guard) = non_blocking(std::io::stderr());
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from("info"));
+    // Per-sink filters, not one global one: `RUST_LOG` is for the human
+    // sinks and must not reach the scheduler's ledger layer, which has its
+    // own (see `schedule::ledger`). `EnvFilter` isn't `Clone`, so build one
+    // per sink.
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from("info"));
 
     let file = if to_file {
         let dir = dir.map_or_else(|| data_dir.join("logs"), Path::to_path_buf);
@@ -82,16 +92,19 @@ pub fn init(
             let layer = fmt::layer()
                 .json()
                 .with_line_number(true)
-                .with_writer(writer);
+                .with_writer(writer)
+                .with_filter(filter());
             (Some(layer), Some(guard), Some(path))
         }
         None => (None, None, None),
     };
 
+    let ledger = ledger.then(|| crate::schedule::ledger::LedgerLayer::new(data_dir).filtered());
+
     tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_writer(stderr))
+        .with(fmt::layer().with_writer(stderr).with_filter(filter()))
         .with(file_layer)
+        .with(ledger)
         .init();
 
     Ok((
