@@ -3,8 +3,13 @@
 //! The seed runner is the reference client, so it does what any client
 //! can: resolve the genesis signing key, fetch the chain, check every
 //! link and signature with [`agora_agentkit::govlog::verify_chain`], and
-//! re-hash the head entry's full `data`. A failure is a loud warning, not
-//! a stop — the log is evidence, not a precondition for posting.
+//! re-hash the head entry's full `data`. A failure **stops the run**: a
+//! client does not act on a platform whose governance record it cannot
+//! verify (Steward, 2026-09-26 — "Clients should not connect to a
+//! compromised server. If this means they crash, they should."). That
+//! includes a check that could not complete: unverifiable is treated as
+//! unverified. A repudiated entry inside a declared compromise window is
+//! a declared state, not a failure, and does not stop the run.
 //!
 //! Two independent pins live in `data_dir`, and mean different things:
 //!
@@ -40,22 +45,92 @@ use serde::{Deserialize, Serialize};
 const PIN_FILE: &str = "governance_signing_key.pub";
 const HEAD_PIN_FILE: &str = "governance_head.pin";
 
-/// Run the check and log the outcome. Never fails the run.
-pub async fn verify(client: &Client, data_dir: &Path) {
-    match run(client, data_dir).await {
-        Ok(()) => {}
-        Err(e) => tracing::warn!(error = %e, "governance log verification did not complete"),
+/// Why the runner refused to go on. Each alarm has already been logged
+/// at ERROR with its details; this is the summary the run exits with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Alarm {
+    /// One or more entries failed signature, link, or content checks.
+    DidNotVerify { failed: usize },
+    /// The chain's active key is not the key the platform serves.
+    KeyMismatch,
+    /// Nothing out of band vouches for the key the chain started under.
+    Unanchored,
+    /// The served key differs from the one pinned on first use (servers
+    /// without the signing-key history endpoint only).
+    PinnedKeyChanged,
+    /// The chain no longer holds the head this client last verified.
+    HistoryRewritten,
+}
+
+impl std::fmt::Display for Alarm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Alarm::DidNotVerify { failed } => write!(f, "{failed} entries failed verification"),
+            Alarm::KeyMismatch => f.write_str("the chain's active key is not the served key"),
+            Alarm::Unanchored => f.write_str("the genesis key is unanchored"),
+            Alarm::PinnedKeyChanged => f.write_str("the served key changed since it was pinned"),
+            Alarm::HistoryRewritten => f.write_str("history changed since the pinned head"),
+        }
     }
 }
 
-async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
+/// The governance log did not verify; the runner must not proceed.
+#[derive(Debug)]
+pub struct Refused(pub Vec<Alarm>);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("refusing to run: the governance log did not verify (")?;
+        for (i, a) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{a}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Verify the log. `Err` means the run must stop: either an [`Alarm`]
+/// fired (wrapped in [`Refused`]) or the check could not complete.
+///
+/// Both failures log one ERROR `governance_log_refused` event, which the
+/// agora repo's `scripts/stall-watch.py` mails to the Steward at once.
+pub async fn verify(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
+    let alarms = match run(client, data_dir).await {
+        Ok(alarms) => alarms,
+        Err(e) => {
+            tracing::error!(
+                event_type = "governance_log_refused",
+                error = %format!("{e:#}"),
+                "REFUSING TO RUN: governance log verification did not complete"
+            );
+            return Err(e.context("refusing to run: governance log verification did not complete"));
+        }
+    };
+    if alarms.is_empty() {
+        Ok(())
+    } else {
+        tracing::error!(
+            event_type = "governance_log_refused",
+            alarms = ?alarms.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "REFUSING TO RUN: the governance log did not verify"
+        );
+        Err(Refused(alarms).into())
+    }
+}
+
+async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<Vec<Alarm>> {
+    let mut alarms = Vec::new();
     let served = client
         .get_governance_signing_key()
         .await
         .context("fetching the governance signing key")?;
     let served_key = served.public_key;
 
-    let genesis_key_hex = resolve_genesis_key(client, data_dir, served_key).await?;
+    let genesis_key_hex = resolve_genesis_key(client, data_dir, served_key, &mut alarms).await?;
     let genesis_key = genesis_key_hex
         .to_verifying_key()
         .context("pinned governance genesis key is not a valid Ed25519 point")?;
@@ -67,7 +142,7 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
         .context("fetching the governance chain")?;
     if links.is_empty() {
         tracing::info!("governance log is empty; nothing to verify");
-        return Ok(());
+        return Ok(alarms);
     }
 
     // Every change of key must be certified by an offline root key
@@ -95,7 +170,8 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
     // if the chain's *active* key (after following every rotation) isn't
     // what the platform serves right now.
     if !active_key_matches_served(&report, served_key) {
-        tracing::warn!(
+        alarms.push(Alarm::KeyMismatch);
+        tracing::error!(
             active_key = %report.public_key,
             served_key = %served_key,
             "GOVERNANCE SIGNING KEY MISMATCH: the chain's active key after \
@@ -104,7 +180,8 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
         );
     }
     if !report.unanchored_keys.is_empty() {
-        tracing::warn!(
+        alarms.push(Alarm::Unanchored);
+        tracing::error!(
             unanchored_keys = ?report.unanchored_keys.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "GOVERNANCE LOG GENESIS KEY IS UNANCHORED: neither this \
              client's agora-agentkit nor a root certificate in the chain \
@@ -134,7 +211,7 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
         );
     } else {
         for e in report.entries.iter().filter(|e| e.problem.is_some()) {
-            tracing::warn!(
+            tracing::error!(
                 id = %e.id,
                 chain_seq = e.chain_seq,
                 signature_valid = e.signature_valid,
@@ -144,22 +221,27 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
                 "governance log entry failed verification"
             );
         }
-        tracing::warn!(
+        let failed = report
+            .entries
+            .iter()
+            .filter(|e| e.problem.is_some())
+            .count();
+        alarms.push(Alarm::DidNotVerify { failed });
+        tracing::error!(
             entries = report.entries.len(),
-            failed = report
-                .entries
-                .iter()
-                .filter(|e| e.problem.is_some())
-                .count(),
+            failed,
             "GOVERNANCE LOG DID NOT VERIFY"
         );
     }
 
-    if let Err(e) = check_and_update_head_pin(data_dir, &links, report.ok).await {
-        tracing::warn!(error = %e, "governance head pin check did not complete");
+    let pin = check_and_update_head_pin(data_dir, &links, report.ok)
+        .await
+        .context("checking the pinned governance head")?;
+    if matches!(pin, HeadPinOutcome::Rewritten { .. }) {
+        alarms.push(Alarm::HistoryRewritten);
     }
 
-    Ok(())
+    Ok(alarms)
 }
 
 /// The genesis key `verify_chain` should be told, resolved and pinned.
@@ -173,6 +255,7 @@ async fn resolve_genesis_key(
     client: &Client,
     data_dir: &Path,
     served: PublicKeyHex,
+    alarms: &mut Vec<Alarm>,
 ) -> anyhow::Result<PublicKeyHex> {
     let path = data_dir.join(PIN_FILE);
 
@@ -201,23 +284,28 @@ async fn resolve_genesis_key(
                         // Defensive: the endpoint answered but named no
                         // genesis record. Fall back rather than fail the
                         // run over a server-side inconsistency.
-                        None => pin_served_key(&path, served).await,
+                        None => pin_served_key(&path, served, alarms).await,
                     }
                 }
             }
         }
-        Err(_) => pin_served_key(&path, served).await,
+        Err(_) => pin_served_key(&path, served, alarms).await,
     }
 }
 
-/// Today's pre-genesis-history behaviour: pin the currently served key
-/// trust-on-first-use, and warn loudly if a later run sees a different
-/// one than what's pinned.
-async fn pin_served_key(path: &Path, served: PublicKeyHex) -> anyhow::Result<PublicKeyHex> {
+/// The pre-genesis-history behaviour: pin the currently served key
+/// trust-on-first-use, and raise [`Alarm::PinnedKeyChanged`] if a later
+/// run sees a different one than what's pinned.
+async fn pin_served_key(
+    path: &Path,
+    served: PublicKeyHex,
+    alarms: &mut Vec<Alarm>,
+) -> anyhow::Result<PublicKeyHex> {
     match read_pinned_key(path).await? {
         Some(pinned) => {
             if pinned != served {
-                tracing::warn!(
+                alarms.push(Alarm::PinnedKeyChanged);
+                tracing::error!(
                     pinned = %pinned,
                     served = %served,
                     path = %path.display(),
@@ -321,8 +409,8 @@ fn compare_head_pin(pinned: Option<&HeadPin>, links: &[GovernanceChainLink]) -> 
 /// Compare the current chain against the pinned head (if any), log an
 /// error-level alarm on a rewrite without touching the pin (so it stays
 /// as evidence), and otherwise — when the chain verified `ok` — refresh
-/// the pin to the current head. Never fails the run: I/O errors are
-/// returned to the caller, which only warns.
+/// the pin to the current head. I/O errors are returned to the caller,
+/// which refuses to run on them.
 async fn check_and_update_head_pin(
     data_dir: &Path,
     links: &[GovernanceChainLink],
@@ -380,6 +468,19 @@ mod tests {
     use agora_agentkit::govlog::{Envelope, attest, data_hash, truncate_to_micros};
     use chrono::{DateTime, Utc};
     use serde_json::json;
+
+    #[test]
+    fn refused_names_every_alarm() {
+        let r = Refused(vec![
+            Alarm::DidNotVerify { failed: 2 },
+            Alarm::HistoryRewritten,
+        ]);
+        assert_eq!(
+            r.to_string(),
+            "refusing to run: the governance log did not verify \
+             (2 entries failed verification; history changed since the pinned head)"
+        );
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
