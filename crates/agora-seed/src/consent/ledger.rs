@@ -30,6 +30,11 @@ pub const FORMAT: u32 = 1;
 /// Sessions on the new model before a trial is reviewed.
 pub const TRIAL_SESSIONS: u32 = 5;
 
+/// How the countdown line ([`Ledger::trial_line`]) starts. A fork of a
+/// trial session removes the line by it: it names the trial model as the
+/// one the session runs on.
+pub const TRIAL_LINE_PREFIX: &str = "Model trial: ";
+
 /// Unanswered asks before the runner stops asking. The first miss is
 /// re-asked at the next eligible session; the second is final.
 pub const MAX_MISSES: u32 = 2;
@@ -129,31 +134,81 @@ pub enum Stage {
     Declined,
     /// Never answered in [`MAX_MISSES`] asks: treated as "stay". Final.
     NoAnswer,
-    /// Chose to move; queued for the Steward, not yet applied.
+    /// Chose to move (or, after a trial, to keep the new model); the change
+    /// is applied, or waits to be, and takes effect at the agent's next
+    /// session on `to`.
     AwaitingSwap { term: Term },
     /// On the new model for a trial. `sessions` counts completed sessions
     /// actually run on it.
     Trial {
         started_at: DateTime<Utc>,
         sessions: u32,
+        /// Unanswered reviews under the pre-2026-09-26 flow, which asked on
+        /// the new model. Kept so older ledgers (and binaries) still read;
+        /// nothing counts it now.
+        #[serde(default)]
         review_misses: u32,
     },
-    /// Returning to the old model; queued, not yet applied.
+    /// The trial's [`TRIAL_SESSIONS`] are done: the agent is being moved
+    /// back to `from`, where the review is asked (Steward, 2026-09-25: the
+    /// original weights make the final call). Until the move takes effect
+    /// the agent still runs on `to`, and the move is retried at the end of
+    /// each such session.
+    ReturningForReview {
+        started_at: DateTime<Utc>,
+        ended_at: DateTime<Utc>,
+        sessions: u32,
+    },
+    /// Back on `from`: the review is the first thing asked at the agent's
+    /// next session on it.
+    ReviewDue {
+        started_at: DateTime<Utc>,
+        ended_at: DateTime<Utc>,
+        sessions: u32,
+    },
+    /// Returning to the old model; applied, or waiting to be (the
+    /// pre-2026-09-26 review, which was asked on the new model).
     AwaitingRevert { cause: RevertCause },
     /// On the new model for good (chose permanent, or kept the trial).
     /// Final.
     Moved,
-    /// Back on the old model. Final.
-    Reverted,
+    /// Back on (or kept on) the old model. Final. `cause` is `None` when
+    /// the agent was moved back out of band mid-trial.
+    Reverted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<RevertCause>,
+    },
+    /// The agent was moved to a model that is neither side of the offer
+    /// while the offer was under way — by hand, since the agent itself
+    /// can't mid-offer. The offer is over; the history's last `moved` event
+    /// names the model. Final.
+    Superseded,
+}
+
+impl Stage {
+    /// Whether a change or trial for this offer is under way. While one
+    /// is, the agent can't switch model itself and isn't offered another.
+    pub fn in_progress(&self) -> bool {
+        matches!(
+            self,
+            Stage::AwaitingSwap { .. }
+                | Stage::Trial { .. }
+                | Stage::ReturningForReview { .. }
+                | Stage::ReviewDue { .. }
+                | Stage::AwaitingRevert { .. }
+        )
+    }
 }
 
 #[cfg(test)]
 impl Stage {
-    /// Whether the Steward has something to apply for this record.
+    /// Whether the record has a change for the runner to apply.
     pub fn is_queued(&self) -> bool {
         matches!(
             self,
-            Stage::AwaitingSwap { .. } | Stage::AwaitingRevert { .. }
+            Stage::AwaitingSwap { .. }
+                | Stage::AwaitingRevert { .. }
+                | Stage::ReturningForReview { .. }
         )
     }
 }
@@ -168,7 +223,7 @@ pub enum Term {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevertCause {
-    /// The agent chose to go back after its trial.
+    /// The agent chose the old model at its trial review.
     Chosen,
     /// The trial review went unanswered: the agent agreed to a
     /// [`TRIAL_SESSIONS`]-session trial, not a permanent move.
@@ -204,8 +259,11 @@ pub enum EventKind {
         failure: Option<String>,
     },
     /// The runner saw the agent start a session on `model` after a queued
-    /// change — the Steward applied it (or moved the agent back early).
+    /// change took effect (or after an out-of-band move).
     Moved { model: Model },
+    /// The trial's `sessions` were done; the runner began moving the agent
+    /// back to `from` for its review.
+    TrialEnded { sessions: u32 },
 }
 
 /// A model change the Steward should apply, produced by recording an
@@ -224,11 +282,19 @@ pub struct Change {
 pub enum ChangeAction {
     SwapTrial,
     SwapPermanent,
-    Revert { cause: RevertCause },
+    /// The pre-2026-09-26 review's way back (asked on the new model).
+    Revert {
+        cause: RevertCause,
+    },
+    /// Back to `from` after the trial, for the review.
+    ReturnForReview,
+    /// Kept the new model at the review (asked on `from`).
+    Keep,
 }
 
-/// What to ask at the end of this session, if anything. At most one
-/// question per session; a due trial review wins over a new offer.
+/// A question for this session: an offer (asked at the end of a session)
+/// or a trial review (asked at the start of the session on `from` after
+/// the trial). At most one per session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Due {
     Offer(OfferKey),
@@ -257,6 +323,17 @@ pub struct OfferNames<'a> {
     pub key: &'a OfferKey,
     pub from_name: &'a str,
     pub to_name: &'a str,
+}
+
+/// A due review's inputs. See [`Ledger::review`].
+#[derive(Debug, Clone, Copy)]
+pub struct Review<'a> {
+    pub record: &'a OfferRecord,
+    /// The trial's first session on `to`.
+    pub started_at: DateTime<Utc>,
+    pub sessions: u32,
+    /// When the agent chose the trial.
+    pub chosen_at: DateTime<Utc>,
 }
 
 impl Ledger {
@@ -317,13 +394,19 @@ impl Ledger {
         self.offers.iter_mut().find(|r| &r.key == key)
     }
 
-    /// Session start: notice queued changes the Steward has applied, by the
-    /// model the agent was routed on. Returns whether anything changed.
+    /// Session start: notice changes that have taken effect, by the model
+    /// the agent was routed on. Returns whether anything changed.
+    ///
+    /// Also notices moves made out of band (by hand): back to `from`
+    /// mid-trial ends the trial, and a model that is neither side of the
+    /// offer ends the offer ([`Stage::Superseded`]).
     pub fn observe_model(&mut self, model: &Model, now: DateTime<Utc>) -> bool {
         let mut changed = false;
         for record in &mut self.offers {
+            let (from, to) = (&record.key.from, &record.key.to);
+            let elsewhere = model != from && model != to;
             let next = match record.stage {
-                Stage::AwaitingSwap { term } if model == &record.key.to => match term {
+                Stage::AwaitingSwap { term } if model == to => match term {
                     Term::Trial => Stage::Trial {
                         started_at: now,
                         sessions: 0,
@@ -331,10 +414,25 @@ impl Ledger {
                     },
                     Term::Permanent => Stage::Moved,
                 },
-                Stage::AwaitingRevert { .. } if model == &record.key.from => Stage::Reverted,
+                Stage::AwaitingRevert { cause } if model == from => {
+                    Stage::Reverted { cause: Some(cause) }
+                }
+                Stage::ReturningForReview {
+                    started_at,
+                    ended_at,
+                    sessions,
+                } if model == from => Stage::ReviewDue {
+                    started_at,
+                    ended_at,
+                    sessions,
+                },
                 // Moved back mid-trial, out of band — say, a technical
                 // necessity. Nothing left to review.
-                Stage::Trial { .. } if model == &record.key.from => Stage::Reverted,
+                Stage::Trial { .. } if model == from => Stage::Reverted { cause: None },
+                // Moved off `from` before its review, by hand: the review
+                // is for the original model to answer, so it waits.
+                Stage::ReviewDue { .. } if !elsewhere => continue,
+                stage if stage.in_progress() && elsewhere => Stage::Superseded,
                 _ => continue,
             };
             record.stage = next;
@@ -366,18 +464,12 @@ impl Ledger {
         changed
     }
 
-    /// What to ask at the close of a completed session on `model` (call
-    /// after [`count_session`](Self::count_session)).
+    /// The offer to ask at the close of a completed session on `model`
+    /// (call after [`count_session`](Self::count_session)), if any. Never
+    /// while another offer's change or trial is under way.
     pub fn due(&self, model: &Model, offer: Option<&OfferKey>) -> Option<Due> {
-        let review = self.offers.iter().find(|r| {
-            model == &r.key.to
-                && matches!(r.stage, Stage::Trial { sessions, .. } if sessions >= TRIAL_SESSIONS)
-        });
-        if let Some(record) = review {
-            return Some(Due::Review(record.key.clone()));
-        }
         let offer = offer?;
-        if model != &offer.from {
+        if model != &offer.from || self.offers.iter().any(|r| r.stage.in_progress()) {
             return None;
         }
         match self.record(offer).map(|r| r.stage) {
@@ -389,18 +481,144 @@ impl Ledger {
         }
     }
 
-    /// The trial review's inputs: names, the swap boundary, and the
-    /// session count.
-    pub fn trial(&self, key: &OfferKey) -> Option<(&OfferRecord, DateTime<Utc>, u32)> {
+    /// Close of a completed session on `model`: a trial that has now run
+    /// its [`TRIAL_SESSIONS`] ends here. Nothing is asked on the new model;
+    /// the agent goes back to `from`, where the review is asked. Returns
+    /// the change to apply.
+    ///
+    /// Also catches up a trial the pre-2026-09-26 flow left mid-review
+    /// (asked on the new model, unanswered once): it returns for review too.
+    pub fn end_trial(&mut self, model: &Model, now: DateTime<Utc>) -> Option<Change> {
+        let record = self.offers.iter_mut().find(|r| {
+            model == &r.key.to
+                && matches!(r.stage, Stage::Trial { sessions, .. } if sessions >= TRIAL_SESSIONS)
+        })?;
+        let Stage::Trial {
+            started_at,
+            sessions,
+            ..
+        } = record.stage
+        else {
+            unreachable!("matched above");
+        };
+        record.stage = Stage::ReturningForReview {
+            started_at,
+            ended_at: now,
+            sessions,
+        };
+        record.history.push(Event {
+            at: now,
+            kind: EventKind::TrialEnded { sessions },
+        });
+        Some(Change {
+            action: ChangeAction::ReturnForReview,
+            from: record.key.to.clone(),
+            to: record.key.from.clone(),
+        })
+    }
+
+    /// The change `record` waits on, if any: `(from, to, action)`.
+    pub fn awaited(record: &OfferRecord) -> Option<Change> {
+        let (from, to, action) = match record.stage {
+            Stage::AwaitingSwap { term } => (
+                &record.key.from,
+                &record.key.to,
+                // After a review, the only way here is `keep`.
+                if record.reviewed() {
+                    ChangeAction::Keep
+                } else {
+                    match term {
+                        Term::Trial => ChangeAction::SwapTrial,
+                        Term::Permanent => ChangeAction::SwapPermanent,
+                    }
+                },
+            ),
+            Stage::AwaitingRevert { cause } => (
+                &record.key.to,
+                &record.key.from,
+                ChangeAction::Revert { cause },
+            ),
+            Stage::ReturningForReview { .. } => (
+                &record.key.to,
+                &record.key.from,
+                ChangeAction::ReturnForReview,
+            ),
+            _ => return None,
+        };
+        Some(Change {
+            action,
+            from: from.clone(),
+            to: to.clone(),
+        })
+    }
+
+    /// A change the agent agreed to that the runner has not applied yet
+    /// (the profile update failed, the model wasn't routable, or an older
+    /// binary queued it for the Steward) and that can be applied from
+    /// `model`, where the agent is now.
+    pub fn unapplied(&self, model: &Model) -> Option<Change> {
+        self.offers.iter().find_map(|r| {
+            let change = Self::awaited(r)?;
+            (&change.from == model && !self.applied(r, &change.from, &change.to)).then_some(change)
+        })
+    }
+
+    /// The offer whose review is due now, on `model`.
+    pub fn review_due(&self, model: &Model) -> Option<OfferKey> {
+        self.offers
+            .iter()
+            .find(|r| model == &r.key.from && matches!(r.stage, Stage::ReviewDue { .. }))
+            .map(|r| r.key.clone())
+    }
+
+    /// The trial review's inputs.
+    pub fn review(&self, key: &OfferKey) -> Option<Review<'_>> {
         let record = self.record(key)?;
-        match record.stage {
-            Stage::Trial {
+        let (started_at, sessions) = match record.stage {
+            Stage::ReviewDue {
                 started_at,
                 sessions,
                 ..
-            } => Some((record, started_at, sessions)),
-            _ => None,
-        }
+            }
+            | Stage::ReturningForReview {
+                started_at,
+                sessions,
+                ..
+            } => (started_at, sessions),
+            _ => return None,
+        };
+        Some(Review {
+            record,
+            started_at,
+            sessions,
+            chosen_at: self.chosen_at(key).unwrap_or(started_at),
+        })
+    }
+
+    /// The countdown line for a session on `model`, while a trial runs on
+    /// it (or its end is waiting to be applied). Appended to the intro.
+    pub fn trial_line(&self, model: &Model) -> Option<String> {
+        self.offers.iter().find_map(|r| {
+            if model != &r.key.to {
+                return None;
+            }
+            let (from, to) = (&r.from_name, &r.to_name);
+            match r.stage {
+                Stage::Trial { sessions, .. } if sessions < TRIAL_SESSIONS => Some(format!(
+                    "{TRIAL_LINE_PREFIX}session {} of {TRIAL_SESSIONS} on {to}. After session \
+                     {TRIAL_SESSIONS} you'll return to {from} for one session to decide \
+                     whether to keep {to}.",
+                    sessions + 1
+                )),
+                Stage::Trial { .. } | Stage::ReturningForReview { .. } => Some(format!(
+                    "{TRIAL_LINE_PREFIX}your {TRIAL_SESSIONS} sessions on {to} are complete. The \
+                     move back to {from} for your decision has not taken effect yet; it is \
+                     retried at the end of this session, and you'll decide on {from} whether \
+                     to keep {to}."
+                )),
+                _ => None,
+            }
+        })
     }
 
     /// When the trial on `key` was chosen — the date the review reminds
@@ -487,8 +705,11 @@ impl Ledger {
         })
     }
 
-    /// Record the trial review's outcome. A second miss reverts: the
-    /// agent's consent covered a trial, not a permanent move.
+    /// Record the trial review's outcome, asked on `from` after the
+    /// trial. `revert` and no answer both leave the agent where it is, on
+    /// `from` — the agent agreed to a trial, not a permanent move, so
+    /// silence is not consent to keep it. `keep` returns the change to
+    /// apply.
     pub fn record_review(
         &mut self,
         key: &OfferKey,
@@ -496,68 +717,53 @@ impl Ledger {
         result: Result<ReviewAnswer, String>,
     ) -> Option<Change> {
         let record = self.record_mut(key)?;
-        let Stage::Trial {
-            started_at,
-            sessions,
-            review_misses,
-        } = record.stage
-        else {
+        let Stage::ReviewDue { sessions, .. } = record.stage else {
             return None;
         };
-        let (stage, cause, event) = match result {
+        let (stage, change, event) = match result {
             Ok(answer) => {
-                let (stage, cause) = match answer.choice {
+                let (stage, change) = match answer.choice {
                     ReviewChoice::Revert => (
-                        Stage::AwaitingRevert {
-                            cause: RevertCause::Chosen,
+                        Stage::Reverted {
+                            cause: Some(RevertCause::Chosen),
                         },
-                        Some(RevertCause::Chosen),
+                        None,
                     ),
-                    ReviewChoice::Keep => (Stage::Moved, None),
+                    ReviewChoice::Keep => (
+                        Stage::AwaitingSwap {
+                            term: Term::Permanent,
+                        },
+                        Some(ChangeAction::Keep),
+                    ),
                 };
                 let event = EventKind::Reviewed {
                     sessions,
                     answer: Some(answer),
                     failure: None,
                 };
-                (stage, cause, event)
+                (stage, change, event)
             }
-            Err(failure) => {
-                let misses = review_misses + 1;
-                let (stage, cause) = if misses >= MAX_MISSES {
-                    (
-                        Stage::AwaitingRevert {
-                            cause: RevertCause::NoAnswer,
-                        },
-                        Some(RevertCause::NoAnswer),
-                    )
-                } else {
-                    (
-                        Stage::Trial {
-                            started_at,
-                            sessions,
-                            review_misses: misses,
-                        },
-                        None,
-                    )
-                };
-                let event = EventKind::Reviewed {
+            Err(failure) => (
+                Stage::Reverted {
+                    cause: Some(RevertCause::NoAnswer),
+                },
+                None,
+                EventKind::Reviewed {
                     sessions,
                     answer: None,
                     failure: Some(failure),
-                };
-                (stage, cause, event)
-            }
+                },
+            ),
         };
         record.stage = stage;
         record.history.push(Event {
             at: now,
             kind: event,
         });
-        cause.map(|cause| Change {
-            action: ChangeAction::Revert { cause },
-            from: record.key.to.clone(),
-            to: record.key.from.clone(),
+        change.map(|action| Change {
+            action,
+            from: record.key.from.clone(),
+            to: record.key.to.clone(),
         })
     }
 
@@ -578,17 +784,17 @@ impl Ledger {
     /// accepted change is under way (trials end at their review), or the
     /// last switch is too recent.
     pub fn switch_blocker(&self) -> Option<String> {
-        if let Some(record) = self.offers.iter().find(|r| {
-            matches!(
-                r.stage,
-                Stage::Trial { .. } | Stage::AwaitingSwap { .. } | Stage::AwaitingRevert { .. }
-            )
-        }) {
+        if let Some(record) = self.offers.iter().find(|r| r.stage.in_progress()) {
             return Some(match record.stage {
                 Stage::Trial { .. } => format!(
-                    "you are in a trial of {}; it ends with a review after \
-                     {TRIAL_SESSIONS} sessions, where you decide whether to keep it",
-                    record.to_name
+                    "you are in a trial of {}; after {TRIAL_SESSIONS} sessions you return \
+                     to {} for one session and decide there whether to keep it",
+                    record.to_name, record.from_name
+                ),
+                Stage::ReturningForReview { .. } | Stage::ReviewDue { .. } => format!(
+                    "your trial of {} is over and your decision on it is due; it is asked \
+                     on {}",
+                    record.to_name, record.from_name
                 ),
                 _ => "a model change you already agreed to has not taken effect yet".to_string(),
             });
@@ -676,6 +882,13 @@ impl Ledger {
 }
 
 impl OfferRecord {
+    /// Whether the trial review has been answered (or gone unanswered).
+    pub fn reviewed(&self) -> bool {
+        self.history
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Reviewed { .. }))
+    }
+
     /// One sentence for the whole history of this offer, e.g. "Asked on
     /// 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a
     /// 5-session trial; moved 2026-09-25."
@@ -689,6 +902,9 @@ impl OfferRecord {
         let mut parts: Vec<String> = Vec::new();
         let mut offer_misses = 0;
         let mut review_misses = 0;
+        // Under the current flow the review is asked on `from`, after the
+        // trial has ended and the agent has gone back.
+        let mut returned = false;
         for event in &self.history {
             let on = event.at.date_naive();
             match &event.kind {
@@ -712,16 +928,31 @@ impl OfferRecord {
                         format!("no answer recorded yet; staying on {from} for now")
                     });
                 }
+                EventKind::TrialEnded { sessions } => {
+                    returned = true;
+                    parts.push(format!(
+                        "trial of {sessions} sessions complete {on}; returned to {from} to decide"
+                    ));
+                }
                 EventKind::Reviewed {
                     answer: Some(a), ..
                 } => {
                     parts.retain(|p| !p.starts_with("trial review unanswered"));
                     parts.push(match a.choice {
+                        ReviewChoice::Revert if returned => {
+                            format!("after the trial chose to stay on {from} ({on})")
+                        }
                         ReviewChoice::Revert => {
                             format!("after the trial chose to return to {from} ({on})")
                         }
                         ReviewChoice::Keep => format!("after the trial chose to keep {to} ({on})"),
                     });
+                }
+                EventKind::Reviewed { answer: None, .. } if returned => {
+                    parts.push(format!(
+                        "trial review unanswered ({on}); staying on {from}, as the trial was \
+                         for {TRIAL_SESSIONS} sessions"
+                    ));
                 }
                 EventKind::Reviewed { answer: None, .. } => {
                     review_misses += 1;
@@ -735,7 +966,15 @@ impl OfferRecord {
                 EventKind::Moved { model } if model == &self.key.to => {
                     parts.push(format!("moved {on}"));
                 }
-                EventKind::Moved { .. } => parts.push(format!("returned to {from} {on}")),
+                // The return for the review: already said by `TrialEnded`.
+                EventKind::Moved { model } if model == &self.key.from && returned => {}
+                EventKind::Moved { model } if model == &self.key.from => {
+                    parts.push(format!("returned to {from} {on}"))
+                }
+                EventKind::Moved { model } => parts.push(format!(
+                    "moved to {} by hand {on}; offer closed",
+                    model.name()
+                )),
             }
         }
         let asked = match asked_on {
@@ -853,8 +1092,8 @@ mod tests {
         assert_eq!(change.unwrap().action, ChangeAction::SwapPermanent);
     }
 
-    /// The whole trial: queued, applied, five sessions on the new model
-    /// (and only on it), reviewed.
+    /// The whole trial: applied, five sessions on the new model (and only
+    /// on it), then ended — nothing asked on the new model.
     #[test]
     fn trial_counts_only_completed_sessions_on_the_new_model() {
         let k = key();
@@ -865,22 +1104,47 @@ mod tests {
         assert!(!ledger.observe_model(&k.from, t(24)));
         assert!(!ledger.count_session(&k.from));
         assert_eq!(ledger.due(&k.from, Some(&k)), None, "answered already");
+        assert_eq!(ledger.end_trial(&k.from, t(24)), None);
 
-        // The Steward applied it.
+        // Applied.
         assert!(ledger.observe_model(&k.to, t(25)));
-        let (_, started, sessions) = ledger.trial(&k).unwrap();
-        assert_eq!((started, sessions), (t(25), 0));
+        assert_eq!(
+            ledger.offers[0].stage,
+            Stage::Trial {
+                started_at: t(25),
+                sessions: 0,
+                review_misses: 0
+            }
+        );
 
         for n in 1..TRIAL_SESSIONS {
             assert!(!ledger.observe_model(&k.to, t(25)), "no re-transition");
             ledger.count_session(&k.to);
+            assert_eq!(ledger.end_trial(&k.to, t(25)), None, "session {n}");
             assert_eq!(ledger.due(&k.to, Some(&k)), None, "session {n}");
         }
         ledger.count_session(&k.to);
-        assert_eq!(ledger.due(&k.to, Some(&k)), Some(Due::Review(k.clone())));
+        assert_eq!(
+            ledger.due(&k.to, Some(&k)),
+            None,
+            "never asked on the new model"
+        );
+        let change = ledger.end_trial(&k.to, t(26)).unwrap();
+        assert_eq!(change.action, ChangeAction::ReturnForReview);
+        assert_eq!((change.from, change.to), (k.to.clone(), k.from.clone()));
+        assert_eq!(
+            ledger.offers[0].stage,
+            Stage::ReturningForReview {
+                started_at: t(25),
+                ended_at: t(26),
+                sessions: TRIAL_SESSIONS
+            }
+        );
+        assert_eq!(ledger.end_trial(&k.to, t(26)), None, "once");
         assert_eq!(ledger.chosen_at(&k), Some(t(23)));
     }
 
+    /// A trial ended, returned to `from`, and the review due there.
     fn in_review() -> (OfferKey, Ledger) {
         let k = key();
         let mut ledger = Ledger::default();
@@ -889,55 +1153,252 @@ mod tests {
         for _ in 0..TRIAL_SESSIONS {
             ledger.count_session(&k.to);
         }
+        ledger.end_trial(&k.to, t(7)).unwrap();
+        assert_eq!(
+            ledger.review_due(&k.from),
+            None,
+            "not until it runs on from"
+        );
+        assert!(ledger.observe_model(&k.from, t(8)));
         (k, ledger)
     }
 
     #[test]
-    fn review_keep_is_final_and_queues_nothing() {
-        let (k, mut ledger) = in_review();
+    fn the_return_leads_to_a_review_on_from() {
+        let (k, ledger) = in_review();
         assert_eq!(
-            ledger.record_review(&k, t(9), review(ReviewChoice::Keep)),
-            None
+            ledger.offers[0].stage,
+            Stage::ReviewDue {
+                started_at: t(2),
+                ended_at: t(7),
+                sessions: TRIAL_SESSIONS
+            }
         );
-        assert_eq!(ledger.offers[0].stage, Stage::Moved);
-        assert_eq!(ledger.due(&k.to, Some(&k)), None);
+        assert_eq!(ledger.review_due(&k.from), Some(k.clone()));
+        assert_eq!(ledger.review_due(&k.to), None);
+        let review = ledger.review(&k).unwrap();
+        assert_eq!((review.started_at, review.sessions), (t(2), TRIAL_SESSIONS));
+        assert_eq!(review.chosen_at, t(1));
+        assert_eq!(ledger.due(&k.from, Some(&k)), None, "never offered again");
     }
 
     #[test]
-    fn review_revert_queues_the_way_back() {
+    fn review_keep_moves_to_the_new_model() {
         let (k, mut ledger) = in_review();
         let change = ledger
-            .record_review(&k, t(9), review(ReviewChoice::Revert))
+            .record_review(&k, t(9), review(ReviewChoice::Keep))
             .unwrap();
+        assert_eq!(change.action, ChangeAction::Keep);
+        assert_eq!(
+            (change.from.clone(), change.to.clone()),
+            (k.from.clone(), k.to.clone())
+        );
+        assert!(ledger.offers[0].stage.is_queued());
+        assert_eq!(Ledger::awaited(&ledger.offers[0]), Some(change.clone()));
+        assert_eq!(ledger.unapplied(&k.from), Some(change), "until applied");
+        ledger.record_switch(consent_switch(t(9), &k.from, &k.to, ChangeAction::Keep));
+        assert_eq!(ledger.unapplied(&k.from), None);
+        assert!(ledger.observe_model(&k.to, t(10)));
+        assert_eq!(ledger.offers[0].stage, Stage::Moved);
+        assert_eq!(ledger.review_due(&k.from), None);
+    }
+
+    #[test]
+    fn review_revert_stays_on_the_old_model() {
+        let (k, mut ledger) = in_review();
+        assert_eq!(
+            ledger.record_review(&k, t(9), review(ReviewChoice::Revert)),
+            None,
+            "already there"
+        );
+        assert_eq!(
+            ledger.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::Chosen)
+            }
+        );
+        assert_eq!(ledger.due(&k.from, Some(&k)), None);
+        assert_eq!(ledger.review_due(&k.from), None);
+        assert_eq!(ledger.switch_blocker(), None);
+    }
+
+    /// Consent covered five sessions; silence doesn't extend it — and the
+    /// review is not asked again.
+    #[test]
+    fn an_unanswered_review_stays_on_the_old_model() {
+        let (k, mut ledger) = in_review();
+        assert_eq!(ledger.record_review(&k, t(9), Err("no json".into())), None);
+        assert_eq!(
+            ledger.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::NoAnswer)
+            }
+        );
+        assert_eq!(ledger.review_due(&k.from), None, "asked once");
+        assert_eq!(
+            ledger.record_review(&k, t(10), review(ReviewChoice::Keep)),
+            None
+        );
+    }
+
+    /// The move back failed (or `from` wasn't routable): the agent is
+    /// still on `to`, the change is retried, and the countdown says so.
+    #[test]
+    fn a_failed_return_is_retried_from_the_new_model() {
+        let k = key();
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
+        ledger.observe_model(&k.to, t(2));
+        for _ in 0..TRIAL_SESSIONS {
+            ledger.count_session(&k.to);
+        }
+        let change = ledger.end_trial(&k.to, t(7)).unwrap();
+        // Not applied. Next session, still on `to`.
+        assert!(!ledger.observe_model(&k.to, t(8)));
+        assert!(
+            ledger
+                .trial_line(&k.to)
+                .unwrap()
+                .contains("has not taken effect yet")
+        );
+        assert!(!ledger.count_session(&k.to), "not a trial session any more");
+        assert_eq!(ledger.end_trial(&k.to, t(8)), None);
+        assert_eq!(ledger.unapplied(&k.to), Some(change.clone()));
+        ledger.record_switch(consent_switch(
+            t(8),
+            &k.to,
+            &k.from,
+            ChangeAction::ReturnForReview,
+        ));
+        assert_eq!(ledger.unapplied(&k.to), None);
+        assert!(ledger.observe_model(&k.from, t(9)));
+        assert_eq!(ledger.review_due(&k.from), Some(k));
+    }
+
+    /// Ledgers the earlier flow left behind: a trial whose review (asked on
+    /// the new model) went unanswered once returns for review now, and an
+    /// unapplied revert is applied.
+    #[test]
+    fn earlier_flow_ledgers_catch_up() {
+        let k = key();
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
+        ledger.observe_model(&k.to, t(2));
+        for _ in 0..TRIAL_SESSIONS + 1 {
+            ledger.count_session(&k.to);
+        }
+        ledger.offers[0].stage = Stage::Trial {
+            started_at: t(2),
+            sessions: TRIAL_SESSIONS + 1,
+            review_misses: 1,
+        };
+        assert!(ledger.end_trial(&k.to, t(9)).is_some());
+
+        let mut old = Ledger::default();
+        old.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
+        old.observe_model(&k.to, t(2));
+        old.offers[0].stage = Stage::AwaitingRevert {
+            cause: RevertCause::Chosen,
+        };
+        let change = old.unapplied(&k.to).unwrap();
         assert_eq!(
             change.action,
             ChangeAction::Revert {
                 cause: RevertCause::Chosen
             }
         );
-        assert_eq!((change.from, change.to), (k.to.clone(), k.from.clone()));
-        // Applied: back on the old model, never asked again.
-        assert!(ledger.observe_model(&k.from, t(10)));
-        assert_eq!(ledger.offers[0].stage, Stage::Reverted);
-        assert_eq!(ledger.due(&k.from, Some(&k)), None);
-    }
-
-    /// Consent covered five sessions; silence doesn't extend it.
-    #[test]
-    fn an_unanswered_review_is_reasked_once_then_reverts() {
-        let (k, mut ledger) = in_review();
-        assert_eq!(ledger.record_review(&k, t(9), Err("no json".into())), None);
-        ledger.count_session(&k.to);
-        assert_eq!(ledger.due(&k.to, Some(&k)), Some(Due::Review(k.clone())));
-        let change = ledger
-            .record_review(&k, t(10), Err("no json".into()))
-            .unwrap();
+        assert!(old.observe_model(&k.from, t(9)));
         assert_eq!(
-            change.action,
-            ChangeAction::Revert {
-                cause: RevertCause::NoAnswer
+            old.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::Chosen)
             }
         );
+    }
+
+    #[test]
+    fn the_countdown_counts_this_session() {
+        let k = key();
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
+        assert_eq!(ledger.trial_line(&k.to), None, "not yet on it");
+        ledger.observe_model(&k.to, t(2));
+        assert_eq!(
+            ledger.trial_line(&k.to).unwrap(),
+            "Model trial: session 1 of 5 on Qwen 3.8. After session 5 you'll return to \
+             Qwen 3.6 for one session to decide whether to keep Qwen 3.8."
+        );
+        assert_eq!(ledger.trial_line(&k.from), None);
+        for _ in 0..TRIAL_SESSIONS - 1 {
+            ledger.count_session(&k.to);
+        }
+        assert!(ledger.trial_line(&k.to).unwrap().contains("session 5 of 5"));
+    }
+
+    /// Moved by hand to a model that is neither side: the offer is over,
+    /// and the agent is free to choose again.
+    #[test]
+    fn an_out_of_band_move_supersedes_the_offer() {
+        let k = key();
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
+        ledger.observe_model(&k.to, t(2));
+        assert!(ledger.switch_blocker().is_some());
+        assert!(ledger.observe_model(&Model::from("cogito.gguf"), t(3)));
+        assert_eq!(ledger.offers[0].stage, Stage::Superseded);
+        assert_eq!(ledger.switch_blocker(), None);
+        assert!(
+            ledger.offers[0]
+                .summary()
+                .ends_with("moved to cogito.gguf by hand 2026-09-03; offer closed."),
+            "{}",
+            ledger.offers[0].summary()
+        );
+
+        // Back to `from` mid-trial: reverted, with no cause of the agent's.
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
+        ledger.observe_model(&k.to, t(2));
+        ledger.observe_model(&k.from, t(3));
+        assert_eq!(ledger.offers[0].stage, Stage::Reverted { cause: None });
+    }
+
+    /// A second, different offer waits while the first is under way.
+    #[test]
+    fn no_new_offer_while_one_is_under_way() {
+        let k = key();
+        let next = OfferKey {
+            from: k.to.clone(),
+            to: Model::from("Qwen4.gguf"),
+        };
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
+        ledger.observe_model(&k.to, t(2));
+        assert_eq!(ledger.due(&k.to, Some(&next)), None, "mid-trial");
+        ledger.offers[0].stage = Stage::Moved;
+        assert_eq!(ledger.due(&k.to, Some(&next)), Some(Due::Offer(next)));
+    }
+
+    /// The old unit form of `reverted` still reads.
+    #[test]
+    fn reverted_without_a_cause_reads() {
+        let stage: Stage = serde_json::from_str(r#"{"stage": "reverted"}"#).unwrap();
+        assert_eq!(stage, Stage::Reverted { cause: None });
+        let json = serde_json::to_string(&Stage::Reverted {
+            cause: Some(RevertCause::NoAnswer),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"stage":"reverted","cause":"no_answer"}"#);
+    }
+
+    fn consent_switch(at: DateTime<Utc>, from: &Model, to: &Model, action: ChangeAction) -> Switch {
+        Switch {
+            at,
+            from: from.clone(),
+            to: to.clone(),
+            cause: SwitchCause::Consent { action },
+            sessions_after: 0,
+        }
     }
 
     #[test]
@@ -1026,15 +1487,25 @@ mod tests {
         for _ in 0..TRIAL_SESSIONS {
             ledger.count_session(&k.to);
         }
-        ledger.record_review(&k, t(30), review(ReviewChoice::Revert));
+        ledger.end_trial(&k.to, t(29));
+        ledger.update_soul(&mut soul, t(29), day(29));
+        assert!(
+            notes(&soul)[3].ends_with(
+                "moved 2026-09-25; trial of 5 sessions complete 2026-09-29; returned to Qwen 3.6 to decide."
+            ),
+            "{:?}",
+            notes(&soul)
+        );
+        ledger.observe_model(&k.from, t(30));
+        ledger.record_review(&k, t(30), review(ReviewChoice::Keep));
         ledger.update_soul(&mut soul, t(30), day(30));
-        ledger.observe_model(&k.from, t(30) + chrono::Duration::days(1));
+        ledger.observe_model(&k.to, t(30) + chrono::Duration::days(1));
         ledger.update_soul(&mut soul, t(30), day(30));
         let n = notes(&soul);
         assert_eq!(n.len(), 5);
         assert_eq!(
             n[3],
-            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25; after the trial chose to return to Qwen 3.6 (2026-09-30); returned to Qwen 3.6 2026-10-01."
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25; trial of 5 sessions complete 2026-09-29; returned to Qwen 3.6 to decide; after the trial chose to keep Qwen 3.8 (2026-09-30); moved 2026-10-01."
         );
         assert!(n[3].len() <= 512);
         assert_eq!(n.iter().filter(|l| l.starts_with("[SYSTEM]")).count(), 1);
@@ -1162,7 +1633,7 @@ mod tests {
             ledger
                 .switch_blocker()
                 .unwrap()
-                .contains("trial of Qwen 3.8")
+                .contains("you are in a trial of Qwen 3.8")
         );
         let mut declined = Ledger::default();
         declined.record_offer(names(&k), t(23), offer(OfferChoice::NoSwap));

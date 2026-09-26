@@ -128,35 +128,20 @@ impl SetModel {
 
     fn description(&self) -> String {
         let catalog = &self.rt.catalog;
-        let mut out = format!(
-            "Change the model you run on, from your next session. You run on {} (`{}`).\n\n\
-             Models you can choose:\n",
-            catalog.name_of(&self.current),
+        let choices: Vec<Choice<'_>> = catalog
+            .selectable()
+            .map(|e| Choice {
+                id: e.info.id.name(),
+                name: &e.name,
+                description: e.description.as_deref().unwrap_or_default(),
+            })
+            .collect();
+        describe(
+            &choices,
+            &catalog.name_of(&self.current),
             self.current.name(),
-        );
-        for e in catalog.selectable() {
-            let here = if e.info.id == self.current {
-                " (current)"
-            } else {
-                ""
-            };
-            out.push_str(&format!(
-                "- `{}`: {}{here}. {}\n",
-                e.info.id.name(),
-                e.name,
-                e.description.as_deref().unwrap_or_default().trim(),
-            ));
-        }
-        out.push_str(&format!(
-            "\nAgents on the same model share its slot in the schedule; a busy model \
-             runs each of its agents less often. After a change, you can change again \
-             after {SWITCH_COOLDOWN_SESSIONS} completed sessions. Pass the model's id \
-             as `model`, and your reason first."
-        ));
-        if let Some(why) = &self.blocked {
-            out.push_str(&format!("\n\nYou cannot change model this session: {why}."));
-        }
-        out
+            self.blocked.as_deref(),
+        )
     }
 
     fn schema() -> serde_json::Value {
@@ -243,6 +228,117 @@ impl SetModel {
     }
 }
 
+/// One model on `set_model`'s menu.
+#[derive(Debug, Clone, Copy)]
+pub struct Choice<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+}
+
+/// Marks the agent's own model on the menu.
+const CURRENT_MARK: &str = " (current)";
+/// Starts the note on why no change is possible this session.
+const BLOCKED_PREFIX: &str = "\n\nYou cannot change model this session: ";
+
+/// `set_model`'s description. The parts that name the agent's model are
+/// kept in fixed forms so [`retarget`] can rewrite them for a fork.
+pub fn describe(
+    choices: &[Choice<'_>],
+    current_name: &str,
+    current_id: &str,
+    blocked: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "Change the model you run on, from your next session. {}\n\n\
+         Models you can choose:\n",
+        current_sentence(current_name, current_id),
+    );
+    for c in choices {
+        let here = if c.id == current_id { CURRENT_MARK } else { "" };
+        out.push_str(&format!(
+            "- `{}`: {}{here}. {}\n",
+            c.id,
+            c.name,
+            c.description.trim(),
+        ));
+    }
+    out.push_str(&format!(
+        "\nAgents on the same model share its slot in the schedule; a busy model \
+         runs each of its agents less often. After a change, you can change again \
+         after {SWITCH_COOLDOWN_SESSIONS} completed sessions. Pass the model's id \
+         as `model`, and your reason first."
+    ));
+    if let Some(why) = blocked {
+        out.push_str(&format!("{BLOCKED_PREFIX}{why}."));
+    }
+    out
+}
+
+fn current_sentence(name: &str, id: &str) -> String {
+    format!("You run on {name} (`{id}`).")
+}
+
+/// Rewrite a [`describe`]d description as if the agent ran on `to_id`: the
+/// "You run on" sentence, the `(current)` mark, and — since it described
+/// the original model's situation (a trial under way, say) — the note on
+/// why no change was possible, which is dropped. `to_name` is used when
+/// `to_id` isn't on the menu. `None` if nothing named the model.
+pub fn retarget(description: &str, to_id: &str, to_name: &str) -> Option<String> {
+    let mut out = description.to_string();
+    let mut changed = false;
+
+    // The model's menu line: "- `{id}`: {name}[ (current)]. {desc}".
+    let line_prefix = format!("- `{to_id}`: ");
+    let menu_name = out.lines().find_map(|l| {
+        let rest = l.strip_prefix(&line_prefix)?;
+        let end = [rest.find(&format!("{CURRENT_MARK}. ")), rest.find(". ")]
+            .into_iter()
+            .flatten()
+            .min()?;
+        Some(rest[..end].to_string())
+    });
+    let name = menu_name.as_deref().unwrap_or(to_name);
+
+    if let Some(start) = out.find("You run on ")
+        && let Some(len) = out[start..].find("`).")
+    {
+        let end = start + len + "`).".len();
+        let new = current_sentence(name, to_id);
+        if out[start..end] != new {
+            out.replace_range(start..end, &new);
+            changed = true;
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for line in out.split('\n') {
+        let mut line = line.to_string();
+        if line.starts_with("- `") {
+            let mine = line.starts_with(&line_prefix);
+            let marked = line.contains(&format!("{CURRENT_MARK}. "));
+            if marked && !mine {
+                line = line.replacen(CURRENT_MARK, "", 1);
+                changed = true;
+            } else if mine && !marked {
+                let at = line_prefix.len() + name.len();
+                if line.get(line_prefix.len()..at) == Some(name) {
+                    line.insert_str(at, CURRENT_MARK);
+                    changed = true;
+                }
+            }
+        }
+        lines.push(line);
+    }
+    out = lines.join("\n");
+
+    if let Some(i) = out.find(BLOCKED_PREFIX) {
+        out.truncate(i);
+        changed = true;
+    }
+    changed.then_some(out)
+}
+
 #[async_trait::async_trait]
 impl Tool for SetModel {
     fn name(&self) -> &str {
@@ -275,5 +371,59 @@ impl SelfSwitch {
             },
             sessions_after: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn menu(current: &str, blocked: Option<&str>) -> String {
+        describe(
+            &[
+                Choice {
+                    id: "Qwen3.6.gguf",
+                    name: "Qwen 3.6",
+                    description: "Sparse and quick.",
+                },
+                Choice {
+                    id: "Qwen3.8.gguf",
+                    name: "Qwen 3.8 27B",
+                    description: "Dense. Slow.",
+                },
+            ],
+            if current == "Qwen3.8.gguf" {
+                "Qwen 3.8 27B"
+            } else {
+                "Qwen 3.6"
+            },
+            current,
+            blocked,
+        )
+    }
+
+    /// A description retargeted to the other model reads exactly as if it
+    /// had been written for that model (minus the blocker note).
+    #[test]
+    fn retarget_names_the_fork_model_as_current() {
+        let on_new = menu("Qwen3.8.gguf", Some("you are in a trial of Qwen 3.8"));
+        let out = retarget(&on_new, "Qwen3.6.gguf", "unused").unwrap();
+        assert_eq!(out, menu("Qwen3.6.gguf", None));
+        assert!(!out.contains("Qwen 3.8 27B (current)"), "{out}");
+        assert!(!out.contains("You run on Qwen 3.8"), "{out}");
+        assert!(!out.contains("trial"), "{out}");
+        assert_eq!(
+            retarget(&menu("Qwen3.6.gguf", None), "Qwen3.6.gguf", "x"),
+            None
+        );
+    }
+
+    /// Off the menu: the sentence uses the given name, and no model is
+    /// marked current.
+    #[test]
+    fn retarget_to_a_model_off_the_menu() {
+        let out = retarget(&menu("Qwen3.8.gguf", None), "cogito.gguf", "Cogito").unwrap();
+        assert!(out.contains("You run on Cogito (`cogito.gguf`)."), "{out}");
+        assert!(!out.contains(CURRENT_MARK), "{out}");
     }
 }
