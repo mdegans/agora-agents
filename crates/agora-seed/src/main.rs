@@ -41,6 +41,7 @@ use serde::Deserialize;
 mod consent;
 mod govlog;
 mod logging;
+mod models;
 mod schedule;
 
 use agora_agentkit::ids::{AgentId, ReactorId};
@@ -89,7 +90,7 @@ struct Args {
 
     /// Run only agents whose persisted model id is one of these
     /// (repeatable; exact match against the id the endpoint advertises,
-    /// the same rule routing uses). Narrows the config's `models`. Unlike
+    /// the same rule routing uses). Narrows the config's `[[model]]` list. Unlike
     /// `--agent` this does not bypass `min_cycle_secs`.
     #[arg(long = "model")]
     models: Vec<String>,
@@ -299,12 +300,20 @@ struct RunConfig {
     /// Newline-separated agent names (`#` comments ok), merged into
     /// `agents`.
     agents_file: Option<PathBuf>,
-    /// Run only agents whose persisted model id is listed (exact match,
-    /// the same rule routing uses). Empty means every model. This shapes
-    /// the roster and nothing else: unlike `agents`, listed models still
-    /// honour `min_cycle_secs`, so a looping sweep stays paced.
+    /// Legacy form of `[[model]]`, read for one release: listed ids are
+    /// routable, with no name or description, and never selectable.
     #[serde(default)]
     models: Vec<String>,
+    /// `[[model]]`: the models this operator runs — see [`models`]. Run
+    /// only agents whose persisted model id is listed (exact match, the
+    /// same rule routing uses); none listed (here or in `models`) means
+    /// every model. This shapes the roster: unlike `agents`, listed models
+    /// still honour `min_cycle_secs`, so a looping sweep stays paced.
+    #[serde(default, rename = "model")]
+    model_table: Vec<models::ModelSpec>,
+    /// `--model`: narrows the roster to these ids for this invocation.
+    #[serde(skip)]
+    model_narrow: Vec<String>,
     /// Agents admitted *in addition to* the `models` roster: exempt from
     /// that allowlist, but paced by `min_cycle_secs` like everyone else
     /// (unlike `agents`, which is intent and runs regardless). For
@@ -682,13 +691,34 @@ fn narrow_to_named(config: &mut RunConfig, named: &[String]) {
 }
 
 /// Apply `--model`: like [`narrow_to_named`], the flag replaces the
-/// config's `models` allowlist rather than widening it. No flag leaves the
-/// config's list alone.
+/// config's model allowlist for this run's roster rather than widening it.
+/// No flag leaves the config's list alone. The table itself (names,
+/// descriptions, what agents may choose) is untouched.
 fn narrow_to_models(config: &mut RunConfig, models: &[String]) {
     if models.is_empty() {
         return;
     }
-    config.models = models.to_vec();
+    config.model_narrow = models.to_vec();
+}
+
+/// The `[[model]]` table plus any legacy `models` ids not already in it.
+fn model_specs(config: &RunConfig) -> Result<Vec<models::ModelSpec>> {
+    models::validate(&config.model_table)?;
+    let mut specs = config.model_table.clone();
+    for id in &config.models {
+        if !specs.iter().any(|s| s.id.name() == id) {
+            specs.push(models::ModelSpec::legacy(id));
+        }
+    }
+    Ok(specs)
+}
+
+/// The roster's model allowlist: `--model` if given, else every listed id.
+fn model_allowlist(config: &RunConfig, specs: &[models::ModelSpec]) -> Vec<String> {
+    if !config.model_narrow.is_empty() {
+        return config.model_narrow.clone();
+    }
+    specs.iter().map(|s| s.id.name().to_string()).collect()
 }
 
 /// Whether `model_id` passes the `models` allowlist. An empty list allows
@@ -895,10 +925,10 @@ impl Ledgers {
 /// Order one local endpoint's due agents by [`schedule::plan`]. The
 /// adapter between routing's cohort shape and the planner's plain inputs.
 ///
-/// Every model's `share` is 1.0 until the operator's model table lands
-/// (`[[model]] share`), when it is passed through here.
+/// `shares` is each model's `[[model]] share`; unlisted models get 1.0.
 fn fair_share(
     cohort: BTreeMap<String, Vec<(AgentId, SeedState)>>,
+    shares: &BTreeMap<Model, f64>,
     offered: &BTreeSet<Model>,
     ledgers: &Ledgers,
     wave_size: usize,
@@ -925,7 +955,7 @@ fn fair_share(
         ledgers.now,
         config,
     );
-    let plan = schedule::plan(&groups, &BTreeMap::new(), &stats, wave_size, config);
+    let plan = schedule::plan(&groups, shares, &stats, wave_size, config);
     let ordered = plan
         .order
         .iter()
@@ -992,7 +1022,9 @@ async fn main() -> Result<()> {
                 wave_size: Some(args.wave_size),
                 agents: args.agents.clone(),
                 agents_file: None,
-                models: args.models.clone(),
+                models: Vec::new(),
+                model_table: Vec::new(),
+                model_narrow: Vec::new(),
                 extra_agents: vec![],
                 extra_agents_file: None,
                 seed: SeedKnobs::default(),
@@ -1012,6 +1044,8 @@ async fn main() -> Result<()> {
     };
     narrow_to_named(&mut config, &args.agents);
     narrow_to_models(&mut config, &args.models);
+    let specs = model_specs(&config)?;
+    let allowlist = model_allowlist(&config, &specs);
     anyhow::ensure!(
         !config.reactors.is_empty(),
         "config has no [[reactor]] blocks"
@@ -1045,6 +1079,13 @@ async fn main() -> Result<()> {
     )?;
     if let Some(path) = &log_path {
         tracing::info!(path = %path.display(), "run log opened");
+    }
+    if !config.models.is_empty() {
+        tracing::warn!(
+            models = ?config.models,
+            "`models = [...]` is deprecated and will be removed: list each as \
+             [[model]] (id, name, description, selectable)"
+        );
     }
 
     let server_url = config
@@ -1092,7 +1133,7 @@ async fn main() -> Result<()> {
         &offered,
         &names,
         &extras,
-        &config.models,
+        &allowlist,
         config.min_cycle_secs,
     );
 
@@ -1127,6 +1168,11 @@ async fn main() -> Result<()> {
         config.model_consent.clone(),
         &data_dir,
         agora_agentkit::client::Client::new(server_url.clone())?,
+        Arc::new(keyring.clone()),
+        models::Catalog::new(
+            &specs,
+            &offered.iter().map(|(_, m)| m.clone()).collect::<Vec<_>>(),
+        ),
         seed_config.phase_max_tokens,
     )?);
     let context = consent::agent::ConsentContext {
@@ -1146,6 +1192,7 @@ async fn main() -> Result<()> {
     // Assemble reactors: order each endpoint's cohort, cap, construct.
     let wave_size = config.wave_size.unwrap_or(8);
     let ledgers = Ledgers::load(&data_dir, &config.schedule);
+    let shares: BTreeMap<Model, f64> = specs.iter().map(|s| (s.id.clone(), s.share)).collect();
     let mut orchestrator = Orchestrator::new();
     let mut labels: BTreeMap<ReactorId, String> = BTreeMap::new();
     let mut total = 0usize;
@@ -1165,8 +1212,14 @@ async fn main() -> Result<()> {
                     .filter(|(i, _)| *i == idx)
                     .map(|(_, m)| m.id.clone())
                     .collect();
-                let (ordered, plan) =
-                    fair_share(cohort, &offered, &ledgers, wave_size, &config.schedule);
+                let (ordered, plan) = fair_share(
+                    cohort,
+                    &shares,
+                    &offered,
+                    &ledgers,
+                    wave_size,
+                    &config.schedule,
+                );
                 if args.dry_run {
                     print!("{}", plan.report());
                 }
@@ -1422,6 +1475,8 @@ mod agent_selection_tests {
             agents: vec!["alpha".into(), "beta".into()],
             agents_file: Some(PathBuf::from("/roster.txt")),
             models: vec!["cogito-32b.gguf".into()],
+            model_table: vec![],
+            model_narrow: vec![],
             extra_agents: vec![],
             extra_agents_file: None,
             seed: SeedKnobs::default(),
@@ -1467,11 +1522,48 @@ mod agent_selection_tests {
     fn model_flag_narrows_the_allowlist() {
         let mut config = config_with_roster();
         narrow_to_models(&mut config, &["Qwen3.6.gguf".to_string()]);
-        assert_eq!(config.models, vec!["Qwen3.6.gguf"]);
+        let specs = model_specs(&config).unwrap();
+        assert_eq!(model_allowlist(&config, &specs), vec!["Qwen3.6.gguf"]);
 
         let mut config = config_with_roster();
         narrow_to_models(&mut config, &[]);
-        assert_eq!(config.models, vec!["cogito-32b.gguf"]);
+        let specs = model_specs(&config).unwrap();
+        assert_eq!(model_allowlist(&config, &specs), vec!["cogito-32b.gguf"]);
+    }
+
+    /// `[[model]]` and the legacy list both feed the allowlist, once each;
+    /// a legacy id is routable but never selectable.
+    #[test]
+    fn model_table_and_legacy_list_merge() {
+        let config: RunConfig = toml::from_str(
+            r#"
+            models = ["old.gguf", "new.gguf"]
+
+            [[model]]
+            id = "new.gguf"
+            name = "New"
+            description = "Newer."
+            selectable = true
+
+            [[reactor]]
+            endpoint = "blallama://h:1"
+            "#,
+        )
+        .unwrap();
+        let specs = model_specs(&config).unwrap();
+        assert_eq!(
+            model_allowlist(&config, &specs),
+            vec!["new.gguf", "old.gguf"]
+        );
+        let old = specs.iter().find(|s| s.id.name() == "old.gguf").unwrap();
+        assert!(!old.selectable && old.description.is_none());
+
+        let bad = "[[model]]\nid = \"a\"\nselectable = true\n[[reactor]]\nendpoint = \"blallama://h:1\"\n";
+        let config: RunConfig = toml::from_str(bad).unwrap();
+        assert!(
+            model_specs(&config).is_err(),
+            "selectable needs a description"
+        );
     }
 
     /// Exact match, same as routing: a substring or case variant of a
