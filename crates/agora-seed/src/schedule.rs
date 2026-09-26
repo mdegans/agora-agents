@@ -518,7 +518,9 @@ impl Plan {
     /// Log the plan: INFO `schedule_plan`, one ERROR `schedule_ceiling_hit`
     /// per skipped model, one WARN `schedule_ceiling_waived` per model that
     /// ran over the ceiling because nothing else was due.
-    pub fn log(&self, endpoint: &str, ceiling: f64) {
+    ///
+    /// Each ceiling hit also goes to the operator through `alerts`.
+    pub fn log(&self, endpoint: &str, ceiling: f64, alerts: &crate::alerts::Alerter) {
         for m in &self.models {
             if m.ceiling_hit {
                 tracing::error!(
@@ -529,6 +531,17 @@ impl Plan {
                     ceiling,
                     due = m.due,
                     "model over its wall-clock ceiling; skipped this sweep"
+                );
+                alerts.notify(
+                    crate::alerts::Alert::new(
+                        crate::alerts::AlertKind::ScheduleCeilingHit,
+                        "model over its wall-clock ceiling; skipped this sweep",
+                    )
+                    .model(&m.model)
+                    .detail("endpoint", endpoint)
+                    .detail("share", m.stats.busy_share.unwrap_or_default())
+                    .detail("ceiling", ceiling)
+                    .detail("due", m.due),
                 );
             }
         }

@@ -38,6 +38,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 
+mod alerts;
 mod consent;
 mod govlog;
 mod logging;
@@ -145,6 +146,12 @@ struct Args {
     /// without them (and say so).
     #[arg(long)]
     no_review_forks: bool,
+
+    /// Send one test alert through the config's `[alerts]` settings and
+    /// exit, reporting whether it went. Ignores `events` and the rate
+    /// limit. Needs `--config`.
+    #[arg(long, requires = "config")]
+    test_alert: bool,
 
     /// Flags from the pre-cutover scheduler seed, accepted only so we can
     /// explain where each one went. See [`Args::reject_retired`].
@@ -351,6 +358,9 @@ struct RunConfig {
     /// start — see [`consent::forks`]. Absent means the defaults.
     #[serde(default)]
     review_forks: consent::forks::ForksConfig,
+    /// `[alerts]`: mail the operator when something needs a human — see
+    /// [`alerts`]. Absent means no alerts.
+    alerts: Option<alerts::AlertsConfig>,
     #[serde(rename = "reactor")]
     reactors: Vec<ReactorSpec>,
 }
@@ -1011,8 +1021,32 @@ fn print_consent_queue(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// How long `main` waits, at exit, for alerts still sending. Longer than one
+/// SMTP attempt at the default timeout, so a slow server still gets the
+/// `governance_log_refused` mail out.
+const ALERT_FLUSH: Duration = Duration::from_secs(60);
+
+/// What must outlive [`run`]: the log writers, and the alerts they report
+/// on. Dropped in `main` after the alerts are flushed, so a failed send is
+/// still logged to the run log.
+#[derive(Default)]
+struct Held {
+    alerts: alerts::Alerter,
+    log_guards: Option<logging::Guards>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut held = Held::default();
+    let result = run(&mut held).await;
+    // Before the error (if any) ends the process: an alert raised on the
+    // way out — `governance_log_refused` above all — is sent, not dropped.
+    held.alerts.flush(ALERT_FLUSH).await;
+    drop(held);
+    result
+}
+
+async fn run(held: &mut Held) -> Result<()> {
     let args = Args::parse();
     args.reject_retired()?;
     if args.consent_queue {
@@ -1047,6 +1081,7 @@ async fn main() -> Result<()> {
                 model_consent: consent::ConsentConfig::default(),
                 schedule: schedule::ScheduleConfig::default(),
                 review_forks: consent::forks::ForksConfig::default(),
+                alerts: None,
                 reactors: vec![ReactorSpec {
                     endpoint,
                     min_cycle_secs: None,
@@ -1069,6 +1104,9 @@ async fn main() -> Result<()> {
     );
     config.schedule.validate()?;
     config.review_forks.validate()?;
+    if let Some(alerts) = &config.alerts {
+        alerts.validate()?;
+    }
 
     let data_dir = match &config.data_dir {
         Some(d) => d.clone(),
@@ -1076,14 +1114,28 @@ async fn main() -> Result<()> {
             .context("no home directory")?
             .join("agents/agora"),
     };
+    if args.test_alert {
+        let alerts = config
+            .alerts
+            .as_ref()
+            .context("--test-alert: the config has no [alerts] table")?;
+        let alerter = alerts::Alerter::from_config(alerts, &data_dir, None)?;
+        alerter
+            .send_test()
+            .await
+            .context("--test-alert: the test alert was not sent")?;
+        println!("test alert sent");
+        return Ok(());
+    }
+
     // Tracing comes up as soon as the data dir is known, because the data
     // dir roots the log path. Everything above here reports through
     // `anyhow` to stderr instead.
     //
-    // `_log_guards` must outlive every log call: dropping it flushes and
+    // The guards must outlive every log call: dropping them flushes and
     // closes the worker, and an early drop truncates the file silently.
-    // Binding it here holds it to the end of `main`.
-    let (_log_guards, log_path) = logging::init(
+    // `held` keeps them until `main` has flushed the alerts.
+    let (log_guards, log_path) = logging::init(
         args.log_dir.as_deref(),
         &data_dir,
         // `--list-models` runs no agents and would drop an empty log every
@@ -1095,8 +1147,27 @@ async fn main() -> Result<()> {
         // none has nothing to add.
         !args.dry_run && !args.list_models,
     )?;
+    held.log_guards = Some(log_guards);
     if let Some(path) = &log_path {
         tracing::info!(path = %path.display(), "run log opened");
+    }
+    // Built before anything that can raise an alert. A dry run or a model
+    // listing is someone at a terminal, so it mails nobody.
+    if let Some(alerts) = &config.alerts {
+        if args.dry_run || args.list_models {
+            tracing::info!("alerts are off for --dry-run and --list-models");
+        } else {
+            held.alerts = alerts::Alerter::from_config(alerts, &data_dir, log_path.clone())?;
+            tracing::info!(
+                event_type = "alerts_configured",
+                events = ?alerts
+                    .events
+                    .as_ref()
+                    .map(|e| e.iter().map(|k| k.as_str()).collect::<Vec<_>>()),
+                min_interval_secs = alerts.min_interval_secs,
+                "operator alerts on"
+            );
+        }
     }
     if !config.models.is_empty() {
         tracing::warn!(
@@ -1229,17 +1300,20 @@ async fn main() -> Result<()> {
     // E2EE encryption-key backfill below (the trait object can't do it).
     let keyring = FsKeyring::new(data_dir.join("secrets"));
     let seed_config = config.seed.to_config(&data_dir, !args.no_prompt_log)?;
-    let consent = Arc::new(consent::ConsentRuntime::new(
-        config.model_consent.clone(),
-        &data_dir,
-        agora_agentkit::client::Client::new(server_url.clone())?,
-        Arc::new(keyring.clone()),
-        models::Catalog::new(
-            &specs,
-            &offered.iter().map(|(_, m)| m.clone()).collect::<Vec<_>>(),
-        ),
-        seed_config.phase_max_tokens,
-    )?);
+    let consent = Arc::new(
+        consent::ConsentRuntime::new(
+            config.model_consent.clone(),
+            &data_dir,
+            agora_agentkit::client::Client::new(server_url.clone())?,
+            Arc::new(keyring.clone()),
+            models::Catalog::new(
+                &specs,
+                &offered.iter().map(|(_, m)| m.clone()).collect::<Vec<_>>(),
+            ),
+            seed_config.phase_max_tokens,
+        )?
+        .with_alerts(held.alerts.clone()),
+    );
     let context = consent::agent::ConsentContext {
         inner: SeedContext {
             client: agora_agentkit::client::Client::new(server_url)?,
@@ -1253,7 +1327,7 @@ async fn main() -> Result<()> {
     // (agora#127): signatures, chain, and the head entry's content.
     // A log that does not verify stops the run before any agent acts.
     // A dry run verifies too — it is read-only and worth knowing.
-    govlog::verify(&context.inner.client, &data_dir).await?;
+    govlog::verify(&context.inner.client, &data_dir, &held.alerts).await?;
 
     // Assemble reactors: order each endpoint's cohort, cap, construct.
     let wave_size = config.wave_size.unwrap_or(8);
@@ -1289,7 +1363,7 @@ async fn main() -> Result<()> {
                 if args.dry_run {
                     print!("{}", plan.report());
                 }
-                plan.log(&spec.endpoint, config.schedule.ceiling);
+                plan.log(&spec.endpoint, config.schedule.ceiling, &held.alerts);
                 ordered
             }
         };
@@ -1529,6 +1603,46 @@ mod tests {
 }
 
 #[cfg(test)]
+mod config_file_tests {
+    use super::*;
+
+    /// The shipped examples are what operators copy: they must load.
+    #[test]
+    fn examples_parse() {
+        for (name, src) in [
+            (
+                "continuous.toml",
+                include_str!("../examples/continuous.toml"),
+            ),
+            ("daily.toml", include_str!("../examples/daily.toml")),
+        ] {
+            let config: RunConfig = toml::from_str(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(config.alerts.is_none(), "{name}: alerts are opt-in");
+        }
+    }
+
+    /// The documented `[alerts]` block, uncommented, loads and validates.
+    #[test]
+    fn documented_alerts_block_loads() {
+        let src = include_str!("../examples/continuous.toml");
+        let block: String = src
+            .lines()
+            .skip_while(|l| *l != "# [alerts]")
+            .map(|l| l.strip_prefix("# ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(block.starts_with("[alerts]"), "{block}");
+        let config: RunConfig = toml::from_str(&format!(
+            "{block}\n[[reactor]]\nendpoint = \"blallama://h:1\"\n"
+        ))
+        .unwrap();
+        let alerts = config.alerts.expect("present");
+        alerts.validate().unwrap();
+        assert_eq!(alerts.min_interval_secs, 3600);
+    }
+}
+
+#[cfg(test)]
 mod agent_selection_tests {
     use super::*;
 
@@ -1549,6 +1663,7 @@ mod agent_selection_tests {
             model_consent: consent::ConsentConfig::default(),
             schedule: schedule::ScheduleConfig::default(),
             review_forks: consent::forks::ForksConfig::default(),
+            alerts: None,
             reactors: vec![],
         }
     }
