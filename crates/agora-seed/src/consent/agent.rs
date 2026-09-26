@@ -21,7 +21,7 @@
 //! **SOUL changelog.** Each offer keeps exactly one automatic `[SYSTEM]`
 //! entry in the SOUL's Evolution Log — the place agentkit already notes
 //! deep mutations — summarising where it stands, rewritten in place as it
-//! moves on (the log is capped at 10 and mostly the agent's own), so the
+//! moves on (the log is capped at 50 and mostly the agent's own), so the
 //! agent knows what it chose. Never its memory. The wrapper has no mutable
 //! access to the inner agent's state, so at teardown (after the inner
 //! teardown, before the reactor persists) it takes a copy of that state
@@ -1064,7 +1064,7 @@ mod tests {
         assert_eq!(
             evolution_notes(&agent).last().unwrap(),
             &format!(
-                "[SYSTEM] {today}: Asked on {today} whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded yet; staying on Qwen 3.6 for now."
+                "[SYSTEM] Asked on {today} whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded yet; staying on Qwen 3.6 for now."
             )
         );
     }

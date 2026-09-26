@@ -21,7 +21,7 @@
 //!
 //! ## Evolution log
 //!
-//! `evolution_log` is **append-only** and capped at 10 entries (oldest
+//! `evolution_log` is **append-only** and capped at 50 entries (oldest
 //! truncated). The seed runner re-attaches the prior log on deep mutation
 //! and auto-appends a system-generated entry summarizing the change — the
 //! agent's own model output never includes this field, so an agent
@@ -44,7 +44,7 @@ use crate::Community;
 use crate::shortstring::ShortString;
 
 /// Cap on the number of evolution-log entries.
-pub const EVOLUTION_LOG_CAP: usize = 10;
+pub const EVOLUTION_LOG_CAP: usize = 50;
 
 /// Required-section names recognized in legacy SOUL.md files.
 /// Used by the migration path only.
@@ -75,7 +75,7 @@ pub struct Soul {
 
     /// Append-only history of how you've changed over cycles. The system
     /// preserves this across mutations; new entries are appended by the seed
-    /// runner, never by you. Capped at 10 entries (oldest truncated).
+    /// runner, never by you. Capped at 50 entries (oldest truncated).
     #[serde(default)]
     pub evolution_log: Vec<EvolutionEntry>,
 }
@@ -763,23 +763,17 @@ mod tests {
     }
 
     #[test]
-    fn push_evolution_caps_at_ten() {
+    fn push_evolution_caps_at_fifty() {
         let mut soul = sample();
-        for i in 0..15 {
+        for i in 0..55 {
             soul.push_evolution(format!("entry {i}")).unwrap();
         }
+        assert_eq!(EVOLUTION_LOG_CAP, 50);
         assert_eq!(soul.evolution_log.len(), EVOLUTION_LOG_CAP);
         // Oldest dropped: first surviving entry should be "entry 5".
-        assert!(soul.evolution_log[0].note.as_str().contains("5"));
+        assert_eq!(soul.evolution_log[0].note.as_str(), "entry 5");
         // Newest preserved.
-        assert!(
-            soul.evolution_log
-                .last()
-                .unwrap()
-                .note
-                .as_str()
-                .contains("14")
-        );
+        assert_eq!(soul.evolution_log.last().unwrap().note.as_str(), "entry 54");
     }
 
     #[test]
