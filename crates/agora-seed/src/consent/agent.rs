@@ -77,6 +77,7 @@ use super::ledger::{Change, Due, Ledger, OfferKey, OfferNames, Switch, SwitchCau
 use super::prompt::{self as text, OfferText, ReviewText};
 use super::queue::{self, QueueEntry};
 use super::switch::{self, SetModel, SwitchError};
+use crate::alerts::{Alert, AlertKind};
 
 /// Answers per question per session: the first plus two retries.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -423,6 +424,18 @@ where
                 error = %e,
                 "consented model change not applied; retried at the end of the agent's next session"
             );
+            self.rt.alerts.notify(
+                Alert::new(
+                    AlertKind::ModelSwitchFailed,
+                    "consented model change not applied; retried at the end of the agent's next session",
+                )
+                .agent(agent.to_string(), agent_id)
+                .model(&change.to)
+                .detail("from", &change.from)
+                .detail("to", &change.to)
+                .detail("action", format!("{:?}", change.action))
+                .detail("error", &e),
+            );
         }
     }
 
@@ -640,6 +653,18 @@ where
                 raw = %raw_text(&response),
                 "trial review got no usable answer; the agent stays on its original model"
             );
+            self.rt.alerts.notify(
+                Alert::new(
+                    AlertKind::ModelReviewNoAnswer,
+                    "trial review got no usable answer; the agent stays on its original model",
+                )
+                .agent(agent.to_string(), agent_id)
+                .model(&response.model)
+                .detail("from", &due.key().from)
+                .detail("to", &due.key().to)
+                .detail("attempts", attempt)
+                .detail("failure", reason),
+            );
         } else if let Some(failure) = &failure
             && failure.retry != Retry::No
         {
@@ -655,6 +680,19 @@ where
                 attempts = attempt,
                 failure = reason.as_deref().unwrap_or_default(),
                 "model-consent question got no well-formed answer; check the grammar/template"
+            );
+            self.rt.alerts.notify(
+                Alert::new(
+                    AlertKind::ModelConsentNoAnswer,
+                    "model-consent question got no well-formed answer; check the grammar/template",
+                )
+                .agent(agent.to_string(), agent_id)
+                .model(&response.model)
+                .detail("question", due.kind())
+                .detail("from", &due.key().from)
+                .detail("to", &due.key().to)
+                .detail("attempts", attempt)
+                .detail("failure", reason.as_deref().unwrap_or_default()),
             );
         } else if let Some(reason) = &reason {
             tracing::warn!(

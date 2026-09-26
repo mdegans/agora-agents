@@ -73,5 +73,13 @@ tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Backs the runner's non-blocking file sink (`agora-seed/src/logging.rs`).
 tracing-appender = "0.2"
+# Operator email alerts from agora-seed (`[alerts.email]`). rustls only:
+# `tokio1-rustls-tls` is rustls + ring + webpki-roots, and the default
+# features (which pull native-tls/OpenSSL) are off.
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "tokio1-rustls-tls",
+] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }

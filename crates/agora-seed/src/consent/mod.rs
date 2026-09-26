@@ -163,6 +163,8 @@ pub struct ConsentRuntime {
     pub catalog: crate::models::Catalog,
     /// `max_tokens` for the question turn — the seed phase budget.
     pub max_tokens: u32,
+    /// Operator alerts (`[alerts]`); off unless [`Self::with_alerts`].
+    pub alerts: crate::alerts::Alerter,
 }
 
 impl ConsentRuntime {
@@ -186,7 +188,14 @@ impl ConsentRuntime {
             keys,
             catalog,
             max_tokens,
+            alerts: crate::alerts::Alerter::off(),
         })
+    }
+
+    /// Mail the operator on the events [`crate::alerts`] covers.
+    pub fn with_alerts(mut self, alerts: crate::alerts::Alerter) -> Self {
+        self.alerts = alerts;
+        self
     }
 }
 

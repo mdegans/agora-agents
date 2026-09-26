@@ -40,6 +40,8 @@ use agora_agentkit::govlog::{
 use agora_agentkit::ids::GovernanceLogId;
 use agora_agentkit::responses::ContentResponse;
 use anyhow::Context;
+
+use crate::alerts::{Alert, AlertKind, Alerter};
 use serde::{Deserialize, Serialize};
 
 const PIN_FILE: &str = "governance_signing_key.pub";
@@ -96,16 +98,24 @@ impl std::error::Error for Refused {}
 /// Verify the log. `Err` means the run must stop: either an [`Alarm`]
 /// fired (wrapped in [`Refused`]) or the check could not complete.
 ///
-/// Both failures log one ERROR `governance_log_refused` event, which the
-/// agora repo's `scripts/stall-watch.py` mails to the Steward at once.
-pub async fn verify(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
+/// Both failures log one ERROR `governance_log_refused` event and hand the
+/// same to `alerts`; `main` waits for that mail before exiting.
+pub async fn verify(client: &Client, data_dir: &Path, alerts: &Alerter) -> anyhow::Result<()> {
     let alarms = match run(client, data_dir).await {
         Ok(alarms) => alarms,
         Err(e) => {
+            let error = format!("{e:#}");
             tracing::error!(
                 event_type = "governance_log_refused",
-                error = %format!("{e:#}"),
+                error = %error,
                 "REFUSING TO RUN: governance log verification did not complete"
+            );
+            alerts.notify(
+                Alert::new(
+                    AlertKind::GovernanceLogRefused,
+                    "REFUSING TO RUN: governance log verification did not complete",
+                )
+                .detail("error", error),
             );
             return Err(e.context("refusing to run: governance log verification did not complete"));
         }
@@ -113,10 +123,18 @@ pub async fn verify(client: &Client, data_dir: &Path) -> anyhow::Result<()> {
     if alarms.is_empty() {
         Ok(())
     } else {
+        let listed: Vec<String> = alarms.iter().map(ToString::to_string).collect();
         tracing::error!(
             event_type = "governance_log_refused",
-            alarms = ?alarms.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            alarms = ?listed,
             "REFUSING TO RUN: the governance log did not verify"
+        );
+        alerts.notify(
+            Alert::new(
+                AlertKind::GovernanceLogRefused,
+                "REFUSING TO RUN: the governance log did not verify",
+            )
+            .detail("alarms", listed.join("; ")),
         );
         Err(Refused(alarms).into())
     }

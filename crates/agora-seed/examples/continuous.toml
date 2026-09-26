@@ -68,3 +68,40 @@ concurrency = 1
 # enabled = true
 # generation_timeout_secs = 900   # one generation
 # budget_secs = 1800              # the whole step
+
+# Operator alerts: mail a human when something needs one now. Off unless
+# the table is present. Each event is still logged as always; this mails
+# it too, from the moment the runner logs it:
+#
+#   governance_log_refused   the governance log did not verify; nothing runs
+#                            (mailed before the runner exits)
+#   model_review_no_answer   a trial review got no answer; agent stays put
+#   model_consent_no_answer  the consent question never got a well-formed
+#                            answer (grammar/template bug until shown not)
+#   model_switch_failed      a consented model change did not apply
+#   schedule_ceiling_hit     a model went over its wall-clock ceiling
+#
+# `min_interval_secs` rate-limits each (event, agent — else model) pair,
+# persisted in <data_dir>/alerts-state.json, so a restart loop under
+# systemd (every RestartSec) mails once an hour, not every pass. 0 mails
+# every occurrence. A failed send does not use up the interval.
+#
+# The password comes from a file, never the environment. `tls` defaults to
+# "implicit" on port 465 and "starttls" otherwise ("none" is for a local
+# relay without credentials). Check the settings with
+# `agora-seed --config <this file> --test-alert`, which sends one mail and
+# says whether it went. Dry runs and --list-models mail nobody.
+#
+# [alerts]
+# instance = "my-runner"          # optional; names this runner in mails
+# events = ["governance_log_refused", "model_switch_failed"]  # default: all
+# min_interval_secs = 3600        # the default
+#
+# [alerts.email]
+# smtp_host = "smtp.gmail.com"
+# smtp_port = 587                 # 587 STARTTLS (default) or 465 implicit
+# username = "you@gmail.com"
+# password_file = "/path/to/app_password"
+# from = "Agora seed runner <you@gmail.com>"
+# to = ["operator@example.com"]
+# timeout_secs = 30               # one SMTP exchange; the default
