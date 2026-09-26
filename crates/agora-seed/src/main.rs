@@ -134,6 +134,18 @@ struct Args {
     #[arg(long)]
     consent_queue: bool,
 
+    /// Prepare the trial-review forks and exit: for every agent returning
+    /// from a model trial, the same moment of a session completed by both
+    /// models (see `consent::forks`). A normal run does this at sweep start
+    /// anyway; this runs only that step. Needs the endpoints (`--config`).
+    #[arg(long)]
+    prepare_review_forks: bool,
+
+    /// Skip preparing trial-review forks at sweep start. Reviews then go
+    /// without them (and say so).
+    #[arg(long)]
+    no_review_forks: bool,
+
     /// Flags from the pre-cutover scheduler seed, accepted only so we can
     /// explain where each one went. See [`Args::reject_retired`].
     ///
@@ -1113,6 +1125,52 @@ async fn main() -> Result<()> {
         endpoints.push(inference);
     }
     if args.list_models {
+        return Ok(());
+    }
+
+    // Trial-review forks, before any agent runs: generating them loads
+    // both models, so they're done together, grouped by model.
+    let log_dir = args
+        .log_dir
+        .clone()
+        .unwrap_or_else(|| data_dir.join("logs"));
+    let act_max_tokens = config
+        .seed
+        .to_config(&data_dir, !args.no_prompt_log)?
+        .act_max_tokens;
+    if args.dry_run {
+        match consent::forks::jobs(&data_dir.join("state")).await {
+            Ok(jobs) if !jobs.is_empty() => println!(
+                "review forks: {} agents would have forks prepared",
+                jobs.len()
+            ),
+            Ok(_) => {}
+            Err(e) => println!("review forks: state unreadable: {e}"),
+        }
+    } else if args.prepare_review_forks || !args.no_review_forks {
+        let prompt_dir = config
+            .seed
+            .prompt_log_dir
+            .clone()
+            .unwrap_or_else(|| data_dir.join("logs").join("prompts"));
+        let prepared = consent::forks::prepare(
+            &data_dir.join("state"),
+            &log_dir,
+            Some(&prompt_dir),
+            consent::forks::Endpoints {
+                clients: &endpoints,
+                offered: &offered,
+            },
+            act_max_tokens,
+        )
+        .await;
+        match prepared {
+            Ok(n) => tracing::info!(agents = n, "review forks step done"),
+            // Never fatal: the review goes without forks and says so.
+            Err(e) => tracing::error!(error = %e, "review forks step failed"),
+        }
+    }
+    if args.prepare_review_forks {
         return Ok(());
     }
 

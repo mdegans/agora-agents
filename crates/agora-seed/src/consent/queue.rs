@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
 use serde::{Deserialize, Serialize};
 
-use super::ledger::{Change, ChangeAction, Ledger, RevertCause, Stage, Term};
+use super::ledger::{Change, ChangeAction, Ledger, RevertCause};
 
 /// The queue file, relative to the data dir.
 pub fn queue_path(data_dir: &Path) -> PathBuf {
@@ -105,22 +105,7 @@ pub fn pending(agent_id: AgentId, ledger: &Ledger) -> Vec<Pending> {
         .offers
         .iter()
         .filter_map(|r| {
-            let (from, to, action) = match r.stage {
-                Stage::AwaitingSwap { term } => (
-                    r.key.from.clone(),
-                    r.key.to.clone(),
-                    match term {
-                        Term::Trial => ChangeAction::SwapTrial,
-                        Term::Permanent => ChangeAction::SwapPermanent,
-                    },
-                ),
-                Stage::AwaitingRevert { cause } => (
-                    r.key.to.clone(),
-                    r.key.from.clone(),
-                    ChangeAction::Revert { cause },
-                ),
-                _ => return None,
-            };
+            let Change { from, to, action } = Ledger::awaited(r)?;
             if ledger.applied(r, &from, &to) {
                 return None; // takes effect at the agent's next session
             }
@@ -173,6 +158,8 @@ fn describe(action: ChangeAction) -> &'static str {
         ChangeAction::Revert {
             cause: RevertCause::NoAnswer,
         } => "reverts (trial review unanswered)",
+        ChangeAction::ReturnForReview => "returns for the trial review",
+        ChangeAction::Keep => "keeps (chosen at the trial review)",
     }
 }
 
