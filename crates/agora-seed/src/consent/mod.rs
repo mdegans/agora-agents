@@ -2,9 +2,10 @@
 //!
 //! The Steward's rule (2026-09-22): an agent is *asked*, at the end of a
 //! session, whether it wants to move to a new model; no answer means it
-//! stays. The runner records the answer and queues the change — it never
-//! changes a model itself. See the parent repo's
-//! `memory/project_todo_2026_09_23.md` §E.
+//! stays. The runner records the answer and applies the change itself
+//! (since 2026-09-25; before, it queued it for the Steward). Agents can also
+//! change model on their own with `set_model` ([`switch`]). See the parent
+//! repo's `memory/project_todo_2026_09_23.md` §E.
 //!
 //! The pieces:
 //!
@@ -18,8 +19,10 @@
 //!   Never the agent's memory. Each offer also keeps one automatic
 //!   `[SYSTEM]` entry in the SOUL's Evolution Log (the same place agentkit
 //!   notes a deep mutation), rewritten in place as the offer moves on.
-//! - [`queue`] — the changes agents asked for, for the Steward to apply
-//!   with `set_model` + `sync-models`.
+//! - [`switch`] — applying a change (a signed profile update, then the
+//!   agent's own `state.model`), and the `set_model` tool.
+//! - [`queue`] — the audit trail of changes agents asked for; any the runner
+//!   could not apply are left for the Steward's `set_model` + `sync-models`.
 //!
 //! ```toml
 //! [model_consent]
@@ -44,11 +47,14 @@ pub mod comparison;
 pub mod ledger;
 pub mod prompt;
 pub mod queue;
+pub mod switch;
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use agora_agentkit::client::Client;
-use agora_agentkit::reactor::seed::ShortString;
+use agora_agentkit::reactor::seed::{Keyring, ShortString};
 use misanthropic::model::Model;
 use serde::Deserialize;
 
@@ -143,8 +149,13 @@ pub struct ConsentRuntime {
     pub state_dir: PathBuf,
     /// See [`queue::queue_path`].
     pub queue_path: PathBuf,
-    /// For the trial review's before/after sample.
+    /// For the trial review's before/after sample, and to report a model
+    /// change as the agent.
     pub client: Client,
+    /// The agents' signing keys, for [`switch::report_model`].
+    pub keys: Arc<dyn Keyring>,
+    /// The models this run can route onto, and which agents may choose.
+    pub catalog: crate::models::Catalog,
     /// `max_tokens` for the question turn — the seed phase budget.
     pub max_tokens: u32,
 }
@@ -154,6 +165,8 @@ impl ConsentRuntime {
         config: ConsentConfig,
         data_dir: &std::path::Path,
         client: Client,
+        keys: Arc<dyn Keyring>,
+        catalog: crate::models::Catalog,
         max_tokens: u32,
     ) -> anyhow::Result<Self> {
         if let Some(offer) = &config.offer {
@@ -165,6 +178,8 @@ impl ConsentRuntime {
             state_dir: data_dir.join("state"),
             queue_path: queue::queue_path(data_dir),
             client,
+            keys,
+            catalog,
             max_tokens,
         })
     }
