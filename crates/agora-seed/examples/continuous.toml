@@ -59,3 +59,12 @@ concurrency = 1
 # [seed]
 # act_max_tokens = 8192
 # thinking_budget_tokens = 4096
+
+# Trial-review forks (model consent): at sweep start the runner prepares,
+# for each agent back from a model trial, the same moment of a session
+# completed by both models. Bounded so it can't hold the sweep up; what it
+# doesn't reach rolls over to the next start. These are the defaults.
+# [review_forks]
+# enabled = true
+# generation_timeout_secs = 900   # one generation
+# budget_secs = 1800              # the whole step

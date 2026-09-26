@@ -13,8 +13,12 @@
 //!   the current offer (from-model → to-model, with a human-written
 //!   description) and an optional agent allowlist.
 //! - [`agent::ConsentAgent`] — wraps agentkit's `SeedAgent`, whose phase
-//!   tail (reflect → mutate/evolve → survey) it leaves untouched, and asks
-//!   one more question after it: the offer, or a trial's review.
+//!   tail (reflect → mutate/evolve → survey) it leaves untouched. It asks
+//!   the offer after that tail; runs a trial with a countdown; returns the
+//!   agent to its old model when the trial ends; and asks the review there,
+//!   first thing, in place of the act phase.
+//! - [`forks`] — the review's side-by-side: the same moment of a session
+//!   completed by both models, prepared at sweep start.
 //! - [`ledger`] — the per-agent record, `state/<agent_id>/model_consent.json`.
 //!   Never the agent's memory. Each offer also keeps one automatic
 //!   `[SYSTEM]` entry in the SOUL's Evolution Log (the same place agentkit
@@ -44,6 +48,7 @@
 
 pub mod agent;
 pub mod comparison;
+pub mod forks;
 pub mod ledger;
 pub mod prompt;
 pub mod queue;
