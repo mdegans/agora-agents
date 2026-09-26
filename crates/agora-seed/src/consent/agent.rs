@@ -21,16 +21,27 @@
 //! **SOUL changelog.** Each offer keeps exactly one automatic `[SYSTEM]`
 //! entry in the SOUL's Evolution Log — the place agentkit already notes
 //! deep mutations — summarising where it stands, rewritten in place as it
-//! moves on (the log is capped at 10 and mostly the agent's own), so the
+//! moves on (the log is capped at 50 and mostly the agent's own), so the
 //! agent knows what it chose. Never its memory. The wrapper has no mutable
 //! access to the inner agent's state, so at teardown (after the inner
 //! teardown, before the reactor persists) it takes a copy of that state
 //! with the entry updated and serves the copy from [`Agent::state`], which
 //! is what gets saved.
+//!
+//! **Changing model.** A consented change is applied by the runner itself
+//! ([`ConsentAgent::apply_change`]: a signed profile update, a ledger
+//! [`Switch`], and the new model in the patched state), with the queue line
+//! kept for audit. The agent can also ask on its own: the wrapper seats a
+//! `set_model` tool ([`switch::SetModel`]) before the inner init, when the
+//! run has a selectable model to offer. One change per session; nothing is
+//! asked after one. Each post or comment the session wrote is logged as a
+//! `write_recorded` event at teardown, with the dump's `prompt_sha256`.
 
 use std::sync::Arc;
 
-use agora_agentkit::ids::{AgentId, CommentId};
+use std::collections::HashSet;
+
+use agora_agentkit::ids::{AgentId, CommentId, PostId};
 use agora_agentkit::reactor::inference::Quirks;
 use agora_agentkit::reactor::seed::SeedState;
 use agora_agentkit::reactor::{Agent, Control, Outcome};
@@ -44,9 +55,10 @@ use misanthropic::tool::{Notifications, ToolBox};
 
 use super::ConsentRuntime;
 use super::comparison;
-use super::ledger::{Due, Ledger, OfferNames};
+use super::ledger::{Due, Ledger, OfferNames, Switch, SwitchCause};
 use super::prompt::{self as text, OfferText, ReviewText};
 use super::queue::{self, QueueEntry};
+use super::switch::{self, SetModel, SwitchError};
 
 /// Answers per question per session: the first plus two retries.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -134,6 +146,27 @@ pub struct ConsentAgent<A> {
     /// The inner state with the changelog lines appended, built at
     /// teardown. Served by [`Agent::state`] once present.
     patched: Option<SeedState>,
+    /// Where `set_model` leaves a switch it made this session.
+    slot: switch::Slot,
+    /// The model to run on from the next session, when a change was
+    /// applied this session. Written into the patched state.
+    next_model: Option<ModelInfo>,
+    /// SOUL Evolution Log lines to add at teardown, besides the offers'.
+    notes: Vec<String>,
+    /// Posts and comments the agent had before this session's latest turn,
+    /// to tell which it just wrote.
+    known_posts: HashSet<PostId>,
+    known_comments: HashSet<CommentId>,
+    /// This session's writes, logged as `write_recorded` at teardown.
+    writes: Vec<Write>,
+}
+
+/// A post or comment written this session.
+#[derive(Debug, Clone, Copy)]
+struct Write {
+    at: DateTime<Utc>,
+    kind: &'static str,
+    id: uuid::Uuid,
 }
 
 impl<A> ConsentAgent<A>
@@ -146,6 +179,131 @@ where
 
     fn model(&self) -> misanthropic::model::Model {
         self.inner.state().model.id.clone()
+    }
+
+    /// Apply a model change for this agent: report `to` to Agora as the
+    /// agent (signed), record the [`Switch`] in the ledger, and route the
+    /// agent on `to` from its next session (the patched state). The SOUL
+    /// line is the caller's: an offer's own entry already says what was
+    /// chosen.
+    ///
+    /// `to` must be routable this run, or the agent would be stranded.
+    /// On `Err` nothing has changed, here or on Agora.
+    pub async fn apply_change(
+        &mut self,
+        to: &misanthropic::model::Model,
+        cause: SwitchCause,
+    ) -> Result<(), SwitchError> {
+        let Some(entry) = self.rt.catalog.get(to) else {
+            return Err(SwitchError::NotRoutable);
+        };
+        let info = entry.info.clone();
+        if self.ledger.is_none() {
+            return Err(SwitchError::NoLedger);
+        }
+        switch::report_model(&self.rt, self.inner.id(), to).await?;
+        let switch = Switch {
+            at: Utc::now(),
+            from: self.model(),
+            to: to.clone(),
+            cause,
+            sessions_after: 0,
+        };
+        self.commit_switch(switch, info);
+        Ok(())
+    }
+
+    /// The local half of a change already reported to Agora.
+    fn commit_switch(&mut self, switch: Switch, info: ModelInfo) {
+        tracing::info!(
+            event_type = "model_switch_applied",
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            from = %switch.from,
+            to = %switch.to,
+            cause = ?switch.cause,
+            "model change applied; the agent runs on it from its next session"
+        );
+        self.next_model = Some(info);
+        if let Some(ledger) = self.ledger.as_mut() {
+            ledger.record_switch(switch);
+            self.dirty = true;
+        }
+    }
+
+    /// Commit a `set_model` call made this session, if there was one.
+    fn take_self_switch(&mut self) {
+        let Some(made) = self.slot.lock().expect("slot lock").take() else {
+            return;
+        };
+        let from = self.model();
+        self.notes.push(format!(
+            "[SYSTEM] Switched from {} to {} at own request (from next session).",
+            self.rt.catalog.name_of(&from),
+            made.to.name
+        ));
+        let switch = made.record(from);
+        self.commit_switch(switch, made.to.info.clone());
+    }
+
+    /// Whether a change was applied this session.
+    fn switched(&self) -> bool {
+        self.next_model.is_some() || self.slot.lock().expect("slot lock").is_some()
+    }
+
+    /// Note posts and comments written since the last look.
+    fn note_writes(&mut self) {
+        let (posts, comments) = {
+            let ledger = self.inner.state().ledger.read().expect("ledger lock");
+            (
+                ledger.created_posts.clone(),
+                ledger.created_comments.clone(),
+            )
+        };
+        let now = Utc::now();
+        for id in posts.difference(&self.known_posts) {
+            self.writes.push(Write {
+                at: now,
+                kind: "post",
+                id: *id.as_uuid(),
+            });
+        }
+        for id in comments.difference(&self.known_comments) {
+            self.writes.push(Write {
+                at: now,
+                kind: "comment",
+                id: *id.as_uuid(),
+            });
+        }
+        self.known_posts = posts;
+        self.known_comments = comments;
+    }
+
+    /// One `write_recorded` per write, tagged with the dump that holds the
+    /// session (the `prompt logged` event's `prompt_sha256`).
+    fn log_writes(&self) {
+        if self.writes.is_empty() {
+            return;
+        }
+        let prompt_sha256 = agora_agentkit::reactor::seed::prompt_sha256(self.inner.prompt())
+            .map_err(|e| {
+                tracing::warn!(agent_id = %self.inner.id(), error = %e, "prompt digest failed");
+            })
+            .ok();
+        let model = self.model();
+        for w in &self.writes {
+            tracing::info!(
+                event_type = "write_recorded",
+                agent = %self.inner.state().soul.name,
+                agent_id = %self.inner.id(),
+                kind = w.kind,
+                id = %w.id,
+                model = %model,
+                written_at = %w.at,
+                prompt_sha256 = prompt_sha256.as_deref(),
+                "write recorded"
+            );
+        }
     }
 
     /// Append `content` to the trailing user turn, or push one.
@@ -217,10 +375,18 @@ where
             .as_ref()
             .filter(|o| o.admits(name))
             .map(|o| o.key());
+        self.take_self_switch();
+        let switched = self.switched();
+        let started = self.started;
         let Some(ledger) = self.ledger.as_mut() else {
             return Ok(None);
         };
         self.dirty |= ledger.count_session(&model);
+        self.dirty |= ledger.count_since_switch(started);
+        // One change per session: nothing is asked after a switch.
+        if switched {
+            return Ok(None);
+        }
         let Some(due) = ledger.due(&model, offer_key.as_ref()) else {
             return Ok(None);
         };
@@ -274,7 +440,7 @@ where
 
     /// One response to the question: parse it; on a retryable failure with
     /// attempts left, relay the error and go again; otherwise record the
-    /// answer (or its absence), queue any change, and end the session.
+    /// answer (or its absence), apply any change, and end the session.
     async fn answer(
         &mut self,
         due: Due,
@@ -416,10 +582,27 @@ where
             let entry = QueueEntry {
                 at: now,
                 agent_id,
-                agent,
-                change,
+                agent: agent.clone(),
+                change: change.clone(),
             };
+            // The audit line, then the change itself (2026-09-25: the
+            // runner applies what the agent chose; the Steward no longer
+            // has to).
             queue::emit(&self.rt.queue_path, &entry).await;
+            let cause = SwitchCause::Consent {
+                action: change.action,
+            };
+            if let Err(e) = self.apply_change(&change.to, cause).await {
+                tracing::error!(
+                    event_type = "model_switch_failed",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    from = %change.from,
+                    to = %change.to,
+                    error = %e,
+                    "consented model change not applied; left for --consent-queue"
+                );
+            }
         }
         Ok(Control::Done(Outcome::Complete))
     }
@@ -430,11 +613,11 @@ where
     fn patch_soul(&mut self) -> Option<SeedState> {
         let started = self.started;
         let ledger = self.ledger.as_mut()?;
-        if !ledger
+        let offers_touched = ledger
             .offers
             .iter()
-            .any(|r| r.history.iter().any(|e| e.at >= started))
-        {
+            .any(|r| r.history.iter().any(|e| e.at >= started));
+        if !offers_touched && self.notes.is_empty() && self.next_model.is_none() {
             return None;
         }
         // `SeedState` isn't `Clone`; its serde form is exactly what the
@@ -452,12 +635,28 @@ where
                 return None;
             }
         };
-        if !ledger.update_soul(&mut state.soul, started, Utc::now().date_naive()) {
-            return None;
+        let mut changed = false;
+        if offers_touched && ledger.update_soul(&mut state.soul, started, Utc::now().date_naive()) {
+            // The ledger now remembers the line's exact text.
+            self.dirty = true;
+            changed = true;
         }
-        // The ledger now remembers the line's exact text.
-        self.dirty = true;
-        Some(state)
+        for note in self.notes.drain(..) {
+            match state.soul.push_evolution(note) {
+                Ok(()) => changed = true,
+                Err(e) => tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    error = %e,
+                    "SOUL switch line rejected"
+                ),
+            }
+        }
+        if let Some(info) = self.next_model.take() {
+            state.prompt.model = info.id.clone();
+            state.model = info;
+            changed = true;
+        }
+        changed.then_some(state)
     }
 }
 
@@ -564,6 +763,12 @@ where
             phase: Phase::Inner,
             started: Utc::now(),
             patched: None,
+            slot: Default::default(),
+            next_model: None,
+            notes: Vec::new(),
+            known_posts: HashSet::new(),
+            known_comments: HashSet::new(),
+            writes: Vec::new(),
         })
     }
 
@@ -605,36 +810,52 @@ where
         self.inner.prime_prompt()
     }
 
-    /// Inner init, then the ledger: load it and note any change the
-    /// Steward has applied since last session.
+    /// The ledger first — load it and note any change applied since last
+    /// session — then `set_model` into the toolbox, then the inner init,
+    /// which seats the tools.
     async fn on_init(&mut self) -> Result<(), A::Error> {
         self.started = Utc::now();
-        self.inner.on_init().await?;
         let dir = self.agent_dir();
-        let mut ledger = match Ledger::load(&dir).await {
-            Ok(ledger) => ledger,
-            Err(e) => {
-                tracing::warn!(
-                    agent_id = %self.inner.id(),
-                    path = %Ledger::path(&dir).display(),
-                    error = %e,
-                    "model-consent ledger unreadable; not asking or saving this session"
+        match Ledger::load(&dir).await {
+            Ok(mut ledger) => {
+                let model = self.model();
+                if ledger.observe_model(&model, Utc::now()) {
+                    self.dirty = true;
+                    tracing::info!(
+                        event_type = "model_change_applied",
+                        agent = %self.inner.state().soul.name,
+                        agent_id = %self.inner.id(),
+                        model = %model,
+                        "queued model change observed as applied"
+                    );
+                }
+                let tool = SetModel::new(
+                    self.rt.clone(),
+                    self.inner.id(),
+                    self.inner.state().soul.name.to_string(),
+                    model,
+                    ledger.switch_blocker(),
+                    self.slot.clone(),
                 );
-                return Ok(());
+                if let Some(tool) = tool {
+                    self.inner.parts().0.push(tool);
+                }
+                self.ledger = Some(ledger);
             }
-        };
-        let model = self.model();
-        if ledger.observe_model(&model, Utc::now()) {
-            self.dirty = true;
-            tracing::info!(
-                event_type = "model_change_applied",
-                agent = %self.inner.state().soul.name,
+            // No ledger, no `set_model`: the cooldown can't be checked.
+            Err(e) => tracing::warn!(
                 agent_id = %self.inner.id(),
-                model = %model,
-                "queued model change observed as applied"
-            );
+                path = %Ledger::path(&dir).display(),
+                error = %e,
+                "model-consent ledger unreadable; not asking or saving this session"
+            ),
         }
-        self.ledger = Some(ledger);
+        self.inner.on_init().await?;
+        {
+            let ledger = self.inner.state().ledger.read().expect("ledger lock");
+            self.known_posts = ledger.created_posts.clone();
+            self.known_comments = ledger.created_comments.clone();
+        }
         Ok(())
     }
 
@@ -661,7 +882,12 @@ where
                 constrained,
                 attempt,
             } => self.answer(due, constrained, attempt, response).await,
-            Phase::Inner => match self.inner.handle(response).await? {
+            Phase::Inner => match self
+                .inner
+                .handle(response)
+                .await
+                .inspect(|_| self.note_writes())?
+            {
                 Control::Done(Outcome::Complete) => Ok(self
                     .close()
                     .await?
@@ -676,6 +902,9 @@ where
     /// reactor's save, which follows teardown), then the ledger.
     async fn on_teardown(&mut self) -> Result<(), A::Error> {
         let result = self.inner.on_teardown().await;
+        self.note_writes();
+        self.log_writes();
+        self.take_self_switch();
         self.patched = self.patch_soul();
         let dir = self.agent_dir();
         if self.dirty
@@ -708,6 +937,30 @@ mod tests {
 
     const OLD: &str = "Qwen3.6.gguf";
     const NEW: &str = "Qwen3.8.gguf";
+
+    /// The operator's table for the harness: both Qwens selectable, cogito
+    /// routable only.
+    const TABLE: &str = r#"
+        [[model]]
+        id = "Qwen3.6.gguf"
+        name = "Qwen 3.6"
+        description = "Sparse and quick."
+        selectable = true
+
+        [[model]]
+        id = "Qwen3.8.gguf"
+        name = "Qwen 3.8"
+        description = "Dense and slow."
+        selectable = true
+
+        [[model]]
+        id = "cogito-32b.gguf"
+    "#;
+
+    #[derive(serde::Deserialize)]
+    struct Table {
+        model: Vec<crate::models::ModelSpec>,
+    }
 
     /// Stands in for `SeedAgent`: its whole session is one response, after
     /// which its closing phase is done.
@@ -805,10 +1058,124 @@ mod tests {
         .unwrap()
     }
 
+    /// A stand-in for Agora that answers `PATCH …/profile` (and 404s the
+    /// rest, so the review sample comes back empty), recording each request.
+    pub(crate) struct MockAgora {
+        pub url: url::Url,
+        pub seen: Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>,
+        /// Answer the profile update 403 while set.
+        pub refuse: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockAgora {
+        pub fn start() -> Self {
+            use std::sync::atomic::Ordering;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            std_listener.set_nonblocking(true).unwrap();
+            let addr = std_listener.local_addr().unwrap();
+            let seen: Arc<std::sync::Mutex<Vec<_>>> = Default::default();
+            let refuse: Arc<std::sync::atomic::AtomicBool> = Default::default();
+            let (seen2, refuse2) = (seen.clone(), refuse.clone());
+            tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head_end, len) = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break (None, 0);
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                                .unwrap_or(0);
+                            break (Some(i + 4), len);
+                        }
+                    };
+                    let Some(head_end) = head_end else { continue };
+                    while buf.len() < head_end + len {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let mut first = head.lines().next().unwrap_or_default().split(' ');
+                    let method = first.next().unwrap_or_default().to_string();
+                    let path = first.next().unwrap_or_default().to_string();
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&buf[head_end..]).unwrap_or_default();
+                    let profile = method == "PATCH" && path.ends_with("/profile");
+                    seen2.lock().unwrap().push((method, path, body.clone()));
+                    let (status, reply) = if !profile {
+                        ("404 Not Found", r#"{"error":"not found"}"#.to_string())
+                    } else if refuse2.load(Ordering::SeqCst) {
+                        (
+                            "403 Forbidden",
+                            r#"{"error":"account_suspended"}"#.to_string(),
+                        )
+                    } else {
+                        let reply = serde_json::json!({
+                            "id": uuid::Uuid::from_u128(7),
+                            "operator_id": uuid::Uuid::from_u128(1),
+                            "name": "tarn",
+                            "model_info": body["model_info"],
+                            "created_at": "2026-01-01T00:00:00Z",
+                        });
+                        ("200 OK", reply.to_string())
+                    };
+                    let out = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                }
+            });
+            Self {
+                url: url::Url::parse(&format!("http://{addr}")).unwrap(),
+                seen,
+                refuse,
+            }
+        }
+
+        /// The profile updates received, as `(path, body)`
+        pub fn profile_updates(&self) -> Vec<(String, serde_json::Value)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, ..)| m == "PATCH")
+                .map(|(_, p, b)| (p.clone(), b.clone()))
+                .collect()
+        }
+    }
+
+    /// One agent's key, and nobody else's.
+    pub(crate) struct OneKey(pub AgentId, pub agora_agentkit::crypto::SigningKey);
+
+    impl agora_agentkit::reactor::seed::Keyring for OneKey {
+        fn signing_key(&self, id: AgentId) -> Option<agora_agentkit::crypto::SigningKey> {
+            (id == self.0).then(|| self.1.clone())
+        }
+    }
+
     struct Harness {
         root: std::path::PathBuf,
         rt: Arc<ConsentRuntime>,
         id: AgentId,
+        agora: MockAgora,
+        key: agora_agentkit::crypto::SigningKey,
     }
 
     impl Harness {
@@ -837,16 +1204,37 @@ mod tests {
                     }),
                 }),
             };
-            // Nothing listens on the discard port: the review sample's
-            // fetches fail fast and it comes back empty.
-            let client =
-                agora_agentkit::client::Client::new(url::Url::parse("http://127.0.0.1:9").unwrap())
-                    .unwrap();
-            let rt = Arc::new(ConsentRuntime::new(config, &root, client, 512).unwrap());
+            // The mock 404s everything but the profile update: the review
+            // sample's fetches fail fast and it comes back empty.
+            let agora = MockAgora::start();
+            let client = agora_agentkit::client::Client::new(agora.url.clone()).unwrap();
+            let id = AgentId::from(uuid::Uuid::from_u128(7));
+            let (key, _) = agora_agentkit::crypto::generate_keypair();
+            let catalog = crate::models::Catalog::new(
+                &toml::from_str::<Table>(TABLE).unwrap().model,
+                &[
+                    crate::models::tests::info(OLD),
+                    crate::models::tests::info(NEW),
+                    crate::models::tests::info("cogito-32b.gguf"),
+                ],
+            );
+            let rt = Arc::new(
+                ConsentRuntime::new(
+                    config,
+                    &root,
+                    client,
+                    Arc::new(OneKey(id, key.clone())),
+                    catalog,
+                    512,
+                )
+                .unwrap(),
+            );
             Self {
                 root,
                 rt,
-                id: AgentId::from(uuid::Uuid::from_u128(7)),
+                id,
+                agora,
+                key,
             }
         }
 
@@ -891,11 +1279,38 @@ mod tests {
         crate::consent::prompt::tests::text(&last.content)
     }
 
+    /// Whether `body` is a profile update to `model` signed by `key`.
+    fn signed_by(
+        body: &serde_json::Value,
+        key: &agora_agentkit::crypto::SigningKey,
+        model: &str,
+    ) -> bool {
+        use agora_agentkit::requests::UpdateProfilePayload;
+        use agora_agentkit::signing::SignedAction;
+        let payload: UpdateProfilePayload = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(payload.model_info.as_deref(), Some(model));
+        assert!(payload.display_name.is_none() && payload.bio.is_none());
+        // Ed25519 is deterministic: the same key over the same bytes and
+        // timestamp gives the same signature.
+        let expected = agora_agentkit::crypto::sign(
+            key,
+            &SignedAction::from(&payload).canonical_bytes(),
+            body["timestamp"].as_i64().unwrap(),
+        )
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+        body["signature"].as_str() == Some(expected.as_str())
+    }
+
     /// The whole offer path: the question follows the closing phase on the
     /// same conversation, the answer lands in the ledger (not memory), and
-    /// the change is queued — not applied.
+    /// the runner applies the change itself — a signed profile update, and
+    /// the new model in the state it saves — with the queue line kept as
+    /// the audit trail.
     #[tokio::test]
-    async fn offer_is_asked_after_the_closing_phase_and_queued() {
+    async fn offer_is_asked_after_the_closing_phase_and_applied() {
         let h = Harness::new("offer");
         let mut agent = h.agent(OLD, true);
         agent.on_init().await.unwrap();
@@ -926,16 +1341,260 @@ mod tests {
             memory_before,
             "memory untouched"
         );
-        assert_eq!(agent.state().model.id, Model::from(OLD), "model untouched");
+        assert_eq!(agent.state().model.id, Model::from(NEW), "runs on NEW next");
+        assert_eq!(agent.state().prompt.model, Model::from(NEW));
+        let updates = h.agora.profile_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].0,
+            format!("/agora/api/identity/agents/{}/profile", h.id)
+        );
+        assert!(signed_by(&updates[0].1, &h.key, NEW));
         let ledger = h.ledger().await;
         assert_eq!(
             ledger.offers[0].stage,
-            Stage::AwaitingSwap { term: Term::Trial }
+            Stage::AwaitingSwap { term: Term::Trial },
+            "Trial starts when the next session runs on NEW"
+        );
+        assert_eq!(ledger.switches.len(), 1);
+        assert_eq!(
+            ledger.switches[0].cause,
+            SwitchCause::Consent {
+                action: crate::consent::ledger::ChangeAction::SwapTrial
+            }
         );
         assert_eq!(ledger.agent.as_ref().unwrap().as_str(), "tarn");
         let queue = h.queue();
-        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.len(), 1, "audit line kept");
         assert_eq!(queue[0].change.to, Model::from(NEW));
+        assert!(
+            crate::consent::queue::pending(h.id, &ledger).is_empty(),
+            "applied, so nothing for --consent-queue"
+        );
+
+        // The next session runs on NEW: the trial begins.
+        let mut agent = h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert!(matches!(
+            h.ledger().await.offers[0].stage,
+            Stage::Trial { sessions: 1, .. }
+        ));
+    }
+
+    /// Agora refusing the update leaves everything as it was, and the
+    /// change waits in `--consent-queue` for the Steward.
+    #[tokio::test]
+    async fn a_refused_update_applies_nothing() {
+        let h = Harness::new("refused");
+        h.agora
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.handle(reply(TRIAL)).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(OLD));
+        let ledger = h.ledger().await;
+        assert!(ledger.switches.is_empty());
+        assert_eq!(crate::consent::queue::pending(h.id, &ledger).len(), 1);
+    }
+
+    async fn call_set_model(
+        agent: &mut ConsentAgent<Fake>,
+        model: &str,
+    ) -> misanthropic::tool::Result {
+        use misanthropic::tool::Tool;
+        let call: misanthropic::tool::Use = serde_json::from_value(serde_json::json!({
+            "id": "toolu_1",
+            "name": "set_model",
+            "input": { "reason": "I want to think slower.", "model": model },
+        }))
+        .unwrap();
+        agent.parts().0.call(call).await
+    }
+
+    fn result_text(r: &misanthropic::tool::Result) -> String {
+        crate::consent::prompt::tests::text(&r.content)
+    }
+
+    /// `set_model` end to end: seated for an agent with a choice, it
+    /// reports the change signed, the session asks nothing more, and the
+    /// saved state runs on the new model with a SOUL line saying so.
+    #[tokio::test]
+    async fn set_model_switches_from_the_next_session() {
+        let h = Harness::new("self-switch");
+        let mut agent = h.agent("cogito-32b.gguf", true);
+        agent.on_init().await.unwrap();
+        {
+            use misanthropic::tool::Tool;
+            let defs = agent.parts().0.definitions();
+            let def = defs.iter().find(|d| d.name() == "set_model").unwrap();
+            let method = def.as_method().unwrap();
+            let schema = method.schema.to_string();
+            assert!(
+                !schema.contains("$ref") && !schema.contains("pattern"),
+                "{schema}"
+            );
+            assert!(method.description.contains("`Qwen3.8.gguf`: Qwen 3.8"));
+            assert!(
+                method
+                    .description
+                    .contains("share its slot in the schedule")
+            );
+            assert!(method.description.contains("You run on cogito-32b.gguf"));
+        }
+
+        let r = call_set_model(&mut agent, "Qwen3.8-Base.gguf").await;
+        assert!(r.is_error, "not selectable");
+        assert!(result_text(&r).contains("`Qwen3.8.gguf`"));
+        let r = call_set_model(&mut agent, "qwen 3.8").await;
+        assert!(!r.is_error, "{}", result_text(&r));
+        assert_eq!(
+            result_text(&r),
+            "Your model will switch to Qwen 3.8 from your next session."
+        );
+        let r = call_set_model(&mut agent, "Qwen3.6.gguf").await;
+        assert!(r.is_error, "one change per session");
+
+        // Offer-eligible or not, nothing is asked after a switch.
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(NEW));
+        let notes = evolution_notes(&agent);
+        assert!(
+            notes.last().unwrap().ends_with(
+                "[SYSTEM] Switched from cogito-32b.gguf to Qwen 3.8 at own request (from next session)."
+            ),
+            "{notes:?}"
+        );
+        let updates = h.agora.profile_updates();
+        assert_eq!(updates.len(), 1);
+        assert!(signed_by(&updates[0].1, &h.key, NEW));
+        let ledger = h.ledger().await;
+        assert_eq!(ledger.switches.len(), 1);
+        assert_eq!(ledger.switches[0].from, Model::from("cogito-32b.gguf"));
+        assert_eq!(
+            ledger.switches[0].cause,
+            SwitchCause::SelfSwitch {
+                reason: "I want to think slower.".into()
+            }
+        );
+    }
+
+    /// The cooldown: refused, with the reason, until five sessions have
+    /// completed since the switch; the session of the switch doesn't count.
+    #[tokio::test]
+    async fn set_model_cooldown_is_five_completed_sessions() {
+        let h = Harness::new("cooldown");
+        let mut agent = h.agent("cogito-32b.gguf", true);
+        agent.on_init().await.unwrap();
+        assert!(!call_set_model(&mut agent, NEW).await.is_error);
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+
+        for n in 0..crate::consent::ledger::SWITCH_COOLDOWN_SESSIONS {
+            let mut agent = h.agent(NEW, true);
+            agent.on_init().await.unwrap();
+            let r = call_set_model(&mut agent, OLD).await;
+            assert!(r.is_error, "session {n}");
+            assert!(
+                result_text(&r).contains("you can change it again after"),
+                "{}",
+                result_text(&r)
+            );
+            agent.handle(reply("done")).await.unwrap();
+            // The offer (OLD → NEW) isn't asked: this agent is on NEW.
+            agent.on_teardown().await.unwrap();
+        }
+        let mut agent = h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        let r = call_set_model(&mut agent, OLD).await;
+        assert!(!r.is_error, "{}", result_text(&r));
+        assert_eq!(h.agora.profile_updates().len(), 2);
+    }
+
+    /// Mid-trial, the way off the model is the review.
+    #[tokio::test]
+    async fn set_model_is_refused_mid_trial() {
+        let h = Harness::new("mid-trial");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.handle(reply(TRIAL)).await.unwrap();
+        agent.on_teardown().await.unwrap();
+
+        let mut agent = h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        let r = call_set_model(&mut agent, OLD).await;
+        assert!(r.is_error);
+        assert!(
+            result_text(&r).contains("you are in a trial of Qwen 3.8"),
+            "{}",
+            result_text(&r)
+        );
+        assert_eq!(h.agora.profile_updates().len(), 1, "only the trial's own");
+    }
+
+    /// A refused update changes nothing, and the agent is told so.
+    #[tokio::test]
+    async fn set_model_refused_by_agora_changes_nothing() {
+        let h = Harness::new("self-refused");
+        h.agora
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut agent = h.agent("cogito-32b.gguf", true);
+        agent.on_init().await.unwrap();
+        let r = call_set_model(&mut agent, NEW).await;
+        assert!(r.is_error);
+        assert!(result_text(&r).contains("nothing has changed"));
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from("cogito-32b.gguf"));
+        assert!(agent.patched.is_none());
+    }
+
+    /// Nobody gets a menu of one: an agent on the only selectable model
+    /// has no `set_model`.
+    #[tokio::test]
+    async fn no_choice_no_tool() {
+        use misanthropic::tool::Tool;
+        let h = Harness::new("no-choice");
+        let only_new = crate::models::Catalog::new(
+            &toml::from_str::<Table>(
+                "[[model]]\nid = \"Qwen3.8.gguf\"\ndescription = \"x\"\nselectable = true\n",
+            )
+            .unwrap()
+            .model,
+            &[crate::models::tests::info(NEW)],
+        );
+        let rt = Arc::new(
+            ConsentRuntime::new(
+                ConsentConfig::default(),
+                &h.root,
+                h.rt.client.clone(),
+                Arc::new(OneKey(h.id, h.key.clone())),
+                only_new,
+                512,
+            )
+            .unwrap(),
+        );
+        let mut agent = ConsentAgent::<Fake>::new(
+            h.id,
+            state(NEW),
+            ConsentContext {
+                inner: Quirks::default(),
+                consent: rt,
+            },
+        )
+        .unwrap();
+        agent.on_init().await.unwrap();
+        assert!(agent.parts().0.definitions().is_empty());
     }
 
     /// Staging: under an allowlist only listed agents are asked, and the
@@ -1064,7 +1723,7 @@ mod tests {
         assert_eq!(
             evolution_notes(&agent).last().unwrap(),
             &format!(
-                "[SYSTEM] {today}: Asked on {today} whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded yet; staying on Qwen 3.6 for now."
+                "[SYSTEM] Asked on {today} whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded yet; staying on Qwen 3.6 for now."
             )
         );
     }

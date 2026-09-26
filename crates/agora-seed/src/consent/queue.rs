@@ -1,5 +1,6 @@
-//! The Steward's queue: model changes agents asked for, which the runner
-//! never applies itself.
+//! The queue: model changes agents asked for. Since 2026-09-25 the runner
+//! applies them itself ([`super::switch`]); what is left here is the audit
+//! trail, and any change the runner could not apply.
 //!
 //! Two views of one fact:
 //!
@@ -8,9 +9,10 @@
 //!   (`event_type = "model_change_requested"`) in the run log.
 //! - **Derived** on demand: `agora-seed --consent-queue` scans every
 //!   agent's ledger for changes still awaiting application and prints the
-//!   `set_model` commands. This view can't go stale — a ledger leaves
-//!   `awaiting_*` only when the runner sees the agent on the target model —
-//!   so it is the one to apply from. The JSON lines are the audit trail.
+//!   `set_model` commands, leaving out changes the runner has already
+//!   applied (they take effect at the agent's next session). This view
+//!   can't go stale, so it is the one to apply from. The JSON lines are the
+//!   audit trail.
 //!
 //! Applying: `cargo run --bin set_model -- --from <from> --to <to> --agent
 //! <name>…` in the parent repo, then `sync-models` here.
@@ -52,7 +54,7 @@ pub async fn emit(path: &Path, entry: &QueueEntry) {
         action = ?entry.change.action,
         from = %entry.change.from,
         to = %entry.change.to,
-        "model change requested; apply with set_model + sync-models"
+        "model change requested; the runner applies it"
     );
     if let Err(e) = append(path, entry).await {
         tracing::warn!(
@@ -119,6 +121,9 @@ pub fn pending(agent_id: AgentId, ledger: &Ledger) -> Vec<Pending> {
                 ),
                 _ => return None,
             };
+            if ledger.applied(r, &from, &to) {
+                return None; // takes effect at the agent's next session
+            }
             Some(Pending {
                 agent_id,
                 agent: agent.clone(),

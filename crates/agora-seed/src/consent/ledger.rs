@@ -53,6 +53,10 @@ pub struct Ledger {
     pub agent: Option<ShortString<64>>,
     #[serde(default)]
     pub offers: Vec<OfferRecord>,
+    /// Every model change the runner applied, oldest first. Absent from
+    /// ledgers written before the runner applied changes itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub switches: Vec<Switch>,
 }
 
 impl Default for Ledger {
@@ -61,8 +65,37 @@ impl Default for Ledger {
             format: FORMAT,
             agent: None,
             offers: Vec::new(),
+            switches: Vec::new(),
         }
     }
+}
+
+/// Completed sessions after a switch before the agent may switch again.
+pub const SWITCH_COOLDOWN_SESSIONS: u32 = 5;
+
+/// A model change the runner applied: reported to Agora, and the agent
+/// routed on `to` from its next session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Switch {
+    pub at: DateTime<Utc>,
+    pub from: Model,
+    pub to: Model,
+    #[serde(flatten)]
+    pub cause: SwitchCause,
+    /// Completed sessions that started after this switch — the cooldown's
+    /// count.
+    #[serde(default)]
+    pub sessions_after: u32,
+}
+
+/// Why a [`Switch`] happened.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "cause", rename_all = "snake_case")]
+pub enum SwitchCause {
+    /// The agent asked, with `set_model`.
+    SelfSwitch { reason: String },
+    /// An answered offer or trial review.
+    Consent { action: ChangeAction },
 }
 
 /// Everything about one offer for one agent.
@@ -528,25 +561,89 @@ impl Ledger {
         })
     }
 
+    /// A session that started at `started` completed: count it toward the
+    /// cooldown of the latest switch made before it. Returns whether
+    /// anything changed.
+    pub fn count_since_switch(&mut self, started: DateTime<Utc>) -> bool {
+        match self.switches.last_mut() {
+            Some(switch) if switch.at < started => {
+                switch.sessions_after += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Why the agent can't switch model now, if it can't: a trial or an
+    /// accepted change is under way (trials end at their review), or the
+    /// last switch is too recent.
+    pub fn switch_blocker(&self) -> Option<String> {
+        if let Some(record) = self.offers.iter().find(|r| {
+            matches!(
+                r.stage,
+                Stage::Trial { .. } | Stage::AwaitingSwap { .. } | Stage::AwaitingRevert { .. }
+            )
+        }) {
+            return Some(match record.stage {
+                Stage::Trial { .. } => format!(
+                    "you are in a trial of {}; it ends with a review after \
+                     {TRIAL_SESSIONS} sessions, where you decide whether to keep it",
+                    record.to_name
+                ),
+                _ => "a model change you already agreed to has not taken effect yet".to_string(),
+            });
+        }
+        let last = self.switches.last()?;
+        (last.sessions_after < SWITCH_COOLDOWN_SESSIONS).then(|| {
+            let left = SWITCH_COOLDOWN_SESSIONS - last.sessions_after;
+            format!(
+                "your model last changed on {}; you can change it again after {left} \
+                 more completed session{}",
+                last.at.date_naive(),
+                if left == 1 { "" } else { "s" }
+            )
+        })
+    }
+
+    /// Whether the runner has applied `record`'s awaited change — a
+    /// consented switch `from` → `to` after the record's latest event.
+    pub fn applied(&self, record: &OfferRecord, from: &Model, to: &Model) -> bool {
+        let Some(since) = record.history.last().map(|e| e.at) else {
+            return false;
+        };
+        self.switches.iter().any(|s| {
+            &s.from == from
+                && &s.to == to
+                && s.at >= since
+                && matches!(s.cause, SwitchCause::Consent { .. })
+        })
+    }
+
+    /// Note a switch the runner has applied.
+    pub fn record_switch(&mut self, switch: Switch) {
+        self.switches.push(switch);
+    }
+
     /// Keep the SOUL's Evolution Log current for every offer touched at or
     /// after `since` (the session start), with **at most one entry per
-    /// offer**: the log is capped at `EVOLUTION_LOG_CAP` (10) and most of it
+    /// offer**: the log is capped at `EVOLUTION_LOG_CAP` (50) and most of it
     /// belongs to the agent.
     ///
     /// The offer's previous entry is found by its exact note text
-    /// ([`OfferRecord::soul_note`]) and rewritten in place, re-dated
-    /// `today`; if the cap has already evicted it (or it was never
-    /// written), a new entry is appended. No other entry is removed or
-    /// changed. Same `[SYSTEM] <date>: …` form as agentkit's automatic
-    /// entries. Returns whether anything changed; the caller must then
-    /// save both the soul and this ledger.
+    /// ([`OfferRecord::soul_note`], which may be in the older dated form)
+    /// and rewritten in place, re-dated `today`; if the cap has already
+    /// evicted it (or it was never written), a new entry is appended. No
+    /// other entry is removed or changed. The note is `[SYSTEM] …` without
+    /// a date: the entry carries its own and renders as `- {date}: {note}`.
+    /// Returns whether anything changed; the caller must then save both the
+    /// soul and this ledger.
     pub fn update_soul(&mut self, soul: &mut Soul, since: DateTime<Utc>, today: NaiveDate) -> bool {
         let mut changed = false;
         for record in &mut self.offers {
             if !record.history.iter().any(|e| e.at >= since) {
                 continue;
             }
-            let line = format!("[SYSTEM] {today}: {}", record.summary());
+            let line = format!("[SYSTEM] {}", record.summary());
             if record.soul_note.as_deref() == Some(line.as_str()) {
                 continue;
             }
@@ -904,7 +1001,7 @@ mod tests {
 
         ledger.record_offer(names(&k), t(23), offer(OfferChoice::Trial));
         assert!(ledger.update_soul(&mut soul, t(23), day(23)));
-        let first = "[SYSTEM] 2026-09-23: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial.";
+        let first = "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial.";
         assert_eq!(notes(&soul)[3], first);
         assert_eq!(soul.evolution_log.len(), 4);
 
@@ -917,7 +1014,7 @@ mod tests {
         assert_eq!(n.len(), 5, "replaced, not appended");
         assert_eq!(
             n[3],
-            "[SYSTEM] 2026-09-25: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25."
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25."
         );
         assert_eq!(soul.evolution_log[3].date, day(25));
         assert_eq!(
@@ -937,10 +1034,36 @@ mod tests {
         assert_eq!(n.len(), 5);
         assert_eq!(
             n[3],
-            "[SYSTEM] 2026-09-30: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25; after the trial chose to return to Qwen 3.6 (2026-09-30); returned to Qwen 3.6 2026-10-01."
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25; after the trial chose to return to Qwen 3.6 (2026-09-30); returned to Qwen 3.6 2026-10-01."
         );
         assert!(n[3].len() <= 512);
         assert_eq!(n.iter().filter(|l| l.starts_with("[SYSTEM]")).count(), 1);
+    }
+
+    /// Entries written before 2026-09-25 carry a second date inside the note
+    /// (`[SYSTEM] 2026-09-23: …`). They're still found by their exact text
+    /// and rewritten in place, in the undated form.
+    #[test]
+    fn a_dated_legacy_entry_is_rewritten_in_place() {
+        let k = key();
+        let mut soul = soul(2);
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(23), offer(OfferChoice::Trial));
+        let legacy = "[SYSTEM] 2026-09-23: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial.";
+        soul.push_evolution(legacy).unwrap();
+        soul.push_evolution("my own entry 2").unwrap();
+        ledger.offers[0].soul_note = Some(legacy.to_string());
+
+        ledger.observe_model(&k.to, t(25));
+        assert!(ledger.update_soul(&mut soul, t(25), day(25)));
+        let n = notes(&soul);
+        assert_eq!(n.len(), 4, "replaced, not appended");
+        assert_eq!(
+            n[2],
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose a 5-session trial; moved 2026-09-25."
+        );
+        assert_eq!(soul.evolution_log[2].date, day(25));
+        assert_eq!(n[3], "my own entry 2");
     }
 
     /// Nothing new this session, nothing written.
@@ -977,7 +1100,7 @@ mod tests {
         assert_eq!(n.len(), CAP);
         assert_eq!(
             n.last().unwrap(),
-            "[SYSTEM] 2026-09-24: Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
+            "[SYSTEM] Asked on 2026-09-23 whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay on Qwen 3.6."
         );
         assert_eq!(n[0], "my own entry 1", "only the cap's own eviction");
     }
@@ -994,5 +1117,77 @@ mod tests {
         let empty = Ledger::load(&dir.join("absent")).await.unwrap();
         assert_eq!(empty, Ledger::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn self_switch(at: DateTime<Utc>) -> Switch {
+        Switch {
+            at,
+            from: Model::from("a.gguf"),
+            to: Model::from("b.gguf"),
+            cause: SwitchCause::SelfSwitch {
+                reason: "why".into(),
+            },
+            sessions_after: 0,
+        }
+    }
+
+    /// Only sessions that *started* after a switch count toward its cooldown.
+    #[test]
+    fn cooldown_counts_sessions_started_after_the_switch() {
+        let mut ledger = Ledger::default();
+        assert_eq!(ledger.switch_blocker(), None, "never switched");
+        ledger.record_switch(self_switch(t(10)));
+        assert!(!ledger.count_since_switch(t(9)), "the switching session");
+        for day in 11..11 + SWITCH_COOLDOWN_SESSIONS {
+            let why = ledger.switch_blocker().expect("cooling down");
+            assert!(why.contains("2026-09-10"), "{why}");
+            assert!(ledger.count_since_switch(t(day)));
+        }
+        assert_eq!(ledger.switch_blocker(), None);
+    }
+
+    #[test]
+    fn a_trial_or_an_accepted_change_blocks_switching() {
+        let k = key();
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(23), offer(OfferChoice::Trial));
+        assert!(
+            ledger
+                .switch_blocker()
+                .unwrap()
+                .contains("not taken effect")
+        );
+        ledger.observe_model(&k.to, t(24));
+        assert!(
+            ledger
+                .switch_blocker()
+                .unwrap()
+                .contains("trial of Qwen 3.8")
+        );
+        let mut declined = Ledger::default();
+        declined.record_offer(names(&k), t(23), offer(OfferChoice::NoSwap));
+        assert_eq!(declined.switch_blocker(), None);
+    }
+
+    /// Ledgers written before switches existed still load, and a ledger
+    /// with none writes no `switches` key, so older binaries read it too.
+    #[test]
+    fn switches_are_optional_in_format_1() {
+        let old = br#"{"format": 1, "agent": "tarn", "offers": []}"#;
+        let ledger = Ledger::from_slice(old).unwrap();
+        assert!(ledger.switches.is_empty());
+        let json = serde_json::to_string(&ledger).unwrap();
+        assert!(!json.contains("switches"), "{json}");
+
+        let mut ledger = ledger;
+        ledger.record_switch(self_switch(t(10)));
+        let json = serde_json::to_value(&ledger).unwrap();
+        assert_eq!(json["format"], 1);
+        assert_eq!(json["switches"][0]["cause"], "self_switch");
+        assert_eq!(json["switches"][0]["reason"], "why");
+        assert_eq!(
+            Ledger::from_slice(json.to_string().as_bytes()).unwrap(),
+            ledger
+        );
     }
 }
