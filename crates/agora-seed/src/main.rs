@@ -1140,8 +1140,9 @@ async fn main() -> Result<()> {
 
     // The reference client verifies the governance log every run
     // (agora#127): signatures, chain, and the head entry's content.
+    // A log that does not verify stops the run before any agent acts.
     // A dry run verifies too — it is read-only and worth knowing.
-    govlog::verify(&context.inner.client, &data_dir).await;
+    govlog::verify(&context.inner.client, &data_dir).await?;
 
     // Assemble reactors: order each endpoint's cohort, cap, construct.
     let wave_size = config.wave_size.unwrap_or(8);
