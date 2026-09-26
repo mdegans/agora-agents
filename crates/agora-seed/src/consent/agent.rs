@@ -1,14 +1,29 @@
-//! [`ConsentAgent`]: agentkit's seed agent plus one closing question.
+//! [`ConsentAgent`]: agentkit's seed agent plus the model-consent questions.
 //!
 //! A wrapper rather than an agentkit change: the seed phase tail lives in
 //! the published `agora-agentkit`, and this is runner policy. The wrapper
-//! delegates every hook to the inner agent and intercepts exactly one
-//! thing — the inner agent's clean `Done(Complete)`, which is the end of
-//! its closing phase (memory written, mutation/evolution rolled, survey
-//! answered and, if anonymous, already redacted from the transcript). If
-//! the ledger says a question is due, the wrapper seats it as the next
-//! user turn on the *same* conversation — the prefix is reused, not
-//! rebuilt, so on blallama the cache carries the whole session.
+//! delegates every hook to the inner agent and intercepts:
+//!
+//! - **The offer**, at the inner agent's clean `Done(Complete)` — the end
+//!   of its closing phase (memory written, mutation/evolution rolled, survey
+//!   answered and, if anonymous, already redacted from the transcript). If
+//!   one is due, the wrapper seats it as the next user turn on the *same*
+//!   conversation — the prefix is reused, not rebuilt, so on blallama the
+//!   cache carries the whole session.
+//! - **A trial**, which runs [`TRIAL_SESSIONS`] sessions on the new model,
+//!   each intro ending with a countdown line. Nothing is asked on the new
+//!   model: at the close of the last trial session the runner moves the
+//!   agent back to the old one (Steward, 2026-09-25: the original weights
+//!   make the final call).
+//! - **The trial review**, the next session, on the old model: the usual
+//!   intro, then — instead of the act phase — the review, led by the forks
+//!   prepared at sweep start ([`super::forks`]). The answer hands over to
+//!   the inner agent's memory turn via [`Agent::on_quiesce`], exactly as an
+//!   act phase that went quiet would, and the rest of its tail follows.
+//!   No answer means the agent stays on the old model, and is an ERROR
+//!   (`model_review_no_answer`) that stall-watch alerts on.
+//!
+//! [`TRIAL_SESSIONS`]: super::ledger::TRIAL_SESSIONS
 //!
 //! **Retries.** An answer that can't be used — unparseable, a tool call
 //! instead of an answer, or clipped at `max_tokens` — is not seated (as
@@ -31,7 +46,9 @@
 //! **Changing model.** A consented change is applied by the runner itself
 //! ([`ConsentAgent::apply_change`]: a signed profile update, a ledger
 //! [`Switch`], and the new model in the patched state), with the queue line
-//! kept for audit. The agent can also ask on its own: the wrapper seats a
+//! kept for audit. One that fails (Agora refuses, or the model isn't
+//! routable this run) stays pending in the ledger and is retried at the
+//! end of the agent's next session. The agent can also ask on its own: the wrapper seats a
 //! `set_model` tool ([`switch::SetModel`]) before the inner init, when the
 //! run has a selectable model to offer. One change per session; nothing is
 //! asked after one. Each post or comment the session wrote is logged as a
@@ -55,7 +72,8 @@ use misanthropic::tool::{Notifications, ToolBox};
 
 use super::ConsentRuntime;
 use super::comparison;
-use super::ledger::{Due, Ledger, OfferNames, Switch, SwitchCause};
+use super::forks;
+use super::ledger::{Change, Due, Ledger, OfferKey, OfferNames, Switch, SwitchCause};
 use super::prompt::{self as text, OfferText, ReviewText};
 use super::queue::{self, QueueEntry};
 use super::switch::{self, SetModel, SwitchError};
@@ -159,6 +177,16 @@ pub struct ConsentAgent<A> {
     known_comments: HashSet<CommentId>,
     /// This session's writes, logged as `write_recorded` at teardown.
     writes: Vec<Write>,
+    /// The offer whose trial review this session is for: asked first,
+    /// with the act phase skipped (see [`ConsentAgent::seat_review`]).
+    review: Option<OfferKey>,
+    /// The review has been answered (or gone unanswered); the inner
+    /// agent's memory turn follows, and nothing more is asked.
+    reviewed: bool,
+    /// The feed-freshness record from before a review session's intro
+    /// marked its feed as seen. The agent reads nothing in that session, so
+    /// the record is put back and the feed stays fresh for its next one.
+    seen_before_review: Option<std::collections::HashMap<PostId, i64>>,
 }
 
 /// A post or comment written this session.
@@ -363,10 +391,47 @@ where
         Ok(Control::Continue)
     }
 
-    /// The inner session completed cleanly: count it toward any trial, then
-    /// ask whatever is due. `None` means nothing is — the session ends.
+    /// Apply a change the agent agreed to, logging a failure (the change
+    /// then stays pending in the ledger and is retried at the end of the
+    /// agent's next session). `audit` also writes the queue line — once per
+    /// change, not per retry.
+    async fn apply_consented(&mut self, change: &Change, now: DateTime<Utc>, audit: bool) {
+        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
+        if audit {
+            let entry = QueueEntry {
+                at: now,
+                agent_id,
+                agent: agent.clone(),
+                change: change.clone(),
+            };
+            // The audit line, then the change itself (2026-09-25: the
+            // runner applies what the agent chose; the Steward no longer
+            // has to).
+            queue::emit(&self.rt.queue_path, &entry).await;
+        }
+        let cause = SwitchCause::Consent {
+            action: change.action,
+        };
+        if let Err(e) = self.apply_change(&change.to, cause).await {
+            tracing::error!(
+                event_type = "model_switch_failed",
+                agent = %agent,
+                agent_id = %agent_id,
+                from = %change.from,
+                to = %change.to,
+                action = ?change.action,
+                error = %e,
+                "consented model change not applied; retried at the end of the agent's next session"
+            );
+        }
+    }
+
+    /// The inner session completed cleanly: count it toward any trial, end
+    /// a trial that has run its course, retry a change still waiting, or
+    /// ask a due offer. `None` means nothing is asked — the session ends.
     async fn close(&mut self) -> Result<Option<Control>, A::Error> {
         let model = self.model();
+        let now = Utc::now();
         // An allowlisted offer simply isn't on the table for anyone else.
         let name = &self.inner.state().soul.name;
         let offer_key = self
@@ -383,59 +448,108 @@ where
         };
         self.dirty |= ledger.count_session(&model);
         self.dirty |= ledger.count_since_switch(started);
-        // One change per session: nothing is asked after a switch.
-        if switched {
+        // One change per session, and one question: nothing after a switch
+        // or a review.
+        if switched || self.reviewed {
+            return Ok(None);
+        }
+        // A trial that has run its course: nothing is asked on the new
+        // model. The agent goes back and decides on the old one.
+        if let Some(change) = ledger.end_trial(&model, now) {
+            self.dirty = true;
+            tracing::info!(
+                event_type = "model_trial_ended",
+                agent = %self.inner.state().soul.name,
+                agent_id = %self.inner.id(),
+                from = %change.to,
+                to = %change.from,
+                "trial complete; returning the agent to its original model for the review"
+            );
+            self.apply_consented(&change, now, true).await;
+            return Ok(None);
+        }
+        if let Some(change) = ledger.unapplied(&model) {
+            tracing::info!(
+                event_type = "model_switch_retry",
+                agent = %self.inner.state().soul.name,
+                agent_id = %self.inner.id(),
+                from = %change.from,
+                to = %change.to,
+                action = ?change.action,
+                "applying a consented model change left pending"
+            );
+            self.apply_consented(&change, now, false).await;
             return Ok(None);
         }
         let Some(due) = ledger.due(&model, offer_key.as_ref()) else {
             return Ok(None);
         };
-        match &due {
-            Due::Offer(_) => {
-                let offer = self
-                    .rt
-                    .offer
-                    .as_ref()
-                    .expect("due offers need one configured");
-                let content = text::offer(OfferText {
-                    from_name: offer.source_name(),
-                    to_name: offer.target_name(),
-                    description: &offer.description,
-                    limited: offer.is_limited(),
-                });
-                self.seat_question(due, content, text::offer_schema())
-                    .map(Some)
-            }
-            Due::Review(key) => {
-                let (record, boundary, sessions) =
-                    ledger.trial(key).expect("due reviews are trials");
-                let (from_name, to_name) = (record.from_name.clone(), record.to_name.clone());
-                let chosen_on = ledger.chosen_at(key).unwrap_or(boundary).date_naive();
-                let comments: Vec<CommentId> = self
-                    .inner
-                    .state()
-                    .ledger
-                    .read()
-                    .expect("ledger lock")
-                    .created_comments
-                    .iter()
-                    .copied()
-                    .collect();
-                let sample =
-                    comparison::gather(&self.rt.client, self.inner.id(), comments, boundary).await;
-                let content = text::review(
-                    ReviewText {
-                        from_name: &from_name,
-                        to_name: &to_name,
-                        chosen_on,
-                        sessions,
-                    },
-                    &sample,
-                );
-                self.seat_question(due, content, text::review_schema())
-                    .map(Some)
-            }
+        let offer = self
+            .rt
+            .offer
+            .as_ref()
+            .expect("due offers need one configured");
+        let content = text::offer(OfferText {
+            from_name: offer.source_name(),
+            to_name: offer.target_name(),
+            description: &offer.description,
+            limited: offer.is_limited(),
+        });
+        self.seat_question(due, content, text::offer_schema())
+            .map(Some)
+    }
+
+    /// The review session: the usual intro is built, then — instead of the
+    /// act phase — the review, with the forks and the before/after sample.
+    /// Its answer hands over to the inner memory turn
+    /// ([`answer`](Self::answer)).
+    async fn seat_review(&mut self, key: OfferKey) -> Result<(), A::Error> {
+        let dir = self.agent_dir();
+        let Some(review) = self.ledger.as_ref().and_then(|l| l.review(&key)) else {
+            return Ok(());
+        };
+        let (from_name, to_name) = (
+            review.record.from_name.clone(),
+            review.record.to_name.clone(),
+        );
+        let (started_at, sessions, chosen_on) = (
+            review.started_at,
+            review.sessions,
+            review.chosen_at.date_naive(),
+        );
+        let forks = forks::load(&dir, &key, started_at).await;
+        if forks.is_none() {
+            tracing::warn!(
+                event_type = "review_forks_missing",
+                agent = %self.inner.state().soul.name,
+                agent_id = %self.inner.id(),
+                "trial review without forks (none prepared for this trial)"
+            );
         }
+        let comments: Vec<CommentId> = self
+            .inner
+            .state()
+            .ledger
+            .read()
+            .expect("ledger lock")
+            .created_comments
+            .iter()
+            .copied()
+            .collect();
+        let sample =
+            comparison::gather(&self.rt.client, self.inner.id(), comments, started_at).await;
+        let content = text::review(
+            ReviewText {
+                from_name: &from_name,
+                to_name: &to_name,
+                chosen_on,
+                sessions,
+            },
+            forks.as_ref(),
+            &sample,
+        );
+        self.seat_question(Due::Review(key), content, text::review_schema())
+            .map(|_| ())
     }
 
     /// One response to the question: parse it; on a retryable failure with
@@ -510,7 +624,23 @@ where
             Retry::No => f.reason.clone(),
             _ => format!("{} (after {attempt} attempts)", f.reason),
         });
-        if let Some(failure) = &failure
+        if let (Some(reason), Due::Review(_)) = (&reason, &due) {
+            // Any unanswered review, refusal included: the agent stays on
+            // `from` by default, and a human should look (stall-watch
+            // alerts on this at once).
+            tracing::error!(
+                event_type = "model_review_no_answer",
+                agent = %agent,
+                agent_id = %agent_id,
+                model = %response.model,
+                from = %due.key().from,
+                to = %due.key().to,
+                attempts = attempt,
+                failure = %reason,
+                raw = %raw_text(&response),
+                "trial review got no usable answer; the agent stays on its original model"
+            );
+        } else if let Some(failure) = &failure
             && failure.retry != Retry::No
         {
             // Every attempt malformed: an upstream bug until shown otherwise.
@@ -574,35 +704,19 @@ where
             );
             // A usable answer joins the transcript (the prompt log keeps it).
             let (_, prompt) = self.inner.parts();
-            if let Err(e) = prompt.push_message(response.inner) {
+            if let Err(e) = prompt.push_message(response.inner.clone()) {
                 tracing::warn!(agent_id = %agent_id, error = %e, "consent answer not seated");
             }
         }
         if let Some(change) = change {
-            let entry = QueueEntry {
-                at: now,
-                agent_id,
-                agent: agent.clone(),
-                change: change.clone(),
-            };
-            // The audit line, then the change itself (2026-09-25: the
-            // runner applies what the agent chose; the Steward no longer
-            // has to).
-            queue::emit(&self.rt.queue_path, &entry).await;
-            let cause = SwitchCause::Consent {
-                action: change.action,
-            };
-            if let Err(e) = self.apply_change(&change.to, cause).await {
-                tracing::error!(
-                    event_type = "model_switch_failed",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    from = %change.from,
-                    to = %change.to,
-                    error = %e,
-                    "consented model change not applied; left for --consent-queue"
-                );
-            }
+            self.apply_consented(&change, now, true).await;
+        }
+        if matches!(due, Due::Review(_)) {
+            // The review replaced the act phase; the inner agent's memory
+            // turn (and the rest of its tail) follows, as after any act
+            // phase that went quiet.
+            self.reviewed = true;
+            return self.inner.on_quiesce(&response).await;
         }
         Ok(Control::Done(Outcome::Complete))
     }
@@ -617,7 +731,11 @@ where
             .offers
             .iter()
             .any(|r| r.history.iter().any(|e| e.at >= started));
-        if !offers_touched && self.notes.is_empty() && self.next_model.is_none() {
+        if !offers_touched
+            && self.notes.is_empty()
+            && self.next_model.is_none()
+            && self.seen_before_review.is_none()
+        {
             return None;
         }
         // `SeedState` isn't `Clone`; its serde form is exactly what the
@@ -654,6 +772,10 @@ where
         if let Some(info) = self.next_model.take() {
             state.prompt.model = info.id.clone();
             state.model = info;
+            changed = true;
+        }
+        if let Some(seen) = self.seen_before_review.take() {
+            state.seen_posts = seen;
             changed = true;
         }
         changed.then_some(state)
@@ -769,6 +891,9 @@ where
             known_posts: HashSet::new(),
             known_comments: HashSet::new(),
             writes: Vec::new(),
+            review: None,
+            reviewed: false,
+            seen_before_review: None,
         })
     }
 
@@ -829,6 +954,9 @@ where
                         "queued model change observed as applied"
                     );
                 }
+                // A review session is only the review and the memory turn:
+                // no act phase, so no `set_model` either.
+                self.review = ledger.review_due(&model);
                 let tool = SetModel::new(
                     self.rt.clone(),
                     self.inner.id(),
@@ -836,7 +964,8 @@ where
                     model,
                     ledger.switch_blocker(),
                     self.slot.clone(),
-                );
+                )
+                .filter(|_| self.review.is_none());
                 if let Some(tool) = tool {
                     self.inner.parts().0.push(tool);
                 }
@@ -850,11 +979,25 @@ where
                 "model-consent ledger unreadable; not asking or saving this session"
             ),
         }
+        if self.review.is_some() {
+            self.seen_before_review = Some(self.inner.state().seen_posts.clone());
+        }
         self.inner.on_init().await?;
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
             self.known_posts = ledger.created_posts.clone();
             self.known_comments = ledger.created_comments.clone();
+        }
+        if let Some(key) = self.review.clone() {
+            self.seat_review(key).await?;
+        } else if let Some(line) = self
+            .ledger
+            .as_ref()
+            .and_then(|l| l.trial_line(&self.model()))
+        {
+            // The countdown, at the end of the intro.
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(prompt, Content::from(line))?;
         }
         Ok(())
     }
@@ -929,7 +1072,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consent::ledger::{OfferKey, Stage, TRIAL_SESSIONS, Term};
+    use crate::consent::ledger::{
+        ChangeAction, OfferKey, RevertCause, Stage, TRIAL_SESSIONS, Term,
+    };
     use crate::consent::queue::QueueEntry;
     use crate::consent::{ConsentConfig, ConsentRuntime, OfferConfig};
     use agora_agentkit::reactor::seed::{SeedError, ShortString};
@@ -969,6 +1114,9 @@ mod tests {
         state: SeedState,
         tools: ToolBox,
         quirks: Quirks,
+        /// Its act phase went quiet (as after a review): the memory turn
+        /// is seated and the next response ends the session.
+        quiesced: bool,
     }
 
     #[async_trait::async_trait]
@@ -987,6 +1135,7 @@ mod tests {
                 state,
                 tools: ToolBox::flat(),
                 quirks,
+                quiesced: false,
             })
         }
         fn id(&self) -> AgentId {
@@ -1013,6 +1162,11 @@ mod tests {
         async fn handle(&mut self, response: response::Message) -> Result<Control, SeedError> {
             self.state.prompt.push_message(response.inner).unwrap();
             Ok(Control::Done(Outcome::Complete))
+        }
+        async fn on_quiesce(&mut self, _: &response::Message) -> Result<Control, SeedError> {
+            self.quiesced = true;
+            ConsentAgent::<Fake>::seat_user(&mut self.state.prompt, "Update your memory.".into())?;
+            Ok(Control::Continue)
         }
     }
 
@@ -1831,68 +1985,239 @@ mod tests {
         );
     }
 
-    /// A trial end to end: sessions still on the old model don't count;
-    /// once the Steward applies the swap, the fifth completed session on the
-    /// new model ends with the review, and "revert" queues the way back.
-    #[tokio::test]
-    async fn trial_review_after_five_sessions_on_the_new_model() {
-        let h = Harness::new("trial");
-        let key = OfferKey {
-            from: Model::from(OLD),
-            to: Model::from(NEW),
-        };
-        let mut agent = h.agent(OLD, true);
-        agent.on_init().await.unwrap();
-        agent.handle(reply("done")).await.unwrap();
-        agent
-            .handle(reply(r#"{"reason": "why not", "choice": "trial"}"#))
-            .await
-            .unwrap();
-        agent.on_teardown().await.unwrap();
-
-        // Not yet applied: still on the old model — not a trial session,
-        // and not asked again.
-        let mut agent = h.agent(OLD, true);
+    /// Run one plain session (no question) on `model`.
+    async fn plain_session(h: &Harness, model: &str) -> ConsentAgent<Fake> {
+        let mut agent = h.agent(model, true);
         agent.on_init().await.unwrap();
         assert_eq!(
             agent.handle(reply("done")).await.unwrap(),
             Control::Done(Outcome::Complete)
         );
         agent.on_teardown().await.unwrap();
+        agent
+    }
 
-        // Applied (set_model + sync-models): sessions on the new model.
+    /// Choose a trial on OLD and run the five trial sessions on NEW. The
+    /// fifth ends the trial: nothing is asked on NEW, and the runner moves
+    /// the agent back to OLD for the review. Returns the last session.
+    async fn through_the_trial(h: &Harness) -> ConsentAgent<Fake> {
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.handle(reply(TRIAL)).await.unwrap();
+        agent.on_teardown().await.unwrap();
         for n in 1..=TRIAL_SESSIONS {
             let mut agent = h.agent(NEW, true);
             agent.on_init().await.unwrap();
-            let control = agent.handle(reply("done")).await.unwrap();
-            if n < TRIAL_SESSIONS {
-                assert_eq!(control, Control::Done(Outcome::Complete), "session {n}");
-                agent.on_teardown().await.unwrap();
-                continue;
+            let intro = last_user_text(&agent);
+            assert!(
+                intro.ends_with(&format!(
+                    "Model trial: session {n} of 5 on Qwen 3.8. After session 5 you'll return \
+                     to Qwen 3.6 for one session to decide whether to keep Qwen 3.8."
+                )),
+                "{intro}"
+            );
+            assert_eq!(
+                agent.handle(reply("done")).await.unwrap(),
+                Control::Done(Outcome::Complete),
+                "session {n}: nothing is asked on the new model"
+            );
+            agent.on_teardown().await.unwrap();
+            if n == TRIAL_SESSIONS {
+                return agent;
             }
-            assert_eq!(control, Control::Continue, "review due after session {n}");
+        }
+        unreachable!()
+    }
+
+    /// Start the review session on OLD: the question comes first, straight
+    /// after the intro, with no `set_model`.
+    async fn review_session(h: &Harness) -> ConsentAgent<Fake> {
+        use misanthropic::tool::Tool;
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(agent.prompt().messages.len(), 1, "intro + review, one turn");
+        assert!(agent.parts().0.definitions().is_empty(), "no set_model");
+        assert!(agent.prompt().output_config.is_some(), "constrained");
+        agent
+    }
+
+    /// The whole trial on the current flow: five sessions on NEW with a
+    /// countdown, the return to OLD, the review asked there first (forks,
+    /// then excerpts, then `revert` before `keep`), then the memory turn,
+    /// and `keep` applied.
+    #[tokio::test]
+    async fn trial_returns_to_the_old_model_and_is_reviewed_there() {
+        let h = Harness::new("trial");
+        let key = OfferKey {
+            from: Model::from(OLD),
+            to: Model::from(NEW),
+        };
+        let fifth = through_the_trial(&h).await;
+        assert_eq!(
+            fifth.state().model.id,
+            Model::from(OLD),
+            "returns next session"
+        );
+        let updates = h.agora.profile_updates();
+        assert_eq!(updates.len(), 2, "trial, then the return");
+        assert!(signed_by(&updates[1].1, &h.key, OLD));
+        let notes = evolution_notes(&fifth);
+        assert!(
+            notes
+                .last()
+                .unwrap()
+                .contains("trial of 5 sessions complete"),
+            "{notes:?}"
+        );
+        let ledger = h.ledger().await;
+        let Stage::ReturningForReview { started_at, .. } = ledger.offers[0].stage else {
+            panic!("{:?}", ledger.offers[0].stage);
+        };
+        assert!(crate::consent::queue::pending(h.id, &ledger).is_empty());
+
+        // Forks prepared at sweep start.
+        let mut prepared = crate::consent::prompt::tests::sample_forks();
+        prepared.trial_started_at = started_at;
+        std::fs::write(
+            h.rt.state_dir
+                .join(h.id.to_string())
+                .join(forks::FORKS_FILE),
+            serde_json::to_vec(&prepared).unwrap(),
+        )
+        .unwrap();
+
+        let mut agent = review_session(&h).await;
+        let q = last_user_text(&agent);
+        assert!(q.starts_with("Your dashboard."), "after the intro: {q}");
+        assert!(q.contains("This session runs on **Qwen 3.6** again"), "{q}");
+        let pos = |needle: &str| q.find(needle).unwrap_or_else(|| panic!("{needle}: {q}"));
+        assert!(
+            pos("### 1. Written on Qwen 3.8 during the trial") < pos("## More of your writing")
+        );
+        assert!(pos("1. `revert`") < pos("2. `keep`"));
+        let control = agent
+            .handle(reply(r#"{"reason": "Sharper.", "choice": "keep"}"#))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Continue, "the memory turn follows");
+        assert!(agent.inner.quiesced, "handed to the inner tail");
+        assert_eq!(
+            agent.handle(reply("memory written")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "nothing more is asked"
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(NEW), "kept");
+        assert_eq!(h.agora.profile_updates().len(), 3);
+        let ledger = h.ledger().await;
+        assert_eq!(
+            ledger.offers[0].stage,
+            Stage::AwaitingSwap {
+                term: Term::Permanent
+            }
+        );
+        let queue = h.queue();
+        assert_eq!(queue.len(), 3, "swap, return, keep");
+        assert_eq!(queue[2].change.action, ChangeAction::Keep);
+
+        let mut agent = h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        assert!(!last_user_text(&agent).contains("Model trial"));
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(h.ledger().await.offers[0].stage, Stage::Moved);
+        let _ = key;
+    }
+
+    #[tokio::test]
+    async fn review_revert_stays_and_no_answer_stays_with_an_alert() {
+        for (tag, answer) in [
+            ("revert", Some(r#"{"reason": "Home.", "choice": "revert"}"#)),
+            ("silent", None),
+        ] {
+            let h = Harness::new(&format!("review-{tag}"));
+            through_the_trial(&h).await;
+            let mut agent = review_session(&h).await;
             let q = last_user_text(&agent);
             assert!(
-                q.contains("You have now completed 5 sessions on Qwen 3.8."),
-                "{q}"
+                q.contains("could not be prepared for this review"),
+                "no forks file: {q}"
             );
-            assert!(q.find("1. `revert`").unwrap() < q.find("2. `keep`").unwrap());
-            agent
-                .handle(reply(
-                    r#"{"reason": "I miss my old voice.", "choice": "revert"}"#,
-                ))
-                .await
-                .unwrap();
+            let control = match answer {
+                Some(a) => agent.handle(reply(a)).await.unwrap(),
+                None => {
+                    let mut control = Control::Continue;
+                    for _ in 0..MAX_ATTEMPTS {
+                        assert!(!agent.inner.quiesced);
+                        control = agent.handle(reply("I'm not sure.")).await.unwrap();
+                    }
+                    control
+                }
+            };
+            assert_eq!(control, Control::Continue, "{tag}: memory turn follows");
+            assert!(agent.inner.quiesced);
+            agent.handle(reply("memory")).await.unwrap();
             agent.on_teardown().await.unwrap();
+            assert_eq!(agent.state().model.id, Model::from(OLD), "{tag}");
+            assert_eq!(h.agora.profile_updates().len(), 2, "{tag}: nothing more");
+            let cause = match answer {
+                Some(_) => RevertCause::Chosen,
+                None => RevertCause::NoAnswer,
+            };
+            assert_eq!(
+                h.ledger().await.offers[0].stage,
+                Stage::Reverted { cause: Some(cause) }
+            );
+            let note = evolution_notes(&agent).last().unwrap().clone();
+            match answer {
+                Some(_) => assert!(
+                    note.contains("after the trial chose to stay on Qwen 3.6"),
+                    "{note}"
+                ),
+                None => assert!(note.contains("trial review unanswered"), "{note}"),
+            }
+            // Asked once: the next session on OLD is an ordinary one.
+            plain_session(&h, OLD).await;
         }
-        let ledger = h.ledger().await;
-        assert!(ledger.trial(&key).is_none());
-        assert!(matches!(
-            ledger.offers[0].stage,
-            Stage::AwaitingRevert { .. }
-        ));
-        let queue = h.queue();
-        assert_eq!(queue.len(), 2, "swap, then revert");
-        assert_eq!(queue[1].change.to, Model::from(OLD));
+    }
+
+    /// The return can't be applied (Agora refuses): the agent stays on NEW,
+    /// is told so, and the return is retried at the end of the next session.
+    #[tokio::test]
+    async fn a_refused_return_is_retried() {
+        let h = Harness::new("return-refused");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.handle(reply(TRIAL)).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        for _ in 1..TRIAL_SESSIONS {
+            plain_session(&h, NEW).await;
+        }
+        h.agora
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let fifth = plain_session(&h, NEW).await;
+        assert_eq!(fifth.state().model.id, Model::from(NEW), "not applied");
+        assert_eq!(
+            crate::consent::queue::pending(h.id, &h.ledger().await).len(),
+            1
+        );
+
+        h.agora
+            .refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut sixth = h.agent(NEW, true);
+        sixth.on_init().await.unwrap();
+        assert!(last_user_text(&sixth).contains("has not taken effect yet"));
+        assert_eq!(
+            sixth.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        sixth.on_teardown().await.unwrap();
+        assert_eq!(sixth.state().model.id, Model::from(OLD), "retried");
+        assert!(crate::consent::queue::pending(h.id, &h.ledger().await).is_empty());
+        review_session(&h).await;
     }
 }

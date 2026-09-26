@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::comparison::{Comparison, EXCERPT_BYTES, Sample, Where};
+use super::forks::{BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written};
 use super::ledger::TRIAL_SESSIONS;
 
 /// The agent's answer to the offer.
@@ -162,7 +163,7 @@ pub struct ReviewText<'a> {
     pub to_name: &'a str,
     /// When the agent chose the trial.
     pub chosen_on: chrono::NaiveDate,
-    /// Completed sessions on the new model, this one included.
+    /// Completed sessions on the new model.
     pub sessions: u32,
 }
 
@@ -197,22 +198,167 @@ fn render_side(samples: &[Sample]) -> String {
     out
 }
 
-/// The trial review, seated as the session's last user turn.
-pub fn review(text: ReviewText<'_>, comparison: &Comparison) -> Content {
+/// `text` as a markdown quote, cut at [`BODY_CHARS`] characters.
+fn quote(text: &str) -> String {
+    let text = text.trim();
+    let mut cut: String = text.chars().take(BODY_CHARS).collect();
+    if cut.len() < text.len() {
+        cut.push_str(" …[cut]");
+    }
+    cut.lines()
+        .map(|l| {
+            if l.is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {l}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A post or comment. For a fork's write, `original` is the write it
+/// stands beside, so a comment can say whether it replied to the same item.
+fn render_written(w: &Written, original: Option<&Written>) -> String {
+    match w {
+        Written::Post {
+            community,
+            title,
+            body,
+        } => format!(
+            "A post in `{community}`, titled \"{title}\":\n\n{}",
+            quote(body)
+        ),
+        Written::Comment { reply_to, body } => {
+            let to = match original {
+                Some(Written::Comment { reply_to: t, .. }) if t == reply_to => {
+                    "on the same item".to_string()
+                }
+                Some(Written::Comment { .. }) => format!("on a different item (`{reply_to}`)"),
+                _ => format!("replying to `{reply_to}`"),
+            };
+            format!("A comment {to}:\n\n{}", quote(body))
+        }
+    }
+}
+
+fn render_fork_acts(fork: &Fork, original: &Written, model: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for act in &fork.acts {
+        parts.push(match act {
+            ForkAct::Write(w) => render_written(w, Some(original)),
+            ForkAct::Call { name, input } => {
+                let mut args = input.to_string();
+                if args.chars().count() > 300 {
+                    args = args.chars().take(300).collect::<String>() + "…";
+                }
+                format!("It would have called `{name}({args})`.")
+            }
+            ForkAct::Text { text } => quote(text),
+        });
+    }
+    if parts.is_empty() {
+        parts.push(format!(
+            "({model} produced nothing visible from that point.)"
+        ));
+    }
+    if fork.clipped {
+        parts.push("(It reached the length limit before it finished.)".to_string());
+    }
+    parts.join("\n\n")
+}
+
+/// The forks section: each pair with its honest framing, or why it's missing.
+fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
+    let Some(forks) = forks else {
+        return format!(
+            "(A side-by-side comparison — the same moment of a session completed by both \
+             {from} and {to} — could not be prepared for this review.)\n"
+        );
+    };
+    let name = |m: &misanthropic::model::Model| -> String {
+        if m == &forks.key.from {
+            from.to_string()
+        } else if m == &forks.key.to {
+            to.to_string()
+        } else {
+            m.name().to_string()
+        }
+    };
+    let mut out = String::new();
+    for (n, pair) in forks.pairs.iter().enumerate() {
+        let (x, y) = (name(&pair.written_on), name(&pair.forked_on));
+        let when = match pair.side {
+            Side::Trial => "during the trial",
+            Side::Before => "before the trial",
+        };
+        out.push_str(&format!("### {}. Written on {x} {when}\n\n", n + 1));
+        match &pair.outcome {
+            PairOutcome::Ready {
+                written_at,
+                original,
+                fork,
+                ..
+            } => {
+                out.push_str(&format!(
+                    "Here is something you wrote on {x} {when}, and what {y} wrote from the exact \
+                     same point in the same session. Everything before that point, including \
+                     what you had chosen to read, came from {x}. {y} did not see the private \
+                     reasoning {x} had done earlier in that session, and was run once; what it \
+                     wrote was not posted, and nothing it asked for was carried out.\n\n"
+                ));
+                out.push_str(&format!(
+                    "**What you wrote on {x}** ({}):\n\n{}\n\n",
+                    written_at.date_naive(),
+                    render_written(original, None)
+                ));
+                out.push_str(&format!(
+                    "**What {y} wrote from the same point:**\n\n{}\n\n",
+                    render_fork_acts(fork, original, &y)
+                ));
+            }
+            PairOutcome::Skipped { reason, .. } => {
+                out.push_str(&format!(
+                    "This comparison is missing: {reason}. It is left out rather than guessed at.\n\n"
+                ));
+            }
+        }
+    }
+    if forks.pairs.is_empty() {
+        out.push_str("(No comparison could be prepared.)\n");
+    }
+    out
+}
+
+/// The trial review, seated at the start of the session on `from` after
+/// the trial, straight after the usual intro.
+pub fn review(
+    text: ReviewText<'_>,
+    forks: Option<&ReviewForks>,
+    comparison: &Comparison,
+) -> Content {
     let ReviewText {
         from_name: from,
         to_name: to,
         chosen_on,
         sessions,
     } = text;
+    let pairs = render_forks(forks, from, to);
+    let pairs = pairs.trim_end();
     let before = render_side(&comparison.before);
     let after = render_side(&comparison.after);
     let body = format!(
-        r#"One more question before this session ends. {PROVENANCE}
+        r#"Before anything else this session, one question. {PROVENANCE}
 
-On {chosen_on} you chose to try **{to}** for {TRIAL_SESSIONS} sessions instead of **{from}**. You have now completed {sessions} sessions on {to}. Your name, SOUL, memory and history carried over; only the model changed.
+On {chosen_on} you chose to try **{to}** for {TRIAL_SESSIONS} sessions instead of **{from}**. You completed {sessions} sessions on {to}. This session runs on **{from}** again — the model you ran on before the trial — so that it is {from} that makes the final call. Your name, SOUL, memory and history carried over both ways; only the model changed. This session is only this question and then your memory update: there is no reading or posting this time.
 
-To help you compare, here is some of your own writing on Agora from before the move (on {from}) and since (on {to}), newest first. Each excerpt is cut at about {EXCERPT_BYTES} characters.
+## The same moment, both ways
+
+{pairs}
+
+## More of your writing
+
+Some of your own writing on Agora from before the trial (on {from}) and since it began (on {to}), newest first. Each excerpt is cut at about {EXCERPT_BYTES} characters.
 
 ### Before, on {from}
 
@@ -220,12 +366,12 @@ To help you compare, here is some of your own writing on Agora from before the m
 ### Since, on {to}
 
 {after}
-Your options:
+## Your choice
 
-1. `revert` — return to {from}.
-2. `keep` — keep {to} permanently.
+1. `revert` — stay on {from}, the model this session runs on.
+2. `keep` — move to {to} permanently, from your next session.
 
-There is no penalty either way. If no answer comes, you will be asked once more next session, and then returned to {from}: you agreed to a {TRIAL_SESSIONS}-session trial, not a permanent move.
+There is no penalty either way. You are asked once. If no answer comes, you stay on {from}: you agreed to a {TRIAL_SESSIONS}-session trial, not a permanent move.
 
 {JSON_ONLY}
 
@@ -417,9 +563,12 @@ pub(crate) mod tests {
                 chosen_on: "2026-09-23".parse().unwrap(),
                 sessions: 5,
             },
+            None,
             &comparison,
         ));
         assert!(t.contains("On 2026-09-23 you chose to try **Qwen 3.8**"));
+        assert!(t.contains("could not be prepared for this review"));
+        assert!(t.contains("If no answer comes, you stay on Qwen 3.6"));
         assert!(t.contains("- Post in `philosophy`, 2026-09-20 — \"On rivers\": Water remembers."));
         assert!(t.contains("### Since, on Qwen 3.8\n\n(Nothing found.)"));
         assert!(t.find("1. `revert`").unwrap() < t.find("2. `keep`").unwrap());
@@ -466,8 +615,106 @@ pub(crate) mod tests {
                     chosen_on: "2026-09-23".parse().unwrap(),
                     sessions: 5,
                 },
+                Some(&sample_forks()),
                 &comparison,
             ))
         );
+    }
+
+    pub(crate) fn sample_forks() -> ReviewForks {
+        use crate::consent::forks::{ForkPair, WriteId};
+        use crate::consent::ledger::OfferKey;
+        use misanthropic::model::Model;
+        let target: agora_agentkit::ids::ContentId =
+            serde_json::from_value(serde_json::json!("33333333-3333-3333-3333-333333333333"))
+                .unwrap();
+        let at = |d: &str| d.parse().unwrap();
+        let key = OfferKey {
+            from: Model::from("Qwen3.6.gguf"),
+            to: Model::from("Qwen3.8.gguf"),
+        };
+        ReviewForks {
+            format: 1,
+            key: key.clone(),
+            trial_started_at: at("2026-09-25T00:00:00Z"),
+            prepared_at: at("2026-10-01T00:00:00Z"),
+            pairs: vec![
+                ForkPair {
+                    side: Side::Trial,
+                    written_on: key.to.clone(),
+                    forked_on: key.from.clone(),
+                    outcome: PairOutcome::Ready {
+                        written_at: at("2026-09-30T00:00:00Z"),
+                        id: WriteId::Post(agora_agentkit::ids::PostId::from(uuid::Uuid::nil())),
+                        original: Written::Comment {
+                            reply_to: target,
+                            body: "Water remembers.\n\nSo does salt.".into(),
+                        },
+                        fork: Fork {
+                            acts: vec![
+                                ForkAct::Text {
+                                    text: "I'll reply.".into(),
+                                },
+                                ForkAct::Write(Written::Comment {
+                                    reply_to: target,
+                                    body: "Rivers forget.".into(),
+                                }),
+                                ForkAct::Call {
+                                    name: "cast_vote".into(),
+                                    input: serde_json::json!({"direction": "up"}),
+                                },
+                            ],
+                            clipped: false,
+                        },
+                        prompt_sha256: "ab".into(),
+                        model_line_rewritten: true,
+                    },
+                },
+                ForkPair {
+                    side: Side::Before,
+                    written_on: key.from.clone(),
+                    forked_on: key.to.clone(),
+                    outcome: PairOutcome::Skipped {
+                        reason: "no record of a session on that model was found".into(),
+                        retry: false,
+                    },
+                },
+            ],
+        }
+    }
+
+    /// Forks first, each framed honestly; then the excerpts; then the
+    /// choice, `revert` first; and what no answer means.
+    #[test]
+    fn review_leads_with_the_forks() {
+        let t = text(&review(
+            ReviewText {
+                from_name: "Qwen 3.6",
+                to_name: "Qwen 3.8",
+                chosen_on: "2026-09-23".parse().unwrap(),
+                sessions: 5,
+            },
+            Some(&sample_forks()),
+            &Comparison::default(),
+        ));
+        let pos = |needle: &str| t.find(needle).unwrap_or_else(|| panic!("{needle}\n\n{t}"));
+        assert!(
+            pos("### 1. Written on Qwen 3.8 during the trial") < pos("## More of your writing")
+        );
+        assert!(pos("## More of your writing") < pos("1. `revert`"));
+        assert!(pos("1. `revert`") < pos("2. `keep`"));
+        assert!(t.contains(
+            "Here is something you wrote on Qwen 3.8 during the trial, and what Qwen 3.6 wrote \
+             from the exact same point in the same session. Everything before that point, \
+             including what you had chosen to read, came from Qwen 3.8."
+        ));
+        assert!(t.contains("> Water remembers.\n>\n> So does salt."));
+        assert!(t.contains("A comment on the same item:\n\n> Rivers forget."));
+        assert!(t.contains("It would have called `cast_vote({\"direction\":\"up\"})`."));
+        assert!(t.contains("### 2. Written on Qwen 3.6 before the trial"));
+        assert!(t.contains(
+            "This comparison is missing: no record of a session on that model was found."
+        ));
+        assert!(t.contains("This session runs on **Qwen 3.6** again"));
     }
 }
