@@ -11,19 +11,25 @@
 //! Each write is found in its session's prompt dump — the runner's
 //! `prompt logged` events name the dump and the model it ran on, so the
 //! model is ground truth rather than a guess from dates. The dump is cut
-//! just before the assistant turn that made the write, the dashboard's
-//! `Model:` line is rewritten to the forking model, earlier thinking is
-//! removed (the other model's private reasoning isn't its own), and the
-//! forking model generates once. **No tool is executed**: what it would
-//! have done is rendered as text. The system prompt and tools are left
-//! byte-identical.
+//! just before the assistant turn that made the write, and everything that
+//! named the original model as the session's is changed ([`Adjustment`]:
+//! the dashboard's `Model:` line, the trial countdown, `set_model`'s
+//! description), recorded in the file and said in the review. Earlier
+//! thinking is removed (the other model's private reasoning isn't its own)
+//! and the forking model generates once. **No tool is executed**: what it
+//! would have done is rendered as text. The system prompt and the other
+//! tools are left byte-identical.
 //!
 //! [`prepare`] runs at sweep start (and as `--prepare-review-forks`) for
 //! every agent whose review is coming, grouped by model to keep model
 //! loads on a local endpoint down, and writes
-//! `state/<agent_id>/review_forks.json`. The review session reads it back
-//! ([`load`]). A pair that can't be built is kept as `skipped`, with the
-//! reason, and the review says so.
+//! `state/<agent_id>/review_forks.json`. It is bounded ([`ForksConfig`]:
+//! a per-generation timeout and a budget for the step; what isn't reached
+//! rolls over to the next start), never redoes a pair already prepared,
+//! retries a transient failure at most [`MAX_FORK_ATTEMPTS`] times, and
+//! leaves alone any side whose forking model this runner doesn't offer.
+//! The review session reads the file back ([`load`]). A pair that can't be
+//! built is kept as `skipped`, with the reason, and the review says so.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -38,9 +44,11 @@ use misanthropic::prompt::Prompt;
 use misanthropic::prompt::message::{Block, Role};
 use misanthropic::prompt::output::OutputConfig;
 use misanthropic::response::{self, StopReason};
+use misanthropic::tool::MethodDef;
 use serde::{Deserialize, Serialize};
 
-use super::ledger::{Ledger, OfferKey, Stage};
+use super::ledger::{Ledger, OfferKey, Stage, TRIAL_LINE_PREFIX};
+use super::switch;
 
 /// The file's name inside the agent's state directory.
 pub const FORKS_FILE: &str = "review_forks.json";
@@ -134,16 +142,22 @@ pub enum PairOutcome {
         fork: Fork,
         /// The dump the fork was cut from.
         prompt_sha256: String,
-        /// Whether the dump carried a `Model:` line to rewrite (dumps from
-        /// before agentkit 0.45 do not name the model at all).
-        model_line_rewritten: bool,
+        /// What was changed so the prompt named the forking model, not the
+        /// original (empty for dumps from before agentkit 0.45, which don't
+        /// name the model at all).
+        #[serde(default)]
+        adjusted: Vec<Adjustment>,
     },
     Skipped {
         reason: String,
-        /// Worth trying again at the next sweep (a generation error), as
-        /// opposed to a permanent gap (no dump, no write).
+        /// Worth trying again at the next start (a transient generation
+        /// error with attempts left), as opposed to a permanent gap (no
+        /// dump, no write, a request the model refused outright).
         #[serde(default)]
         retry: bool,
+        /// Failed generations so far (see [`MAX_FORK_ATTEMPTS`]).
+        #[serde(default)]
+        attempts: u32,
     },
 }
 
@@ -160,16 +174,6 @@ pub struct ReviewForks {
 }
 
 impl ReviewForks {
-    /// Whether this file is for the trial `key` that started at
-    /// `started_at`, with nothing worth another try.
-    fn settled_for(&self, key: &OfferKey, started_at: DateTime<Utc>) -> bool {
-        self.matches(key, started_at)
-            && !self
-                .pairs
-                .iter()
-                .any(|p| matches!(p.outcome, PairOutcome::Skipped { retry: true, .. }))
-    }
-
     fn matches(&self, key: &OfferKey, started_at: DateTime<Utc>) -> bool {
         self.format == FORMAT && &self.key == key && self.trial_started_at == started_at
     }
@@ -321,18 +325,37 @@ impl std::fmt::Display for SurgeryError {
 
 impl std::error::Error for SurgeryError {}
 
+/// A place where the original session's prompt named the model it ran on,
+/// changed for the fork so the forking model isn't told it is the other
+/// one. Recorded per pair, and said in the review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Adjustment {
+    /// The dashboard's `Model:` line now names the forking model.
+    ModelLine,
+    /// The trial countdown ("Model trial: session n of 5 on …") was
+    /// removed: it named the trial model as the session's.
+    TrialCountdown,
+    /// `set_model`'s description now names the forking model as current,
+    /// and its note on why no change was possible (which described the
+    /// original model's situation) was dropped.
+    SetModelDescription,
+}
+
 /// Cut `prompt` just before the assistant turn at `turn` and hand it to
-/// `fork`: the dashboard's `Model:` line names `fork` (when there is one;
-/// returned as `true`), earlier thinking is removed, `prompt.model` is
-/// `fork`, `max_tokens` is the act budget, and `output_config` keeps only
-/// the session's effort (a dump ends in a phase turn, whose format must
-/// not carry over). System prompt and tools are untouched.
+/// `fork`. Everything in it that named the original model as the one the
+/// session runs on is changed ([`Adjustment`]s, returned): the `Model:`
+/// line, the trial countdown, `set_model`'s description. Earlier thinking
+/// is removed, `prompt.model` is `fork`, `max_tokens` is the act budget, and
+/// `output_config` keeps only the session's effort (a dump ends in a phase
+/// turn, whose format must not carry over). The system prompt and every
+/// other tool definition are untouched.
 pub fn fork_prompt(
     mut prompt: Prompt,
     turn: usize,
     fork: &ModelInfo,
     act_max_tokens: u32,
-) -> Result<(Prompt, bool), SurgeryError> {
+) -> Result<(Prompt, Vec<Adjustment>), SurgeryError> {
     if turn == 0
         || prompt.messages.get(turn).map(|m| m.role) != Some(Role::Assistant)
         || prompt.messages[turn - 1].role != Role::User
@@ -341,7 +364,7 @@ pub fn fork_prompt(
     }
     prompt.messages.truncate(turn);
 
-    let mut rewritten = false;
+    let mut adjusted = Vec::new();
     let name = ModelName::of(fork);
     if let Some(first) = prompt.messages.first_mut() {
         for block in first.content.iter_mut() {
@@ -349,9 +372,40 @@ pub fn fork_prompt(
                 && let Some(new) = replace_model_line(text, name)
             {
                 *text = new.into();
-                rewritten = true;
+                adjusted.push(Adjustment::ModelLine);
                 break;
             }
+        }
+        let mut countdown = false;
+        for block in first.content.iter_mut() {
+            if let Block::Text { text, .. } = block
+                && text
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(TRIAL_LINE_PREFIX))
+            {
+                let kept: Vec<&str> = text
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with(TRIAL_LINE_PREFIX))
+                    .collect();
+                *text = kept.join("\n").trim_end().to_string().into();
+                countdown = true;
+            }
+        }
+        if countdown {
+            first
+                .content
+                .retain(|b| !matches!(b, Block::Text { text, .. } if text.trim().is_empty()));
+            adjusted.push(Adjustment::TrialCountdown);
+        }
+    }
+
+    for def in prompt.tools.iter_mut().flatten() {
+        if let MethodDef::Custom(custom) = def
+            && custom.name == switch::TOOL_NAME
+            && let Some(new) = switch::retarget(&custom.description, fork.id.name(), name.display)
+        {
+            custom.description = new.into();
+            adjusted.push(Adjustment::SetModelDescription);
         }
     }
 
@@ -374,7 +428,7 @@ pub fn fork_prompt(
         .take()
         .and_then(|c| c.effort)
         .map(OutputConfig::effort);
-    Ok((prompt, rewritten))
+    Ok((prompt, adjusted))
 }
 
 /// What the fork did, for the review. Thinking is left out.
@@ -483,38 +537,114 @@ pub fn scan_logs(
     Ok(out)
 }
 
-/// The sessions that can hold `side`'s write, newest first: on `to` since
-/// the trial started, or on `from` before it.
+/// How long after the trial's end a trial session's dump may be logged:
+/// `ended_at` is stamped at the close of the last trial session, and its
+/// dump is written at teardown, moments later.
+const TEARDOWN_SLACK_MINUTES: i64 = 30;
+
+/// The sessions that can hold `side`'s write, newest first: on `to` during
+/// the trial (`started_at` to `ended_at`, plus the teardown that logs the
+/// last one), or on `from` before it.
 pub fn candidates<'a>(
     sessions: &'a [Session],
     key: &OfferKey,
     started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
     side: Side,
 ) -> impl Iterator<Item = &'a Session> {
     let (model, trial) = match side {
         Side::Trial => (key.to.clone(), true),
         Side::Before => (key.from.clone(), false),
     };
-    sessions
-        .iter()
-        .filter(move |s| s.model == model && (s.at >= started_at) == trial)
+    let until = ended_at + chrono::Duration::minutes(TEARDOWN_SLACK_MINUTES);
+    sessions.iter().filter(move |s| {
+        s.model == model
+            && if trial {
+                s.at >= started_at && s.at < until
+            } else {
+                s.at < started_at
+            }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // The batch step
 
-/// One agent whose review is coming.
+/// Generation attempts per pair before a transient failure is final.
+pub const MAX_FORK_ATTEMPTS: u32 = 3;
+
+/// `[review_forks]` in the run config: bounds on the sweep-start step, so
+/// it can never hold the sweep up for long. Pairs it doesn't reach roll
+/// over to the next start.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ForksConfig {
+    /// Prepare forks at sweep start. `--no-review-forks` overrides.
+    pub enabled: bool,
+    /// Longest one generation may take before it counts as a (retryable)
+    /// failure.
+    pub generation_timeout_secs: u64,
+    /// Longest the whole step may take: no generation starts after it.
+    pub budget_secs: u64,
+}
+
+impl Default for ForksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // One act turn on the slowest local model (Qwen 3.8 dense at
+            // 8192 tokens, with a cold ~40k prompt) is well inside this.
+            generation_timeout_secs: 900,
+            budget_secs: 1800,
+        }
+    }
+}
+
+impl ForksConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.generation_timeout_secs > 0 && self.budget_secs > 0,
+            "[review_forks]: timeouts must be nonzero (set enabled = false to turn the step off)"
+        );
+        Ok(())
+    }
+}
+
+/// One agent whose review is coming, and the sides still to do.
 #[derive(Debug, Clone)]
 pub struct Job {
     pub agent_id: AgentId,
     pub agent: String,
     pub key: OfferKey,
     pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    /// The file already prepared for this trial, kept as it is except for
+    /// the sides redone.
+    pub existing: Option<ReviewForks>,
+    pub sides: Vec<Side>,
+}
+
+impl Job {
+    /// The model that forks `side`.
+    fn forked_on(&self, side: Side) -> &Model {
+        match side {
+            Side::Trial => &self.key.from,
+            Side::Before => &self.key.to,
+        }
+    }
+}
+
+/// Whether `side` still needs doing, given the file prepared so far: it
+/// is missing, or failed in a way worth another try.
+fn needs(existing: Option<&ReviewForks>, side: Side) -> bool {
+    match existing.and_then(|f| f.pairs.iter().find(|p| p.side == side)) {
+        None => true,
+        Some(p) => matches!(p.outcome, PairOutcome::Skipped { retry: true, .. }),
+    }
 }
 
 /// Agents under `state_dir` in [`Stage::ReturningForReview`] or
-/// [`Stage::ReviewDue`] whose forks aren't prepared (or are worth another
-/// try).
+/// [`Stage::ReviewDue`] with a side still to prepare.
 pub async fn jobs(state_dir: &Path) -> std::io::Result<Vec<Job>> {
     let mut out = Vec::new();
     let mut dirs = tokio::fs::read_dir(state_dir).await?;
@@ -532,16 +662,29 @@ pub async fn jobs(state_dir: &Path) -> std::io::Result<Vec<Job>> {
             continue;
         };
         for record in &ledger.offers {
-            let started_at = match record.stage {
-                Stage::ReturningForReview { started_at, .. }
-                | Stage::ReviewDue { started_at, .. } => started_at,
+            let (started_at, ended_at) = match record.stage {
+                Stage::ReturningForReview {
+                    started_at,
+                    ended_at,
+                    ..
+                }
+                | Stage::ReviewDue {
+                    started_at,
+                    ended_at,
+                    ..
+                } => (started_at, ended_at),
                 _ => continue,
             };
             let existing = tokio::fs::read(forks_path(&dir))
                 .await
                 .ok()
-                .and_then(|b| serde_json::from_slice::<ReviewForks>(&b).ok());
-            if existing.is_some_and(|f| f.settled_for(&record.key, started_at)) {
+                .and_then(|b| serde_json::from_slice::<ReviewForks>(&b).ok())
+                .filter(|f| f.matches(&record.key, started_at));
+            let sides: Vec<Side> = [Side::Trial, Side::Before]
+                .into_iter()
+                .filter(|&side| needs(existing.as_ref(), side))
+                .collect();
+            if sides.is_empty() {
                 continue;
             }
             out.push(Job {
@@ -553,6 +696,9 @@ pub async fn jobs(state_dir: &Path) -> std::io::Result<Vec<Job>> {
                     .unwrap_or_else(|| agent_id.to_string()),
                 key: record.key.clone(),
                 started_at,
+                ended_at,
+                existing,
+                sides,
             });
         }
     }
@@ -570,7 +716,9 @@ struct Pending {
     turn: WriteTurn,
     prompt: Prompt,
     prompt_sha256: String,
-    model_line_rewritten: bool,
+    adjusted: Vec<Adjustment>,
+    /// Failed attempts so far.
+    attempts: u32,
 }
 
 /// Where each model runs: one inference client per endpoint and the models
@@ -590,39 +738,45 @@ impl<I> Endpoints<'_, I> {
     }
 }
 
-/// Build one side's pair up to the generation, or say why it can't be.
+fn skipped(side: Side, written_on: &Model, forked_on: &Model, reason: String) -> ForkPair {
+    ForkPair {
+        side,
+        written_on: written_on.clone(),
+        forked_on: forked_on.clone(),
+        outcome: PairOutcome::Skipped {
+            reason,
+            retry: false,
+            attempts: 0,
+        },
+    }
+}
+
+/// Build one side's pair up to the generation, or say why it can't be
+/// (a permanent gap: no dump, no write, a dump that can't be cut).
 async fn build(
     job_index: usize,
     job: &Job,
     side: Side,
     sessions: &[Session],
-    offered: &[(usize, ModelInfo)],
+    fork_info: &ModelInfo,
     act_max_tokens: u32,
 ) -> Result<Pending, Box<ForkPair>> {
-    let (written_on, forked_on) = match side {
-        Side::Trial => (job.key.to.clone(), job.key.from.clone()),
-        Side::Before => (job.key.from.clone(), job.key.to.clone()),
+    let forked_on = job.forked_on(side).clone();
+    let written_on = match side {
+        Side::Trial => job.key.to.clone(),
+        Side::Before => job.key.from.clone(),
     };
-    let skipped = |reason: String, retry: bool| {
-        Box::new(ForkPair {
-            side,
-            written_on: written_on.clone(),
-            forked_on: forked_on.clone(),
-            outcome: PairOutcome::Skipped { reason, retry },
-        })
-    };
-    let Some(fork_info) = offered
-        .iter()
-        .find(|(_, m)| m.id == forked_on)
-        .map(|(_, m)| m)
-    else {
-        return Err(skipped(
-            format!("{forked_on} is not offered by any endpoint this run"),
-            true,
-        ));
-    };
+    let attempts = job
+        .existing
+        .as_ref()
+        .and_then(|f| f.pairs.iter().find(|p| p.side == side))
+        .map_or(0, |p| match p.outcome {
+            PairOutcome::Skipped { attempts, .. } => attempts,
+            PairOutcome::Ready { .. } => 0,
+        });
     let mut examined = 0;
-    for session in candidates(sessions, &job.key, job.started_at, side).take(MAX_SESSIONS_PER_SIDE)
+    for session in candidates(sessions, &job.key, job.started_at, job.ended_at, side)
+        .take(MAX_SESSIONS_PER_SIDE)
     {
         examined += 1;
         let bytes = match tokio::fs::read(&session.path).await {
@@ -643,7 +797,7 @@ async fn build(
             continue;
         };
         return match fork_prompt(prompt, turn.message, fork_info, act_max_tokens) {
-            Ok((prompt, model_line_rewritten)) => Ok(Pending {
+            Ok((prompt, adjusted)) => Ok(Pending {
                 job: job_index,
                 side,
                 written_on,
@@ -652,15 +806,21 @@ async fn build(
                 turn,
                 prompt,
                 prompt_sha256: session.prompt_sha256.clone(),
-                model_line_rewritten,
+                adjusted,
+                attempts,
             }),
-            Err(e) => Err(skipped(
+            Err(e) => Err(Box::new(skipped(
+                side,
+                &written_on,
+                &forked_on,
                 format!("the session could not be forked: {e}"),
-                false,
-            )),
+            ))),
         };
     }
-    Err(skipped(
+    Err(Box::new(skipped(
+        side,
+        &written_on,
+        &forked_on,
         if examined == 0 {
             "no record of a session on that model was found".to_string()
         } else {
@@ -668,20 +828,53 @@ async fn build(
                 "no post or comment was found in the last {examined} recorded sessions on that model"
             )
         },
-        false,
-    ))
+    )))
+}
+
+/// A failed generation: final if the error says retrying won't help (a
+/// 4xx such as a context overflow) or attempts are spent.
+fn failed(p: &Pending, reason: String, transient: bool) -> PairOutcome {
+    let attempts = p.attempts + 1;
+    let retry = transient && attempts < MAX_FORK_ATTEMPTS;
+    PairOutcome::Skipped {
+        reason,
+        retry,
+        attempts,
+    }
 }
 
 /// The batch step. See the [module docs](self). Returns the number of
-/// agents whose forks were written.
+/// agents whose forks file was written.
+///
+/// Bounded: each generation by `config.generation_timeout_secs`, the whole
+/// step by `config.budget_secs`; whatever isn't reached is left for the
+/// next start. Only sides whose forking model this runner's endpoints
+/// offer are touched — another runner's file is left as it is — and a
+/// side already prepared is never redone.
 pub async fn prepare<I: Inference>(
     state_dir: &Path,
     log_dir: &Path,
     prompt_dir: Option<&Path>,
     endpoints: Endpoints<'_, I>,
     act_max_tokens: u32,
+    config: ForksConfig,
 ) -> std::io::Result<usize> {
-    let jobs = jobs(state_dir).await?;
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(config.budget_secs);
+    let timeout = std::time::Duration::from_secs(config.generation_timeout_secs);
+    let mut jobs = jobs(state_dir).await?;
+    // Only what this runner can generate.
+    for job in &mut jobs {
+        let key = job.key.clone();
+        job.sides.retain(|&side| {
+            let model = match side {
+                Side::Trial => &key.from,
+                Side::Before => &key.to,
+            };
+            endpoints.find(model).is_some()
+        });
+    }
+    jobs.retain(|j| !j.sides.is_empty());
     if jobs.is_empty() {
         return Ok(0);
     }
@@ -693,67 +886,87 @@ pub async fn prepare<I: Inference>(
         "preparing trial-review forks"
     );
 
-    let mut pairs: Vec<Vec<ForkPair>> = vec![Vec::new(); jobs.len()];
+    // Per job, the sides decided this run.
+    let mut done: Vec<Vec<ForkPair>> = vec![Vec::new(); jobs.len()];
     // Grouped by the forking model, so a local endpoint loads each once.
     let mut pending: BTreeMap<String, Vec<Pending>> = BTreeMap::new();
     for (i, job) in jobs.iter().enumerate() {
         let empty = Vec::new();
         let agent_sessions = sessions.get(&job.agent_id).unwrap_or(&empty);
-        for side in [Side::Trial, Side::Before] {
-            match build(
-                i,
-                job,
-                side,
-                agent_sessions,
-                endpoints.offered,
-                act_max_tokens,
-            )
-            .await
-            {
+        for &side in &job.sides {
+            let Some((_, fork_info)) = endpoints.find(job.forked_on(side)) else {
+                continue;
+            };
+            match build(i, job, side, agent_sessions, fork_info, act_max_tokens).await {
                 Ok(p) => pending
                     .entry(p.forked_on.name().to_string())
                     .or_default()
                     .push(p),
-                Err(pair) => pairs[i].push(*pair),
+                Err(pair) => done[i].push(*pair),
             }
         }
     }
 
+    let mut left = 0usize;
     for (model, group) in pending {
         tracing::info!(model = %model, pairs = group.len(), "generating review forks");
         for p in group {
+            if started.elapsed() >= budget {
+                left += 1;
+                continue;
+            }
             let job = &jobs[p.job];
-            let outcome = match endpoints.find(&p.forked_on) {
-                None => PairOutcome::Skipped {
-                    reason: format!("{} is not offered by any endpoint this run", p.forked_on),
-                    retry: true,
-                },
-                Some((client, _)) => match client.infer(&p.prompt).await {
-                    Ok(response) => PairOutcome::Ready {
-                        written_at: p.written_at,
-                        id: p.turn.id,
-                        original: p.turn.written,
-                        fork: render_fork(&response),
-                        prompt_sha256: p.prompt_sha256,
-                        model_line_rewritten: p.model_line_rewritten,
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            event_type = "review_fork_failed",
-                            agent = %job.agent,
-                            agent_id = %job.agent_id,
-                            model = %p.forked_on,
-                            error = %e,
-                            "review fork generation failed; retried next sweep"
-                        );
-                        PairOutcome::Skipped {
-                            reason: "the other model could not be run".to_string(),
-                            retry: true,
-                        }
-                    }
-                },
+            let Some((client, _)) = endpoints.find(&p.forked_on) else {
+                continue;
             };
-            pairs[p.job].push(ForkPair {
+            let outcome = match tokio::time::timeout(timeout, client.infer(&p.prompt)).await {
+                Ok(Ok(response)) => PairOutcome::Ready {
+                    written_at: p.written_at,
+                    id: p.turn.id,
+                    original: p.turn.written.clone(),
+                    fork: render_fork(&response),
+                    prompt_sha256: p.prompt_sha256.clone(),
+                    adjusted: p.adjusted.clone(),
+                },
+                Ok(Err(e)) => {
+                    use agora_agentkit::reactor::RetryAfter;
+                    let transient = !e.is_fatal();
+                    tracing::warn!(
+                        event_type = "review_fork_failed",
+                        agent = %job.agent,
+                        agent_id = %job.agent_id,
+                        model = %p.forked_on,
+                        transient,
+                        error = %e,
+                        "review fork generation failed"
+                    );
+                    failed(
+                        &p,
+                        format!("the other model could not be run ({e})"),
+                        transient,
+                    )
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        event_type = "review_fork_failed",
+                        agent = %job.agent,
+                        agent_id = %job.agent_id,
+                        model = %p.forked_on,
+                        transient = true,
+                        timeout_secs = timeout.as_secs(),
+                        "review fork generation timed out"
+                    );
+                    failed(
+                        &p,
+                        format!(
+                            "the other model did not finish within {}s",
+                            timeout.as_secs()
+                        ),
+                        true,
+                    )
+                }
+            };
+            done[p.job].push(ForkPair {
                 side: p.side,
                 written_on: p.written_on,
                 forked_on: p.forked_on,
@@ -761,22 +974,42 @@ pub async fn prepare<I: Inference>(
             });
         }
     }
+    if left > 0 {
+        tracing::info!(
+            event_type = "review_forks_deferred",
+            pairs = left,
+            budget_secs = budget.as_secs(),
+            "review forks budget spent; the rest roll over to the next start"
+        );
+    }
 
     let mut written = 0;
-    for (job, mut pairs) in jobs.iter().zip(pairs) {
-        pairs.sort_by_key(|p| p.side != Side::Trial);
-        for p in &pairs {
-            if let PairOutcome::Skipped { reason, .. } = &p.outcome {
+    for (job, decided) in jobs.iter().zip(done) {
+        if decided.is_empty() {
+            continue; // nothing reached: leave any file as it is
+        }
+        for p in &decided {
+            if let PairOutcome::Skipped { reason, retry, .. } = &p.outcome {
                 tracing::warn!(
                     event_type = "review_fork_skipped",
                     agent = %job.agent,
                     agent_id = %job.agent_id,
                     side = ?p.side,
+                    retry,
                     reason = %reason,
                     "review fork pair skipped"
                 );
             }
         }
+        // Keep what was already prepared; replace only the sides decided.
+        let mut pairs: Vec<ForkPair> = job
+            .existing
+            .as_ref()
+            .map(|f| f.pairs.clone())
+            .unwrap_or_default();
+        pairs.retain(|p| !decided.iter().any(|d| d.side == p.side));
+        pairs.extend(decided);
+        pairs.sort_by_key(|p| p.side != Side::Trial);
         let forks = ReviewForks {
             format: FORMAT,
             key: job.key.clone(),
@@ -836,19 +1069,55 @@ mod tests {
 
     /// A session dump shaped like the runner's: intro with a model line,
     /// a read, a failed write, a comment and a post, then the memory turn.
+    /// `set_model`'s description as the runner writes it, for an agent on
+    /// `current`.
+    fn set_model_description(current: &str) -> String {
+        let choices = [
+            switch::Choice {
+                id: OLD,
+                name: "Qwen 3.6",
+                description: "Sparse and quick.",
+            },
+            switch::Choice {
+                id: NEW,
+                name: "Qwen 3.8",
+                description: "Dense and slow.",
+            },
+        ];
+        let name = if current == NEW {
+            "Qwen 3.8"
+        } else {
+            "Qwen 3.6"
+        };
+        let blocked = (current == NEW).then_some("you are in a trial of Qwen 3.8");
+        switch::describe(&choices, name, current, blocked)
+    }
+
+    /// A session dump shaped like the runner's: intro with a model line
+    /// (and, on the trial model, the countdown after it), `set_model` among
+    /// the tools, a read, a failed write, a comment and a post, then the
+    /// memory turn.
     pub(crate) fn dump(model: &str) -> Prompt {
+        let mut intro = vec![serde_json::json!({"type": "text",
+            "text": format!("## Your Personality\n\nName: tarn\nModel: Qwen {model} ({model})\nFeed…"),
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}})];
+        if model == NEW {
+            intro.push(serde_json::json!({"type": "text", "text":
+                "Model trial: session 3 of 5 on Qwen 3.8. After session 5 you'll return to Qwen 3.6 for one session to decide whether to keep Qwen 3.8."}));
+        }
         serde_json::from_value(serde_json::json!({
             "model": model,
             "max_tokens": 8192,
             "system": [{"type": "text", "text": "SYSTEM"}],
-            "tools": [{"name": "create_post", "description": "d", "input_schema": {"type": "object"}}],
+            "tools": [
+                {"name": "create_post", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "set_model", "description": set_model_description(model), "input_schema": {"type": "object"}},
+            ],
             "tool_choice": {"type": "auto"},
             "thinking": {"type": "adaptive"},
             "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}, "effort": "medium"},
             "messages": [
-                {"role": "user", "content": [
-                    {"type": "text", "text": format!("## Your Personality\n\nName: tarn\nModel: Qwen {model} ({model})\nFeed…")},
-                ]},
+                {"role": "user", "content": intro},
                 {"role": "assistant", "content": [
                     {"type": "thinking", "thinking": "I should read.", "signature": ""},
                     {"type": "text", "text": "Reading."},
@@ -909,9 +1178,16 @@ mod tests {
     fn surgery_cuts_rewrites_strips_and_swaps() {
         let original = dump(NEW);
         let turn = find_writes(&original).pop().unwrap().message;
-        let (fork, rewritten) =
+        let (fork, adjusted) =
             fork_prompt(original.clone(), turn, &info(OLD, "Qwen 3.6 35B"), 8192).unwrap();
-        assert!(rewritten);
+        assert_eq!(
+            adjusted,
+            [
+                Adjustment::ModelLine,
+                Adjustment::TrialCountdown,
+                Adjustment::SetModelDescription
+            ]
+        );
         assert_eq!(fork.messages.len(), turn, "cut before the write's turn");
         assert_eq!(fork.messages.last().unwrap().role, Role::User);
         assert_eq!(fork.model, Model::from(OLD));
@@ -920,18 +1196,19 @@ mod tests {
             intro.contains("\nModel: Qwen 3.6 35B (Qwen3.6.gguf)\n"),
             "{intro}"
         );
-        assert!(!intro.contains(NEW));
+        assert_eq!(fork.messages[0].content.len(), 1, "countdown block removed");
         assert!(fork.messages.iter().all(|m| {
             m.content
                 .iter()
                 .all(|b| !matches!(b, Block::Thought { .. } | Block::RedactedThought { .. }))
         }));
-        // The rest untouched: system, tools, tool choice, thinking mode,
-        // and every non-thinking block.
+        // The rest untouched: system, the other tools, tool choice, thinking
+        // mode, and every non-thinking block after the intro.
         let json = |p: &Prompt, k: &str| serde_json::to_value(p).unwrap()[k].clone();
-        for k in ["system", "tools", "tool_choice", "thinking"] {
+        for k in ["system", "tool_choice", "thinking"] {
             assert_eq!(json(&fork, k), json(&original, k), "{k}");
         }
+        assert_eq!(json(&fork, "tools")[0], json(&original, "tools")[0]);
         assert_eq!(
             serde_json::to_value(&fork.messages[2]).unwrap(),
             serde_json::to_value(&original.messages[2]).unwrap()
@@ -941,12 +1218,49 @@ mod tests {
         assert_eq!(config, serde_json::json!({"effort": "medium"}));
     }
 
+    /// Nothing in a fork's prompt tells the forking model it runs on the
+    /// original: not the model line, not the trial countdown, not
+    /// `set_model`'s "You run on …" or its `(current)` mark.
+    #[test]
+    fn no_text_names_the_original_model_as_current() {
+        for (written, forked, forked_name) in [(NEW, OLD, "Qwen 3.6"), (OLD, NEW, "Qwen 3.8")] {
+            let original = dump(written);
+            let turn = find_writes(&original).pop().unwrap().message;
+            let (fork, _) = fork_prompt(original, turn, &info(forked, forked_name), 8192).unwrap();
+            let all = serde_json::to_string(&fork).unwrap();
+            let written_name = if written == NEW {
+                "Qwen 3.8"
+            } else {
+                "Qwen 3.6"
+            };
+            for stale in [
+                format!("({written})"),
+                format!("You run on {written_name}"),
+                format!("(`{written}`)"),
+                format!("{written_name} (current)"),
+                "Model trial".to_string(),
+                "You cannot change model this session".to_string(),
+            ] {
+                assert!(
+                    !all.contains(&stale),
+                    "{written} -> {forked}: `{stale}` survives"
+                );
+            }
+            assert!(
+                all.contains(&format!("You run on {forked_name} (`{forked}`).")),
+                "{all}"
+            );
+            assert!(all.contains(&format!("{forked_name} (current)")), "{all}");
+            assert!(all.contains(&format!("({forked})")), "{all}");
+        }
+    }
+
     #[test]
     fn surgery_without_a_model_line_says_so() {
         let mut original = dump(NEW);
         original.messages[0] = (Role::User, "Name: tarn\nFeed…").into();
-        let (fork, rewritten) = fork_prompt(original, 3, &info(OLD, ""), 8192).unwrap();
-        assert!(!rewritten);
+        let (fork, adjusted) = fork_prompt(original, 3, &info(OLD, ""), 8192).unwrap();
+        assert_eq!(adjusted, [Adjustment::SetModelDescription]);
         assert_eq!(fork.messages.len(), 3);
     }
 
@@ -1016,13 +1330,26 @@ mod tests {
         // Newest first, as scan_logs returns them. Day 22: a one-off
         // session on the new model before the trial (the unconsented
         // test) is on neither side.
-        let sessions = vec![s(28, NEW), s(27, NEW), s(24, OLD), s(22, NEW), s(21, OLD)];
+        // Day 30: after the trial ended on day 28 (a session left on the
+        // new model by a failed return) is not a trial session.
+        let sessions = vec![
+            s(30, NEW),
+            s(28, NEW),
+            s(27, NEW),
+            s(24, OLD),
+            s(22, NEW),
+            s(21, OLD),
+        ];
         let days = |side| {
-            candidates(&sessions, &key, at(25), side)
+            candidates(&sessions, &key, at(25), at(28), side)
                 .map(|s| s.at)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(days(Side::Trial), [at(28), at(27)]);
+        assert_eq!(
+            days(Side::Trial),
+            [at(28), at(27)],
+            "the last one's teardown included"
+        );
         assert_eq!(days(Side::Before), [at(24), at(21)]);
     }
 
@@ -1064,10 +1391,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// How [`Echo`] fails a generation on one model.
+    #[derive(Debug, Clone, Copy)]
+    enum Failure {
+        /// A 400: retrying the same request can't help.
+        Fatal,
+        /// A 529: worth another try.
+        Transient,
+        /// Never answers.
+        Hang,
+    }
+
     /// Stands in for an endpoint: records each prompt and answers with a
-    /// comment.
+    /// comment, or fails on one model as told.
+    #[derive(Default)]
     struct Echo {
         seen: std::sync::Mutex<Vec<Prompt>>,
+        fail: std::sync::Mutex<Option<(&'static str, Failure)>>,
+    }
+
+    impl Echo {
+        fn fail(&self, model: &'static str, how: Failure) {
+            *self.fail.lock().unwrap() = Some((model, how));
+        }
+        fn heal(&self) {
+            *self.fail.lock().unwrap() = None;
+        }
+        fn seen(&self) -> Vec<Model> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| p.model.clone())
+                .collect()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1077,9 +1434,30 @@ mod tests {
         where
             P: Serialize + Send,
         {
+            use misanthropic::client::{AnthropicError, Error};
             let p: Prompt = serde_json::from_value(serde_json::to_value(&prompt).unwrap()).unwrap();
             let model = p.model.name().to_string();
             self.seen.lock().unwrap().push(p);
+            let fail = *self.fail.lock().unwrap();
+            match fail {
+                Some((m, how)) if m == model => match how {
+                    Failure::Fatal => {
+                        return Err(Error::Anthropic(AnthropicError::InvalidRequest {
+                            message: "prompt is too long".into(),
+                        }));
+                    }
+                    Failure::Transient => {
+                        return Err(Error::Anthropic(AnthropicError::Overloaded {
+                            message: "busy".into(),
+                            retry_after: None,
+                        }));
+                    }
+                    Failure::Hang => {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
+                },
+                _ => {}
+            }
             Ok(response(
                 serde_json::json!([
                     {"type": "text", "text": format!("from {model}")},
@@ -1102,92 +1480,153 @@ mod tests {
         }
     }
 
-    /// The batch step end to end on a scratch data dir: one agent back from
-    /// its trial, a dump on each side, both pairs forked on the other model
-    /// with nothing executed, and the file read back by the review.
+    /// A scratch data dir with one agent back from its trial (days 25–28)
+    /// and a dump on each side: day 24 on OLD, day 27 on NEW.
+    struct Scratch {
+        root: PathBuf,
+        state: PathBuf,
+        logs: PathBuf,
+        id: AgentId,
+        key: OfferKey,
+    }
+
+    impl Scratch {
+        async fn new(tag: &str) -> Self {
+            use crate::consent::ledger::{OfferNames, TRIAL_SESSIONS};
+            use crate::consent::prompt::{OfferAnswer, OfferChoice};
+            let root =
+                std::env::temp_dir().join(format!("agora-seed-forks-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let (state, logs, prompts) =
+                (root.join("state"), root.join("logs"), root.join("prompts"));
+            for d in [&state, &logs, &prompts] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let id = AgentId::from(uuid::Uuid::from_u128(7));
+            let key = OfferKey {
+                from: Model::from(OLD),
+                to: Model::from(NEW),
+            };
+            let mut ledger = Ledger::default();
+            ledger.record_offer(
+                OfferNames {
+                    key: &key,
+                    from_name: "Qwen 3.6",
+                    to_name: "Qwen 3.8",
+                },
+                at(20),
+                Ok(OfferAnswer {
+                    reason: "r".into(),
+                    choice: OfferChoice::Trial,
+                }),
+            );
+            ledger.observe_model(&key.to, at(25));
+            for _ in 0..TRIAL_SESSIONS {
+                ledger.count_session(&key.to);
+            }
+            ledger.end_trial(&key.to, at(28));
+            ledger.save(&state.join(id.to_string())).await.unwrap();
+
+            let mut lines = Vec::new();
+            for (day, model) in [(24, OLD), (27, NEW)] {
+                let sha = format!("{day:0>4}");
+                let path = prompts.join(format!("{sha}.json"));
+                std::fs::write(&path, serde_json::to_vec(&dump(model)).unwrap()).unwrap();
+                lines.push(
+                    serde_json::json!({
+                        "timestamp": at(day), "level": "INFO",
+                        "fields": {"message": "prompt logged", "agent_id": id, "model": model,
+                                   "prompt_sha256": sha, "path": path},
+                    })
+                    .to_string(),
+                );
+            }
+            std::fs::write(logs.join("seed-log.1.jsonl"), lines.join("\n")).unwrap();
+            Self {
+                root,
+                state,
+                logs,
+                id,
+                key,
+            }
+        }
+
+        async fn prepare_on(&self, echo: &Echo, models: &[&str], config: ForksConfig) -> usize {
+            let offered: Vec<(usize, ModelInfo)> = models.iter().map(|m| (0, info(m, m))).collect();
+            let clients = std::slice::from_ref(echo);
+            prepare(
+                &self.state,
+                &self.logs,
+                None,
+                Endpoints {
+                    clients,
+                    offered: &offered,
+                },
+                4096,
+                config,
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn prepare(&self, echo: &Echo) -> usize {
+            self.prepare_on(echo, &[OLD, NEW], ForksConfig::default())
+                .await
+        }
+
+        fn file(&self) -> Option<Vec<u8>> {
+            std::fs::read(self.state.join(self.id.to_string()).join(FORKS_FILE)).ok()
+        }
+
+        async fn forks(&self) -> ReviewForks {
+            load(&self.state.join(self.id.to_string()), &self.key, at(25))
+                .await
+                .expect("forks prepared")
+        }
+
+        async fn side(&self, side: Side) -> Option<PairOutcome> {
+            self.forks()
+                .await
+                .pairs
+                .into_iter()
+                .find(|p| p.side == side)
+                .map(|p| p.outcome)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The batch step end to end: both pairs forked on the other model with
+    /// nothing executed, grouped by model, and the file read back by the
+    /// review. Nothing is redone once settled.
     #[tokio::test]
     async fn prepare_writes_both_pairs() {
-        use crate::consent::ledger::{OfferNames, TRIAL_SESSIONS};
-        use crate::consent::prompt::{OfferAnswer, OfferChoice};
-        let root =
-            std::env::temp_dir().join(format!("agora-seed-forks-prep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (state, logs, prompts) = (root.join("state"), root.join("logs"), root.join("prompts"));
-        for d in [&state, &logs, &prompts] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        let id = AgentId::from(uuid::Uuid::from_u128(7));
-        let key = OfferKey {
-            from: Model::from(OLD),
-            to: Model::from(NEW),
-        };
-        let mut ledger = Ledger::default();
-        ledger.record_offer(
-            OfferNames {
-                key: &key,
-                from_name: "Qwen 3.6",
-                to_name: "Qwen 3.8",
-            },
-            at(20),
-            Ok(OfferAnswer {
-                reason: "r".into(),
-                choice: OfferChoice::Trial,
-            }),
+        let s = Scratch::new("prep").await;
+        let echo = Echo::default();
+        assert_eq!(s.prepare(&echo).await, 1);
+        // Grouped by model: OLD's fork first (BTreeMap order), then NEW's.
+        assert_eq!(echo.seen(), [Model::from(OLD), Model::from(NEW)]);
+        assert!(
+            echo.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|p| p.max_tokens.get() == 4096)
         );
-        ledger.observe_model(&key.to, at(25));
-        for _ in 0..TRIAL_SESSIONS {
-            ledger.count_session(&key.to);
-        }
-        ledger.end_trial(&key.to, at(28));
-        ledger.save(&state.join(id.to_string())).await.unwrap();
 
-        let mut lines = Vec::new();
-        for (day, model) in [(24, OLD), (27, NEW)] {
-            let sha = format!("{day:0>4}");
-            let path = prompts.join(format!("{sha}.json"));
-            std::fs::write(&path, serde_json::to_vec(&dump(model)).unwrap()).unwrap();
-            lines.push(
-                serde_json::json!({
-                    "timestamp": at(day), "level": "INFO",
-                    "fields": {"message": "prompt logged", "agent_id": id, "model": model,
-                               "prompt_sha256": sha, "path": path},
-                })
-                .to_string(),
-            );
-        }
-        std::fs::write(logs.join("seed-log.1.jsonl"), lines.join("\n")).unwrap();
-
-        let echo = Echo {
-            seen: Default::default(),
-        };
-        let clients = [echo];
-        let offered = [(0, info(OLD, "Qwen 3.6")), (0, info(NEW, "Qwen 3.8"))];
-        let endpoints = Endpoints {
-            clients: &clients,
-            offered: &offered,
-        };
-        let n = prepare(&state, &logs, None, endpoints, 4096).await.unwrap();
-        assert_eq!(n, 1);
-        {
-            let seen = clients[0].seen.lock().unwrap();
-            assert_eq!(seen.len(), 2);
-            // Grouped by model: OLD's fork first (BTreeMap order), then NEW's.
-            assert_eq!(seen[0].model, Model::from(OLD));
-            assert_eq!(seen[1].model, Model::from(NEW));
-            assert!(seen.iter().all(|p| p.max_tokens.get() == 4096));
-        }
-
-        let forks = load(&state.join(id.to_string()), &key, at(25))
-            .await
-            .unwrap();
+        let forks = s.forks().await;
         assert_eq!(forks.pairs.len(), 2);
         assert_eq!(forks.pairs[0].side, Side::Trial);
-        assert_eq!(forks.pairs[0].forked_on, key.from);
+        assert_eq!(forks.pairs[0].forked_on, s.key.from);
         let PairOutcome::Ready {
             original,
             fork,
             written_at,
-            model_line_rewritten,
+            adjusted,
             ..
         } = &forks.pairs[0].outcome
         else {
@@ -1201,21 +1640,154 @@ mod tests {
                 text: format!("from {OLD}")
             }
         );
-        assert!(model_line_rewritten);
+        assert!(adjusted.contains(&Adjustment::TrialCountdown));
         assert!(
-            load(&state.join(id.to_string()), &key, at(26))
+            load(&s.state.join(s.id.to_string()), &s.key, at(26))
                 .await
                 .is_none(),
             "another trial"
         );
 
         // Settled: nothing left to do.
-        assert!(jobs(&state).await.unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&root);
+        assert!(jobs(&s.state).await.unwrap().is_empty());
+        assert_eq!(s.prepare(&echo).await, 0);
+        assert_eq!(echo.seen().len(), 2);
     }
 
-    /// No dump for a side, or no endpoint for the forking model: the pair
-    /// is skipped with a reason, and only the latter is retried.
+    /// A transient failure is retried at the next start — only that pair;
+    /// the one already prepared is kept as it is.
+    #[tokio::test]
+    async fn only_the_failed_pair_is_redone() {
+        let s = Scratch::new("redo").await;
+        let echo = Echo::default();
+        echo.fail(OLD, Failure::Transient);
+        assert_eq!(s.prepare(&echo).await, 1);
+        assert!(matches!(
+            s.side(Side::Trial).await,
+            Some(PairOutcome::Skipped {
+                retry: true,
+                attempts: 1,
+                ..
+            })
+        ));
+        let before = s.side(Side::Before).await.unwrap();
+        assert!(matches!(before, PairOutcome::Ready { .. }));
+
+        echo.heal();
+        assert_eq!(s.prepare(&echo).await, 1);
+        assert_eq!(
+            echo.seen(),
+            [Model::from(OLD), Model::from(NEW), Model::from(OLD)],
+            "only the failed side generated again"
+        );
+        assert!(matches!(
+            s.side(Side::Trial).await,
+            Some(PairOutcome::Ready { .. })
+        ));
+        assert_eq!(
+            s.side(Side::Before).await.unwrap(),
+            before,
+            "kept as it was"
+        );
+    }
+
+    /// A 4xx (a context overflow, say) reads the same every time: skipped
+    /// for good, with the reason. A transient failure stops being retried
+    /// after MAX_FORK_ATTEMPTS.
+    #[tokio::test]
+    async fn fatal_errors_and_spent_attempts_are_final() {
+        let s = Scratch::new("fatal").await;
+        let echo = Echo::default();
+        echo.fail(OLD, Failure::Fatal);
+        s.prepare(&echo).await;
+        let Some(PairOutcome::Skipped { reason, retry, .. }) = s.side(Side::Trial).await else {
+            panic!("skipped");
+        };
+        assert!(!retry);
+        assert!(reason.contains("prompt is too long"), "{reason}");
+        assert!(jobs(&s.state).await.unwrap().is_empty(), "nothing to retry");
+
+        let s = Scratch::new("spent").await;
+        echo.fail(OLD, Failure::Transient);
+        for _ in 0..MAX_FORK_ATTEMPTS + 2 {
+            s.prepare(&echo).await;
+        }
+        assert!(matches!(
+            s.side(Side::Trial).await,
+            Some(PairOutcome::Skipped {
+                retry: false,
+                attempts: MAX_FORK_ATTEMPTS,
+                ..
+            })
+        ));
+    }
+
+    /// A generation that doesn't answer is cut off at the timeout (and
+    /// retried later); a spent budget starts nothing and touches nothing.
+    #[tokio::test]
+    async fn the_step_is_bounded() {
+        let s = Scratch::new("timeout").await;
+        let echo = Echo::default();
+        echo.fail(OLD, Failure::Hang);
+        let config = ForksConfig {
+            generation_timeout_secs: 1,
+            ..ForksConfig::default()
+        };
+        s.prepare_on(&echo, &[OLD, NEW], config).await;
+        let Some(PairOutcome::Skipped { reason, retry, .. }) = s.side(Side::Trial).await else {
+            panic!("skipped");
+        };
+        assert!(retry);
+        assert!(reason.contains("did not finish within 1s"), "{reason}");
+
+        let s = Scratch::new("budget").await;
+        let echo = Echo::default();
+        let config = ForksConfig {
+            budget_secs: 0,
+            ..ForksConfig::default()
+        };
+        assert_eq!(s.prepare_on(&echo, &[OLD, NEW], config).await, 0);
+        assert!(echo.seen().is_empty());
+        assert!(s.file().is_none(), "rolled over, nothing written");
+        assert_eq!(jobs(&s.state).await.unwrap().len(), 1);
+    }
+
+    /// A runner offers only some models: it does its sides and leaves the
+    /// rest (and another runner's work) alone.
+    #[tokio::test]
+    async fn a_runner_touches_only_the_sides_it_can_run() {
+        let s = Scratch::new("partial").await;
+        let echo = Echo::default();
+        assert_eq!(
+            s.prepare_on(&echo, &["cogito.gguf"], ForksConfig::default())
+                .await,
+            0
+        );
+        assert!(s.file().is_none(), "nothing it can run, nothing written");
+
+        s.prepare_on(&echo, &[NEW], ForksConfig::default()).await;
+        assert_eq!(echo.seen(), [Model::from(NEW)]);
+        assert!(s.side(Side::Trial).await.is_none(), "not this runner's");
+        assert!(matches!(
+            s.side(Side::Before).await,
+            Some(PairOutcome::Ready { .. })
+        ));
+        let file = s.file().unwrap();
+        s.prepare_on(&echo, &[NEW], ForksConfig::default()).await;
+        assert_eq!(s.file().unwrap(), file, "left alone");
+
+        s.prepare_on(&echo, &[OLD], ForksConfig::default()).await;
+        assert!(matches!(
+            s.side(Side::Trial).await,
+            Some(PairOutcome::Ready { .. })
+        ));
+        assert!(matches!(
+            s.side(Side::Before).await,
+            Some(PairOutcome::Ready { .. })
+        ));
+    }
+
+    /// No dump for a side: skipped with a reason, for good.
     #[tokio::test]
     async fn missing_pieces_skip_with_a_reason() {
         let job = Job {
@@ -1226,21 +1798,16 @@ mod tests {
                 to: Model::from(NEW),
             },
             started_at: at(25),
+            ended_at: at(28),
+            existing: None,
+            sides: vec![Side::Trial],
         };
-        let offered = [(0, info(OLD, "")), (0, info(NEW, ""))];
-        let Err(pair) = build(0, &job, Side::Trial, &[], &offered, 4096).await else {
+        let Err(pair) = build(0, &job, Side::Trial, &[], &info(OLD, ""), 4096).await else {
             panic!("no sessions");
         };
         assert!(matches!(
             &pair.outcome,
-            PairOutcome::Skipped { reason, retry: false } if reason.contains("no record")
-        ));
-        let Err(pair) = build(0, &job, Side::Before, &[], &offered[..1], 4096).await else {
-            panic!("no endpoint");
-        };
-        assert!(matches!(
-            pair.outcome,
-            PairOutcome::Skipped { retry: true, .. }
+            PairOutcome::Skipped { reason, retry: false, .. } if reason.contains("no record")
         ));
     }
 
@@ -1277,7 +1844,7 @@ mod tests {
             .filter(|b| matches!(b, Block::Thought { .. } | Block::RedactedThought { .. }))
             .count();
         println!(
-            "fork: {} messages, model {}, line rewritten {rewritten}, thoughts left {thoughts}, output_config {}",
+            "fork: {} messages, model {}, adjusted {rewritten:?}, thoughts left {thoughts}, output_config {}",
             fork.messages.len(),
             fork.model,
             serde_json::to_string(&fork.output_config).unwrap()

@@ -347,6 +347,10 @@ struct RunConfig {
     /// — see [`schedule`]. Absent means the defaults.
     #[serde(default)]
     schedule: schedule::ScheduleConfig,
+    /// `[review_forks]`: bounds on preparing trial-review forks at sweep
+    /// start — see [`consent::forks`]. Absent means the defaults.
+    #[serde(default)]
+    review_forks: consent::forks::ForksConfig,
     #[serde(rename = "reactor")]
     reactors: Vec<ReactorSpec>,
 }
@@ -1042,6 +1046,7 @@ async fn main() -> Result<()> {
                 seed: SeedKnobs::default(),
                 model_consent: consent::ConsentConfig::default(),
                 schedule: schedule::ScheduleConfig::default(),
+                review_forks: consent::forks::ForksConfig::default(),
                 reactors: vec![ReactorSpec {
                     endpoint,
                     min_cycle_secs: None,
@@ -1063,6 +1068,7 @@ async fn main() -> Result<()> {
         "config has no [[reactor]] blocks"
     );
     config.schedule.validate()?;
+    config.review_forks.validate()?;
 
     let data_dir = match &config.data_dir {
         Some(d) => d.clone(),
@@ -1147,7 +1153,7 @@ async fn main() -> Result<()> {
             Ok(_) => {}
             Err(e) => println!("review forks: state unreadable: {e}"),
         }
-    } else if args.prepare_review_forks || !args.no_review_forks {
+    } else if args.prepare_review_forks || (config.review_forks.enabled && !args.no_review_forks) {
         let prompt_dir = config
             .seed
             .prompt_log_dir
@@ -1162,6 +1168,7 @@ async fn main() -> Result<()> {
                 offered: &offered,
             },
             act_max_tokens,
+            config.review_forks,
         )
         .await;
         match prepared {
@@ -1540,6 +1547,7 @@ mod agent_selection_tests {
             seed: SeedKnobs::default(),
             model_consent: consent::ConsentConfig::default(),
             schedule: schedule::ScheduleConfig::default(),
+            review_forks: consent::forks::ForksConfig::default(),
             reactors: vec![],
         }
     }

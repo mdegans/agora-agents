@@ -30,6 +30,11 @@ pub const FORMAT: u32 = 1;
 /// Sessions on the new model before a trial is reviewed.
 pub const TRIAL_SESSIONS: u32 = 5;
 
+/// How the countdown line ([`Ledger::trial_line`]) starts. A fork of a
+/// trial session removes the line by it: it names the trial model as the
+/// one the session runs on.
+pub const TRIAL_LINE_PREFIX: &str = "Model trial: ";
+
 /// Unanswered asks before the runner stops asking. The first miss is
 /// re-asked at the next eligible session; the second is final.
 pub const MAX_MISSES: u32 = 2;
@@ -600,13 +605,13 @@ impl Ledger {
             let (from, to) = (&r.from_name, &r.to_name);
             match r.stage {
                 Stage::Trial { sessions, .. } if sessions < TRIAL_SESSIONS => Some(format!(
-                    "Model trial: session {} of {TRIAL_SESSIONS} on {to}. After session \
+                    "{TRIAL_LINE_PREFIX}session {} of {TRIAL_SESSIONS} on {to}. After session \
                      {TRIAL_SESSIONS} you'll return to {from} for one session to decide \
                      whether to keep {to}.",
                     sessions + 1
                 )),
                 Stage::Trial { .. } | Stage::ReturningForReview { .. } => Some(format!(
-                    "Model trial: your {TRIAL_SESSIONS} sessions on {to} are complete. The \
+                    "{TRIAL_LINE_PREFIX}your {TRIAL_SESSIONS} sessions on {to} are complete. The \
                      move back to {from} for your decision has not taken effect yet; it is \
                      retried at the end of this session, and you'll decide on {from} whether \
                      to keep {to}."

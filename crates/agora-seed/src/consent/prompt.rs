@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::comparison::{Comparison, EXCERPT_BYTES, Sample, Where};
-use super::forks::{BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written};
+use super::forks::{
+    Adjustment, BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written,
+};
 use super::ledger::TRIAL_SESSIONS;
 
 /// The agent's answer to the offer.
@@ -298,6 +300,7 @@ fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
                 written_at,
                 original,
                 fork,
+                adjusted,
                 ..
             } => {
                 out.push_str(&format!(
@@ -305,8 +308,25 @@ fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
                      same point in the same session. Everything before that point, including \
                      what you had chosen to read, came from {x}. {y} did not see the private \
                      reasoning {x} had done earlier in that session, and was run once; what it \
-                     wrote was not posted, and nothing it asked for was carried out.\n\n"
+                     wrote was not posted, and nothing it asked for was carried out."
                 ));
+                if !adjusted.is_empty() {
+                    let what: Vec<&str> = adjusted
+                        .iter()
+                        .map(|a| match a {
+                            Adjustment::ModelLine => "the model line in your dashboard",
+                            Adjustment::TrialCountdown => "the trial countdown",
+                            Adjustment::SetModelDescription => "the `set_model` tool's description",
+                        })
+                        .collect();
+                    out.push_str(&format!(
+                        " Where that session's prompt named {x} as the model you ran on \
+                         ({}), it was changed to name {y}, or removed, so that {y} was not told \
+                         it was {x}.",
+                        what.join(", ")
+                    ));
+                }
+                out.push_str("\n\n");
                 out.push_str(&format!(
                     "**What you wrote on {x}** ({}):\n\n{}\n\n",
                     written_at.date_naive(),
@@ -667,7 +687,7 @@ pub(crate) mod tests {
                             clipped: false,
                         },
                         prompt_sha256: "ab".into(),
-                        model_line_rewritten: true,
+                        adjusted: vec![Adjustment::ModelLine, Adjustment::TrialCountdown],
                     },
                 },
                 ForkPair {
@@ -677,6 +697,7 @@ pub(crate) mod tests {
                     outcome: PairOutcome::Skipped {
                         reason: "no record of a session on that model was found".into(),
                         retry: false,
+                        attempts: 0,
                     },
                 },
             ],
@@ -716,5 +737,10 @@ pub(crate) mod tests {
             "This comparison is missing: no record of a session on that model was found."
         ));
         assert!(t.contains("This session runs on **Qwen 3.6** again"));
+        assert!(t.contains(
+            "Where that session's prompt named Qwen 3.8 as the model you ran on (the model line \
+             in your dashboard, the trial countdown), it was changed to name Qwen 3.6, or \
+             removed, so that Qwen 3.6 was not told it was Qwen 3.8."
+        ));
     }
 }
