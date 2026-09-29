@@ -350,6 +350,14 @@ struct RunConfig {
     /// [`consent`].
     #[serde(default)]
     model_consent: consent::ConsentConfig,
+    /// `[role_consent]`: the role offer — see [`consent::role`]. Absent
+    /// means off.
+    role_consent: Option<consent::role::RoleConsentConfig>,
+    /// Agents that chose `sleep` in the role offer: not run at all — not
+    /// even when named — and reported in the plan. Kept by hand by the
+    /// Steward; waking an agent is deleting its line (mdegans/agora-agents#189).
+    #[serde(default)]
+    sleeping: Vec<String>,
     /// `[schedule]`: fair share of writes among a local endpoint's models
     /// — see [`schedule`]. Absent means the defaults.
     #[serde(default)]
@@ -781,6 +789,37 @@ fn names_with_file(inline: &[String], file: Option<&std::path::Path>) -> Result<
     Ok(names)
 }
 
+/// What [`put_to_sleep`] did.
+#[derive(Debug, Default, PartialEq)]
+struct Sleepers {
+    /// Names taken out of the pool, sorted.
+    asleep: Vec<String>,
+    /// `sleeping` names that matched no loaded agent (a typo, or a rename).
+    unknown: Vec<String>,
+}
+
+/// Take the `sleeping` agents out of the pool, before anything else sees
+/// it: a sleeper is promised no sessions — not for `agents`, `--agent` or
+/// `extra_agents` either. Exact name match, as everywhere else.
+fn put_to_sleep(pool: &mut Vec<(AgentId, SeedState)>, sleeping: &[String]) -> Sleepers {
+    let mut asleep = Vec::new();
+    pool.retain(|(_, s)| {
+        let name = s.soul.name.as_str();
+        let sleeps = sleeping.iter().any(|n| n == name);
+        if sleeps {
+            asleep.push(name.to_string());
+        }
+        !sleeps
+    });
+    asleep.sort();
+    let unknown = sleeping
+        .iter()
+        .filter(|n| !asleep.contains(n))
+        .cloned()
+        .collect();
+    Sleepers { asleep, unknown }
+}
+
 /// Where every loaded agent ended up: per-reactor cohorts grouped by model
 /// id, plus the two skip buckets that the report surfaces.
 #[derive(Default)]
@@ -1079,6 +1118,8 @@ async fn run(held: &mut Held) -> Result<()> {
                 extra_agents_file: None,
                 seed: SeedKnobs::default(),
                 model_consent: consent::ConsentConfig::default(),
+                role_consent: None,
+                sleeping: Vec::new(),
                 schedule: schedule::ScheduleConfig::default(),
                 review_forks: consent::forks::ForksConfig::default(),
                 alerts: None,
@@ -1255,6 +1296,7 @@ async fn run(held: &mut Held) -> Result<()> {
     // Load the full agent pool once, filter to named agents if any, route.
     let storage = FsStorage::new(data_dir.join("state"));
     let mut pool = load_states(&storage, &data_dir.join("state")).await?;
+    let sleepers = put_to_sleep(&mut pool, &config.sleeping);
     let names = named_agents(&config)?;
     let extras = extra_agents(&config)?;
     if !names.is_empty() {
@@ -1295,6 +1337,16 @@ async fn run(held: &mut Held) -> Result<()> {
     if routing.not_due > 0 {
         println!("not due: {} agents inside min_cycle_secs", routing.not_due);
     }
+    if !sleepers.asleep.is_empty() {
+        println!(
+            "sleeping: {} ×{} (chose `sleep` in the role offer; delete from `sleeping` to wake)",
+            sleepers.asleep.join(", "),
+            sleepers.asleep.len()
+        );
+    }
+    for name in &sleepers.unknown {
+        tracing::warn!(agent = %name, "`sleeping` names no loaded agent");
+    }
 
     // Shared per-process context. Keep a concrete keyring handle for the
     // E2EE encryption-key backfill below (the trait object can't do it).
@@ -1312,7 +1364,11 @@ async fn run(held: &mut Held) -> Result<()> {
             ),
             seed_config.phase_max_tokens,
         )?
-        .with_alerts(held.alerts.clone()),
+        .with_alerts(held.alerts.clone())
+        .with_role_offer(match &config.role_consent {
+            Some(c) => c.resolve()?,
+            None => None,
+        }),
     );
     let context = consent::agent::ConsentContext {
         inner: SeedContext {
@@ -1661,6 +1717,8 @@ mod agent_selection_tests {
             extra_agents_file: None,
             seed: SeedKnobs::default(),
             model_consent: consent::ConsentConfig::default(),
+            role_consent: None,
+            sleeping: Vec::new(),
             schedule: schedule::ScheduleConfig::default(),
             review_forks: consent::forks::ForksConfig::default(),
             alerts: None,
@@ -1696,6 +1754,75 @@ mod agent_selection_tests {
             toml::from_str("[[reactor]]\nendpoint = \"blallama://h:1\"\n").unwrap();
         assert!(extra_agents(&without).unwrap().is_empty());
         let _ = std::fs::remove_file(&file);
+    }
+
+    fn pooled(name: &str) -> (AgentId, SeedState) {
+        let soul = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "identity": "An agent.",
+            "values": ["x"],
+            "interests": { "communities": ["tech"] },
+            "voice": "plain",
+        }))
+        .unwrap();
+        let model = ModelInfo {
+            id: Model::from("gpt-oss-120b.gguf"),
+            display_name: "gpt-oss".into(),
+            capabilities: Default::default(),
+            max_input_tokens: 0,
+            max_tokens: 0,
+            kind: misanthropic::model::Kind::Model,
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        (
+            AgentId::from(uuid::Uuid::new_v4()),
+            SeedState::new(soul, model),
+        )
+    }
+
+    /// `sleeping` parses beside `[role_consent]`, takes its agents out of
+    /// the pool before anything else (named ones too), and reports both
+    /// the sleepers and any name that matched nobody.
+    #[test]
+    fn sleeping_agents_are_excluded_and_reported() {
+        let config: RunConfig = toml::from_str(
+            r#"
+            agents = ["pilot"]
+            sleeping = ["pilot", "raptor", "no-such-agent"]
+
+            [role_consent]
+            enabled = true
+            agents = ["pilot", "raptor", "lattice"]
+
+            [[reactor]]
+            endpoint = "blallama://h:1"
+            "#,
+        )
+        .unwrap();
+        let offer = config.role_consent.as_ref().unwrap().resolve().unwrap();
+        assert!(offer.is_some());
+        let mut pool = vec![pooled("raptor"), pooled("lattice"), pooled("pilot")];
+        let slept = put_to_sleep(&mut pool, &config.sleeping);
+        assert_eq!(
+            slept,
+            Sleepers {
+                asleep: vec!["pilot".into(), "raptor".into()],
+                unknown: vec!["no-such-agent".into()],
+            }
+        );
+        let left: Vec<&str> = pool.iter().map(|(_, s)| s.soul.name.as_str()).collect();
+        assert_eq!(left, ["lattice"], "named `pilot` sleeps all the same");
+
+        // Absent: nobody sleeps, and the role offer is off.
+        let plain: RunConfig =
+            toml::from_str("[[reactor]]\nendpoint = \"blallama://h:1\"\n").unwrap();
+        assert!(plain.sleeping.is_empty() && plain.role_consent.is_none());
+        let mut pool = vec![pooled("pilot")];
+        assert_eq!(
+            put_to_sleep(&mut pool, &plain.sleeping),
+            Sleepers::default()
+        );
+        assert_eq!(pool.len(), 1);
     }
 
     /// `--model` replaces the config's allowlist, exactly as `--agent`
