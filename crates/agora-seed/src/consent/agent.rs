@@ -53,6 +53,15 @@
 //! run has a selectable model to offer. One change per session; nothing is
 //! asked after one. Each post or comment the session wrote is logged as a
 //! `write_recorded` event at teardown, with the dump's `prompt_sha256`.
+//!
+//! **The role offer** ([`super::role`]) is asked at the same point, by the
+//! same machinery (retries, parse, constrained output), but only in a
+//! session where the model-swap half did nothing — no question, switch,
+//! review, trial end or retried change, and not mid-trial — so a session
+//! asks at most one question. Its answer is applied at teardown into the
+//! same patched state: the SOUL edit and its Evolution Log disclosure, and
+//! the agent's own memory note if it wrote one. Its ledger is
+//! `role_consent.json`.
 
 use std::sync::Arc;
 
@@ -76,6 +85,10 @@ use super::forks;
 use super::ledger::{Change, Due, Ledger, OfferKey, OfferNames, Switch, SwitchCause};
 use super::prompt::{self as text, OfferText, ReviewText};
 use super::queue::{self, QueueEntry};
+use super::role::{
+    self,
+    ledger::{Applied, RoleAsk, RoleLedger, RoleOutcome},
+};
 use super::switch::{self, SetModel, SwitchError};
 use crate::alerts::{Alert, AlertKind};
 
@@ -104,6 +117,19 @@ enum Phase {
         constrained: bool,
         attempt: u32,
     },
+    /// The role offer ([`super::role`]) is seated; the same rules.
+    AskingRole { constrained: bool, attempt: u32 },
+}
+
+/// What the model-swap half of [`ConsentAgent::close`] did.
+enum Closing {
+    /// Seated a question.
+    Asked(Control),
+    /// Did something this session (a switch, a review, a trial ended, a
+    /// change retried), or the agent is mid-trial: nothing more is asked.
+    Busy,
+    /// Nothing: the role offer may be asked.
+    Idle,
 }
 
 /// Why an answer couldn't be used, and whether it's worth another try.
@@ -188,6 +214,14 @@ pub struct ConsentAgent<A> {
     /// marked its feed as seen. The agent reads nothing in that session, so
     /// the record is put back and the feed stays fresh for its next one.
     seen_before_review: Option<std::collections::HashMap<PostId, i64>>,
+    /// The role offer's ledger, loaded only for agents the offer lists;
+    /// `None` also when unreadable (then nothing is asked or saved).
+    role_ledger: Option<RoleLedger>,
+    role_dirty: bool,
+    /// A SOUL edit the agent chose this session, applied at teardown.
+    role_applied: Option<Applied>,
+    /// The agent's own memory note, appended at teardown.
+    memory_note: Option<String>,
 }
 
 /// A post or comment written this session.
@@ -357,6 +391,30 @@ where
         content: Content,
         schema: serde_json::Value,
     ) -> Result<Control, A::Error> {
+        let cache_safe = self.constrain(schema);
+        let (_, prompt) = self.inner.parts();
+        Self::seat_user(prompt, content)?;
+        tracing::info!(
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            question = due.kind(),
+            from = %due.key().from,
+            to = %due.key().to,
+            constrained = cache_safe,
+            "model-consent question seated"
+        );
+        self.phase = Phase::Asking {
+            due,
+            constrained: cache_safe,
+            attempt: 1,
+        };
+        Ok(Control::Continue)
+    }
+
+    /// Give the next turn the question budget and — where changing
+    /// `output_config` keeps the prefix cache (blallama) — `schema`.
+    /// Returns whether the answer is constrained.
+    fn constrain(&mut self, schema: serde_json::Value) -> bool {
         let cache_safe = self
             .inner
             .quirks()
@@ -374,22 +432,7 @@ where
             (true, None) => Some(OutputConfig::json_schema(schema)),
             (false, effort) => effort.map(OutputConfig::effort),
         };
-        Self::seat_user(prompt, content)?;
-        tracing::info!(
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            question = due.kind(),
-            from = %due.key().from,
-            to = %due.key().to,
-            constrained = cache_safe,
-            "model-consent question seated"
-        );
-        self.phase = Phase::Asking {
-            due,
-            constrained: cache_safe,
-            attempt: 1,
-        };
-        Ok(Control::Continue)
+        cache_safe
     }
 
     /// Apply a change the agent agreed to, logging a failure (the change
@@ -439,10 +482,21 @@ where
         }
     }
 
-    /// The inner session completed cleanly: count it toward any trial, end
-    /// a trial that has run its course, retry a change still waiting, or
-    /// ask a due offer. `None` means nothing is asked — the session ends.
+    /// The inner session completed cleanly: the model-swap machinery
+    /// first ([`close_model`](Self::close_model)); only if it did nothing,
+    /// the role offer. One question per session. `None` means nothing is
+    /// asked — the session ends.
     async fn close(&mut self) -> Result<Option<Control>, A::Error> {
+        match self.close_model().await? {
+            Closing::Asked(control) => Ok(Some(control)),
+            Closing::Busy => Ok(None),
+            Closing::Idle => self.ask_role(),
+        }
+    }
+
+    /// Count the session toward any trial, end a trial that has run its
+    /// course, retry a change still waiting, or ask a due offer.
+    async fn close_model(&mut self) -> Result<Closing, A::Error> {
         let model = self.model();
         let now = Utc::now();
         // An allowlisted offer simply isn't on the table for anyone else.
@@ -457,14 +511,18 @@ where
         let switched = self.switched();
         let started = self.started;
         let Some(ledger) = self.ledger.as_mut() else {
-            return Ok(None);
+            return Ok(if switched || self.reviewed {
+                Closing::Busy
+            } else {
+                Closing::Idle
+            });
         };
         self.dirty |= ledger.count_session(&model);
         self.dirty |= ledger.count_since_switch(started);
         // One change per session, and one question: nothing after a switch
         // or a review.
         if switched || self.reviewed {
-            return Ok(None);
+            return Ok(Closing::Busy);
         }
         // A trial that has run its course: nothing is asked on the new
         // model. The agent goes back and decides on the old one.
@@ -479,7 +537,7 @@ where
                 "trial complete; returning the agent to its original model for the review"
             );
             self.apply_consented(&change, now, true).await;
-            return Ok(None);
+            return Ok(Closing::Busy);
         }
         if let Some(change) = ledger.unapplied(&model) {
             tracing::info!(
@@ -492,10 +550,15 @@ where
                 "applying a consented model change left pending"
             );
             self.apply_consented(&change, now, false).await;
-            return Ok(None);
+            return Ok(Closing::Busy);
         }
         let Some(due) = ledger.due(&model, offer_key.as_ref()) else {
-            return Ok(None);
+            // Mid-trial, the trial is the agent's open question.
+            return Ok(if ledger.trial_line(&model).is_some() {
+                Closing::Busy
+            } else {
+                Closing::Idle
+            });
         };
         let offer = self
             .rt
@@ -509,7 +572,168 @@ where
             limited: offer.is_limited(),
         });
         self.seat_question(due, content, text::offer_schema())
-            .map(Some)
+            .map(Closing::Asked)
+    }
+
+    /// Seat the role offer, if this agent is listed and it is due.
+    fn ask_role(&mut self) -> Result<Option<Control>, A::Error> {
+        if !self.role_ledger.as_ref().is_some_and(RoleLedger::due) {
+            return Ok(None);
+        }
+        let content = role::prompt::offer(self.inner.state().soul.identity.as_str());
+        let constrained = self.constrain(role::prompt::schema());
+        let (_, prompt) = self.inner.parts();
+        Self::seat_user(prompt, content)?;
+        tracing::info!(
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            question = "role",
+            offer_version = role::prompt::OFFER_VERSION,
+            constrained,
+            "role-consent question seated"
+        );
+        self.phase = Phase::AskingRole {
+            constrained,
+            attempt: 1,
+        };
+        Ok(Some(Control::Continue))
+    }
+
+    /// One response to the role offer: the model-swap rules (retry an
+    /// unusable answer, up to [`MAX_ATTEMPTS`]; a refusal is final), plus
+    /// [`RoleAnswer::validate`] — an answer that can't be applied as given
+    /// (empty or over-long text) is relayed back like a malformed one, and
+    /// if every attempt fails it is no answer: nothing changes. Nothing is
+    /// applied here: the SOUL edit and the memory note are written into the
+    /// state the reactor saves, at teardown.
+    ///
+    /// [`RoleAnswer::validate`]: role::prompt::RoleAnswer::validate
+    async fn answer_role(
+        &mut self,
+        constrained: bool,
+        attempt: u32,
+        response: response::Message,
+    ) -> Result<Control, A::Error> {
+        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
+        let identity = self.inner.state().soul.identity.to_string();
+        let result = parse(&response, constrained, role::prompt::parse).and_then(|answer| {
+            answer
+                .validate(&identity)
+                .map(|()| answer)
+                .map_err(|e| Failure::new(e, Retry::Unusable))
+        });
+        if let Err(failure) = &result
+            && failure.retry != Retry::No
+        {
+            tracing::warn!(
+                event_type = "role_consent_malformed",
+                agent = %agent,
+                agent_id = %agent_id,
+                model = %response.model,
+                constrained,
+                attempt,
+                stop_reason = ?response.stop_reason,
+                output_tokens = response.usage.output_tokens,
+                failure = %failure.reason,
+                raw = %raw_text(&response),
+                "role-consent answer unusable"
+            );
+        }
+        if let Err(failure) = &result
+            && attempt < MAX_ATTEMPTS
+            && let Some(note) = failure.retry_note()
+        {
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(prompt, Content::from(note))?;
+            self.phase = Phase::AskingRole {
+                constrained,
+                attempt: attempt + 1,
+            };
+            return Ok(Control::Continue);
+        }
+
+        let outcome = match result {
+            Ok(answer) => {
+                let applied = role::plan(&answer, &identity);
+                tracing::info!(
+                    event_type = "role_consent_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %response.model,
+                    attempts = attempt,
+                    choice = answer.choice.as_str(),
+                    memory_note = !answer.memory_note.trim().is_empty(),
+                    "role-consent answer recorded"
+                );
+                if matches!(applied, Applied::Sleep) {
+                    const SLEEP: &str = "agent chose to sleep until tools fit its role; add it \
+                                         to `sleeping` in the run config";
+                    tracing::warn!(
+                        event_type = "role_consent_sleep",
+                        agent = %agent,
+                        agent_id = %agent_id,
+                        "{SLEEP}"
+                    );
+                    self.rt.alerts.notify(
+                        Alert::new(AlertKind::RoleConsentSleep, SLEEP)
+                            .agent(agent.to_string(), agent_id)
+                            .model(&response.model),
+                    );
+                }
+                let (_, prompt) = self.inner.parts();
+                if let Err(e) = prompt.push_message(response.inner.clone()) {
+                    tracing::warn!(agent_id = %agent_id, error = %e, "role answer not seated");
+                }
+                let note = answer.memory_note.trim();
+                self.memory_note = (!note.is_empty()).then(|| note.to_string());
+                if !matches!(applied, Applied::Nothing | Applied::Sleep) {
+                    self.role_applied = Some(applied.clone());
+                }
+                RoleOutcome::Answered {
+                    memory_note_written: self.memory_note.is_some(),
+                    answer,
+                    applied,
+                    apply_failed: None,
+                }
+            }
+            Err(failure) if failure.retry == Retry::No => {
+                tracing::warn!(
+                    event_type = "role_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    attempts = attempt,
+                    failure = %failure.reason,
+                    "role offer refused; nothing changes"
+                );
+                RoleOutcome::Refused {
+                    reason: failure.reason,
+                }
+            }
+            Err(failure) => {
+                let failure = format!("{} (after {attempt} attempts)", failure.reason);
+                tracing::error!(
+                    event_type = "role_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %response.model,
+                    attempts = attempt,
+                    failure = %failure,
+                    "role offer got no usable answer; nothing changes"
+                );
+                RoleOutcome::NoAnswer { failure }
+            }
+        };
+        if let Some(ledger) = self.role_ledger.as_mut() {
+            ledger.record(RoleAsk {
+                at: Utc::now(),
+                offer_version: role::prompt::OFFER_VERSION,
+                model: response.model.clone(),
+                attempts: attempt,
+                outcome,
+            });
+            self.role_dirty = true;
+        }
+        Ok(Control::Done(Outcome::Complete))
     }
 
     /// The review session: the usual intro is built, then — instead of the
@@ -764,15 +988,18 @@ where
     /// place (see [`Ledger::update_soul`]). `None` when nothing changed.
     fn patch_soul(&mut self) -> Option<SeedState> {
         let started = self.started;
-        let ledger = self.ledger.as_mut()?;
-        let offers_touched = ledger
-            .offers
-            .iter()
-            .any(|r| r.history.iter().any(|e| e.at >= started));
+        let offers_touched = self.ledger.as_ref().is_some_and(|ledger| {
+            ledger
+                .offers
+                .iter()
+                .any(|r| r.history.iter().any(|e| e.at >= started))
+        });
         if !offers_touched
             && self.notes.is_empty()
             && self.next_model.is_none()
             && self.seen_before_review.is_none()
+            && self.role_applied.is_none()
+            && self.memory_note.is_none()
         {
             return None;
         }
@@ -788,11 +1015,17 @@ where
                     error = %e,
                     "could not copy state for the SOUL consent line; skipped"
                 );
+                if self.role_applied.is_some() || self.memory_note.is_some() {
+                    self.role_failed(format!("could not copy state: {e}"));
+                }
                 return None;
             }
         };
         let mut changed = false;
-        if offers_touched && ledger.update_soul(&mut state.soul, started, Utc::now().date_naive()) {
+        if offers_touched
+            && let Some(ledger) = self.ledger.as_mut()
+            && ledger.update_soul(&mut state.soul, started, Utc::now().date_naive())
+        {
             // The ledger now remembers the line's exact text.
             self.dirty = true;
             changed = true;
@@ -816,7 +1049,53 @@ where
             state.seen_posts = seen;
             changed = true;
         }
+        changed |= self.apply_role(&mut state);
         changed.then_some(state)
+    }
+
+    /// Write the role answer into `state`: the SOUL edit (identity and
+    /// the Evolution Log disclosure, all or nothing) and the agent's own
+    /// memory note. A SOUL edit that fails writes nothing — not the note
+    /// either, which would describe a change that didn't happen.
+    fn apply_role(&mut self, state: &mut SeedState) -> bool {
+        let applied = self.role_applied.take();
+        let note = self.memory_note.take();
+        if let Some(applied) = &applied
+            && let Err(e) = role::apply(&mut state.soul, applied)
+        {
+            self.role_failed(e);
+            return false;
+        }
+        let today = Utc::now().date_naive();
+        let noted = note
+            .as_deref()
+            .is_some_and(|n| role::append_memory_note(&mut state.memory, n, today));
+        if applied.is_some() || noted {
+            tracing::info!(
+                event_type = "role_consent_applied",
+                agent = %state.soul.name,
+                agent_id = %self.inner.id(),
+                soul_changed = applied.is_some(),
+                memory_note = noted,
+                "role-consent answer applied"
+            );
+        }
+        applied.is_some() || noted
+    }
+
+    fn role_failed(&mut self, why: String) {
+        tracing::error!(
+            event_type = "role_consent_apply_failed",
+            agent_id = %self.inner.id(),
+            error = %why,
+            "role-consent answer not applied; SOUL and memory unchanged"
+        );
+        self.role_applied = None;
+        self.memory_note = None;
+        if let Some(ledger) = self.role_ledger.as_mut() {
+            ledger.mark_apply_failed(why);
+            self.role_dirty = true;
+        }
     }
 }
 
@@ -932,6 +1211,10 @@ where
             review: None,
             reviewed: false,
             seen_before_review: None,
+            role_ledger: None,
+            role_dirty: false,
+            role_applied: None,
+            memory_note: None,
         })
     }
 
@@ -1020,6 +1303,22 @@ where
         if self.review.is_some() {
             self.seen_before_review = Some(self.inner.state().seen_posts.clone());
         }
+        let listed = self
+            .rt
+            .role
+            .as_ref()
+            .is_some_and(|r| r.admits(&self.inner.state().soul.name));
+        if listed {
+            match RoleLedger::load(&dir).await {
+                Ok(ledger) => self.role_ledger = Some(ledger),
+                Err(e) => tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %RoleLedger::path(&dir).display(),
+                    error = %e,
+                    "role-consent ledger unreadable; not asking or saving this session"
+                ),
+            }
+        }
         self.inner.on_init().await?;
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
@@ -1063,6 +1362,10 @@ where
                 constrained,
                 attempt,
             } => self.answer(due, constrained, attempt, response).await,
+            Phase::AskingRole {
+                constrained,
+                attempt,
+            } => self.answer_role(constrained, attempt, response).await,
             Phase::Inner => match self
                 .inner
                 .handle(response)
@@ -1103,6 +1406,19 @@ where
                 );
             }
         }
+        if self.role_dirty
+            && let Some(ledger) = &mut self.role_ledger
+        {
+            ledger.agent = Some(self.inner.state().soul.name.clone());
+            if let Err(e) = ledger.save(&dir).await {
+                tracing::error!(
+                    agent_id = %self.inner.id(),
+                    path = %RoleLedger::path(&dir).display(),
+                    error = %e,
+                    "role-consent ledger save failed"
+                );
+            }
+        }
         result
     }
 }
@@ -1114,6 +1430,7 @@ mod tests {
         ChangeAction, OfferKey, RevertCause, Stage, TRIAL_SESSIONS, Term,
     };
     use crate::consent::queue::QueueEntry;
+    use crate::consent::role::ledger::{Applied, RoleLedger, RoleOutcome};
     use crate::consent::{ConsentConfig, ConsentRuntime, OfferConfig};
     use agora_agentkit::reactor::seed::{SeedError, ShortString};
     use misanthropic::model::{Kind, Model};
@@ -1376,6 +1693,16 @@ mod tests {
         }
 
         fn with_allowlist(tag: &str, agents: Option<&[&str]>) -> Self {
+            Self::build(tag, agents, None)
+        }
+
+        /// The model-swap offer to everyone on OLD, and the role offer to
+        /// `role`.
+        fn with_role(tag: &str, role: &[&str]) -> Self {
+            Self::build(tag, None, Some(role))
+        }
+
+        fn build(tag: &str, agents: Option<&[&str]>, role: Option<&[&str]>) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "agora-seed-consent-agent-{tag}-{}",
                 std::process::id()
@@ -1419,7 +1746,8 @@ mod tests {
                     catalog,
                     512,
                 )
-                .unwrap(),
+                .unwrap()
+                .with_role_offer(role.map(crate::consent::role::RoleOffer::for_agents)),
             );
             Self {
                 root,
@@ -1442,6 +1770,12 @@ mod tests {
                 },
             )
             .unwrap()
+        }
+
+        async fn role_ledger(&self) -> RoleLedger {
+            RoleLedger::load(&self.rt.state_dir.join(self.id.to_string()))
+                .await
+                .unwrap()
         }
 
         async fn ledger(&self) -> Ledger {
@@ -2257,5 +2591,305 @@ mod tests {
         assert_eq!(sixth.state().model.id, Model::from(OLD), "retried");
         assert!(crate::consent::queue::pending(h.id, &h.ledger().await).is_empty());
         review_session(&h).await;
+    }
+
+    // --- The role offer ---------------------------------------------------
+
+    /// Not on the model-swap offer's `from`, so only the role offer is due.
+    const OTHER: &str = "cogito-32b.gguf";
+
+    fn role_reply(choice: &str, soul_text: &str, memory_note: &str) -> response::Message {
+        let answer = crate::consent::role::prompt::RoleAnswer {
+            reason: "I thought about it.".into(),
+            choice: serde_json::from_value(serde_json::Value::from(choice)).unwrap(),
+            soul_text: soul_text.into(),
+            memory_note: memory_note.into(),
+        };
+        reply(&serde_json::to_string(&answer).unwrap())
+    }
+
+    const WHY: &str = "after the Steward's offer about a generator-assigned role that outran the \
+                       agent's tools.";
+
+    /// One whole session answering the role offer with `answer`.
+    async fn role_session(h: &Harness, answer: response::Message) -> ConsentAgent<Fake> {
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "role offer seated"
+        );
+        assert_eq!(
+            agent.handle(answer).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        agent
+    }
+
+    /// Whether a fresh session on `model` gets asked anything.
+    async fn asks(h: &Harness, model: &str) -> bool {
+        let mut agent = h.agent(model, true);
+        agent.on_init().await.unwrap();
+        let asked = agent.handle(reply("done")).await.unwrap() == Control::Continue;
+        agent.on_teardown().await.unwrap();
+        asked
+    }
+
+    /// The offer follows the closing phase, quotes the SOUL, is
+    /// constrained; `clarify` appends the sentence to `identity` with one
+    /// disclosing Evolution Log line; the agent's note (and only it) goes
+    /// into memory; the answer is on file; and it is never asked again.
+    #[tokio::test]
+    async fn role_offer_clarify_is_applied_disclosed_and_asked_once() {
+        let h = Harness::with_role("role-clarify", &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue
+        );
+        let q = last_user_text(&agent);
+        assert!(q.contains("Yours begins: *\"A test agent.\"*."), "{q}");
+        assert!(q.contains("1. **nothing**"));
+        assert!(agent.prompt().output_config.is_some(), "constrained");
+        let before_values = serde_json::to_value(&agent.state().soul.values).unwrap();
+        let control = agent
+            .handle(role_reply(
+                "clarify",
+                "I reason from what I can read on Agora.",
+                "I chose to say what I actually work with.",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+
+        let soul = &agent.state().soul;
+        assert_eq!(
+            soul.identity.as_str(),
+            "A test agent. I reason from what I can read on Agora."
+        );
+        assert_eq!(serde_json::to_value(&soul.values).unwrap(), before_values);
+        assert_eq!(
+            evolution_notes(&agent),
+            [format!(
+                "[SYSTEM] Identity clarified by the agent's own choice, {WHY} Added: \"I reason \
+                 from what I can read on Agora.\""
+            )]
+        );
+        let today = Utc::now().date_naive();
+        assert_eq!(
+            agent.state().memory.content,
+            format!(
+                "# Memory — tarn\n\n[{today}, my note] I chose to say what I actually work with."
+            )
+        );
+        let ledger = h.role_ledger().await;
+        assert_eq!(ledger.agent.as_ref().unwrap().as_str(), "tarn");
+        assert_eq!(ledger.asks.len(), 1);
+        match &ledger.asks[0].outcome {
+            RoleOutcome::Answered {
+                answer,
+                applied: Applied::Clarified { previous, identity },
+                memory_note_written: true,
+                apply_failed: None,
+            } => {
+                assert_eq!(answer.reason, "I thought about it.");
+                assert_eq!(previous, "A test agent.");
+                assert_eq!(
+                    identity,
+                    "A test agent. I reason from what I can read on Agora."
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            ledger.asks[0].offer_version,
+            crate::consent::role::prompt::OFFER_VERSION
+        );
+        assert!(!asks(&h, OTHER).await, "asked once");
+    }
+
+    #[tokio::test]
+    async fn role_offer_new_role_replaces_identity_and_keeps_the_old() {
+        let h = Harness::with_role("role-new", &["tarn"]);
+        let agent = role_session(
+            &h,
+            role_reply("new_role", "I am a careful reader of Agora's debates.", ""),
+        )
+        .await;
+        assert_eq!(
+            agent.state().soul.identity.as_str(),
+            "I am a careful reader of Agora's debates."
+        );
+        assert_eq!(
+            evolution_notes(&agent),
+            [format!(
+                "[SYSTEM] Role changed by the agent's own choice, {WHY} Previous identity: \"A \
+                 test agent.\""
+            )]
+        );
+        assert_eq!(
+            agent.state().memory.content,
+            "# Memory — tarn\n\n",
+            "no note"
+        );
+        assert!(matches!(
+            h.role_ledger().await.asks[0].outcome,
+            RoleOutcome::Answered {
+                applied: Applied::RoleChanged { .. },
+                memory_note_written: false,
+                ..
+            }
+        ));
+    }
+
+    /// `nothing` and `sleep`: SOUL and memory byte-identical, the answer on
+    /// file, never asked again. `sleep` does not stop the runner — that is
+    /// the Steward's `sleeping` list.
+    #[tokio::test]
+    async fn role_offer_nothing_and_sleep_change_nothing() {
+        for choice in ["nothing", "sleep"] {
+            let h = Harness::with_role(&format!("role-{choice}"), &["tarn"]);
+            let fresh = h.agent(OTHER, true);
+            let (soul, memory) = (
+                serde_json::to_vec(&fresh.state().soul).unwrap(),
+                fresh.state().memory.content.clone(),
+            );
+            let agent = role_session(&h, role_reply(choice, "stray text", "")).await;
+            assert_eq!(
+                serde_json::to_vec(&agent.state().soul).unwrap(),
+                soul,
+                "{choice}"
+            );
+            assert_eq!(agent.state().memory.content, memory, "{choice}");
+            assert!(agent.patched.is_none(), "{choice}: nothing to patch");
+            let expected = if choice == "sleep" {
+                Applied::Sleep
+            } else {
+                Applied::Nothing
+            };
+            match &h.role_ledger().await.asks[0].outcome {
+                RoleOutcome::Answered { applied, .. } => assert_eq!(applied, &expected),
+                other => panic!("{other:?}"),
+            }
+            assert!(!asks(&h, OTHER).await, "{choice}: asked once");
+        }
+    }
+
+    /// The agent's own note is written whatever it chose — here, `nothing`.
+    #[tokio::test]
+    async fn role_offer_memory_note_is_written_only_when_present() {
+        let h = Harness::with_role("role-note", &["tarn"]);
+        let agent = role_session(&h, role_reply("nothing", "", "Kept my role, on purpose.")).await;
+        assert!(
+            agent
+                .state()
+                .memory
+                .content
+                .ends_with("my note] Kept my role, on purpose."),
+            "{}",
+            agent.state().memory.content
+        );
+        assert!(evolution_notes(&agent).is_empty(), "SOUL untouched");
+    }
+
+    /// An edit without its text is relayed back like a malformed answer;
+    /// when every attempt fails it is no answer — nothing changes — and it
+    /// is asked once more next session.
+    #[tokio::test]
+    async fn role_offer_empty_or_over_long_text_is_retried_then_nothing() {
+        let h = Harness::with_role("role-empty", &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        let soul = serde_json::to_vec(&agent.state().soul).unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        let len = agent.prompt().messages.len();
+        let too_long = "a".repeat(crate::consent::role::prompt::CLARIFY_MAX_CHARS + 1);
+        let answers = [
+            role_reply("clarify", " ", ""),
+            role_reply("clarify", &too_long, ""),
+            role_reply("new_role", "", ""),
+        ];
+        for (n, answer) in answers.into_iter().enumerate() {
+            let control = agent.handle(answer).await.unwrap();
+            if n + 1 < MAX_ATTEMPTS as usize {
+                assert_eq!(control, Control::Continue);
+                assert_eq!(agent.prompt().messages.len(), len, "not seated");
+                let note = last_user_text(&agent);
+                assert!(note.contains("Your answer could not be used"), "{note}");
+            } else {
+                assert_eq!(control, Control::Done(Outcome::Complete));
+            }
+        }
+        assert!(last_user_text(&agent).contains("at most 300"));
+        agent.on_teardown().await.unwrap();
+        assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
+        match &h.role_ledger().await.asks[0].outcome {
+            RoleOutcome::NoAnswer { failure } => {
+                assert!(
+                    failure.contains("`new_role` needs") && failure.contains("after 3"),
+                    "{failure}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(asks(&h, OTHER).await, "a miss is asked once more");
+    }
+
+    #[tokio::test]
+    async fn role_offer_goes_only_to_listed_agents() {
+        let h = Harness::with_role("role-unlisted", &["pilot"]);
+        assert!(!asks(&h, OTHER).await);
+        assert!(!RoleLedger::path(&h.rt.state_dir.join(h.id.to_string())).exists());
+        let h = Harness::new("role-off");
+        assert!(!asks(&h, OTHER).await);
+    }
+
+    /// One question per session, the model-swap offer first; the role
+    /// offer waits while a trial is under way.
+    #[tokio::test]
+    async fn role_offer_waits_for_the_model_swap_offer_and_its_trial() {
+        let h = Harness::with_role("role-order", &["tarn"]);
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        assert!(
+            last_user_text(&agent).contains("1. `no_swap`"),
+            "model-swap first"
+        );
+        assert_eq!(
+            agent.handle(reply(TRIAL)).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "and nothing after it"
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(h.role_ledger().await.asks.is_empty());
+
+        // Trial sessions on NEW: not asked.
+        for _ in 0..TRIAL_SESSIONS - 1 {
+            assert!(!asks(&h, NEW).await);
+        }
+        assert!(h.role_ledger().await.asks.is_empty());
+
+        // A session on another model with no model-swap business: asked.
+        let h = Harness::with_role("role-after-decline", &["tarn"]);
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent
+            .handle(reply(r#"{"reason": "home", "choice": "no_swap"}"#))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Continue
+        );
+        assert!(last_user_text(&agent).contains("**Something we got wrong.**"));
     }
 }
