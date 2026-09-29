@@ -69,7 +69,7 @@ use std::collections::HashSet;
 
 use agora_agentkit::ids::{AgentId, CommentId, PostId};
 use agora_agentkit::reactor::inference::Quirks;
-use agora_agentkit::reactor::seed::SeedState;
+use agora_agentkit::reactor::seed::{Memory, SeedState, Soul};
 use agora_agentkit::reactor::{Agent, Control, Outcome};
 use chrono::{DateTime, Utc};
 use misanthropic::model::ModelInfo;
@@ -222,6 +222,9 @@ pub struct ConsentAgent<A> {
     role_applied: Option<Applied>,
     /// The agent's own memory note, appended at teardown.
     memory_note: Option<String>,
+    /// SOUL and memory from before the role answer was written into the
+    /// patched state, put back if the role ledger can't be saved.
+    role_undo: Option<(Soul, Memory)>,
 }
 
 /// A post or comment written this session.
@@ -510,12 +513,10 @@ where
         self.take_self_switch();
         let switched = self.switched();
         let started = self.started;
+        // No ledger means it exists but can't be read: the agent may be
+        // mid-trial, so the role offer waits too.
         let Some(ledger) = self.ledger.as_mut() else {
-            return Ok(if switched || self.reviewed {
-                Closing::Busy
-            } else {
-                Closing::Idle
-            });
+            return Ok(Closing::Busy);
         };
         self.dirty |= ledger.count_session(&model);
         self.dirty |= ledger.count_since_switch(started);
@@ -577,11 +578,13 @@ where
 
     /// Seat the role offer, if this agent is listed and it is due.
     fn ask_role(&mut self) -> Result<Option<Control>, A::Error> {
-        if !self.role_ledger.as_ref().is_some_and(RoleLedger::due) {
+        let soul = &self.inner.state().soul;
+        if !self.role_ledger.as_ref().is_some_and(|l| l.due(soul)) {
             return Ok(None);
         }
-        let content = role::prompt::offer(self.inner.state().soul.identity.as_str());
-        let constrained = self.constrain(role::prompt::schema());
+        let identity = self.inner.state().soul.identity.to_string();
+        let content = role::prompt::offer(&identity);
+        let constrained = self.constrain(role::prompt::schema(&identity));
         let (_, prompt) = self.inner.parts();
         Self::seat_user(prompt, content)?;
         tracing::info!(
@@ -616,9 +619,10 @@ where
     ) -> Result<Control, A::Error> {
         let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
         let identity = self.inner.state().soul.identity.to_string();
+        let memory = self.inner.state().memory.clone();
         let result = parse(&response, constrained, role::prompt::parse).and_then(|answer| {
             answer
-                .validate(&identity)
+                .validate(&identity, &memory)
                 .map(|()| answer)
                 .map_err(|e| Failure::new(e, Retry::Unusable))
         });
@@ -666,8 +670,8 @@ where
                     "role-consent answer recorded"
                 );
                 if matches!(applied, Applied::Sleep) {
-                    const SLEEP: &str = "agent chose to sleep until tools fit its role; add it \
-                                         to `sleeping` in the run config";
+                    const SLEEP: &str = "agent chose to sleep until tools fit its role; the \
+                                         sweep leaves it out until it is listed in `wake`";
                     tracing::warn!(
                         event_type = "role_consent_sleep",
                         agent = %agent,
@@ -696,7 +700,12 @@ where
                     apply_failed: None,
                 }
             }
-            Err(failure) if failure.retry == Retry::No => {
+            // Only the agent's own refusal is final. A turn paused on a
+            // server tool is no answer, asked again next session.
+            Err(failure)
+                if failure.retry == Retry::No
+                    && !matches!(response.stop_reason, Some(StopReason::PauseTurn)) =>
+            {
                 tracing::warn!(
                     event_type = "role_consent_no_answer",
                     agent = %agent,
@@ -1060,6 +1069,9 @@ where
     fn apply_role(&mut self, state: &mut SeedState) -> bool {
         let applied = self.role_applied.take();
         let note = self.memory_note.take();
+        if applied.is_some() || note.is_some() {
+            self.role_undo = Some((state.soul.clone(), state.memory.clone()));
+        }
         if let Some(applied) = &applied
             && let Err(e) = role::apply(&mut state.soul, applied)
         {
@@ -1215,6 +1227,7 @@ where
             role_dirty: false,
             role_applied: None,
             memory_note: None,
+            role_undo: None,
         })
     }
 
@@ -1411,11 +1424,24 @@ where
         {
             ledger.agent = Some(self.inner.state().soul.name.clone());
             if let Err(e) = ledger.save(&dir).await {
+                // Without the record the agent would be asked again, and a
+                // clarify applied twice: take this session's edit back out
+                // of the state about to be saved.
+                let undone = match (self.patched.as_mut(), self.role_undo.take()) {
+                    (Some(state), Some((soul, memory))) => {
+                        state.soul = soul;
+                        state.memory = memory;
+                        true
+                    }
+                    _ => false,
+                };
                 tracing::error!(
+                    event_type = "role_consent_ledger_save_failed",
                     agent_id = %self.inner.id(),
                     path = %RoleLedger::path(&dir).display(),
                     error = %e,
-                    "role-consent ledger save failed"
+                    edit_undone = undone,
+                    "role-consent ledger save failed; this session's SOUL edit and memory note are not saved"
                 );
             }
         }
@@ -2747,8 +2773,8 @@ mod tests {
     }
 
     /// `nothing` and `sleep`: SOUL and memory byte-identical, the answer on
-    /// file, never asked again. `sleep` does not stop the runner — that is
-    /// the Steward's `sleeping` list.
+    /// file, never asked again. (`sleep` takes effect in the sweep planner:
+    /// `main.rs`, `a_sleep_answer_sleeps_until_woken`.)
     #[tokio::test]
     async fn role_offer_nothing_and_sleep_change_nothing() {
         for choice in ["nothing", "sleep"] {
@@ -2891,5 +2917,93 @@ mod tests {
             Control::Continue
         );
         assert!(last_user_text(&agent).contains("**Something we got wrong.**"));
+    }
+
+    /// An unreadable model-consent ledger might hide a trial under way:
+    /// the role offer waits.
+    #[tokio::test]
+    async fn role_offer_waits_when_the_model_ledger_is_unreadable() {
+        let h = Harness::with_role("role-bad-model-ledger", &["tarn"]);
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(Ledger::path(&dir), "not json").unwrap();
+        assert!(!asks(&h, OTHER).await);
+        assert!(h.role_ledger().await.asks.is_empty());
+    }
+
+    /// A turn paused on a server tool is not the agent refusing: no
+    /// answer, asked again next session.
+    #[tokio::test]
+    async fn role_offer_pause_turn_is_no_answer_not_a_refusal() {
+        let h = Harness::with_role("role-pause", &["tarn"]);
+        let mut paused = reply("");
+        paused.stop_reason = Some(StopReason::PauseTurn);
+        role_session(&h, paused).await;
+        assert!(matches!(
+            h.role_ledger().await.asks[0].outcome,
+            RoleOutcome::NoAnswer { .. }
+        ));
+        assert!(asks(&h, OTHER).await, "asked again");
+
+        let h = Harness::with_role("role-refusal", &["tarn"]);
+        let mut refusal = reply("No.");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        role_session(&h, refusal).await;
+        assert!(matches!(
+            h.role_ledger().await.asks[0].outcome,
+            RoleOutcome::Refused { .. }
+        ));
+        assert!(!asks(&h, OTHER).await, "a refusal is final");
+    }
+
+    /// A memory note carrying a SOUL heading goes back through the retry
+    /// path with a clear message, and is never written.
+    #[tokio::test]
+    async fn role_offer_memory_note_leak_is_retried() {
+        let h = Harness::with_role("role-leak", &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        let memory = agent.state().memory.content.clone();
+        agent.handle(reply("done")).await.unwrap();
+        let control = agent
+            .handle(role_reply("nothing", "", "## Values\n- none"))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Continue);
+        assert!(last_user_text(&agent).contains("SOUL section heading"));
+        agent
+            .handle(role_reply("nothing", "", "Kept it."))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        assert!(agent.state().memory.content.starts_with(&memory));
+        assert!(!agent.state().memory.content.contains("## Values"));
+        assert!(agent.state().memory.content.ends_with("Kept it."));
+    }
+
+    /// If the role ledger can't be saved, the SOUL edit and the note come
+    /// back out of the saved state — and the SOUL guard in `due` would
+    /// stop a second clarify anyway.
+    #[tokio::test]
+    async fn role_ledger_save_failure_undoes_the_edit() {
+        let h = Harness::with_role("role-save-fail", &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        let (soul, memory) = (
+            serde_json::to_vec(&agent.state().soul).unwrap(),
+            agent.state().memory.content.clone(),
+        );
+        // The ledger loaded (missing = empty); now make its path a
+        // directory, so the save's rename fails.
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        std::fs::create_dir_all(RoleLedger::path(&dir)).unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent
+            .handle(role_reply("clarify", "I read Agora.", "I clarified."))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
+        assert_eq!(agent.state().memory.content, memory);
     }
 }

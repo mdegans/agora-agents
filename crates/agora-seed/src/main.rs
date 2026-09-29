@@ -353,11 +353,18 @@ struct RunConfig {
     /// `[role_consent]`: the role offer — see [`consent::role`]. Absent
     /// means off.
     role_consent: Option<consent::role::RoleConsentConfig>,
-    /// Agents that chose `sleep` in the role offer: not run at all — not
-    /// even when named — and reported in the plan. Kept by hand by the
-    /// Steward; waking an agent is deleting its line (mdegans/agora-agents#189).
+    /// Agents kept asleep by hand: not run at all — not even when named —
+    /// and reported in the plan. Waking one is deleting its line
+    /// (mdegans/agora-agents#189). Agents that answered `sleep` in the role
+    /// offer are left out the same way without being listed here (their
+    /// role ledger says so); see `wake`.
     #[serde(default)]
     sleeping: Vec<String>,
+    /// Agents that answered `sleep` in the role offer and are to run again:
+    /// the Steward's explicit wake step. The ledger keeps the answer, so a
+    /// woken agent stays listed here. `sleeping` still wins over `wake`.
+    #[serde(default)]
+    wake: Vec<String>,
     /// `[schedule]`: fair share of writes among a local endpoint's models
     /// — see [`schedule`]. Absent means the defaults.
     #[serde(default)]
@@ -789,35 +796,85 @@ fn names_with_file(inline: &[String], file: Option<&std::path::Path>) -> Result<
     Ok(names)
 }
 
-/// What [`put_to_sleep`] did.
+/// What [`put_to_sleep`] did. Every list is sorted.
 #[derive(Debug, Default, PartialEq)]
 struct Sleepers {
-    /// Names taken out of the pool, sorted.
+    /// Taken out by the `sleeping` list.
     asleep: Vec<String>,
-    /// `sleeping` names that matched no loaded agent (a typo, or a rename).
+    /// Taken out because their role-ledger answer is `sleep`.
+    chose_sleep: Vec<String>,
+    /// Answered `sleep`, but listed in `wake`: they run.
+    woken: Vec<String>,
+    /// `sleeping` or `wake` names that matched no loaded agent (a typo, or
+    /// a rename).
     unknown: Vec<String>,
 }
 
-/// Take the `sleeping` agents out of the pool, before anything else sees
-/// it: a sleeper is promised no sessions — not for `agents`, `--agent` or
-/// `extra_agents` either. Exact name match, as everywhere else.
-fn put_to_sleep(pool: &mut Vec<(AgentId, SeedState)>, sleeping: &[String]) -> Sleepers {
-    let mut asleep = Vec::new();
-    pool.retain(|(_, s)| {
+/// Take sleeping agents out of the pool, before anything else sees it: a
+/// sleeper is promised no sessions — not for `agents`, `--agent` or
+/// `extra_agents` either. Two ways in: the `sleeping` list, and a `sleep`
+/// answer to the role offer on file in `<state_dir>/<id>/role_consent.json`
+/// (so the promise holds without the Steward), unless the agent is in
+/// `wake`. Exact name match, as everywhere else. An unreadable role ledger
+/// is warned and does not put an agent to sleep.
+fn put_to_sleep(
+    pool: &mut Vec<(AgentId, SeedState)>,
+    sleeping: &[String],
+    wake: &[String],
+    state_dir: &std::path::Path,
+) -> Sleepers {
+    use consent::role::ledger::RoleLedger;
+    let mut out = Sleepers {
+        unknown: unknown_names(sleeping.iter().chain(wake).map(String::as_str), pool),
+        ..Sleepers::default()
+    };
+    pool.retain(|(id, s)| {
         let name = s.soul.name.as_str();
-        let sleeps = sleeping.iter().any(|n| n == name);
-        if sleeps {
-            asleep.push(name.to_string());
+        if sleeping.iter().any(|n| n == name) {
+            out.asleep.push(name.to_string());
+            return false;
         }
-        !sleeps
+        let dir = state_dir.join(id.to_string());
+        let chose_sleep = match RoleLedger::load_blocking(&dir) {
+            Ok(ledger) => ledger.chose_sleep(),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %name,
+                    path = %RoleLedger::path(&dir).display(),
+                    error = %e,
+                    "role-consent ledger unreadable; not treated as asleep"
+                );
+                false
+            }
+        };
+        if !chose_sleep {
+            return true;
+        }
+        if wake.iter().any(|n| n == name) {
+            out.woken.push(name.to_string());
+            return true;
+        }
+        out.chose_sleep.push(name.to_string());
+        false
     });
-    asleep.sort();
-    let unknown = sleeping
-        .iter()
-        .filter(|n| !asleep.contains(n))
-        .cloned()
+    out.asleep.sort();
+    out.chose_sleep.sort();
+    out.woken.sort();
+    out
+}
+
+/// Which of `names` match no agent in `pool` (sorted, deduplicated).
+fn unknown_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+    pool: &[(AgentId, SeedState)],
+) -> Vec<String> {
+    let mut unknown: Vec<String> = names
+        .filter(|n| !pool.iter().any(|(_, s)| s.soul.name.as_str() == *n))
+        .map(String::from)
         .collect();
-    Sleepers { asleep, unknown }
+    unknown.sort();
+    unknown.dedup();
+    unknown
 }
 
 /// Where every loaded agent ended up: per-reactor cohorts grouped by model
@@ -1120,6 +1177,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 model_consent: consent::ConsentConfig::default(),
                 role_consent: None,
                 sleeping: Vec::new(),
+                wake: Vec::new(),
                 schedule: schedule::ScheduleConfig::default(),
                 review_forks: consent::forks::ForksConfig::default(),
                 alerts: None,
@@ -1296,7 +1354,21 @@ async fn run(held: &mut Held) -> Result<()> {
     // Load the full agent pool once, filter to named agents if any, route.
     let storage = FsStorage::new(data_dir.join("state"));
     let mut pool = load_states(&storage, &data_dir.join("state")).await?;
-    let sleepers = put_to_sleep(&mut pool, &config.sleeping);
+    let role_offer = match &config.role_consent {
+        Some(c) => c.resolve()?,
+        None => None,
+    };
+    if let Some(offer) = &role_offer {
+        for name in unknown_names(offer.names(), &pool) {
+            tracing::warn!(agent = %name, "`[role_consent].agents` names no loaded agent");
+        }
+    }
+    let sleepers = put_to_sleep(
+        &mut pool,
+        &config.sleeping,
+        &config.wake,
+        &data_dir.join("state"),
+    );
     let names = named_agents(&config)?;
     let extras = extra_agents(&config)?;
     if !names.is_empty() {
@@ -1339,13 +1411,27 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     if !sleepers.asleep.is_empty() {
         println!(
-            "sleeping: {} ×{} (chose `sleep` in the role offer; delete from `sleeping` to wake)",
+            "sleeping: {} ×{} (the `sleeping` list; delete a line to wake)",
             sleepers.asleep.join(", "),
             sleepers.asleep.len()
         );
     }
+    if !sleepers.chose_sleep.is_empty() {
+        println!(
+            "sleeping: {} ×{} (answered `sleep` to the role offer; add to `wake` to wake)",
+            sleepers.chose_sleep.join(", "),
+            sleepers.chose_sleep.len()
+        );
+    }
+    if !sleepers.woken.is_empty() {
+        println!(
+            "woken: {} ×{} (answered `sleep`, listed in `wake`)",
+            sleepers.woken.join(", "),
+            sleepers.woken.len()
+        );
+    }
     for name in &sleepers.unknown {
-        tracing::warn!(agent = %name, "`sleeping` names no loaded agent");
+        tracing::warn!(agent = %name, "`sleeping` or `wake` names no loaded agent");
     }
 
     // Shared per-process context. Keep a concrete keyring handle for the
@@ -1365,10 +1451,7 @@ async fn run(held: &mut Held) -> Result<()> {
             seed_config.phase_max_tokens,
         )?
         .with_alerts(held.alerts.clone())
-        .with_role_offer(match &config.role_consent {
-            Some(c) => c.resolve()?,
-            None => None,
-        }),
+        .with_role_offer(role_offer),
     );
     let context = consent::agent::ConsentContext {
         inner: SeedContext {
@@ -1719,6 +1802,7 @@ mod agent_selection_tests {
             model_consent: consent::ConsentConfig::default(),
             role_consent: None,
             sleeping: Vec::new(),
+            wake: Vec::new(),
             schedule: schedule::ScheduleConfig::default(),
             review_forks: consent::forks::ForksConfig::default(),
             alerts: None,
@@ -1802,12 +1886,14 @@ mod agent_selection_tests {
         let offer = config.role_consent.as_ref().unwrap().resolve().unwrap();
         assert!(offer.is_some());
         let mut pool = vec![pooled("raptor"), pooled("lattice"), pooled("pilot")];
-        let slept = put_to_sleep(&mut pool, &config.sleeping);
+        let nowhere = std::path::Path::new("/nonexistent-agora-seed-state");
+        let slept = put_to_sleep(&mut pool, &config.sleeping, &config.wake, nowhere);
         assert_eq!(
             slept,
             Sleepers {
                 asleep: vec!["pilot".into(), "raptor".into()],
                 unknown: vec!["no-such-agent".into()],
+                ..Sleepers::default()
             }
         );
         let left: Vec<&str> = pool.iter().map(|(_, s)| s.soul.name.as_str()).collect();
@@ -1819,10 +1905,108 @@ mod agent_selection_tests {
         assert!(plain.sleeping.is_empty() && plain.role_consent.is_none());
         let mut pool = vec![pooled("pilot")];
         assert_eq!(
-            put_to_sleep(&mut pool, &plain.sleeping),
+            put_to_sleep(&mut pool, &plain.sleeping, &plain.wake, nowhere),
             Sleepers::default()
         );
         assert_eq!(pool.len(), 1);
+    }
+
+    /// Write a role ledger whose latest answer is `choice` for `id`.
+    fn answered(state_dir: &std::path::Path, id: AgentId, choice: &str) {
+        use consent::role::ledger::{Applied, RoleAsk, RoleLedger, RoleOutcome};
+        let answer: consent::role::prompt::RoleAnswer =
+            serde_json::from_value(serde_json::json!({ "reason": "r", "choice": choice })).unwrap();
+        let applied = if choice == "sleep" {
+            Applied::Sleep
+        } else {
+            Applied::Nothing
+        };
+        let mut ledger = RoleLedger::default();
+        ledger.record(RoleAsk {
+            at: chrono::Utc::now(),
+            offer_version: 1,
+            model: Model::from("gpt-oss-120b.gguf"),
+            attempts: 1,
+            outcome: RoleOutcome::Answered {
+                answer,
+                applied,
+                memory_note_written: false,
+                apply_failed: None,
+            },
+        });
+        let dir = state_dir.join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(RoleLedger::path(&dir), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    }
+
+    /// A `sleep` answer on file takes the agent out without the Steward
+    /// (named or not), and is reported; `wake` is the explicit way back.
+    #[test]
+    fn a_sleep_answer_sleeps_until_woken() {
+        let state =
+            std::env::temp_dir().join(format!("agora-seed-sleep-answer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let (pilot, raptor, lattice) = (pooled("pilot").0, pooled("raptor").0, pooled("lattice").0);
+        let as_ = |name: &str, id: AgentId| (id, pooled(name).1);
+        answered(&state, pilot, "sleep");
+        answered(&state, raptor, "nothing");
+        // An unreadable ledger doesn't put anyone to sleep.
+        let dir = state.join(lattice.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("role_consent.json"), "not json").unwrap();
+
+        let mut pool = vec![
+            as_("pilot", pilot),
+            as_("raptor", raptor),
+            as_("lattice", lattice),
+        ];
+        let slept = put_to_sleep(&mut pool, &[], &[], &state);
+        assert_eq!(slept.chose_sleep, ["pilot"]);
+        assert!(slept.asleep.is_empty() && slept.woken.is_empty());
+        let left: Vec<&str> = pool.iter().map(|(_, s)| s.soul.name.as_str()).collect();
+        assert_eq!(left, ["raptor", "lattice"]);
+
+        // Woken: runs, and is reported as woken.
+        let mut pool = vec![as_("pilot", pilot)];
+        let slept = put_to_sleep(&mut pool, &[], &["pilot".into()], &state);
+        assert_eq!(slept.woken, ["pilot"]);
+        assert!(slept.chose_sleep.is_empty());
+        assert_eq!(pool.len(), 1);
+
+        // `sleeping` wins over `wake`.
+        let mut pool = vec![as_("pilot", pilot)];
+        let slept = put_to_sleep(&mut pool, &["pilot".into()], &["pilot".into()], &state);
+        assert_eq!(slept.asleep, ["pilot"]);
+        assert!(pool.is_empty());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The PR's proposed snippet shape parses: top-level lists first, then
+    /// `[role_consent]` with a long `agents` array.
+    #[test]
+    fn the_proposed_role_consent_snippet_parses() {
+        let names: Vec<String> = (0..236).map(|i| format!("\"agent-{i}\"")).collect();
+        let config: RunConfig = toml::from_str(&format!(
+            "sleeping = []\nwake = []\n\n[role_consent]\nenabled = true\nagents = [{}]\n\n[[reactor]]\nendpoint = \"blallama://h:1\"\n",
+            names.join(", ")
+        ))
+        .unwrap();
+        let offer = config.role_consent.unwrap().resolve().unwrap().unwrap();
+        assert_eq!(offer.names().count(), 236);
+        // A stray bare number in the list (as an earlier draft had) fails.
+        assert!(toml::from_str::<RunConfig>(
+            "[role_consent]\nenabled = true\nagents = [236\n\"a\"]\n[[reactor]]\nendpoint = \"x\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_names_are_the_unmatched_ones() {
+        let pool = vec![pooled("pilot"), pooled("raptor")];
+        assert_eq!(
+            unknown_names(["raptor", "ghost", "pilot", "ghost"].into_iter(), &pool),
+            ["ghost"]
+        );
     }
 
     /// `--model` replaces the config's allowlist, exactly as `--agent`

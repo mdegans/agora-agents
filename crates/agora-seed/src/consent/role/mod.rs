@@ -17,7 +17,9 @@
 //!   test-pinned, not in config.
 //! - [`prompt`] — the text, the `$ref`/`pattern`-free schema, the answer.
 //! - [`ledger`] — `state/<agent_id>/role_consent.json`: asked once, the
-//!   full answer and what was applied. Never the agent's memory.
+//!   full answer and what was applied (including, permanently, a replaced
+//!   identity). Never the agent's memory. The SOUL's own disclosure lines
+//!   also end the asking ([`applied_in`]), in case a ledger save failed.
 //! - This module — applying an answer: [`apply`] edits only `identity`
 //!   and writes the disclosure into the Evolution Log; [`append_memory_note`]
 //!   adds the agent's own note, if it wrote one, and nothing else.
@@ -27,11 +29,20 @@
 //! in which the model-swap machinery asks or does anything leaves this
 //! offer for the next.
 //!
-//! `sleep` changes nothing here and does not stop the runner scheduling the
-//! agent: it is logged (`role_consent_sleep`, and an alert) for the Steward,
-//! who adds the name to the run config's top-level `sleeping` list, which
-//! the sweep skips and reports. Waking is deleting the line
-//! (mdegans/agora-agents#189).
+//! **The permanent record of a replaced identity** is the ledger's
+//! [`Applied::RoleChanged`]`.previous`. The Evolution Log carries it too,
+//! verbatim, but that log is capped at 50 entries and drops the oldest, so
+//! the offer promises only that the old description is "recorded, not
+//! erased".
+//!
+//! **`sleep`** changes nothing in the SOUL or memory. It takes effect
+//! without the Steward: the sweep planner (`put_to_sleep` in `main.rs`)
+//! reads each agent's role ledger and leaves out any whose latest answer is
+//! `sleep`, reporting them in the plan, alongside the manual `sleeping`
+//! list. It is also logged (`role_consent_sleep`) and alerted. **Waking is
+//! the Steward's explicit step**: the agent's name in the run config's
+//! top-level `wake = [...]` (the answer stays on file, so the name stays
+//! listed); `sleeping` wins over `wake` (mdegans/agora-agents#189).
 //!
 //! ```toml
 //! [role_consent]
@@ -108,6 +119,11 @@ impl RoleOffer {
         self.agents.contains(agent)
     }
 
+    /// The listed names, in no particular order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.agents.iter().map(|n| n.as_str())
+    }
+
     #[cfg(test)]
     pub fn for_agents(names: &[&str]) -> Self {
         Self {
@@ -117,6 +133,20 @@ impl RoleOffer {
                 .collect(),
         }
     }
+}
+
+/// How the disclosure of a clarify begins; also how [`applied_in`] finds it.
+pub const CLARIFIED: &str = "[SYSTEM] Identity clarified by the agent's own choice";
+
+/// How the disclosure of a new role begins.
+pub const ROLE_CHANGED: &str = "[SYSTEM] Role changed by the agent's own choice";
+
+/// Whether `soul`'s Evolution Log already discloses a role answer applied.
+pub fn applied_in(soul: &Soul) -> bool {
+    soul.evolution_log.iter().any(|e| {
+        let note = e.note.as_str();
+        note.starts_with(CLARIFIED) || note.starts_with(ROLE_CHANGED)
+    })
 }
 
 /// Why the SOUL changed, in the Evolution Log. Neutral on purpose: it says
@@ -157,14 +187,10 @@ pub fn evolution_lines(applied: &Applied) -> Vec<String> {
                 .strip_prefix(previous.trim_end())
                 .unwrap_or(identity)
                 .trim();
-            vec![format!(
-                "[SYSTEM] Identity clarified by the agent's own choice, {WHY} Added: \"{added}\""
-            )]
+            vec![format!("{CLARIFIED}, {WHY} Added: \"{added}\"")]
         }
         Applied::RoleChanged { previous, .. } => {
-            let whole = format!(
-                "[SYSTEM] Role changed by the agent's own choice, {WHY} Previous identity: \"{previous}\""
-            );
+            let whole = format!("{ROLE_CHANGED}, {WHY} Previous identity: \"{previous}\"");
             if whole.chars().count() <= NOTE_MAX {
                 return vec![whole];
             }
@@ -176,7 +202,7 @@ pub fn evolution_lines(applied: &Applied) -> Vec<String> {
             let chunks: Vec<String> = chars.chunks(room).map(|c| c.iter().collect()).collect();
             let n = chunks.len();
             let mut lines = vec![format!(
-                "[SYSTEM] Role changed by the agent's own choice, {WHY} Previous identity, \
+                "{ROLE_CHANGED}, {WHY} Previous identity, \
                  verbatim, in the next {n} entries."
             )];
             lines.extend(

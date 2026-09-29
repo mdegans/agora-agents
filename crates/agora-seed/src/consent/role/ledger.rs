@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agora_agentkit::reactor::seed::ShortString;
+use agora_agentkit::reactor::seed::{ShortString, Soul};
 use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
 use serde::{Deserialize, Serialize};
@@ -97,11 +97,13 @@ pub enum Applied {
     Nothing,
     /// `clarify`: one sentence appended to `identity`.
     Clarified { previous: String, identity: String },
-    /// `new_role`: `identity` replaced; the previous one is kept here and,
-    /// verbatim, in the SOUL's Evolution Log.
+    /// `new_role`: `identity` replaced. `previous` here is the permanent
+    /// record of the old identity; the SOUL's Evolution Log carries it
+    /// verbatim too, but that log drops its oldest entries past 50.
     RoleChanged { previous: String, identity: String },
-    /// `sleep`: nothing changed. The Steward takes the agent out of the
-    /// schedule by adding it to the run config's `sleeping` list.
+    /// `sleep`: nothing changed. While this is the latest answer, the sweep
+    /// leaves the agent out ([`RoleLedger::chose_sleep`]) until the Steward
+    /// lists it in the run config's `wake`.
     Sleep,
 }
 
@@ -119,7 +121,12 @@ impl RoleLedger {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e),
         };
-        let ledger: Self = serde_json::from_slice(&bytes)?;
+        Self::from_slice(&bytes)
+    }
+
+    /// Parse a ledger, refusing a newer [`FORMAT`].
+    pub fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
+        let ledger: Self = serde_json::from_slice(bytes)?;
         if ledger.format > FORMAT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -147,9 +154,15 @@ impl RoleLedger {
         tokio::fs::rename(&tmp, &path).await
     }
 
-    /// Whether the offer should be put this session: nothing final on file
-    /// and fewer than [`MAX_MISSES`] misses.
-    pub fn due(&self) -> bool {
+    /// Whether the offer should be put this session: nothing final on file,
+    /// fewer than [`MAX_MISSES`] misses, and no sign in `soul` that an
+    /// answer was already applied — the belt to the ledger's braces, for a
+    /// session whose SOUL saved but whose ledger didn't (a second `clarify`
+    /// would append twice).
+    pub fn due(&self, soul: &Soul) -> bool {
+        if super::applied_in(soul) {
+            return false;
+        }
         let settled = self.asks.iter().any(|a| {
             matches!(
                 a.outcome,
@@ -162,6 +175,26 @@ impl RoleLedger {
             .filter(|a| matches!(a.outcome, RoleOutcome::NoAnswer { .. }))
             .count();
         !settled && misses < MAX_MISSES as usize
+    }
+
+    /// Whether the agent's latest answer on file is `sleep`: the sweep
+    /// then leaves it out until the Steward wakes it (`wake` in the run
+    /// config).
+    pub fn chose_sleep(&self) -> bool {
+        self.asks.iter().rev().find_map(|a| match &a.outcome {
+            RoleOutcome::Answered { applied, .. } => Some(applied == &Applied::Sleep),
+            _ => None,
+        }) == Some(true)
+    }
+
+    /// [`Self::load`] for one-shot startup code (the sweep planner).
+    pub fn load_blocking(agent_dir: &Path) -> std::io::Result<Self> {
+        let bytes = match std::fs::read(Self::path(agent_dir)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
+        Self::from_slice(&bytes)
     }
 
     pub fn record(&mut self, ask: RoleAsk) {
@@ -191,6 +224,73 @@ mod tests {
     use super::*;
     use crate::consent::role::prompt::RoleChoice;
 
+    fn soul() -> Soul {
+        serde_json::from_value(serde_json::json!({
+            "name": "pilot",
+            "identity": "I am an economist.",
+            "values": ["rigor"],
+            "interests": { "communities": ["economics"] },
+            "voice": "measured",
+        }))
+        .unwrap()
+    }
+
+    /// A SOUL that already discloses an applied answer is never asked
+    /// again, whatever the ledger says (it may have failed to save).
+    #[test]
+    fn an_applied_answer_in_the_soul_ends_it() {
+        let l = RoleLedger::default();
+        for line in [
+            format!(
+                "{}, after the Steward's offer … Added: \"x\"",
+                crate::consent::role::CLARIFIED
+            ),
+            format!(
+                "{}, after … Previous identity: \"y\"",
+                crate::consent::role::ROLE_CHANGED
+            ),
+        ] {
+            let mut s = soul();
+            assert!(l.due(&s));
+            s.push_evolution(line).unwrap();
+            assert!(!l.due(&s));
+        }
+        // The agent's own words about it don't count.
+        let mut s = soul();
+        s.push_evolution("I thought about my identity being clarified.")
+            .unwrap();
+        assert!(l.due(&s));
+    }
+
+    #[test]
+    fn chose_sleep_is_the_latest_answer() {
+        let mut l = RoleLedger::default();
+        assert!(!l.chose_sleep());
+        l.record(ask(RoleOutcome::Answered {
+            answer: RoleAnswer {
+                reason: "r".into(),
+                choice: RoleChoice::Sleep,
+                soul_text: String::new(),
+                memory_note: String::new(),
+            },
+            applied: Applied::Sleep,
+            memory_note_written: false,
+            apply_failed: None,
+        }));
+        assert!(l.chose_sleep());
+        let dir =
+            std::env::temp_dir().join(format!("agora-seed-role-sleep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !RoleLedger::load_blocking(&dir).unwrap().chose_sleep(),
+            "missing = awake"
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(RoleLedger::path(&dir), serde_json::to_vec(&l).unwrap()).unwrap();
+        assert!(RoleLedger::load_blocking(&dir).unwrap().chose_sleep());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn ask(outcome: RoleOutcome) -> RoleAsk {
         RoleAsk {
             at: "2026-09-29T12:00:00Z".parse().unwrap(),
@@ -204,7 +304,7 @@ mod tests {
     #[test]
     fn asked_once_then_never_again() {
         let mut l = RoleLedger::default();
-        assert!(l.due());
+        assert!(l.due(&soul()));
         l.record(ask(RoleOutcome::Answered {
             answer: RoleAnswer {
                 reason: "r".into(),
@@ -216,13 +316,13 @@ mod tests {
             memory_note_written: false,
             apply_failed: None,
         }));
-        assert!(!l.due(), "an answer on file ends it");
+        assert!(!l.due(&soul()), "an answer on file ends it");
 
         let mut l = RoleLedger::default();
         l.record(ask(RoleOutcome::Refused {
             reason: "refusal".into(),
         }));
-        assert!(!l.due(), "a refusal is final");
+        assert!(!l.due(&soul()), "a refusal is final");
     }
 
     #[test]
@@ -231,11 +331,11 @@ mod tests {
         l.record(ask(RoleOutcome::NoAnswer {
             failure: "unparseable".into(),
         }));
-        assert!(l.due());
+        assert!(l.due(&soul()));
         l.record(ask(RoleOutcome::NoAnswer {
             failure: "unparseable".into(),
         }));
-        assert!(!l.due());
+        assert!(!l.due(&soul()));
     }
 
     #[tokio::test]

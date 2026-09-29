@@ -79,8 +79,8 @@ pub enum AlertKind {
     ModelSwitchFailed,
     /// A model went over its wall-clock ceiling and sat a sweep out.
     ScheduleCeilingHit,
-    /// An agent answered the role offer with `sleep`: the Steward adds it
-    /// to the run config's `sleeping` list.
+    /// An agent answered the role offer with `sleep`; the sweep leaves it
+    /// out from now on, until the Steward lists it in `wake`.
     RoleConsentSleep,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
@@ -147,9 +147,10 @@ impl AlertKind {
             Self::RoleConsentSleep => {
                 "An agent answered the role offer with `sleep`: it asked to \
                  pause its sessions until tools that fit its role exist. The \
-                 runner does not stop scheduling it by itself: add its name to \
-                 `sleeping` in the run config. It is woken by deleting the \
-                 line (mdegans/agora-agents#189)."
+                 runner leaves it out of every sweep from now on (its role \
+                 ledger says so; the plan lists it under `sleeping`). Nothing \
+                 to do now. To wake it, add its name to `wake` in the run \
+                 config (mdegans/agora-agents#189)."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
