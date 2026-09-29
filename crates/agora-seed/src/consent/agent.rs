@@ -2824,7 +2824,7 @@ mod tests {
                 assert_eq!(control, Control::Done(Outcome::Complete));
             }
         }
-        assert!(last_user_text(&agent).contains("at most 300"));
+        assert!(last_user_text(&agent).contains("Your `soul_text` is longer than the limit"));
         agent.on_teardown().await.unwrap();
         assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
         match &h.role_ledger().await.asks[0].outcome {

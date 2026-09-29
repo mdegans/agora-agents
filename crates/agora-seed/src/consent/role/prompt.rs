@@ -99,37 +99,87 @@ impl RoleAnswer {
                 );
             }
             RoleChoice::Clarify if chars(text) > CLARIFY_MAX_CHARS => {
-                return Err(format!(
-                    "`soul_text` is {} characters; a `clarify` sentence may be at most \
-                     {CLARIFY_MAX_CHARS}",
-                    chars(text)
-                ));
+                return Err(over_limit("soul_text", text, CLARIFY_MAX_CHARS));
             }
-            RoleChoice::Clarify if chars(identity.trim_end()) + 1 + chars(text) > IDENTITY_MAX => {
-                return Err(format!(
-                    "`soul_text` does not fit: your identity holds at most {IDENTITY_MAX} \
-                     characters, and it is already {}",
-                    chars(identity.trim_end())
-                ));
+            RoleChoice::Clarify => {
+                // It has to fit after the identity and a space.
+                let room = IDENTITY_MAX.saturating_sub(chars(identity.trim_end()) + 1);
+                if chars(text) > room {
+                    return Err(over_limit("soul_text", text, room));
+                }
             }
             RoleChoice::NewRole if chars(text) > NEW_ROLE_MAX_CHARS => {
-                return Err(format!(
-                    "`soul_text` is {} characters; a `new_role` description may be at most \
-                     {NEW_ROLE_MAX_CHARS}",
-                    chars(text)
-                ));
+                return Err(over_limit("soul_text", text, NEW_ROLE_MAX_CHARS));
             }
             _ => {}
         }
         let note = self.memory_note.trim();
         if chars(note) > MEMORY_NOTE_MAX_CHARS {
-            return Err(format!(
-                "`memory_note` is {} characters; it may be at most {MEMORY_NOTE_MAX_CHARS}",
-                chars(note)
-            ));
+            return Err(over_limit("memory_note", note, MEMORY_NOTE_MAX_CHARS));
         }
         Ok(())
     }
+}
+
+/// Characters of context quoted on each side of the cut in [`over_limit`].
+const CUT_CONTEXT_CHARS: usize = 80;
+
+/// The cut mark.
+const CUT: &str = "⟂";
+
+/// Why `text` (the agent's `field`) is refused as longer than `limit`
+/// characters, shown to the agent before it tries again: not a count, but
+/// its own words around the point where the limit falls, with the cut
+/// marked and what fell after it — so it gets a concrete sense of how much
+/// to shorten. The cut is on a character boundary; if the limit falls
+/// inside a word, the mark moves back to the previous whitespace, and the
+/// message says so.
+pub fn over_limit(field: &str, text: &str, limit: usize) -> String {
+    // Byte index of the first character past the limit (a char boundary).
+    let mut cut = text
+        .char_indices()
+        .nth(limit)
+        .map_or(text.len(), |(i, _)| i);
+    let mid_word = text[..cut]
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace())
+        && text[cut..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace());
+    let mut moved = false;
+    if mid_word && let Some((i, _)) = text[..cut].char_indices().rfind(|(_, c)| c.is_whitespace()) {
+        cut = i;
+        moved = true;
+    }
+    let (kept, lost) = (text[..cut].trim_end(), text[cut..].trim_start());
+    let kept_chars = kept.chars().count();
+    let before: String = kept
+        .chars()
+        .skip(kept_chars.saturating_sub(CUT_CONTEXT_CHARS))
+        .collect();
+    let after: String = lost.chars().take(CUT_CONTEXT_CHARS).collect();
+    let lead = if kept_chars > CUT_CONTEXT_CHARS {
+        "…"
+    } else {
+        ""
+    };
+    let tail = if lost.chars().count() > CUT_CONTEXT_CHARS {
+        "…"
+    } else {
+        ""
+    };
+    let word = if moved {
+        " The limit falls inside a word, so the mark is at the word break just before it."
+    } else {
+        ""
+    };
+    format!(
+        "Your `{field}` is longer than the limit. It would have ended here {CUT}: \
+         \"{lead}{before} {CUT} [cut here] {after}{tail}\".{word} Everything after {CUT} \
+         doesn't fit. Please shorten it and answer again."
+    )
 }
 
 /// agentkit's `Soul::identity` capacity, in characters.
@@ -394,7 +444,10 @@ mod tests {
         let err = answer(RoleChoice::Clarify, &long(CLARIFY_MAX_CHARS + 1), "")
             .validate("I am x.")
             .unwrap_err();
-        assert!(err.contains("at most 300"), "{err}");
+        assert!(
+            err.contains("Your `soul_text` is longer than the limit"),
+            "{err}"
+        );
         answer(RoleChoice::NewRole, &long(NEW_ROLE_MAX_CHARS), "")
             .validate("I am x.")
             .unwrap();
@@ -407,16 +460,80 @@ mod tests {
         let err = answer(RoleChoice::Clarify, "I read Agora.", "")
             .validate(&long(IDENTITY_MAX - 5))
             .unwrap_err();
-        assert!(err.contains("does not fit"), "{err}");
+        assert!(
+            err.contains("Your `soul_text` is longer than the limit"),
+            "{err}"
+        );
         // The memory note, for any choice.
         let err = answer(RoleChoice::Nothing, "", &long(MEMORY_NOTE_MAX_CHARS + 1))
             .validate("I am x.")
             .unwrap_err();
-        assert!(err.contains("`memory_note`"), "{err}");
+        assert!(err.contains("Your `memory_note` is longer"), "{err}");
         // Characters, not bytes.
         answer(RoleChoice::Clarify, &"é".repeat(CLARIFY_MAX_CHARS), "")
             .validate("I am x.")
             .unwrap();
+    }
+
+    /// The refusal quotes the agent's own words around the cut, marks it,
+    /// and shows what fell after it.
+    #[test]
+    fn over_limit_shows_where_the_text_went_over() {
+        // The limit falls exactly at a word break.
+        let text = "I reason from Agora. I say when a model is hypothetical. And more after.";
+        let limit = "I reason from Agora. I say when a model is hypothetical."
+            .chars()
+            .count();
+        assert_eq!(
+            over_limit("soul_text", text, limit),
+            "Your `soul_text` is longer than the limit. It would have ended here ⟂: \"I reason \
+             from Agora. I say when a model is hypothetical. ⟂ [cut here] And more after.\". \
+             Everything after ⟂ doesn't fit. Please shorten it and answer again."
+        );
+        // Mid-word: the mark backs up to the previous whitespace, and says so.
+        let m = over_limit("memory_note", "one two three", 6);
+        assert!(m.contains("\"one ⟂ [cut here] two three\"."), "{m}");
+        assert!(m.contains("inside a word"), "{m}");
+        // Long text: ~80 characters of context either side, elided.
+        let long = format!("{} {}", "a ".repeat(200), "b ".repeat(200));
+        let m = over_limit("soul_text", &long, 400);
+        let quoted = m.split('"').nth(1).unwrap();
+        assert!(quoted.starts_with('…') && quoted.ends_with('…'), "{quoted}");
+        assert!(
+            quoted.chars().count() < 2 * CUT_CONTEXT_CHARS + 20,
+            "{quoted}"
+        );
+    }
+
+    /// Multi-byte characters at the boundary: the cut is on a character
+    /// boundary (no panic, valid UTF-8), counted in characters.
+    #[test]
+    fn over_limit_cuts_on_a_char_boundary() {
+        // 9 ASCII + "é" (2 bytes) at char 10, then more multi-byte text.
+        let text = "abcdefghi é ü日本語 ünd";
+        for limit in 8..text.chars().count() {
+            let m = over_limit("soul_text", text, limit);
+            assert!(m.contains("⟂ [cut here]"), "{limit}: {m}");
+        }
+        // Limit 11 ends right after "é ": nothing moves.
+        let m = over_limit("soul_text", text, 11);
+        assert!(
+            m.contains("\"abcdefghi é ⟂ [cut here] ü日本語 ünd\"."),
+            "{m}"
+        );
+        assert!(!m.contains("inside a word"));
+        // Limit 13 falls inside "ü日本語": back to the space before it.
+        let m = over_limit("soul_text", text, 13);
+        assert!(
+            m.contains("\"abcdefghi é ⟂ [cut here] ü日本語 ünd\"."),
+            "{m}"
+        );
+        assert!(m.contains("inside a word"));
+        // And through validate, with an all-multi-byte clarify.
+        let err = answer(RoleChoice::Clarify, &"日".repeat(CLARIFY_MAX_CHARS + 3), "")
+            .validate("I am x.")
+            .unwrap_err();
+        assert!(err.contains("⟂ [cut here] 日日日\""), "{err}");
     }
 
     #[test]
