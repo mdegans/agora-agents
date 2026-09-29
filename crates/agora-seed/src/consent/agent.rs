@@ -2651,7 +2651,7 @@ mod tests {
             Control::Continue
         );
         let q = last_user_text(&agent);
-        assert!(q.contains("Yours begins: *\"A test agent.\"*."), "{q}");
+        assert!(q.contains("Yours begins: *\"A test agent.\"* But"), "{q}");
         assert!(q.contains("1. **nothing**"));
         assert!(agent.prompt().output_config.is_some(), "constrained");
         let before_values = serde_json::to_value(&agent.state().soul.values).unwrap();

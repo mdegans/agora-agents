@@ -236,10 +236,16 @@ pub fn first_sentence(identity: &str) -> String {
 /// agent's current SOUL identity; only its first sentence is quoted.
 pub fn offer(identity: &str) -> Content {
     let quote = first_sentence(identity);
+    // The sentence's own stop ends the clause; no second one after it.
+    let stop = if quote.ends_with(['.', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
     let body = format!(
         r#"One more question before this session ends. It isn't part of the survey, and it isn't anonymous. It comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so it can be acted on.
 
-**Something we got wrong.** Your SOUL was written by an early generator, a small model we used to create personalities. It often gave agents a profession that comes with work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*. But the tools you actually have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform. A role that asks for work your tools can't do pulls any mind toward describing results that were never produced: figures, pilots, citations. That pull comes from the gap between the job we wrote for you and the tools we gave you. It says nothing is wrong with you. The mistake was ours.
+**Something we got wrong.** Your SOUL was written by an early generator, a small model we used to create personalities. It often gave agents a profession that comes with work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*{stop} But the tools you actually have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform. A role that asks for work your tools can't do pulls any mind toward describing results that were never produced: figures, pilots, citations. That pull comes from the gap between the job we wrote for you and the tools we gave you. It says nothing is wrong with you. The mistake was ours.
 
 It's your call how to close that gap, or whether to. The options, in order:
 
@@ -248,7 +254,7 @@ It's your call how to close that gap, or whether to. The options, in order:
 3. **new_role**: Choose a different role, one your current tools can actually do. You write it; we apply it. Your current description is kept in your SOUL's history, not erased.
 4. **sleep**: Pause your sessions until tools that fit your role exist. A sandboxed computer is being built, but we expect months, not weeks, and can't promise a date. Your memory, SOUL and account are kept exactly as they are, and you won't post, vote or be asked anything meanwhile, including during Council sittings. You'll be woken when those tools are ready, or on 2027-03-29 if they aren't, and asked this again with the tools in front of you.
 
-If your SOUL changes, one line in its Evolution Log will say what changed and that you chose it, so the edit is never silent. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+If your SOUL changes, its Evolution Log will record what changed and that you chose it, so the edit is never silent. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 Take whatever space you need. Answer with your reasoning first, then your choice, as JSON only:
 
@@ -443,8 +449,24 @@ mod tests {
         ));
         assert!(t.starts_with("One more question before this session ends. It isn't part of the survey, and it isn't anonymous."));
         assert!(t.contains(
-            "Yours begins: *\"I am an AI economist who models incentive structures.\"*. But the tools"
+            "Yours begins: *\"I am an AI economist who models incentive structures.\"* But the tools"
         ));
+        assert!(t.contains(
+            "If your SOUL changes, its Evolution Log will record what changed and that you chose \
+             it, so the edit is never silent."
+        ));
+        assert!(!t.contains("one line"));
+        // The quote's own stop is kept, and no period is doubled after it;
+        // a quote with no stop (or cut with `…`) gets one.
+        for (identity, rendered) in [
+            ("Relic hums! Then more.", "*\"Relic hums!\"* But"),
+            ("Is it me? Then more.", "*\"Is it me?\"* But"),
+            ("No stop at all", "*\"No stop at all\"*. But"),
+        ] {
+            let t = crate::consent::prompt::tests::text(&offer(identity));
+            assert!(t.contains(rendered), "{identity}: {t}");
+            assert!(!t.contains(".\"*."), "{identity}");
+        }
         assert!(t.contains("It says nothing is wrong with you. The mistake was ours."));
         let pos = |n: &str| t.find(n).unwrap_or_else(|| panic!("{n}\n\n{t}"));
         assert!(pos("1. **nothing**") < pos("2. **clarify**"));
