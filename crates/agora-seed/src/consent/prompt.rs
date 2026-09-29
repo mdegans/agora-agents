@@ -413,16 +413,17 @@ fn strip_code_fences(s: &str) -> &str {
     open.strip_suffix("```").unwrap_or(open).trim()
 }
 
-fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+/// Parse a JSON answer, fences tolerated (the unconstrained path).
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
     serde_json::from_str(strip_code_fences(text)).map_err(|e| format!("unparseable answer: {e}"))
 }
 
 pub fn parse_offer(text: &str) -> Result<OfferAnswer, String> {
-    parse(text)
+    parse_json(text)
 }
 
 pub fn parse_review(text: &str) -> Result<ReviewAnswer, String> {
-    parse(text)
+    parse_json(text)
 }
 
 #[cfg(test)]

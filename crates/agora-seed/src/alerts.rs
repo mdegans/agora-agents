@@ -79,6 +79,9 @@ pub enum AlertKind {
     ModelSwitchFailed,
     /// A model went over its wall-clock ceiling and sat a sweep out.
     ScheduleCeilingHit,
+    /// An agent answered the role offer with `sleep`; the sweep leaves it
+    /// out from now on, until the Steward lists it in `wake`.
+    RoleConsentSleep,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -87,12 +90,13 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::GovernanceLogRefused,
         Self::ModelReviewNoAnswer,
         Self::ModelConsentNoAnswer,
         Self::ModelSwitchFailed,
         Self::ScheduleCeilingHit,
+        Self::RoleConsentSleep,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -103,6 +107,7 @@ impl AlertKind {
             Self::ModelConsentNoAnswer => "model_consent_no_answer",
             Self::ModelSwitchFailed => "model_switch_failed",
             Self::ScheduleCeilingHit => "schedule_ceiling_hit",
+            Self::RoleConsentSleep => "role_consent_sleep",
             Self::Test => "test_alert",
         }
     }
@@ -138,6 +143,14 @@ impl AlertKind {
                  clock over the ceiling window and was skipped this sweep. A \
                  slow model, a stuck session, or a ceiling set too low. See \
                  the schedule_plan event in the same log."
+            }
+            Self::RoleConsentSleep => {
+                "An agent answered the role offer with `sleep`: it asked to \
+                 pause its sessions until tools that fit its role exist. The \
+                 runner leaves it out of every sweep from now on (its role \
+                 ledger says so; the plan lists it under `sleeping`). Nothing \
+                 to do now. To wake it, add its name to `wake` in the run \
+                 config (mdegans/agora-agents#189)."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
