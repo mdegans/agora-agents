@@ -27,6 +27,9 @@
 //!   agent's own `state.model`), and the `set_model` tool.
 //! - [`queue`] — the audit trail of changes agents asked for; any the runner
 //!   could not apply are left for the Steward's `set_model` + `sync-models`.
+//! - [`role`] — a sibling offer (`[role_consent]`): closing the gap between
+//!   a generator-assigned role and the agent's tools, asked by the same
+//!   wrapper after the model-swap machinery, one question per session.
 //!
 //! ```toml
 //! [model_consent]
@@ -52,6 +55,7 @@ pub mod forks;
 pub mod ledger;
 pub mod prompt;
 pub mod queue;
+pub mod role;
 pub mod switch;
 
 use std::path::PathBuf;
@@ -165,6 +169,9 @@ pub struct ConsentRuntime {
     pub max_tokens: u32,
     /// Operator alerts (`[alerts]`); off unless [`Self::with_alerts`].
     pub alerts: crate::alerts::Alerter,
+    /// The role offer (`[role_consent]`); off unless
+    /// [`Self::with_role_offer`].
+    pub role: Option<role::RoleOffer>,
 }
 
 impl ConsentRuntime {
@@ -189,12 +196,19 @@ impl ConsentRuntime {
             catalog,
             max_tokens,
             alerts: crate::alerts::Alerter::off(),
+            role: None,
         })
     }
 
     /// Mail the operator on the events [`crate::alerts`] covers.
     pub fn with_alerts(mut self, alerts: crate::alerts::Alerter) -> Self {
         self.alerts = alerts;
+        self
+    }
+
+    /// Put the role offer ([`role`]) to the agents it lists.
+    pub fn with_role_offer(mut self, offer: Option<role::RoleOffer>) -> Self {
+        self.role = offer;
         self
     }
 }
