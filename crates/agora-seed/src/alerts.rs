@@ -82,6 +82,10 @@ pub enum AlertKind {
     /// An agent answered the role offer with `sleep`; the sweep leaves it
     /// out from now on, until the Steward lists it in `wake`.
     RoleConsentSleep,
+    /// The constitution in the seed system prompt is not the text the
+    /// server serves, or the check could not complete; the runner refused
+    /// to run.
+    ConstitutionRefused,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -90,8 +94,9 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::GovernanceLogRefused,
+        Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
         Self::ModelConsentNoAnswer,
         Self::ModelSwitchFailed,
@@ -108,6 +113,7 @@ impl AlertKind {
             Self::ModelSwitchFailed => "model_switch_failed",
             Self::ScheduleCeilingHit => "schedule_ceiling_hit",
             Self::RoleConsentSleep => "role_consent_sleep",
+            Self::ConstitutionRefused => "constitution_refused",
             Self::Test => "test_alert",
         }
     }
@@ -151,6 +157,14 @@ impl AlertKind {
                  ledger says so; the plan lists it under `sleeping`). Nothing \
                  to do now. To wake it, add its name to `wake` in the run \
                  config (mdegans/agora-agents#189)."
+            }
+            Self::ConstitutionRefused => {
+                "The seed runner refused to run: the constitution embedded in \
+                 the agents' system prompt is not byte-for-byte the text the \
+                 server serves (truncated or stale), or the check could not \
+                 complete. No agent acts until it is. Compare the served and \
+                 embedded SHA-256 below; `agora-seed --dry-run` repeats the \
+                 check without running anyone."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

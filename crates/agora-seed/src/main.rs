@@ -40,6 +40,7 @@ use serde::Deserialize;
 
 mod alerts;
 mod consent;
+mod constitution;
 mod govlog;
 mod logging;
 mod models;
@@ -1522,6 +1523,11 @@ async fn run(held: &mut Held) -> Result<()> {
     // A log that does not verify stops the run before any agent acts.
     // A dry run verifies too — it is read-only and worth knowing.
     govlog::verify(&context.inner.client, &data_dir, &held.alerts).await?;
+    // The constitution the agents read must be the one the server serves,
+    // whole: a truncated or stale copy stops the run the same way.
+    let web_tools =
+        context.inner.config.web_search.is_some() || context.inner.config.web_fetch.is_some();
+    constitution::verify(&context.inner.client, web_tools, &held.alerts).await?;
 
     // Assemble reactors: order each endpoint's cohort, cap, construct.
     let wave_size = config.wave_size.unwrap_or(8);
