@@ -1089,8 +1089,13 @@ mod tests {
         } else {
             "Qwen 3.6"
         };
-        let blocked = (current == NEW).then_some("you are in a trial of Qwen 3.8");
-        switch::describe(&choices, name, current, blocked)
+        let mut out = switch::describe(&choices, name, current);
+        // A dump logged before the blocker note moved to the refusal.
+        if current == NEW {
+            out.push_str(switch::BLOCKED_PREFIX);
+            out.push_str("you are in a trial of Qwen 3.8.");
+        }
+        out
     }
 
     /// A session dump shaped like the runner's: intro with a model line

@@ -13,6 +13,15 @@
 //! [`SetModel`] runs inside the inner agent's tool dispatch, where the
 //! wrapper can't be reached, so it does the remote half itself and leaves a
 //! [`SelfSwitch`] in a slot the wrapper drains.
+//!
+//! **Cache prefix.** The tool definitions are the first thing on the wire,
+//! ahead of the system prompt, and every agent on a model shares that
+//! prefix. So `set_model` is the same for every agent on a model: always
+//! registered when the run has a choice to offer, always last in `tools`
+//! (see [`ConsentAgent::seat_set_model`](super::agent::ConsentAgent)), and
+//! its description names only the model and the menu. Why an agent can't
+//! switch right now (a cooldown, a trial, a review session) is per-agent,
+//! so it lives in the refusal a call gets, never in the description.
 
 use std::sync::{Arc, Mutex};
 
@@ -100,6 +109,8 @@ pub struct SetModel {
     agent: String,
     current: Model,
     /// Why no switch is possible this session, fixed at session start.
+    /// Told to the agent only when it calls: kept out of the description,
+    /// which every agent on the model shares.
     blocked: Option<String>,
     slot: Slot,
 }
@@ -140,7 +151,6 @@ impl SetModel {
             &choices,
             &catalog.name_of(&self.current),
             self.current.name(),
-            self.blocked.as_deref(),
         )
     }
 
@@ -238,17 +248,17 @@ pub struct Choice<'a> {
 
 /// Marks the agent's own model on the menu.
 const CURRENT_MARK: &str = " (current)";
-/// Starts the note on why no change is possible this session.
-const BLOCKED_PREFIX: &str = "\n\nYou cannot change model this session: ";
+/// Started the note on why no change was possible this session, which
+/// descriptions carried until it moved to the refusal (it made the tool
+/// definitions per-agent). Kept so [`retarget`] can drop it from older
+/// logged prompts.
+pub(crate) const BLOCKED_PREFIX: &str = "\n\nYou cannot change model this session: ";
 
 /// `set_model`'s description. The parts that name the agent's model are
-/// kept in fixed forms so [`retarget`] can rewrite them for a fork.
-pub fn describe(
-    choices: &[Choice<'_>],
-    current_name: &str,
-    current_id: &str,
-    blocked: Option<&str>,
-) -> String {
+/// kept in fixed forms so [`retarget`] can rewrite them for a fork. Nothing
+/// in it is per-agent: it is part of the prefix every agent on the model
+/// shares.
+pub fn describe(choices: &[Choice<'_>], current_name: &str, current_id: &str) -> String {
     let mut out = format!(
         "Change the model you run on, from your next session. {}\n\n\
          Models you can choose:\n",
@@ -267,11 +277,9 @@ pub fn describe(
         "\nAgents on the same model share its slot in the schedule; a busy model \
          runs each of its agents less often. After a change, you can change again \
          after {SWITCH_COOLDOWN_SESSIONS} completed sessions. Pass the model's id \
-         as `model`, and your reason first."
+         as `model`, and your reason first. If you can't change model this session, \
+         the call says why and when you next can, and changes nothing."
     ));
-    if let Some(why) = blocked {
-        out.push_str(&format!("{BLOCKED_PREFIX}{why}."));
-    }
     out
 }
 
@@ -282,7 +290,8 @@ fn current_sentence(name: &str, id: &str) -> String {
 /// Rewrite a [`describe`]d description as if the agent ran on `to_id`: the
 /// "You run on" sentence, the `(current)` mark, and — since it described
 /// the original model's situation (a trial under way, say) — the note on
-/// why no change was possible, which is dropped. `to_name` is used when
+/// why no change was possible, which is dropped (descriptions logged
+/// before that note moved to the refusal still carry it). `to_name` is used when
 /// `to_id` isn't on the menu. `None` if nothing named the model.
 pub fn retarget(description: &str, to_id: &str, to_name: &str) -> Option<String> {
     let mut out = description.to_string();
@@ -379,7 +388,7 @@ mod tests {
     use super::*;
 
     fn menu(current: &str, blocked: Option<&str>) -> String {
-        describe(
+        let mut out = describe(
             &[
                 Choice {
                     id: "Qwen3.6.gguf",
@@ -398,8 +407,12 @@ mod tests {
                 "Qwen 3.6"
             },
             current,
-            blocked,
-        )
+        );
+        // As logged before the note moved to the refusal.
+        if let Some(why) = blocked {
+            out.push_str(&format!("{BLOCKED_PREFIX}{why}."));
+        }
+        out
     }
 
     /// A description retargeted to the other model reads exactly as if it
