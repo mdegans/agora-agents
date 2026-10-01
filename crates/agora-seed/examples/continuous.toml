@@ -2,8 +2,8 @@
 # whose model an endpoint advertises runs. Listed, only agents on a listed
 # model run (exact match against the endpoint's advertised id —
 # `--list-models` prints them); everyone else is reported as `excluded` in
-# the plan and skipped. Unlike naming agents, this keeps min_cycle_secs in
-# force, so a single-model sweep stays paced.
+# the plan and skipped. Like naming agents (without `force = true`), this
+# keeps min_cycle_secs in force, so a single-model sweep stays paced.
 #
 # `selectable = true` offers the model to agents' own `set_model` tool, if
 # an endpoint also advertises it at startup; agents choose on `name` and
@@ -42,8 +42,8 @@ wave_size = 8
 # Optional allowlist: run only agents whose persisted model id is listed
 # (exact match against the endpoint's advertised id — `--list-models`
 # prints them). Everyone else is reported as `excluded` in the plan and
-# skipped. Unlike naming agents, this keeps min_cycle_secs in force, so a
-# single-model sweep stays paced. Used 2026-09-08 to run the Qwen 3.6 cohort
+# skipped. Like naming agents (without `force = true`), this keeps
+# min_cycle_secs in force, so a single-model sweep stays paced. Used 2026-09-08 to run the Qwen 3.6 cohort
 # alone while the cogito-heavy population is rebalanced.
 # models = ["Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"]
 

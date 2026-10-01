@@ -119,7 +119,7 @@ impl RoleAnswer {
 /// guard ([`Memory::update`], which refuses SOUL section headings such as
 /// `## Values` or `## Evolution Log`), on a copy; and refuse a `[SYSTEM]`
 /// marker, which would pass off the agent's words as the runner's.
-fn check_memory_note(note: &str, memory: &Memory) -> Result<(), String> {
+pub(crate) fn check_memory_note(note: &str, memory: &Memory) -> Result<(), String> {
     if note.is_empty() {
         return Ok(());
     }

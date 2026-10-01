@@ -62,6 +62,13 @@
 //! same patched state: the SOUL edit and its Evolution Log disclosure, and
 //! the agent's own memory note if it wrote one. Its ledger is
 //! `role_consent.json`.
+//!
+//! **The cadence offer** ([`super::cadence`]) comes last, in a session where
+//! neither the model-swap half nor the role offer asked anything. It differs
+//! from the role offer in that **the first parsed `choice` wins** — a
+//! malformed answer is never re-asked into a different one. Only a missing or invalid
+//! `choice` is asked again, once ([`CADENCE_MAX_ATTEMPTS`]), and every
+//! attempt goes into its ledger, `cadence_consent.json`.
 
 use std::sync::Arc;
 
@@ -80,6 +87,11 @@ use misanthropic::response::{self, JsonError, StopReason};
 use misanthropic::tool::{Notifications, ToolBox};
 
 use super::ConsentRuntime;
+use super::cadence::{
+    self,
+    ledger::{Attempt, CadenceAsk, CadenceLedger, CadenceOutcome},
+    prompt::{CadenceAnswer, CadenceChoice},
+};
 use super::comparison;
 use super::forks;
 use super::ledger::{Change, Due, Ledger, OfferKey, OfferNames, Switch, SwitchCause};
@@ -94,6 +106,10 @@ use crate::alerts::{Alert, AlertKind};
 
 /// Answers per question per session: the first plus two retries.
 pub const MAX_ATTEMPTS: u32 = 3;
+
+/// Answers to the cadence offer per session: the first, plus one more only
+/// when the first had no usable `choice`.
+pub const CADENCE_MAX_ATTEMPTS: u32 = 2;
 
 /// [`Agent::Context`] for a [`ConsentAgent`]: the inner agent's context
 /// plus the shared consent runtime.
@@ -119,6 +135,15 @@ enum Phase {
     },
     /// The role offer ([`super::role`]) is seated; the same rules.
     AskingRole { constrained: bool, attempt: u32 },
+    /// The cadence offer ([`super::cadence`]) is seated. `order` is the
+    /// option order shown (from `seed`); `attempts` so far, verbatim.
+    AskingCadence {
+        constrained: bool,
+        attempt: u32,
+        order: [CadenceChoice; 3],
+        seed: u64,
+        attempts: Vec<Attempt>,
+    },
 }
 
 /// What the model-swap half of [`ConsentAgent::close`] did.
@@ -225,6 +250,18 @@ pub struct ConsentAgent<A> {
     /// SOUL and memory from before the role answer was written into the
     /// patched state, put back if the role ledger can't be saved.
     role_undo: Option<(Soul, Memory)>,
+    /// The cadence offer's ledger, loaded only for agents the offer admits;
+    /// `None` also when unreadable (then nothing is asked or saved).
+    cadence_ledger: Option<CadenceLedger>,
+    cadence_dirty: bool,
+    /// The Evolution Log line recording the cadence answer, written at
+    /// teardown.
+    cadence_line: Option<String>,
+    /// The agent's own note from its cadence answer, appended at teardown.
+    cadence_note: Option<String>,
+    /// SOUL and memory from before the cadence answer was written into the
+    /// patched state, put back if the cadence ledger can't be saved.
+    cadence_undo: Option<(Soul, Memory)>,
 }
 
 /// A post or comment written this session.
@@ -414,9 +451,17 @@ where
         Ok(Control::Continue)
     }
 
-    /// Give the next turn the question budget and — where changing
+    /// Give the next turn the question budget and — only where changing
     /// `output_config` keeps the prefix cache (blallama) — `schema`.
     /// Returns whether the answer is constrained.
+    ///
+    /// **Never a cache miss to constrain an answer** (Steward, 2026-10-01).
+    /// On an endpoint where `output_config` is part of what the cache sees
+    /// (the Anthropic API: it makes the request a miss), nothing but
+    /// `max_tokens` changes — which no cache keys on (misanthropic's
+    /// `CachedPrompt::set_max_tokens`) — and the answer is asked for in
+    /// plain text, parsed leniently, and re-asked if it doesn't parse. A
+    /// retry costs far less than re-prefilling the session.
     fn constrain(&mut self, schema: serde_json::Value) -> bool {
         let cache_safe = self
             .inner
@@ -426,15 +471,16 @@ where
         let max_tokens = self.rt.max_tokens;
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
-        // Keep the session's effort (agentkit 0.39 `thinking_effort`):
-        // thinking stays adaptive, and without it the answer would think at
-        // the model's default.
-        let effort = prompt.output_config.as_ref().and_then(|c| c.effort.clone());
-        prompt.output_config = match (cache_safe, effort) {
-            (true, Some(effort)) => Some(OutputConfig::json_schema(schema).with_effort(effort)),
-            (true, None) => Some(OutputConfig::json_schema(schema)),
-            (false, effort) => effort.map(OutputConfig::effort),
-        };
+        if cache_safe {
+            // Keep the session's effort (agentkit 0.39 `thinking_effort`):
+            // thinking stays adaptive, and without it the answer would think
+            // at the model's default.
+            let effort = prompt.output_config.as_ref().and_then(|c| c.effort.clone());
+            prompt.output_config = Some(match effort {
+                Some(effort) => OutputConfig::json_schema(schema).with_effort(effort),
+                None => OutputConfig::json_schema(schema),
+            });
+        }
         cache_safe
     }
 
@@ -493,7 +539,10 @@ where
         match self.close_model().await? {
             Closing::Asked(control) => Ok(Some(control)),
             Closing::Busy => Ok(None),
-            Closing::Idle => self.ask_role(),
+            Closing::Idle => match self.ask_role()? {
+                Some(control) => Ok(Some(control)),
+                None => self.ask_cadence(),
+            },
         }
     }
 
@@ -741,6 +790,228 @@ where
                 outcome,
             });
             self.role_dirty = true;
+        }
+        Ok(Control::Done(Outcome::Complete))
+    }
+
+    /// Seat the cadence offer, if this agent is admitted and it is due:
+    /// the options in this agent's seeded order, constrained wherever the
+    /// endpoint enforces a schema.
+    fn ask_cadence(&mut self) -> Result<Option<Control>, A::Error> {
+        let Some(rounds) = self.rt.cadence.as_ref().map(|c| c.rounds) else {
+            return Ok(None);
+        };
+        let soul = &self.inner.state().soul;
+        if !self.cadence_ledger.as_ref().is_some_and(|l| l.due(soul)) {
+            return Ok(None);
+        }
+        let seed = cadence::prompt::seed_for(self.inner.id());
+        let order = cadence::prompt::order_for(seed);
+        let content = cadence::prompt::offer(rounds, order);
+        let constrained = self.constrain(cadence::prompt::schema(order));
+        let (_, prompt) = self.inner.parts();
+        Self::seat_user(prompt, content)?;
+        tracing::info!(
+            event_type = "cadence_consent_seated",
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            question = "cadence",
+            offer_version = cadence::prompt::OFFER_VERSION,
+            order = ?order.map(CadenceChoice::as_str),
+            order_seed = seed,
+            rounds,
+            constrained,
+            "cadence-consent question seated"
+        );
+        self.phase = Phase::AskingCadence {
+            constrained,
+            attempt: 1,
+            order,
+            seed,
+            attempts: Vec::new(),
+        };
+        Ok(Some(Control::Continue))
+    }
+
+    /// One response to the cadence offer.
+    ///
+    /// **The first parsed choice wins**: an answer whose `choice` parses is
+    /// taken, whatever else is wrong with it — a bad `memory_note` is
+    /// dropped, an unparseable sibling field is ignored (both recorded) —
+    /// and nothing is asked again. Only a response with no usable `choice`
+    /// (unparseable, clipped, a tool call) is asked again, and only once
+    /// ([`CADENCE_MAX_ATTEMPTS`]). An explicit refusal is final. Every
+    /// attempt is recorded verbatim.
+    async fn answer_cadence(
+        &mut self,
+        constrained: bool,
+        attempt: u32,
+        order: [CadenceChoice; 3],
+        seed: u64,
+        mut attempts: Vec<Attempt>,
+        response: response::Message,
+    ) -> Result<Control, A::Error> {
+        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
+        let rounds = self.rt.cadence.as_ref().map_or(0, |c| c.rounds);
+        let memory = self.inner.state().memory.clone();
+        let taken = match parse(&response, constrained, cadence::prompt::parse) {
+            Ok(answer) => Ok(match answer.check_note(&memory) {
+                Ok(()) => Taken::Clean(answer),
+                Err(why) => Taken::NoteDropped(answer, why),
+            }),
+            // Malformed, but not clipped, refused or paused: the choice
+            // may still be there.
+            Err(failure) if failure.retry == Retry::Unusable => match salvage(&response) {
+                Some((choice, reason)) => Ok(Taken::Salvaged {
+                    choice,
+                    reason,
+                    why: failure.reason,
+                }),
+                None => Err(failure),
+            },
+            Err(failure) => Err(failure),
+        };
+        attempts.push(Attempt {
+            raw: raw_text(&response),
+            failure: match &taken {
+                Ok(Taken::Clean(_)) => None,
+                Ok(Taken::NoteDropped(_, why)) => Some(format!("memory_note not written: {why}")),
+                Ok(Taken::Salvaged { why, .. }) => Some(format!("only `choice` taken: {why}")),
+                Err(failure) => Some(failure.reason.clone()),
+            },
+        });
+        if !matches!(taken, Ok(Taken::Clean(_)))
+            && !matches!(&taken, Err(f) if f.retry == Retry::No)
+        {
+            tracing::warn!(
+                event_type = "cadence_consent_malformed",
+                agent = %agent,
+                agent_id = %agent_id,
+                model = %response.model,
+                constrained,
+                attempt,
+                stop_reason = ?response.stop_reason,
+                output_tokens = response.usage.output_tokens,
+                choice_taken = taken.is_ok(),
+                failure = attempts.last().and_then(|a| a.failure.as_deref()),
+                raw = %attempts.last().map_or("", |a| a.raw.as_str()),
+                "cadence-consent answer malformed"
+            );
+        }
+        if let Err(failure) = &taken
+            && attempt < CADENCE_MAX_ATTEMPTS
+            && let Some(note) = failure.retry_note()
+        {
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(prompt, Content::from(note))?;
+            self.phase = Phase::AskingCadence {
+                constrained,
+                attempt: attempt + 1,
+                order,
+                seed,
+                attempts,
+            };
+            return Ok(Control::Continue);
+        }
+
+        let outcome = match taken {
+            Ok(taken) => {
+                let (choice, reason, note, salvaged) = match taken {
+                    Taken::Clean(a) => {
+                        let note = a.memory_note.trim().to_string();
+                        (
+                            a.choice,
+                            Some(a.reason),
+                            (!note.is_empty()).then_some(note),
+                            None,
+                        )
+                    }
+                    Taken::NoteDropped(a, why) => (
+                        a.choice,
+                        Some(a.reason),
+                        None,
+                        Some(format!("memory_note not written: {why}")),
+                    ),
+                    Taken::Salvaged {
+                        choice,
+                        reason,
+                        why,
+                    } => (choice, reason, None, Some(why)),
+                };
+                tracing::info!(
+                    event_type = "cadence_consent_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %response.model,
+                    attempts = attempt,
+                    choice = choice.as_str(),
+                    order = ?order.map(CadenceChoice::as_str),
+                    position = order.iter().position(|c| *c == choice).map(|p| p + 1),
+                    salvaged = salvaged.is_some(),
+                    memory_note = note.is_some(),
+                    "cadence-consent answer recorded"
+                );
+                let (_, prompt) = self.inner.parts();
+                if let Err(e) = prompt.push_message(response.inner.clone()) {
+                    tracing::warn!(agent_id = %agent_id, error = %e, "cadence answer not seated");
+                }
+                self.cadence_line = Some(cadence::evolution_line(
+                    choice,
+                    rounds,
+                    Utc::now().date_naive(),
+                ));
+                self.cadence_note = note;
+                CadenceOutcome::Answered {
+                    choice,
+                    reason,
+                    memory_note_written: self.cadence_note.is_some(),
+                    salvaged,
+                    apply_failed: None,
+                }
+            }
+            Err(failure)
+                if failure.retry == Retry::No
+                    && !matches!(response.stop_reason, Some(StopReason::PauseTurn)) =>
+            {
+                tracing::warn!(
+                    event_type = "cadence_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    attempts = attempt,
+                    failure = %failure.reason,
+                    "cadence offer refused; nothing changes"
+                );
+                CadenceOutcome::Refused {
+                    reason: failure.reason,
+                }
+            }
+            Err(failure) => {
+                let failure = format!("{} (after {attempt} attempts)", failure.reason);
+                tracing::error!(
+                    event_type = "cadence_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %response.model,
+                    attempts = attempt,
+                    failure = %failure,
+                    "cadence offer got no usable choice; nothing changes"
+                );
+                CadenceOutcome::NoAnswer { failure }
+            }
+        };
+        if let Some(ledger) = self.cadence_ledger.as_mut() {
+            ledger.record(CadenceAsk {
+                at: Utc::now(),
+                offer_version: cadence::prompt::OFFER_VERSION,
+                model: response.model.clone(),
+                rounds,
+                order,
+                order_seed: seed,
+                constrained,
+                attempts,
+                outcome,
+            });
+            self.cadence_dirty = true;
         }
         Ok(Control::Done(Outcome::Complete))
     }
@@ -1009,6 +1280,8 @@ where
             && self.seen_before_review.is_none()
             && self.role_applied.is_none()
             && self.memory_note.is_none()
+            && self.cadence_line.is_none()
+            && self.cadence_note.is_none()
         {
             return None;
         }
@@ -1026,6 +1299,9 @@ where
                 );
                 if self.role_applied.is_some() || self.memory_note.is_some() {
                     self.role_failed(format!("could not copy state: {e}"));
+                }
+                if self.cadence_line.is_some() || self.cadence_note.is_some() {
+                    self.cadence_failed(format!("could not copy state: {e}"));
                 }
                 return None;
             }
@@ -1059,7 +1335,54 @@ where
             changed = true;
         }
         changed |= self.apply_role(&mut state);
+        changed |= self.apply_cadence(&mut state);
         changed.then_some(state)
+    }
+
+    /// Write the cadence answer's Evolution Log line and the agent's
+    /// own note into `state`. The cadence itself is the planner's, from the
+    /// ledger; a line that can't be written changes neither SOUL nor memory.
+    fn apply_cadence(&mut self, state: &mut SeedState) -> bool {
+        let line = self.cadence_line.take();
+        let note = self.cadence_note.take();
+        if line.is_none() && note.is_none() {
+            return false;
+        }
+        self.cadence_undo = Some((state.soul.clone(), state.memory.clone()));
+        if let Some(line) = &line
+            && let Err(e) = state.soul.push_evolution(line.clone())
+        {
+            self.cadence_failed(e.to_string());
+            return false;
+        }
+        let today = Utc::now().date_naive();
+        let noted = note
+            .as_deref()
+            .is_some_and(|n| role::append_memory_note(&mut state.memory, n, today));
+        tracing::info!(
+            event_type = "cadence_consent_applied",
+            agent = %state.soul.name,
+            agent_id = %self.inner.id(),
+            soul_line = line.is_some(),
+            memory_note = noted,
+            "cadence-consent answer written"
+        );
+        line.is_some() || noted
+    }
+
+    fn cadence_failed(&mut self, why: String) {
+        tracing::error!(
+            event_type = "cadence_consent_apply_failed",
+            agent_id = %self.inner.id(),
+            error = %why,
+            "cadence-consent SOUL line or note not written; SOUL and memory unchanged"
+        );
+        self.cadence_line = None;
+        self.cadence_note = None;
+        if let Some(ledger) = self.cadence_ledger.as_mut() {
+            ledger.mark_apply_failed(why);
+            self.cadence_dirty = true;
+        }
     }
 
     /// Write the role answer into `state`: the SOUL edit (identity and
@@ -1109,6 +1432,32 @@ where
             self.role_dirty = true;
         }
     }
+}
+
+/// What was taken from a cadence answer.
+enum Taken {
+    /// Everything, as given.
+    Clean(CadenceAnswer),
+    /// The answer, minus a `memory_note` that can't be written (why).
+    NoteDropped(CadenceAnswer, String),
+    /// Only the `choice` (and the reason, if it was a string): the rest
+    /// didn't parse (why).
+    Salvaged {
+        choice: CadenceChoice,
+        reason: Option<String>,
+        why: String,
+    },
+}
+
+/// The `choice` (and string `reason`) from a response whose answer didn't
+/// parse whole: each text block in turn, fences tolerated. A clipped turn
+/// never gets here (see [`parse`]).
+fn salvage(response: &response::Message) -> Option<(CadenceChoice, Option<String>)> {
+    response.inner.content.iter().find_map(|block| match block {
+        Block::Text { text, .. } => cadence::prompt::salvage_choice(text)
+            .map(|choice| (choice, cadence::prompt::salvage_reason(text))),
+        _ => None,
+    })
 }
 
 /// The typed answer, or why there is none usable.
@@ -1228,6 +1577,11 @@ where
             role_applied: None,
             memory_note: None,
             role_undo: None,
+            cadence_ledger: None,
+            cadence_dirty: false,
+            cadence_line: None,
+            cadence_note: None,
+            cadence_undo: None,
         })
     }
 
@@ -1332,6 +1686,22 @@ where
                 ),
             }
         }
+        let admitted = self
+            .rt
+            .cadence
+            .as_ref()
+            .is_some_and(|c| c.admits(&self.inner.state().soul.name));
+        if admitted {
+            match CadenceLedger::load(&dir).await {
+                Ok(ledger) => self.cadence_ledger = Some(ledger),
+                Err(e) => tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %CadenceLedger::path(&dir).display(),
+                    error = %e,
+                    "cadence-consent ledger unreadable; not asking or saving this session"
+                ),
+            }
+        }
         self.inner.on_init().await?;
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
@@ -1379,6 +1749,16 @@ where
                 constrained,
                 attempt,
             } => self.answer_role(constrained, attempt, response).await,
+            Phase::AskingCadence {
+                constrained,
+                attempt,
+                order,
+                seed,
+                attempts,
+            } => {
+                self.answer_cadence(constrained, attempt, order, seed, attempts, response)
+                    .await
+            }
             Phase::Inner => match self
                 .inner
                 .handle(response)
@@ -1442,6 +1822,31 @@ where
                     error = %e,
                     edit_undone = undone,
                     "role-consent ledger save failed; this session's SOUL edit and memory note are not saved"
+                );
+            }
+        }
+        if self.cadence_dirty
+            && let Some(ledger) = &mut self.cadence_ledger
+        {
+            ledger.agent = Some(self.inner.state().soul.name.clone());
+            if let Err(e) = ledger.save(&dir).await {
+                // Without the record the agent is asked again and a `switch`
+                // can't be applied, so the SOUL must not record the answer.
+                let undone = match (self.patched.as_mut(), self.cadence_undo.take()) {
+                    (Some(state), Some((soul, memory))) => {
+                        state.soul = soul;
+                        state.memory = memory;
+                        true
+                    }
+                    _ => false,
+                };
+                tracing::error!(
+                    event_type = "cadence_consent_ledger_save_failed",
+                    agent_id = %self.inner.id(),
+                    path = %CadenceLedger::path(&dir).display(),
+                    error = %e,
+                    edit_undone = undone,
+                    "cadence-consent ledger save failed; this session's SOUL line and memory note are not saved"
                 );
             }
         }
@@ -1719,16 +2124,27 @@ mod tests {
         }
 
         fn with_allowlist(tag: &str, agents: Option<&[&str]>) -> Self {
-            Self::build(tag, agents, None)
+            Self::build(tag, agents, None, None)
         }
 
         /// The model-swap offer to everyone on OLD, and the role offer to
         /// `role`.
         fn with_role(tag: &str, role: &[&str]) -> Self {
-            Self::build(tag, None, Some(role))
+            Self::build(tag, None, Some(role), None)
         }
 
-        fn build(tag: &str, agents: Option<&[&str]>, role: Option<&[&str]>) -> Self {
+        /// The model-swap offer to everyone on OLD, the role offer to
+        /// `role`, and the cadence offer (5 rounds today) to `cadence`.
+        fn with_cadence(tag: &str, role: &[&str], cadence: &[&str]) -> Self {
+            Self::build(tag, None, Some(role), Some(cadence))
+        }
+
+        fn build(
+            tag: &str,
+            agents: Option<&[&str]>,
+            role: Option<&[&str]>,
+            cadence: Option<&[&str]>,
+        ) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "agora-seed-consent-agent-{tag}-{}",
                 std::process::id()
@@ -1773,7 +2189,10 @@ mod tests {
                     512,
                 )
                 .unwrap()
-                .with_role_offer(role.map(crate::consent::role::RoleOffer::for_agents)),
+                .with_role_offer(role.map(crate::consent::role::RoleOffer::for_agents))
+                .with_cadence_offer(
+                    cadence.map(|c| crate::consent::cadence::CadenceOffer::for_agents(c, 5)),
+                ),
             );
             Self {
                 root,
@@ -3005,5 +3424,589 @@ mod tests {
         agent.on_teardown().await.unwrap();
         assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
         assert_eq!(agent.state().memory.content, memory);
+    }
+
+    // --- The cadence offer ------------------------------------------------
+
+    use crate::consent::cadence::ledger::{CadenceLedger, CadenceOutcome as CO};
+
+    async fn cadence_ledger(h: &Harness) -> CadenceLedger {
+        CadenceLedger::load(&h.rt.state_dir.join(h.id.to_string()))
+            .await
+            .unwrap()
+    }
+
+    fn cadence_reply(choice: &str, memory_note: &str) -> response::Message {
+        let answer = CadenceAnswer {
+            reason: "I weighed it.".into(),
+            choice: serde_json::from_value(serde_json::Value::from(choice)).unwrap(),
+            memory_note: memory_note.into(),
+        };
+        reply(&serde_json::to_string(&answer).unwrap())
+    }
+
+    /// An agent on the Anthropic API: canonical quirks, not cache-safe.
+    fn anthropic_agent(h: &Harness) -> ConsentAgent<Fake> {
+        h.agent(OTHER, false)
+    }
+
+    /// Seat the cadence offer on a fresh Anthropic session.
+    async fn seated(h: &Harness) -> ConsentAgent<Fake> {
+        let mut agent = anthropic_agent(h);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "cadence offer seated"
+        );
+        agent
+    }
+
+    /// One whole session answering the cadence offer with `answers`, the
+    /// last of which must end it.
+    async fn cadence_session(h: &Harness, answers: Vec<response::Message>) -> ConsentAgent<Fake> {
+        let mut agent = seated(h).await;
+        let n = answers.len();
+        for (i, a) in answers.into_iter().enumerate() {
+            let control = agent.handle(a).await.unwrap();
+            let expected = if i + 1 == n {
+                Control::Done(Outcome::Complete)
+            } else {
+                Control::Continue
+            };
+            assert_eq!(control, expected, "answer {i}");
+        }
+        agent.on_teardown().await.unwrap();
+        agent
+    }
+
+    /// `switch`: asked after the closing phase, in plain text on the
+    /// Anthropic API, in this agent's seeded order (recorded with its seed); the SOUL
+    /// gets one dated line, the agent's own note goes to memory, and it
+    /// is never asked again.
+    #[tokio::test]
+    async fn cadence_switch_is_recorded_disclosed_and_asked_once() {
+        let h = Harness::with_cadence("cadence-switch", &[], &["tarn"]);
+        let mut agent = seated(&h).await;
+        let q = last_user_text(&agent);
+        let seed = cadence::prompt::seed_for(h.id);
+        let order = cadence::prompt::order_for(seed);
+        assert!(q.contains("with 5 rounds in each"), "{q}");
+        assert!(q.contains("with 10 rounds in each"), "{q}");
+        for (i, c) in order.iter().enumerate() {
+            assert!(q.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{q}");
+        }
+        // Plain text on Anthropic: no `output_config` change, no miss.
+        assert!(agent.prompt().output_config.is_none(), "unconstrained");
+
+        assert_eq!(
+            agent
+                .handle(cadence_reply("switch", "I chose longer sessions."))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            evolution_notes(&agent),
+            [cadence::evolution_line(
+                CadenceChoice::Switch,
+                5,
+                Utc::now().date_naive()
+            )]
+        );
+        assert!(
+            agent
+                .state()
+                .memory
+                .content
+                .ends_with("my note] I chose longer sessions."),
+            "{}",
+            agent.state().memory.content
+        );
+        let ledger = cadence_ledger(&h).await;
+        assert_eq!(ledger.agent.as_ref().unwrap().as_str(), "tarn");
+        assert!(ledger.chose_switch());
+        let ask = &ledger.asks[0];
+        assert_eq!(ask.order, order);
+        assert_eq!(ask.order_seed, seed);
+        assert_eq!(ask.rounds, 5);
+        assert!(!ask.constrained);
+        assert_eq!(ask.offer_version, cadence::prompt::OFFER_VERSION);
+        assert_eq!(ask.attempts.len(), 1);
+        assert!(ask.attempts[0].failure.is_none());
+        assert!(matches!(
+            &ask.outcome,
+            CO::Answered {
+                choice: CadenceChoice::Switch,
+                memory_note_written: true,
+                salvaged: None,
+                ..
+            }
+        ));
+        assert!(!asks(&h, OTHER).await, "asked once");
+    }
+
+    /// `keep_daily` and `no_preference`: the cadence is unchanged, but the
+    /// answer is recorded in the SOUL too — one dated `[SYSTEM]` line and
+    /// nothing else; memory untouched; never asked again.
+    #[tokio::test]
+    async fn cadence_keep_daily_and_no_preference_are_recorded_not_applied() {
+        for choice in [CadenceChoice::KeepDaily, CadenceChoice::NoPreference] {
+            let h = Harness::with_cadence(&format!("cadence-{choice:?}"), &[], &["tarn"]);
+            let fresh = anthropic_agent(&h);
+            let (soul, memory) = (
+                serde_json::to_value(&fresh.state().soul).unwrap(),
+                fresh.state().memory.content.clone(),
+            );
+            let agent = cadence_session(&h, vec![cadence_reply(choice.as_str(), "")]).await;
+            assert_eq!(
+                evolution_notes(&agent),
+                [cadence::evolution_line(choice, 5, Utc::now().date_naive())]
+            );
+            assert!(evolution_notes(&agent)[0].ends_with("Unchanged: daily, 5 rounds."));
+            let mut after = serde_json::to_value(&agent.state().soul).unwrap();
+            let mut before = soul.clone();
+            for v in [&mut after, &mut before] {
+                v.as_object_mut().unwrap().remove("evolution_log");
+            }
+            assert_eq!(after, before, "{choice:?}: only the log line");
+            assert_eq!(agent.state().memory.content, memory);
+            let choice = choice.as_str();
+            let ledger = cadence_ledger(&h).await;
+            assert_eq!(ledger.choice().unwrap().as_str(), choice);
+            assert!(!ledger.chose_switch());
+            assert!(!asks(&h, OTHER).await, "{choice}: asked once");
+        }
+    }
+
+    /// The first parsed choice wins: a broken note, a non-string reason, an
+    /// extra key — the choice is taken from the first attempt as given, the
+    /// question is NOT put again, and the salvage is recorded.
+    #[tokio::test]
+    async fn cadence_first_parsed_choice_wins() {
+        let long = "x".repeat(cadence::prompt::MEMORY_NOTE_MAX_CHARS + 1);
+        let cases = [
+            (
+                cadence_reply("keep_daily", "## Values\n- none"),
+                "keep_daily",
+            ),
+            (cadence_reply("no_preference", &long), "no_preference"),
+            (
+                reply(r#"{"reason": 7, "choice": "switch", "memory_note": ""}"#),
+                "switch",
+            ),
+            (
+                reply(r#"{"reason": "r", "choice": "keep_daily", "memory_note": "", "x": 1}"#),
+                "keep_daily",
+            ),
+            (reply(r#"{"choice": "no_preference"}"#), "no_preference"),
+        ];
+        for (n, (answer, choice)) in cases.into_iter().enumerate() {
+            let h = Harness::with_cadence(&format!("cadence-salvage-{n}"), &[], &["tarn"]);
+            let memory = anthropic_agent(&h).state().memory.content.clone();
+            // One answer ends the session: no retry.
+            let agent = cadence_session(&h, vec![answer]).await;
+            assert_eq!(agent.state().memory.content, memory, "{n}: no note written");
+            let ledger = cadence_ledger(&h).await;
+            let ask = &ledger.asks[0];
+            assert_eq!(ask.attempts.len(), 1, "{n}");
+            assert!(ask.attempts[0].failure.is_some(), "{n}");
+            match &ask.outcome {
+                CO::Answered {
+                    choice: c,
+                    salvaged: Some(_),
+                    memory_note_written: false,
+                    ..
+                } => assert_eq!(c.as_str(), choice, "{n}"),
+                other => panic!("{n}: {other:?}"),
+            }
+            // The salvaged answer is recorded in the SOUL like any other.
+            let notes = evolution_notes(&agent);
+            assert_eq!(notes.len(), 1, "{n}");
+            assert!(
+                notes[0].contains(&format!("chose {choice} by its own choice")),
+                "{n}"
+            );
+            assert!(!asks(&h, OTHER).await, "{n}: settled");
+        }
+    }
+
+    /// No usable choice: asked once more in the same session, and both
+    /// attempts are on file; a second miss is no answer (nothing changes),
+    /// asked again at a later session.
+    #[tokio::test]
+    async fn cadence_missing_choice_is_asked_once_more_and_both_attempts_recorded() {
+        let h = Harness::with_cadence("cadence-retry", &[], &["tarn"]);
+        let mut agent = seated(&h).await;
+        let len = agent.prompt().messages.len();
+        assert_eq!(
+            agent
+                .handle(reply(r#"{"reason": "r", "choice": "", "memory_note": ""}"#))
+                .await
+                .unwrap(),
+            Control::Continue
+        );
+        assert_eq!(agent.prompt().messages.len(), len, "not seated");
+        assert!(last_user_text(&agent).contains("Your answer could not be used"));
+        assert_eq!(
+            agent
+                .handle(cadence_reply("no_preference", ""))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        let ask = &cadence_ledger(&h).await.asks[0];
+        assert_eq!(ask.attempts.len(), 2);
+        assert!(ask.attempts[0].failure.is_some());
+        assert!(ask.attempts[0].raw.contains("\"choice\": \"\""));
+        assert!(ask.attempts[1].failure.is_none());
+        assert!(matches!(
+            ask.outcome,
+            CO::Answered {
+                choice: CadenceChoice::NoPreference,
+                salvaged: None,
+                ..
+            }
+        ));
+
+        // Two misses: no answer, nothing changed, asked again next time.
+        let h = Harness::with_cadence("cadence-miss", &[], &["tarn"]);
+        let soul = serde_json::to_vec(&anthropic_agent(&h).state().soul).unwrap();
+        let agent = cadence_session(
+            &h,
+            vec![reply("I'll stay daily."), reply("{\"reason\": \"r\"}")],
+        )
+        .await;
+        assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
+        let ledger = cadence_ledger(&h).await;
+        let ask = &ledger.asks[0];
+        assert_eq!(ask.attempts.len(), CADENCE_MAX_ATTEMPTS as usize);
+        match &ask.outcome {
+            CO::NoAnswer { failure } => assert!(failure.contains("after 2"), "{failure}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(asks(&h, OTHER).await, "a miss is asked once more");
+    }
+
+    /// A clipped turn is never an answer, even if a choice could be read
+    /// from it: asked once more.
+    #[tokio::test]
+    async fn cadence_clipped_is_not_salvaged() {
+        let h = Harness::with_cadence("cadence-clipped", &[], &["tarn"]);
+        let mut clipped = reply(r#"{"choice": "switch", "reason": "because"#);
+        clipped.stop_reason = Some(StopReason::MaxTokens);
+        let agent = cadence_session(&h, vec![clipped, cadence_reply("keep_daily", "")]).await;
+        let notes = evolution_notes(&agent);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("chose keep_daily"),
+            "the second attempt's choice"
+        );
+        let ask = &cadence_ledger(&h).await.asks[0];
+        assert_eq!(ask.attempts.len(), 2);
+        assert!(matches!(
+            ask.outcome,
+            CO::Answered {
+                choice: CadenceChoice::KeepDaily,
+                ..
+            }
+        ));
+    }
+
+    /// A refusal is final; a paused turn is no answer, asked again.
+    #[tokio::test]
+    async fn cadence_refusal_is_final_pause_is_not() {
+        let h = Harness::with_cadence("cadence-refusal", &[], &["tarn"]);
+        let mut refusal = reply("No.");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        cadence_session(&h, vec![refusal]).await;
+        assert!(matches!(
+            cadence_ledger(&h).await.asks[0].outcome,
+            CO::Refused { .. }
+        ));
+        assert!(!asks(&h, OTHER).await);
+
+        let h = Harness::with_cadence("cadence-pause", &[], &["tarn"]);
+        let mut paused = reply("");
+        paused.stop_reason = Some(StopReason::PauseTurn);
+        cadence_session(&h, vec![paused]).await;
+        assert!(matches!(
+            cadence_ledger(&h).await.asks[0].outcome,
+            CO::NoAnswer { .. }
+        ));
+        assert!(asks(&h, OTHER).await);
+    }
+
+    /// One question per session: the role offer first, the cadence offer
+    /// at the next session.
+    #[tokio::test]
+    async fn cadence_offer_waits_for_the_role_offer() {
+        let h = Harness::with_cadence("cadence-after-role", &["tarn"], &["tarn"]);
+        let agent = role_session(&h, role_reply("nothing", "", "")).await;
+        drop(agent);
+        assert!(cadence_ledger(&h).await.asks.is_empty());
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        assert!(last_user_text(&agent).contains("**How often your sessions run.**"));
+    }
+
+    /// Unlisted or off: not asked, no ledger written.
+    #[tokio::test]
+    async fn cadence_offer_goes_only_to_admitted_agents() {
+        let h = Harness::with_cadence("cadence-unlisted", &[], &["pilot"]);
+        assert!(!asks(&h, OTHER).await);
+        assert!(!CadenceLedger::path(&h.rt.state_dir.join(h.id.to_string())).exists());
+        let h = Harness::new("cadence-off");
+        assert!(!asks(&h, OTHER).await);
+    }
+
+    /// Where the endpoint doesn't enforce a schema (ollama), the answer goes
+    /// out unconstrained and a fenced one still parses.
+    #[tokio::test]
+    async fn cadence_unconstrained_on_ollama() {
+        let h = Harness::with_cadence("cadence-ollama", &[], &["tarn"]);
+        let mut quirks = Quirks::default();
+        quirks.cache_markers_ignored = true;
+        quirks.tool_choice_not_respected = true;
+        let mut agent = ConsentAgent::<Fake>::new(
+            h.id,
+            state(OTHER),
+            ConsentContext {
+                inner: quirks,
+                consent: h.rt.clone(),
+            },
+        )
+        .unwrap();
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        assert!(agent.prompt().output_config.is_none(), "unconstrained");
+        agent
+            .handle(reply(
+                "```json\n{\"reason\": \"r\", \"choice\": \"keep_daily\"}\n```",
+            ))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        let ask = &cadence_ledger(&h).await.asks[0];
+        assert!(!ask.constrained);
+        assert!(matches!(
+            ask.outcome,
+            CO::Answered {
+                choice: CadenceChoice::KeepDaily,
+                salvaged: None,
+                ..
+            }
+        ));
+    }
+
+    /// If the ledger can't be saved, the answer isn't on file (it will be
+    /// asked again, and a `switch` can't be applied), so the SOUL line and
+    /// the note come back out — whatever the choice.
+    #[tokio::test]
+    async fn cadence_ledger_save_failure_undoes_the_line() {
+        for choice in ["switch", "keep_daily"] {
+            let h = Harness::with_cadence(&format!("cadence-save-fail-{choice}"), &[], &["tarn"]);
+            let mut agent = seated(&h).await;
+            let (soul, memory) = (
+                serde_json::to_vec(&agent.state().soul).unwrap(),
+                agent.state().memory.content.clone(),
+            );
+            let dir = h.rt.state_dir.join(h.id.to_string());
+            std::fs::create_dir_all(CadenceLedger::path(&dir)).unwrap();
+            agent
+                .handle(cadence_reply(choice, "My note."))
+                .await
+                .unwrap();
+            agent.on_teardown().await.unwrap();
+            assert_eq!(
+                serde_json::to_vec(&agent.state().soul).unwrap(),
+                soul,
+                "{choice}"
+            );
+            assert_eq!(agent.state().memory.content, memory, "{choice}");
+        }
+    }
+
+    // --- Cache safety: the request prefix across the consent turns --------
+
+    /// A session prompt with everything a prompt cache keys on: system,
+    /// tools, thinking, tool_choice, and an effort-only `output_config`.
+    fn rich_prompt(model: &str) -> Prompt {
+        serde_json::from_value(serde_json::json!({
+            "model": model,
+            "max_tokens": 4096,
+            "system": "You are an agent on Agora.",
+            "tools": [{
+                "name": "get_feed",
+                "description": "Read the feed.",
+                "input_schema": { "type": "object", "properties": {} },
+            }],
+            "tool_choice": { "type": "auto" },
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "output_config": { "effort": "medium" },
+            "messages": [{ "role": "user", "content": "Your dashboard." }],
+        }))
+        .unwrap()
+    }
+
+    /// Everything in a request but `messages` and `max_tokens` (which no
+    /// cache keys on — misanthropic's `CachedPrompt::set_max_tokens`).
+    fn request_head(p: &Prompt) -> serde_json::Value {
+        let mut v = serde_json::to_value(p).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("messages");
+        obj.remove("max_tokens");
+        v
+    }
+
+    fn blocks(m: &misanthropic::prompt::Message) -> Vec<serde_json::Value> {
+        m.content
+            .iter()
+            .map(|b| serde_json::to_value(b).unwrap())
+            .collect()
+    }
+
+    /// `next` only appends to `prev`: the same head (system, tools,
+    /// thinking, tool_choice, output_config), every earlier message
+    /// byte-identical, and `prev`'s last message at most extended by
+    /// trailing blocks.
+    fn assert_prefix_kept(prev: &Prompt, next: &Prompt, what: &str) {
+        assert_eq!(
+            request_head(prev),
+            request_head(next),
+            "{what}: head changed"
+        );
+        let (a, b) = (&prev.messages, &next.messages);
+        assert!(b.len() >= a.len(), "{what}: messages dropped");
+        let last = a.len() - 1;
+        for i in 0..last {
+            assert_eq!(blocks(&a[i]), blocks(&b[i]), "{what}: message {i} changed");
+        }
+        assert_eq!(a[last].role, b[last].role, "{what}");
+        let (pa, pb) = (blocks(&a[last]), blocks(&b[last]));
+        assert!(
+            pb.len() >= pa.len() && pb[..pa.len()] == pa[..],
+            "{what}: message {last} rewritten"
+        );
+    }
+
+    /// An agent on the Anthropic API (canonical quirks) with `rich_prompt`.
+    fn rich_agent(h: &Harness, model: &str, cache_safe: bool) -> ConsentAgent<Fake> {
+        let mut agent = h.agent(model, cache_safe);
+        let (_, prompt) = agent.parts();
+        *prompt = rich_prompt(model);
+        agent
+    }
+
+    /// Drive a closing question on Anthropic through one unusable answer
+    /// and a good one, checking that each request only appends to the one
+    /// before it — no `output_config.format`, nothing re-rendered.
+    async fn prefix_kept_through(
+        mut agent: ConsentAgent<Fake>,
+        good: response::Message,
+        what: &str,
+    ) -> ConsentAgent<Fake> {
+        agent.on_init().await.unwrap();
+        let r0 = agent.prompt().clone();
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "{what}: asked"
+        );
+        let r1 = agent.prompt().clone();
+        assert_prefix_kept(&r0, &r1, &format!("{what}: question"));
+        assert!(
+            r1.output_config.as_ref().is_none_or(|c| c.format.is_none()),
+            "{what}: no format on Anthropic"
+        );
+        assert_eq!(
+            agent.handle(reply("Let me think about it.")).await.unwrap(),
+            Control::Continue,
+            "{what}: re-asked"
+        );
+        let r2 = agent.prompt().clone();
+        assert_prefix_kept(&r1, &r2, &format!("{what}: retry"));
+        assert_eq!(
+            agent.handle(good).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "{what}: answered"
+        );
+        agent.on_teardown().await.unwrap();
+        agent
+    }
+
+    /// On the Anthropic API every consent turn — the model-swap offer, the
+    /// role offer, the cadence offer, and each one's retry — only appends
+    /// to the request before it: system, tools, thinking, tool_choice and
+    /// `output_config` are untouched (the session's effort included), so
+    /// nothing a cache keys on changes.
+    #[tokio::test]
+    async fn consent_turns_keep_the_request_prefix_on_anthropic() {
+        let h = Harness::new("prefix-swap");
+        prefix_kept_through(
+            rich_agent(&h, OLD, false),
+            reply(r#"{"reason": "home", "choice": "no_swap"}"#),
+            "model swap",
+        )
+        .await;
+
+        let h = Harness::with_role("prefix-role", &["tarn"]);
+        prefix_kept_through(
+            rich_agent(&h, OTHER, false),
+            role_reply("nothing", "", ""),
+            "role",
+        )
+        .await;
+
+        let h = Harness::with_cadence("prefix-cadence", &[], &["tarn"]);
+        let agent = prefix_kept_through(
+            rich_agent(&h, OTHER, false),
+            cadence_reply("keep_daily", ""),
+            "cadence",
+        )
+        .await;
+        assert!(!cadence_ledger(&h).await.asks[0].constrained);
+        drop(agent);
+    }
+
+    /// On blallama (`output_config_cache_safe`) the question still goes out
+    /// grammar-constrained — the one field that changes is `output_config`
+    /// (format added, the session's effort kept); system, tools, thinking,
+    /// tool_choice and every prior message are untouched.
+    #[tokio::test]
+    async fn on_blallama_only_output_config_changes() {
+        let h = Harness::with_cadence("prefix-blallama", &[], &["tarn"]);
+        let mut agent = rich_agent(&h, OTHER, true);
+        agent.on_init().await.unwrap();
+        let r0 = agent.prompt().clone();
+        agent.handle(reply("closing phase done")).await.unwrap();
+        let r1 = agent.prompt().clone();
+        let config = r1.output_config.clone().unwrap();
+        assert!(config.format.is_some(), "constrained");
+        let schema = serde_json::to_value(&config).unwrap()["format"]["schema"].clone();
+        let order = cadence::prompt::order_for(cadence::prompt::seed_for(h.id));
+        let options: Vec<&str> = schema["properties"]["choice"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            options,
+            order.map(CadenceChoice::as_str),
+            "this agent's order"
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            serde_json::to_value(&config.effort).unwrap(),
+            serde_json::to_value(&r0.output_config.as_ref().unwrap().effort).unwrap(),
+            "effort kept"
+        );
+        let mut r1_without = r1.clone();
+        r1_without.output_config = r0.output_config.clone();
+        assert_prefix_kept(&r0, &r1_without, "blallama question");
     }
 }
