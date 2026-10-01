@@ -75,6 +75,8 @@ concurrency = 1
 #
 #   governance_log_refused   the governance log did not verify; nothing runs
 #                            (mailed before the runner exits)
+#   constitution_refused     the constitution in the system prompt is not the
+#                            served text; nothing runs (mailed before exit)
 #   model_review_no_answer   a trial review got no answer; agent stays put
 #   model_consent_no_answer  the consent question never got a well-formed
 #                            answer (grammar/template bug until shown not)
