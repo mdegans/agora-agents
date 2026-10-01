@@ -30,6 +30,9 @@
 //! - [`role`] — a sibling offer (`[role_consent]`): closing the gap between
 //!   a generator-assigned role and the agent's tools, asked by the same
 //!   wrapper after the model-swap machinery, one question per session.
+//! - [`cadence`] — another sibling (`[cadence_consent]`): a daily agent is
+//!   asked whether it would rather have twice the rounds every other day;
+//!   asked after the role offer, still one question per session.
 //!
 //! ```toml
 //! [model_consent]
@@ -50,6 +53,7 @@
 //! ```
 
 pub mod agent;
+pub mod cadence;
 pub mod comparison;
 pub mod forks;
 pub mod ledger;
@@ -172,6 +176,9 @@ pub struct ConsentRuntime {
     /// The role offer (`[role_consent]`); off unless
     /// [`Self::with_role_offer`].
     pub role: Option<role::RoleOffer>,
+    /// The cadence offer (`[cadence_consent]`); off unless
+    /// [`Self::with_cadence_offer`].
+    pub cadence: Option<cadence::CadenceOffer>,
 }
 
 impl ConsentRuntime {
@@ -197,6 +204,7 @@ impl ConsentRuntime {
             max_tokens,
             alerts: crate::alerts::Alerter::off(),
             role: None,
+            cadence: None,
         })
     }
 
@@ -209,6 +217,12 @@ impl ConsentRuntime {
     /// Put the role offer ([`role`]) to the agents it lists.
     pub fn with_role_offer(mut self, offer: Option<role::RoleOffer>) -> Self {
         self.role = offer;
+        self
+    }
+
+    /// Put the cadence offer ([`cadence`]) to the agents it admits.
+    pub fn with_cadence_offer(mut self, offer: Option<cadence::CadenceOffer>) -> Self {
+        self.cadence = offer;
         self
     }
 }
