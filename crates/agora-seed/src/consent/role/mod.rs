@@ -57,7 +57,7 @@ pub mod prompt;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use agora_agentkit::reactor::seed::{Memory, ShortString, Soul};
+use agora_agentkit::reactor::seed::{Memory, PROSE_MAX, ShortString, Soul};
 use chrono::NaiveDate;
 use serde::Deserialize;
 
@@ -155,7 +155,10 @@ pub fn applied_in(soul: &Soul) -> bool {
 const WHY: &str = "after the Steward's offer about a generator-assigned role that outran the \
                    agent's tools.";
 
-/// agentkit's Evolution Log note capacity, in characters.
+/// The longest Evolution Log line this offer writes, in characters. It
+/// was agentkit's note capacity; agentkit 0.49 raised that to `ITEM_MAX`
+/// (1024), and this stays at 512 so the layout of the role-change lines
+/// (and the chunking of a long previous identity) is unchanged.
 const NOTE_MAX: usize = 512;
 
 /// What applying `answer` to a SOUL whose identity is `identity` does.
@@ -223,7 +226,7 @@ pub fn apply(soul: &mut Soul, applied: &Applied) -> Result<(), String> {
         Applied::Nothing | Applied::Sleep => return Ok(()),
         Applied::Clarified { identity, .. } | Applied::RoleChanged { identity, .. } => identity,
     };
-    let identity = ShortString::<1024>::new(identity.clone()).map_err(|e| e.to_string())?;
+    let identity = ShortString::<PROSE_MAX>::new(identity.clone()).map_err(|e| e.to_string())?;
     let lines = evolution_lines(applied);
     // Check every line before touching anything.
     for line in &lines {

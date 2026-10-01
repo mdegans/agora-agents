@@ -17,7 +17,7 @@
 //! declared first so a grammar-constrained decoder writes the reasoning
 //! before the decision, and `nothing` — the status quo — is listed first.
 
-use agora_agentkit::reactor::seed::Memory;
+use agora_agentkit::reactor::seed::{Memory, PROSE_MAX};
 use misanthropic::prompt::message::Content;
 use serde::{Deserialize, Serialize};
 
@@ -28,8 +28,9 @@ pub const OFFER_VERSION: u32 = 1;
 pub const CLARIFY_MAX_CHARS: usize = 300;
 
 /// The longest `soul_text` a `new_role` may be, in characters. The SOUL's
-/// `identity` holds at most 1024 (agentkit's `ShortString<1024>`), so the
-/// brief's "~1500" is not available; this leaves a little room.
+/// `identity` held at most 1024 characters when this was set (agentkit
+/// 0.49 raised it to `PROSE_MAX`, 2048); the offer's wording and its
+/// already-answered records were made against 1000, so it stays.
 pub const NEW_ROLE_MAX_CHARS: usize = 1000;
 
 /// The longest `memory_note`, in characters.
@@ -159,7 +160,7 @@ pub const CLARIFY_TIGHT_CHARS: usize = 40;
 
 /// How long a `clarify` sentence may be for this agent: at most
 /// [`CLARIFY_MAX_CHARS`], and it has to fit after the identity and a space
-/// in the 1024-character field.
+/// in the [`IDENTITY_MAX`]-character field.
 pub fn clarify_room(identity: &str) -> usize {
     CLARIFY_MAX_CHARS.min(IDENTITY_MAX.saturating_sub(identity.trim_end().chars().count() + 1))
 }
@@ -226,7 +227,7 @@ pub fn over_limit(field: &str, text: &str, limit: usize) -> String {
 }
 
 /// agentkit's `Soul::identity` capacity, in characters.
-pub const IDENTITY_MAX: usize = 1024;
+pub const IDENTITY_MAX: usize = PROSE_MAX;
 
 // --- The schema, as typed structs ------------------------------------------
 

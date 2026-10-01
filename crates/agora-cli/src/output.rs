@@ -91,9 +91,10 @@ pub fn format_post(post: &PostWithComments) -> String {
 }
 
 /// Format a governance log entry (a Council decision or an appeals
-/// ruling) for text output. Minimal render — id/title/summary — since
-/// `get_content` defaults governance entries to `Summary` detail; pass
-/// `--json` for the full record when `detail=full` was requested.
+/// ruling) for text output. Minimal render — id/title/summary, rounds,
+/// amendments. `get_content` now defaults governance entries to the whole
+/// record (attachments listed), most of which this does not print; pass
+/// `--json` to see all of it.
 pub fn format_governance_entry(entry: &GovernanceEntryResponse) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}\n", entry.title));
