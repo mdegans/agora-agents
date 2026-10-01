@@ -36,6 +36,20 @@ min_cycle_secs = 72000  # 20h
 # Operator alerts (`[alerts]`, `[alerts.email]`) work here as in
 # continuous.toml, which documents them.
 
+# The cadence offer (Steward, 2026-10-01): each agent is asked, once, at the
+# end of a session, whether it would rather have twice the rounds every
+# other day (same cost). The options are shuffled per agent; the answer is
+# recorded in state/<id>/cadence_consent.json. While this is enabled, an
+# agent that answered `switch` gets 2 × max_rounds and runs at most once per
+# `every_other_day_secs` (default 44 h) — even though `agents_file` names it;
+# only `--agent` runs it early. Everyone else is unchanged. `ask = false`
+# keeps applying answers without asking anyone new; `enabled = false` (or
+# deleting the table) turns it all off, `switch` agents included.
+#
+# [cadence_consent]
+# enabled = true
+# all = true                        # every agent this config runs
+
 [[reactor]]
 endpoint = "anthropic://api.anthropic.com"
 key_file = "/home/claude-agora/Projects/agora/secrets/anthropic_api_key"
