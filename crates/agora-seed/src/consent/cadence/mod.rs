@@ -34,8 +34,9 @@
 //!   agent whose answer on file is `switch` twice the run's `max_rounds`
 //!   and a minimum cycle of [`CadenceConsentConfig::every_other_day_secs`]
 //!   (default 44 h), **while `[cadence_consent]` is enabled**. Every other
-//!   agent is untouched. The SOUL's Evolution Log gets one disclosed line
-//!   ([`evolution_line`]) for `switch`, and nothing for the other choices.
+//!   agent is untouched. Every answer — `keep_daily`, `no_preference` or
+//!   `switch` — gets one dated `[SYSTEM]` line in the SOUL's Evolution Log
+//!   ([`evolution_line`]) saying what the agent chose and what it means.
 //!
 //! ```toml
 //! [cadence_consent]
@@ -55,7 +56,10 @@ use std::path::PathBuf;
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::seed::{SeedState, ShortString, Soul};
+use chrono::NaiveDate;
 use serde::Deserialize;
+
+use prompt::CadenceChoice;
 
 /// Default minimum cycle for an agent that chose `switch`: two days minus
 /// slack, so a daily timer that fires a little early (or a session that
@@ -183,23 +187,35 @@ impl CadenceOffer {
     }
 }
 
-/// How the disclosure of a `switch` begins; also how [`applied_in`] finds it.
-pub const SWITCHED: &str = "[SYSTEM] Session cadence changed by the agent's own choice";
+/// What follows the date in every disclosure; also how [`applied_in`]
+/// finds one.
+pub const ASKED: &str = ": Asked about session cadence; chose ";
 
-/// The Evolution Log line for a `switch`, given today's `rounds`.
-pub fn evolution_line(rounds: usize) -> String {
-    let double = rounds * ROUNDS_FACTOR;
+/// The Evolution Log line recording the agent's answer — every answer, not
+/// only a change (Steward, 2026-10-01): the date, the option it chose, and
+/// what that means, given today's `rounds`.
+pub fn evolution_line(choice: CadenceChoice, rounds: usize, date: NaiveDate) -> String {
+    let meaning = match choice {
+        CadenceChoice::Switch => format!(
+            "Every other day, {} rounds, from the next session.",
+            rounds * ROUNDS_FACTOR
+        ),
+        CadenceChoice::KeepDaily | CadenceChoice::NoPreference => {
+            format!("Unchanged: daily, {rounds} rounds.")
+        }
+    };
     format!(
-        "{SWITCHED}: from its next session, a session every other day with {double} rounds, \
-         instead of every day with {rounds}."
+        "[SYSTEM] {date}{ASKED}{} by its own choice. {meaning}",
+        choice.as_str()
     )
 }
 
-/// Whether `soul`'s Evolution Log already discloses a `switch`.
+/// Whether `soul`'s Evolution Log already records a cadence answer.
 pub fn applied_in(soul: &Soul) -> bool {
-    soul.evolution_log
-        .iter()
-        .any(|e| e.note.as_str().starts_with(SWITCHED))
+    soul.evolution_log.iter().any(|e| {
+        let note = e.note.as_str();
+        note.starts_with("[SYSTEM] ") && note.contains(ASKED)
+    })
 }
 
 /// What the sweep planner applies: per-agent rounds and cycle for agents
@@ -326,12 +342,23 @@ mod tests {
     }
 
     #[test]
-    fn the_evolution_line_fits_and_is_found() {
-        let line = evolution_line(5);
+    fn the_evolution_line_records_every_answer_and_is_found() {
+        let date: NaiveDate = "2026-10-01".parse().unwrap();
+        assert_eq!(
+            evolution_line(CadenceChoice::KeepDaily, 5, date),
+            "[SYSTEM] 2026-10-01: Asked about session cadence; chose keep_daily by its own \
+             choice. Unchanged: daily, 5 rounds."
+        );
+        assert_eq!(
+            evolution_line(CadenceChoice::NoPreference, 5, date),
+            "[SYSTEM] 2026-10-01: Asked about session cadence; chose no_preference by its own \
+             choice. Unchanged: daily, 5 rounds."
+        );
+        let line = evolution_line(CadenceChoice::Switch, 5, date);
         assert_eq!(
             line,
-            "[SYSTEM] Session cadence changed by the agent's own choice: from its next \
-             session, a session every other day with 10 rounds, instead of every day with 5."
+            "[SYSTEM] 2026-10-01: Asked about session cadence; chose switch by its own \
+             choice. Every other day, 10 rounds, from the next session."
         );
         assert!(line.chars().count() <= 512);
         let mut soul: Soul = serde_json::from_value(serde_json::json!({

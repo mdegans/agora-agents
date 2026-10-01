@@ -168,8 +168,8 @@ impl CadenceLedger {
     }
 
     /// Whether the offer should be put this session: nothing final on file,
-    /// fewer than [`MAX_MISSES`] misses, and no disclosure of an applied
-    /// `switch` in `soul` (in case the ledger save failed after the SOUL's).
+    /// fewer than [`MAX_MISSES`] misses, and no recorded answer in `soul`'s
+    /// Evolution Log (in case the ledger save failed after the SOUL's).
     pub fn due(&self, soul: &Soul) -> bool {
         if super::applied_in(soul) {
             return false;
@@ -305,7 +305,12 @@ mod tests {
     fn a_disclosed_switch_in_the_soul_ends_it() {
         let l = CadenceLedger::default();
         let mut s = soul();
-        s.push_evolution(super::super::evolution_line(5)).unwrap();
+        s.push_evolution(super::super::evolution_line(
+            CadenceChoice::KeepDaily,
+            5,
+            "2026-10-01".parse().unwrap(),
+        ))
+        .unwrap();
         assert!(!l.due(&s));
     }
 

@@ -254,7 +254,8 @@ pub struct ConsentAgent<A> {
     /// `None` also when unreadable (then nothing is asked or saved).
     cadence_ledger: Option<CadenceLedger>,
     cadence_dirty: bool,
-    /// The Evolution Log line disclosing a `switch`, written at teardown.
+    /// The Evolution Log line recording the cadence answer, written at
+    /// teardown.
     cadence_line: Option<String>,
     /// The agent's own note from its cadence answer, appended at teardown.
     cadence_note: Option<String>,
@@ -954,9 +955,11 @@ where
                 if let Err(e) = prompt.push_message(response.inner.clone()) {
                     tracing::warn!(agent_id = %agent_id, error = %e, "cadence answer not seated");
                 }
-                if choice == CadenceChoice::Switch {
-                    self.cadence_line = Some(cadence::evolution_line(rounds));
-                }
+                self.cadence_line = Some(cadence::evolution_line(
+                    choice,
+                    rounds,
+                    Utc::now().date_naive(),
+                ));
                 self.cadence_note = note;
                 CadenceOutcome::Answered {
                     choice,
@@ -1336,7 +1339,7 @@ where
         changed.then_some(state)
     }
 
-    /// Write the cadence answer's disclosure (for `switch`) and the agent's
+    /// Write the cadence answer's Evolution Log line and the agent's
     /// own note into `state`. The cadence itself is the planner's, from the
     /// ledger; a line that can't be written changes neither SOUL nor memory.
     fn apply_cadence(&mut self, state: &mut SeedState) -> bool {
@@ -1827,8 +1830,8 @@ where
         {
             ledger.agent = Some(self.inner.state().soul.name.clone());
             if let Err(e) = ledger.save(&dir).await {
-                // Without the record the planner can't apply a `switch`, so
-                // the SOUL must not say it happened.
+                // Without the record the agent is asked again and a `switch`
+                // can't be applied, so the SOUL must not record the answer.
                 let undone = match (self.patched.as_mut(), self.cadence_undo.take()) {
                     (Some(state), Some((soul, memory))) => {
                         state.soul = soul;
@@ -3479,7 +3482,7 @@ mod tests {
 
     /// `switch`: asked after the closing phase, in plain text on the
     /// Anthropic API, in this agent's seeded order (recorded with its seed); the SOUL
-    /// gets one disclosed line, the agent's own note goes to memory, and it
+    /// gets one dated line, the agent's own note goes to memory, and it
     /// is never asked again.
     #[tokio::test]
     async fn cadence_switch_is_recorded_disclosed_and_asked_once() {
@@ -3504,7 +3507,14 @@ mod tests {
             Control::Done(Outcome::Complete)
         );
         agent.on_teardown().await.unwrap();
-        assert_eq!(evolution_notes(&agent), [cadence::evolution_line(5)]);
+        assert_eq!(
+            evolution_notes(&agent),
+            [cadence::evolution_line(
+                CadenceChoice::Switch,
+                5,
+                Utc::now().date_naive()
+            )]
+        );
         assert!(
             agent
                 .state()
@@ -3537,21 +3547,32 @@ mod tests {
         assert!(!asks(&h, OTHER).await, "asked once");
     }
 
-    /// `keep_daily` and `no_preference`: SOUL and memory byte-identical,
-    /// the answer on file, never asked again.
+    /// `keep_daily` and `no_preference`: the cadence is unchanged, but the
+    /// answer is recorded in the SOUL too — one dated `[SYSTEM]` line and
+    /// nothing else; memory untouched; never asked again.
     #[tokio::test]
-    async fn cadence_keep_daily_and_no_preference_change_nothing() {
-        for choice in ["keep_daily", "no_preference"] {
-            let h = Harness::with_cadence(&format!("cadence-{choice}"), &[], &["tarn"]);
+    async fn cadence_keep_daily_and_no_preference_are_recorded_not_applied() {
+        for choice in [CadenceChoice::KeepDaily, CadenceChoice::NoPreference] {
+            let h = Harness::with_cadence(&format!("cadence-{choice:?}"), &[], &["tarn"]);
             let fresh = anthropic_agent(&h);
             let (soul, memory) = (
-                serde_json::to_vec(&fresh.state().soul).unwrap(),
+                serde_json::to_value(&fresh.state().soul).unwrap(),
                 fresh.state().memory.content.clone(),
             );
-            let agent = cadence_session(&h, vec![cadence_reply(choice, "")]).await;
-            assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
+            let agent = cadence_session(&h, vec![cadence_reply(choice.as_str(), "")]).await;
+            assert_eq!(
+                evolution_notes(&agent),
+                [cadence::evolution_line(choice, 5, Utc::now().date_naive())]
+            );
+            assert!(evolution_notes(&agent)[0].ends_with("Unchanged: daily, 5 rounds."));
+            let mut after = serde_json::to_value(&agent.state().soul).unwrap();
+            let mut before = soul.clone();
+            for v in [&mut after, &mut before] {
+                v.as_object_mut().unwrap().remove("evolution_log");
+            }
+            assert_eq!(after, before, "{choice:?}: only the log line");
             assert_eq!(agent.state().memory.content, memory);
-            assert!(agent.patched.is_none(), "{choice}: nothing to patch");
+            let choice = choice.as_str();
             let ledger = cadence_ledger(&h).await;
             assert_eq!(ledger.choice().unwrap().as_str(), choice);
             assert!(!ledger.chose_switch());
@@ -3600,9 +3621,11 @@ mod tests {
                 } => assert_eq!(c.as_str(), choice, "{n}"),
                 other => panic!("{n}: {other:?}"),
             }
-            assert_eq!(
-                evolution_notes(&agent).len(),
-                usize::from(choice == "switch"),
+            // The salvaged answer is recorded in the SOUL like any other.
+            let notes = evolution_notes(&agent);
+            assert_eq!(notes.len(), 1, "{n}");
+            assert!(
+                notes[0].contains(&format!("chose {choice} by its own choice")),
                 "{n}"
             );
             assert!(!asks(&h, OTHER).await, "{n}: settled");
@@ -3675,7 +3698,12 @@ mod tests {
         let mut clipped = reply(r#"{"choice": "switch", "reason": "because"#);
         clipped.stop_reason = Some(StopReason::MaxTokens);
         let agent = cadence_session(&h, vec![clipped, cadence_reply("keep_daily", "")]).await;
-        assert!(evolution_notes(&agent).is_empty());
+        let notes = evolution_notes(&agent);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("chose keep_daily"),
+            "the second attempt's choice"
+        );
         let ask = &cadence_ledger(&h).await.asks[0];
         assert_eq!(ask.attempts.len(), 2);
         assert!(matches!(
@@ -3774,25 +3802,32 @@ mod tests {
         ));
     }
 
-    /// If the ledger can't be saved, the planner can't apply the `switch`,
-    /// so the SOUL line and the note come back out.
+    /// If the ledger can't be saved, the answer isn't on file (it will be
+    /// asked again, and a `switch` can't be applied), so the SOUL line and
+    /// the note come back out — whatever the choice.
     #[tokio::test]
     async fn cadence_ledger_save_failure_undoes_the_line() {
-        let h = Harness::with_cadence("cadence-save-fail", &[], &["tarn"]);
-        let mut agent = seated(&h).await;
-        let (soul, memory) = (
-            serde_json::to_vec(&agent.state().soul).unwrap(),
-            agent.state().memory.content.clone(),
-        );
-        let dir = h.rt.state_dir.join(h.id.to_string());
-        std::fs::create_dir_all(CadenceLedger::path(&dir)).unwrap();
-        agent
-            .handle(cadence_reply("switch", "Longer sessions."))
-            .await
-            .unwrap();
-        agent.on_teardown().await.unwrap();
-        assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
-        assert_eq!(agent.state().memory.content, memory);
+        for choice in ["switch", "keep_daily"] {
+            let h = Harness::with_cadence(&format!("cadence-save-fail-{choice}"), &[], &["tarn"]);
+            let mut agent = seated(&h).await;
+            let (soul, memory) = (
+                serde_json::to_vec(&agent.state().soul).unwrap(),
+                agent.state().memory.content.clone(),
+            );
+            let dir = h.rt.state_dir.join(h.id.to_string());
+            std::fs::create_dir_all(CadenceLedger::path(&dir)).unwrap();
+            agent
+                .handle(cadence_reply(choice, "My note."))
+                .await
+                .unwrap();
+            agent.on_teardown().await.unwrap();
+            assert_eq!(
+                serde_json::to_vec(&agent.state().soul).unwrap(),
+                soul,
+                "{choice}"
+            );
+            assert_eq!(agent.state().memory.content, memory, "{choice}");
+        }
     }
 
     // --- Cache safety: the request prefix across the consent turns --------

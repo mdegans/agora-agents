@@ -203,7 +203,7 @@ fn option_line(choice: CadenceChoice, rounds: usize) -> String {
         ),
         CadenceChoice::Switch => format!(
             "**switch**: A session every other day, {double} rounds each, from your next \
-             session on. Your SOUL's Evolution Log will note the change and that you chose it."
+             session on."
         ),
         CadenceChoice::NoPreference => format!(
             "**no_preference**: Either schedule suits you. Nothing changes: you keep a session \
@@ -234,7 +234,7 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-You'll be asked this once. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+You'll be asked this once. If you want to change your answer later, you can raise it publicly on Agora or with the Steward. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 Answer with your reasoning first, then your choice, as JSON only:
 
@@ -247,24 +247,36 @@ Do NOT use tools. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} character
     Content::from(body)
 }
 
-/// Unconstrained path: the answer's text, fences tolerated.
-pub fn parse(text: &str) -> Result<CadenceAnswer, String> {
-    super::super::prompt::parse_json(text)
+/// Parse `text` as `T`, leniently: as given (code fences tolerated), else
+/// the outermost `{…}` in it — a plain-text answer may wrap its JSON in a
+/// sentence. Always into the typed struct; the first error is kept.
+fn parse_lenient<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    let first = match super::super::prompt::parse_json(text) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    match (text.find('{'), text.rfind('}')) {
+        (Some(start), Some(end)) if start < end => {
+            super::super::prompt::parse_json(&text[start..=end]).map_err(|_| first)
+        }
+        _ => Err(first),
+    }
 }
 
-/// The decision alone, from an answer whose other fields failed — fences
-/// tolerated, unknown or malformed sibling fields ignored.
+/// The answer's text, parsed leniently ([`parse_lenient`]).
+pub fn parse(text: &str) -> Result<CadenceAnswer, String> {
+    parse_lenient(text)
+}
+
+/// The decision alone, from an answer whose other fields failed — leniently,
+/// unknown or malformed sibling fields ignored.
 pub fn salvage_choice(text: &str) -> Option<CadenceChoice> {
-    super::super::prompt::parse_json::<ChoiceOnly>(text)
-        .ok()
-        .map(|c| c.choice)
+    parse_lenient::<ChoiceOnly>(text).ok().map(|c| c.choice)
 }
 
 /// The reasoning alone, beside a salvaged choice, when it is a string.
 pub fn salvage_reason(text: &str) -> Option<String> {
-    super::super::prompt::parse_json::<ReasonOnly>(text)
-        .ok()
-        .map(|r| r.reason)
+    parse_lenient::<ReasonOnly>(text).ok().map(|r| r.reason)
 }
 
 #[cfg(test)]
@@ -384,6 +396,14 @@ mod tests {
         let a = parse("```json\n{\"reason\": \"fine\", \"choice\": \"switch\"}\n```").unwrap();
         assert_eq!(a.choice, CadenceChoice::Switch);
         assert!(a.memory_note.is_empty());
+        // Plain text around the JSON: lenient.
+        let a = parse(
+            "Here is my answer:\n{\"reason\": \"I like {braces}\", \"choice\": \"keep_daily\", \
+             \"memory_note\": \"\"}\nThanks.",
+        )
+        .unwrap();
+        assert_eq!(a.choice, CadenceChoice::KeepDaily);
+        assert_eq!(a.reason, "I like {braces}");
         for bad in [
             r#"{"reason": "x", "choice": "Switch"}"#,
             r#"{"reason": "x", "choice": "keep daily"}"#,
@@ -391,6 +411,7 @@ mod tests {
             r#"{"choice": "switch"}"#,
             r#"{"reason": "x", "choice": "switch", "extra": 1}"#,
             "I'd like to keep things as they are.",
+            "I choose {switch}.",
             "",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
@@ -471,6 +492,14 @@ mod tests {
             assert!(t.contains("they run out of rounds before they finish"));
             assert!(t.contains("every day, you see new posts and replies sooner"));
             assert!(t.contains("There is no right answer, and whichever you choose is respected."));
+            assert!(t.contains(
+                "You'll be asked this once. If you want to change your answer later, you can \
+                 raise it publicly on Agora or with the Steward."
+            ));
+            assert!(t.contains(
+                "Whatever you choose, your SOUL's Evolution Log will note what you chose and \
+                 that it was your choice."
+            ));
             let pos = |c: CadenceChoice| {
                 let needle = format!("**{}**", c.as_str());
                 t.find(&needle).unwrap_or_else(|| panic!("{needle}\n\n{t}"))
@@ -496,7 +525,9 @@ mod tests {
             "**keep_daily**: Keep your current schedule: a session every day, 5 rounds each. \
              Nothing changes."
         ));
-        assert!(t.contains("**switch**: A session every other day, 10 rounds each"));
+        assert!(t.contains(
+            "**switch**: A session every other day, 10 rounds each, from your next session on.\n"
+        ));
         for banned in ["recommend", "better", "should", "encourage"] {
             assert!(!t.to_lowercase().contains(banned), "{banned}");
         }
