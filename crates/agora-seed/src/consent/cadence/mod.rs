@@ -11,11 +11,13 @@
 //! - **Neutral text**, the trade stated both ways, no example answer for
 //!   any one option, and the options in an order **shuffled per agent**,
 //!   seeded from its id and recorded ([`prompt::order_for`]).
-//! - **Constrained where the endpoint really constrains**: on the Anthropic
-//!   API (Haiku) the answer always goes out with the `$ref`-free,
-//!   `pattern`-free, closed schema as `output_config` — even though
-//!   Anthropic re-prefills when `output_config` changes; one re-prefill per
-//!   agent, once, buys a grammar-enforced reasoning-first answer.
+//! - **Never a cache miss to constrain an answer** (Steward, 2026-10-01):
+//!   the closed, `$ref`-free, `pattern`-free schema goes out as
+//!   `output_config` only where that keeps the prefix cache
+//!   (`Quirks::output_config_cache_safe`: blallama). On the Anthropic API
+//!   (Haiku) the request is left byte-for-byte as it was plus the question:
+//!   the JSON shape is described in the text, the answer parsed leniently
+//!   into the same typed struct, and re-asked if no choice can be read.
 //! - **The first parsed choice wins.** An answer whose `choice` parses is
 //!   honoured even if its other fields are broken (the note is then
 //!   dropped and the salvage recorded). Only a missing or invalid `choice`

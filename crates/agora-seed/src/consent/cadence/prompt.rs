@@ -291,8 +291,9 @@ mod tests {
     }
 
     /// CLAUDE.md, "Never ship a `$ref` schema; `strict` only on
-    /// `$ref`-free schemas": the cadence answer goes out constrained on the
-    /// Anthropic API (Haiku), so its schema must carry no `$ref`/`$defs`
+    /// `$ref`-free schemas": the cadence answer goes out grammar-constrained
+    /// on blallama (and the same type parses it everywhere, so the schema
+    /// must be fit for `strict` wherever it is ever sent): no `$ref`/`$defs`
     /// (rule 1) and no `pattern` (rule 4) anywhere, must be closed with an
     /// explicit `additionalProperties: false` (rule 2), require every
     /// property, and declare `reason` before `choice` — for every order the

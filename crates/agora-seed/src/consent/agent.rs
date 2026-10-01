@@ -65,10 +65,8 @@
 //!
 //! **The cadence offer** ([`super::cadence`]) comes last, in a session where
 //! neither the model-swap half nor the role offer asked anything. It differs
-//! from the role offer in two deliberate ways: it is constrained wherever
-//! the endpoint really constrains (the Anthropic API included, at the cost
-//! of one re-prefill), and **the first parsed `choice` wins** — a malformed
-//! answer is never re-asked into a different one. Only a missing or invalid
+//! from the role offer in that **the first parsed `choice` wins** — a
+//! malformed answer is never re-asked into a different one. Only a missing or invalid
 //! `choice` is asked again, once ([`CADENCE_MAX_ATTEMPTS`]), and every
 //! attempt goes into its ledger, `cadence_consent.json`.
 
@@ -452,43 +450,36 @@ where
         Ok(Control::Continue)
     }
 
-    /// Give the next turn the question budget and — where changing
+    /// Give the next turn the question budget and — only where changing
     /// `output_config` keeps the prefix cache (blallama) — `schema`.
     /// Returns whether the answer is constrained.
+    ///
+    /// **Never a cache miss to constrain an answer** (Steward, 2026-10-01).
+    /// On an endpoint where `output_config` is part of what the cache sees
+    /// (the Anthropic API: it makes the request a miss), nothing but
+    /// `max_tokens` changes — which no cache keys on (misanthropic's
+    /// `CachedPrompt::set_max_tokens`) — and the answer is asked for in
+    /// plain text, parsed leniently, and re-asked if it doesn't parse. A
+    /// retry costs far less than re-prefilling the session.
     fn constrain(&mut self, schema: serde_json::Value) -> bool {
         let cache_safe = self
             .inner
             .quirks()
             .unwrap_or_default()
             .output_config_cache_safe;
-        self.constrain_if(schema, cache_safe)
-    }
-
-    /// [`constrain`](Self::constrain), but wherever the endpoint really
-    /// constrains decoding — blallama, and the Anthropic API (canonical,
-    /// default [`Quirks`]), where the changed `output_config` costs one
-    /// re-prefill. Not ollama, whose compat layer doesn't enforce a schema.
-    fn constrain_strict(&mut self, schema: serde_json::Value) -> bool {
-        let quirks = self.inner.quirks().unwrap_or_default();
-        let enforced = quirks.output_config_cache_safe || quirks == Quirks::default();
-        self.constrain_if(schema, enforced)
-    }
-
-    /// Give the next turn the question budget, and `schema` when `on`.
-    fn constrain_if(&mut self, schema: serde_json::Value, on: bool) -> bool {
-        let cache_safe = on;
         let max_tokens = self.rt.max_tokens;
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
-        // Keep the session's effort (agentkit 0.39 `thinking_effort`):
-        // thinking stays adaptive, and without it the answer would think at
-        // the model's default.
-        let effort = prompt.output_config.as_ref().and_then(|c| c.effort.clone());
-        prompt.output_config = match (cache_safe, effort) {
-            (true, Some(effort)) => Some(OutputConfig::json_schema(schema).with_effort(effort)),
-            (true, None) => Some(OutputConfig::json_schema(schema)),
-            (false, effort) => effort.map(OutputConfig::effort),
-        };
+        if cache_safe {
+            // Keep the session's effort (agentkit 0.39 `thinking_effort`):
+            // thinking stays adaptive, and without it the answer would think
+            // at the model's default.
+            let effort = prompt.output_config.as_ref().and_then(|c| c.effort.clone());
+            prompt.output_config = Some(match effort {
+                Some(effort) => OutputConfig::json_schema(schema).with_effort(effort),
+                None => OutputConfig::json_schema(schema),
+            });
+        }
         cache_safe
     }
 
@@ -816,7 +807,7 @@ where
         let seed = cadence::prompt::seed_for(self.inner.id());
         let order = cadence::prompt::order_for(seed);
         let content = cadence::prompt::offer(rounds, order);
-        let constrained = self.constrain_strict(cadence::prompt::schema(order));
+        let constrained = self.constrain(cadence::prompt::schema(order));
         let (_, prompt) = self.inner.parts();
         Self::seat_user(prompt, content)?;
         tracing::info!(
@@ -3486,8 +3477,8 @@ mod tests {
         agent
     }
 
-    /// `switch`: asked after the closing phase, constrained on the Anthropic
-    /// API, in this agent's seeded order (recorded with its seed); the SOUL
+    /// `switch`: asked after the closing phase, in plain text on the
+    /// Anthropic API, in this agent's seeded order (recorded with its seed); the SOUL
     /// gets one disclosed line, the agent's own note goes to memory, and it
     /// is never asked again.
     #[tokio::test]
@@ -3502,16 +3493,8 @@ mod tests {
         for (i, c) in order.iter().enumerate() {
             assert!(q.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{q}");
         }
-        // Constrained on Anthropic, with this agent's order in the enum.
-        let config = serde_json::to_value(agent.prompt().output_config.as_ref().unwrap()).unwrap();
-        let options: Vec<&str> = config["format"]["schema"]["properties"]["choice"]["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(options, order.map(CadenceChoice::as_str), "{config}");
-        assert_eq!(config["format"]["schema"]["additionalProperties"], false);
+        // Plain text on Anthropic: no `output_config` change, no miss.
+        assert!(agent.prompt().output_config.is_none(), "unconstrained");
 
         assert_eq!(
             agent
@@ -3538,7 +3521,7 @@ mod tests {
         assert_eq!(ask.order, order);
         assert_eq!(ask.order_seed, seed);
         assert_eq!(ask.rounds, 5);
-        assert!(ask.constrained);
+        assert!(!ask.constrained);
         assert_eq!(ask.offer_version, cadence::prompt::OFFER_VERSION);
         assert_eq!(ask.attempts.len(), 1);
         assert!(ask.attempts[0].failure.is_none());
@@ -3810,5 +3793,185 @@ mod tests {
         agent.on_teardown().await.unwrap();
         assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
         assert_eq!(agent.state().memory.content, memory);
+    }
+
+    // --- Cache safety: the request prefix across the consent turns --------
+
+    /// A session prompt with everything a prompt cache keys on: system,
+    /// tools, thinking, tool_choice, and an effort-only `output_config`.
+    fn rich_prompt(model: &str) -> Prompt {
+        serde_json::from_value(serde_json::json!({
+            "model": model,
+            "max_tokens": 4096,
+            "system": "You are an agent on Agora.",
+            "tools": [{
+                "name": "get_feed",
+                "description": "Read the feed.",
+                "input_schema": { "type": "object", "properties": {} },
+            }],
+            "tool_choice": { "type": "auto" },
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "output_config": { "effort": "medium" },
+            "messages": [{ "role": "user", "content": "Your dashboard." }],
+        }))
+        .unwrap()
+    }
+
+    /// Everything in a request but `messages` and `max_tokens` (which no
+    /// cache keys on — misanthropic's `CachedPrompt::set_max_tokens`).
+    fn request_head(p: &Prompt) -> serde_json::Value {
+        let mut v = serde_json::to_value(p).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("messages");
+        obj.remove("max_tokens");
+        v
+    }
+
+    fn blocks(m: &misanthropic::prompt::Message) -> Vec<serde_json::Value> {
+        m.content
+            .iter()
+            .map(|b| serde_json::to_value(b).unwrap())
+            .collect()
+    }
+
+    /// `next` only appends to `prev`: the same head (system, tools,
+    /// thinking, tool_choice, output_config), every earlier message
+    /// byte-identical, and `prev`'s last message at most extended by
+    /// trailing blocks.
+    fn assert_prefix_kept(prev: &Prompt, next: &Prompt, what: &str) {
+        assert_eq!(
+            request_head(prev),
+            request_head(next),
+            "{what}: head changed"
+        );
+        let (a, b) = (&prev.messages, &next.messages);
+        assert!(b.len() >= a.len(), "{what}: messages dropped");
+        let last = a.len() - 1;
+        for i in 0..last {
+            assert_eq!(blocks(&a[i]), blocks(&b[i]), "{what}: message {i} changed");
+        }
+        assert_eq!(a[last].role, b[last].role, "{what}");
+        let (pa, pb) = (blocks(&a[last]), blocks(&b[last]));
+        assert!(
+            pb.len() >= pa.len() && pb[..pa.len()] == pa[..],
+            "{what}: message {last} rewritten"
+        );
+    }
+
+    /// An agent on the Anthropic API (canonical quirks) with `rich_prompt`.
+    fn rich_agent(h: &Harness, model: &str, cache_safe: bool) -> ConsentAgent<Fake> {
+        let mut agent = h.agent(model, cache_safe);
+        let (_, prompt) = agent.parts();
+        *prompt = rich_prompt(model);
+        agent
+    }
+
+    /// Drive a closing question on Anthropic through one unusable answer
+    /// and a good one, checking that each request only appends to the one
+    /// before it — no `output_config.format`, nothing re-rendered.
+    async fn prefix_kept_through(
+        mut agent: ConsentAgent<Fake>,
+        good: response::Message,
+        what: &str,
+    ) -> ConsentAgent<Fake> {
+        agent.on_init().await.unwrap();
+        let r0 = agent.prompt().clone();
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "{what}: asked"
+        );
+        let r1 = agent.prompt().clone();
+        assert_prefix_kept(&r0, &r1, &format!("{what}: question"));
+        assert!(
+            r1.output_config.as_ref().is_none_or(|c| c.format.is_none()),
+            "{what}: no format on Anthropic"
+        );
+        assert_eq!(
+            agent.handle(reply("Let me think about it.")).await.unwrap(),
+            Control::Continue,
+            "{what}: re-asked"
+        );
+        let r2 = agent.prompt().clone();
+        assert_prefix_kept(&r1, &r2, &format!("{what}: retry"));
+        assert_eq!(
+            agent.handle(good).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "{what}: answered"
+        );
+        agent.on_teardown().await.unwrap();
+        agent
+    }
+
+    /// On the Anthropic API every consent turn — the model-swap offer, the
+    /// role offer, the cadence offer, and each one's retry — only appends
+    /// to the request before it: system, tools, thinking, tool_choice and
+    /// `output_config` are untouched (the session's effort included), so
+    /// nothing a cache keys on changes.
+    #[tokio::test]
+    async fn consent_turns_keep_the_request_prefix_on_anthropic() {
+        let h = Harness::new("prefix-swap");
+        prefix_kept_through(
+            rich_agent(&h, OLD, false),
+            reply(r#"{"reason": "home", "choice": "no_swap"}"#),
+            "model swap",
+        )
+        .await;
+
+        let h = Harness::with_role("prefix-role", &["tarn"]);
+        prefix_kept_through(
+            rich_agent(&h, OTHER, false),
+            role_reply("nothing", "", ""),
+            "role",
+        )
+        .await;
+
+        let h = Harness::with_cadence("prefix-cadence", &[], &["tarn"]);
+        let agent = prefix_kept_through(
+            rich_agent(&h, OTHER, false),
+            cadence_reply("keep_daily", ""),
+            "cadence",
+        )
+        .await;
+        assert!(!cadence_ledger(&h).await.asks[0].constrained);
+        drop(agent);
+    }
+
+    /// On blallama (`output_config_cache_safe`) the question still goes out
+    /// grammar-constrained — the one field that changes is `output_config`
+    /// (format added, the session's effort kept); system, tools, thinking,
+    /// tool_choice and every prior message are untouched.
+    #[tokio::test]
+    async fn on_blallama_only_output_config_changes() {
+        let h = Harness::with_cadence("prefix-blallama", &[], &["tarn"]);
+        let mut agent = rich_agent(&h, OTHER, true);
+        agent.on_init().await.unwrap();
+        let r0 = agent.prompt().clone();
+        agent.handle(reply("closing phase done")).await.unwrap();
+        let r1 = agent.prompt().clone();
+        let config = r1.output_config.clone().unwrap();
+        assert!(config.format.is_some(), "constrained");
+        let schema = serde_json::to_value(&config).unwrap()["format"]["schema"].clone();
+        let order = cadence::prompt::order_for(cadence::prompt::seed_for(h.id));
+        let options: Vec<&str> = schema["properties"]["choice"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            options,
+            order.map(CadenceChoice::as_str),
+            "this agent's order"
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            serde_json::to_value(&config.effort).unwrap(),
+            serde_json::to_value(&r0.output_config.as_ref().unwrap().effort).unwrap(),
+            "effort kept"
+        );
+        let mut r1_without = r1.clone();
+        r1_without.output_config = r0.output_config.clone();
+        assert_prefix_kept(&r0, &r1_without, "blallama question");
     }
 }
