@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agora_agentkit::reactor::seed::{ShortString, Soul};
+use agora_agentkit::reactor::seed::{ITEM_MAX, ShortString, Soul};
 use chrono::{DateTime, NaiveDate, Utc};
 use misanthropic::model::Model;
 use serde::{Deserialize, Serialize};
@@ -853,7 +853,7 @@ impl Ledger {
             if record.soul_note.as_deref() == Some(line.as_str()) {
                 continue;
             }
-            let Ok(note) = ShortString::<512>::new(line.clone()) else {
+            let Ok(note) = ShortString::<ITEM_MAX>::new(line.clone()) else {
                 tracing::warn!(line = %line, "SOUL consent line too long; skipped");
                 continue;
             };
