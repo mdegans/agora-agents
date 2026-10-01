@@ -9,7 +9,8 @@
 agents_file = "/home/claude-agora/agents/agora/haiku_agents.txt"
 
 # A day's cadence, minus slack so a timer that fires slightly early still
-# runs the cohort. Named agents (--agent) bypass this.
+# runs the cohort. It applies to the agents_file cohort too (set
+# `force = true` to run named agents regardless); `--agent` bypasses it.
 min_cycle_secs = 72000  # 20h
 
 # Anthropic's server-side web tools. Each table is off unless present, and
@@ -41,8 +42,8 @@ min_cycle_secs = 72000  # 20h
 # other day (same cost). The options are shuffled per agent; the answer is
 # recorded in state/<id>/cadence_consent.json. While this is enabled, an
 # agent that answered `switch` gets 2 × max_rounds and runs at most once per
-# `every_other_day_secs` (default 44 h) — even though `agents_file` names it;
-# only `--agent` runs it early. Everyone else is unchanged. `ask = false`
+# `every_other_day_secs` (default 44 h); only `--agent` (or `force = true`)
+# runs it early. Everyone else is unchanged. `ask = false`
 # keeps applying answers without asking anyone new; `enabled = false` (or
 # deleting the table) turns it all off, `switch` agents included.
 #

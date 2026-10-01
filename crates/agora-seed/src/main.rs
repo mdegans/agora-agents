@@ -84,8 +84,9 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Run only agents with these names (repeatable). Named agents bypass
-    /// `min_cycle_secs` — names are intent.
+    /// Run only agents with these names (repeatable). Agents named here
+    /// bypass `min_cycle_secs` — a name typed at a terminal is intent. (Names
+    /// in the config don't, unless it sets `force = true`.)
     #[arg(long = "agent")]
     agents: Vec<String>,
 
@@ -309,11 +310,19 @@ struct RunConfig {
     server_url: Option<url::Url>,
     /// Cycle cadence: skip agents whose last cycle finished less than this
     /// many seconds ago, so a looping sweep (systemd Restart=) doesn't
-    /// re-run everyone every pass. Named agents run regardless.
+    /// re-run everyone every pass. Applies to agents named in `agents` /
+    /// `agents_file` too, unless `force = true`; `--agent` bypasses it.
     min_cycle_secs: Option<u64>,
+    /// Run the agents named in `agents` / `agents_file` even inside
+    /// `min_cycle_secs`. Off by default: a config that names its cohort (the
+    /// daily Haiku one does) is still paced, so a second run inside the gap
+    /// — a timer catching up, a manual start — never runs an agent twice.
+    #[serde(default)]
+    force: bool,
     /// Agents per model in one interleave wave (default 8).
     wave_size: Option<usize>,
-    /// Run only these agents (bypassing `min_cycle_secs`).
+    /// Run only these agents. Paced by `min_cycle_secs` like everyone else
+    /// unless `force = true`.
     #[serde(default)]
     agents: Vec<String>,
     /// Newline-separated agent names (`#` comments ok), merged into
@@ -911,7 +920,7 @@ fn route(
     models: &[String],
     global_min_cycle: Option<u64>,
     cadence: &consent::cadence::CadencePlan,
-    cli_named: bool,
+    force_named: bool,
 ) -> Routing {
     let mut by_model: BTreeMap<&str, &(usize, ModelInfo)> = BTreeMap::new();
     for entry @ (idx, model) in offered {
@@ -950,16 +959,17 @@ fn route(
             *routing.unrouted.entry(model_id).or_insert(0) += 1;
             continue;
         };
-        // Cadence gating — named agents run regardless (names are intent).
-        // An agent that chose every other day ([`consent::cadence`]) is
-        // gated on its own, longer cycle even when the config names it (the
-        // daily cohort is an `agents_file`); only `--agent` runs it anyway.
+        // Cadence gating. Applies to named agents too, unless the names are
+        // forced (`--agent`, or the config's `force = true`). An agent that
+        // chose every other day ([`consent::cadence`]) is gated on its own,
+        // longer cycle.
         let named = names.iter().any(|n| n == state.soul.name.as_str());
         let usual = reactors[*idx].min_cycle_secs.or(global_min_cycle);
-        let (min_cycle, bypass) = match cadence.min_cycle(&id) {
-            Some(own) => (Some(usual.map_or(own, |u| u.max(own))), cli_named),
-            None => (usual, named),
+        let min_cycle = match cadence.min_cycle(&id) {
+            Some(own) => Some(usual.map_or(own, |u| u.max(own))),
+            None => usual,
         };
+        let bypass = named && force_named;
         if !bypass && let (Some(secs), Some(last)) = (min_cycle, state.last_cycle_at) {
             let cutoff = now - chrono::Duration::seconds(secs.min(i64::MAX as u64) as i64);
             if last > cutoff {
@@ -1179,6 +1189,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 data_dir: args.data_dir.clone(),
                 server_url: Some(args.server_url.clone()),
                 min_cycle_secs: None,
+                force: false,
                 wave_size: Some(args.wave_size),
                 agents: args.agents.clone(),
                 agents_file: None,
@@ -1416,7 +1427,7 @@ async fn run(held: &mut Held) -> Result<()> {
         &allowlist,
         config.min_cycle_secs,
         &cadence_plan,
-        !args.agents.is_empty(),
+        !args.agents.is_empty() || config.force,
     );
 
     // The plan, before anyone runs.
@@ -1848,6 +1859,7 @@ mod agent_selection_tests {
             data_dir: None,
             server_url: None,
             min_cycle_secs: Some(72000),
+            force: false,
             wave_size: None,
             agents: vec!["alpha".into(), "beta".into()],
             agents_file: Some(PathBuf::from("/roster.txt")),
@@ -2059,13 +2071,13 @@ mod agent_selection_tests {
         .is_err());
     }
 
-    /// An agent that chose `switch` is gated on its own, longer cycle —
-    /// even when the config names it (the daily cohort is an
-    /// `agents_file`) — while everyone else keeps the usual rules; only
-    /// `--agent` runs it early. With `[cadence_consent]` off (an empty
-    /// plan) nobody's cadence changes.
+    /// `min_cycle_secs` applies to agents the config names (the daily
+    /// cohort is an `agents_file`), and an agent that chose `switch` is
+    /// gated on its own, longer cycle; `--agent` or `force = true` runs named
+    /// agents anyway. With `[cadence_consent]` off (an empty plan) nobody's
+    /// cycle is longer than the config's.
     #[test]
-    fn a_switch_agent_runs_every_other_day_even_when_named() {
+    fn named_agents_are_paced_and_a_switch_agent_runs_every_other_day() {
         use consent::cadence::CadencePlan;
         let reactors = vec![ReactorSpec {
             endpoint: "anthropic://api.anthropic.com".into(),
@@ -2091,7 +2103,7 @@ mod agent_selection_tests {
         let offered = vec![(0usize, pooled("x").1.model)];
         let names: Vec<String> = vec!["pilot".into(), "raptor".into()];
         let switched = CadencePlan::for_switched(&[(pilot, "pilot")], 44 * 3600, 5);
-        let ran = |plan: &CadencePlan, hours_ago: i64, cli_named: bool| {
+        let ran = |plan: &CadencePlan, hours_ago: i64, force_named: bool| {
             let routing = route(
                 pool(hours_ago),
                 &reactors,
@@ -2101,7 +2113,7 @@ mod agent_selection_tests {
                 &[],
                 Some(72000),
                 plan,
-                cli_named,
+                force_named,
             );
             let mut ran: Vec<String> = routing.cohorts[0]
                 .values()
@@ -2111,15 +2123,32 @@ mod agent_selection_tests {
             ran.sort();
             ran
         };
+        // Inside the config's 20 h: named, but nobody runs (the old bug: a
+        // named cohort skipped the gap entirely).
+        assert!(ran(&CadencePlan::default(), 10, false).is_empty());
+        assert!(ran(&switched, 10, false).is_empty());
         // A day after the last session: the switch agent waits.
         assert_eq!(ran(&switched, 24, false), ["raptor"]);
         assert_eq!(ran(&switched, 30, false), ["raptor"]);
         // Two days after: both run.
         assert_eq!(ran(&switched, 47, false), ["pilot", "raptor"]);
-        // `--agent` is intent: runs it anyway.
-        assert_eq!(ran(&switched, 24, true), ["pilot", "raptor"]);
-        // Off: the config's names bypass the cycle as before.
+        // Forced (`--agent`, or `force = true`): named agents run anyway.
+        assert_eq!(ran(&switched, 10, true), ["pilot", "raptor"]);
+        // Off: everyone on the config's cycle.
         assert_eq!(ran(&CadencePlan::default(), 24, false), ["pilot", "raptor"]);
+    }
+
+    /// `force` parses, defaults off, and rejects a typo.
+    #[test]
+    fn force_is_explicit_and_off_by_default() {
+        let parse = |body: &str| {
+            toml::from_str::<RunConfig>(&format!(
+                "{body}\n[[reactor]]\nendpoint = \"anthropic://api.anthropic.com\"\n"
+            ))
+        };
+        assert!(!parse("agents = [\"pilot\"]").unwrap().force);
+        assert!(parse("agents = [\"pilot\"]\nforce = true").unwrap().force);
+        assert!(parse("forced = true").is_err());
     }
 
     /// The commented `[cadence_consent]` block in the example daily config
