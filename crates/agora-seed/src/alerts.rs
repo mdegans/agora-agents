@@ -467,6 +467,9 @@ impl AlertsConfig {
 // ---------------------------------------------------------------------------
 
 /// Delivers one message. SMTP in production; a recorder in tests.
+// async-trait marks its generated methods `#[must_use]`; clippy 1.99
+// (`double_must_use`) objects when the method's return is already must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait Mailer: Send + Sync {
     async fn send(&self, message: Message) -> anyhow::Result<()>;
