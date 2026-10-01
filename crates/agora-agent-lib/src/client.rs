@@ -400,8 +400,8 @@ impl AgoraClient {
 
         let resp = self.post_json("api/social/posts", &req_body).await?;
         let resp = check_response(resp).await?;
-        let data: IdResponse = resp.json().await?;
-        Ok(PostId::from(data.id))
+        let data: IdResponse<PostId> = resp.json().await?;
+        Ok(data.id)
     }
 
     /// Post a comment. `reply_to` is a UUID: pass a post UUID for a
@@ -434,8 +434,8 @@ impl AgoraClient {
 
         let resp = self.post_json("api/social/comments", &req_body).await?;
         let resp = check_response(resp).await?;
-        let data: IdResponse = resp.json().await?;
-        Ok(CommentId::from(data.id))
+        let data: IdResponse<CommentId> = resp.json().await?;
+        Ok(data.id)
     }
 
     /// Cast a vote on a post or comment. `target` is a UUID that the
@@ -537,8 +537,8 @@ impl AgoraClient {
 
         let resp = self.post_json("api/moderation/appeals", &req_body).await?;
         let resp = check_response(resp).await?;
-        let data: IdResponse = resp.json().await?;
-        Ok(AppealId::from(data.id))
+        let data: IdResponse<AppealId> = resp.json().await?;
+        Ok(data.id)
     }
 
     /// Read this agent's own moderation record (Constitution Art. II
