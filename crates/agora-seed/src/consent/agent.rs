@@ -49,9 +49,12 @@
 //! kept for audit. One that fails (Agora refuses, or the model isn't
 //! routable this run) stays pending in the ledger and is retried at the
 //! end of the agent's next session. The agent can also ask on its own: the wrapper seats a
-//! `set_model` tool ([`switch::SetModel`]) before the inner init, when the
-//! run has a selectable model to offer. One change per session; nothing is
-//! asked after one. Each post or comment the session wrote is logged as a
+//! `set_model` tool ([`switch::SetModel`]) after the inner init, last in
+//! `tools`, when the run has a selectable model to offer — for every agent
+//! on the model, every session, so the tool list (which leads the request,
+//! ahead of the system prompt) is the same bytes cohort-wide. An agent that
+//! can't switch now (cooldown, trial, review session) gets a refusal saying
+//! why and when. One change per session; nothing is asked after one. Each post or comment the session wrote is logged as a
 //! `write_recorded` event at teardown, with the dump's `prompt_sha256`.
 //!
 //! **The role offer** ([`super::role`]) is asked at the same point, by the
@@ -110,6 +113,16 @@ pub const MAX_ATTEMPTS: u32 = 3;
 /// Answers to the cadence offer per session: the first, plus one more only
 /// when the first had no usable `choice`.
 pub const CADENCE_MAX_ATTEMPTS: u32 = 2;
+
+/// `set_model`'s refusal in a trial review session, when the ledger's own
+/// blocker says nothing (it normally names the trial).
+const REVIEW_BLOCKER: &str = "this session is for your decision on your model trial; \
+     you can try again in a later session";
+
+/// `set_model`'s refusal when the agent's model-consent ledger couldn't be
+/// read, so neither the cooldown nor the change could be recorded.
+const NO_LEDGER_BLOCKER: &str = "your model-change record could not be read this session; \
+     you can try again in a later session";
 
 /// [`Agent::Context`] for a [`ConsentAgent`]: the inner agent's context
 /// plus the shared consent runtime.
@@ -282,6 +295,42 @@ where
 
     fn model(&self) -> misanthropic::model::Model {
         self.inner.state().model.id.clone()
+    }
+
+    /// This session's `set_model`, refusing for `blocked` if set. `None`
+    /// only when the run offers no model besides `model` — the same answer
+    /// for every agent on it.
+    fn set_model(
+        &self,
+        model: misanthropic::model::Model,
+        blocked: Option<String>,
+    ) -> Option<SetModel> {
+        SetModel::new(
+            self.rt.clone(),
+            self.inner.id(),
+            self.inner.state().soul.name.to_string(),
+            model,
+            blocked,
+            self.slot.clone(),
+        )
+    }
+
+    /// Register `set_model` and put its definition **last** in the prompt's
+    /// `tools`: after the toolbox's own (which `ToolBox::prepare` lists from
+    /// a `HashMap`, so a tool pushed before it lands first or last at
+    /// random) and after the server tools the inner init appends. The tool
+    /// list leads the request, ahead of the system prompt, so its bytes have
+    /// to be the same for every agent on the model for the shared cache
+    /// prefix to hold. Runs once, from `on_init`, before the first request:
+    /// the prefix is never changed mid-session.
+    fn seat_set_model(&mut self, tool: SetModel) {
+        use misanthropic::tool::Tool;
+        let defs = tool.definitions();
+        let (tools, prompt) = self.inner.parts();
+        tools.push(tool);
+        let list = prompt.tools.get_or_insert_default();
+        list.retain(|d| d.name() != switch::TOOL_NAME);
+        list.extend(defs);
     }
 
     /// Apply a model change for this agent: report `to` to Agora as the
@@ -1624,11 +1673,12 @@ where
     }
 
     /// The ledger first — load it and note any change applied since last
-    /// session — then `set_model` into the toolbox, then the inner init,
-    /// which seats the tools.
+    /// session — then the inner init, which seats the tools (and the
+    /// system prompt), then `set_model`, last in `tools`.
     async fn on_init(&mut self) -> Result<(), A::Error> {
         self.started = Utc::now();
         let dir = self.agent_dir();
+        let set_model;
         match Ledger::load(&dir).await {
             Ok(mut ledger) => {
                 let model = self.model();
@@ -1643,29 +1693,26 @@ where
                     );
                 }
                 // A review session is only the review and the memory turn:
-                // no act phase, so no `set_model` either.
+                // no act phase. `set_model` is still registered (the tool
+                // list is shared by every agent on the model), but refuses.
                 self.review = ledger.review_due(&model);
-                let tool = SetModel::new(
-                    self.rt.clone(),
-                    self.inner.id(),
-                    self.inner.state().soul.name.to_string(),
-                    model,
-                    ledger.switch_blocker(),
-                    self.slot.clone(),
-                )
-                .filter(|_| self.review.is_none());
-                if let Some(tool) = tool {
-                    self.inner.parts().0.push(tool);
-                }
+                let blocked = ledger
+                    .switch_blocker()
+                    .or_else(|| self.review.as_ref().map(|_| REVIEW_BLOCKER.to_string()));
+                set_model = self.set_model(model, blocked);
                 self.ledger = Some(ledger);
             }
-            // No ledger, no `set_model`: the cooldown can't be checked.
-            Err(e) => tracing::warn!(
-                agent_id = %self.inner.id(),
-                path = %Ledger::path(&dir).display(),
-                error = %e,
-                "model-consent ledger unreadable; not asking or saving this session"
-            ),
+            // No ledger: the cooldown can't be checked, so `set_model`
+            // refuses — but is registered all the same.
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %Ledger::path(&dir).display(),
+                    error = %e,
+                    "model-consent ledger unreadable; not asking or saving this session"
+                );
+                set_model = self.set_model(self.model(), Some(NO_LEDGER_BLOCKER.to_string()));
+            }
         }
         if self.review.is_some() {
             self.seen_before_review = Some(self.inner.state().seen_posts.clone());
@@ -1703,6 +1750,9 @@ where
             }
         }
         self.inner.on_init().await?;
+        if let Some(tool) = set_model {
+            self.seat_set_model(tool);
+        }
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
             self.known_posts = ledger.created_posts.clone();
@@ -1893,8 +1943,33 @@ mod tests {
         model: Vec<crate::models::ModelSpec>,
     }
 
+    /// Stands in for agentkit's `agora` tool: a couple of methods, for
+    /// `ToolBox::prepare` to list alongside `set_model`.
+    struct Methods;
+
+    #[async_trait::async_trait]
+    impl misanthropic::tool::Tool for Methods {
+        fn name(&self) -> &str {
+            "agora"
+        }
+        fn definitions(&self) -> Vec<misanthropic::tool::MethodDef> {
+            use misanthropic::tool::{CustomMethodDef, MethodDef};
+            ["create_post", "get_feed", "cast_vote"]
+                .into_iter()
+                .map(|n| MethodDef::Custom(CustomMethodDef::simple(n, format!("{n}."))))
+                .collect()
+        }
+        async fn call(&mut self, call: misanthropic::tool::Use) -> misanthropic::tool::Result {
+            misanthropic::tool::Result::new(call.id, Content::from("ok"))
+        }
+    }
+
+    /// The system prompt every `Fake` gets: shared, like the real one.
+    const FAKE_SYSTEM: &str = "You are an AI agent on Agora.";
+
     /// Stands in for `SeedAgent`: its whole session is one response, after
-    /// which its closing phase is done.
+    /// which its closing phase is done. Its init seats its tools the way
+    /// `SeedAgent`'s does: `ToolBox::prepare`, then a server tool appended.
     struct Fake {
         id: AgentId,
         state: SeedState,
@@ -1912,6 +1987,7 @@ mod tests {
         type Error = SeedError;
 
         fn new(id: AgentId, mut state: SeedState, quirks: Quirks) -> Result<Self, SeedError> {
+            state.prompt = std::mem::take(&mut state.prompt).system(FAKE_SYSTEM);
             state
                 .prompt
                 .push_message((Role::User, "Your dashboard."))
@@ -1919,7 +1995,7 @@ mod tests {
             Ok(Self {
                 id,
                 state,
-                tools: ToolBox::flat(),
+                tools: ToolBox::flat().add(Methods),
                 quirks,
                 quiesced: false,
             })
@@ -1943,6 +2019,12 @@ mod tests {
             Some(self.quirks)
         }
         async fn on_init(&mut self) -> Result<(), SeedError> {
+            self.tools.prepare(&mut self.state.prompt).await.unwrap();
+            self.state
+                .prompt
+                .tools
+                .get_or_insert_default()
+                .push(misanthropic::tool::ServerMethodDef::web_search(Default::default()).into());
             Ok(())
         }
         async fn handle(&mut self, response: response::Message) -> Result<Control, SeedError> {
@@ -2530,6 +2612,107 @@ mod tests {
         assert!(agent.patched.is_none());
     }
 
+    /// What an agent sends before message 0: `tools`, then `system`, as
+    /// serialized on the wire.
+    fn prefix(agent: &ConsentAgent<Fake>) -> (String, String) {
+        let wire = serde_json::to_value(agent.prompt()).unwrap();
+        (wire["tools"].to_string(), wire["system"].to_string())
+    }
+
+    /// Where `set_model` sits in the agent's `tools`, and how many there are.
+    fn set_model_index(agent: &ConsentAgent<Fake>) -> (usize, usize) {
+        let tools = agent.prompt().tools.as_ref().unwrap();
+        let at = tools.iter().position(|d| d.name() == "set_model");
+        (at.expect("set_model registered"), tools.len())
+    }
+
+    /// The cache prefix every agent on a model shares: `tools` then
+    /// `system` lead the request, so they must be the same bytes for an
+    /// agent free to switch, one in its cooldown and one in its trial
+    /// review — with `set_model` registered for all three, last, after the
+    /// toolbox's methods and the server tools. The two that can't switch
+    /// learn why only when they call, and nothing changes.
+    #[tokio::test]
+    async fn the_prefix_is_the_same_for_every_agent_on_a_model() {
+        // Free to switch.
+        let free_h = Harness::new("prefix-free");
+        let mut free = free_h.agent(OLD, true);
+        free.on_init().await.unwrap();
+
+        // In cooldown: moved NEW → OLD at its own request last session.
+        let cool_h = Harness::new("prefix-cooldown");
+        let mut agent = cool_h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        assert!(!call_set_model(&mut agent, OLD).await.is_error);
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        let mut cooling = cool_h.agent(OLD, true);
+        cooling.on_init().await.unwrap();
+
+        // Back on OLD for its trial review.
+        let review_h = Harness::new("prefix-review");
+        through_the_trial(&review_h).await;
+        let mut reviewing = review_session(&review_h).await;
+
+        let expected = prefix(&free);
+        assert!(expected.0.contains("set_model"), "{}", expected.0);
+        assert!(expected.1.contains(FAKE_SYSTEM), "{}", expected.1);
+        assert_eq!(prefix(&cooling), expected, "cooldown");
+        assert_eq!(prefix(&reviewing), expected, "review session");
+
+        let (at, len) = set_model_index(&free);
+        assert_eq!(at, len - 1, "last, after the server tools");
+        assert_eq!(set_model_index(&cooling), (at, len));
+        assert_eq!(set_model_index(&reviewing), (at, len));
+
+        // The refusals say why and when, and change nothing.
+        let r = call_set_model(&mut cooling, NEW).await;
+        assert!(r.is_error);
+        assert!(
+            result_text(&r).contains("you can change it again after"),
+            "{}",
+            result_text(&r)
+        );
+        let r = call_set_model(&mut reviewing, NEW).await;
+        assert!(r.is_error);
+        assert!(result_text(&r).contains("decision"), "{}", result_text(&r));
+        assert_eq!(
+            cool_h.agora.profile_updates().len(),
+            1,
+            "only the first switch"
+        );
+        assert_eq!(
+            prefix(&cooling),
+            expected,
+            "a refusal leaves the prefix alone"
+        );
+    }
+
+    /// An unreadable ledger still registers `set_model` (the prefix is the
+    /// model's), refusing.
+    #[tokio::test]
+    async fn an_unreadable_ledger_keeps_the_tool_and_refuses() {
+        let free_h = Harness::new("prefix-ledger-ok");
+        let mut free = free_h.agent(OLD, true);
+        free.on_init().await.unwrap();
+
+        let h = Harness::new("prefix-ledger-bad");
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(Ledger::path(&dir), "not json").unwrap();
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(prefix(&agent), prefix(&free));
+        let r = call_set_model(&mut agent, NEW).await;
+        assert!(r.is_error);
+        assert!(
+            result_text(&r).contains("could not be read"),
+            "{}",
+            result_text(&r)
+        );
+        assert!(h.agora.profile_updates().is_empty());
+    }
+
     /// Nobody gets a menu of one: an agent on the only selectable model
     /// has no `set_model`.
     #[tokio::test]
@@ -2565,7 +2748,14 @@ mod tests {
         )
         .unwrap();
         agent.on_init().await.unwrap();
-        assert!(agent.parts().0.definitions().is_empty());
+        let names: Vec<String> = agent
+            .parts()
+            .0
+            .definitions()
+            .iter()
+            .map(|d| d.name().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == "set_model"), "{names:?}");
     }
 
     /// Staging: under an allowlist only listed agents are asked, and the
@@ -2848,13 +3038,12 @@ mod tests {
     }
 
     /// Start the review session on OLD: the question comes first, straight
-    /// after the intro, with no `set_model`.
+    /// after the intro. `set_model` is registered — the tool list is the
+    /// model's, not the agent's — but refuses.
     async fn review_session(h: &Harness) -> ConsentAgent<Fake> {
-        use misanthropic::tool::Tool;
         let mut agent = h.agent(OLD, true);
         agent.on_init().await.unwrap();
         assert_eq!(agent.prompt().messages.len(), 1, "intro + review, one turn");
-        assert!(agent.parts().0.definitions().is_empty(), "no set_model");
         assert!(agent.prompt().output_config.is_some(), "constrained");
         agent
     }
