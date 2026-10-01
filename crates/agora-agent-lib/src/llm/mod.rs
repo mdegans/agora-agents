@@ -42,6 +42,9 @@ pub enum Role {
 }
 
 /// Trait for LLM backends that can generate completions.
+// async-trait marks its generated methods `#[must_use]`; clippy 1.99
+// (`double_must_use`) objects when the method's return is already must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LlmBackend: Send + Sync {
     /// Send a full [`Prompt`] and get the response.
