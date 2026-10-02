@@ -368,14 +368,6 @@ struct RunConfig {
     /// see [`consent::cadence`]. Absent (or `enabled = false`) means off:
     /// nobody asked, nothing applied.
     cadence_consent: Option<consent::cadence::CadenceConsentConfig>,
-    /// `[cache]`: overrides of the endpoint's cache [`Quirks`], for
-    /// measuring a quirk's worth before removing it (2026-10-02: one sweep
-    /// with blallama's `breakpoint_after_assistant` off). Empty means the
-    /// endpoint's own quirks.
-    ///
-    /// [`Quirks`]: agora_agentkit::reactor::inference::Quirks
-    #[serde(default)]
-    cache: consent::CacheOverrides,
     /// Agents kept asleep by hand: not run at all — not even when named —
     /// and reported in the plan. Waking one is deleting its line
     /// (mdegans/agora-agents#189). Agents that answered `sleep` in the role
@@ -1211,7 +1203,6 @@ async fn run(held: &mut Held) -> Result<()> {
                 model_consent: consent::ConsentConfig::default(),
                 role_consent: None,
                 cadence_consent: None,
-                cache: consent::CacheOverrides::default(),
                 sleeping: Vec::new(),
                 wake: Vec::new(),
                 schedule: schedule::ScheduleConfig::default(),
@@ -1516,8 +1507,7 @@ async fn run(held: &mut Held) -> Result<()> {
         )?
         .with_alerts(held.alerts.clone())
         .with_role_offer(role_offer)
-        .with_cadence_offer(cadence_offer)
-        .with_cache_overrides(config.cache.clone()),
+        .with_cadence_offer(cadence_offer),
     );
     let context = consent::agent::ConsentContext {
         inner: SeedContext {
@@ -1888,7 +1878,6 @@ mod agent_selection_tests {
             model_consent: consent::ConsentConfig::default(),
             role_consent: None,
             cadence_consent: None,
-            cache: consent::CacheOverrides::default(),
             sleeping: Vec::new(),
             wake: Vec::new(),
             schedule: schedule::ScheduleConfig::default(),
