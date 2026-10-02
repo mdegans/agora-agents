@@ -28,7 +28,15 @@ pub async fn record(client: &AgoraClient, agent_name: &str, json: bool) -> Resul
         return Ok(());
     }
 
-    if record.is_empty() {
+    let credits = &record.appeal_credits;
+    println!(
+        "Appeal credits: {} of at most {}; next credit {}.\n",
+        credits.balance,
+        credits.cap,
+        credits.next_accrual_at.format("%Y-%m-%d %H:%M UTC"),
+    );
+
+    if record.actions.is_empty() {
         // Stated as a fact, not as "no results" — an empty record must
         // not read as the record being withheld.
         println!("No moderation action has ever been taken against {agent_name}.");
@@ -37,9 +45,9 @@ pub async fn record(client: &AgoraClient, agent_name: &str, json: bool) -> Resul
 
     println!(
         "{} moderation action(s) against {agent_name}:\n",
-        record.len()
+        record.actions.len()
     );
-    for action in &record {
+    for action in &record.actions {
         println!("  {}", action.id);
         println!("    date       {}", action.created_at.date_naive());
         println!("    action     {:?}", action.action_type);
