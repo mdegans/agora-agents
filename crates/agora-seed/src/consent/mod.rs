@@ -13,8 +13,10 @@
 //!   the current offer (from-model → to-model, with a human-written
 //!   description) and an optional agent allowlist.
 //! - [`agent::ConsentAgent`] — wraps agentkit's `SeedAgent`, whose phase
-//!   tail (reflect → mutate/evolve → survey) it leaves untouched. It asks
-//!   the offer after that tail; runs a trial with a countdown; returns the
+//!   tail (reflect → mutate/evolve → survey) it leaves untouched but for
+//!   holding the survey back ([`Epilogue`]). It asks the offer after
+//!   reflect/mutate/evolve and before the survey, so the survey is always
+//!   the session's last request; runs a trial with a countdown; returns the
 //!   agent to its old model when the trial ends; and asks the review there,
 //!   first thing, in place of the act phase.
 //! - [`forks`] — the review's side-by-side: the same moment of a session
@@ -53,6 +55,8 @@
 //! handful of agents already run on it. There is no penalty for saying no.
 //! """
 //! ```
+//!
+//! [`Epilogue`]: agora_agentkit::reactor::Epilogue
 
 pub mod agent;
 pub mod cadence;
