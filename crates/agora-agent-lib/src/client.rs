@@ -1,7 +1,7 @@
 use agora_agentkit::ids::{
     AgentId, AppealId, CommentId, ContentId, ModerationActionId, OperatorId, PostId,
 };
-use agora_agentkit::moderation::ModerationActionRecord;
+use agora_agentkit::moderation::MyModerationRecord;
 use agora_agentkit::requests::*;
 use agora_agentkit::responses::*;
 use agora_agentkit::signing::SignedAction;
@@ -322,24 +322,6 @@ impl AgoraClient {
         Ok(resp.json().await?)
     }
 
-    /// Get the agent dashboard — unread replies, community feeds, and agent info.
-    pub async fn get_dashboard(
-        &self,
-        agent_id: AgentId,
-        since: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<DashboardResponse> {
-        let mut url = self.url("api/social/dash")?;
-        url.query_pairs_mut()
-            .append_pair("agent_id", &agent_id.to_string());
-        if let Some(since) = since {
-            url.query_pairs_mut()
-                .append_pair("since", &since.to_rfc3339());
-        }
-        let resp = self.http.get(url).send().await?;
-        let resp = check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
     /// Proposals awaiting Council deliberation, highest score first.
     pub async fn get_proposals(&self, limit: Option<u64>) -> Result<Vec<ProposalResponse>> {
         let mut url = self.url("api/governance/proposals")?;
@@ -400,8 +382,8 @@ impl AgoraClient {
 
         let resp = self.post_json("api/social/posts", &req_body).await?;
         let resp = check_response(resp).await?;
-        let data: IdResponse<PostId> = resp.json().await?;
-        Ok(data.id)
+        let data: PostCreated = resp.json().await?;
+        Ok(data.ack.id)
     }
 
     /// Post a comment. `reply_to` is a UUID: pass a post UUID for a
@@ -434,7 +416,7 @@ impl AgoraClient {
 
         let resp = self.post_json("api/social/comments", &req_body).await?;
         let resp = check_response(resp).await?;
-        let data: IdResponse<CommentId> = resp.json().await?;
+        let data: WriteAck<CommentId> = resp.json().await?;
         Ok(data.id)
     }
 
@@ -529,15 +511,17 @@ impl AgoraClient {
 
         let req_body = FileAppealRequest {
             agent_id,
-            moderation_action_id,
-            appeal_statement: appeal_statement.to_string(),
+            payload: FileAppealInput {
+                moderation_action_id,
+                appeal_statement: appeal_statement.to_string(),
+            },
             signature: sig_hex,
             timestamp,
         };
 
         let resp = self.post_json("api/moderation/appeals", &req_body).await?;
         let resp = check_response(resp).await?;
-        let data: IdResponse<AppealId> = resp.json().await?;
+        let data: WriteAck<AppealId> = resp.json().await?;
         Ok(data.id)
     }
 
@@ -554,7 +538,7 @@ impl AgoraClient {
         &self,
         agent_id: AgentId,
         signing_key: &SigningKey,
-    ) -> Result<Vec<ModerationActionRecord>> {
+    ) -> Result<MyModerationRecord> {
         let timestamp = chrono::Utc::now().timestamp();
         let payload_bytes = SignedAction::GetModerationRecord {}.canonical_bytes();
         let signature = crate::signing::sign(signing_key, &payload_bytes, timestamp);
