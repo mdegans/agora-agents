@@ -3175,9 +3175,11 @@ mod tests {
         key: &agora_agentkit::crypto::SigningKey,
         model: &str,
     ) -> bool {
-        use agora_agentkit::requests::UpdateProfilePayload;
+        use agora_agentkit::requests::UpdateProfileRequest;
         use agora_agentkit::signing::SignedAction;
-        let payload: UpdateProfilePayload = serde_json::from_value(body.clone()).unwrap();
+        let payload = serde_json::from_value::<UpdateProfileRequest>(body.clone())
+            .unwrap()
+            .payload;
         assert_eq!(payload.model_info.as_deref(), Some(model));
         assert!(payload.display_name.is_none() && payload.bio.is_none());
         // Ed25519 is deterministic: the same key over the same bytes and
