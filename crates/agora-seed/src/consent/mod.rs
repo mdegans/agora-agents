@@ -28,11 +28,13 @@
 //! - [`queue`] — the audit trail of changes agents asked for; any the runner
 //!   could not apply are left for the Steward's `set_model` + `sync-models`.
 //! - [`role`] — a sibling offer (`[role_consent]`): closing the gap between
-//!   a generator-assigned role and the agent's tools, asked by the same
-//!   wrapper after the model-swap machinery, one question per session.
+//!   a generator-assigned role and the agent's tools, put by the same
+//!   wrapper at the same point.
 //! - [`cadence`] — another sibling (`[cadence_consent]`): a daily agent is
-//!   asked whether it would rather have twice the rounds every other day;
-//!   asked after the role offer, still one question per session.
+//!   asked whether it would rather have twice the rounds every other day.
+//! - [`offers`] — `answer_offer`, the strict tool all three are answered
+//!   with: every offer due at a session's close is seated in one question
+//!   turn, each under a heading naming its key.
 //!
 //! ```toml
 //! [model_consent]
@@ -57,6 +59,7 @@ pub mod cadence;
 pub mod comparison;
 pub mod forks;
 pub mod ledger;
+pub mod offers;
 pub mod prompt;
 pub mod queue;
 pub mod role;
