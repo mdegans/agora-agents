@@ -1,5 +1,6 @@
+use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::ids::ContentId;
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::requests::CastVotePayload;
 use anyhow::Result;
 
 use crate::cli::VoteDirection;
@@ -8,7 +9,7 @@ use crate::credentials;
 /// Cast a vote. `target` is a UUID — the server resolves whether it's a
 /// post or a comment; the caller no longer specifies kind explicitly.
 pub async fn run(
-    client: &AgoraClient,
+    client: &Client,
     agent_name: &str,
     direction: &VoteDirection,
     target: ContentId,
@@ -23,7 +24,11 @@ pub async fn run(
     };
 
     client
-        .cast_vote(creds.agent_id, target, value, &signing_key)
+        .cast_vote(
+            creds.agent_id,
+            &CastVotePayload { target, value },
+            &signing_key,
+        )
         .await?;
 
     if json {

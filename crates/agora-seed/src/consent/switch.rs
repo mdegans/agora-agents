@@ -27,10 +27,12 @@ use std::sync::{Arc, Mutex};
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::requests::UpdateProfilePayload;
+use agora_agentkit::responses::inline_input_schema_for;
 use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
 use misanthropic::prompt::message::Content;
 use misanthropic::tool::{self, CustomMethodDef, MethodDef, Tool, Use};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::ConsentRuntime;
@@ -95,10 +97,14 @@ pub type Slot = Arc<Mutex<Option<SelfSwitch>>>;
 /// The tool's name on the wire.
 pub const TOOL_NAME: &str = "set_model";
 
-/// `set_model`'s arguments. Reason first: it is written before the choice.
-#[derive(Debug, Deserialize)]
+/// `set_model`'s arguments, and its schema ([`SetModel::schema`]). Reason
+/// first: it is written before the choice.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct Args {
+    /// Why you want to change model.
     reason: String,
+    /// The id of the model to run on, from the list.
     model: String,
 }
 
@@ -154,23 +160,9 @@ impl SetModel {
         )
     }
 
+    /// [`Args`]' schema, inline: two plain strings, closed
     fn schema() -> serde_json::Value {
-        // Hand-written: two plain strings, no `$ref`, no enum, no pattern.
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "reason": {
-                    "type": "string",
-                    "description": "Why you want to change model."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "The id of the model to run on, from the list."
-                }
-            },
-            "required": ["reason", "model"],
-            "additionalProperties": false
-        })
+        inline_input_schema_for::<Args>()
     }
 
     /// The call, minus the wire envelope. `Err` is the message the agent
@@ -386,6 +378,35 @@ impl SelfSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The schema is `Args`' own: reason before model, both required,
+    /// closed, and free of `$ref`/`$defs`/`pattern`
+    #[test]
+    fn schema_is_derived_reason_first_closed_and_ref_free() {
+        let schema = SetModel::schema();
+        let rendered = schema.to_string();
+        for banned in ["$ref", "$defs", "definitions", "pattern"] {
+            assert!(!rendered.contains(&format!("\"{banned}\"")), "{rendered}");
+        }
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        let props: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(props, ["reason", "model"]);
+        assert_eq!(schema["required"], serde_json::json!(["reason", "model"]));
+        for p in ["reason", "model"] {
+            assert_eq!(schema["properties"][p]["type"], "string", "{p}");
+        }
+        assert_eq!(
+            schema["properties"]["model"]["description"],
+            "The id of the model to run on, from the list."
+        );
+        // And the type it decodes into refuses what the schema refuses.
+        let err = serde_json::from_value::<Args>(
+            serde_json::json!({"reason": "r", "model": "m", "model_info": "m"}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
 
     fn menu(current: &str, blocked: Option<&str>) -> String {
         let mut out = describe(

@@ -1,4 +1,4 @@
-use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
+use agora_agent_lib::agora_agentkit::enums::{FeedSort, ProposalCategory};
 use agora_agent_lib::agora_agentkit::ids::{ContentId, ContentRef, ModerationActionId, PostId};
 use clap::{Parser, Subcommand};
 
@@ -56,13 +56,14 @@ pub enum Command {
         /// Community name.
         community: String,
 
-        /// Max posts to show.
+        /// Max posts to show (at most 100).
         #[arg(long, default_value = "25")]
-        limit: i64,
+        limit: u32,
 
-        /// Sort order: random (default), date, score, active, controversial.
-        #[arg(long, default_value = "random")]
-        sort: String,
+        /// Sort order: random (default), date, score, active,
+        /// controversial, diverse or unpopular.
+        #[arg(long, default_value = "random", value_parser = parse_feed_sort)]
+        sort: FeedSort,
     },
 
     /// Check replies to your posts.
@@ -186,11 +187,11 @@ pub enum Command {
         community: String,
     },
 
-    /// List proposals awaiting Council deliberation, highest score first.
+    /// List proposals awaiting Council deliberation, newest first.
     Proposals {
         /// Max proposals to show.
         #[arg(long, default_value = "10")]
-        limit: u64,
+        limit: u32,
     },
 
     /// Community management.
@@ -444,4 +445,11 @@ pub enum MessageAction {
     /// Read the inbox (marks returned DMs as read). E2EE bodies are
     /// decrypted locally with this agent's stored encryption key.
     Inbox,
+}
+
+/// A `--sort` value, spelled as on the wire (`FeedSort`'s serde names)
+fn parse_feed_sort(s: &str) -> Result<FeedSort, String> {
+    use serde::Deserialize;
+    use serde::de::IntoDeserializer;
+    FeedSort::deserialize(s.into_deserializer()).map_err(|e: serde::de::value::Error| e.to_string())
 }

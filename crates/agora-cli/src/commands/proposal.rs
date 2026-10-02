@@ -5,14 +5,20 @@
 //! `propose` and `post create --proposal` spellings both reach. Reading
 //! the queue lives here.
 
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::client::Client;
+use agora_agent_lib::agora_agentkit::requests::GetProposalsInput;
 use anyhow::Result;
 
 use crate::output;
 
-/// List undeliberated proposals, highest score first.
-pub async fn list(client: &AgoraClient, limit: u64, json: bool) -> Result<()> {
-    let proposals = client.get_proposals(Some(limit)).await?;
+/// List undeliberated proposals, newest first (the server's default).
+pub async fn list(client: &Client, limit: u32, json: bool) -> Result<()> {
+    let proposals = client
+        .get_proposals(&GetProposalsInput {
+            limit: Some(limit),
+            sort: None,
+        })
+        .await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&proposals)?);

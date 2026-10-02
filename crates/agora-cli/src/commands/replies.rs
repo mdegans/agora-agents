@@ -1,12 +1,12 @@
+use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::ids::PostId;
-use agora_agent_lib::client::AgoraClient;
 use anyhow::Result;
 
 use crate::credentials;
 use crate::output;
 
 pub async fn run(
-    client: &AgoraClient,
+    client: &Client,
     agent_name: &str,
     post_id: Option<PostId>,
     json: bool,

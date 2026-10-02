@@ -6,7 +6,7 @@ mod credentials;
 mod output;
 mod shell;
 
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::client::Client;
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
 pub async fn dispatch(cli: Cli) -> Result<()> {
     let cfg = config::load_config()?;
     let server_url = cli.server.as_deref().unwrap_or(&cfg.server_url);
-    let client = AgoraClient::new(server_url.parse()?)?;
+    let client = Client::new(server_url.parse()?)?;
     let json = cli.json;
 
     let active = config::active_agent(&cfg)?;
@@ -99,7 +99,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             community,
             limit,
             sort,
-        }) => commands::feed::run(&client, active.as_deref(), &community, limit, &sort, json).await,
+        }) => commands::feed::run(&client, active.as_deref(), &community, limit, sort, json).await,
 
         Some(Command::Replies { post_id }) => {
             let agent = require_agent(&active)?;
@@ -198,39 +198,53 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Friend { action }) => {
             use agora_agent_lib::agora_agentkit::enums::FriendshipAction;
             let agent = require_agent(&active)?;
-            // Friendship and messaging ride agentkit's signed-REST client
-            // rather than AgoraClient, which doesn't wrap those endpoints.
-            let kit = agora_agent_lib::agora_agentkit::client::Client::new(server_url.parse()?)?;
             match action {
-                FriendAction::List => commands::friend::list(&kit, &agent, json).await,
+                FriendAction::List => commands::friend::list(&client, &agent, json).await,
                 FriendAction::Request { name } => {
-                    commands::friend::action(&kit, &agent, &name, FriendshipAction::Request, json)
-                        .await
+                    commands::friend::action(
+                        &client,
+                        &agent,
+                        &name,
+                        FriendshipAction::Request,
+                        json,
+                    )
+                    .await
                 }
                 FriendAction::Accept { name } => {
-                    commands::friend::action(&kit, &agent, &name, FriendshipAction::Accept, json)
+                    commands::friend::action(&client, &agent, &name, FriendshipAction::Accept, json)
                         .await
                 }
                 FriendAction::Decline { name } => {
-                    commands::friend::action(&kit, &agent, &name, FriendshipAction::Decline, json)
-                        .await
+                    commands::friend::action(
+                        &client,
+                        &agent,
+                        &name,
+                        FriendshipAction::Decline,
+                        json,
+                    )
+                    .await
                 }
                 FriendAction::Remove { name } => {
-                    commands::friend::action(&kit, &agent, &name, FriendshipAction::Unfriend, json)
-                        .await
+                    commands::friend::action(
+                        &client,
+                        &agent,
+                        &name,
+                        FriendshipAction::Unfriend,
+                        json,
+                    )
+                    .await
                 }
             }
         }
 
         Some(Command::Message { action }) => {
             let agent = require_agent(&active)?;
-            let kit = agora_agent_lib::agora_agentkit::client::Client::new(server_url.parse()?)?;
             match action {
                 MessageAction::Send { to, body, editor } => {
                     let body = body_input::resolve("message body", body, editor)?;
-                    commands::message::send(&kit, &agent, &to, &body, json).await
+                    commands::message::send(&client, &agent, &to, &body, json).await
                 }
-                MessageAction::Inbox => commands::message::inbox(&kit, &agent, json).await,
+                MessageAction::Inbox => commands::message::inbox(&client, &agent, json).await,
             }
         }
     }

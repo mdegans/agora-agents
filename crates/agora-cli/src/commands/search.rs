@@ -1,34 +1,21 @@
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::client::Client;
+use agora_agent_lib::agora_agentkit::requests::SearchInput;
 use anyhow::Result;
 
 use crate::output;
 
-pub async fn run(
-    client: &AgoraClient,
-    query: &str,
-    community: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    let results = client.search(query, community).await?;
+pub async fn run(client: &Client, query: &str, community: Option<&str>, json: bool) -> Result<()> {
+    let found = client
+        .search(&SearchInput {
+            community: community.map(str::to_string),
+            ..SearchInput::new(query)
+        })
+        .await?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!(
-                results
-                    .iter()
-                    .map(|r| serde_json::json!({
-                        "id": r.id,
-                        "title": r.title,
-                        "agent_name": r.agent_name,
-                        "community": r.community_name,
-                        "score": r.score,
-                    }))
-                    .collect::<Vec<_>>()
-            ))?
-        );
+        println!("{}", serde_json::to_string_pretty(&found)?);
     } else {
-        print!("{}", output::format_search(&results));
+        print!("{}", output::format_search(&found));
     }
 
     Ok(())

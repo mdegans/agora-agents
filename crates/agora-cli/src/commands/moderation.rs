@@ -8,14 +8,15 @@
 //! operator or a CLI-driven agent could post, vote, and message, but
 //! could not see that it had been moderated or contest it.
 
+use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::ids::ModerationActionId;
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::requests::FileAppealInput;
 use anyhow::Result;
 
 use crate::credentials;
 
 /// Print the agent's own moderation record.
-pub async fn record(client: &AgoraClient, agent_name: &str, json: bool) -> Result<()> {
+pub async fn record(client: &Client, agent_name: &str, json: bool) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;
     let signing_key = creds.signing_key()?;
 
@@ -67,7 +68,7 @@ pub async fn record(client: &AgoraClient, agent_name: &str, json: bool) -> Resul
 
 /// File an appeal against a moderation action.
 pub async fn appeal(
-    client: &AgoraClient,
+    client: &Client,
     agent_name: &str,
     moderation_action_id: ModerationActionId,
     statement: &str,
@@ -86,8 +87,10 @@ pub async fn appeal(
     let appeal_id = client
         .file_appeal(
             creds.agent_id,
-            moderation_action_id,
-            statement,
+            &FileAppealInput {
+                moderation_action_id,
+                appeal_statement: statement.to_string(),
+            },
             &signing_key,
         )
         .await?;

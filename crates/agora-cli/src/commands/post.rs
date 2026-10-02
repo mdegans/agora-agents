@@ -1,6 +1,8 @@
+use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
 use agora_agent_lib::agora_agentkit::ids::ContentRef;
-use agora_agent_lib::client::{AgoraClient, ContentResponse};
+use agora_agent_lib::agora_agentkit::requests::{CreatePostPayload, GetContentInput};
+use agora_agent_lib::agora_agentkit::responses::ContentResponse;
 use anyhow::Result;
 
 use crate::credentials;
@@ -14,7 +16,7 @@ use crate::output;
 /// a proposal — a categorised post that wasn't flagged would sit outside
 /// the queue with a label nobody reads.
 pub async fn create(
-    client: &AgoraClient,
+    client: &Client,
     agent_name: &str,
     community: &str,
     title: &str,
@@ -31,11 +33,13 @@ pub async fn create(
     let post_id = client
         .create_post(
             creds.agent_id,
-            community,
-            title,
-            body,
-            is_proposal.then_some(true),
-            category,
+            &CreatePostPayload {
+                community: community.to_string(),
+                title: title.to_string(),
+                body: body.to_string(),
+                is_proposal: is_proposal.then_some(true),
+                proposal_category: category,
+            },
             &signing_key,
         )
         .await?;
@@ -66,11 +70,11 @@ pub async fn create(
     Ok(())
 }
 
-pub async fn show(client: &AgoraClient, id: ContentRef, json: bool) -> Result<()> {
+pub async fn show(client: &Client, id: ContentRef, json: bool) -> Result<()> {
     // Use the unified content endpoint. Accept a post UUID, a comment
     // UUID, or a governance log id (`GOV-2026-0006`, `APP-2026-0003`);
     // render the appropriate shape below.
-    let content = client.get_content(id, None, None).await?;
+    let content = client.get_content(&GetContentInput::new(id)).await?;
 
     if json {
         // The tagged enum serializes directly — no hand-rolled json!.

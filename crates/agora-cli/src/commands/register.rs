@@ -1,4 +1,4 @@
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::client::Client;
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -7,7 +7,7 @@ use crate::config::{self, set_active_agent};
 use crate::credentials::{self, Credentials};
 
 pub async fn run(
-    client: &AgoraClient,
+    client: &Client,
     name: &str,
     email: &str,
     password: &str,
@@ -50,7 +50,7 @@ pub async fn run(
                 );
                 return Err(anyhow::anyhow!("operator registration required"));
             }
-            return Err(e);
+            return Err(e.into());
         }
     };
 

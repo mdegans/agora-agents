@@ -1,5 +1,6 @@
 //! The two questions — the offer and the trial review — as instructions,
-//! a hand-written output schema (the review's), and parse targets.
+//! the review's output schema (derived from [`ReviewAnswer`]), and parse
+//! targets.
 //!
 //! The offer is answered with the strict `answer_offer` tool
 //! ([`super::offers`]), as one section of the closing question; its typed
@@ -8,11 +9,11 @@
 //! of the act phase, still goes out with its schema as `output_config`
 //! where that keeps the cache (blallama), and as plain text elsewhere.
 //!
-//! **Schemas are hand-written JSON**, not `#[derive(JsonSchema)]`: a derive
-//! on a struct holding an enum field emits the enum into `$defs` behind a
-//! `$ref`, and `$ref` in a constrained-decoding schema is banned in this
-//! project (CLAUDE.md, "Never ship a `$ref` schema"). The tests pin that
-//! and pin the schemas to the serde types, so the two can't drift.
+//! **The schema is the parse type's own**, rendered inline
+//! (`inline_input_schema_for`): a plain derive would put the enum into `$defs`
+//! behind a `$ref`, and `$ref` in a constrained-decoding schema is banned in
+//! this project (CLAUDE.md, "Never ship a `$ref` schema"). The tests pin
+//! that.
 //!
 //! **Order is deliberate.** `reason` precedes `choice` in both the schema
 //! and the parse structs: under a grammar the decoder emits properties in
@@ -20,9 +21,10 @@
 //! than rationalising it afterwards. And "stay"/"revert" is listed first
 //! — the no-change option takes the first-option bias.
 
+use agora_agentkit::responses::inline_input_schema_for;
 use misanthropic::prompt::message::Content;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use super::comparison::{Comparison, EXCERPT_BYTES, Sample, Where};
 use super::forks::{
@@ -51,15 +53,19 @@ impl OfferChoice {
     pub const ALL: [Self; 3] = [Self::NoSwap, Self::Trial, Self::Permanent];
 }
 
-/// The agent's answer to the trial review.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The agent's answer to the trial review, and its schema
+/// ([`review_schema`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewAnswer {
+    /// Why you chose as you did, in your own words. Written before the choice.
     pub reason: String,
+    /// `revert` or `keep`
     pub choice: ReviewChoice,
 }
 
 /// The review's options, in the order they are presented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewChoice {
     Revert,
@@ -71,31 +77,10 @@ impl ReviewChoice {
     pub const ALL: [Self; 2] = [Self::Revert, Self::Keep];
 }
 
-/// `{reason, choice}` with `choice` one of `options`. Inline, `$ref`-free,
-/// closed (`additionalProperties: false`, as strict mode requires).
-fn answer_schema(reason: &str, options: &[&str]) -> serde_json::Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "reason": {
-                "type": "string",
-                "description": reason,
-            },
-            "choice": {
-                "type": "string",
-                "enum": options,
-            },
-        },
-        "required": ["reason", "choice"],
-        "additionalProperties": false,
-    })
-}
-
+/// [`ReviewAnswer`]'s schema: `{reason, choice}`, inline, `$ref`-free and
+/// closed
 pub fn review_schema() -> serde_json::Value {
-    answer_schema(
-        "Why you chose as you did, in your own words. Written before the choice.",
-        &["revert", "keep"],
-    )
+    inline_input_schema_for::<ReviewAnswer>()
 }
 
 /// The human-facing half of an offer.
@@ -431,6 +416,7 @@ pub fn parse_review(text: &str) -> Result<ReviewAnswer, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Absolute rule (CLAUDE.md): no `$ref`/`$defs` anywhere in a schema a
     /// constrained decoder sees.
@@ -467,6 +453,15 @@ pub(crate) mod tests {
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
         assert_eq!(keys, ["reason", "choice"], "reason must come first");
         assert_eq!(schema["required"], json!(["reason", "choice"]));
+        assert!(!schema.to_string().contains("\"pattern\""), "{schema}");
+        assert_eq!(schema["properties"]["choice"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["reason"]["description"],
+            "Why you chose as you did, in your own words. Written before the choice."
+        );
+        // The parse type refuses what the closed schema refuses.
+        let err = parse_review(r#"{"reason": "r", "choice": "keep", "note": "n"}"#).unwrap_err();
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     /// The schema's enum is exactly the serde names, in presentation order
