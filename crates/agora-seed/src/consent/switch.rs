@@ -18,7 +18,7 @@
 //! ahead of the system prompt, and every agent on a model shares that
 //! prefix. So `set_model` is the same for every agent on a model: always
 //! registered when the run has a choice to offer, always last in `tools`
-//! (see [`ConsentAgent::seat_set_model`](super::agent::ConsentAgent)), and
+//! (see [`ConsentAgent::seat_tail_tools`](super::agent::ConsentAgent)), and
 //! its description names only the model and the menu. Why an agent can't
 //! switch right now (a cooldown, a trial, a review session) is per-agent,
 //! so it lives in the refusal a call gets, never in the description.

@@ -1,5 +1,12 @@
 //! The two questions — the offer and the trial review — as instructions,
-//! hand-written output schemas, and parse targets.
+//! a hand-written output schema (the review's), and parse targets.
+//!
+//! The offer is answered with the strict `answer_offer` tool
+//! ([`super::offers`]), as one section of the closing question; its typed
+//! answer ([`OfferAnswer`]) is built from the call, or parsed from plain
+//! text as a fallback. The review, asked at the start of a session in place
+//! of the act phase, still goes out with its schema as `output_config`
+//! where that keeps the cache (blallama), and as plain text elsewhere.
 //!
 //! **Schemas are hand-written JSON**, not `#[derive(JsonSchema)]`: a derive
 //! on a struct holding an enum field emits the enum into `$defs` behind a
@@ -84,13 +91,6 @@ fn answer_schema(reason: &str, options: &[&str]) -> serde_json::Value {
     })
 }
 
-pub fn offer_schema() -> serde_json::Value {
-    answer_schema(
-        "Why you chose as you did, in your own words. Written before the choice.",
-        &["no_swap", "trial", "permanent"],
-    )
-}
-
 pub fn review_schema() -> serde_json::Value {
     answer_schema(
         "Why you chose as you did, in your own words. Written before the choice.",
@@ -118,7 +118,13 @@ const JSON_ONLY: &str = "Do NOT use tools. Respond in JSON **only**, giving your
 /// (the Steward's call, 2026-09-23 — see `ledger::Ledger::changelog`).
 const PROVENANCE: &str = "It is not part of the survey and it is not anonymous: it comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so that it can be acted on. It is kept in a separate record, not written into your memory; a one-line note of your answer will be added to the Evolution Log in your SOUL.";
 
-/// The offer, seated as the session's last user turn.
+/// Where the model-swap offer's answer goes (the second half of
+/// [`PROVENANCE`]; the closing question says who is asking).
+const RECORD: &str = "Your answer is kept in a separate record, not written into your memory; a one-line note of your answer will be added to the Evolution Log in your SOUL.";
+
+/// The offer's section of the closing question ([`super::offers::question`],
+/// which says who is asking and how to answer). Answered with
+/// `answer_offer`, `offer` = `model_swap`.
 pub fn offer(text: OfferText<'_>) -> Content {
     let OfferText {
         from_name: from,
@@ -133,9 +139,7 @@ pub fn offer(text: OfferText<'_>) -> Content {
         format!("Every agent on {from} is being asked whether it would like to move to **{to}**.")
     };
     let body = format!(
-        r#"One more question before this session ends. {PROVENANCE}
-
-It is about the model you run on. You currently run on **{from}**. {who}
+        r#"**About the model you run on.** You currently run on **{from}**. {who}
 
 {description}
 
@@ -149,11 +153,9 @@ Your options:
 
 A move is applied by hand, so it may take a few days to happen.
 
-{JSON_ONLY}
+{RECORD}
 
-```json
-{{"reason": "<why, in your own words>", "choice": "<no_swap | trial | permanent>"}}
-```"#
+To answer, call `answer_offer` with `offer` set to `model_swap` and `choice` set to `no_swap`, `trial` or `permanent`. Leave `text` and `memory_note` empty: this question writes nothing into your memory."#
     );
     Content::from(body)
 }
@@ -455,14 +457,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn schemas_are_ref_free_closed_and_reason_first() {
-        for schema in [offer_schema(), review_schema()] {
-            assert_ref_free(&schema);
-            assert_eq!(schema["additionalProperties"], false);
-            let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
-            assert_eq!(keys, ["reason", "choice"], "reason must come first");
-            assert_eq!(schema["required"], json!(["reason", "choice"]));
-        }
+    fn review_schema_is_ref_free_closed_and_reason_first() {
+        // The offer is answered with `answer_offer` (`super::offers`, whose
+        // tests pin its schema); only the review still goes out as
+        // `output_config`.
+        let schema = review_schema();
+        assert_ref_free(&schema);
+        assert_eq!(schema["additionalProperties"], false);
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["reason", "choice"], "reason must come first");
+        assert_eq!(schema["required"], json!(["reason", "choice"]));
     }
 
     /// The schema's enum is exactly the serde names, in presentation order
@@ -474,9 +478,6 @@ pub(crate) mod tests {
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect::<Vec<_>>()
         };
-        let offer: Vec<_> = OfferChoice::ALL.iter().map(|c| json!(c)).collect();
-        assert_eq!(enum_of(&offer_schema()), names(offer));
-        assert_eq!(enum_of(&offer_schema())[0], "no_swap");
         let review: Vec<_> = ReviewChoice::ALL.iter().map(|c| json!(c)).collect();
         assert_eq!(enum_of(&review_schema()), names(review));
         assert_eq!(enum_of(&review_schema())[0], "revert");

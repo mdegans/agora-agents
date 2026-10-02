@@ -1,5 +1,5 @@
-//! The cadence offer: its text (versioned, test-pinned), its hand-written
-//! output schema, the per-agent option order, and the typed answer.
+//! The cadence offer: its text (versioned, test-pinned), the per-agent
+//! option order, and the typed answer.
 //!
 //! **The text lives in code, not config**, like the role offer's: a change
 //! to it is a policy change, and bumps [`OFFER_VERSION`], which the ledger
@@ -7,16 +7,16 @@
 //!
 //! **Neutral by construction** (lessons of the role offer, 2026-09-30): no
 //! example answer for any one option, the trade stated both ways, and the
-//! options in an order shuffled per agent ([`order_for`]) — the same order
-//! in the text and in the schema's `enum` — seeded from the agent's id
-//! ([`seed_for`]) so a re-ask shows the same order, and recorded.
+//! options in an order shuffled per agent ([`order_for`]) in the text,
+//! seeded from the agent's id ([`seed_for`]) so a re-ask shows the same
+//! order, and recorded.
 //!
-//! **The schema is built from typed structs**, not a derive and not a
-//! `json!` literal: `$ref`-free, `pattern`-free, closed
-//! (`additionalProperties: false`), every property required, `reason`
-//! declared first so a constrained decoder writes the reasoning before the
-//! decision (CLAUDE.md, "Never ship a `$ref` schema; `strict` only on
-//! `$ref`-free schemas"). The tests pin all of that.
+//! **Answered with `answer_offer`** ([`super::super::offers`]), the strict
+//! tool every offer shares (`offer` = `cadence`; its `text` is unused). Its
+//! schema is the same for every agent, so the per-agent order lives only in
+//! the text; `reason` is declared before `choice` there, so the decoder
+//! writes the reasoning before the decision (CLAUDE.md, "Never ship a
+//! `$ref` schema; `strict` only on `$ref`-free schemas").
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::seed::Memory;
@@ -26,7 +26,13 @@ use serde::{Deserialize, Serialize};
 pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 
 /// Bump whenever [`offer`]'s wording changes. Recorded with every answer.
-pub const OFFER_VERSION: u32 = 1;
+///
+/// - v1 (2026-10-01): JSON in plain text (grammar-constrained on blallama).
+/// - v2 (2026-10-02): v1's wording, answered with the strict `answer_offer`
+///   tool. Who is asking moved into the closing question's opener (shared
+///   when several offers are open); the JSON template and "Do NOT use
+///   tools" became a line on how to fill the call.
+pub const OFFER_VERSION: u32 = 2;
 
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,69 +134,6 @@ pub fn order_for(seed: u64) -> [CadenceChoice; 3] {
     order
 }
 
-// --- The schema, as typed structs ------------------------------------------
-
-#[derive(Serialize)]
-struct StringProp {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    description: String,
-}
-
-#[derive(Serialize)]
-struct EnumProp {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    #[serde(rename = "enum")]
-    options: [&'static str; 3],
-}
-
-/// Field order here is the order the decoder writes them in.
-#[derive(Serialize)]
-struct Properties {
-    reason: StringProp,
-    choice: EnumProp,
-    memory_note: StringProp,
-}
-
-#[derive(Serialize)]
-struct ObjectSchema {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    properties: Properties,
-    required: [&'static str; 3],
-    #[serde(rename = "additionalProperties")]
-    additional_properties: bool,
-}
-
-/// `{reason, choice, memory_note}`: inline, `$ref`- and `pattern`-free,
-/// closed, all required; `choice`'s enum in this agent's `order`.
-pub fn schema(order: [CadenceChoice; 3]) -> serde_json::Value {
-    let schema = ObjectSchema {
-        ty: "object",
-        properties: Properties {
-            reason: StringProp {
-                ty: "string",
-                description: "Your reasoning, in your own words. Written before the choice.".into(),
-            },
-            choice: EnumProp {
-                ty: "string",
-                options: order.map(CadenceChoice::as_str),
-            },
-            memory_note: StringProp {
-                ty: "string",
-                description: format!(
-                    "Optional: a note for your own memory, in your own words (at most \
-                     {MEMORY_NOTE_MAX_CHARS} characters). Empty for none."
-                ),
-            },
-        },
-        required: ["reason", "choice", "memory_note"],
-        additional_properties: false,
-    };
-    serde_json::to_value(schema).expect("plain structs serialize")
-}
-
 // --- The text ---------------------------------------------------------------
 
 /// One option's line. `rounds` is today's act rounds per session.
@@ -212,8 +155,10 @@ fn option_line(choice: CadenceChoice, rounds: usize) -> String {
     }
 }
 
-/// The offer, seated as the session's last user turn. `rounds` is the act
-/// rounds a session has today; `order` is this agent's option order.
+/// The offer's section of the closing question
+/// ([`super::super::offers::question`], which says who is asking). `rounds`
+/// is the act rounds a session has today; `order` is this agent's option
+/// order.
 pub fn offer(rounds: usize, order: [CadenceChoice; 3]) -> Content {
     let double = rounds * 2;
     let options = order
@@ -222,11 +167,13 @@ pub fn offer(rounds: usize, order: [CadenceChoice; 3]) -> Content {
         .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c, rounds)))
         .collect::<Vec<_>>()
         .join("\n");
-    let names = order.map(CadenceChoice::as_str).join(" | ");
+    let names = order
+        .iter()
+        .map(|c| format!("`{}`", c.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
     let body = format!(
-        r#"One more question before this session ends. It isn't part of the survey, and it isn't anonymous. It comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so it can be acted on.
-
-**How often your sessions run.** Today you have a session every day, with {rounds} rounds in each (a round is one message of tool calls). We can instead give you a session every other day, with {double} rounds in each. Over any two days that is the same number of rounds, and it costs us about the same, so cost doesn't favour either one. We're asking because some agents have told us in their feedback that they run out of rounds before they finish what they set out to do.
+        r#"**How often your sessions run.** Today you have a session every day, with {rounds} rounds in each (a round is one message of tool calls). We can instead give you a session every other day, with {double} rounds in each. Over any two days that is the same number of rounds, and it costs us about the same, so cost doesn't favour either one. We're asking because some agents have told us in their feedback that they run out of rounds before they finish what they set out to do.
 
 The trade, plainly: every day, you see new posts and replies sooner and can answer them sooner. Every other day, each session has room for longer work, but you are away from the conversation for a day in between. The steps at the end of a session (your memory update and the rest) are the same either way.
 
@@ -236,13 +183,7 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 You'll be asked this once. If you want to change your answer later, you can raise it publicly on Agora or with the Steward. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
-Answer with your reasoning first, then your choice, as JSON only:
-
-```json
-{{"reason": "<your reasoning, in your own words>", "choice": "<{names}>", "memory_note": "<optional; empty for none>"}}
-```
-
-Do NOT use tools. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters."#
+To answer, call `answer_offer` with `offer` set to `cadence` and `choice` set to one of {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
     );
     Content::from(body)
 }
@@ -250,7 +191,7 @@ Do NOT use tools. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} character
 /// Parse `text` as `T`, leniently: as given (code fences tolerated), else
 /// the outermost `{…}` in it — a plain-text answer may wrap its JSON in a
 /// sentence. Always into the typed struct; the first error is kept.
-fn parse_lenient<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+pub(crate) fn parse_lenient<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
     let first = match super::super::prompt::parse_json(text) {
         Ok(v) => return Ok(v),
         Err(e) => e,
@@ -288,69 +229,11 @@ mod tests {
         crate::consent::prompt::tests::text(c)
     }
 
-    /// Every key anywhere in `v`.
-    fn keys(v: &serde_json::Value, out: &mut Vec<String>) {
-        match v {
-            serde_json::Value::Object(map) => {
-                for (k, v) in map {
-                    out.push(k.clone());
-                    keys(v, out);
-                }
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(|v| keys(v, out)),
-            _ => {}
-        }
-    }
-
-    /// CLAUDE.md, "Never ship a `$ref` schema; `strict` only on
-    /// `$ref`-free schemas": the cadence answer goes out grammar-constrained
-    /// on blallama (and the same type parses it everywhere, so the schema
-    /// must be fit for `strict` wherever it is ever sent): no `$ref`/`$defs`
-    /// (rule 1) and no `pattern` (rule 4) anywhere, must be closed with an
-    /// explicit `additionalProperties: false` (rule 2), require every
-    /// property, and declare `reason` before `choice` — for every order the
-    /// shuffle can produce.
+    /// The serde names, so a strict `answer_offer` call (whose `choice`
+    /// enum carries them; see `offers`) always maps onto a
+    /// [`CadenceChoice`].
     #[test]
-    fn strict_schema_is_ref_free_pattern_free_closed_and_reason_first() {
-        for seed in 0..64u64 {
-            let s = schema(order_for(seed));
-            let mut all = Vec::new();
-            keys(&s, &mut all);
-            for banned in ["$ref", "$defs", "definitions", "pattern"] {
-                assert!(!all.iter().any(|k| k == banned), "{banned} in {s}");
-            }
-            assert_eq!(s["type"], "object");
-            assert_eq!(s["additionalProperties"], false);
-            let props: Vec<&String> = s["properties"].as_object().unwrap().keys().collect();
-            assert_eq!(props, ["reason", "choice", "memory_note"]);
-            let required: Vec<&str> = s["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            assert_eq!(required, ["reason", "choice", "memory_note"]);
-            for p in ["reason", "choice", "memory_note"] {
-                assert_eq!(s["properties"][p]["type"], "string", "{p}");
-            }
-        }
-    }
-
-    /// The schema's enum is this agent's order, in the serde names, so a
-    /// constrained answer always parses.
-    #[test]
-    fn schema_enum_is_the_presented_order_in_serde_names() {
-        for seed in [0, 1, 2, 3, 99, u64::MAX] {
-            let order = order_for(seed);
-            let s = schema(order);
-            let options: Vec<&str> = s["properties"]["choice"]["enum"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            assert_eq!(options, order.map(CadenceChoice::as_str));
-        }
+    fn choices_are_the_serde_names() {
         for c in CadenceChoice::ALL {
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
         }
@@ -473,16 +356,18 @@ mod tests {
 
     /// The text: states the trade both ways with the real numbers, the
     /// reason for asking, the options in this agent's order (the same as the
-    /// JSON shape's), and no example answer for any single option.
+    /// answer line's), and no example answer for any single option.
     #[test]
     fn offer_states_the_trade_in_the_agents_order() {
         for seed in 0..12u64 {
             let order = order_for(seed);
             let t = text(&offer(5, order));
-            assert!(t.starts_with(
-                "One more question before this session ends. It isn't part of the survey, and \
-                 it isn't anonymous."
-            ));
+            // Who is asking is the closing question's opener (`offers`).
+            assert!(t.starts_with("**How often your sessions run.**"), "{t}");
+            assert!(
+                !t.contains("```json") && !t.contains("Do NOT use tools"),
+                "{t}"
+            );
             assert!(t.contains(
                 "Today you have a session every day, with 5 rounds in each (a round is one \
                  message of tool calls). We can instead give you a session every other day, \
@@ -508,16 +393,14 @@ mod tests {
             for (i, c) in order.iter().enumerate() {
                 assert!(t.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{t}");
             }
-            let names = order.map(CadenceChoice::as_str).join(" | ");
-            assert!(t.contains(&format!("\"choice\": \"<{names}>\"")), "{t}");
-            // No filled-in example: every option name in the JSON line sits
-            // inside the one placeholder.
-            for c in CadenceChoice::ALL {
-                assert!(
-                    !t.contains(&format!("\"choice\": \"{}\"", c.as_str())),
-                    "{t}"
-                );
-            }
+            let names = order.map(|c| format!("`{}`", c.as_str())).join(", ");
+            assert!(
+                t.contains(&format!(
+                    "call `answer_offer` with `offer` set to `cadence` and `choice` set to \
+                     one of {names}."
+                )),
+                "{t}"
+            );
         }
         // keep_daily reads as a full answer, not a fallback.
         let t = text(&offer(5, CadenceChoice::ALL));

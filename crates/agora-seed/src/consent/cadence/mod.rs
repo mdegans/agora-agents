@@ -11,13 +11,13 @@
 //! - **Neutral text**, the trade stated both ways, no example answer for
 //!   any one option, and the options in an order **shuffled per agent**,
 //!   seeded from its id and recorded ([`prompt::order_for`]).
-//! - **Never a cache miss to constrain an answer** (Steward, 2026-10-01):
-//!   the closed, `$ref`-free, `pattern`-free schema goes out as
-//!   `output_config` only where that keeps the prefix cache
-//!   (`Quirks::output_config_cache_safe`: blallama). On the Anthropic API
-//!   (Haiku) the request is left byte-for-byte as it was plus the question:
-//!   the JSON shape is described in the text, the answer parsed leniently
-//!   into the same typed struct, and re-asked if no choice can be read.
+//! - **Never a cache miss to constrain an answer** (Steward, 2026-10-01).
+//!   Since v2 (2026-10-02) the answer is a call to the strict
+//!   `answer_offer` tool ([`super::offers`]), registered for every agent
+//!   from the first turn, so the request is left byte-for-byte as it was
+//!   plus the question on every backend, and `reason` is still written
+//!   before `choice`. An answer given as JSON text instead is parsed
+//!   leniently into the same typed struct (the fallback).
 //! - **The first parsed choice wins.** An answer whose `choice` parses is
 //!   honoured even if its other fields are broken (the note is then
 //!   dropped and the salvage recorded). Only a missing or invalid `choice`
@@ -28,7 +28,7 @@
 //!
 //! - [`CadenceConsentConfig`] — the `[cadence_consent]` table: off unless
 //!   present and `enabled`.
-//! - [`prompt`] — the text, the schema, the order, the answer.
+//! - [`prompt`] — the text, the order, the answer.
 //! - [`ledger`] — `state/<agent_id>/cadence_consent.json`: asked once.
 //! - [`CadencePlan`] — applying it: the sweep planner (`main.rs`) gives an
 //!   agent whose answer on file is `switch` twice the run's `max_rounds`

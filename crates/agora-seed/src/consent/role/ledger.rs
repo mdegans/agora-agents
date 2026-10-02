@@ -72,6 +72,11 @@ pub struct RoleAsk {
     /// The seed [`super::prompt::order_for`] turned into `order`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_seed: Option<u64>,
+    /// Whether the answer taken was grammar-constrained: `true` for a call
+    /// to the strict `answer_offer` tool (v3 on), `false` for the
+    /// plain-text fallback or no answer. Not recorded before v3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained: Option<bool>,
     pub outcome: RoleOutcome,
 }
 
@@ -306,6 +311,7 @@ mod tests {
             attempts: 1,
             order: None,
             order_seed: None,
+            constrained: None,
             outcome,
         }
     }

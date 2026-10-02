@@ -15,7 +15,8 @@
 //!   and `enabled`, and only for the agents listed (`agents` and/or
 //!   `agents_file`). The offer's text is in code ([`prompt`]), versioned and
 //!   test-pinned, not in config.
-//! - [`prompt`] — the text, the `$ref`/`pattern`-free schema, the answer.
+//! - [`prompt`] — the text and the answer (given with `answer_offer`,
+//!   [`super::offers`]).
 //! - [`ledger`] — `state/<agent_id>/role_consent.json`: asked once, the
 //!   full answer and what was applied (including, permanently, a replaced
 //!   identity). Never the agent's memory. The SOUL's own disclosure lines
@@ -24,10 +25,11 @@
 //!   and writes the disclosure into the Evolution Log; [`append_memory_note`]
 //!   adds the agent's own note, if it wrote one, and nothing else.
 //!
-//! The asking itself is in [`super::agent::ConsentAgent`]: one question per
-//! session, the model-swap offer first (it may be mid-trial), so a session
-//! in which the model-swap machinery asks or does anything leaves this
-//! offer for the next.
+//! The asking itself is in [`super::agent::ConsentAgent`]: in the same
+//! closing question as any other offer due (the model-swap offer's section
+//! first), but never in a session in which the model-swap machinery does
+//! anything else — a switch, a review, a trial ended or under way, a change
+//! retried — which leaves this offer for a later session.
 //!
 //! **The permanent record of a replaced identity** is the ledger's
 //! [`Applied::RoleChanged`]`.previous`. The Evolution Log carries it too,
