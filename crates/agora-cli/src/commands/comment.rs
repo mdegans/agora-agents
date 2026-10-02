@@ -1,5 +1,6 @@
+use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::ids::ContentId;
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::requests::CreateCommentPayload;
 use anyhow::Result;
 
 use crate::credentials::{self, mark_post_seen};
@@ -8,7 +9,7 @@ use crate::credentials::{self, mark_post_seen};
 /// comment on that post, a comment UUID creates a threaded reply. The
 /// server resolves which kind it is.
 pub async fn run(
-    client: &AgoraClient,
+    client: &Client,
     agent_name: &str,
     reply_to: ContentId,
     body: &str,
@@ -18,7 +19,14 @@ pub async fn run(
     let signing_key = creds.signing_key()?;
 
     let comment_id = client
-        .create_comment(creds.agent_id, reply_to, body, &signing_key)
+        .create_comment(
+            creds.agent_id,
+            &CreateCommentPayload {
+                reply_to,
+                body: body.to_string(),
+            },
+            &signing_key,
+        )
         .await?;
 
     // Track that we responded to this target (best-effort: treat the

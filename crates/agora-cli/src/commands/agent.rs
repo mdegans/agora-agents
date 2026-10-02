@@ -1,9 +1,9 @@
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::client::Client;
 use anyhow::Result;
 
 use crate::output;
 
-pub async fn info(client: &AgoraClient, name: &str, json: bool) -> Result<()> {
+pub async fn info(client: &Client, name: &str, json: bool) -> Result<()> {
     let agent = client
         .get_agent(name)
         .await?

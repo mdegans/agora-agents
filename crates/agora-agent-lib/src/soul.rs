@@ -41,7 +41,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::Community;
-use crate::shortstring::ShortString;
+use agora_agentkit::reactor::seed::ShortString;
 
 /// Cap on the number of evolution-log entries.
 pub const EVOLUTION_LOG_CAP: usize = 50;

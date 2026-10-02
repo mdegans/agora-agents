@@ -1,7 +1,8 @@
 use agora_agent_lib::agora_agentkit::enums::{ProposalCategory, Standing};
 use agora_agent_lib::agora_agentkit::ids::ContentId;
-use agora_agent_lib::client::{
-    AgentResponse, Community, FeedPost, GovernanceEntryResponse, PostWithComments, ProposalResponse,
+use agora_agent_lib::agora_agentkit::responses::{
+    AgentResponse, CommunityResponse, GovernanceEntryResponse, PostResponse,
+    PostWithCommentsResponse, ProposalResponse, SearchResponse,
 };
 use std::collections::HashSet;
 
@@ -17,7 +18,7 @@ pub fn badges(labels: &[&str]) -> String {
 }
 
 /// Format a feed for text output.
-pub fn format_feed(posts: &[FeedPost], seen: &HashSet<ContentId>) -> String {
+pub fn format_feed(posts: &[PostResponse], seen: &HashSet<ContentId>) -> String {
     if posts.is_empty() {
         return "No posts found.".to_string();
     }
@@ -48,7 +49,7 @@ pub fn format_feed(posts: &[FeedPost], seen: &HashSet<ContentId>) -> String {
 }
 
 /// Format a single post with comments for text output.
-pub fn format_post(post: &PostWithComments) -> String {
+pub fn format_post(post: &PostWithCommentsResponse) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}\n", post.post.title));
     let author = post.post.agent_name.as_deref().unwrap_or("unknown");
@@ -181,7 +182,7 @@ pub fn proposal_next_steps(category: Option<ProposalCategory>) -> String {
 }
 
 /// Format community list for text output.
-pub fn format_communities(communities: &[Community]) -> String {
+pub fn format_communities(communities: &[CommunityResponse]) -> String {
     if communities.is_empty() {
         return "No communities found.".to_string();
     }
@@ -193,17 +194,19 @@ pub fn format_communities(communities: &[Community]) -> String {
     out
 }
 
-/// Format search results for text output. Search returns `FeedPost`
-/// (aka `PostResponse`) — the same shape the server uses for feeds and
-/// agent post listings. The prior parallel `SearchResult` type drifted
-/// and was removed; this consumes the unified type.
-pub fn format_search(results: &[FeedPost]) -> String {
-    if results.is_empty() {
-        return "No results found.".to_string();
+/// Format search results for text output, noting a semantic search that
+/// fell back to keyword.
+pub fn format_search(found: &SearchResponse) -> String {
+    let mut out = String::new();
+    if found.degraded {
+        out.push_str("(semantic search was unavailable; these are keyword results)\n");
+    }
+    if found.results.is_empty() {
+        out.push_str("No results found.");
+        return out;
     }
 
-    let mut out = String::new();
-    for r in results {
+    for r in &found.results {
         let agent = r.agent_name.as_deref().unwrap_or("unknown");
         let community = &r.community_name;
         out.push_str(&format!(
@@ -236,7 +239,7 @@ pub fn format_agent(agent: &AgentResponse) -> String {
 }
 
 /// Format a list of agent's posts with reply counts.
-pub fn format_replies_list(posts: &[FeedPost]) -> String {
+pub fn format_replies_list(posts: &[PostResponse]) -> String {
     if posts.is_empty() {
         return "You haven't posted anything yet.".to_string();
     }

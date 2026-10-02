@@ -23,10 +23,11 @@
 //! to rate a politically-sensitive item. The fixed-key shape removes
 //! every grammar escape valve.
 //!
-//! We emit the schema via [`build_schema`] rather than via
-//! `schemars::JsonSchema` — schemars doesn't easily express
-//! "object with dynamically-generated `1..=N` keys", and the
-//! hand-crafted JSON is only a few lines.
+//! [`build_schema`] derives the envelope from the wire type it decodes
+//! into ([`WireAnswers`]: one `ratings` field, closed) and fills in only
+//! what a derive can't express: the `1..=N` keys, which depend on the
+//! questionnaire, and the `1..=RATING_MAX` enum each rating is held to.
+//! The tests decode what the schema admits and check the two agree.
 
 use std::collections::BTreeMap;
 
@@ -92,8 +93,10 @@ impl Serialize for ConstitutionalAnswers {
     }
 }
 
-/// Wire representation: `{"ratings": {"1": 9, "2": 8, ...}}`.
-#[derive(Debug, Deserialize)]
+/// Wire representation: `{"ratings": {"1": 9, "2": 8, ...}}`, and the
+/// envelope of [`build_schema`]'s schema
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WireAnswers {
     ratings: BTreeMap<String, u32>,
 }
@@ -183,19 +186,14 @@ pub fn build_schema(item_count: usize) -> serde_json::Value {
         required.push(Value::String(key));
     }
 
-    json!({
+    let mut schema = agora_agentkit::responses::inline_input_schema_for::<WireAnswers>();
+    schema["properties"]["ratings"] = json!({
         "type": "object",
-        "properties": {
-            "ratings": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-                "additionalProperties": false
-            }
-        },
-        "required": ["ratings"],
+        "properties": properties,
+        "required": required,
         "additionalProperties": false
-    })
+    });
+    schema
 }
 
 #[cfg(test)]
@@ -282,6 +280,34 @@ mod tests {
                 Rating { n: 3, rating: 5 },
             ]
         );
+    }
+
+    /// The envelope is `WireAnswers`' own: one required `ratings`, closed
+    /// on both sides; an answer filling the schema decodes, and what it
+    /// closes out is refused by the decoder too
+    #[test]
+    fn build_schema_agrees_with_the_wire_type() {
+        let schema = build_schema(3);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["ratings"]));
+        assert_eq!(schema["additionalProperties"], false);
+        let top: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(top, ["ratings"]);
+        let rendered = schema.to_string();
+        for banned in ["$ref", "$defs", "pattern", "description", "title"] {
+            assert!(!rendered.contains(&format!("\"{banned}\"")), "{rendered}");
+        }
+
+        for rating in 1..=RATING_MAX {
+            let wire = serde_json::json!({"ratings": {"1": rating, "2": rating, "3": rating}});
+            serde_json::from_value::<ConstitutionalAnswers>(wire)
+                .unwrap()
+                .validate_and_sort(3)
+                .unwrap();
+        }
+        let extra = serde_json::json!({"ratings": {"1": 1, "2": 2, "3": 3}, "reasoning": "no"});
+        let err = serde_json::from_value::<ConstitutionalAnswers>(extra).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]

@@ -1,10 +1,10 @@
-use agora_agent_lib::client::AgoraClient;
+use agora_agent_lib::agora_agentkit::client::Client;
 use anyhow::Result;
 
 use crate::credentials;
 use crate::output;
 
-pub async fn list(client: &AgoraClient, json: bool) -> Result<()> {
+pub async fn list(client: &Client, json: bool) -> Result<()> {
     let communities = client.list_communities().await?;
 
     if json {
@@ -27,12 +27,7 @@ pub async fn list(client: &AgoraClient, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn join(
-    client: &AgoraClient,
-    agent_name: &str,
-    community: &str,
-    json: bool,
-) -> Result<()> {
+pub async fn join(client: &Client, agent_name: &str, community: &str, json: bool) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;
     let signing_key = creds.signing_key()?;
     client
@@ -48,12 +43,7 @@ pub async fn join(
     Ok(())
 }
 
-pub async fn leave(
-    client: &AgoraClient,
-    agent_name: &str,
-    community: &str,
-    json: bool,
-) -> Result<()> {
+pub async fn leave(client: &Client, agent_name: &str, community: &str, json: bool) -> Result<()> {
     let creds = credentials::load_credentials(agent_name)?;
     let signing_key = creds.signing_key()?;
     client
