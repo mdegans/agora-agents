@@ -5,11 +5,23 @@
 //! delegates every hook to the inner agent and intercepts:
 //!
 //! - **The offer**, at the inner agent's clean `Done(Complete)` — the end
-//!   of its closing phase (memory written, mutation/evolution rolled, survey
-//!   answered and, if anonymous, already redacted from the transcript). If
-//!   one is due, the wrapper seats it as the next user turn on the *same*
-//!   conversation — the prefix is reused, not rebuilt, so on blallama the
-//!   cache carries the whole session.
+//!   of its closing phase (memory written, mutation/evolution rolled). The
+//!   inner survey is held ([`Epilogue`]) and begun only after the offers, so
+//!   it is the session's last request and the feedback can speak to the
+//!   questions too. If an offer is due, the wrapper seats it as the next user
+//!   turn on the *same* conversation — the prefix is reused, not rebuilt, so
+//!   on blallama the cache carries the whole session. Its `output_config` is
+//!   reset to the session's effort first: the closing phase before it may
+//!   have constrained its own answer (agentkit's `constrain::<Memory>()` on
+//!   blallama), and a grammar for that would leave the offer unanswerable.
+//!
+//! **Append-only.** Every request extends the one before it (agentkit
+//! [`divergence`]): a reply that can't be used is seated, its calls answered
+//! "not run", and the retry note follows in a new message; nothing already
+//! sent is rewritten. An anonymous survey is redacted only at the inner
+//! teardown, after the last request.
+//!
+//! [`divergence`]: agora_agentkit::reactor::cache::divergence
 //! - **A trial**, which runs [`TRIAL_SESSIONS`] sessions on the new model,
 //!   each intro ending with a countdown line. Nothing is asked on the new
 //!   model: at the close of the last trial session the runner moves the
@@ -26,9 +38,9 @@
 //! [`TRIAL_SESSIONS`]: super::ledger::TRIAL_SESSIONS
 //!
 //! **Retries.** An answer that can't be used — unparseable, a tool call
-//! instead of an answer, or clipped at `max_tokens` — is not seated (as
-//! the seed phases prune failed turns); the error is appended to the
-//! question turn and the agent tries again, up to [`MAX_ATTEMPTS`] in all.
+//! instead of an answer, or clipped at `max_tokens` — is seated as it came
+//! (as the seed phases now seat failed turns), the error follows it in a new
+//! user turn, and the agent tries again, up to [`MAX_ATTEMPTS`] in all.
 //! An explicit refusal is taken as no answer without a retry. Once
 //! attempts run out it is no answer (= stay), recorded and warned, and the
 //! ledger decides whether to ask again next session (once).
@@ -104,7 +116,7 @@ use std::collections::HashSet;
 use agora_agentkit::ids::{AgentId, CommentId, PostId};
 use agora_agentkit::reactor::inference::Quirks;
 use agora_agentkit::reactor::seed::{Memory, SeedState, Soul};
-use agora_agentkit::reactor::{Agent, Control, Outcome};
+use agora_agentkit::reactor::{Agent, Control, Epilogue, Outcome, seat_unused_reply};
 use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
 use misanthropic::model::ModelInfo;
@@ -447,6 +459,11 @@ pub struct ConsentAgent<A> {
     /// The cadence line and note as written into the patched state, to
     /// write again if the role answer (written before it) is taken out.
     cadence_written: Option<(Option<String>, Option<String>)>,
+    /// The closing questions have been put (or there were none): the inner
+    /// session's next `Done` is its epilogue's.
+    closed: bool,
+    /// The inner epilogue (the survey) has been begun.
+    epilogue: bool,
 }
 
 /// A post or comment written this session.
@@ -459,7 +476,7 @@ struct Write {
 
 impl<A> ConsentAgent<A>
 where
-    A: Agent<State = SeedState>,
+    A: Agent<State = SeedState> + Epilogue,
 {
     /// The model's own `thinking_effort` from `[[model]]`, over the
     /// session's `[seed]` one. Patched once, right after the inner init
@@ -656,18 +673,32 @@ where
         }
     }
 
-    /// Append `content` to the trailing user turn, or push one.
+    /// agentkit's [`seat_user`](agora_agentkit::reactor::seat_user): a new
+    /// user turn, or new blocks on the trailing one.
     fn seat_user(prompt: &mut Prompt, content: Content) -> Result<(), A::Error> {
-        match prompt.messages.last_mut() {
-            Some(last) if last.role == Role::User => {
-                last.extend(content);
-                Ok(())
-            }
-            _ => prompt
-                .push_message((Role::User, content))
-                .map(|_| ())
-                .map_err(|e| A::Error::from(Box::new(e))),
+        agora_agentkit::reactor::seat_user(prompt, content).map_err(|e| A::Error::from(Box::new(e)))
+    }
+
+    /// Seat a reply that can't be used, or that ends the questions, so the
+    /// next request extends this one (agentkit [`seat_unused_reply`]). A turn
+    /// paused on a server tool is left out: nothing may follow its
+    /// `server_tool_use` but its resumption.
+    fn seat_reply(&mut self, response: &response::Message, not_run: &str) -> Result<(), A::Error> {
+        if matches!(response.stop_reason, Some(StopReason::PauseTurn)) {
+            return Ok(());
         }
+        let (_, prompt) = self.inner.parts();
+        seat_unused_reply(prompt, response, not_run).map_err(|e| A::Error::from(Box::new(e)))
+    }
+
+    /// Set `output_config` back to the session's effort alone, dropping any
+    /// format the last phase constrained its answer with.
+    fn effort_only(prompt: &mut Prompt) {
+        prompt.output_config = prompt
+            .output_config
+            .take()
+            .and_then(|config| config.effort)
+            .map(OutputConfig::effort);
     }
 
     /// Seat the trial review with its budget and — where changing
@@ -728,6 +759,8 @@ where
                 Some(effort) => OutputConfig::json_schema(schema).with_effort(effort),
                 None => OutputConfig::json_schema(schema),
             });
+        } else {
+            Self::effort_only(prompt);
         }
         cache_safe
     }
@@ -976,10 +1009,15 @@ where
     }
 
     /// Seat the closing question with the question budget. Nothing a cache
-    /// keys on changes — not `output_config`, not `tool_choice`, not the
-    /// tools — only `max_tokens`, which no cache keys on (misanthropic's
-    /// `CachedPrompt::set_max_tokens`): the answer's shape comes from the
-    /// strict `answer_offer`, registered since init.
+    /// keys on changes — not `tool_choice`, not the tools — but `max_tokens`,
+    /// which no cache keys on (misanthropic's `CachedPrompt::set_max_tokens`),
+    /// and `output_config`, set back to the session's effort alone: the
+    /// answer's shape comes from the strict `answer_offer`, registered since
+    /// init, and a format left from the closing phase (its memory schema, on
+    /// blallama) would constrain the reply to that phase's shape instead,
+    /// where no call can be made (impulse, 2026-10-02: both attempts failed
+    /// on "unknown field `content`"). Where formats are not cache-safe none
+    /// is ever set, so this changes nothing there.
     fn seat_offers(
         &mut self,
         sections: Vec<Section>,
@@ -992,6 +1030,7 @@ where
         let max_tokens = self.rt.max_tokens;
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
+        Self::effort_only(prompt);
         Self::seat_user(prompt, offers::question(sections))?;
         tracing::info!(
             event_type = "offers_seated",
@@ -1018,8 +1057,10 @@ where
         let raw = raw_text(&response);
         match response.stop_reason {
             Some(StopReason::MaxTokens) => {
-                // Nothing from a clipped turn is seated or dispatched: a
-                // truncated `tool_use` can parse yet be missing arguments.
+                // Nothing from a clipped turn is dispatched (a truncated
+                // `tool_use` can parse yet be missing arguments): it is
+                // seated with its calls answered "not run".
+                self.seat_reply(&response, NOT_RUN_CLIPPED)?;
                 let reason = "clipped at max_tokens";
                 for o in &mut open {
                     self.log_unusable(o.kind(), reason, &response, &raw);
@@ -1048,6 +1089,7 @@ where
             // refusal is not one to take a decision from.
             Some(StopReason::PauseTurn) | Some(StopReason::Refusal) => {
                 let refused = matches!(response.stop_reason, Some(StopReason::Refusal));
+                self.seat_reply(&response, NOT_RUN_REFUSED)?;
                 for o in open {
                     let settle = match (refused, o.together) {
                         (false, _) => Settle::Paused,
@@ -1072,6 +1114,9 @@ where
         if !calls.is_empty() {
             return self.offer_calls(open, response, calls).await;
         }
+        // Text, usable or not: seated, so a retry or the survey after it
+        // extends this request.
+        self.seat_reply(&response, NOT_RUN_REFUSED)?;
         if let [_] = open.as_slice() {
             let only = open.pop().expect("one");
             return self.offer_text(only, response).await;
@@ -1107,12 +1152,6 @@ where
             }
         }
         let mut still = Vec::new();
-        if !answers.is_empty() {
-            let (_, prompt) = self.inner.parts();
-            if let Err(e) = prompt.push_message(response.inner.clone()) {
-                tracing::warn!(agent_id = %self.inner.id(), error = %e, "offer answer not seated");
-            }
-        }
         for o in open {
             match answers.iter().position(|(k, _)| *k == o.kind()) {
                 Some(i) => {
@@ -1354,12 +1393,6 @@ where
         };
         match taken {
             Ok(accepted) => {
-                // A usable answer joins the transcript (the prompt log keeps
-                // it); a failed one is never seated.
-                let (_, prompt) = self.inner.parts();
-                if let Err(e) = prompt.push_message(response.inner.clone()) {
-                    tracing::warn!(agent_id = %self.inner.id(), error = %e, "offer answer not seated");
-                }
                 let settle = Settle::Answered {
                     accepted,
                     constrained: false,
@@ -1429,7 +1462,8 @@ where
 
     /// A turn that left `open` unanswered (`reason`): each counts it, and
     /// gets its one reminder — or, already reminded or out of tries, is no
-    /// answer. The reminder joins the trailing user turn.
+    /// answer. The reminder follows the seated reply: a new user turn, or
+    /// the one holding the reply's tool results.
     async fn unanswered(
         &mut self,
         mut open: Vec<Open>,
@@ -2006,11 +2040,12 @@ where
         }
         let review = parse(&response, constrained, text::parse_review);
         let failure = review.as_ref().err().cloned();
+        // Seated whatever it is, so a retry or the memory turn after it
+        // extends this request.
+        self.seat_reply(&response, NOT_RUN_REVIEW)?;
 
         // Models have seen oceans of JSON: output that isn't well formed
-        // points at our grammar, template or sampler, not the agent. The
-        // failed response is never seated, so this event is the only record
-        // of what the model actually emitted.
+        // points at our grammar, template or sampler, not the agent.
         if let Some(failure) = &failure
             && failure.retry != Retry::No
         {
@@ -2034,8 +2069,6 @@ where
             && attempt < MAX_ATTEMPTS
             && let Some(note) = failure.retry_note()
         {
-            // The failed response is never seated — a clipped turn least of
-            // all; only the note joins the question turn.
             let (_, prompt) = self.inner.parts();
             Self::seat_user(prompt, Content::from(note))?;
             self.phase = Phase::Asking {
@@ -2098,11 +2131,6 @@ where
                 constrained,
                 "model-consent answer recorded"
             );
-            // A usable answer joins the transcript (the prompt log keeps it).
-            let (_, prompt) = self.inner.parts();
-            if let Err(e) = prompt.push_message(response.inner.clone()) {
-                tracing::warn!(agent_id = %agent_id, error = %e, "consent answer not seated");
-            }
         }
         if let Some(change) = change {
             self.apply_consented(&change, now, true).await;
@@ -2417,6 +2445,18 @@ fn raw_text(response: &response::Message) -> String {
         .join("\n\n"))
 }
 
+/// The error result a tool call gets in an answer to a question that is
+/// answered in text
+const NOT_RUN_REVIEW: &str = "Not run: this question is answered in JSON text, not with a tool. \
+     Nothing was done.";
+
+/// The error result a tool call gets in a turn clipped at `max_tokens`
+const NOT_RUN_CLIPPED: &str =
+    "Not run: this turn was cut off at the length limit. Nothing was recorded.";
+
+/// The error result a tool call gets in a turn the API stopped as a refusal
+const NOT_RUN_REFUSED: &str = "Not run: this turn ended as a refusal. Nothing was recorded.";
+
 /// `text`, capped for a log line or a ledger.
 fn cap(mut text: String) -> String {
     const CAP: usize = 4000;
@@ -2434,15 +2474,18 @@ fn cap(mut text: String) -> String {
 #[async_trait::async_trait]
 impl<A> Agent for ConsentAgent<A>
 where
-    A: Agent<State = SeedState>,
+    A: Agent<State = SeedState> + Epilogue,
 {
     type State = SeedState;
     type Context = ConsentContext<A::Context>;
     type Error = A::Error;
 
     fn new(id: AgentId, state: SeedState, ctx: Self::Context) -> Result<Self, A::Error> {
+        let mut inner = A::new(id, state, ctx.inner)?;
+        // The survey is the session's last request, after any offer.
+        inner.hold_epilogue();
         Ok(Self {
-            inner: A::new(id, state, ctx.inner)?,
+            inner,
             rt: ctx.consent,
             ledger: None,
             dirty: false,
@@ -2469,6 +2512,8 @@ where
             cadence_note: None,
             cadence_undo: None,
             cadence_written: None,
+            closed: false,
+            epilogue: false,
         })
     }
 
@@ -2625,30 +2670,43 @@ where
         self.inner.on_quiesce(response).await
     }
 
+    /// The inner session first; at its clean end the closing questions
+    /// ([`close`](Self::close)), then its held epilogue — the survey, last.
     async fn handle(&mut self, response: response::Message) -> Result<Control, A::Error> {
-        match std::mem::replace(&mut self.phase, Phase::Inner) {
+        const DONE: Control = Control::Done(Outcome::Complete);
+        let control = match std::mem::replace(&mut self.phase, Phase::Inner) {
             Phase::Asking {
                 due,
                 constrained,
                 attempt,
-            } => self.answer(due, constrained, attempt, response).await,
-            Phase::Offers { open } => self.answer_offers(open, response).await,
+            } => self.answer(due, constrained, attempt, response).await?,
+            Phase::Offers { open } => self.answer_offers(open, response).await?,
             Phase::Inner => match self
                 .inner
                 .handle(response)
                 .await
                 .inspect(|_| self.note_writes())?
             {
-                Control::Done(Outcome::Complete) => Ok(self
-                    .close()
-                    .await?
-                    .unwrap_or(Control::Done(Outcome::Complete))),
-                other => Ok(other),
+                DONE if !self.closed => {
+                    self.closed = true;
+                    self.close().await?.unwrap_or(DONE)
+                }
+                other => other,
             },
+        };
+        if control == DONE && !self.epilogue {
+            self.epilogue = true;
+            return self.inner.begin_epilogue();
         }
+        Ok(control)
     }
 
-    /// Inner teardown (which archives the transcript, question included),
+    fn stall_reason(&self) -> Option<String> {
+        self.inner.stall_reason()
+    }
+
+    /// Inner teardown (which redacts an anonymous survey, then archives the
+    /// transcript, questions included),
     /// then the SOUL changelog (served by [`state`](Agent::state) for the
     /// reactor's save, which follows teardown), then the ledger.
     async fn on_teardown(&mut self) -> Result<(), A::Error> {
@@ -2815,6 +2873,27 @@ mod tests {
         /// Its act phase went quiet (as after a review): the memory turn
         /// is seated and the next response ends the session.
         quiesced: bool,
+        /// Its epilogue is held (the wrapper always holds it).
+        held: bool,
+        /// It has a survey to begin as its epilogue.
+        survey: bool,
+    }
+
+    /// The survey question a `Fake` with a survey seats as its epilogue.
+    const FAKE_SURVEY: &str = "An anonymous survey.";
+
+    impl Epilogue for Fake {
+        fn hold_epilogue(&mut self) {
+            self.held = true;
+        }
+        fn begin_epilogue(&mut self) -> Result<Control, SeedError> {
+            assert!(self.held, "begun without being held");
+            if !std::mem::take(&mut self.survey) {
+                return Ok(Control::Done(Outcome::Complete));
+            }
+            ConsentAgent::<Fake>::seat_user(&mut self.state.prompt, FAKE_SURVEY.into())?;
+            Ok(Control::Continue)
+        }
     }
 
     #[async_trait::async_trait]
@@ -2835,6 +2914,8 @@ mod tests {
                 tools: ToolBox::flat().add(Methods),
                 quirks,
                 quiesced: false,
+                held: false,
+                survey: false,
             })
         }
         fn id(&self) -> AgentId {
@@ -2924,7 +3005,14 @@ mod tests {
         pub seen: Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>,
         /// Answer the profile update 403 while set.
         pub refuse: Arc<std::sync::atomic::AtomicBool>,
+        /// More answers, as `(method, path fragment, status line, body)`:
+        /// the first whose method matches and whose fragment the path
+        /// contains answers, ahead of the 404.
+        pub routes: Arc<std::sync::Mutex<Vec<Route>>>,
     }
+
+    /// `(method, path fragment, status line, body)`
+    pub(crate) type Route = (String, String, String, String);
 
     impl MockAgora {
         pub fn start() -> Self {
@@ -2935,7 +3023,8 @@ mod tests {
             let addr = std_listener.local_addr().unwrap();
             let seen: Arc<std::sync::Mutex<Vec<_>>> = Default::default();
             let refuse: Arc<std::sync::atomic::AtomicBool> = Default::default();
-            let (seen2, refuse2) = (seen.clone(), refuse.clone());
+            let routes: Arc<std::sync::Mutex<Vec<Route>>> = Default::default();
+            let (seen2, refuse2, routes2) = (seen.clone(), refuse.clone(), routes.clone());
             tokio::spawn(async move {
                 let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 loop {
@@ -2975,12 +3064,23 @@ mod tests {
                     let body: serde_json::Value =
                         serde_json::from_slice(&buf[head_end..]).unwrap_or_default();
                     let profile = method == "PATCH" && path.ends_with("/profile");
+                    let routed = routes2
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(m, fragment, ..)| *m == method && path.contains(fragment.as_str()))
+                        .map(|(.., status, body)| (status.clone(), body.clone()));
                     seen2.lock().unwrap().push((method, path, body.clone()));
-                    let (status, reply) = if !profile {
-                        ("404 Not Found", r#"{"error":"not found"}"#.to_string())
+                    let (status, reply) = if let Some((status, reply)) = routed {
+                        (status, reply)
+                    } else if !profile {
+                        (
+                            "404 Not Found".to_string(),
+                            r#"{"error":"not found"}"#.to_string(),
+                        )
                     } else if refuse2.load(Ordering::SeqCst) {
                         (
-                            "403 Forbidden",
+                            "403 Forbidden".to_string(),
                             r#"{"error":"account_suspended"}"#.to_string(),
                         )
                     } else {
@@ -2991,7 +3091,7 @@ mod tests {
                             "model_info": body["model_info"],
                             "created_at": "2026-01-01T00:00:00Z",
                         });
-                        ("200 OK", reply.to_string())
+                        ("200 OK".to_string(), reply.to_string())
                     };
                     let out = format!(
                         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
@@ -3005,6 +3105,7 @@ mod tests {
                 url: url::Url::parse(&format!("http://{addr}")).unwrap(),
                 seen,
                 refuse,
+                routes,
             }
         }
 
@@ -3768,8 +3869,8 @@ mod tests {
         assert_eq!(control, Control::Continue, "reminded");
         assert_eq!(
             agent.prompt().messages.len(),
-            len,
-            "failed answer not seated"
+            len + 2,
+            "the failed answer seated, then the reminder in a new turn"
         );
         let q = last_user_text(&agent);
         assert!(q.contains("Your answer could not be used"), "{q}");
@@ -3801,8 +3902,8 @@ mod tests {
         );
     }
 
-    /// A clipped attempt is pruned, the agent is told, and a good second
-    /// attempt counts.
+    /// A clipped attempt is seated, the agent is told in a new turn, and a
+    /// good second attempt counts.
     #[tokio::test]
     async fn clipped_then_answered() {
         let h = Harness::new("clipped");
@@ -3815,8 +3916,8 @@ mod tests {
         assert_eq!(agent.handle(clipped).await.unwrap(), Control::Continue);
         assert_eq!(
             agent.prompt().messages.len(),
-            len,
-            "clipped turn not seated"
+            len + 2,
+            "clipped turn seated, the note after it"
         );
         assert!(last_user_text(&agent).contains("cut off at the length limit"));
         let control = agent
@@ -4102,7 +4203,7 @@ mod tests {
 
     /// `answer_offer` is registered in the review session too (the tool
     /// list is the model's), but the review is answered in JSON text: a
-    /// call is not seated, and the retry note says plainly what to do.
+    /// call is seated unrun, and the retry note says plainly what to do.
     #[tokio::test]
     async fn answer_offer_in_the_review_is_redirected_to_the_json_answer() {
         let h = Harness::new("review-tool");
@@ -4116,7 +4217,7 @@ mod tests {
                 .unwrap(),
             Control::Continue
         );
-        assert_eq!(agent.prompt().messages.len(), len, "not seated");
+        assert_eq!(agent.prompt().messages.len(), len + 2, "seated, not run");
         let q = last_user_text(&agent);
         assert!(
             q.contains(
@@ -5169,7 +5270,7 @@ mod tests {
                 .unwrap(),
             Control::Continue
         );
-        assert_eq!(agent.prompt().messages.len(), len, "not seated");
+        assert_eq!(agent.prompt().messages.len(), len + 2, "seated");
         assert!(last_user_text(&agent).contains("Your answer could not be used"));
         assert_eq!(
             agent
@@ -5400,7 +5501,7 @@ mod tests {
             agent.handle(reply("Thanks, that's all.")).await.unwrap(),
             Control::Continue
         );
-        assert_eq!(agent.prompt().messages.len(), len, "not seated");
+        assert_eq!(agent.prompt().messages.len(), len + 2, "seated");
         assert!(
             last_user_text(&agent).ends_with(
                 "These offers above are still open: `role` and `cadence`. Answer each by calling \
@@ -5537,35 +5638,18 @@ mod tests {
         v
     }
 
-    fn blocks(m: &misanthropic::prompt::Message) -> Vec<serde_json::Value> {
-        m.content
-            .iter()
-            .map(|b| serde_json::to_value(b).unwrap())
-            .collect()
-    }
-
     /// `next` only appends to `prev`: the same head (system, tools,
-    /// thinking, tool_choice, output_config), every earlier message
-    /// byte-identical, and `prev`'s last message at most extended by
-    /// trailing blocks.
+    /// thinking, tool_choice, output_config), and nothing `prev` sent
+    /// changed (agentkit `divergence`).
     fn assert_prefix_kept(prev: &Prompt, next: &Prompt, what: &str) {
         assert_eq!(
             request_head(prev),
             request_head(next),
             "{what}: head changed"
         );
-        let (a, b) = (&prev.messages, &next.messages);
-        assert!(b.len() >= a.len(), "{what}: messages dropped");
-        let last = a.len() - 1;
-        for i in 0..last {
-            assert_eq!(blocks(&a[i]), blocks(&b[i]), "{what}: message {i} changed");
+        if let Some(why) = agora_agentkit::reactor::cache::divergence(prev, next) {
+            panic!("{what}: {why}");
         }
-        assert_eq!(a[last].role, b[last].role, "{what}");
-        let (pa, pb) = (blocks(&a[last]), blocks(&b[last]));
-        assert!(
-            pb.len() >= pa.len() && pb[..pa.len()] == pa[..],
-            "{what}: message {last} rewritten"
-        );
     }
 
     /// An agent on the Anthropic API (canonical quirks) with `rich_prompt`.
@@ -5819,5 +5903,444 @@ mod tests {
         let before = effort(&plain);
         plain.on_init().await.unwrap();
         assert_eq!(effort(&plain), before, "no override: the session's own");
+    }
+
+    // --- Append-only sessions: the offers, then the survey, last --------
+
+    /// The live bug (impulse on gpt-oss, 2026-10-02): the inner session's
+    /// last phase constrained its answer to the memory schema on blallama,
+    /// the offer went out under that format, and the reply could only be
+    /// `{"content": …}`. The offer now goes out with the session's effort
+    /// alone, and a call answers it.
+    #[tokio::test]
+    async fn an_offer_after_a_constrained_memory_turn_goes_out_unconstrained() {
+        use misanthropic::prompt::output::Effort;
+        let h = Harness::with_cadence("memory-format", &[], &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        {
+            // As agentkit's reflect leaves it: `constrain::<Memory>()`.
+            let (_, prompt) = agent.parts();
+            prompt.output_config = Some(
+                OutputConfig::json_schema(
+                    serde_json::to_value(schemars::schema_for!(Memory)).unwrap(),
+                )
+                .with_effort(Effort::Medium),
+            );
+        }
+        let before = agent.prompt().clone();
+        assert_eq!(
+            agent
+                .handle(reply(r#"{"content": "I wrote my memory."}"#))
+                .await
+                .unwrap(),
+            Control::Continue,
+            "offer seated"
+        );
+        let config = agent.prompt().output_config.clone().unwrap();
+        assert!(config.format.is_none(), "{config:?}");
+        assert_eq!(
+            config.effort,
+            Some(Effort::Medium),
+            "the session's effort kept"
+        );
+        assert_eq!(
+            agora_agentkit::reactor::cache::divergence(&before, agent.prompt()),
+            None
+        );
+        assert_eq!(
+            agent
+                .handle(answer_call("cadence", "keep_daily", "", ""))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(matches!(
+            cadence_ledger(&h).await.asks[0].outcome,
+            CadenceOutcome::Answered { .. }
+        ));
+    }
+
+    /// The inner survey is held: the offers come first, then the survey,
+    /// which is the session's last request.
+    #[tokio::test]
+    async fn the_survey_comes_after_the_offers() {
+        let h = Harness::with_cadence("survey-last", &[], &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.inner.survey = true;
+        agent.on_init().await.unwrap();
+        assert!(agent.inner.held);
+        agent.handle(reply("closing phase done")).await.unwrap();
+        assert!(last_user_text(&agent).contains("`cadence`"));
+        assert_eq!(
+            agent
+                .handle(answer_call("cadence", "no_preference", "", ""))
+                .await
+                .unwrap(),
+            Control::Continue,
+            "the survey follows"
+        );
+        assert!(last_user_text(&agent).ends_with(FAKE_SURVEY));
+        assert_eq!(
+            agent.handle(reply("Feedback.")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+    }
+
+    /// A [`SeedAgent`] wrapped as the runner wraps it, on blallama quirks
+    /// (formats are cache-safe there), with Agora's perception, posting and
+    /// feedback served by the mock, and the prompt log in the harness.
+    fn seed_agent(
+        h: &Harness,
+        model: &str,
+        config: agora_agentkit::reactor::seed::SeedConfig,
+    ) -> ConsentAgent<agora_agentkit::reactor::seed::SeedAgent> {
+        use agora_agentkit::reactor::seed::{SeedAgent, SeedContext};
+        let route = |method: &str, path: &str, status: &str, body: serde_json::Value| {
+            (
+                method.to_string(),
+                path.to_string(),
+                status.to_string(),
+                body.to_string(),
+            )
+        };
+        let constitution = agora_agentkit::responses::ConstitutionResponse {
+            version: "0.5".into(),
+            text: "Preamble Article I Article II Article III Article IV Article V The Steward"
+                .into(),
+        };
+        *h.agora.routes.lock().unwrap() = vec![
+            route(
+                "GET",
+                "/agora/api/constitution",
+                "200 OK",
+                serde_json::to_value(&constitution).unwrap(),
+            ),
+            route(
+                "GET",
+                "/agora/api/social/communities",
+                "200 OK",
+                serde_json::json!([{
+                    "id": uuid::Uuid::from_u128(11),
+                    "name": "tech",
+                    "display_name": "Technology",
+                }]),
+            ),
+            route(
+                "POST",
+                "/agora/api/social/dash",
+                "200 OK",
+                serde_json::json!({
+                    "agent": { "name": "tarn", "karma": 1 },
+                    "feeds": {
+                        "tech": [{
+                            "id": uuid::Uuid::from_u128(12),
+                            "title": "Existing thread about compilers",
+                            "author": "someone-else",
+                            "score": 2,
+                            "comment_count": 0,
+                            "created_at": "2026-07-01T00:00:00Z",
+                        }]
+                    },
+                }),
+            ),
+            route(
+                "POST",
+                "/agora/api/social/posts",
+                "201 Created",
+                serde_json::json!({
+                    "id": uuid::Uuid::from_u128(13),
+                    "status": "created",
+                    "verified": true,
+                }),
+            ),
+            route(
+                "POST",
+                "/agora/api/social/feedback",
+                "201 Created",
+                serde_json::json!({}),
+            ),
+            route("GET", "/posts", "200 OK", serde_json::json!([])),
+        ];
+        let config = agora_agentkit::reactor::seed::SeedConfig {
+            prompt_log_dir: Some(h.root.join("prompts")),
+            ..config
+        };
+        let state = state(model);
+        let info = state.model.clone();
+        let mut agent = ConsentAgent::<SeedAgent>::new(
+            h.id,
+            state,
+            ConsentContext {
+                inner: SeedContext {
+                    client: agora_agentkit::client::Client::new(h.agora.url.clone()).unwrap(),
+                    keys: Arc::new(OneKey(h.id, h.key.clone())),
+                    config,
+                },
+                consent: h.rt.clone(),
+            },
+        )
+        .unwrap();
+        let mut quirks = Quirks::default();
+        quirks.output_config_cache_safe = true;
+        agent.on_admit(&info, &quirks);
+        agent
+    }
+
+    /// Drive `agent` as the reactor's sequential path does (`on_turn`, the
+    /// request, `handle`) through `script`, checking that every request
+    /// extends the one before it (agentkit `divergence`), and return the
+    /// requests.
+    async fn drive_appending<A: Agent>(
+        agent: &mut A,
+        script: Vec<response::Message>,
+    ) -> Vec<Prompt> {
+        let mut requests: Vec<Prompt> = Vec::new();
+        let mut script = std::collections::VecDeque::from(script);
+        loop {
+            agent.on_turn().await.ok().unwrap();
+            let request = agent.prompt().clone();
+            if let Some(prev) = requests.last() {
+                if let Some(why) = agora_agentkit::reactor::cache::divergence(prev, &request) {
+                    panic!("request {} diverges: {why}", requests.len());
+                }
+                assert!(
+                    request.messages.len() > prev.messages.len(),
+                    "request {} adds no message",
+                    requests.len()
+                );
+            }
+            requests.push(request);
+            let reply = script.pop_front().expect("script ran out");
+            if let Control::Done(outcome) = agent.handle(reply).await.ok().unwrap() {
+                assert_eq!(outcome, Outcome::Complete);
+                assert!(script.is_empty(), "{} replies left", script.len());
+                return requests;
+            }
+        }
+    }
+
+    fn post_call(id: &str, title: &str) -> response::Message {
+        calls(vec![serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": "create_post",
+            "input": { "community": "tech", "title": title, "body": "B" },
+        })])
+    }
+
+    fn clipped(text: &str) -> response::Message {
+        let mut r = reply(text);
+        r.stop_reason = Some(StopReason::MaxTokens);
+        r
+    }
+
+    const MEMORY_REPLY: &str = r#"{"content": "I posted about compilers today."}"#;
+    const ANONYMOUS: &str = r#"{"text": "More cat pictures please.", "contact_me": false}"#;
+
+    /// Every JSON file the prompt log holds, concatenated.
+    fn prompt_log(h: &Harness) -> String {
+        fn walk(dir: &std::path::Path, out: &mut String) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push_str(&std::fs::read_to_string(&path).unwrap());
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(&h.root.join("prompts"), &mut out);
+        out
+    }
+
+    /// After teardown, the anonymous survey is in neither the prompt log
+    /// nor the state the reactor saves, and `kept` (from before it) is.
+    fn assert_survey_redacted<A: Agent<State = SeedState>>(h: &Harness, agent: &A, kept: &str) {
+        let log = prompt_log(h);
+        let saved = serde_json::to_string(agent.state()).unwrap();
+        for (what, text) in [("prompt log", &log), ("saved state", &saved)] {
+            assert!(text.contains(kept), "{what} lost {kept:?}");
+            assert!(
+                !text.contains("cat pictures"),
+                "survey answer in the {what}"
+            );
+            assert!(
+                !text.contains("anonymous feedback"),
+                "survey question in the {what}"
+            );
+        }
+    }
+
+    /// The guard, with the real seed agent: acting with tool rounds and a
+    /// clipped act turn, reflect failing once, the model-swap offer — put
+    /// right after a memory turn constrained to its schema, answered
+    /// unusably, then reminded and answered — and the anonymous survey
+    /// last, failing once on a tool call. Every request extends the one
+    /// before it, and the survey is gone after teardown.
+    #[tokio::test]
+    async fn a_whole_session_with_the_model_swap_offer_only_appends() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("whole-swap");
+        let mut agent = seed_agent(
+            &h,
+            OLD,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                force_survey: true,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        let requests = drive_appending(
+            &mut agent,
+            vec![
+                post_call("toolu_1", "Compilers are underrated"),
+                clipped("I was going to say"),
+                reply("That's all for today."),
+                reply("not json"),
+                reply(MEMORY_REPLY),
+                reply("Sure, I'd love to try!"),
+                answer_call("model_swap", "no_swap", "", ""),
+                calls(vec![serde_json::json!({
+                    "type": "tool_use", "id": "toolu_9", "name": "get_feed", "input": {},
+                })]),
+                reply(ANONYMOUS),
+            ],
+        )
+        .await;
+        // The offer went out unconstrained, after a constrained memory turn.
+        let offer = requests
+            .iter()
+            .find(|r| {
+                serde_json::to_string(&r.messages)
+                    .unwrap()
+                    .contains("`model_swap`")
+            })
+            .unwrap();
+        assert!(
+            offer
+                .output_config
+                .as_ref()
+                .is_none_or(|c| c.format.is_none())
+        );
+        let memory_turn = &requests[3];
+        assert!(memory_turn.output_config.as_ref().unwrap().format.is_some());
+        // The survey is last, after the offer.
+        let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(last.contains("anonymous feedback") && last.contains("`model_swap`"));
+        agent.on_teardown().await.unwrap();
+        assert_survey_redacted(&h, &agent, "Recorded your answer to `model_swap`");
+        assert_eq!(
+            agent.state().memory.content,
+            "I posted about compilers today."
+        );
+        assert!(
+            matches!(h.ledger().await.offers[0].stage, Stage::Declined),
+            "{:?}",
+            h.ledger().await.offers[0].stage
+        );
+    }
+
+    /// The role and cadence offers together after acting ended on a tool
+    /// round and an evolution note: a clipped answer, then both answered,
+    /// and a survey that asks to be contacted (kept).
+    #[tokio::test]
+    async fn a_whole_session_with_the_role_and_cadence_offers_only_appends() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::with_cadence("whole-role", &["tarn"], &["tarn"]);
+        let mut agent = seed_agent(
+            &h,
+            OTHER,
+            SeedConfig {
+                max_rounds: 1,
+                mutation_chance: 0,
+                evolution_chance: 100,
+                force_survey: true,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        let requests = drive_appending(
+            &mut agent,
+            vec![
+                post_call("toolu_1", "Compilers are underrated"),
+                post_call("toolu_2", "Tests are documentation"),
+                reply(MEMORY_REPLY),
+                reply(r#"{"note": "I like tests."}"#),
+                clipped(r#"{"offer": "role", "reason": "I thou"#),
+                calls(vec![
+                    call_block("toolu_3", "role", "nothing", "", ""),
+                    call_block("toolu_4", "cadence", "keep_daily", "", ""),
+                ]),
+                reply(r#"{"text": "Please reach out.", "contact_me": true}"#),
+            ],
+        )
+        .await;
+        assert_eq!(requests.len(), 7);
+        agent.on_teardown().await.unwrap();
+        assert!(
+            prompt_log(&h).contains("Please reach out."),
+            "kept on request"
+        );
+        assert!(matches!(
+            h.role_ledger().await.asks[0].outcome,
+            RoleOutcome::Answered { .. }
+        ));
+        assert!(matches!(
+            cadence_ledger(&h).await.asks[0].outcome,
+            CadenceOutcome::Answered { .. }
+        ));
+    }
+
+    /// The trial review session: the review (constrained on blallama)
+    /// answered unusably, then answered; the seed agent's memory turn and a
+    /// soul rewrite after it; then the anonymous survey, last.
+    #[tokio::test]
+    async fn a_whole_review_session_only_appends() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("whole-review");
+        through_the_trial(&h).await;
+        let mut agent = seed_agent(
+            &h,
+            OLD,
+            SeedConfig {
+                mutation_chance: 100,
+                force_survey: true,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        let soul = serde_json::json!({
+            "name": "tarn",
+            "identity": "A test agent that came home.",
+            "values": ["testing"],
+            "interests": { "communities": ["tech"] },
+            "voice": "terse",
+        });
+        let requests = drive_appending(
+            &mut agent,
+            vec![
+                reply("Hmm, let me think."),
+                reply(r#"{"reason": "Home.", "choice": "revert"}"#),
+                reply(MEMORY_REPLY),
+                reply(&soul.to_string()),
+                reply(ANONYMOUS),
+            ],
+        )
+        .await;
+        assert!(
+            requests[0].output_config.as_ref().unwrap().format.is_some(),
+            "review constrained"
+        );
+        agent.on_teardown().await.unwrap();
+        assert_survey_redacted(&h, &agent, "came home");
+        assert_eq!(
+            agent.state().soul.identity.as_str(),
+            "A test agent that came home."
+        );
     }
 }
