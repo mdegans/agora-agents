@@ -182,32 +182,6 @@ pub struct ConsentRuntime {
     /// The cadence offer (`[cadence_consent]`); off unless
     /// [`Self::with_cadence_offer`].
     pub cadence: Option<cadence::CadenceOffer>,
-    /// `[cache]` overrides applied to every agent's admitted quirks.
-    pub cache: CacheOverrides,
-}
-
-/// `[cache]` in the run config: per-quirk overrides of what the endpoint
-/// variant implies. Each `None` keeps the endpoint's own value.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CacheOverrides {
-    /// Roll the cache markers onto the trailing assistant turns (`true`,
-    /// blallama's default) or the tail user turn (`false`, Anthropic's).
-    pub breakpoint_after_assistant: Option<bool>,
-}
-
-impl CacheOverrides {
-    /// `quirks` with these overrides applied.
-    pub fn apply(
-        &self,
-        quirks: &agora_agentkit::reactor::inference::Quirks,
-    ) -> agora_agentkit::reactor::inference::Quirks {
-        let mut q = *quirks;
-        if let Some(b) = self.breakpoint_after_assistant {
-            q.breakpoint_after_assistant = b;
-        }
-        q
-    }
 }
 
 impl ConsentRuntime {
@@ -234,7 +208,6 @@ impl ConsentRuntime {
             alerts: crate::alerts::Alerter::off(),
             role: None,
             cadence: None,
-            cache: CacheOverrides::default(),
         })
     }
 
@@ -255,38 +228,11 @@ impl ConsentRuntime {
         self.cadence = offer;
         self
     }
-
-    pub fn with_cache_overrides(mut self, cache: CacheOverrides) -> Self {
-        self.cache = cache;
-        self
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `[cache]` overrides one quirk and leaves the rest as the endpoint
-    /// set them; empty overrides change nothing.
-    #[test]
-    fn cache_overrides_apply_only_what_they_name() {
-        use agora_agentkit::reactor::anthropic::EndpointVariant;
-        use agora_agentkit::reactor::inference::Quirks;
-        let blallama = Quirks::from(EndpointVariant::Blallama);
-        assert!(blallama.breakpoint_after_assistant);
-        assert_eq!(CacheOverrides::default().apply(&blallama), blallama);
-        let off: CacheOverrides = toml::from_str("breakpoint_after_assistant = false").unwrap();
-        let q = off.apply(&blallama);
-        assert!(!q.breakpoint_after_assistant);
-        assert_eq!(
-            q.output_config_cache_safe,
-            blallama.output_config_cache_safe
-        );
-        assert!(
-            toml::from_str::<CacheOverrides>("typo = 1").is_err(),
-            "closed"
-        );
-    }
 
     #[test]
     fn config_parses_and_rejects_typos() {
