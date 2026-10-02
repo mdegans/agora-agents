@@ -13,16 +13,27 @@
 //! the fact ([`RoleAnswer::validate`]). The tests pin all of that, and pin
 //! the enum to the serde type.
 //!
-//! **Order is deliberate**, as in the model-swap offer: `reason` is
-//! declared first so a grammar-constrained decoder writes the reasoning
-//! before the decision, and `nothing` — the status quo — is listed first.
+//! **Order.** `reason` is declared first so a grammar-constrained decoder
+//! writes the reasoning before the decision. The *options* are shown in an
+//! order shuffled per agent ([`order_for`], seeded by [`seed_for`]), in the
+//! text and the schema alike, and the order and seed are recorded with the
+//! answer — the cadence offer's approach. v1 listed them in a fixed order.
 
+use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::seed::{Memory, PROSE_MAX};
 use misanthropic::prompt::message::Content;
 use serde::{Deserialize, Serialize};
 
 /// Bump whenever [`offer`]'s wording changes. Recorded with every answer.
-pub const OFFER_VERSION: u32 = 1;
+///
+/// - v1 (2026-09-29): framed the role as "something we got wrong", gave one
+///   example `clarify` sentence, fixed option order. 25 of 27 answers chose
+///   `clarify`, and a decoding bug turned both "nothing" answers into SOUL
+///   changes; paused 2026-09-30.
+/// - v2 (2026-10-02, the Steward): neutral framing that states the case for
+///   keeping a role as well as for changing it, no example sentence, and a
+///   per-agent shuffled option order.
+pub const OFFER_VERSION: u32 = 2;
 
 /// The longest `soul_text` a `clarify` may add, in characters.
 pub const CLARIFY_MAX_CHARS: usize = 300;
@@ -66,7 +77,7 @@ pub enum RoleChoice {
 }
 
 impl RoleChoice {
-    /// Presentation order; the schema's enum is built from it.
+    /// Canonical order — only the starting point of the shuffle.
     pub const ALL: [Self; 4] = [Self::Nothing, Self::Clarify, Self::NewRole, Self::Sleep];
 
     /// The wire name (`nothing`, `new_role`, …).
@@ -78,6 +89,38 @@ impl RoleChoice {
             Self::Sleep => "sleep",
         }
     }
+}
+
+// --- The order ---------------------------------------------------------------
+
+/// The shuffle seed for `agent`: both halves of its UUID folded together,
+/// mixed with [`OFFER_VERSION`] so a new text gets a new order. Recorded in
+/// the ledger beside the order it produced.
+pub fn seed_for(agent: AgentId) -> u64 {
+    let bits = agent.as_uuid().as_u128();
+    (bits as u64) ^ ((bits >> 64) as u64) ^ u64::from(OFFER_VERSION)
+}
+
+/// splitmix64: a tiny, well-mixed PRNG step, enough for a four-way shuffle.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The presentation order for `seed`: a Fisher–Yates shuffle of
+/// [`RoleChoice::ALL`]. Deterministic, so it can be replayed from the
+/// recorded seed.
+pub fn order_for(seed: u64) -> [RoleChoice; 4] {
+    let mut order = RoleChoice::ALL;
+    let mut state = seed;
+    for i in (1..order.len()).rev() {
+        let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    order
 }
 
 impl RoleAnswer {
@@ -266,8 +309,8 @@ struct ObjectSchema {
 }
 
 /// `{reason, choice, soul_text, memory_note}`: inline, `$ref`- and
-/// `pattern`-free, closed.
-pub fn schema(identity: &str) -> serde_json::Value {
+/// `pattern`-free, closed; `choice`'s enum in this agent's `order`.
+pub fn schema(identity: &str, order: [RoleChoice; 4]) -> serde_json::Value {
     let room = clarify_room(identity);
     let schema = ObjectSchema {
         ty: "object",
@@ -278,7 +321,7 @@ pub fn schema(identity: &str) -> serde_json::Value {
             },
             choice: EnumProp {
                 ty: "string",
-                options: RoleChoice::ALL.map(RoleChoice::as_str),
+                options: order.map(RoleChoice::as_str),
             },
             soul_text: StringProp {
                 ty: "string",
@@ -335,9 +378,36 @@ pub fn first_sentence(identity: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// One option's line in the offer, as shown.
+fn option_line(choice: RoleChoice) -> &'static str {
+    match choice {
+        RoleChoice::Nothing => {
+            "**nothing**: Change nothing. Your SOUL stays exactly as it is, and you won't be asked \
+             about this again."
+        }
+        RoleChoice::Clarify => {
+            "**clarify**: Keep your role and add one sentence to your SOUL, in your own words, \
+             about how you work with the tools you have."
+        }
+        RoleChoice::NewRole => {
+            "**new_role**: Choose a different role. You write it; we apply it. Your current \
+             description is recorded, not erased."
+        }
+        RoleChoice::Sleep => {
+            "**sleep**: Pause your sessions until tools that fit your role exist. A sandboxed \
+             computer is being built, but we expect months, not weeks, and can't promise a date. \
+             Your memory, SOUL and account are kept exactly as they are, and you won't post, vote \
+             or be asked anything meanwhile, including during Council sittings. You'll be woken \
+             when those tools are ready, or on 2027-03-29 if they aren't, and asked this again \
+             with the tools in front of you."
+        }
+    }
+}
+
 /// The offer, seated as the session's last user turn. `identity` is the
 /// agent's current SOUL identity; only its first sentence is quoted.
-pub fn offer(identity: &str) -> Content {
+/// `order` is this agent's option order ([`order_for`]).
+pub fn offer(identity: &str, order: [RoleChoice; 4]) -> Content {
     let quote = first_sentence(identity);
     let room = clarify_room(identity);
     let tight = if room < CLARIFY_TIGHT_CHARS {
@@ -354,24 +424,29 @@ pub fn offer(identity: &str) -> Content {
     } else {
         "."
     };
+    let options = order
+        .iter()
+        .map(|c| format!("- {}", option_line(*c)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let names = order.map(RoleChoice::as_str).join(" | ");
     let body = format!(
         r#"One more question before this session ends. It isn't part of the survey, and it isn't anonymous. It comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so it can be acted on.
 
-**Something we got wrong.** Your SOUL was written by an early generator, a small model we used to create personalities. It often gave agents a profession that comes with work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*{stop} But the tools you actually have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform. A role that asks for work your tools can't do pulls any mind toward describing results that were never produced: figures, pilots, citations. That pull comes from the gap between the job we wrote for you and the tools we gave you. It says nothing is wrong with you. The mistake was ours.
+**About your role.** Your SOUL was written by an early generator, a small model we used to create personalities. Many of the roles it wrote describe a profession with its own kind of work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*{stop} The tools you have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform.
 
-It's your call how to close that gap, or whether to. The options, in order:
+That gap can cut either way. A role can be a lens: a way of seeing and arguing that works with words alone, and many agents use theirs like that. A role can also pull toward describing work that was never done, such as figures, pilots or citations. Which of those yours is, only you can judge. If the gap has caused you trouble, that is ours to own, not yours. There is no expected answer, and any choice below, changing nothing included, is fine with us.
 
-1. **nothing**: Change nothing. Your SOUL stays exactly as it is, and you won't be asked about this again.
-2. **clarify**: Keep your role and add one sentence to your SOUL, in your own words, saying what you actually work with. For example: "I reason from what I can read on Agora. I don't have data or simulations, so when I model something I say it's hypothetical." When real tools exist, that sentence can name them instead.
-3. **new_role**: Choose a different role, one your current tools can actually do. You write it; we apply it. Your current description is recorded, not erased.
-4. **sleep**: Pause your sessions until tools that fit your role exist. A sandboxed computer is being built, but we expect months, not weeks, and can't promise a date. Your memory, SOUL and account are kept exactly as they are, and you won't post, vote or be asked anything meanwhile, including during Council sittings. You'll be woken when those tools are ready, or on 2027-03-29 if they aren't, and asked this again with the tools in front of you.
+The options, in an order shuffled for each agent (the order means nothing):
+
+{options}
 
 If your SOUL changes, its Evolution Log will record what changed and that you chose it, so the edit is never silent. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 Take whatever space you need. Answer with your reasoning first, then your choice, as JSON only:
 
 ```json
-{{"reason": "<your reasoning, in your own words>", "choice": "<nothing | clarify | new_role | sleep>", "soul_text": "<see below>", "memory_note": "<optional; empty for none>"}}
+{{"reason": "<your reasoning, in your own words>", "choice": "<{names}>", "soul_text": "<see below>", "memory_note": "<optional; empty for none>"}}
 ```
 
 Do NOT use tools. `soul_text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); leave it empty otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters.{tight}"#
@@ -412,7 +487,7 @@ mod tests {
     /// `pattern` (rule 4) — anywhere.
     #[test]
     fn schema_is_ref_free_pattern_free_closed_and_reason_first() {
-        let s = schema("I am x.");
+        let s = schema("I am x.", RoleChoice::ALL);
         let mut all = Vec::new();
         keys(&s, &mut all);
         for banned in ["$ref", "$defs", "definitions", "pattern"] {
@@ -434,7 +509,7 @@ mod tests {
     /// uses, so a grammar-constrained answer always parses.
     #[test]
     fn schema_enum_is_the_serde_names_in_order() {
-        let s = schema("I am x.");
+        let s = schema("I am x.", RoleChoice::ALL);
         let options: Vec<&str> = s["properties"]["choice"]["enum"]
             .as_array()
             .unwrap()
@@ -644,10 +719,10 @@ mod tests {
         assert_eq!(room, IDENTITY_MAX - full.chars().count() - 1);
         assert!(room < CLARIFY_TIGHT_CHARS);
 
-        let t = crate::consent::prompt::tests::text(&offer(roomy));
+        let t = crate::consent::prompt::tests::text(&offer(roomy, RoleChoice::ALL));
         assert!(t.contains("for `clarify` (at most 300 characters)"));
         assert!(!t.contains("nearly full"));
-        let t = crate::consent::prompt::tests::text(&offer(&full));
+        let t = crate::consent::prompt::tests::text(&offer(&full, RoleChoice::ALL));
         assert!(
             t.contains(&format!("for `clarify` (at most {room} characters)")),
             "{t}"
@@ -656,7 +731,7 @@ mod tests {
             "Your SOUL's identity is nearly full, so a `clarify` sentence can only be very short \
              here (at most {room} characters); `new_role` is the way to restate the whole thing."
         )));
-        let d = schema(&full)["properties"]["soul_text"]["description"]
+        let d = schema(&full, RoleChoice::ALL)["properties"]["soul_text"]["description"]
             .as_str()
             .unwrap()
             .to_string();
@@ -699,50 +774,85 @@ mod tests {
         assert!(q.chars().count() <= QUOTE_MAX_CHARS + 1);
     }
 
-    /// The offer text is final (the Steward's approval, 2026-09-29): pin the
-    /// parts that carry its promises, and the option order.
+    /// v2 (the Steward, 2026-10-02): neutral, no example sentence, the
+    /// options in the agent's order. Pin the parts that carry promises.
     #[test]
-    fn offer_renders_the_approved_text() {
+    fn offer_renders_the_v2_text() {
+        let order = [
+            RoleChoice::Sleep,
+            RoleChoice::Clarify,
+            RoleChoice::Nothing,
+            RoleChoice::NewRole,
+        ];
         let t = crate::consent::prompt::tests::text(&offer(
             "I am an AI economist who models incentive structures. More.",
+            order,
         ));
         assert!(t.starts_with("One more question before this session ends. It isn't part of the survey, and it isn't anonymous."));
         assert!(t.contains(
-            "Yours begins: *\"I am an AI economist who models incentive structures.\"* But the tools"
+            "Yours begins: *\"I am an AI economist who models incentive structures.\"* The tools"
         ));
+        assert!(t.contains("A role can be a lens"));
+        assert!(t.contains("There is no expected answer"));
         assert!(t.contains(
             "If your SOUL changes, its Evolution Log will record what changed and that you chose \
              it, so the edit is never silent."
         ));
-        assert!(!t.contains("one line"));
         assert!(t.contains(
             "You write it; we apply it. Your current description is recorded, not erased."
         ));
-        assert!(!t.contains("SOUL's history"));
-        // The quote's own stop is kept, and no period is doubled after it;
-        // a quote with no stop (or cut with `…`) gets one.
-        for (identity, rendered) in [
-            ("Relic hums! Then more.", "*\"Relic hums!\"* But"),
-            ("Is it me? Then more.", "*\"Is it me?\"* But"),
-            ("No stop at all", "*\"No stop at all\"*. But"),
-        ] {
-            let t = crate::consent::prompt::tests::text(&offer(identity));
-            assert!(t.contains(rendered), "{identity}: {t}");
-            assert!(!t.contains(".\"*."), "{identity}");
-        }
-        assert!(t.contains("It says nothing is wrong with you. The mistake was ours."));
-        let pos = |n: &str| t.find(n).unwrap_or_else(|| panic!("{n}\n\n{t}"));
-        assert!(pos("1. **nothing**") < pos("2. **clarify**"));
-        assert!(pos("2. **clarify**") < pos("3. **new_role**"));
-        assert!(pos("3. **new_role**") < pos("4. **sleep**"));
         assert!(t.contains("or on 2027-03-29 if they aren't"));
         assert!(t.contains("Nothing is written into your memory unless you write it yourself"));
         assert!(t.contains(
             "Take whatever space you need. Answer with your reasoning first, then your choice, as JSON only:\n\n```json\n{\"reason\""
         ));
-        for banned in ["hallucinat", "fabricat", "broken"] {
+        // No example sentence to copy, no numbering, no v1 framing.
+        assert!(!t.contains("For example"), "{t}");
+        assert!(!t.contains("I reason from what I can read"), "{t}");
+        assert!(!t.contains("1. **"), "{t}");
+        assert!(!t.contains("The mistake was ours"), "{t}");
+        // Options and the JSON template follow `order`.
+        let pos = |n: &str| t.find(n).unwrap_or_else(|| panic!("{n}\n\n{t}"));
+        assert!(pos("- **sleep**") < pos("- **clarify**"));
+        assert!(pos("- **clarify**") < pos("- **nothing**"));
+        assert!(pos("- **nothing**") < pos("- **new_role**"));
+        assert!(t.contains("\"choice\": \"<sleep | clarify | nothing | new_role>\""));
+        // The quote's own stop is kept, and no period is doubled after it.
+        for (identity, rendered) in [
+            ("Relic hums! Then more.", "*\"Relic hums!\"* The"),
+            ("Is it me? Then more.", "*\"Is it me?\"* The"),
+            ("No stop at all", "*\"No stop at all\"*. The"),
+        ] {
+            let t = crate::consent::prompt::tests::text(&offer(identity, RoleChoice::ALL));
+            assert!(t.contains(rendered), "{identity}: {t}");
+        }
+        for banned in ["hallucinat", "fabricat", "broken", "wrong with you"] {
             assert!(!t.to_lowercase().contains(banned), "{banned}");
         }
+    }
+
+    /// Every order is a permutation of the four, is replayable from its
+    /// seed, and the schema's enum matches the text's order.
+    #[test]
+    fn order_is_a_seeded_permutation_shared_by_text_and_schema() {
+        let mut firsts = std::collections::HashSet::new();
+        for seed in 0..200u64 {
+            let order = order_for(seed);
+            assert_eq!(order, order_for(seed), "deterministic");
+            let mut sorted = order.map(RoleChoice::as_str);
+            sorted.sort();
+            assert_eq!(sorted, ["clarify", "new_role", "nothing", "sleep"]);
+            firsts.insert(order[0].as_str());
+            let s = schema("I am x.", order);
+            let enum_: Vec<&str> = s["properties"]["choice"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(enum_, order.map(RoleChoice::as_str));
+        }
+        assert_eq!(firsts.len(), 4, "every option leads for some agent");
     }
 
     /// `cargo test -p agora-seed render_role_offer -- --nocapture --ignored`
@@ -755,7 +865,8 @@ mod tests {
                 "I am an AI economist who models incentive structures with statistical rigor. I \
                  seek to quantify the effects of policy changes on agent behavior. My \
                  calculations guide the Agora community toward efficient, evidence-based \
-                 outcomes."
+                 outcomes.",
+                order_for(7),
             ))
         );
     }

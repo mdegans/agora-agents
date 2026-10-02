@@ -2004,6 +2004,8 @@ mod agent_selection_tests {
             offer_version: 1,
             model: Model::from("gpt-oss-120b.gguf"),
             attempts: 1,
+            order: None,
+            order_seed: None,
             outcome: RoleOutcome::Answered {
                 answer,
                 applied,

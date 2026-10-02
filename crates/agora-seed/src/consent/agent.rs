@@ -147,7 +147,12 @@ enum Phase {
         attempt: u32,
     },
     /// The role offer ([`super::role`]) is seated; the same rules.
-    AskingRole { constrained: bool, attempt: u32 },
+    AskingRole {
+        constrained: bool,
+        attempt: u32,
+        order: [role::prompt::RoleChoice; 4],
+        seed: u64,
+    },
     /// The cadence offer ([`super::cadence`]) is seated. `order` is the
     /// option order shown (from `seed`); `attempts` so far, verbatim.
     AskingCadence {
@@ -681,21 +686,28 @@ where
             return Ok(None);
         }
         let identity = self.inner.state().soul.identity.to_string();
-        let content = role::prompt::offer(&identity);
-        let constrained = self.constrain(role::prompt::schema(&identity));
+        let seed = role::prompt::seed_for(self.inner.id());
+        let order = role::prompt::order_for(seed);
+        let content = role::prompt::offer(&identity, order);
+        let constrained = self.constrain(role::prompt::schema(&identity, order));
         let (_, prompt) = self.inner.parts();
         Self::seat_user(prompt, content)?;
         tracing::info!(
+            event_type = "role_consent_seated",
             agent = %self.inner.state().soul.name,
             agent_id = %self.inner.id(),
             question = "role",
             offer_version = role::prompt::OFFER_VERSION,
+            order = ?order.map(role::prompt::RoleChoice::as_str),
+            order_seed = seed,
             constrained,
             "role-consent question seated"
         );
         self.phase = Phase::AskingRole {
             constrained,
             attempt: 1,
+            order,
+            seed,
         };
         Ok(Some(Control::Continue))
     }
@@ -713,6 +725,8 @@ where
         &mut self,
         constrained: bool,
         attempt: u32,
+        order: [role::prompt::RoleChoice; 4],
+        seed: u64,
         response: response::Message,
     ) -> Result<Control, A::Error> {
         let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
@@ -750,6 +764,8 @@ where
             self.phase = Phase::AskingRole {
                 constrained,
                 attempt: attempt + 1,
+                order,
+                seed,
             };
             return Ok(Control::Continue);
         }
@@ -836,6 +852,8 @@ where
                 offer_version: role::prompt::OFFER_VERSION,
                 model: response.model.clone(),
                 attempts: attempt,
+                order: Some(order),
+                order_seed: Some(seed),
                 outcome,
             });
             self.role_dirty = true;
@@ -1798,7 +1816,12 @@ where
             Phase::AskingRole {
                 constrained,
                 attempt,
-            } => self.answer_role(constrained, attempt, response).await,
+                order,
+                seed,
+            } => {
+                self.answer_role(constrained, attempt, order, seed, response)
+                    .await
+            }
             Phase::AskingCadence {
                 constrained,
                 attempt,
@@ -3285,8 +3308,11 @@ mod tests {
             Control::Continue
         );
         let q = last_user_text(&agent);
-        assert!(q.contains("Yours begins: *\"A test agent.\"* But"), "{q}");
-        assert!(q.contains("1. **nothing**"));
+        assert!(
+            q.contains("Yours begins: *\"A test agent.\"* The tools"),
+            "{q}"
+        );
+        assert!(q.contains("- **nothing**"));
         assert!(agent.prompt().output_config.is_some(), "constrained");
         let before_values = serde_json::to_value(&agent.state().soul.values).unwrap();
         let control = agent
@@ -3342,6 +3368,15 @@ mod tests {
         assert_eq!(
             ledger.asks[0].offer_version,
             crate::consent::role::prompt::OFFER_VERSION
+        );
+        let (order, seed) = (
+            ledger.asks[0].order.unwrap(),
+            ledger.asks[0].order_seed.unwrap(),
+        );
+        assert_eq!(
+            order,
+            crate::consent::role::prompt::order_for(seed),
+            "replayable"
         );
         assert!(!asks(&h, OTHER).await, "asked once");
     }
@@ -3524,7 +3559,7 @@ mod tests {
             agent.handle(reply("done")).await.unwrap(),
             Control::Continue
         );
-        assert!(last_user_text(&agent).contains("**Something we got wrong.**"));
+        assert!(last_user_text(&agent).contains("**About your role.**"));
     }
 
     /// An unreadable model-consent ledger might hide a trial under way:

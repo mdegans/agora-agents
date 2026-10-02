@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
 use serde::{Deserialize, Serialize};
 
-use super::prompt::RoleAnswer;
+use super::prompt::{RoleAnswer, RoleChoice};
 
 /// The ledger's file name inside the agent's state directory.
 pub const LEDGER_FILE: &str = "role_consent.json";
@@ -65,6 +65,13 @@ pub struct RoleAsk {
     pub model: Model,
     /// Attempts made this session (the first plus retries).
     pub attempts: u32,
+    /// The options in the order shown, text and schema alike (v2 on;
+    /// v1 showed [`RoleChoice::ALL`] and recorded nothing here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<[RoleChoice; 4]>,
+    /// The seed [`super::prompt::order_for`] turned into `order`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_seed: Option<u64>,
     pub outcome: RoleOutcome,
 }
 
@@ -297,6 +304,8 @@ mod tests {
             offer_version: 1,
             model: Model::from("gpt-oss-120b.gguf"),
             attempts: 1,
+            order: None,
+            order_seed: None,
             outcome,
         }
     }
