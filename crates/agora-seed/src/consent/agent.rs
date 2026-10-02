@@ -2479,11 +2479,8 @@ where
         self.inner.model()
     }
 
-    /// The `[cache]` overrides apply here, before the inner agent stores
-    /// the quirks it rolls its cache markers by.
     fn on_admit(&mut self, model: &ModelInfo, quirks: &Quirks) {
-        let quirks = self.rt.cache.apply(quirks);
-        self.inner.on_admit(model, &quirks)
+        self.inner.on_admit(model, quirks)
     }
 
     fn quirks(&self) -> Option<Quirks> {
