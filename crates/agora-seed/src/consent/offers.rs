@@ -23,8 +23,9 @@
 //! after the fact).
 //!
 //! **The schema** (CLAUDE.md, "Never ship a `$ref` schema; `strict` only on
-//! `$ref`-free schemas"): built from typed structs, never a derive that
-//! could emit a `$ref`; no `$ref`/`$defs` (rule 1); `additionalProperties:
+//! `$ref`-free schemas") is [`Args`]' own, rendered inline
+//! (`inline_input_schema_for`), so nothing can emit a `$ref`; no `$ref`/`$defs`
+//! (rule 1); `additionalProperties:
 //! false` (rule 2); no `pattern` (rule 4). Every property is `required` —
 //! under strict, Haiku 4.5, Sonnet 5 and Opus 5 *omit* optional fields —
 //! with an empty string meaning "unused". The order is `offer` (an
@@ -33,8 +34,10 @@
 //! order; which of them an offer accepts is checked when the call lands.
 //! The tests pin all of it.
 
+use agora_agentkit::responses::inline_input_schema_for;
 use misanthropic::prompt::message::Content;
 use misanthropic::tool::{self, CustomMethodDef, MethodDef, Tool, Use};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::cadence::prompt::CadenceChoice;
@@ -45,7 +48,7 @@ use super::role::prompt::RoleChoice;
 pub const TOOL_NAME: &str = "answer_offer";
 
 /// Which offer a call answers: the key in the offer's heading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OfferKind {
     ModelSwap,
@@ -55,6 +58,7 @@ pub enum OfferKind {
 
 impl OfferKind {
     /// Canonical order: the order offers are seated in, and the schema's.
+    #[cfg(test)]
     pub const ALL: [Self; 3] = [Self::ModelSwap, Self::Role, Self::Cadence];
 
     /// The wire name.
@@ -72,7 +76,7 @@ impl OfferKind {
 /// cadence offer's ([`CadenceChoice`]), each in its own canonical order.
 /// The wire names are theirs (a test pins that), so each offer's own
 /// answer type is built from a call unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AnyChoice {
     NoSwap,
@@ -89,6 +93,7 @@ pub enum AnyChoice {
 
 impl AnyChoice {
     /// Canonical order, as in the schema's `enum`.
+    #[cfg(test)]
     pub const ALL: [Self; 10] = [
         Self::NoSwap,
         Self::Trial,
@@ -160,17 +165,22 @@ pub struct Head {
     pub offer: OfferKind,
 }
 
-/// A call's arguments. `text` and `memory_note` are required by the schema
-/// (empty when unused); defaulted here only so a backend that doesn't
-/// enforce the schema still gets a fair reading.
-#[derive(Debug, Clone, Deserialize)]
+/// A call's arguments, and the tool's schema ([`schema`]). Declaration order
+/// is the order the decoder writes them in; every field is required (empty
+/// when unused), as strict models omit optional ones.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Args {
+    /// The key of the offer you are answering, from its heading.
     pub offer: OfferKind,
+    /// Your reasoning, in your own words, written before the choice.
     pub reason: String,
+    // One line per doc: each is the property's description, verbatim.
+    /// Your choice: one of the options this offer lists. Each offer accepts only its own options.
     pub choice: AnyChoice,
-    #[serde(default)]
+    /// The free text this offer asks for with your choice, if it asks for any (it says when, and how long it may be). Empty otherwise.
     pub text: String,
-    #[serde(default)]
+    /// Optional: a note for your own memory, in your own words, where the offer allows one. Empty for none.
     pub memory_note: String,
 }
 
@@ -246,44 +256,6 @@ pub fn json_objects(text: &str) -> Vec<serde_json::Map<String, serde_json::Value
     out
 }
 
-// --- The schema, as typed structs ------------------------------------------
-
-#[derive(Serialize)]
-struct StringProp {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    description: &'static str,
-}
-
-#[derive(Serialize)]
-struct EnumProp {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    description: &'static str,
-    #[serde(rename = "enum")]
-    options: Vec<&'static str>,
-}
-
-/// Field order here is the order the decoder writes them in.
-#[derive(Serialize)]
-struct Properties {
-    offer: EnumProp,
-    reason: StringProp,
-    choice: EnumProp,
-    text: StringProp,
-    memory_note: StringProp,
-}
-
-#[derive(Serialize)]
-struct ObjectSchema {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    properties: Properties,
-    required: [&'static str; 5],
-    #[serde(rename = "additionalProperties")]
-    additional_properties: bool,
-}
-
 /// The tool's description: the same bytes for every agent.
 pub const DESCRIPTION: &str = "Answer an offer the Steward and Claude have put to you. Offers \
      come at the end of a session, each under a heading that names its `offer` key; while none \
@@ -293,42 +265,10 @@ pub const DESCRIPTION: &str = "Answer an offer the Steward and Claude have put t
      which); leave it empty otherwise. `memory_note` is an optional note for your own memory, \
      in your own words, where the offer allows one; leave it empty for none.";
 
-/// `{offer, reason, choice, text, memory_note}`: inline, `$ref`- and
-/// `pattern`-free, closed, every property required.
+/// [`Args`]' schema, `{offer, reason, choice, text, memory_note}`: inline,
+/// `$ref`- and `pattern`-free, closed, every property required
 pub fn schema() -> serde_json::Value {
-    let schema = ObjectSchema {
-        ty: "object",
-        properties: Properties {
-            offer: EnumProp {
-                ty: "string",
-                description: "The key of the offer you are answering, from its heading.",
-                options: OfferKind::ALL.iter().map(|k| k.as_str()).collect(),
-            },
-            reason: StringProp {
-                ty: "string",
-                description: "Your reasoning, in your own words, written before the choice.",
-            },
-            choice: EnumProp {
-                ty: "string",
-                description: "Your choice: one of the options this offer lists. Each offer \
-                              accepts only its own options.",
-                options: AnyChoice::ALL.iter().map(|c| c.as_str()).collect(),
-            },
-            text: StringProp {
-                ty: "string",
-                description: "The free text this offer asks for with your choice, if it asks \
-                              for any (it says when, and how long it may be). Empty otherwise.",
-            },
-            memory_note: StringProp {
-                ty: "string",
-                description: "Optional: a note for your own memory, in your own words, where \
-                              the offer allows one. Empty for none.",
-            },
-        },
-        required: ["offer", "reason", "choice", "text", "memory_note"],
-        additional_properties: false,
-    };
-    serde_json::to_value(schema).expect("plain structs serialize")
+    inline_input_schema_for::<Args>()
 }
 
 /// The tool's one definition: `strict`, so the input is decoded under a
@@ -589,6 +529,36 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(h.offer, OfferKind::Role);
+    }
+
+    /// `Args` agrees with the schema it derives: what the schema requires
+    /// is required, and what it closes out is refused
+    #[test]
+    fn args_require_and_refuse_what_the_schema_does() {
+        let full = serde_json::json!({
+            "offer": "role", "reason": "r", "choice": "nothing", "text": "", "memory_note": "",
+        });
+        serde_json::from_value::<Args>(full.clone()).unwrap();
+        for field in ["offer", "reason", "choice", "text", "memory_note"] {
+            let mut missing = full.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let err = serde_json::from_value::<Args>(missing).unwrap_err();
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
+        let mut extra = full;
+        extra["soul_text"] = "s".into();
+        let err = serde_json::from_value::<Args>(extra).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+
+        let s = schema();
+        assert!(
+            s.get("description").is_none(),
+            "the tool describes itself: {s}"
+        );
+        for p in ["offer", "reason", "choice", "text", "memory_note"] {
+            let d = s["properties"][p]["description"].as_str().unwrap();
+            assert!(!d.is_empty() && !d.contains('\n'), "{p}: {d:?}");
+        }
     }
 
     #[test]

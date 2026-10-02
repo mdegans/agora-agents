@@ -19,7 +19,6 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-hex = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
 schemars = { workspace = true }
