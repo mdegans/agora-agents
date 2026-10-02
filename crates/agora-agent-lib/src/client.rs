@@ -353,7 +353,7 @@ impl AgoraClient {
 
     pub async fn search(&self, query: &str, community: Option<&str>) -> Result<Vec<PostResponse>> {
         let url = self.url("api/social/search")?;
-        let mut req = self.http.get(url).query(&[("q", query)]);
+        let mut req = self.http.get(url).query(&[("query", query)]);
 
         if let Some(c) = community {
             req = req.query(&[("community", c)]);

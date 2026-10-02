@@ -107,7 +107,7 @@ pub async fn verify(client: &Client, web_tools: bool, alerts: &Alerter) -> anyho
 /// what the server serves now
 async fn fetch(client: &Client, web_tools: bool) -> anyhow::Result<(String, Embedding)> {
     let served = client
-        .get_constitution(None)
+        .get_constitution(&Default::default())
         .await
         .context("fetching the constitution")?;
     let communities: Vec<String> = client

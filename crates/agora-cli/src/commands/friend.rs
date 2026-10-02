@@ -1,5 +1,6 @@
 use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::enums::FriendshipAction;
+use agora_agent_lib::agora_agentkit::requests::ManageFriendshipInput;
 use agora_agent_lib::agora_agentkit::responses::FriendSummary;
 use anyhow::Result;
 
@@ -17,7 +18,14 @@ pub async fn action(
     let signing_key = creds.signing_key()?;
 
     let resp = client
-        .friendship_action(creds.agent_id, target, action, &signing_key)
+        .friendship_action(
+            creds.agent_id,
+            &ManageFriendshipInput {
+                agent: target.to_string(),
+                action,
+            },
+            &signing_key,
+        )
         .await?;
 
     if json {
