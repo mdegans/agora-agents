@@ -7,6 +7,7 @@
 //! description = "Dense 27B; all parameters active per token. ~1/3 the speed of 3.6."
 //! selectable = true   # offered to agents' set_model
 //! share = 1.0         # weight in the fair-share schedule
+//! thinking_effort = "low"  # overrides `[seed] thinking_effort` on this model
 //! ```
 //!
 //! A model is **routable** if it is listed (and some endpoint advertises
@@ -39,6 +40,11 @@ pub struct ModelSpec {
     /// Weight in the fair-share schedule; `1.0` is an equal share.
     #[serde(default = "default_share")]
     pub share: f64,
+    /// This model's thinking effort, overriding `[seed] thinking_effort`
+    /// for every session routed on it (Steward, 2026-10-02: Qwen3.8 at
+    /// `low`, since it overthinks at higher levels). Constant across a
+    /// session like the global one, so it never moves a cache prefix.
+    pub thinking_effort: Option<crate::EffortKnob>,
 }
 
 fn default_share() -> f64 {
@@ -54,6 +60,7 @@ impl ModelSpec {
             description: None,
             selectable: false,
             share: default_share(),
+            thinking_effort: None,
         }
     }
 }
@@ -95,6 +102,8 @@ pub struct Entry {
     pub description: Option<String>,
     /// Listed `selectable` (and, being here, advertised).
     pub selectable: bool,
+    /// See [`ModelSpec::thinking_effort`].
+    pub thinking_effort: Option<misanthropic::prompt::output::Effort>,
 }
 
 /// The model table resolved against what the endpoints advertise at
@@ -127,6 +136,9 @@ impl Catalog {
                 name,
                 description: spec.and_then(|s| s.description.clone()),
                 selectable: spec.is_some_and(|s| s.selectable),
+                thinking_effort: spec
+                    .and_then(|s| s.thinking_effort)
+                    .map(crate::EffortKnob::into_effort),
             });
         }
         Self { entries }
@@ -200,6 +212,7 @@ pub(crate) mod tests {
         description = "Dense."
         selectable = true
         share = 2.0
+        thinking_effort = "low"
 
         [[model]]
         id = "Qwen3.8-Base.gguf"
@@ -269,5 +282,25 @@ pub(crate) mod tests {
             toml::from_str::<T>("[[model]]\nid = \"a\"\nselectible = true\n").is_err(),
             "typos fail at load"
         );
+    }
+
+    /// A per-model effort reaches the catalog entry; unset stays unset, and
+    /// a typo'd level is rejected rather than sent as a custom effort.
+    #[test]
+    fn per_model_thinking_effort() {
+        use misanthropic::prompt::output::Effort;
+        let specs = specs(TABLE);
+        let advertised = [info("Qwen3.6.gguf"), info("Qwen3.8.gguf")];
+        let catalog = Catalog::new(&specs, &advertised);
+        let effort = |id: &str| {
+            catalog
+                .get(&Model::from(id.to_string()))
+                .unwrap()
+                .thinking_effort
+                .clone()
+        };
+        assert_eq!(effort("Qwen3.8.gguf"), Some(Effort::Low));
+        assert_eq!(effort("Qwen3.6.gguf"), None);
+        assert!(toml::from_str::<ModelSpec>("id = \"m\"\nthinking_effort = \"lo\"").is_err());
     }
 }
