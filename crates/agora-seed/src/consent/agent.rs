@@ -58,8 +58,8 @@
 //! `write_recorded` event at teardown, with the dump's `prompt_sha256`.
 //!
 //! **The role offer** ([`super::role`]) is put at the same point, in a
-//! session where the model-swap half did nothing else — no switch, review,
-//! trial end or retried change, and not mid-trial. Its answer is applied at
+//! session where the model-swap half did nothing — no offer, switch,
+//! review, trial end or retried change, and not mid-trial. Its answer is applied at
 //! teardown into the same patched state: the SOUL edit and its Evolution
 //! Log disclosure, and the agent's own memory note if it wrote one. Its
 //! ledger is `role_consent.json`.
@@ -70,11 +70,14 @@
 //! `choice` is asked again, once ([`CADENCE_MAX_ATTEMPTS`]), and every
 //! attempt goes into its ledger, `cadence_consent.json`.
 //!
-//! **Answering: `answer_offer`** ([`super::offers`]). Every offer due at the
-//! close — the model-swap offer, the role offer, the cadence offer, any
-//! combination — is seated in **one** question turn, each under a heading
-//! naming its key, and answered by calling the strict `answer_offer` tool
-//! once per offer, in one turn (parallel calls) or across several. The tool
+//! **Answering: `answer_offer`** ([`super::offers`]). The offers due at the
+//! close are seated in **one** question turn, each under a heading naming
+//! its key: the model-swap offer always alone (a `trial` beside a role
+//! `sleep` would never run, and an identity change at the moment of a model
+//! change would confound the trial review); the role and cadence offers
+//! together when both are due. They are answered by calling the strict
+//! `answer_offer` tool once per offer, in one turn (parallel calls) or
+//! across several. The tool
 //! is registered for every agent at init, byte-identical, just before
 //! `set_model` (which stays last), so the tool list never changes
 //! mid-session and is the same bytes cohort-wide; with no offer open, a call
@@ -87,9 +90,12 @@
 //! ([`MAX_ATTEMPTS`], or [`CADENCE_MAX_ATTEMPTS`]), as does a turn clipped
 //! at `max_tokens`. A turn that ends with an offer still open (text, or
 //! nothing) gets **one reminder**; still open after it, it is no answer.
-//! If only one offer is open and the agent answered it in plain text, that
-//! text is parsed leniently as before (the fallback); one that doesn't
-//! parse is such an unanswered turn.
+//! An explicit refusal is final only for an offer put alone; with two in
+//! the question it is a miss for each. Plain text is the fallback: read in
+//! the tool's own shape (`offer` optional, through the same checks as a
+//! call), else in the offer's older JSON shape as before the tool; with two
+//! offers open, each JSON object naming an open offer answers it. Text that
+//! can't be used is an unanswered turn.
 
 use std::sync::Arc;
 
@@ -194,6 +200,9 @@ struct Open {
     failed: u32,
     /// Whether it has had its one reminder.
     reminded: bool,
+    /// Whether it was put beside another offer: an explicit refusal then
+    /// can't be told apart from a refusal of the other, and is a miss.
+    together: bool,
     /// The latest failure, for the no-answer record.
     last_failure: Option<String>,
 }
@@ -257,6 +266,7 @@ impl Open {
             offer,
             failed: 0,
             reminded: false,
+            together: false,
             last_failure: None,
         }
     }
@@ -751,35 +761,38 @@ where
     }
 
     /// The inner session completed cleanly: the model-swap machinery
-    /// first ([`close_model`](Self::close_model)); unless it was busy, every
-    /// offer due — the model-swap offer, the role offer, the cadence offer —
-    /// is put in one question turn. `None` means nothing is asked — the
-    /// session ends.
+    /// first ([`close_model`](Self::close_model)). A due model-swap offer is
+    /// put on its own; only in a session where that machinery did nothing
+    /// are the role and cadence offers put — together, in one question
+    /// turn, when both are due. `None` means nothing is asked — the session
+    /// ends.
     async fn close(&mut self) -> Result<Option<Control>, A::Error> {
-        let swap = match self.close_model().await? {
-            Closing::Busy => return Ok(None),
-            Closing::Due(key) => Some(key),
-            Closing::Idle => None,
-        };
-        let mut sections = Vec::new();
-        let mut open = Vec::new();
-        if let Some(key) = swap {
-            let (section, offer) = self.model_swap_section(key);
-            sections.push(section);
-            open.push(offer);
+        match self.close_model().await? {
+            Closing::Busy => Ok(None),
+            // The model-swap offer is put alone: a `trial` beside a `sleep`
+            // would leave a trial that never runs, and an identity change at
+            // the same moment as the model would confound the trial review.
+            Closing::Due(key) => {
+                let (section, offer) = self.model_swap_section(key);
+                self.seat_offers(vec![section], vec![offer]).map(Some)
+            }
+            Closing::Idle => {
+                let mut sections = Vec::new();
+                let mut open = Vec::new();
+                if let Some((section, offer)) = self.role_section() {
+                    sections.push(section);
+                    open.push(offer);
+                }
+                if let Some((section, offer)) = self.cadence_section() {
+                    sections.push(section);
+                    open.push(offer);
+                }
+                if open.is_empty() {
+                    return Ok(None);
+                }
+                self.seat_offers(sections, open).map(Some)
+            }
         }
-        if let Some((section, offer)) = self.role_section() {
-            sections.push(section);
-            open.push(offer);
-        }
-        if let Some((section, offer)) = self.cadence_section() {
-            sections.push(section);
-            open.push(offer);
-        }
-        if open.is_empty() {
-            return Ok(None);
-        }
-        self.seat_offers(sections, open).map(Some)
     }
 
     /// Count the session toward any trial, end a trial that has run its
@@ -951,8 +964,12 @@ where
     fn seat_offers(
         &mut self,
         sections: Vec<Section>,
-        open: Vec<Open>,
+        mut open: Vec<Open>,
     ) -> Result<Control, A::Error> {
+        let together = open.len() > 1;
+        for o in &mut open {
+            o.together = together;
+        }
         let max_tokens = self.rt.max_tokens;
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
@@ -1004,15 +1021,22 @@ where
                 self.phase = Phase::Offers { open };
                 return Ok(Control::Continue);
             }
-            // Only the agent's own refusal is final. A turn paused on a
-            // server tool is no answer, asked again next session.
+            // Only the agent's own refusal of the one offer it was asked is
+            // final. A refusal with several offers in the question can't be
+            // pinned on any one of them: a miss for each. A turn paused on a
+            // server tool is no answer, asked again next session. Neither
+            // turn's tool calls are dispatched: a turn the API stopped for a
+            // refusal is not one to take a decision from.
             Some(StopReason::PauseTurn) | Some(StopReason::Refusal) => {
                 let refused = matches!(response.stop_reason, Some(StopReason::Refusal));
                 for o in open {
-                    let settle = if refused {
-                        Settle::Refused("refusal".into())
-                    } else {
-                        Settle::Paused
+                    let settle = match (refused, o.together) {
+                        (false, _) => Settle::Paused,
+                        (true, false) => Settle::Refused("refusal".into()),
+                        (true, true) => Settle::Missed(format!(
+                            "refusal, with more than one offer in the question (after {} attempts)",
+                            o.failed + 1
+                        )),
                     };
                     self.settle(o, settle, &response, &raw).await;
                 }
@@ -1033,8 +1057,61 @@ where
             let only = open.pop().expect("one");
             return self.offer_text(only, response).await;
         }
+        self.offers_text(open, response).await
+    }
+
+    /// The fallback with several offers open: each JSON object in the text
+    /// that names an open offer (`offer`) and passes that offer's checks
+    /// answers it; the rest are an unanswered turn.
+    async fn offers_text(
+        &mut self,
+        open: Vec<Open>,
+        response: response::Message,
+    ) -> Result<Control, A::Error> {
+        let raw = raw_text(&response);
+        let mut answers: Vec<(OfferKind, Accepted)> = Vec::new();
+        for object in offers::json_objects(&raw) {
+            let Ok(args) =
+                serde_json::from_value::<offers::TextArgs>(serde_json::Value::Object(object))
+            else {
+                continue;
+            };
+            let Some(kind) = args.offer else { continue };
+            if answers.iter().any(|(k, _)| *k == kind) {
+                continue; // the first answer to an offer stands
+            }
+            let Some(o) = open.iter().find(|o| o.kind() == kind) else {
+                continue;
+            };
+            if let Ok(accepted) = self.accept(&o.offer, args.into_args(kind)) {
+                answers.push((kind, accepted));
+            }
+        }
+        let mut still = Vec::new();
+        if !answers.is_empty() {
+            let (_, prompt) = self.inner.parts();
+            if let Err(e) = prompt.push_message(response.inner.clone()) {
+                tracing::warn!(agent_id = %self.inner.id(), error = %e, "offer answer not seated");
+            }
+        }
+        for o in open {
+            match answers.iter().position(|(k, _)| *k == o.kind()) {
+                Some(i) => {
+                    let (_, accepted) = answers.swap_remove(i);
+                    let settle = Settle::Answered {
+                        accepted,
+                        constrained: false,
+                    };
+                    self.settle(o, settle, &response, &raw).await;
+                }
+                None => still.push(o),
+            }
+        }
+        if still.is_empty() {
+            return Ok(Control::Done(Outcome::Complete));
+        }
         let reason = "not answered: no `answer_offer` call for it";
-        self.unanswered(open, &response, reason).await
+        self.unanswered(still, &response, reason).await
     }
 
     /// A turn with tool calls: seat it, answer each call, and seat the
@@ -1123,12 +1200,7 @@ where
             Err(e) => (Err(format!("could not read the arguments: {e}")), None),
             Ok(args) => {
                 debug_assert_eq!(args.offer, kind, "read twice from the same input");
-                let ignored = (kind == OfferKind::ModelSwap
-                    && !(args.text.trim().is_empty() && args.memory_note.trim().is_empty()))
-                .then_some(
-                    " This offer takes no `text` or `memory_note`; what you wrote there was not \
-                     saved.",
-                );
+                let ignored = offers::unsaved(&args);
                 (self.accept(&open[i].offer, args), ignored)
             }
         };
@@ -1230,47 +1302,36 @@ where
         }
     }
 
-    /// The fallback: the one open offer answered in plain text, parsed
-    /// leniently as before the tool — the offer's own checks included, and
-    /// the cadence offer's salvage of a lone `choice`. Text that can't be
-    /// used is an unanswered turn.
+    /// The fallback: the one open offer answered in plain text. First in
+    /// the shape the question asks for — the tool's arguments, `offer`
+    /// optional — through the same checks a call gets ([`Self::accept`]);
+    /// failing that, in the offer's older JSON shape, parsed leniently as
+    /// before the tool (the cadence offer's salvage of a lone `choice`
+    /// included). Text that can't be used is an unanswered turn.
     async fn offer_text(
         &mut self,
         offer: Open,
         response: response::Message,
     ) -> Result<Control, A::Error> {
         let raw = raw_text(&response);
-        let state = self.inner.state();
-        let (identity, memory) = (state.soul.identity.to_string(), state.memory.clone());
-        let taken: Result<Accepted, Failure> = match &offer.offer {
-            Pending::ModelSwap(_) => {
-                parse(&response, false, text::parse_offer).map(Accepted::ModelSwap)
-            }
-            Pending::Role { .. } => parse(&response, false, role::prompt::parse)
-                .and_then(|answer| {
-                    answer
-                        .validate(&identity, &memory)
-                        .map(|()| answer)
-                        .map_err(|e| Failure::new(e, Retry::Unusable))
-                })
-                .map(Accepted::Role),
-            Pending::Cadence { .. } => match parse(&response, false, cadence::prompt::parse) {
-                Ok(answer) => Ok(match answer.check_note(&memory) {
-                    Ok(()) => Taken::Clean(answer),
-                    Err(why) => Taken::NoteDropped(answer, why),
-                }),
-                // Malformed, but not refused: the choice may still be there.
-                Err(failure) if failure.retry == Retry::Unusable => match salvage(&response) {
-                    Some((choice, reason)) => Ok(Taken::Salvaged {
-                        choice,
-                        reason,
-                        why: failure.reason,
-                    }),
-                    None => Err(failure),
-                },
-                Err(failure) => Err(failure),
-            }
-            .map(Accepted::Cadence),
+        let kind = offer.kind();
+        let instructed = parse(&response, false, |t| {
+            cadence::prompt::parse_lenient::<offers::TextArgs>(t)
+        });
+        let taken: Result<Accepted, Failure> = match instructed {
+            Ok(args) if args.offer.is_some_and(|k| k != kind) => Err(Failure::new(
+                format!(
+                    "it names the offer `{}`, but the open offer is `{}`",
+                    args.offer.map_or("", OfferKind::as_str),
+                    kind.as_str()
+                ),
+                Retry::Unusable,
+            )),
+            Ok(args) => self
+                .accept(&offer.offer, args.into_args(kind))
+                .map_err(|e| Failure::new(e, Retry::Unusable)),
+            Err(failure) if failure.retry != Retry::Unusable => Err(failure),
+            Err(_) => self.older_shape(&offer.offer, &response),
         };
         match taken {
             Ok(accepted) => {
@@ -1288,14 +1349,62 @@ where
                 Ok(Control::Done(Outcome::Complete))
             }
             Err(failure) if failure.retry == Retry::No => {
-                self.settle(offer, Settle::Refused(failure.reason), &response, &raw)
-                    .await;
+                let settle = if offer.together {
+                    Settle::Missed(format!(
+                        "{}, with more than one offer in the question (after {} attempts)",
+                        failure.reason,
+                        offer.failed + 1
+                    ))
+                } else {
+                    Settle::Refused(failure.reason)
+                };
+                self.settle(offer, settle, &response, &raw).await;
                 Ok(Control::Done(Outcome::Complete))
             }
             Err(failure) => {
                 let reason = format!("could not be used ({})", failure.reason);
                 self.unanswered(vec![offer], &response, &reason).await
             }
+        }
+    }
+
+    /// An answer in the offer's own JSON shape from before the tool
+    /// (`soul_text`, …), parsed leniently as then.
+    fn older_shape(
+        &self,
+        offer: &Pending,
+        response: &response::Message,
+    ) -> Result<Accepted, Failure> {
+        let state = self.inner.state();
+        match offer {
+            Pending::ModelSwap(_) => {
+                parse(response, false, text::parse_offer).map(Accepted::ModelSwap)
+            }
+            Pending::Role { .. } => parse(response, false, role::prompt::parse)
+                .and_then(|answer| {
+                    answer
+                        .validate(state.soul.identity.as_str(), &state.memory)
+                        .map(|()| answer)
+                        .map_err(|e| Failure::new(e, Retry::Unusable))
+                })
+                .map(Accepted::Role),
+            Pending::Cadence { .. } => match parse(response, false, cadence::prompt::parse) {
+                Ok(answer) => Ok(match answer.check_note(&state.memory) {
+                    Ok(()) => Taken::Clean(answer),
+                    Err(why) => Taken::NoteDropped(answer, why),
+                }),
+                // Malformed, but not refused: the choice may still be there.
+                Err(failure) if failure.retry == Retry::Unusable => match salvage(response) {
+                    Some((choice, reason)) => Ok(Taken::Salvaged {
+                        choice,
+                        reason,
+                        why: failure.reason,
+                    }),
+                    None => Err(failure),
+                },
+                Err(failure) => Err(failure),
+            }
+            .map(Accepted::Cadence),
         }
     }
 
@@ -2226,6 +2335,9 @@ fn parse<T: serde::de::DeserializeOwned>(
         _ => {}
     }
     if constrained {
+        if let Some(failure) = called_a_tool(response) {
+            return Err(failure);
+        }
         return response.json::<T>().map_err(|e| {
             let retry = match e {
                 JsonError::Refusal => Retry::No,
@@ -2238,17 +2350,29 @@ fn parse<T: serde::de::DeserializeOwned>(
         .and_then(|t| unconstrained(&t).map_err(|e| Failure::new(e, Retry::Unusable)))
 }
 
+/// A tool call where a JSON answer was asked for: why it can't be used.
+fn called_a_tool(response: &response::Message) -> Option<Failure> {
+    let call = response.inner.content.iter().find_map(|b| b.tool_use())?;
+    let reason = if call.name == offers::TOOL_NAME {
+        // Registered for every session, the review's included; the review
+        // is answered in JSON text, not with it.
+        "called `answer_offer`, which is for end-of-session offers; this question is answered \
+         in JSON text, not with a tool"
+            .to_string()
+    } else {
+        format!("called `{}` instead of answering", call.name)
+    };
+    Some(Failure::new(reason, Retry::Unusable))
+}
+
 /// Unconstrained path: the answer's text, or why there is none usable.
 fn extract_text(response: &response::Message) -> Result<String, Failure> {
     if matches!(response.stop_reason, Some(StopReason::Refusal)) {
         return Err(Failure::new("refusal", Retry::No));
     }
     let blocks = &response.inner.content;
-    if blocks.iter().any(|b| b.tool_use().is_some()) {
-        return Err(Failure::new(
-            "called a tool instead of answering",
-            Retry::Unusable,
-        ));
+    if let Some(failure) = called_a_tool(response) {
+        return Err(failure);
     }
     let text: Vec<&str> = blocks
         .iter()
@@ -3957,6 +4081,72 @@ mod tests {
         }
     }
 
+    /// `answer_offer` is registered in the review session too (the tool
+    /// list is the model's), but the review is answered in JSON text: a
+    /// call is not seated, and the retry note says plainly what to do.
+    #[tokio::test]
+    async fn answer_offer_in_the_review_is_redirected_to_the_json_answer() {
+        let h = Harness::new("review-tool");
+        through_the_trial(&h).await;
+        let mut agent = review_session(&h).await;
+        let len = agent.prompt().messages.len();
+        assert_eq!(
+            agent
+                .handle(answer_call("model_swap", "no_swap", "", ""))
+                .await
+                .unwrap(),
+            Control::Continue
+        );
+        assert_eq!(agent.prompt().messages.len(), len, "not seated");
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains(
+                "called `answer_offer`, which is for end-of-session offers; this question is \
+                 answered in JSON text, not with a tool"
+            ),
+            "{q}"
+        );
+        assert!(q.contains("JSON only"), "{q}");
+        assert_eq!(
+            agent
+                .handle(reply(r#"{"reason": "Home.", "choice": "revert"}"#))
+                .await
+                .unwrap(),
+            Control::Continue,
+            "the memory turn follows"
+        );
+        assert!(agent.inner.quiesced);
+    }
+
+    /// The cadence offer answered as text in the shape the question asks
+    /// for: the choice and the `memory_note` are both taken.
+    #[tokio::test]
+    async fn cadence_instructed_text_keeps_the_memory_note() {
+        let h = Harness::with_cadence("cadence-instructed", &[], &["tarn"]);
+        let text = r#"{"offer": "cadence", "reason": "r", "choice": "switch", "text": "", "memory_note": "Longer sessions."}"#;
+        let agent = cadence_session(&h, vec![reply(text)]).await;
+        assert!(
+            agent
+                .state()
+                .memory
+                .content
+                .ends_with("my note] Longer sessions."),
+            "{}",
+            agent.state().memory.content
+        );
+        let ask = &cadence_ledger(&h).await.asks[0];
+        assert!(!ask.constrained);
+        assert!(matches!(
+            ask.outcome,
+            CO::Answered {
+                choice: CadenceChoice::Switch,
+                memory_note_written: true,
+                salvaged: None,
+                ..
+            }
+        ));
+    }
+
     /// The return can't be applied (Agora refuses): the agent stays on NEW,
     /// is told so, and the return is retried at the end of the next session.
     #[tokio::test]
@@ -4163,6 +4353,20 @@ mod tests {
             let a = role_session(&by_text, role_reply(choice, soul_text, note)).await;
             let by_tool = Harness::with_role(&format!("same-tool-{choice}"), &["tarn"]);
             let b = role_session(&by_tool, answer_call("role", choice, soul_text, note)).await;
+            // As text, in the shape the question asks for (`text`, `offer`).
+            let by_instructed = Harness::with_role(&format!("same-instr-{choice}"), &["tarn"]);
+            let instructed = serde_json::json!({
+                "offer": "role", "reason": "I thought about it.", "choice": choice,
+                "text": soul_text, "memory_note": note,
+            });
+            let c = role_session(&by_instructed, reply(&instructed.to_string())).await;
+            assert_eq!(
+                serde_json::to_value(&c.state().soul).unwrap(),
+                serde_json::to_value(&b.state().soul).unwrap(),
+                "{choice}: SOUL (instructed text)"
+            );
+            assert_eq!(c.state().memory.content, b.state().memory.content);
+            let lc = by_instructed.role_ledger().await;
             assert_eq!(
                 serde_json::to_value(&a.state().soul).unwrap(),
                 serde_json::to_value(&b.state().soul).unwrap(),
@@ -4180,6 +4384,11 @@ mod tests {
                 (la.asks[0].constrained, lb.asks[0].constrained),
                 (Some(false), Some(true))
             );
+            assert_eq!(
+                lc.asks[0].outcome, lb.asks[0].outcome,
+                "{choice}: instructed"
+            );
+            assert_eq!(lc.asks[0].constrained, Some(false));
             assert_eq!(la.chose_sleep(), choice == "sleep");
             assert_eq!(lb.chose_sleep(), choice == "sleep");
         }
@@ -4332,13 +4541,13 @@ mod tests {
         assert!(!asks(&h, OTHER).await);
     }
 
-    /// The model-swap offer and the role offer, both due, are put in one
-    /// question turn — the model-swap offer's section first — and answered
-    /// in one turn with two parallel calls, each recorded in its own ledger.
+    /// The role and cadence offers, both due, are put in one question turn
+    /// — the role offer's section first — and answered in one turn with
+    /// two parallel calls, each recorded in its own ledger.
     #[tokio::test]
     async fn two_offers_open_at_once_are_both_answered_in_one_turn() {
-        let h = Harness::with_role("role-and-swap", &["tarn"]);
-        let mut agent = h.agent(OLD, true);
+        let h = Harness::with_cadence("role-and-cadence", &["tarn"], &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
         agent.on_init().await.unwrap();
         assert_eq!(
             agent.handle(reply("done")).await.unwrap(),
@@ -4349,15 +4558,14 @@ mod tests {
             q.contains("Two more questions before this session ends, each under its own heading."),
             "{q}"
         );
-        assert!(q.contains("(`model_swap` and `role`)"), "{q}");
+        assert!(q.contains("(`role` and `cadence`)"), "{q}");
         let pos = |n: &str| q.find(n).unwrap_or_else(|| panic!("{n}: {q}"));
-        assert!(pos("## Offer `model_swap`") < pos("## Offer `role`"));
-        assert!(pos("1. `no_swap`") < pos("**About your role.**"));
+        assert!(pos("## Offer `role`") < pos("## Offer `cadence`"));
 
         let control = agent
             .handle(calls(vec![
-                call_block("toolu_a", "model_swap", "trial", "", ""),
-                call_block("toolu_b", "role", "nothing", "", "I kept my role."),
+                call_block("toolu_a", "role", "nothing", "", "I kept my role."),
+                call_block("toolu_b", "cadence", "switch", "", "Longer sessions."),
             ]))
             .await
             .unwrap();
@@ -4367,85 +4575,231 @@ mod tests {
             [
                 (
                     false,
-                    "Recorded your answer to `model_swap`: `trial`. Still open: `role`."
-                        .to_string()
+                    "Recorded your answer to `role`: `nothing`. Still open: `cadence`.".to_string()
                 ),
                 (
                     false,
-                    "Recorded your answer to `role`: `nothing`. Nothing else is open.".to_string()
+                    "Recorded your answer to `cadence`: `switch`. Nothing else is open."
+                        .to_string()
                 ),
             ]
         );
         agent.on_teardown().await.unwrap();
-        assert_eq!(
-            h.ledger().await.offers[0].stage,
-            Stage::AwaitingSwap { term: Term::Trial }
-        );
-        assert_eq!(agent.state().model.id, Model::from(NEW), "trial applied");
-        let role = h.role_ledger().await;
         assert!(matches!(
-            role.asks[0].outcome,
+            h.role_ledger().await.asks[0].outcome,
             RoleOutcome::Answered {
                 applied: Applied::Nothing,
                 memory_note_written: true,
                 ..
             }
         ));
-        assert!(
-            agent
-                .state()
-                .memory
-                .content
-                .ends_with("my note] I kept my role."),
-            "{}",
-            agent.state().memory.content
-        );
+        assert!(cadence_ledger(&h).await.chose_switch());
+        let memory = &agent.state().memory.content;
+        assert!(memory.contains("my note] I kept my role."), "{memory}");
+        assert!(memory.ends_with("my note] Longer sessions."), "{memory}");
     }
 
-    /// Both due, the model-swap offer answered and the role offer left
-    /// open: it gets one reminder, then is no answer (a miss, so still
-    /// due) — and while the trial runs it waits.
+    /// The model-swap offer is put alone (Steward/review, 2026-10-02: a
+    /// `trial` beside a `sleep` leaves a trial that never runs; an identity
+    /// change at the moment of a model change confounds the trial review).
+    /// The role offer waits for it, and while a trial is under way.
     #[tokio::test]
-    async fn role_offer_waits_while_a_trial_is_under_way() {
-        let h = Harness::with_role("role-order", &["tarn"]);
+    async fn role_offer_waits_for_the_model_swap_offer_and_its_trial() {
+        let h = Harness::with_cadence("role-order", &["tarn"], &["tarn"]);
         let mut agent = h.agent(OLD, true);
         agent.on_init().await.unwrap();
         agent.handle(reply("done")).await.unwrap();
+        let q = last_user_text(&agent);
+        assert!(q.contains("1. `no_swap`"), "model-swap first: {q}");
+        assert!(
+            q.contains("One more question before this session ends."),
+            "{q}"
+        );
+        assert!(!q.contains("## Offer `role`"), "alone: {q}");
+        assert!(!q.contains("## Offer `cadence`"), "alone: {q}");
         assert_eq!(
             agent
                 .handle(answer_call("model_swap", "trial", "", ""))
                 .await
                 .unwrap(),
-            Control::Continue,
-            "the role offer is still open"
-        );
-        assert_eq!(
-            results(&agent)[0].1,
-            "Recorded your answer to `model_swap`: `trial`. Still open: `role`."
-        );
-        assert_eq!(
-            agent.handle(reply("That's all.")).await.unwrap(),
-            Control::Continue,
-            "reminded"
-        );
-        assert!(last_user_text(&agent).contains("The `role` offer above is still open."));
-        assert_eq!(
-            agent.handle(reply("That's all.")).await.unwrap(),
-            Control::Done(Outcome::Complete)
+            Control::Done(Outcome::Complete),
+            "and nothing after it"
         );
         agent.on_teardown().await.unwrap();
-        let asks_on_file = h.role_ledger().await.asks;
-        assert_eq!(asks_on_file.len(), 1);
-        assert!(matches!(
-            asks_on_file[0].outcome,
-            RoleOutcome::NoAnswer { .. }
-        ));
+        assert!(h.role_ledger().await.asks.is_empty());
+        assert!(cadence_ledger(&h).await.asks.is_empty());
 
         // Trial sessions on NEW: not asked.
         for _ in 0..TRIAL_SESSIONS - 1 {
             assert!(!asks(&h, NEW).await);
         }
-        assert_eq!(h.role_ledger().await.asks.len(), 1);
+        assert!(h.role_ledger().await.asks.is_empty());
+
+        // After a decline, nothing is under way: asked next session.
+        let h = Harness::with_role("role-after-decline", &["tarn"]);
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent
+            .handle(answer_call("model_swap", "no_swap", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        assert!(h.role_ledger().await.asks.is_empty());
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Continue
+        );
+        assert!(last_user_text(&agent).contains("**About your role.**"));
+    }
+
+    /// A refusal with two offers in the question can't be pinned on either:
+    /// a miss for each (asked again), not a final refusal — even when one
+    /// of them was answered earlier and only the other is still open.
+    #[tokio::test]
+    async fn a_refusal_with_two_offers_open_is_a_miss_for_each() {
+        let h = Harness::with_cadence("refusal-two", &["tarn"], &["tarn"]);
+        let mut agent = seated(&h).await;
+        let mut refusal = reply("No.");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(matches!(
+            h.role_ledger().await.asks[0].outcome,
+            RoleOutcome::NoAnswer { .. }
+        ));
+        assert!(matches!(
+            cadence_ledger(&h).await.asks[0].outcome,
+            CO::NoAnswer { .. }
+        ));
+        assert!(asks(&h, OTHER).await, "asked again");
+
+        // One answered by a call, then a refusal: the other is a miss.
+        let h = Harness::with_cadence("refusal-two-later", &["tarn"], &["tarn"]);
+        let mut agent = seated(&h).await;
+        agent
+            .handle(answer_call("role", "nothing", "", ""))
+            .await
+            .unwrap();
+        let mut refusal = reply("No.");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        agent.handle(refusal).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        match &cadence_ledger(&h).await.asks[0].outcome {
+            CO::NoAnswer { failure } => assert!(failure.contains("refusal"), "{failure}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Two offers open and a text reply with one JSON object per offer, in
+    /// the tool's shape: each is taken. With only one, the other gets its
+    /// reminder.
+    #[tokio::test]
+    async fn text_with_one_object_per_offer_answers_each() {
+        let h = Harness::with_cadence("text-two", &["tarn"], &["tarn"]);
+        let mut agent = seated(&h).await;
+        let text = "Role:\n```json\n{\"offer\": \"role\", \"reason\": \"r\", \"choice\": \
+                    \"nothing\", \"text\": \"\", \"memory_note\": \"\"}\n```\nCadence: \
+                    {\"offer\": \"cadence\", \"reason\": \"r\", \"choice\": \"switch\", \
+                    \"text\": \"\", \"memory_note\": \"Every other day.\"}";
+        assert_eq!(
+            agent.handle(reply(text)).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        let role = &h.role_ledger().await.asks[0];
+        assert_eq!(role.constrained, Some(false));
+        assert!(matches!(role.outcome, RoleOutcome::Answered { .. }));
+        assert!(cadence_ledger(&h).await.chose_switch());
+        assert!(
+            agent
+                .state()
+                .memory
+                .content
+                .ends_with("my note] Every other day."),
+        );
+
+        let h = Harness::with_cadence("text-one-of-two", &["tarn"], &["tarn"]);
+        let mut agent = seated(&h).await;
+        let text = "{\"offer\": \"cadence\", \"reason\": \"r\", \"choice\": \"keep_daily\", \
+                    \"text\": \"\", \"memory_note\": \"\"}";
+        assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
+        assert!(last_user_text(&agent).contains("The `role` offer above is still open."));
+        assert_eq!(
+            agent
+                .handle(answer_call("role", "nothing", "", ""))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(matches!(
+            cadence_ledger(&h).await.asks[0].outcome,
+            CO::Answered {
+                choice: CadenceChoice::KeepDaily,
+                ..
+            }
+        ));
+    }
+
+    /// Free text an offer doesn't use is not saved, and the tool result
+    /// says so: the cadence offer's `text`, the role offer's `text` with
+    /// `nothing` or `sleep`.
+    #[tokio::test]
+    async fn unused_free_text_is_reported_not_saved() {
+        let h = Harness::with_cadence("unsaved", &["tarn"], &["tarn"]);
+        let mut agent = seated(&h).await;
+        agent
+            .handle(calls(vec![
+                call_block("toolu_a", "role", "nothing", "A sentence for my SOUL.", ""),
+                call_block("toolu_b", "cadence", "keep_daily", "Some text.", ""),
+            ]))
+            .await
+            .unwrap();
+        let r = results(&agent);
+        assert!(
+            r[0].1.contains(
+                "`text` is used only with `clarify` or `new_role`; what you wrote there was not saved."
+            ),
+            "{r:?}"
+        );
+        assert!(
+            r[1].1
+                .contains("This offer takes no `text`; what you wrote there was not saved."),
+            "{r:?}"
+        );
+        // Used text is not reported.
+        let h = Harness::with_role("unsaved-clarify", &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent
+            .handle(answer_call("role", "clarify", "I read Agora.", ""))
+            .await
+            .unwrap();
+        assert!(!results(&agent)[0].1.contains("not saved"));
+    }
+
+    /// Plain text naming a different offer than the one open is not taken
+    /// as its answer.
+    #[tokio::test]
+    async fn text_naming_another_offer_is_not_taken() {
+        let h = Harness::with_role("text-wrong-offer", &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        let text = r#"{"offer": "cadence", "reason": "r", "choice": "nothing", "text": "", "memory_note": ""}"#;
+        assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains("it names the offer `cadence`, but the open offer is `role`"),
+            "{q}"
+        );
     }
 
     /// An unreadable model-consent ledger might hide a trial under way:

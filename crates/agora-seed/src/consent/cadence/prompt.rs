@@ -191,7 +191,7 @@ To answer, call `answer_offer` with `offer` set to `cadence` and `choice` set to
 /// Parse `text` as `T`, leniently: as given (code fences tolerated), else
 /// the outermost `{…}` in it — a plain-text answer may wrap its JSON in a
 /// sentence. Always into the typed struct; the first error is kept.
-fn parse_lenient<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+pub(crate) fn parse_lenient<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
     let first = match super::super::prompt::parse_json(text) {
         Ok(v) => return Ok(v),
         Err(e) => e,

@@ -174,6 +174,78 @@ pub struct Args {
     pub memory_note: String,
 }
 
+/// The plain-text fallback's reading of an answer in the tool's own shape
+/// (what the question asks for). `offer` may be left out; if given, it must
+/// be the open offer's. Closed, so an answer in an offer's older shape
+/// (`soul_text`, …) is not misread as this one with its text dropped: it
+/// gets the offer's own parse instead.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextArgs {
+    #[serde(default)]
+    pub offer: Option<OfferKind>,
+    pub reason: String,
+    pub choice: AnyChoice,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub memory_note: String,
+}
+
+impl TextArgs {
+    /// As a call's arguments for `kind`.
+    pub fn into_args(self, kind: OfferKind) -> Args {
+        Args {
+            offer: kind,
+            reason: self.reason,
+            choice: self.choice,
+            text: self.text,
+            memory_note: self.memory_note,
+        }
+    }
+}
+
+/// The notice for free text a call carried that its offer doesn't use
+/// (and so doesn't save), if any.
+pub fn unsaved(args: &Args) -> Option<&'static str> {
+    let text = !args.text.trim().is_empty();
+    let note = !args.memory_note.trim().is_empty();
+    match args.offer {
+        OfferKind::ModelSwap if text || note => Some(
+            " This offer takes no `text` or `memory_note`; what you wrote there was not saved.",
+        ),
+        OfferKind::Role if text && matches!(args.choice, AnyChoice::Nothing | AnyChoice::Sleep) => {
+            Some(
+                " `text` is used only with `clarify` or `new_role`; what you wrote there was not \
+                 saved.",
+            )
+        }
+        OfferKind::Cadence if text => {
+            Some(" This offer takes no `text`; what you wrote there was not saved.")
+        }
+        _ => None,
+    }
+}
+
+/// Every JSON object in `text` that is not inside another, in order
+/// (fences, prose and other text around them ignored).
+pub fn json_objects(text: &str) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = text[at..].find('{').map(|i| i + at) {
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[i..]).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(serde_json::Value::Object(map))) => {
+                at = i + stream.byte_offset();
+                out.push(map);
+            }
+            _ => at = i + 1,
+        }
+    }
+    out
+}
+
 // --- The schema, as typed structs ------------------------------------------
 
 #[derive(Serialize)]
@@ -322,7 +394,10 @@ pub fn key_list(kinds: &[OfferKind]) -> String {
 }
 
 /// The closing question: who is asking and how to answer, then each offer
-/// under a heading naming its key. Seated as one user turn.
+/// under a heading naming its key. Seated as one user turn. Only the role
+/// and cadence offers are ever put together (the model-swap offer is put
+/// alone), and those two are independent, so the opener's "what you choose
+/// in one changes nothing in the others" holds.
 pub fn question(sections: Vec<Section>) -> Content {
     let kinds: Vec<OfferKind> = sections.iter().map(|s| s.kind).collect();
     let opener = match kinds.as_slice() {
