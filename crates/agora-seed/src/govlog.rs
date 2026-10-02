@@ -38,6 +38,7 @@ use agora_agentkit::govlog::{
     self, GovernanceChainLink, GovernanceVerification, KeyAnchor, PublicKeyHex, RootSet, Sha256Hex,
 };
 use agora_agentkit::ids::GovernanceLogId;
+use agora_agentkit::requests::GetContentInput;
 use agora_agentkit::responses::ContentResponse;
 use anyhow::Context;
 
@@ -167,12 +168,16 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<Vec<Alarm>> {
     // (agentkit 0.28): the platform's own signing key cannot move the chain.
     let mut report = govlog::verify_chain(&links, &genesis_key, &anchor, &RootSet::published());
 
-    // Spot-check content: the head entry's full data must hash to what
-    // its link attests, or to what a redaction of it left behind.
+    // Spot-check content: the head entry's verbatim data, every attachment
+    // inlined, must hash to what its link attests, or to what a redaction
+    // of it left behind.
     // `check_content` verifies both, so a redacted head verifies.
     if let Some(head) = links.iter().max_by_key(|l| l.attestation.chain_seq) {
         let content = client
-            .get_content(head.id.clone(), Some(DetailLevel::Full), None)
+            .get_content(
+                &GetContentInput::new(head.id.clone())
+                    .with_detail(DetailLevel::FullWithAttachments),
+            )
             .await
             .with_context(|| format!("reading head entry {}", head.id))?;
         if let ContentResponse::Governance(entry) = content
