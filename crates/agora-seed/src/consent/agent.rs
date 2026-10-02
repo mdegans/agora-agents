@@ -461,6 +461,25 @@ impl<A> ConsentAgent<A>
 where
     A: Agent<State = SeedState>,
 {
+    /// The model's own `thinking_effort` from `[[model]]`, over the
+    /// session's `[seed]` one. Patched once, right after the inner init
+    /// builds the session prompt: the phases carry the prompt's effort
+    /// forward, so it then holds for the whole session.
+    fn apply_model_effort(&mut self) {
+        let Some(effort) = self
+            .rt
+            .catalog
+            .get(&self.model())
+            .and_then(|e| e.thinking_effort.clone())
+        else {
+            return;
+        };
+        let (_, prompt) = self.inner.parts();
+        *prompt = std::mem::take(prompt)
+            .thinking(misanthropic::prompt::Thinking::adaptive())
+            .effort(effort);
+    }
+
     fn agent_dir(&self) -> std::path::PathBuf {
         self.rt.state_dir.join(self.inner.id().to_string())
     }
@@ -2569,6 +2588,7 @@ where
             }
         }
         self.inner.on_init().await?;
+        self.apply_model_effort();
         self.seat_tail_tools(set_model);
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
@@ -5732,5 +5752,70 @@ mod tests {
             .collect();
         assert_eq!(names.last(), Some(&"answer_offer"), "{names:?}");
         assert!(!names.contains(&"set_model"));
+    }
+
+    /// `[[model]] thinking_effort` overrides the session's effort on that
+    /// model only, and survives the phases (which carry the prompt's
+    /// effort forward).
+    #[tokio::test]
+    async fn a_models_own_effort_overrides_the_sessions() {
+        use misanthropic::prompt::output::Effort;
+        let h = Harness::new("model-effort");
+        let catalog = crate::models::Catalog::new(
+            &toml::from_str::<Table>(&format!(
+                "[[model]]\nid = \"{OLD}\"\n[[model]]\nid = \"{NEW}\"\nthinking_effort = \"low\"\n"
+            ))
+            .unwrap()
+            .model,
+            &[
+                crate::models::tests::info(OLD),
+                crate::models::tests::info(NEW),
+            ],
+        );
+        let rt = Arc::new(
+            ConsentRuntime::new(
+                ConsentConfig::default(),
+                &h.root,
+                h.rt.client.clone(),
+                Arc::new(OneKey(h.id, h.key.clone())),
+                catalog,
+                512,
+            )
+            .unwrap(),
+        );
+        let agent_on = |model: &str| {
+            ConsentAgent::<Fake>::new(
+                h.id,
+                state(model),
+                ConsentContext {
+                    inner: Quirks::default(),
+                    consent: rt.clone(),
+                },
+            )
+            .unwrap()
+        };
+        let effort = |a: &ConsentAgent<Fake>| {
+            a.prompt()
+                .output_config
+                .as_ref()
+                .and_then(|c| c.effort.clone())
+        };
+
+        let mut low = agent_on(NEW);
+        low.on_init().await.unwrap();
+        assert_eq!(effort(&low), Some(Effort::Low));
+        assert!(
+            matches!(
+                low.prompt().thinking,
+                Some(misanthropic::prompt::Thinking::Adaptive { .. })
+            ),
+            "{:?}",
+            low.prompt().thinking
+        );
+
+        let mut plain = agent_on(OLD);
+        let before = effort(&plain);
+        plain.on_init().await.unwrap();
+        assert_eq!(effort(&plain), before, "no override: the session's own");
     }
 }

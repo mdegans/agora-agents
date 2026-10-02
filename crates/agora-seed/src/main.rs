@@ -611,7 +611,7 @@ impl SeedKnobs {
 /// accepts any string as `Custom`, which would let a typo through.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum EffortKnob {
+pub(crate) enum EffortKnob {
     Low,
     Medium,
     High,
@@ -620,7 +620,7 @@ enum EffortKnob {
 }
 
 impl EffortKnob {
-    fn into_effort(self) -> misanthropic::prompt::output::Effort {
+    pub(crate) fn into_effort(self) -> misanthropic::prompt::output::Effort {
         use misanthropic::prompt::output::Effort;
         match self {
             Self::Low => Effort::Low,
