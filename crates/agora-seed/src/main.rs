@@ -2017,6 +2017,7 @@ mod agent_selection_tests {
             attempts: 1,
             order: None,
             order_seed: None,
+            constrained: None,
             outcome: RoleOutcome::Answered {
                 answer,
                 applied,

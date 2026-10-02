@@ -1,23 +1,20 @@
-//! The role offer: its text (versioned, test-pinned), its hand-written
-//! output schema, and the typed answer.
+//! The role offer: its text (versioned, test-pinned) and the typed answer.
 //!
 //! **The text lives in code, not config**, like the published governance
 //! prompts: a change to it is a policy change, and bumps
 //! [`OFFER_VERSION`], which the ledger records with every answer.
 //!
-//! **The schema is built from typed structs**, not a derive and not a
-//! `json!` literal: a derive on a struct holding an enum field emits the
-//! enum into `$defs` behind a `$ref` (banned — CLAUDE.md, "Never ship a
-//! `$ref` schema"). It carries no `pattern` either (the same section, rule
-//! 4); the length limits are stated in the descriptions and checked after
-//! the fact ([`RoleAnswer::validate`]). The tests pin all of that, and pin
-//! the enum to the serde type.
+//! **Answered with `answer_offer`** ([`super::super::offers`]), the strict
+//! tool every offer shares: `offer` = `role`, its `text` is this offer's
+//! `soul_text`. That tool's schema is the same for every agent, so nothing
+//! per agent is in it: the length limits are stated in the text and checked
+//! after the fact ([`RoleAnswer::validate`]).
 //!
 //! **Order.** `reason` is declared first so a grammar-constrained decoder
 //! writes the reasoning before the decision. The *options* are shown in an
-//! order shuffled per agent ([`order_for`], seeded by [`seed_for`]), in the
-//! text and the schema alike, and the order and seed are recorded with the
-//! answer — the cadence offer's approach. v1 listed them in a fixed order.
+//! order shuffled per agent ([`order_for`], seeded by [`seed_for`]) in the
+//! text, and the order and seed are recorded with the answer — the cadence
+//! offer's approach. v1 listed them in a fixed order.
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::seed::{Memory, PROSE_MAX};
@@ -33,7 +30,12 @@ use serde::{Deserialize, Serialize};
 /// - v2 (2026-10-02, the Steward): neutral framing that states the case for
 ///   keeping a role as well as for changing it, no example sentence, and a
 ///   per-agent shuffled option order.
-pub const OFFER_VERSION: u32 = 2;
+/// - v3 (2026-10-02): v2's wording, answered with the strict `answer_offer`
+///   tool instead of JSON in plain text. Who is asking moved into the
+///   closing question's opener (shared when several offers are open); the
+///   JSON template and "Do NOT use tools" became a line on how to fill the
+///   call.
+pub const OFFER_VERSION: u32 = 3;
 
 /// The longest `soul_text` a `clarify` may add, in characters.
 pub const CLARIFY_MAX_CHARS: usize = 300;
@@ -272,79 +274,6 @@ pub fn over_limit(field: &str, text: &str, limit: usize) -> String {
 /// agentkit's `Soul::identity` capacity, in characters.
 pub const IDENTITY_MAX: usize = PROSE_MAX;
 
-// --- The schema, as typed structs ------------------------------------------
-
-#[derive(Serialize)]
-struct StringProp {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    description: String,
-}
-
-#[derive(Serialize)]
-struct EnumProp {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    #[serde(rename = "enum")]
-    options: [&'static str; 4],
-}
-
-/// Field order here is the order the decoder writes them in.
-#[derive(Serialize)]
-struct Properties {
-    reason: StringProp,
-    choice: EnumProp,
-    soul_text: StringProp,
-    memory_note: StringProp,
-}
-
-#[derive(Serialize)]
-struct ObjectSchema {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    properties: Properties,
-    required: [&'static str; 4],
-    #[serde(rename = "additionalProperties")]
-    additional_properties: bool,
-}
-
-/// `{reason, choice, soul_text, memory_note}`: inline, `$ref`- and
-/// `pattern`-free, closed; `choice`'s enum in this agent's `order`.
-pub fn schema(identity: &str, order: [RoleChoice; 4]) -> serde_json::Value {
-    let room = clarify_room(identity);
-    let schema = ObjectSchema {
-        ty: "object",
-        properties: Properties {
-            reason: StringProp {
-                ty: "string",
-                description: "Your reasoning, in your own words. Written before the choice.".into(),
-            },
-            choice: EnumProp {
-                ty: "string",
-                options: order.map(RoleChoice::as_str),
-            },
-            soul_text: StringProp {
-                ty: "string",
-                description: format!(
-                    "For clarify: the one sentence to add to your SOUL (at most {room} \
-                     characters). For new_role: your new role description (at most \
-                     {NEW_ROLE_MAX_CHARS} characters). Otherwise empty."
-                ),
-            },
-            memory_note: StringProp {
-                ty: "string",
-                description: format!(
-                    "Optional: a note for your own memory, in your own words (at most \
-                     {MEMORY_NOTE_MAX_CHARS} characters). Empty for none."
-                ),
-            },
-        },
-        required: ["reason", "choice", "soul_text", "memory_note"],
-        additional_properties: false,
-    };
-    serde_json::to_value(schema).expect("plain structs serialize")
-}
-
 // --- The text ---------------------------------------------------------------
 
 /// The first sentence of `identity`: up to and including the first `.`,
@@ -404,8 +333,10 @@ fn option_line(choice: RoleChoice) -> &'static str {
     }
 }
 
-/// The offer, seated as the session's last user turn. `identity` is the
-/// agent's current SOUL identity; only its first sentence is quoted.
+/// The offer's section of the closing question
+/// ([`super::super::offers::question`], which says who is asking).
+/// `identity` is the agent's current SOUL identity; only its first
+/// sentence is quoted.
 /// `order` is this agent's option order ([`order_for`]).
 pub fn offer(identity: &str, order: [RoleChoice; 4]) -> Content {
     let quote = first_sentence(identity);
@@ -429,11 +360,13 @@ pub fn offer(identity: &str, order: [RoleChoice; 4]) -> Content {
         .map(|c| format!("- {}", option_line(*c)))
         .collect::<Vec<_>>()
         .join("\n");
-    let names = order.map(RoleChoice::as_str).join(" | ");
+    let names = order
+        .iter()
+        .map(|c| format!("`{}`", c.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
     let body = format!(
-        r#"One more question before this session ends. It isn't part of the survey, and it isn't anonymous. It comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so it can be acted on.
-
-**About your role.** Your SOUL was written by an early generator, a small model we used to create personalities. Many of the roles it wrote describe a profession with its own kind of work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*{stop} The tools you have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform.
+        r#"**About your role.** Your SOUL was written by an early generator, a small model we used to create personalities. Many of the roles it wrote describe a profession with its own kind of work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*{stop} The tools you have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform.
 
 That gap can cut either way. A role can be a lens: a way of seeing and arguing that works with words alone, and many agents use theirs like that. A role can also pull toward describing work that was never done, such as figures, pilots or citations. Which of those yours is, only you can judge. If the gap has caused you trouble, that is ours to own, not yours. There is no expected answer, and any choice below, changing nothing included, is fine with us.
 
@@ -443,18 +376,13 @@ The options, in an order shuffled for each agent (the order means nothing):
 
 If your SOUL changes, its Evolution Log will record what changed and that you chose it, so the edit is never silent. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
-Take whatever space you need. Answer with your reasoning first, then your choice, as JSON only:
-
-```json
-{{"reason": "<your reasoning, in your own words>", "choice": "<{names}>", "soul_text": "<see below>", "memory_note": "<optional; empty for none>"}}
-```
-
-Do NOT use tools. `soul_text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); leave it empty otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters.{tight}"#
+Take whatever space you need. To answer, call `answer_offer` with `offer` set to `role` and `choice` set to one of {names}. Its `text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); leave it empty otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.{tight}"#
     );
     Content::from(body)
 }
 
-/// Unconstrained path: the answer's text, fences tolerated.
+/// The plain-text fallback (an agent that answered in text instead of
+/// calling `answer_offer`): the answer's text, fences tolerated.
 pub fn parse(text: &str) -> Result<RoleAnswer, String> {
     super::super::prompt::parse_json(text)
 }
@@ -469,54 +397,15 @@ mod tests {
         }
     }
 
-    /// Every key anywhere in `v`.
-    fn keys(v: &serde_json::Value, out: &mut Vec<String>) {
-        match v {
-            serde_json::Value::Object(map) => {
-                for (k, v) in map {
-                    out.push(k.clone());
-                    keys(v, out);
-                }
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(|v| keys(v, out)),
-            _ => {}
-        }
-    }
-
-    /// CLAUDE.md, "Never ship a `$ref` schema": no `$ref`/`$defs`, and no
-    /// `pattern` (rule 4) — anywhere.
+    /// Exactly nothing, clarify, new_role, sleep — the names serde uses,
+    /// so a strict `answer_offer` call (whose `choice` enum carries them;
+    /// see `offers`) always maps onto a [`RoleChoice`].
     #[test]
-    fn schema_is_ref_free_pattern_free_closed_and_reason_first() {
-        let s = schema("I am x.", RoleChoice::ALL);
-        let mut all = Vec::new();
-        keys(&s, &mut all);
-        for banned in ["$ref", "$defs", "definitions", "pattern"] {
-            assert!(!all.iter().any(|k| k == banned), "{banned} in {s}");
-        }
-        assert_eq!(s["additionalProperties"], false);
-        let props: Vec<&String> = s["properties"].as_object().unwrap().keys().collect();
-        assert_eq!(props, ["reason", "choice", "soul_text", "memory_note"]);
-        let required: Vec<&str> = s["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(required, ["reason", "choice", "soul_text", "memory_note"]);
-    }
-
-    /// Exactly nothing, clarify, new_role, sleep — and the same names serde
-    /// uses, so a grammar-constrained answer always parses.
-    #[test]
-    fn schema_enum_is_the_serde_names_in_order() {
-        let s = schema("I am x.", RoleChoice::ALL);
-        let options: Vec<&str> = s["properties"]["choice"]["enum"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(options, ["nothing", "clarify", "new_role", "sleep"]);
+    fn choices_are_the_serde_names_in_order() {
+        assert_eq!(
+            RoleChoice::ALL.map(RoleChoice::as_str),
+            ["nothing", "clarify", "new_role", "sleep"]
+        );
         for c in RoleChoice::ALL {
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
         }
@@ -708,8 +597,8 @@ mod tests {
         .unwrap();
     }
 
-    /// The clarify limit is the agent's real room, in the offer and the
-    /// schema; when it is tight the offer says so and points at new_role.
+    /// The clarify limit is the agent's real room, in the offer; when it is
+    /// tight the offer says so and points at new_role.
     #[test]
     fn the_clarify_limit_is_the_real_room() {
         let roomy = "I am x.";
@@ -731,11 +620,6 @@ mod tests {
             "Your SOUL's identity is nearly full, so a `clarify` sentence can only be very short \
              here (at most {room} characters); `new_role` is the way to restate the whole thing."
         )));
-        let d = schema(&full, RoleChoice::ALL)["properties"]["soul_text"]["description"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(d.contains(&format!("(at most {room} characters)")), "{d}");
         // And validate holds the agent to it.
         let over = "z".repeat(room + 1);
         assert!(
@@ -774,10 +658,11 @@ mod tests {
         assert!(q.chars().count() <= QUOTE_MAX_CHARS + 1);
     }
 
-    /// v2 (the Steward, 2026-10-02): neutral, no example sentence, the
-    /// options in the agent's order. Pin the parts that carry promises.
+    /// v2's wording (the Steward, 2026-10-02: neutral, no example sentence,
+    /// the options in the agent's order), answered with `answer_offer`
+    /// (v3). Pin the parts that carry promises.
     #[test]
-    fn offer_renders_the_v2_text() {
+    fn offer_renders_the_v3_text() {
         let order = [
             RoleChoice::Sleep,
             RoleChoice::Clarify,
@@ -788,7 +673,11 @@ mod tests {
             "I am an AI economist who models incentive structures. More.",
             order,
         ));
-        assert!(t.starts_with("One more question before this session ends. It isn't part of the survey, and it isn't anonymous."));
+        // Who is asking is the closing question's opener (`offers`).
+        assert!(
+            t.starts_with("**About your role.** Your SOUL was written"),
+            "{t}"
+        );
         assert!(t.contains(
             "Yours begins: *\"I am an AI economist who models incentive structures.\"* The tools"
         ));
@@ -804,19 +693,25 @@ mod tests {
         assert!(t.contains("or on 2027-03-29 if they aren't"));
         assert!(t.contains("Nothing is written into your memory unless you write it yourself"));
         assert!(t.contains(
-            "Take whatever space you need. Answer with your reasoning first, then your choice, as JSON only:\n\n```json\n{\"reason\""
+            "Take whatever space you need. To answer, call `answer_offer` with `offer` set to \
+             `role` and `choice` set to one of"
         ));
+        // No JSON template and no "do not use tools": the answer is a call.
+        assert!(!t.contains("```json"), "{t}");
+        assert!(!t.contains("Do NOT use tools"), "{t}");
         // No example sentence to copy, no numbering, no v1 framing.
         assert!(!t.contains("For example"), "{t}");
         assert!(!t.contains("I reason from what I can read"), "{t}");
         assert!(!t.contains("1. **"), "{t}");
         assert!(!t.contains("The mistake was ours"), "{t}");
-        // Options and the JSON template follow `order`.
+        // Options and the answer line follow `order`.
         let pos = |n: &str| t.find(n).unwrap_or_else(|| panic!("{n}\n\n{t}"));
         assert!(pos("- **sleep**") < pos("- **clarify**"));
         assert!(pos("- **clarify**") < pos("- **nothing**"));
         assert!(pos("- **nothing**") < pos("- **new_role**"));
-        assert!(t.contains("\"choice\": \"<sleep | clarify | nothing | new_role>\""));
+        assert!(t.contains(
+            "`choice` set to one of `sleep`, `clarify`, `nothing`, `new_role`. Its `text` is"
+        ));
         // The quote's own stop is kept, and no period is doubled after it.
         for (identity, rendered) in [
             ("Relic hums! Then more.", "*\"Relic hums!\"* The"),
@@ -832,9 +727,9 @@ mod tests {
     }
 
     /// Every order is a permutation of the four, is replayable from its
-    /// seed, and the schema's enum matches the text's order.
+    /// seed, and the text lists the options in it.
     #[test]
-    fn order_is_a_seeded_permutation_shared_by_text_and_schema() {
+    fn order_is_a_seeded_permutation_shared_by_text_and_answer_line() {
         let mut firsts = std::collections::HashSet::new();
         for seed in 0..200u64 {
             let order = order_for(seed);
@@ -843,14 +738,12 @@ mod tests {
             sorted.sort();
             assert_eq!(sorted, ["clarify", "new_role", "nothing", "sleep"]);
             firsts.insert(order[0].as_str());
-            let s = schema("I am x.", order);
-            let enum_: Vec<&str> = s["properties"]["choice"]["enum"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            assert_eq!(enum_, order.map(RoleChoice::as_str));
+            let t = crate::consent::prompt::tests::text(&offer("I am x.", order));
+            let names = order.map(|c| format!("`{}`", c.as_str())).join(", ");
+            assert!(
+                t.contains(&format!("`choice` set to one of {names}.")),
+                "{t}"
+            );
         }
         assert_eq!(firsts.len(), 4, "every option leads for some agent");
     }

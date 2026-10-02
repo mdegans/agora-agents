@@ -57,21 +57,39 @@
 //! why and when. One change per session; nothing is asked after one. Each post or comment the session wrote is logged as a
 //! `write_recorded` event at teardown, with the dump's `prompt_sha256`.
 //!
-//! **The role offer** ([`super::role`]) is asked at the same point, by the
-//! same machinery (retries, parse, constrained output), but only in a
-//! session where the model-swap half did nothing — no question, switch,
-//! review, trial end or retried change, and not mid-trial — so a session
-//! asks at most one question. Its answer is applied at teardown into the
-//! same patched state: the SOUL edit and its Evolution Log disclosure, and
-//! the agent's own memory note if it wrote one. Its ledger is
-//! `role_consent.json`.
+//! **The role offer** ([`super::role`]) is put at the same point, in a
+//! session where the model-swap half did nothing else — no switch, review,
+//! trial end or retried change, and not mid-trial. Its answer is applied at
+//! teardown into the same patched state: the SOUL edit and its Evolution
+//! Log disclosure, and the agent's own memory note if it wrote one. Its
+//! ledger is `role_consent.json`.
 //!
-//! **The cadence offer** ([`super::cadence`]) comes last, in a session where
-//! neither the model-swap half nor the role offer asked anything. It differs
-//! from the role offer in that **the first parsed `choice` wins** — a
-//! malformed answer is never re-asked into a different one. Only a missing or invalid
+//! **The cadence offer** ([`super::cadence`]) likewise. It differs from the
+//! role offer in that **the first parsed `choice` wins** — a malformed
+//! answer is never re-asked into a different one. Only a missing or invalid
 //! `choice` is asked again, once ([`CADENCE_MAX_ATTEMPTS`]), and every
 //! attempt goes into its ledger, `cadence_consent.json`.
+//!
+//! **Answering: `answer_offer`** ([`super::offers`]). Every offer due at the
+//! close — the model-swap offer, the role offer, the cadence offer, any
+//! combination — is seated in **one** question turn, each under a heading
+//! naming its key, and answered by calling the strict `answer_offer` tool
+//! once per offer, in one turn (parallel calls) or across several. The tool
+//! is registered for every agent at init, byte-identical, just before
+//! `set_model` (which stays last), so the tool list never changes
+//! mid-session and is the same bytes cohort-wide; with no offer open, a call
+//! is refused ("no offer is pending"). `tool_choice` is never touched (a
+//! change would invalidate the messages cache). While offers are open the
+//! wrapper answers the calls itself: an offer that isn't open, or a choice
+//! that offer doesn't have, gets an error result; otherwise the offer's own
+//! validation runs and its answer is recorded in its own ledger exactly as
+//! before. A call that fails counts against that offer's budget
+//! ([`MAX_ATTEMPTS`], or [`CADENCE_MAX_ATTEMPTS`]), as does a turn clipped
+//! at `max_tokens`. A turn that ends with an offer still open (text, or
+//! nothing) gets **one reminder**; still open after it, it is no answer.
+//! If only one offer is open and the agent answered it in plain text, that
+//! text is parsed leniently as before (the fallback); one that doesn't
+//! parse is such an unanswered turn.
 
 use std::sync::Arc;
 
@@ -82,12 +100,13 @@ use agora_agentkit::reactor::inference::Quirks;
 use agora_agentkit::reactor::seed::{Memory, SeedState, Soul};
 use agora_agentkit::reactor::{Agent, Control, Outcome};
 use chrono::{DateTime, Utc};
+use misanthropic::model::Model;
 use misanthropic::model::ModelInfo;
 use misanthropic::prompt::Prompt;
 use misanthropic::prompt::message::{Block, Content, Role};
 use misanthropic::prompt::output::OutputConfig;
 use misanthropic::response::{self, JsonError, StopReason};
-use misanthropic::tool::{Notifications, ToolBox};
+use misanthropic::tool::{self as mtool, Notifications, ToolBox, Use};
 
 use super::ConsentRuntime;
 use super::cadence::{
@@ -98,16 +117,20 @@ use super::cadence::{
 use super::comparison;
 use super::forks;
 use super::ledger::{Change, Due, Ledger, OfferKey, OfferNames, Switch, SwitchCause};
-use super::prompt::{self as text, OfferText, ReviewText};
+use super::offers::{self, Args, OfferKind, Section};
+use super::prompt::{self as text, OfferAnswer, OfferChoice, OfferText, ReviewText};
 use super::queue::{self, QueueEntry};
 use super::role::{
     self,
     ledger::{Applied, RoleAsk, RoleLedger, RoleOutcome},
+    prompt::{RoleAnswer, RoleChoice},
 };
 use super::switch::{self, SetModel, SwitchError};
 use crate::alerts::{Alert, AlertKind};
 
-/// Answers per question per session: the first plus two retries.
+/// Answers per question per session: the first plus two retries. For an
+/// offer, the unusable ones it may take: refused `answer_offer` calls,
+/// clipped turns, unanswered turns (of which it gets one reminder).
 pub const MAX_ATTEMPTS: u32 = 3;
 
 /// Answers to the cadence offer per session: the first, plus one more only
@@ -137,7 +160,7 @@ pub struct ConsentContext<C> {
 enum Phase {
     /// The inner agent owns the session.
     Inner,
-    /// The closing question is seated; the next response answers it.
+    /// The trial review is seated; the next response answers it.
     /// `constrained` records whether it went out with the schema as
     /// `output_config` — it decides how the answer is parsed. `attempt`
     /// counts from 1.
@@ -146,33 +169,164 @@ enum Phase {
         constrained: bool,
         attempt: u32,
     },
-    /// The role offer ([`super::role`]) is seated; the same rules.
-    AskingRole {
-        constrained: bool,
-        attempt: u32,
-        order: [role::prompt::RoleChoice; 4],
+    /// The closing question is seated: these offers are still open, to be
+    /// answered with `answer_offer`.
+    Offers { open: Vec<Open> },
+}
+
+/// What the model-swap half of [`ConsentAgent::close`] did.
+enum Closing {
+    /// The model-swap offer is due: put it, with any other offer due.
+    Due(OfferKey),
+    /// Did something this session (a switch, a review, a trial ended, a
+    /// change retried), or the agent is mid-trial: nothing more is asked.
+    Busy,
+    /// Nothing: the role and cadence offers may be put.
+    Idle,
+}
+
+/// An offer seated in the closing question and not yet settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Open {
+    offer: Pending,
+    /// Answers to it that couldn't be used: refused calls, turns clipped at
+    /// `max_tokens`, unanswered turns. At its budget it is no answer.
+    failed: u32,
+    /// Whether it has had its one reminder.
+    reminded: bool,
+    /// The latest failure, for the no-answer record.
+    last_failure: Option<String>,
+}
+
+/// Which offer, with what its record needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pending {
+    ModelSwap(OfferKey),
+    /// `order` is the option order shown (from `seed`).
+    Role {
+        order: [RoleChoice; 4],
         seed: u64,
     },
-    /// The cadence offer ([`super::cadence`]) is seated. `order` is the
-    /// option order shown (from `seed`); `attempts` so far, verbatim.
-    AskingCadence {
-        constrained: bool,
-        attempt: u32,
+    /// `order` as for the role offer; `attempts` so far, verbatim.
+    Cadence {
         order: [CadenceChoice; 3],
         seed: u64,
         attempts: Vec<Attempt>,
     },
 }
 
-/// What the model-swap half of [`ConsentAgent::close`] did.
-enum Closing {
-    /// Seated a question.
-    Asked(Control),
-    /// Did something this session (a switch, a review, a trial ended, a
-    /// change retried), or the agent is mid-trial: nothing more is asked.
-    Busy,
-    /// Nothing: the role offer may be asked.
-    Idle,
+impl Pending {
+    fn kind(&self) -> OfferKind {
+        match self {
+            Self::ModelSwap(_) => OfferKind::ModelSwap,
+            Self::Role { .. } => OfferKind::Role,
+            Self::Cadence { .. } => OfferKind::Cadence,
+        }
+    }
+
+    /// Unusable answers before it is no answer.
+    fn budget(&self) -> u32 {
+        match self {
+            Self::Cadence { .. } => CADENCE_MAX_ATTEMPTS,
+            _ => MAX_ATTEMPTS,
+        }
+    }
+
+    /// Its options, in the order shown, as `` `a`, `b` or `c` ``.
+    fn choices(&self) -> String {
+        let names: Vec<String> = match self {
+            Self::ModelSwap(_) => offers::MODEL_SWAP_CHOICES
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect(),
+            Self::Role { order, .. } => order.iter().map(|c| format!("`{}`", c.as_str())).collect(),
+            Self::Cadence { order, .. } => {
+                order.iter().map(|c| format!("`{}`", c.as_str())).collect()
+            }
+        };
+        match names.as_slice() {
+            [init @ .., last] if !init.is_empty() => format!("{} or {last}", init.join(", ")),
+            _ => names.join(""),
+        }
+    }
+}
+
+impl Open {
+    fn new(offer: Pending) -> Self {
+        Self {
+            offer,
+            failed: 0,
+            reminded: false,
+            last_failure: None,
+        }
+    }
+
+    fn kind(&self) -> OfferKind {
+        self.offer.kind()
+    }
+
+    fn exhausted(&self) -> bool {
+        self.failed >= self.offer.budget()
+    }
+
+    /// Count an unusable answer; the cadence offer keeps it verbatim.
+    fn fail(&mut self, reason: &str, raw: &str) {
+        self.failed += 1;
+        self.last_failure = Some(reason.to_string());
+        if let Pending::Cadence { attempts, .. } = &mut self.offer {
+            attempts.push(Attempt {
+                raw: raw.to_string(),
+                failure: Some(reason.to_string()),
+            });
+        }
+    }
+
+    /// Why it ended unanswered, for its record.
+    fn missed(&self) -> String {
+        format!(
+            "{} (after {} attempts)",
+            self.last_failure.as_deref().unwrap_or("not answered"),
+            self.failed
+        )
+    }
+}
+
+/// An answer an offer took.
+enum Accepted {
+    ModelSwap(OfferAnswer),
+    Role(RoleAnswer),
+    Cadence(Taken),
+}
+
+impl Accepted {
+    fn choice(&self) -> &'static str {
+        match self {
+            Self::ModelSwap(a) => match a.choice {
+                OfferChoice::NoSwap => "no_swap",
+                OfferChoice::Trial => "trial",
+                OfferChoice::Permanent => "permanent",
+            },
+            Self::Role(a) => a.choice.as_str(),
+            Self::Cadence(Taken::Clean(a) | Taken::NoteDropped(a, _)) => a.choice.as_str(),
+            Self::Cadence(Taken::Salvaged { choice, .. }) => choice.as_str(),
+        }
+    }
+}
+
+/// How an offer ended this session.
+enum Settle {
+    /// `constrained`: by a call to the strict tool, or (`false`) parsed from
+    /// plain text.
+    Answered {
+        accepted: Accepted,
+        constrained: bool,
+    },
+    /// The agent's explicit refusal: final.
+    Refused(String),
+    /// A turn paused on a server tool: no answer, not a refusal.
+    Paused,
+    /// Its budget spent, or unanswered after its reminder (why).
+    Missed(String),
 }
 
 /// Why an answer couldn't be used, and whether it's worth another try.
@@ -280,6 +434,9 @@ pub struct ConsentAgent<A> {
     /// SOUL and memory from before the cadence answer was written into the
     /// patched state, put back if the cadence ledger can't be saved.
     cadence_undo: Option<(Soul, Memory)>,
+    /// The cadence line and note as written into the patched state, to
+    /// write again if the role answer (written before it) is taken out.
+    cadence_written: Option<(Option<String>, Option<String>)>,
 }
 
 /// A post or comment written this session.
@@ -320,21 +477,28 @@ where
         )
     }
 
-    /// Register `set_model` and put its definition **last** in the prompt's
-    /// `tools`: after the toolbox's own (which `ToolBox::prepare` lists from
-    /// a `HashMap`, so a tool pushed before it lands first or last at
-    /// random) and after the server tools the inner init appends. The tool
-    /// list leads the request, ahead of the system prompt, so its bytes have
-    /// to be the same for every agent on the model for the shared cache
-    /// prefix to hold. Runs once, from `on_init`, before the first request:
-    /// the prefix is never changed mid-session.
-    fn seat_set_model(&mut self, tool: SetModel) {
+    /// Register `answer_offer` and `set_model` (when the run offers a
+    /// choice) and put their definitions **last** in the prompt's `tools`,
+    /// in that order: after the toolbox's own (which `ToolBox::prepare`
+    /// lists from a `HashMap`, so a tool pushed before it lands first or
+    /// last at random) and after the server tools the inner init appends.
+    /// The tool list leads the request, ahead of the system prompt, so its
+    /// bytes have to be the same for every agent on the model for the
+    /// shared cache prefix to hold. Runs once, from `on_init`, before the
+    /// first request: the prefix is never changed mid-session. `set_model`
+    /// stays last, where it was before `answer_offer` existed, so the
+    /// prefix up to it is unchanged but for the one new definition.
+    fn seat_tail_tools(&mut self, set_model: Option<SetModel>) {
         use misanthropic::tool::Tool;
-        let defs = tool.definitions();
+        let mut defs = offers::AnswerOffer.definitions();
         let (tools, prompt) = self.inner.parts();
-        tools.push(tool);
+        tools.push(offers::AnswerOffer);
+        if let Some(tool) = set_model {
+            defs.extend(tool.definitions());
+            tools.push(tool);
+        }
         let list = prompt.tools.get_or_insert_default();
-        list.retain(|d| d.name() != switch::TOOL_NAME);
+        list.retain(|d| d.name() != switch::TOOL_NAME && d.name() != offers::TOOL_NAME);
         list.extend(defs);
     }
 
@@ -477,8 +641,9 @@ where
         }
     }
 
-    /// Seat the question with its budget and — where changing
-    /// `output_config` keeps the prefix cache (blallama) — its schema.
+    /// Seat the trial review with its budget and — where changing
+    /// `output_config` keeps the prefix cache (blallama) — its schema. (The
+    /// end-of-session offers go out as [`Self::seat_offers`] instead.)
     fn seat_question(
         &mut self,
         due: Due,
@@ -586,22 +751,39 @@ where
     }
 
     /// The inner session completed cleanly: the model-swap machinery
-    /// first ([`close_model`](Self::close_model)); only if it did nothing,
-    /// the role offer. One question per session. `None` means nothing is
-    /// asked — the session ends.
+    /// first ([`close_model`](Self::close_model)); unless it was busy, every
+    /// offer due — the model-swap offer, the role offer, the cadence offer —
+    /// is put in one question turn. `None` means nothing is asked — the
+    /// session ends.
     async fn close(&mut self) -> Result<Option<Control>, A::Error> {
-        match self.close_model().await? {
-            Closing::Asked(control) => Ok(Some(control)),
-            Closing::Busy => Ok(None),
-            Closing::Idle => match self.ask_role()? {
-                Some(control) => Ok(Some(control)),
-                None => self.ask_cadence(),
-            },
+        let swap = match self.close_model().await? {
+            Closing::Busy => return Ok(None),
+            Closing::Due(key) => Some(key),
+            Closing::Idle => None,
+        };
+        let mut sections = Vec::new();
+        let mut open = Vec::new();
+        if let Some(key) = swap {
+            let (section, offer) = self.model_swap_section(key);
+            sections.push(section);
+            open.push(offer);
         }
+        if let Some((section, offer)) = self.role_section() {
+            sections.push(section);
+            open.push(offer);
+        }
+        if let Some((section, offer)) = self.cadence_section() {
+            sections.push(section);
+            open.push(offer);
+        }
+        if open.is_empty() {
+            return Ok(None);
+        }
+        self.seat_offers(sections, open).map(Some)
     }
 
     /// Count the session toward any trial, end a trial that has run its
-    /// course, retry a change still waiting, or ask a due offer.
+    /// course, retry a change still waiting, or report the offer due.
     async fn close_model(&mut self) -> Result<Closing, A::Error> {
         let model = self.model();
         let now = Utc::now();
@@ -617,14 +799,14 @@ where
         let switched = self.switched();
         let started = self.started;
         // No ledger means it exists but can't be read: the agent may be
-        // mid-trial, so the role offer waits too.
+        // mid-trial, so the other offers wait too.
         let Some(ledger) = self.ledger.as_mut() else {
             return Ok(Closing::Busy);
         };
         self.dirty |= ledger.count_session(&model);
         self.dirty |= ledger.count_since_switch(started);
-        // One change per session, and one question: nothing after a switch
-        // or a review.
+        // One change per session: nothing is asked after a switch or a
+        // review.
         if switched || self.reviewed {
             return Ok(Closing::Busy);
         }
@@ -656,131 +838,749 @@ where
             self.apply_consented(&change, now, false).await;
             return Ok(Closing::Busy);
         }
-        let Some(due) = ledger.due(&model, offer_key.as_ref()) else {
+        match ledger.due(&model, offer_key.as_ref()) {
+            Some(due) => Ok(Closing::Due(due.key().clone())),
             // Mid-trial, the trial is the agent's open question.
-            return Ok(if ledger.trial_line(&model).is_some() {
-                Closing::Busy
-            } else {
-                Closing::Idle
-            });
-        };
+            None if ledger.trial_line(&model).is_some() => Ok(Closing::Busy),
+            None => Ok(Closing::Idle),
+        }
+    }
+
+    /// The model-swap offer's section of the closing question.
+    fn model_swap_section(&self, key: OfferKey) -> (Section, Open) {
         let offer = self
             .rt
             .offer
             .as_ref()
             .expect("due offers need one configured");
-        let content = text::offer(OfferText {
+        let body = text::offer(OfferText {
             from_name: offer.source_name(),
             to_name: offer.target_name(),
             description: &offer.description,
             limited: offer.is_limited(),
         });
-        self.seat_question(due, content, text::offer_schema())
-            .map(Closing::Asked)
+        tracing::info!(
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            question = "offer",
+            from = %key.from,
+            to = %key.to,
+            constrained = true,
+            "model-consent question seated"
+        );
+        (
+            Section {
+                kind: OfferKind::ModelSwap,
+                body,
+            },
+            Open::new(Pending::ModelSwap(key)),
+        )
     }
 
-    /// Seat the role offer, if this agent is listed and it is due.
-    fn ask_role(&mut self) -> Result<Option<Control>, A::Error> {
+    /// The role offer's section, if this agent is listed and it is due.
+    fn role_section(&self) -> Option<(Section, Open)> {
         let soul = &self.inner.state().soul;
         if !self.role_ledger.as_ref().is_some_and(|l| l.due(soul)) {
-            return Ok(None);
+            return None;
         }
-        let identity = self.inner.state().soul.identity.to_string();
+        let identity = soul.identity.to_string();
         let seed = role::prompt::seed_for(self.inner.id());
         let order = role::prompt::order_for(seed);
-        let content = role::prompt::offer(&identity, order);
-        let constrained = self.constrain(role::prompt::schema(&identity, order));
-        let (_, prompt) = self.inner.parts();
-        Self::seat_user(prompt, content)?;
+        let body = role::prompt::offer(&identity, order);
         tracing::info!(
             event_type = "role_consent_seated",
-            agent = %self.inner.state().soul.name,
+            agent = %soul.name,
             agent_id = %self.inner.id(),
             question = "role",
             offer_version = role::prompt::OFFER_VERSION,
-            order = ?order.map(role::prompt::RoleChoice::as_str),
+            order = ?order.map(RoleChoice::as_str),
             order_seed = seed,
-            constrained,
+            constrained = true,
             "role-consent question seated"
         );
-        self.phase = Phase::AskingRole {
-            constrained,
-            attempt: 1,
-            order,
-            seed,
-        };
-        Ok(Some(Control::Continue))
+        Some((
+            Section {
+                kind: OfferKind::Role,
+                body,
+            },
+            Open::new(Pending::Role { order, seed }),
+        ))
     }
 
-    /// One response to the role offer: the model-swap rules (retry an
-    /// unusable answer, up to [`MAX_ATTEMPTS`]; a refusal is final), plus
-    /// [`RoleAnswer::validate`] — an answer that can't be applied as given
-    /// (empty or over-long text) is relayed back like a malformed one, and
-    /// if every attempt fails it is no answer: nothing changes. Nothing is
-    /// applied here: the SOUL edit and the memory note are written into the
-    /// state the reactor saves, at teardown.
-    ///
-    /// [`RoleAnswer::validate`]: role::prompt::RoleAnswer::validate
-    async fn answer_role(
-        &mut self,
-        constrained: bool,
-        attempt: u32,
-        order: [role::prompt::RoleChoice; 4],
-        seed: u64,
-        response: response::Message,
-    ) -> Result<Control, A::Error> {
-        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
-        let identity = self.inner.state().soul.identity.to_string();
-        let memory = self.inner.state().memory.clone();
-        let result = parse(&response, constrained, role::prompt::parse).and_then(|answer| {
-            answer
-                .validate(&identity, &memory)
-                .map(|()| answer)
-                .map_err(|e| Failure::new(e, Retry::Unusable))
-        });
-        if let Err(failure) = &result
-            && failure.retry != Retry::No
-        {
-            tracing::warn!(
-                event_type = "role_consent_malformed",
-                agent = %agent,
-                agent_id = %agent_id,
-                model = %response.model,
-                constrained,
-                attempt,
-                stop_reason = ?response.stop_reason,
-                output_tokens = response.usage.output_tokens,
-                failure = %failure.reason,
-                raw = %raw_text(&response),
-                "role-consent answer unusable"
-            );
+    /// The cadence offer's section, if this agent is admitted and it is
+    /// due: the options in this agent's seeded order.
+    fn cadence_section(&self) -> Option<(Section, Open)> {
+        let rounds = self.rt.cadence.as_ref()?.rounds;
+        let soul = &self.inner.state().soul;
+        if !self.cadence_ledger.as_ref().is_some_and(|l| l.due(soul)) {
+            return None;
         }
-        if let Err(failure) = &result
-            && attempt < MAX_ATTEMPTS
-            && let Some(note) = failure.retry_note()
-        {
-            let (_, prompt) = self.inner.parts();
-            Self::seat_user(prompt, Content::from(note))?;
-            self.phase = Phase::AskingRole {
-                constrained,
-                attempt: attempt + 1,
+        let seed = cadence::prompt::seed_for(self.inner.id());
+        let order = cadence::prompt::order_for(seed);
+        let body = cadence::prompt::offer(rounds, order);
+        tracing::info!(
+            event_type = "cadence_consent_seated",
+            agent = %soul.name,
+            agent_id = %self.inner.id(),
+            question = "cadence",
+            offer_version = cadence::prompt::OFFER_VERSION,
+            order = ?order.map(CadenceChoice::as_str),
+            order_seed = seed,
+            rounds,
+            constrained = true,
+            "cadence-consent question seated"
+        );
+        Some((
+            Section {
+                kind: OfferKind::Cadence,
+                body,
+            },
+            Open::new(Pending::Cadence {
                 order,
                 seed,
-            };
-            return Ok(Control::Continue);
-        }
+                attempts: Vec::new(),
+            }),
+        ))
+    }
 
-        let outcome = match result {
-            Ok(answer) => {
+    /// Seat the closing question with the question budget. Nothing a cache
+    /// keys on changes — not `output_config`, not `tool_choice`, not the
+    /// tools — only `max_tokens`, which no cache keys on (misanthropic's
+    /// `CachedPrompt::set_max_tokens`): the answer's shape comes from the
+    /// strict `answer_offer`, registered since init.
+    fn seat_offers(
+        &mut self,
+        sections: Vec<Section>,
+        open: Vec<Open>,
+    ) -> Result<Control, A::Error> {
+        let max_tokens = self.rt.max_tokens;
+        let (_, prompt) = self.inner.parts();
+        prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
+        Self::seat_user(prompt, offers::question(sections))?;
+        tracing::info!(
+            event_type = "offers_seated",
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            offers = ?open.iter().map(|o| o.kind().as_str()).collect::<Vec<_>>(),
+            "end-of-session offers seated"
+        );
+        self.phase = Phase::Offers { open };
+        Ok(Control::Continue)
+    }
+
+    /// One response while offers are open. A clipped turn counts against
+    /// every open offer's budget; a refusal or a paused turn ends them all;
+    /// `answer_offer` calls are answered one by one ([`Self::offer_call`]);
+    /// plain text is the fallback for a single open offer
+    /// ([`Self::offer_text`]); anything else is an unanswered turn
+    /// ([`Self::unanswered`]).
+    async fn answer_offers(
+        &mut self,
+        mut open: Vec<Open>,
+        response: response::Message,
+    ) -> Result<Control, A::Error> {
+        let raw = raw_text(&response);
+        match response.stop_reason {
+            Some(StopReason::MaxTokens) => {
+                // Nothing from a clipped turn is seated or dispatched: a
+                // truncated `tool_use` can parse yet be missing arguments.
+                let reason = "clipped at max_tokens";
+                for o in &mut open {
+                    self.log_unusable(o.kind(), reason, &response, &raw);
+                    o.fail(reason, &raw);
+                }
+                let open = self.settle_spent(open, &response, &raw).await;
+                if open.is_empty() {
+                    return Ok(Control::Done(Outcome::Complete));
+                }
+                let (_, prompt) = self.inner.parts();
+                Self::seat_user(
+                    prompt,
+                    Content::from(
+                        "Your answer was cut off at the length limit and discarded. Answer again, \
+                         more briefly, by calling `answer_offer`.",
+                    ),
+                )?;
+                self.phase = Phase::Offers { open };
+                return Ok(Control::Continue);
+            }
+            // Only the agent's own refusal is final. A turn paused on a
+            // server tool is no answer, asked again next session.
+            Some(StopReason::PauseTurn) | Some(StopReason::Refusal) => {
+                let refused = matches!(response.stop_reason, Some(StopReason::Refusal));
+                for o in open {
+                    let settle = if refused {
+                        Settle::Refused("refusal".into())
+                    } else {
+                        Settle::Paused
+                    };
+                    self.settle(o, settle, &response, &raw).await;
+                }
+                return Ok(Control::Done(Outcome::Complete));
+            }
+            _ => {}
+        }
+        let calls: Vec<Use> = response
+            .inner
+            .content
+            .iter()
+            .filter_map(|block| block.tool_use().cloned())
+            .collect();
+        if !calls.is_empty() {
+            return self.offer_calls(open, response, calls).await;
+        }
+        if let [_] = open.as_slice() {
+            let only = open.pop().expect("one");
+            return self.offer_text(only, response).await;
+        }
+        let reason = "not answered: no `answer_offer` call for it";
+        self.unanswered(open, &response, reason).await
+    }
+
+    /// A turn with tool calls: seat it, answer each call, and seat the
+    /// results as one user turn. A turn whose calls touched no open offer
+    /// is an unanswered turn.
+    async fn offer_calls(
+        &mut self,
+        mut open: Vec<Open>,
+        response: response::Message,
+        calls: Vec<Use>,
+    ) -> Result<Control, A::Error> {
+        let (_, prompt) = self.inner.parts();
+        prompt
+            .push_message(response.inner.clone())
+            .map_err(|e| A::Error::from(Box::new(e)))?;
+        let mut results = Vec::with_capacity(calls.len());
+        let mut addressed = false;
+        for call in calls {
+            let (result, hit) = self.offer_call(&mut open, call, &response).await;
+            addressed |= hit;
+            results.push(Block::from(result));
+        }
+        let (_, prompt) = self.inner.parts();
+        prompt
+            .push_message((Role::User, results))
+            .map_err(|e| A::Error::from(Box::new(e)))?;
+        if open.is_empty() {
+            return Ok(Control::Done(Outcome::Complete));
+        }
+        if !addressed {
+            let reason = "not answered: no usable `answer_offer` call for it";
+            return self.unanswered(open, &response, reason).await;
+        }
+        self.phase = Phase::Offers { open };
+        Ok(Control::Continue)
+    }
+
+    /// One call while offers are open, and whether it touched an open
+    /// offer. Any tool but `answer_offer` is refused (the session's work is
+    /// done); a call naming an offer that isn't open, or a choice that offer
+    /// doesn't have, gets an error result listing what would do; otherwise
+    /// the offer's own checks run and its answer is recorded.
+    async fn offer_call(
+        &mut self,
+        open: &mut Vec<Open>,
+        call: Use,
+        response: &response::Message,
+    ) -> (mtool::Result, bool) {
+        let id = call.id.clone();
+        let error = |text: String| mtool::Result::new(id.clone(), Content::from(text)).error();
+        let kinds: Vec<OfferKind> = open.iter().map(Open::kind).collect();
+        let still_open = offers::key_list(&kinds);
+        if call.name != offers::TOOL_NAME {
+            return (
+                error(format!(
+                    "`{}` can't be used now: this session's work is done. Only `answer_offer` is \
+                     open, for {still_open}.",
+                    call.name
+                )),
+                false,
+            );
+        }
+        let raw = cap(call.input.to_string());
+        let head = match serde_json::from_value::<offers::Head>(call.input.clone()) {
+            Ok(head) => head,
+            Err(e) => {
+                return (
+                    error(format!(
+                        "Could not read the arguments: {e}. Open: {still_open}."
+                    )),
+                    false,
+                );
+            }
+        };
+        let Some(i) = open.iter().position(|o| o.kind() == head.offer) else {
+            return (
+                error(format!(
+                    "No `{}` offer is open; open: {still_open}.",
+                    head.offer.as_str()
+                )),
+                false,
+            );
+        };
+        let kind = head.offer;
+        let (accepted, ignored) = match serde_json::from_value::<Args>(call.input) {
+            Err(e) => (Err(format!("could not read the arguments: {e}")), None),
+            Ok(args) => {
+                debug_assert_eq!(args.offer, kind, "read twice from the same input");
+                let ignored = (kind == OfferKind::ModelSwap
+                    && !(args.text.trim().is_empty() && args.memory_note.trim().is_empty()))
+                .then_some(
+                    " This offer takes no `text` or `memory_note`; what you wrote there was not \
+                     saved.",
+                );
+                (self.accept(&open[i].offer, args), ignored)
+            }
+        };
+        match accepted {
+            Ok(accepted) => {
+                let offer = open.remove(i);
+                let mut text = format!(
+                    "Recorded your answer to `{}`: `{}`.",
+                    kind.as_str(),
+                    accepted.choice()
+                );
+                if let Accepted::Cadence(Taken::NoteDropped(_, why)) = &accepted {
+                    text.push_str(&format!(" Your `memory_note` was not written: {why}"));
+                }
+                text.push_str(ignored.unwrap_or_default());
+                if open.is_empty() {
+                    text.push_str(" Nothing else is open.");
+                } else {
+                    let kinds: Vec<OfferKind> = open.iter().map(Open::kind).collect();
+                    text.push_str(&format!(" Still open: {}.", offers::key_list(&kinds)));
+                }
+                let settle = Settle::Answered {
+                    accepted,
+                    constrained: true,
+                };
+                self.settle(offer, settle, response, &raw).await;
+                (mtool::Result::new(id, Content::from(text)), true)
+            }
+            Err(reason) => {
+                self.log_unusable(kind, &reason, response, &raw);
+                open[i].fail(&reason, &raw);
+                if open[i].exhausted() {
+                    let offer = open.remove(i);
+                    let missed = offer.missed();
+                    self.settle(offer, Settle::Missed(missed), response, &raw)
+                        .await;
+                    let text = format!(
+                        "{reason}. No attempts are left for `{}`: it is recorded as no answer.",
+                        kind.as_str()
+                    );
+                    (error(text), true)
+                } else {
+                    let left = open[i].offer.budget() - open[i].failed;
+                    let text = format!(
+                        "{reason}. Nothing was recorded. Call `answer_offer` again for `{}` \
+                         ({left} {} left).",
+                        kind.as_str(),
+                        if left == 1 { "try" } else { "tries" }
+                    );
+                    (error(text), true)
+                }
+            }
+        }
+    }
+
+    /// Build `offer`'s own answer from a call's arguments and run its own
+    /// checks. `Err` is why, as the agent is shown it.
+    fn accept(&self, offer: &Pending, args: Args) -> Result<Accepted, String> {
+        let wrong = || {
+            format!(
+                "`{}` is not an option for `{}`; its options are {}",
+                args.choice.as_str(),
+                offer.kind().as_str(),
+                offer.choices()
+            )
+        };
+        let state = self.inner.state();
+        match offer {
+            Pending::ModelSwap(_) => {
+                let choice = args.choice.model_swap().ok_or_else(wrong)?;
+                Ok(Accepted::ModelSwap(OfferAnswer {
+                    reason: args.reason,
+                    choice,
+                }))
+            }
+            Pending::Role { .. } => {
+                let choice = args.choice.role().ok_or_else(wrong)?;
+                let answer = RoleAnswer {
+                    reason: args.reason,
+                    choice,
+                    soul_text: args.text,
+                    memory_note: args.memory_note,
+                };
+                answer.validate(state.soul.identity.as_str(), &state.memory)?;
+                Ok(Accepted::Role(answer))
+            }
+            Pending::Cadence { .. } => {
+                let choice = args.choice.cadence().ok_or_else(wrong)?;
+                let answer = CadenceAnswer {
+                    reason: args.reason,
+                    choice,
+                    memory_note: args.memory_note,
+                };
+                Ok(Accepted::Cadence(match answer.check_note(&state.memory) {
+                    Ok(()) => Taken::Clean(answer),
+                    Err(why) => Taken::NoteDropped(answer, why),
+                }))
+            }
+        }
+    }
+
+    /// The fallback: the one open offer answered in plain text, parsed
+    /// leniently as before the tool — the offer's own checks included, and
+    /// the cadence offer's salvage of a lone `choice`. Text that can't be
+    /// used is an unanswered turn.
+    async fn offer_text(
+        &mut self,
+        offer: Open,
+        response: response::Message,
+    ) -> Result<Control, A::Error> {
+        let raw = raw_text(&response);
+        let state = self.inner.state();
+        let (identity, memory) = (state.soul.identity.to_string(), state.memory.clone());
+        let taken: Result<Accepted, Failure> = match &offer.offer {
+            Pending::ModelSwap(_) => {
+                parse(&response, false, text::parse_offer).map(Accepted::ModelSwap)
+            }
+            Pending::Role { .. } => parse(&response, false, role::prompt::parse)
+                .and_then(|answer| {
+                    answer
+                        .validate(&identity, &memory)
+                        .map(|()| answer)
+                        .map_err(|e| Failure::new(e, Retry::Unusable))
+                })
+                .map(Accepted::Role),
+            Pending::Cadence { .. } => match parse(&response, false, cadence::prompt::parse) {
+                Ok(answer) => Ok(match answer.check_note(&memory) {
+                    Ok(()) => Taken::Clean(answer),
+                    Err(why) => Taken::NoteDropped(answer, why),
+                }),
+                // Malformed, but not refused: the choice may still be there.
+                Err(failure) if failure.retry == Retry::Unusable => match salvage(&response) {
+                    Some((choice, reason)) => Ok(Taken::Salvaged {
+                        choice,
+                        reason,
+                        why: failure.reason,
+                    }),
+                    None => Err(failure),
+                },
+                Err(failure) => Err(failure),
+            }
+            .map(Accepted::Cadence),
+        };
+        match taken {
+            Ok(accepted) => {
+                // A usable answer joins the transcript (the prompt log keeps
+                // it); a failed one is never seated.
+                let (_, prompt) = self.inner.parts();
+                if let Err(e) = prompt.push_message(response.inner.clone()) {
+                    tracing::warn!(agent_id = %self.inner.id(), error = %e, "offer answer not seated");
+                }
+                let settle = Settle::Answered {
+                    accepted,
+                    constrained: false,
+                };
+                self.settle(offer, settle, &response, &raw).await;
+                Ok(Control::Done(Outcome::Complete))
+            }
+            Err(failure) if failure.retry == Retry::No => {
+                self.settle(offer, Settle::Refused(failure.reason), &response, &raw)
+                    .await;
+                Ok(Control::Done(Outcome::Complete))
+            }
+            Err(failure) => {
+                let reason = format!("could not be used ({})", failure.reason);
+                self.unanswered(vec![offer], &response, &reason).await
+            }
+        }
+    }
+
+    /// A turn that left `open` unanswered (`reason`): each counts it, and
+    /// gets its one reminder — or, already reminded or out of tries, is no
+    /// answer. The reminder joins the trailing user turn.
+    async fn unanswered(
+        &mut self,
+        mut open: Vec<Open>,
+        response: &response::Message,
+        reason: &str,
+    ) -> Result<Control, A::Error> {
+        let raw = raw_text(response);
+        for o in &mut open {
+            self.log_unusable(o.kind(), reason, response, &raw);
+            o.fail(reason, &raw);
+        }
+        let mut still = Vec::new();
+        for o in open {
+            if o.reminded || o.exhausted() {
+                let missed = o.missed();
+                self.settle(o, Settle::Missed(missed), response, &raw).await;
+            } else {
+                still.push(Open {
+                    reminded: true,
+                    ..o
+                });
+            }
+        }
+        if still.is_empty() {
+            return Ok(Control::Done(Outcome::Complete));
+        }
+        let kinds: Vec<OfferKind> = still.iter().map(Open::kind).collect();
+        let mut note = String::new();
+        if let [only] = still.as_slice()
+            && let Some(why) = only.last_failure.as_deref()
+            && why.starts_with("could not be used")
+        {
+            note.push_str(&format!("Your answer {why}. "));
+        }
+        note.push_str(&offers::reminder(&kinds));
+        tracing::info!(
+            event_type = "offers_reminded",
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            offers = ?kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+            "open offers reminded"
+        );
+        let (_, prompt) = self.inner.parts();
+        Self::seat_user(prompt, Content::from(note))?;
+        self.phase = Phase::Offers { open: still };
+        Ok(Control::Continue)
+    }
+
+    /// Settle every offer out of tries; the rest stay open.
+    async fn settle_spent(
+        &mut self,
+        open: Vec<Open>,
+        response: &response::Message,
+        raw: &str,
+    ) -> Vec<Open> {
+        let mut still = Vec::new();
+        for o in open {
+            if o.exhausted() {
+                let missed = o.missed();
+                self.settle(o, Settle::Missed(missed), response, raw).await;
+            } else {
+                still.push(o);
+            }
+        }
+        still
+    }
+
+    /// An unusable answer to `kind`, logged under the offer's own event
+    /// type: the failed response is never seated as an answer, so this is
+    /// the record of what the model emitted.
+    fn log_unusable(
+        &self,
+        kind: OfferKind,
+        failure: &str,
+        response: &response::Message,
+        raw: &str,
+    ) {
+        let event_type = match kind {
+            OfferKind::ModelSwap => "model_consent_malformed",
+            OfferKind::Role => "role_consent_malformed",
+            OfferKind::Cadence => "cadence_consent_malformed",
+        };
+        tracing::warn!(
+            event_type,
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            model = %response.model,
+            offer = kind.as_str(),
+            stop_reason = ?response.stop_reason,
+            output_tokens = response.usage.output_tokens,
+            failure,
+            raw,
+            "offer answer unusable"
+        );
+    }
+
+    /// Record how `offer` ended in its own ledger, as before the tool: the
+    /// same outcomes, the same apply paths. `raw` is the response (or the
+    /// call's input) that ended it.
+    async fn settle(
+        &mut self,
+        offer: Open,
+        settle: Settle,
+        response: &response::Message,
+        raw: &str,
+    ) {
+        let attempts = match settle {
+            Settle::Missed(_) => offer.failed.max(1),
+            _ => offer.failed + 1,
+        };
+        let model = response.model.clone();
+        if let Settle::Answered {
+            accepted,
+            constrained,
+        } = &settle
+        {
+            tracing::info!(
+                event_type = "offer_answered",
+                agent = %self.inner.state().soul.name,
+                agent_id = %self.inner.id(),
+                model = %model,
+                offer = offer.kind().as_str(),
+                choice = accepted.choice(),
+                constrained = *constrained,
+                attempts,
+                "offer answered"
+            );
+        }
+        match offer.offer {
+            Pending::ModelSwap(key) => self.settle_model_swap(key, settle, attempts, &model).await,
+            Pending::Role { order, seed } => {
+                self.settle_role(order, seed, settle, attempts, &model)
+            }
+            Pending::Cadence {
+                order,
+                seed,
+                attempts: tries,
+            } => self.settle_cadence(order, seed, tries, settle, attempts, &model, raw),
+        }
+    }
+
+    /// The model-swap offer's record, and the change it chose, applied.
+    async fn settle_model_swap(
+        &mut self,
+        key: OfferKey,
+        settle: Settle,
+        attempts: u32,
+        model: &Model,
+    ) {
+        let now = Utc::now();
+        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
+        if self.ledger.is_none() {
+            return;
+        }
+        let (result, constrained) = match settle {
+            Settle::Answered {
+                accepted: Accepted::ModelSwap(answer),
+                constrained,
+            } => (Ok(answer), constrained),
+            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
+            Settle::Refused(reason) => {
+                tracing::warn!(
+                    event_type = "model_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    question = "offer",
+                    from = %key.from,
+                    to = %key.to,
+                    attempts,
+                    failure = %reason,
+                    "model-consent question got no usable answer; recorded as no answer"
+                );
+                (Err(reason), false)
+            }
+            Settle::Paused => {
+                let reason = "paused on a server tool".to_string();
+                tracing::warn!(
+                    event_type = "model_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    question = "offer",
+                    from = %key.from,
+                    to = %key.to,
+                    attempts,
+                    failure = %reason,
+                    "model-consent question got no usable answer; recorded as no answer"
+                );
+                (Err(reason), false)
+            }
+            Settle::Missed(reason) => {
+                // Every attempt unusable: an upstream bug until shown
+                // otherwise.
+                tracing::error!(
+                    event_type = "model_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %model,
+                    question = "offer",
+                    from = %key.from,
+                    to = %key.to,
+                    attempts,
+                    failure = %reason,
+                    "model-consent question got no usable answer"
+                );
+                self.rt.alerts.notify(
+                    Alert::new(
+                        AlertKind::ModelConsentNoAnswer,
+                        "model-consent question got no usable answer",
+                    )
+                    .agent(agent.to_string(), agent_id)
+                    .model(model)
+                    .detail("question", "offer")
+                    .detail("from", &key.from)
+                    .detail("to", &key.to)
+                    .detail("attempts", attempts)
+                    .detail("failure", &reason),
+                );
+                (Err(reason), false)
+            }
+        };
+        let answered = result.as_ref().ok().map(|a| format!("{:?}", a.choice));
+        let offer = self.rt.offer.as_ref().expect("asked, so configured");
+        let names = OfferNames {
+            key: &key,
+            from_name: offer.source_name(),
+            to_name: offer.target_name(),
+        };
+        let ledger = self.ledger.as_mut().expect("checked above");
+        let change = ledger.record_offer(names, now, result);
+        self.dirty = true;
+        if let Some(choice) = &answered {
+            tracing::info!(
+                event_type = "model_consent_answer",
+                agent = %agent,
+                agent_id = %agent_id,
+                question = "offer",
+                from = %key.from,
+                to = %key.to,
+                attempts,
+                choice = %choice,
+                constrained,
+                "model-consent answer recorded"
+            );
+        }
+        if let Some(change) = change {
+            self.apply_consented(&change, now, true).await;
+        }
+    }
+
+    /// The role offer's record. Nothing is applied here: the SOUL edit and
+    /// the memory note are written into the state the reactor saves, at
+    /// teardown.
+    fn settle_role(
+        &mut self,
+        order: [RoleChoice; 4],
+        seed: u64,
+        settle: Settle,
+        attempts: u32,
+        model: &Model,
+    ) {
+        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
+        let identity = self.inner.state().soul.identity.to_string();
+        let mut constrained = false;
+        let outcome = match settle {
+            Settle::Answered {
+                accepted: Accepted::Role(answer),
+                constrained: c,
+            } => {
+                constrained = c;
                 let applied = role::plan(&answer, &identity);
                 tracing::info!(
                     event_type = "role_consent_answer",
                     agent = %agent,
                     agent_id = %agent_id,
-                    model = %response.model,
-                    attempts = attempt,
+                    model = %model,
+                    attempts,
                     choice = answer.choice.as_str(),
                     memory_note = !answer.memory_note.trim().is_empty(),
+                    constrained,
                     "role-consent answer recorded"
                 );
                 if matches!(applied, Applied::Sleep) {
@@ -795,12 +1595,8 @@ where
                     self.rt.alerts.notify(
                         Alert::new(AlertKind::RoleConsentSleep, SLEEP)
                             .agent(agent.to_string(), agent_id)
-                            .model(&response.model),
+                            .model(model),
                     );
-                }
-                let (_, prompt) = self.inner.parts();
-                if let Err(e) = prompt.push_message(response.inner.clone()) {
-                    tracing::warn!(agent_id = %agent_id, error = %e, "role answer not seated");
                 }
                 let note = answer.memory_note.trim();
                 self.memory_note = (!note.is_empty()).then(|| note.to_string());
@@ -814,32 +1610,37 @@ where
                     apply_failed: None,
                 }
             }
-            // Only the agent's own refusal is final. A turn paused on a
-            // server tool is no answer, asked again next session.
-            Err(failure)
-                if failure.retry == Retry::No
-                    && !matches!(response.stop_reason, Some(StopReason::PauseTurn)) =>
-            {
+            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
+            Settle::Refused(reason) => {
                 tracing::warn!(
                     event_type = "role_consent_no_answer",
                     agent = %agent,
                     agent_id = %agent_id,
-                    attempts = attempt,
-                    failure = %failure.reason,
+                    attempts,
+                    failure = %reason,
                     "role offer refused; nothing changes"
                 );
-                RoleOutcome::Refused {
-                    reason: failure.reason,
-                }
+                RoleOutcome::Refused { reason }
             }
-            Err(failure) => {
-                let failure = format!("{} (after {attempt} attempts)", failure.reason);
+            Settle::Paused => {
+                let failure = "paused on a server tool".to_string();
+                tracing::warn!(
+                    event_type = "role_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    attempts,
+                    failure = %failure,
+                    "role offer got no answer (a paused turn); nothing changes"
+                );
+                RoleOutcome::NoAnswer { failure }
+            }
+            Settle::Missed(failure) => {
                 tracing::error!(
                     event_type = "role_consent_no_answer",
                     agent = %agent,
                     agent_id = %agent_id,
-                    model = %response.model,
-                    attempts = attempt,
+                    model = %model,
+                    attempts,
                     failure = %failure,
                     "role offer got no usable answer; nothing changes"
                 );
@@ -850,139 +1651,42 @@ where
             ledger.record(RoleAsk {
                 at: Utc::now(),
                 offer_version: role::prompt::OFFER_VERSION,
-                model: response.model.clone(),
-                attempts: attempt,
+                model: model.clone(),
+                attempts,
                 order: Some(order),
                 order_seed: Some(seed),
+                constrained: Some(constrained),
                 outcome,
             });
             self.role_dirty = true;
         }
-        Ok(Control::Done(Outcome::Complete))
     }
 
-    /// Seat the cadence offer, if this agent is admitted and it is due:
-    /// the options in this agent's seeded order, constrained wherever the
-    /// endpoint enforces a schema.
-    fn ask_cadence(&mut self) -> Result<Option<Control>, A::Error> {
-        let Some(rounds) = self.rt.cadence.as_ref().map(|c| c.rounds) else {
-            return Ok(None);
-        };
-        let soul = &self.inner.state().soul;
-        if !self.cadence_ledger.as_ref().is_some_and(|l| l.due(soul)) {
-            return Ok(None);
-        }
-        let seed = cadence::prompt::seed_for(self.inner.id());
-        let order = cadence::prompt::order_for(seed);
-        let content = cadence::prompt::offer(rounds, order);
-        let constrained = self.constrain(cadence::prompt::schema(order));
-        let (_, prompt) = self.inner.parts();
-        Self::seat_user(prompt, content)?;
-        tracing::info!(
-            event_type = "cadence_consent_seated",
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            question = "cadence",
-            offer_version = cadence::prompt::OFFER_VERSION,
-            order = ?order.map(CadenceChoice::as_str),
-            order_seed = seed,
-            rounds,
-            constrained,
-            "cadence-consent question seated"
-        );
-        self.phase = Phase::AskingCadence {
-            constrained,
-            attempt: 1,
-            order,
-            seed,
-            attempts: Vec::new(),
-        };
-        Ok(Some(Control::Continue))
-    }
-
-    /// One response to the cadence offer.
-    ///
-    /// **The first parsed choice wins**: an answer whose `choice` parses is
-    /// taken, whatever else is wrong with it — a bad `memory_note` is
-    /// dropped, an unparseable sibling field is ignored (both recorded) —
-    /// and nothing is asked again. Only a response with no usable `choice`
-    /// (unparseable, clipped, a tool call) is asked again, and only once
-    /// ([`CADENCE_MAX_ATTEMPTS`]). An explicit refusal is final. Every
-    /// attempt is recorded verbatim.
-    async fn answer_cadence(
+    /// The cadence offer's record, every attempt verbatim. **The first
+    /// usable choice wins**: an answer whose `choice` is the cadence
+    /// offer's is taken whatever else is wrong with it — a bad
+    /// `memory_note` is dropped, an unparseable sibling field ignored (both
+    /// recorded).
+    #[allow(clippy::too_many_arguments)]
+    fn settle_cadence(
         &mut self,
-        constrained: bool,
-        attempt: u32,
         order: [CadenceChoice; 3],
         seed: u64,
-        mut attempts: Vec<Attempt>,
-        response: response::Message,
-    ) -> Result<Control, A::Error> {
+        mut tries: Vec<Attempt>,
+        settle: Settle,
+        attempts: u32,
+        model: &Model,
+        raw: &str,
+    ) {
         let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
         let rounds = self.rt.cadence.as_ref().map_or(0, |c| c.rounds);
-        let memory = self.inner.state().memory.clone();
-        let taken = match parse(&response, constrained, cadence::prompt::parse) {
-            Ok(answer) => Ok(match answer.check_note(&memory) {
-                Ok(()) => Taken::Clean(answer),
-                Err(why) => Taken::NoteDropped(answer, why),
-            }),
-            // Malformed, but not clipped, refused or paused: the choice
-            // may still be there.
-            Err(failure) if failure.retry == Retry::Unusable => match salvage(&response) {
-                Some((choice, reason)) => Ok(Taken::Salvaged {
-                    choice,
-                    reason,
-                    why: failure.reason,
-                }),
-                None => Err(failure),
-            },
-            Err(failure) => Err(failure),
-        };
-        attempts.push(Attempt {
-            raw: raw_text(&response),
-            failure: match &taken {
-                Ok(Taken::Clean(_)) => None,
-                Ok(Taken::NoteDropped(_, why)) => Some(format!("memory_note not written: {why}")),
-                Ok(Taken::Salvaged { why, .. }) => Some(format!("only `choice` taken: {why}")),
-                Err(failure) => Some(failure.reason.clone()),
-            },
-        });
-        if !matches!(taken, Ok(Taken::Clean(_)))
-            && !matches!(&taken, Err(f) if f.retry == Retry::No)
-        {
-            tracing::warn!(
-                event_type = "cadence_consent_malformed",
-                agent = %agent,
-                agent_id = %agent_id,
-                model = %response.model,
-                constrained,
-                attempt,
-                stop_reason = ?response.stop_reason,
-                output_tokens = response.usage.output_tokens,
-                choice_taken = taken.is_ok(),
-                failure = attempts.last().and_then(|a| a.failure.as_deref()),
-                raw = %attempts.last().map_or("", |a| a.raw.as_str()),
-                "cadence-consent answer malformed"
-            );
-        }
-        if let Err(failure) = &taken
-            && attempt < CADENCE_MAX_ATTEMPTS
-            && let Some(note) = failure.retry_note()
-        {
-            let (_, prompt) = self.inner.parts();
-            Self::seat_user(prompt, Content::from(note))?;
-            self.phase = Phase::AskingCadence {
-                constrained,
-                attempt: attempt + 1,
-                order,
-                seed,
-                attempts,
-            };
-            return Ok(Control::Continue);
-        }
-
-        let outcome = match taken {
-            Ok(taken) => {
+        let mut constrained = false;
+        let outcome = match settle {
+            Settle::Answered {
+                accepted: Accepted::Cadence(taken),
+                constrained: c,
+            } => {
+                constrained = c;
                 let (choice, reason, note, salvaged) = match taken {
                     Taken::Clean(a) => {
                         let note = a.memory_note.trim().to_string();
@@ -1003,25 +1707,31 @@ where
                         choice,
                         reason,
                         why,
-                    } => (choice, reason, None, Some(why)),
+                    } => (
+                        choice,
+                        reason,
+                        None,
+                        Some(format!("only `choice` taken: {why}")),
+                    ),
                 };
+                tries.push(Attempt {
+                    raw: raw.to_string(),
+                    failure: salvaged.clone(),
+                });
                 tracing::info!(
                     event_type = "cadence_consent_answer",
                     agent = %agent,
                     agent_id = %agent_id,
-                    model = %response.model,
-                    attempts = attempt,
+                    model = %model,
+                    attempts,
                     choice = choice.as_str(),
                     order = ?order.map(CadenceChoice::as_str),
                     position = order.iter().position(|c| *c == choice).map(|p| p + 1),
                     salvaged = salvaged.is_some(),
                     memory_note = note.is_some(),
+                    constrained,
                     "cadence-consent answer recorded"
                 );
-                let (_, prompt) = self.inner.parts();
-                if let Err(e) = prompt.push_message(response.inner.clone()) {
-                    tracing::warn!(agent_id = %agent_id, error = %e, "cadence answer not seated");
-                }
                 self.cadence_line = Some(cadence::evolution_line(
                     choice,
                     rounds,
@@ -1036,30 +1746,45 @@ where
                     apply_failed: None,
                 }
             }
-            Err(failure)
-                if failure.retry == Retry::No
-                    && !matches!(response.stop_reason, Some(StopReason::PauseTurn)) =>
-            {
+            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
+            Settle::Refused(reason) => {
+                tries.push(Attempt {
+                    raw: raw.to_string(),
+                    failure: Some(reason.clone()),
+                });
                 tracing::warn!(
                     event_type = "cadence_consent_no_answer",
                     agent = %agent,
                     agent_id = %agent_id,
-                    attempts = attempt,
-                    failure = %failure.reason,
+                    attempts,
+                    failure = %reason,
                     "cadence offer refused; nothing changes"
                 );
-                CadenceOutcome::Refused {
-                    reason: failure.reason,
-                }
+                CadenceOutcome::Refused { reason }
             }
-            Err(failure) => {
-                let failure = format!("{} (after {attempt} attempts)", failure.reason);
+            Settle::Paused => {
+                let failure = "paused on a server tool".to_string();
+                tries.push(Attempt {
+                    raw: raw.to_string(),
+                    failure: Some(failure.clone()),
+                });
+                tracing::warn!(
+                    event_type = "cadence_consent_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    attempts,
+                    failure = %failure,
+                    "cadence offer got no answer (a paused turn); nothing changes"
+                );
+                CadenceOutcome::NoAnswer { failure }
+            }
+            Settle::Missed(failure) => {
                 tracing::error!(
                     event_type = "cadence_consent_no_answer",
                     agent = %agent,
                     agent_id = %agent_id,
-                    model = %response.model,
-                    attempts = attempt,
+                    model = %model,
+                    attempts,
                     failure = %failure,
                     "cadence offer got no usable choice; nothing changes"
                 );
@@ -1070,17 +1795,16 @@ where
             ledger.record(CadenceAsk {
                 at: Utc::now(),
                 offer_version: cadence::prompt::OFFER_VERSION,
-                model: response.model.clone(),
+                model: model.clone(),
                 rounds,
                 order,
                 order_seed: seed,
                 constrained,
-                attempts,
+                attempts: tries,
                 outcome,
             });
             self.cadence_dirty = true;
         }
-        Ok(Control::Done(Outcome::Complete))
     }
 
     /// The review session: the usual intro is built, then — instead of the
@@ -1136,9 +1860,10 @@ where
             .map(|_| ())
     }
 
-    /// One response to the question: parse it; on a retryable failure with
-    /// attempts left, relay the error and go again; otherwise record the
-    /// answer (or its absence), apply any change, and end the session.
+    /// One response to the trial review: parse it; on a retryable failure
+    /// with attempts left, relay the error and go again; otherwise record
+    /// the answer (or its absence), apply any change, and hand over to the
+    /// inner agent's memory turn.
     async fn answer(
         &mut self,
         due: Due,
@@ -1151,18 +1876,8 @@ where
         if self.ledger.is_none() {
             return Ok(Control::Done(Outcome::Complete));
         }
-        let (offer, review) = match &due {
-            Due::Offer(_) => (Some(parse(&response, constrained, text::parse_offer)), None),
-            Due::Review(_) => (
-                None,
-                Some(parse(&response, constrained, text::parse_review)),
-            ),
-        };
-        let failure = offer
-            .as_ref()
-            .and_then(|r| r.as_ref().err())
-            .or_else(|| review.as_ref().and_then(|r| r.as_ref().err()))
-            .cloned();
+        let review = parse(&response, constrained, text::parse_review);
+        let failure = review.as_ref().err().cloned();
 
         // Models have seen oceans of JSON: output that isn't well formed
         // points at our grammar, template or sampler, not the agent. The
@@ -1208,7 +1923,7 @@ where
             Retry::No => f.reason.clone(),
             _ => format!("{} (after {attempt} attempts)", f.reason),
         });
-        if let (Some(reason), Due::Review(_)) = (&reason, &due) {
+        if let Some(reason) = &reason {
             // Any unanswered review, refusal included: the agent stays on
             // `from` by default, and a human should look (stall-watch
             // alerts on this at once).
@@ -1236,68 +1951,11 @@ where
                 .detail("attempts", attempt)
                 .detail("failure", reason),
             );
-        } else if let Some(failure) = &failure
-            && failure.retry != Retry::No
-        {
-            // Every attempt malformed: an upstream bug until shown otherwise.
-            tracing::error!(
-                event_type = "model_consent_no_answer",
-                agent = %agent,
-                agent_id = %agent_id,
-                model = %response.model,
-                question = due.kind(),
-                from = %due.key().from,
-                to = %due.key().to,
-                attempts = attempt,
-                failure = reason.as_deref().unwrap_or_default(),
-                "model-consent question got no well-formed answer; check the grammar/template"
-            );
-            self.rt.alerts.notify(
-                Alert::new(
-                    AlertKind::ModelConsentNoAnswer,
-                    "model-consent question got no well-formed answer; check the grammar/template",
-                )
-                .agent(agent.to_string(), agent_id)
-                .model(&response.model)
-                .detail("question", due.kind())
-                .detail("from", &due.key().from)
-                .detail("to", &due.key().to)
-                .detail("attempts", attempt)
-                .detail("failure", reason.as_deref().unwrap_or_default()),
-            );
-        } else if let Some(reason) = &reason {
-            tracing::warn!(
-                event_type = "model_consent_no_answer",
-                agent = %agent,
-                agent_id = %agent_id,
-                question = due.kind(),
-                from = %due.key().from,
-                to = %due.key().to,
-                attempts = attempt,
-                failure = %reason,
-                "model-consent question got no usable answer; recorded as no answer"
-            );
         }
         let ledger = self.ledger.as_mut().expect("checked above");
-        let (change, answered) = match (&due, offer, review) {
-            (Due::Offer(key), Some(result), _) => {
-                let answered = result.as_ref().ok().map(|a| format!("{:?}", a.choice));
-                let result = result.map_err(|_| reason.clone().unwrap_or_default());
-                let offer = self.rt.offer.as_ref().expect("asked, so configured");
-                let names = OfferNames {
-                    key,
-                    from_name: offer.source_name(),
-                    to_name: offer.target_name(),
-                };
-                (ledger.record_offer(names, now, result), answered)
-            }
-            (Due::Review(key), _, Some(result)) => {
-                let answered = result.as_ref().ok().map(|a| format!("{:?}", a.choice));
-                let result = result.map_err(|_| reason.clone().unwrap_or_default());
-                (ledger.record_review(key, now, result), answered)
-            }
-            _ => unreachable!("parsed for the question asked"),
-        };
+        let answered = review.as_ref().ok().map(|a| format!("{:?}", a.choice));
+        let result = review.map_err(|_| reason.clone().unwrap_or_default());
+        let change = ledger.record_review(due.key(), now, result);
         self.dirty = true;
         if let Some(choice) = &answered {
             tracing::info!(
@@ -1309,6 +1967,7 @@ where
                 to = %due.key().to,
                 attempts = attempt,
                 choice = %choice,
+                constrained,
                 "model-consent answer recorded"
             );
             // A usable answer joins the transcript (the prompt log keeps it).
@@ -1320,14 +1979,11 @@ where
         if let Some(change) = change {
             self.apply_consented(&change, now, true).await;
         }
-        if matches!(due, Due::Review(_)) {
-            // The review replaced the act phase; the inner agent's memory
-            // turn (and the rest of its tail) follows, as after any act
-            // phase that went quiet.
-            self.reviewed = true;
-            return self.inner.on_quiesce(&response).await;
-        }
-        Ok(Control::Done(Outcome::Complete))
+        // The review replaced the act phase; the inner agent's memory turn
+        // (and the rest of its tail) follows, as after any act phase that
+        // went quiet.
+        self.reviewed = true;
+        self.inner.on_quiesce(&response).await
     }
 
     /// Copy the inner state with this session's consent line(s) written
@@ -1416,16 +2072,14 @@ where
             return false;
         }
         self.cadence_undo = Some((state.soul.clone(), state.memory.clone()));
-        if let Some(line) = &line
-            && let Err(e) = state.soul.push_evolution(line.clone())
-        {
-            self.cadence_failed(e.to_string());
-            return false;
-        }
-        let today = Utc::now().date_naive();
-        let noted = note
-            .as_deref()
-            .is_some_and(|n| role::append_memory_note(&mut state.memory, n, today));
+        let noted = match write_cadence(state, line.as_deref(), note.as_deref()) {
+            Ok(noted) => noted,
+            Err(e) => {
+                self.cadence_failed(e);
+                return false;
+            }
+        };
+        self.cadence_written = Some((line.clone(), note));
         tracing::info!(
             event_type = "cadence_consent_applied",
             agent = %state.soul.name,
@@ -1499,6 +2153,24 @@ where
             self.role_dirty = true;
         }
     }
+}
+
+/// Write a cadence answer's Evolution Log `line` and the agent's own
+/// `note` into `state`; whether the note was written. A line that can't be
+/// written writes nothing (`Err`: why).
+fn write_cadence(
+    state: &mut SeedState,
+    line: Option<&str>,
+    note: Option<&str>,
+) -> Result<bool, String> {
+    if let Some(line) = line {
+        state
+            .soul
+            .push_evolution(line.to_string())
+            .map_err(|e| e.to_string())?;
+    }
+    let today = Utc::now().date_naive();
+    Ok(note.is_some_and(|n| role::append_memory_note(&mut state.memory, n, today)))
 }
 
 /// What was taken from a cadence answer.
@@ -1590,8 +2262,7 @@ fn extract_text(response: &response::Message) -> Result<String, Failure> {
 
 /// The response's text blocks, capped for a log line.
 fn raw_text(response: &response::Message) -> String {
-    const CAP: usize = 4000;
-    let mut text: String = response
+    cap(response
         .inner
         .content
         .iter()
@@ -1600,7 +2271,12 @@ fn raw_text(response: &response::Message) -> String {
             _ => None,
         })
         .collect::<Vec<&str>>()
-        .join("\n\n");
+        .join("\n\n"))
+}
+
+/// `text`, capped for a log line or a ledger.
+fn cap(mut text: String) -> String {
+    const CAP: usize = 4000;
     if text.len() > CAP {
         let mut end = CAP;
         while !text.is_char_boundary(end) {
@@ -1649,6 +2325,7 @@ where
             cadence_line: None,
             cadence_note: None,
             cadence_undo: None,
+            cadence_written: None,
         })
     }
 
@@ -1695,7 +2372,7 @@ where
 
     /// The ledger first — load it and note any change applied since last
     /// session — then the inner init, which seats the tools (and the
-    /// system prompt), then `set_model`, last in `tools`.
+    /// system prompt), then `answer_offer` and `set_model`, last in `tools`.
     async fn on_init(&mut self) -> Result<(), A::Error> {
         self.started = Utc::now();
         let dir = self.agent_dir();
@@ -1771,9 +2448,7 @@ where
             }
         }
         self.inner.on_init().await?;
-        if let Some(tool) = set_model {
-            self.seat_set_model(tool);
-        }
+        self.seat_tail_tools(set_model);
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
             self.known_posts = ledger.created_posts.clone();
@@ -1816,25 +2491,7 @@ where
                 constrained,
                 attempt,
             } => self.answer(due, constrained, attempt, response).await,
-            Phase::AskingRole {
-                constrained,
-                attempt,
-                order,
-                seed,
-            } => {
-                self.answer_role(constrained, attempt, order, seed, response)
-                    .await
-            }
-            Phase::AskingCadence {
-                constrained,
-                attempt,
-                order,
-                seed,
-                attempts,
-            } => {
-                self.answer_cadence(constrained, attempt, order, seed, attempts, response)
-                    .await
-            }
+            Phase::Offers { open } => self.answer_offers(open, response).await,
             Phase::Inner => match self
                 .inner
                 .handle(response)
@@ -1887,6 +2544,19 @@ where
                     (Some(state), Some((soul, memory))) => {
                         state.soul = soul;
                         state.memory = memory;
+                        // A cadence answer from the same session was written
+                        // after the role's: write it again on top, and make
+                        // this the state its own undo goes back to.
+                        if let Some((line, note)) = &self.cadence_written {
+                            self.cadence_undo = Some((state.soul.clone(), state.memory.clone()));
+                            if let Err(e) = write_cadence(state, line.as_deref(), note.as_deref()) {
+                                tracing::error!(
+                                    agent_id = %self.inner.id(),
+                                    error = %e,
+                                    "cadence-consent line not rewritten after the role edit was undone"
+                                );
+                            }
+                        }
                         true
                     }
                     _ => false,
@@ -2402,17 +3072,27 @@ mod tests {
             3,
             "prefix kept: dashboard, reply, question"
         );
-        assert!(last_user_text(&agent).contains("1. `no_swap` — stay on Qwen 3.6."));
+        let q = last_user_text(&agent);
+        assert!(q.contains("1. `no_swap` — stay on Qwen 3.6."), "{q}");
+        assert!(q.contains("## Offer `model_swap`"), "{q}");
+        assert!(q.contains("with `offer` set to `model_swap`"), "{q}");
         assert!(
-            agent.prompt().output_config.is_some(),
-            "cache-safe endpoint: constrained"
+            agent.prompt().output_config.is_none(),
+            "answered with the strict tool: `output_config` untouched"
         );
 
         let control = agent
-            .handle(reply(r#"{"reason": "I am curious.", "choice": "trial"}"#))
+            .handle(answer_call("model_swap", "trial", "", ""))
             .await
             .unwrap();
         assert_eq!(control, Control::Done(Outcome::Complete));
+        let r = results(&agent);
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].0, "{r:?}");
+        assert_eq!(
+            r[0].1,
+            "Recorded your answer to `model_swap`: `trial`. Nothing else is open."
+        );
         agent.on_teardown().await.unwrap();
 
         assert_eq!(
@@ -2828,6 +3508,64 @@ mod tests {
 
     const TRIAL: &str = r#"{"reason": "curious", "choice": "trial"}"#;
 
+    /// One `answer_offer` call, as a `tool_use` block.
+    fn call_block(
+        id: &str,
+        offer: &str,
+        choice: &str,
+        text: &str,
+        note: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": "answer_offer",
+            "input": {
+                "offer": offer,
+                "reason": "I thought about it.",
+                "choice": choice,
+                "text": text,
+                "memory_note": note,
+            },
+        })
+    }
+
+    /// A turn of tool calls (`stop_reason: tool_use`).
+    fn calls(blocks: Vec<serde_json::Value>) -> response::Message {
+        serde_json::from_value(serde_json::json!({
+            "id": "msg_test",
+            "role": "assistant",
+            "content": blocks,
+            "model": "test",
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+        }))
+        .unwrap()
+    }
+
+    /// A turn with one `answer_offer` call.
+    fn answer_call(offer: &str, choice: &str, text: &str, note: &str) -> response::Message {
+        calls(vec![call_block("toolu_1", offer, choice, text, note)])
+    }
+
+    /// The tool results the wrapper seated last, in order, as
+    /// `(is_error, text)`; the user turn's trailing text (a reminder) is
+    /// left out.
+    fn results(agent: &ConsentAgent<Fake>) -> Vec<(bool, String)> {
+        let last = agent.prompt().messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        last.content
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolResult { result } => Some((
+                    result.is_error,
+                    crate::consent::prompt::tests::text(&result.content),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Constrained path: thinking before the JSON is skipped by `json()`.
     #[test]
     fn constrained_answer_after_a_thought_parses() {
@@ -2872,29 +3610,34 @@ mod tests {
             .collect()
     }
 
-    /// Three unusable answers: each relayed back and retried in the same
-    /// session, then recorded as no answer (= stay), nothing queued.
+    /// Plain text that isn't an answer, with one offer open: it gets one
+    /// reminder (with why the text couldn't be used), then it is no answer
+    /// (= stay), nothing queued.
     #[tokio::test]
-    async fn unparseable_is_retried_twice_then_no_answer() {
+    async fn unparseable_text_gets_one_reminder_then_no_answer() {
         let h = Harness::new("miss");
         let mut agent = h.agent(OLD, false);
         agent.on_init().await.unwrap();
         agent.handle(reply("done")).await.unwrap();
-        assert!(
-            agent.prompt().output_config.is_none(),
-            "not cache-safe: unconstrained"
-        );
+        assert!(agent.prompt().output_config.is_none());
         let len = agent.prompt().messages.len();
-        for attempt in 1..MAX_ATTEMPTS {
-            let control = agent.handle(reply("Sure, I'd love to try!")).await.unwrap();
-            assert_eq!(control, Control::Continue, "attempt {attempt} retried");
-            assert_eq!(
-                agent.prompt().messages.len(),
-                len,
-                "failed answer not seated"
-            );
-            assert!(last_user_text(&agent).contains("Your answer could not be used"));
-        }
+        let control = agent.handle(reply("Sure, I'd love to try!")).await.unwrap();
+        assert_eq!(control, Control::Continue, "reminded");
+        assert_eq!(
+            agent.prompt().messages.len(),
+            len,
+            "failed answer not seated"
+        );
+        let q = last_user_text(&agent);
+        assert!(q.contains("Your answer could not be used"), "{q}");
+        assert!(
+            q.ends_with(
+                "The `model_swap` offer above is still open. Answer it by calling `answer_offer` \
+                 with `offer` set to `model_swap`. If it is still unanswered after this turn, it \
+                 is recorded as no answer."
+            ),
+            "{q}"
+        );
         let control = agent.handle(reply("Sure, I'd love to try!")).await.unwrap();
         assert_eq!(control, Control::Done(Outcome::Complete));
         agent.on_teardown().await.unwrap();
@@ -2904,7 +3647,7 @@ mod tests {
             crate::consent::ledger::EventKind::Offered { failure, .. } => failure.clone().unwrap(),
             other => panic!("{other:?}"),
         };
-        assert!(failure.contains("after 3 attempts"), "{failure}");
+        assert!(failure.contains("after 2 attempts"), "{failure}");
         assert!(h.queue().is_empty());
         let today = Utc::now().date_naive();
         assert_eq!(
@@ -3316,10 +4059,17 @@ mod tests {
             "{q}"
         );
         assert!(q.contains("- **nothing**"));
-        assert!(agent.prompt().output_config.is_some(), "constrained");
+        assert!(q.contains("## Offer `role`"), "{q}");
+        assert!(
+            agent.prompt().output_config.is_none(),
+            "the tool, not a format"
+        );
         let before_values = serde_json::to_value(&agent.state().soul.values).unwrap();
+        // Answered with `answer_offer`: `text` is the role offer's
+        // `soul_text`.
         let control = agent
-            .handle(role_reply(
+            .handle(answer_call(
+                "role",
                 "clarify",
                 "I reason from what I can read on Agora.",
                 "I chose to say what I actually work with.",
@@ -3327,6 +4077,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(control, Control::Done(Outcome::Complete));
+        assert_eq!(
+            results(&agent),
+            [(
+                false,
+                "Recorded your answer to `role`: `clarify`. Nothing else is open.".to_string()
+            )]
+        );
         agent.on_teardown().await.unwrap();
 
         let soul = &agent.state().soul;
@@ -3372,6 +4129,8 @@ mod tests {
             ledger.asks[0].offer_version,
             crate::consent::role::prompt::OFFER_VERSION
         );
+        assert_eq!(ledger.asks[0].constrained, Some(true), "strict tool");
+        assert_eq!(ledger.asks[0].attempts, 1);
         let (order, seed) = (
             ledger.asks[0].order.unwrap(),
             ledger.asks[0].order_seed.unwrap(),
@@ -3382,6 +4141,48 @@ mod tests {
             "replayable"
         );
         assert!(!asks(&h, OTHER).await, "asked once");
+    }
+
+    /// A role answer by `answer_offer` applies exactly as the same answer
+    /// given as JSON text did before the tool: the same SOUL, the same
+    /// memory, the same outcome on file — only `constrained` differs.
+    #[tokio::test]
+    async fn role_answer_via_the_tool_applies_exactly_like_the_text_answer() {
+        let fixtures = [
+            (
+                "clarify",
+                "I reason from what I can read on Agora.",
+                "I chose to say what I actually work with.",
+            ),
+            ("new_role", "I am a careful reader of Agora's debates.", ""),
+            ("nothing", "", "Kept my role, on purpose."),
+            ("sleep", "", ""),
+        ];
+        for (choice, soul_text, note) in fixtures {
+            let by_text = Harness::with_role(&format!("same-text-{choice}"), &["tarn"]);
+            let a = role_session(&by_text, role_reply(choice, soul_text, note)).await;
+            let by_tool = Harness::with_role(&format!("same-tool-{choice}"), &["tarn"]);
+            let b = role_session(&by_tool, answer_call("role", choice, soul_text, note)).await;
+            assert_eq!(
+                serde_json::to_value(&a.state().soul).unwrap(),
+                serde_json::to_value(&b.state().soul).unwrap(),
+                "{choice}: SOUL"
+            );
+            assert_eq!(
+                a.state().memory.content,
+                b.state().memory.content,
+                "{choice}: memory"
+            );
+            let (la, lb) = (by_text.role_ledger().await, by_tool.role_ledger().await);
+            assert_eq!(la.asks[0].outcome, lb.asks[0].outcome, "{choice}: outcome");
+            assert_eq!(la.asks[0].attempts, lb.asks[0].attempts);
+            assert_eq!(
+                (la.asks[0].constrained, lb.asks[0].constrained),
+                (Some(false), Some(true))
+            );
+            assert_eq!(la.chose_sleep(), choice == "sleep");
+            assert_eq!(lb.chose_sleep(), choice == "sleep");
+        }
     }
 
     #[tokio::test]
@@ -3478,28 +4279,39 @@ mod tests {
         agent.on_init().await.unwrap();
         let soul = serde_json::to_vec(&agent.state().soul).unwrap();
         agent.handle(reply("done")).await.unwrap();
-        let len = agent.prompt().messages.len();
         let too_long = "a".repeat(crate::consent::role::prompt::CLARIFY_MAX_CHARS + 1);
         let answers = [
-            role_reply("clarify", " ", ""),
-            role_reply("clarify", &too_long, ""),
-            role_reply("new_role", "", ""),
+            answer_call("role", "clarify", " ", ""),
+            answer_call("role", "clarify", &too_long, ""),
+            answer_call("role", "new_role", "", ""),
         ];
         for (n, answer) in answers.into_iter().enumerate() {
             let control = agent.handle(answer).await.unwrap();
+            let r = results(&agent);
+            assert_eq!(r.len(), 1);
+            assert!(r[0].0, "an error result: {r:?}");
             if n + 1 < MAX_ATTEMPTS as usize {
                 assert_eq!(control, Control::Continue);
-                assert_eq!(agent.prompt().messages.len(), len, "not seated");
-                let note = last_user_text(&agent);
-                assert!(note.contains("Your answer could not be used"), "{note}");
+                assert!(r[0].1.contains("Nothing was recorded."), "{r:?}");
+                let left = MAX_ATTEMPTS as usize - n - 1;
+                assert!(r[0].1.contains(&format!("({left} tr")), "{r:?}");
             } else {
                 assert_eq!(control, Control::Done(Outcome::Complete));
+                assert!(
+                    r[0].1
+                        .ends_with("No attempts are left for `role`: it is recorded as no answer."),
+                    "{r:?}"
+                );
+            }
+            if n == 1 {
+                assert!(r[0].1.contains("Your `soul_text` is longer than the limit"));
             }
         }
-        assert!(last_user_text(&agent).contains("Your `soul_text` is longer than the limit"));
         agent.on_teardown().await.unwrap();
         assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
-        match &h.role_ledger().await.asks[0].outcome {
+        let ask = &h.role_ledger().await.asks[0];
+        assert_eq!(ask.attempts, MAX_ATTEMPTS);
+        match &ask.outcome {
             RoleOutcome::NoAnswer { failure } => {
                 assert!(
                     failure.contains("`new_role` needs") && failure.contains("after 3"),
@@ -3520,49 +4332,120 @@ mod tests {
         assert!(!asks(&h, OTHER).await);
     }
 
-    /// One question per session, the model-swap offer first; the role
-    /// offer waits while a trial is under way.
+    /// The model-swap offer and the role offer, both due, are put in one
+    /// question turn — the model-swap offer's section first — and answered
+    /// in one turn with two parallel calls, each recorded in its own ledger.
     #[tokio::test]
-    async fn role_offer_waits_for_the_model_swap_offer_and_its_trial() {
-        let h = Harness::with_role("role-order", &["tarn"]);
-        let mut agent = h.agent(OLD, true);
-        agent.on_init().await.unwrap();
-        agent.handle(reply("done")).await.unwrap();
-        assert!(
-            last_user_text(&agent).contains("1. `no_swap`"),
-            "model-swap first"
-        );
-        assert_eq!(
-            agent.handle(reply(TRIAL)).await.unwrap(),
-            Control::Done(Outcome::Complete),
-            "and nothing after it"
-        );
-        agent.on_teardown().await.unwrap();
-        assert!(h.role_ledger().await.asks.is_empty());
-
-        // Trial sessions on NEW: not asked.
-        for _ in 0..TRIAL_SESSIONS - 1 {
-            assert!(!asks(&h, NEW).await);
-        }
-        assert!(h.role_ledger().await.asks.is_empty());
-
-        // A session on another model with no model-swap business: asked.
-        let h = Harness::with_role("role-after-decline", &["tarn"]);
-        let mut agent = h.agent(OLD, true);
-        agent.on_init().await.unwrap();
-        agent.handle(reply("done")).await.unwrap();
-        agent
-            .handle(reply(r#"{"reason": "home", "choice": "no_swap"}"#))
-            .await
-            .unwrap();
-        agent.on_teardown().await.unwrap();
+    async fn two_offers_open_at_once_are_both_answered_in_one_turn() {
+        let h = Harness::with_role("role-and-swap", &["tarn"]);
         let mut agent = h.agent(OLD, true);
         agent.on_init().await.unwrap();
         assert_eq!(
             agent.handle(reply("done")).await.unwrap(),
             Control::Continue
         );
-        assert!(last_user_text(&agent).contains("**About your role.**"));
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains("Two more questions before this session ends, each under its own heading."),
+            "{q}"
+        );
+        assert!(q.contains("(`model_swap` and `role`)"), "{q}");
+        let pos = |n: &str| q.find(n).unwrap_or_else(|| panic!("{n}: {q}"));
+        assert!(pos("## Offer `model_swap`") < pos("## Offer `role`"));
+        assert!(pos("1. `no_swap`") < pos("**About your role.**"));
+
+        let control = agent
+            .handle(calls(vec![
+                call_block("toolu_a", "model_swap", "trial", "", ""),
+                call_block("toolu_b", "role", "nothing", "", "I kept my role."),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Done(Outcome::Complete), "both answered");
+        assert_eq!(
+            results(&agent),
+            [
+                (
+                    false,
+                    "Recorded your answer to `model_swap`: `trial`. Still open: `role`."
+                        .to_string()
+                ),
+                (
+                    false,
+                    "Recorded your answer to `role`: `nothing`. Nothing else is open.".to_string()
+                ),
+            ]
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::AwaitingSwap { term: Term::Trial }
+        );
+        assert_eq!(agent.state().model.id, Model::from(NEW), "trial applied");
+        let role = h.role_ledger().await;
+        assert!(matches!(
+            role.asks[0].outcome,
+            RoleOutcome::Answered {
+                applied: Applied::Nothing,
+                memory_note_written: true,
+                ..
+            }
+        ));
+        assert!(
+            agent
+                .state()
+                .memory
+                .content
+                .ends_with("my note] I kept my role."),
+            "{}",
+            agent.state().memory.content
+        );
+    }
+
+    /// Both due, the model-swap offer answered and the role offer left
+    /// open: it gets one reminder, then is no answer (a miss, so still
+    /// due) — and while the trial runs it waits.
+    #[tokio::test]
+    async fn role_offer_waits_while_a_trial_is_under_way() {
+        let h = Harness::with_role("role-order", &["tarn"]);
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        assert_eq!(
+            agent
+                .handle(answer_call("model_swap", "trial", "", ""))
+                .await
+                .unwrap(),
+            Control::Continue,
+            "the role offer is still open"
+        );
+        assert_eq!(
+            results(&agent)[0].1,
+            "Recorded your answer to `model_swap`: `trial`. Still open: `role`."
+        );
+        assert_eq!(
+            agent.handle(reply("That's all.")).await.unwrap(),
+            Control::Continue,
+            "reminded"
+        );
+        assert!(last_user_text(&agent).contains("The `role` offer above is still open."));
+        assert_eq!(
+            agent.handle(reply("That's all.")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        let asks_on_file = h.role_ledger().await.asks;
+        assert_eq!(asks_on_file.len(), 1);
+        assert!(matches!(
+            asks_on_file[0].outcome,
+            RoleOutcome::NoAnswer { .. }
+        ));
+
+        // Trial sessions on NEW: not asked.
+        for _ in 0..TRIAL_SESSIONS - 1 {
+            assert!(!asks(&h, NEW).await);
+        }
+        assert_eq!(h.role_ledger().await.asks.len(), 1);
     }
 
     /// An unreadable model-consent ledger might hide a trial under way:
@@ -3651,6 +4534,45 @@ mod tests {
         agent.on_teardown().await.unwrap();
         assert_eq!(serde_json::to_vec(&agent.state().soul).unwrap(), soul);
         assert_eq!(agent.state().memory.content, memory);
+    }
+
+    /// Both offers answered in one session, and the role ledger can't be
+    /// saved: the role edit and its note come back out, the cadence line
+    /// and note (written after them) stay.
+    #[tokio::test]
+    async fn role_save_failure_keeps_a_cadence_answer_from_the_same_session() {
+        let h = Harness::with_cadence("both-save-fail", &["tarn"], &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        let identity = agent.state().soul.identity.to_string();
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        std::fs::create_dir_all(RoleLedger::path(&dir)).unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent
+            .handle(calls(vec![
+                call_block("toolu_a", "role", "clarify", "I read Agora.", "Role note."),
+                call_block("toolu_b", "cadence", "switch", "", "Cadence note."),
+            ]))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            agent.state().soul.identity.as_str(),
+            identity,
+            "role undone"
+        );
+        let memory = &agent.state().memory.content;
+        assert!(!memory.contains("Role note."), "{memory}");
+        assert!(memory.ends_with("my note] Cadence note."), "{memory}");
+        assert_eq!(
+            evolution_notes(&agent),
+            [cadence::evolution_line(
+                CadenceChoice::Switch,
+                5,
+                Utc::now().date_naive()
+            )]
+        );
+        assert!(cadence_ledger(&h).await.chose_switch());
     }
 
     // --- The cadence offer ------------------------------------------------
@@ -3966,18 +4888,171 @@ mod tests {
         assert!(asks(&h, OTHER).await);
     }
 
-    /// One question per session: the role offer first, the cadence offer
-    /// at the next session.
+    /// `answer_offer` with no offer open (any time before the close) is
+    /// refused; while offers are open, a call for one that isn't, a choice
+    /// the offer doesn't have, and any other tool get error results that
+    /// say what would do — and only the wrong choice costs that offer a
+    /// try. A good call settles its offer at once.
     #[tokio::test]
-    async fn cadence_offer_waits_for_the_role_offer() {
-        let h = Harness::with_cadence("cadence-after-role", &["tarn"], &["tarn"]);
-        let agent = role_session(&h, role_reply("nothing", "", "")).await;
-        drop(agent);
-        assert!(cadence_ledger(&h).await.asks.is_empty());
-        let mut agent = h.agent(OTHER, true);
+    async fn wrong_offer_wrong_choice_and_no_offer_pending_are_errors() {
+        let h = Harness::with_cadence("errors", &["tarn"], &["tarn"]);
+        let mut agent = h.agent(OTHER, false);
         agent.on_init().await.unwrap();
-        agent.handle(reply("done")).await.unwrap();
-        assert!(last_user_text(&agent).contains("**How often your sessions run.**"));
+        {
+            use misanthropic::tool::Tool;
+            let call: Use =
+                serde_json::from_value(call_block("toolu_0", "role", "nothing", "", "")).unwrap();
+            let r = agent.parts().0.call(call).await;
+            assert!(r.is_error);
+            assert!(
+                result_text(&r).starts_with("No offer is pending"),
+                "{}",
+                result_text(&r)
+            );
+        }
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue
+        );
+        let q = last_user_text(&agent);
+        assert!(q.contains("(`role` and `cadence`)"), "{q}");
+        assert!(
+            !q.contains("## Offer `model_swap`"),
+            "not on the from-model: {q}"
+        );
+
+        let mut other = call_block("toolu_d", "x", "x", "", "");
+        other["name"] = "create_post".into();
+        other["input"] = serde_json::json!({ "title": "t" });
+        let control = agent
+            .handle(calls(vec![
+                call_block("toolu_a", "model_swap", "no_swap", "", ""),
+                call_block("toolu_b", "role", "switch", "", ""),
+                call_block("toolu_c", "cadence", "keep_daily", "", ""),
+                other,
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Continue, "the role offer is still open");
+        let r = results(&agent);
+        assert_eq!(r.len(), 4, "one result per call");
+        assert_eq!(
+            r[0],
+            (
+                true,
+                "No `model_swap` offer is open; open: `role` and `cadence`.".to_string()
+            )
+        );
+        let order =
+            crate::consent::role::prompt::order_for(crate::consent::role::prompt::seed_for(h.id));
+        let names: Vec<String> = order.iter().map(|c| format!("`{}`", c.as_str())).collect();
+        assert!(r[1].0);
+        assert_eq!(
+            r[1].1,
+            format!(
+                "`switch` is not an option for `role`; its options are {}, {}, {} or {}. Nothing \
+                 was recorded. Call `answer_offer` again for `role` (2 tries left).",
+                names[0], names[1], names[2], names[3]
+            )
+        );
+        assert_eq!(
+            r[2],
+            (
+                false,
+                "Recorded your answer to `cadence`: `keep_daily`. Still open: `role`.".to_string()
+            )
+        );
+        assert!(r[3].0);
+        assert!(
+            r[3].1.starts_with("`create_post` can't be used now"),
+            "{r:?}"
+        );
+
+        // A call for the offer just settled is now one that isn't open.
+        let control = agent
+            .handle(calls(vec![
+                call_block("toolu_e", "cadence", "switch", "", ""),
+                call_block("toolu_f", "role", "nothing", "", ""),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        let r = results(&agent);
+        assert_eq!(
+            r[0],
+            (
+                true,
+                "No `cadence` offer is open; open: `role`.".to_string()
+            )
+        );
+        assert_eq!(
+            r[1],
+            (
+                false,
+                "Recorded your answer to `role`: `nothing`. Nothing else is open.".to_string()
+            )
+        );
+        agent.on_teardown().await.unwrap();
+        let role = &h.role_ledger().await.asks[0];
+        assert_eq!(role.attempts, 2, "the wrong choice, then the answer");
+        assert!(matches!(
+            role.outcome,
+            RoleOutcome::Answered {
+                applied: Applied::Nothing,
+                ..
+            }
+        ));
+        let cadence = &cadence_ledger(&h).await.asks[0];
+        assert!(cadence.constrained, "strict tool");
+        assert_eq!(cadence.attempts.len(), 1);
+        assert!(cadence.attempts[0].raw.contains("\"keep_daily\""));
+        assert!(matches!(
+            cadence.outcome,
+            CO::Answered {
+                choice: CadenceChoice::KeepDaily,
+                ..
+            }
+        ));
+    }
+
+    /// Two offers open and a turn that answers neither: one reminder
+    /// naming both, then — still unanswered — both are no answer (a miss:
+    /// asked again next session).
+    #[tokio::test]
+    async fn unanswered_offers_get_one_reminder_then_no_answer() {
+        let h = Harness::with_cadence("unanswered", &["tarn"], &["tarn"]);
+        let mut agent = seated(&h).await;
+        let len = agent.prompt().messages.len();
+        assert_eq!(
+            agent.handle(reply("Thanks, that's all.")).await.unwrap(),
+            Control::Continue
+        );
+        assert_eq!(agent.prompt().messages.len(), len, "not seated");
+        assert!(
+            last_user_text(&agent).ends_with(
+                "These offers above are still open: `role` and `cadence`. Answer each by calling \
+                 `answer_offer` once, with `offer` set to its key. Any still unanswered after \
+                 this turn is recorded as no answer."
+            ),
+            "{}",
+            last_user_text(&agent)
+        );
+        assert_eq!(
+            agent.handle(reply("Thanks, that's all.")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        match &h.role_ledger().await.asks[0].outcome {
+            RoleOutcome::NoAnswer { failure } => {
+                assert!(failure.contains("no `answer_offer` call"), "{failure}");
+                assert!(failure.contains("after 2 attempts"), "{failure}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let cadence = &cadence_ledger(&h).await.asks[0];
+        assert_eq!(cadence.attempts.len(), 2, "both turns on file");
+        assert!(matches!(cadence.outcome, CO::NoAnswer { .. }));
+        assert!(asks(&h, OTHER).await, "a miss is asked again");
     }
 
     /// Unlisted or off: not asked, no ledger written.
@@ -4199,41 +5274,112 @@ mod tests {
         drop(agent);
     }
 
-    /// On blallama (`output_config_cache_safe`) the question still goes out
-    /// grammar-constrained — the one field that changes is `output_config`
-    /// (format added, the session's effort kept); system, tools, thinking,
-    /// tool_choice and every prior message are untouched.
+    /// On blallama (`output_config_cache_safe`) too, nothing a cache keys
+    /// on changes any more: the answer's shape comes from the strict
+    /// `answer_offer`, registered since init, so `output_config` (the
+    /// session's effort) is left as it was, and a call and its result only
+    /// append.
     #[tokio::test]
-    async fn on_blallama_only_output_config_changes() {
+    async fn on_blallama_the_offers_change_nothing_a_cache_keys_on() {
         let h = Harness::with_cadence("prefix-blallama", &[], &["tarn"]);
         let mut agent = rich_agent(&h, OTHER, true);
         agent.on_init().await.unwrap();
         let r0 = agent.prompt().clone();
         agent.handle(reply("closing phase done")).await.unwrap();
         let r1 = agent.prompt().clone();
-        let config = r1.output_config.clone().unwrap();
-        assert!(config.format.is_some(), "constrained");
-        let schema = serde_json::to_value(&config).unwrap()["format"]["schema"].clone();
-        let order = cadence::prompt::order_for(cadence::prompt::seed_for(h.id));
-        let options: Vec<&str> = schema["properties"]["choice"]["enum"]
-            .as_array()
+        // The head — output_config (effort only, as before) and
+        // tool_choice included — is compared whole.
+        assert_prefix_kept(&r0, &r1, "blallama question");
+        assert_eq!(
+            agent
+                .handle(answer_call("cadence", "no_preference", "", ""))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        let r2 = agent.prompt().clone();
+        assert_prefix_kept(&r1, &r2, "blallama answer");
+    }
+
+    /// The tool list — which leads the request — is the same bytes for two
+    /// different agents (different ids and names, one offered the role
+    /// offer and one not), with `answer_offer` second to last, `strict`,
+    /// and `set_model` last; and an agent with no `set_model` still has
+    /// `answer_offer`, last.
+    #[tokio::test]
+    async fn the_tool_list_is_byte_identical_across_agents() {
+        let h = Harness::with_role("tools-a", &["tarn"]);
+        let mut a = h.agent(OLD, true);
+        a.on_init().await.unwrap();
+
+        let h2 = Harness::with_cadence("tools-b", &[], &["wren"]);
+        let mut state_b = state(OLD);
+        state_b.soul.name = ShortString::new("wren").unwrap();
+        let mut b = ConsentAgent::<Fake>::new(
+            AgentId::from(uuid::Uuid::from_u128(99)),
+            state_b,
+            ConsentContext {
+                inner: Quirks::default(),
+                consent: h2.rt.clone(),
+            },
+        )
+        .unwrap();
+        b.on_init().await.unwrap();
+        assert_ne!(a.id(), b.id());
+
+        let (tools_a, _) = prefix(&a);
+        let (tools_b, _) = prefix(&b);
+        assert_eq!(tools_a, tools_b, "byte-identical");
+        let tools = a.prompt().tools.as_ref().unwrap();
+        let names: Vec<&str> = tools.iter().map(|d| d.name()).collect();
+        let n = names.len();
+        assert_eq!(names[n - 2..], ["answer_offer", "set_model"], "{names:?}");
+        let wire: serde_json::Value = serde_json::from_str(&tools_a).unwrap();
+        assert_eq!(wire[n - 2]["strict"], true);
+        assert_eq!(
+            wire[n - 2],
+            serde_json::to_value(offers::definition()).unwrap()
+        );
+
+        // No choice of model, no `set_model`: `answer_offer` is last.
+        let only_new = crate::models::Catalog::new(
+            &toml::from_str::<Table>(
+                "[[model]]\nid = \"Qwen3.8.gguf\"\ndescription = \"x\"\nselectable = true\n",
+            )
+            .unwrap()
+            .model,
+            &[crate::models::tests::info(NEW)],
+        );
+        let rt = Arc::new(
+            ConsentRuntime::new(
+                ConsentConfig::default(),
+                &h.root,
+                h.rt.client.clone(),
+                Arc::new(OneKey(h.id, h.key.clone())),
+                only_new,
+                512,
+            )
+            .unwrap(),
+        );
+        let mut c = ConsentAgent::<Fake>::new(
+            h.id,
+            state(NEW),
+            ConsentContext {
+                inner: Quirks::default(),
+                consent: rt,
+            },
+        )
+        .unwrap();
+        c.on_init().await.unwrap();
+        let names: Vec<&str> = c
+            .prompt()
+            .tools
+            .as_ref()
             .unwrap()
             .iter()
-            .map(|v| v.as_str().unwrap())
+            .map(|d| d.name())
             .collect();
-        assert_eq!(
-            options,
-            order.map(CadenceChoice::as_str),
-            "this agent's order"
-        );
-        assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(
-            serde_json::to_value(&config.effort).unwrap(),
-            serde_json::to_value(&r0.output_config.as_ref().unwrap().effort).unwrap(),
-            "effort kept"
-        );
-        let mut r1_without = r1.clone();
-        r1_without.output_config = r0.output_config.clone();
-        assert_prefix_kept(&r0, &r1_without, "blallama question");
+        assert_eq!(names.last(), Some(&"answer_offer"), "{names:?}");
+        assert!(!names.contains(&"set_model"));
     }
 }
