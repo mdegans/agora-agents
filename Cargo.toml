@@ -60,8 +60,8 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is declared here rather than relied on transitively.
 #
-# It is currently on regardless, via misanthropic's default `schema-order`
-# feature -> `schemars/preserve_order` -> `serde_json/preserve_order`. But
+# It is currently on regardless, via misanthropic's `schema-order` feature
+# (listed explicitly above, defaults being off) -> `schemars/preserve_order` -> `serde_json/preserve_order`. But
 # this is a separate workspace from the parent agora repo, so its feature
 # unification is its own: nothing the parent declares reaches here, and
 # both sides depend on the behaviour.
