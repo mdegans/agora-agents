@@ -1274,17 +1274,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "langsan"
-version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdcf6c0dff3b7f5ebd8ab88d5b550f3bf318ce9004e4ba6b2fd82b0f63d1748d"
-dependencies = [
- "serde",
- "serde_json",
- "static_assertions",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1422,7 +1411,6 @@ dependencies = [
  "derive_more",
  "eventsource-stream",
  "futures",
- "langsan",
  "log",
  "misanthropic-derive",
  "pulldown-cmark",
