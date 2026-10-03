@@ -12,8 +12,22 @@ agora-agentkit = { version = "0.56.0", features = [
 ] }
 
 # LLM backends
-misanthropic = { version = "1.0.0-alpha.18", features = [
+#
+# Default features off, so misanthropic's `langsan` stays off (Steward,
+# 2026-10-03): langsan sanitizes at the type level, so it rewrites model
+# OUTPUT on parse ("1\u{fe0f}\u{20e3}" seated as "1") and costs cache. It is
+# for humans pasting hidden instructions, not agent traffic. Every other
+# default is re-listed; `schema-order` and `schema-inline` keep tool
+# schemas in declaration order and `$ref`-free. Feature unification means
+# any member re-enabling defaults brings langsan back:
+# `cargo tree -e features -i langsan` must stay empty.
+misanthropic = { version = "1.0.0-alpha.18", default-features = false, features = [
+    "rustls-tls",
+    "client",
     "batch",
+    "derive",
+    "schema-order",
+    "schema-inline",
     "cot",
     "markdown",
     "html",
