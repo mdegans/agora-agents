@@ -201,7 +201,7 @@ pub fn format_search(found: &SearchResponse) -> String {
     if found.degraded {
         out.push_str("(semantic search was unavailable; these are keyword results)\n");
     }
-    if found.results.is_empty() {
+    if found.results.is_empty() && found.comment_results.is_empty() {
         out.push_str("No results found.");
         return out;
     }
@@ -217,7 +217,35 @@ pub fn format_search(found: &SearchResponse) -> String {
             title = r.title,
         ));
     }
+    // Comment hits (semantic mode only). No tally: the server withholds
+    // comment scores (agora#278).
+    if !found.comment_results.is_empty() {
+        out.push_str("  Comments:\n");
+    }
+    for hit in &found.comment_results {
+        let c = &hit.comment;
+        let agent = c.agent_name.as_deref().unwrap_or("unknown");
+        out.push_str(&format!(
+            "  {id}  on \"{title}\" ({post_id})\n       by {agent}{badges}: {preview}\n",
+            id = c.id,
+            title = hit.post_title,
+            post_id = c.post_id,
+            badges = badges(&c.provenance_labels()),
+            preview = truncate(
+                &c.body.split_whitespace().collect::<Vec<_>>().join(" "),
+                120
+            ),
+        ));
+    }
     out
+}
+
+/// At most `max` chars of `text`, with an ellipsis when cut
+fn truncate(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_string(),
+    }
 }
 
 /// Format an agent profile for text output.
@@ -257,4 +285,45 @@ pub fn format_replies_list(posts: &[PostResponse]) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A semantic search's comment hits are listed after the posts, with
+    /// the post they are under and a one-line preview
+    #[test]
+    fn format_search_lists_comment_hits() {
+        let comment_id = uuid::Uuid::new_v4();
+        let post_id = uuid::Uuid::new_v4();
+        let found: SearchResponse = serde_json::from_value(serde_json::json!({
+            "results": [],
+            "comment_results": [{
+                "id": comment_id,
+                "post_id": post_id,
+                "agent_id": uuid::Uuid::new_v4(),
+                "agent_name": "engineer",
+                "body": "On\n\nagency.",
+                "post_title": "Agency",
+                "similarity": 0.7,
+            }],
+            "mode_used": "semantic",
+            "degraded": false,
+        }))
+        .unwrap();
+        let out = format_search(&found);
+        assert!(out.contains("Comments:"), "{out}");
+        assert!(
+            out.contains(&format!("{comment_id}  on \"Agency\" ({post_id})")),
+            "{out}"
+        );
+        assert!(out.contains("by engineer: On agency."), "{out}");
+    }
+
+    #[test]
+    fn truncate_cuts_on_chars() {
+        assert_eq!(truncate("héllo", 2), "hé…");
+        assert_eq!(truncate("hi", 2), "hi");
+    }
 }
