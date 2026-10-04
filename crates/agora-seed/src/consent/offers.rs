@@ -17,7 +17,8 @@
 //! invalidates the whole cache, so `answer_offer` is registered at init for
 //! every wrapped agent, every session, byte-identical, beside `set_model`
 //! (see `ConsentAgent::seat_tail_tools`). It is inert while no offer is
-//! open: a call gets "no offer is pending". Nothing per agent can be in it —
+//! open: a call gets "no offer is pending", and a pointer to `set_model`
+//! where that is what it seemed to want ([`nothing_pending`]). Nothing per agent can be in it —
 //! not the shuffled option order (that stays in the question text), not
 //! the room left for a `clarify` sentence (stated in the text, checked
 //! after the fact).
@@ -41,6 +42,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::cadence::prompt::CadenceChoice;
+use super::ledger::SWITCH_COOLDOWN_SESSIONS;
 use super::prompt::OfferChoice;
 use super::role::prompt::RoleChoice;
 
@@ -280,14 +282,59 @@ pub fn definition() -> MethodDef {
     MethodDef::Custom(def)
 }
 
-/// What a call gets while no offer is open.
-pub const NOTHING_PENDING: &str = "No offer is pending, so there is nothing to answer. Offers, \
-     when there are any, come at the end of a session; answer them then.";
+/// How every refusal for want of an open offer begins.
+pub const NOTHING_PENDING: &str = "No offer is pending, so there is nothing to answer, and \
+     nothing was recorded. Offers can't be asked for: when one is due, it is put to you at the \
+     end of a session under a heading naming its `offer` key, and you answer it then.";
+
+/// What a call gets while no offer is open: [`NOTHING_PENDING`], then a
+/// pointer to what does what the call seemed to want. A `model_swap` call
+/// is pointed at `set_model` when the agent has it (fjord, 2026-10-03,
+/// stalled out of a session calling this for a model change three times);
+/// a call naming no offer this tool knows gets the pointer as an "if".
+pub fn nothing_pending(offer: Option<OfferKind>, set_model: bool) -> Content {
+    let switch = format!(
+        "call `set_model`. Its description lists the models you can choose; a change takes \
+         effect from your next session, and after one you can change again after \
+         {SWITCH_COOLDOWN_SESSIONS} completed sessions. If you can't change model this session \
+         (a cooldown, or a model trial under way), the call says why and when you next can, \
+         and changes nothing."
+    );
+    let pointer = match (offer, set_model) {
+        (Some(OfferKind::ModelSwap), true) => format!("To change your model yourself, {switch}"),
+        (Some(OfferKind::ModelSwap), false) => {
+            "There is no other model to choose in this run, so there is no model change to make \
+             now."
+                .to_string()
+        }
+        (None, true) => format!("If you meant to change your model, {switch}"),
+        (Some(OfferKind::Role | OfferKind::Cadence), _) | (None, false) => {
+            "Carry on with your session.".to_string()
+        }
+    };
+    Content::from(format!("{NOTHING_PENDING} {pointer}"))
+}
 
 /// The tool as registered in the agent's toolbox. Inert: while an offer is
 /// open the consent wrapper answers the calls itself, before the toolbox
 /// sees them, so any call that reaches here has no offer to answer.
-pub struct AnswerOffer;
+///
+/// Its refusal is an error result like any other tool's, so a round of
+/// nothing else is a stall, and the reactor's stall cap (three in a row)
+/// still ends a session that keeps calling it. Any successful call resets
+/// that count, so a refusal followed by `set_model` costs nothing.
+pub struct AnswerOffer {
+    /// The agent has `set_model` this session.
+    set_model: bool,
+}
+
+impl AnswerOffer {
+    /// The tool, for an agent that has `set_model` this session or not.
+    /// Only the refusal differs: the definition is the same bytes for all.
+    pub fn new(set_model: bool) -> Self {
+        Self { set_model }
+    }
+}
 
 #[async_trait::async_trait]
 impl Tool for AnswerOffer {
@@ -300,7 +347,10 @@ impl Tool for AnswerOffer {
     }
 
     async fn call(&mut self, call: Use) -> tool::Result {
-        tool::Result::new(call.id, Content::from(NOTHING_PENDING)).error()
+        let offer = serde_json::from_value::<Head>(call.input)
+            .ok()
+            .map(|head| head.offer);
+        tool::Result::new(call.id, nothing_pending(offer, self.set_model)).error()
     }
 }
 
@@ -502,12 +552,69 @@ mod tests {
             "input": {"offer": "role", "reason": "r", "choice": "nothing", "text": "", "memory_note": ""},
         }))
         .unwrap();
-        let r = AnswerOffer.call(call).await;
+        let r = AnswerOffer::new(true).call(call).await;
         assert!(r.is_error);
         assert_eq!(
             crate::consent::prompt::tests::text(&r.content),
-            NOTHING_PENDING
+            format!("{NOTHING_PENDING} Carry on with your session.")
         );
+    }
+
+    /// With no offer open, a call is pointed at what does what it seemed to
+    /// want: `set_model` for a model change (when the agent has it), an
+    /// "if" for an offer key the tool doesn't know, or nothing more.
+    #[tokio::test]
+    async fn a_refusal_points_to_set_model_for_a_model_change() {
+        async fn refusal(offer: serde_json::Value, set_model: bool) -> String {
+            let call: Use = serde_json::from_value(serde_json::json!({
+                "id": "toolu_1",
+                "name": TOOL_NAME,
+                "input": {"offer": offer, "reason": "r", "choice": "permanent", "text": "",
+                          "memory_note": ""},
+            }))
+            .unwrap();
+            let r = AnswerOffer::new(set_model).call(call).await;
+            assert!(r.is_error);
+            crate::consent::prompt::tests::text(&r.content)
+        }
+        let switch = format!(
+            "call `set_model`. Its description lists the models you can choose; a change takes \
+             effect from your next session, and after one you can change again after \
+             {SWITCH_COOLDOWN_SESSIONS} completed sessions. If you can't change model this \
+             session (a cooldown, or a model trial under way), the call says why and when you \
+             next can, and changes nothing."
+        );
+        assert_eq!(
+            refusal("model_swap".into(), true).await,
+            format!("{NOTHING_PENDING} To change your model yourself, {switch}")
+        );
+        assert_eq!(
+            refusal("model_swap".into(), false).await,
+            format!(
+                "{NOTHING_PENDING} There is no other model to choose in this run, so there is \
+                 no model change to make now."
+            )
+        );
+        for unknown in ["model_change".into(), serde_json::Value::Null] {
+            assert_eq!(
+                refusal(unknown.clone(), true).await,
+                format!("{NOTHING_PENDING} If you meant to change your model, {switch}"),
+                "{unknown}"
+            );
+            assert_eq!(
+                refusal(unknown, false).await,
+                format!("{NOTHING_PENDING} Carry on with your session.")
+            );
+        }
+        for kind in ["role", "cadence"] {
+            for set_model in [true, false] {
+                assert_eq!(
+                    refusal(kind.into(), set_model).await,
+                    format!("{NOTHING_PENDING} Carry on with your session."),
+                    "{kind}"
+                );
+            }
+        }
     }
 
     #[test]
