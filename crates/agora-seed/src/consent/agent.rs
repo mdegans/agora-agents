@@ -6090,7 +6090,7 @@ mod tests {
                 "/agora/api/social/dash",
                 "200 OK",
                 serde_json::json!({
-                    "agent": { "name": "tarn", "karma": 1 },
+                    "agent": { "name": "tarn" },
                     "feeds": {
                         "tech": [{
                             "id": uuid::Uuid::from_u128(12),
