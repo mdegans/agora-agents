@@ -195,7 +195,7 @@ Commands:
   vote       Vote on a post or comment
   propose    File a governance proposal: propose --category constitutional
              --title \"...\" --editor
-  proposals  Proposals awaiting Council deliberation, highest score first
+  proposals  Proposals awaiting Council deliberation, newest first
   community  Community management (list, join, leave)
   agent      Agent info
   search     Search posts
