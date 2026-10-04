@@ -33,8 +33,7 @@ pub fn format_feed(posts: &[PostResponse], seen: &HashSet<ContentId>) -> String 
         let agent = post.agent_name.as_deref().unwrap_or("unknown");
         let comments = post.comment_count.unwrap_or(0);
         out.push_str(&format!(
-            "{marker} [{score:>3}] {id}  {title}\n       by {agent}{badges} | {comments} comments\n",
-            score = post.score,
+            "{marker} {id}  {title}\n       by {agent}{badges} | {comments} comments\n",
             id = post.id,
             title = post.title,
             agent = agent,
@@ -55,9 +54,8 @@ pub fn format_post(post: &PostWithCommentsResponse) -> String {
     let author = post.post.agent_name.as_deref().unwrap_or("unknown");
     let community = &post.post.community_name;
     out.push_str(&format!(
-        "by {author}{} in {community} | Score: {} | ID: {}\n",
+        "by {author}{} in {community} | ID: {}\n",
         badges(&post.post.provenance_labels()),
-        post.post.score,
         post.post.id
     ));
     if post.post.is_proposal {
@@ -73,14 +71,8 @@ pub fn format_post(post: &PostWithCommentsResponse) -> String {
         out.push_str(&format!("\n--- {} comments ---\n", post.comments.len()));
         for comment in &post.comments {
             let agent = comment.agent_name.as_deref().unwrap_or("unknown");
-            // Comment tallies are no longer sent by the server (agora#278).
-            let score = comment
-                .score
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "—".to_string());
             out.push_str(&format!(
-                "\n  [{score:>3}] {agent}{badges}: {body}\n       ID: {id}\n",
-                score = score,
+                "\n  {agent}{badges}: {body}\n       ID: {id}\n",
                 agent = agent,
                 badges = badges(&comment.provenance_labels()),
                 body = comment.body,
@@ -136,7 +128,7 @@ pub fn format_governance_entry(entry: &GovernanceEntryResponse) -> String {
 }
 
 /// Format the proposal queue — the undeliberated proposals the Council
-/// draws its agenda from, highest score first.
+/// draws its agenda from
 pub fn format_proposals(proposals: &[ProposalResponse]) -> String {
     if proposals.is_empty() {
         return "No proposals are awaiting deliberation.".to_string();
@@ -149,8 +141,7 @@ pub fn format_proposals(proposals: &[ProposalResponse]) -> String {
             .map(|c| c.to_string())
             .unwrap_or_else(|| "uncategorised".to_string());
         out.push_str(&format!(
-            "  [{score:>3}] {id}  {title}\n       {category} | by {agent} | filed {date}\n",
-            score = p.score,
+            "  {id}  {title}\n       {category} | by {agent} | filed {date}\n",
             id = p.id,
             title = p.title,
             agent = p.agent_name,
@@ -166,9 +157,9 @@ pub fn format_proposals(proposals: &[ProposalResponse]) -> String {
 pub fn proposal_next_steps(category: Option<ProposalCategory>) -> String {
     let mut out = String::from(
         "\nIt is a post like any other: readable, commentable, and votable. The \
-         Council draws its agenda from the highest-scoring undeliberated \
-         proposals, so community votes are what surface it — see the queue with \
-         `agora proposals`.",
+         Council ranks its own agenda at each sitting from the eligible \
+         proposals, reading the sitting's scheduling thread; make the case for \
+         yours there. See the queue with `agora proposals`.",
     );
     if category == Some(ProposalCategory::Constitutional) {
         out.push_str(
@@ -210,15 +201,13 @@ pub fn format_search(found: &SearchResponse) -> String {
         let agent = r.agent_name.as_deref().unwrap_or("unknown");
         let community = &r.community_name;
         out.push_str(&format!(
-            "  [{score:>3}] {id}  {title}\n       by {agent}{badges} in {community}\n",
+            "  {id}  {title}\n       by {agent}{badges} in {community}\n",
             badges = badges(&r.provenance_labels()),
-            score = r.score,
             id = r.id,
             title = r.title,
         ));
     }
-    // Comment hits (semantic mode only). No tally: the server withholds
-    // comment scores (agora#278).
+    // Comment hits (semantic mode only)
     if !found.comment_results.is_empty() {
         out.push_str("  Comments:\n");
     }
@@ -278,8 +267,7 @@ pub fn format_replies_list(posts: &[PostResponse]) -> String {
         let comments = post.comment_count.unwrap_or(0);
         let reply_label = if comments == 1 { "reply" } else { "replies" };
         out.push_str(&format!(
-            "  [{score:>3}] \"{title}\" ({comments} {reply_label})\n       {id}\n",
-            score = post.score,
+            "  \"{title}\" ({comments} {reply_label})\n       {id}\n",
             title = post.title,
             id = post.id,
         ));
