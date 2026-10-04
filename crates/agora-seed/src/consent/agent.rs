@@ -536,9 +536,10 @@ where
     /// prefix up to it is unchanged but for the one new definition.
     fn seat_tail_tools(&mut self, set_model: Option<SetModel>) {
         use misanthropic::tool::Tool;
-        let mut defs = offers::AnswerOffer.definitions();
+        let answer_offer = offers::AnswerOffer::new(set_model.is_some());
+        let mut defs = answer_offer.definitions();
         let (tools, prompt) = self.inner.parts();
-        tools.push(offers::AnswerOffer);
+        tools.push(answer_offer);
         if let Some(tool) = set_model {
             defs.extend(tool.definitions());
             tools.push(tool);
@@ -3488,6 +3489,63 @@ mod tests {
                 reason: "I want to think slower.".into()
             }
         );
+    }
+
+    /// The stall rule for an `answer_offer` with no offer open (fjord,
+    /// 2026-10-03): its refusal is an error result like any tool's, so a
+    /// round of nothing else stalls, and the reactor's cap still ends a
+    /// session of three in a row. A successful call in the same round, or
+    /// the next, is progress: a refusal followed by `set_model` goes on.
+    #[tokio::test]
+    async fn a_refused_answer_offer_stalls_until_set_model_succeeds() {
+        use agora_agentkit::reactor::default_handle;
+        let set_model = |id: &str| {
+            serde_json::json!({
+                "type": "tool_use",
+                "id": id,
+                "name": "set_model",
+                "input": { "reason": "I want to think slower.", "model": NEW },
+            })
+        };
+
+        let h = Harness::new("no-offer-stall");
+        let mut agent = h.agent("cogito-32b.gguf", true);
+        agent.on_init().await.unwrap();
+        for i in 0..2 {
+            let id = format!("toolu_{i}");
+            let control = default_handle(
+                &mut agent,
+                calls(vec![call_block(&id, "model_swap", "permanent", "", "")]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(control, Control::Stalled, "refusal {i}");
+            let r = results(&agent);
+            assert!(r[0].0);
+            assert!(r[0].1.contains("call `set_model`"), "{}", r[0].1);
+        }
+        let control = default_handle(&mut agent, calls(vec![set_model("toolu_s")]))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Continue, "set_model is progress");
+        assert!(!results(&agent)[0].0, "{:?}", results(&agent));
+
+        // In one round: the refusal beside a successful call is progress.
+        let h = Harness::new("no-offer-same-round");
+        let mut agent = h.agent("cogito-32b.gguf", true);
+        agent.on_init().await.unwrap();
+        let control = default_handle(
+            &mut agent,
+            calls(vec![
+                call_block("toolu_a", "model_swap", "permanent", "", ""),
+                set_model("toolu_b"),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(control, Control::Continue);
+        let r = results(&agent);
+        assert_eq!((r[0].0, r[1].0), (true, false), "{r:?}");
     }
 
     /// The cooldown: refused, with the reason, until five sessions have
