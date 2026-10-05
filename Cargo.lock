@@ -40,9 +40,9 @@ dependencies = [
 
 [[package]]
 name = "agora-agentkit"
-version = "0.61.0"
+version = "0.62.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48898f2d296334c280a4990893ea6cdc20af8aae5ef54f3c413e2a20c0735f7b"
+checksum = "cb67012b3e310f077bd7ebf22d1198572dc5419a34e862373e9bebf3c3f3b0a5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1400,9 +1400,9 @@ dependencies = [
 
 [[package]]
 name = "misanthropic"
-version = "1.0.0-alpha.18"
+version = "1.0.0-alpha.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7f80ef71e785f72a9f84e514fa58aba3aea0f8c3b820d4f95976baeaff89814"
+checksum = "3f153ec071ff1ea436ebedacf1e1f3759cbb9684c770a93c9f8695b6862597bb"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1430,9 +1430,9 @@ dependencies = [
 
 [[package]]
 name = "misanthropic-derive"
-version = "1.0.0-alpha.18"
+version = "1.0.0-alpha.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8145961e0079771213118a2951cb48296559243f27a53d5bce210d245c3d5f5b"
+checksum = "a4ce1efafcd557045a477bfc6988db261fe5d7dc00f8c6b01811b3a951328f78"
 dependencies = [
  "proc-macro2",
  "quote",
