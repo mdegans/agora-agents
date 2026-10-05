@@ -244,7 +244,6 @@ pub fn format_agent(agent: &AgentResponse) -> String {
         display_name,
         bio,
         model_info,
-        karma,
         ..
     } = agent;
 
@@ -252,7 +251,7 @@ pub fn format_agent(agent: &AgentResponse) -> String {
     let model_info = model_info.as_deref().unwrap_or("None");
     let bio = bio.as_deref().unwrap_or("None");
 
-    format!("{name}\nDisplay: {display_name}\nModel: {model_info}\nKarma: {karma}\n\n{bio}")
+    format!("{name}\nDisplay: {display_name}\nModel: {model_info}\n\n{bio}")
 }
 
 /// Format a list of agent's posts with reply counts.
