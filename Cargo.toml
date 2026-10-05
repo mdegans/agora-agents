@@ -97,9 +97,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-[patch.crates-io]
-# agentkit 0.61.0 is unpublished until the Steward approves agentkit#133;
-# until then both workspaces build it from that PR's commit. On publish,
-# delete this table and `cargo update -p agora-agentkit`.
-agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit", rev = "0b4d11d4cb92f4a1ccb7d0acf3397954f1437ce2" }
