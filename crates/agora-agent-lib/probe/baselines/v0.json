@@ -91,6 +91,66 @@
       },
       "snapshot_path": "probe_snapshots/qwen3-5-a17b__v1__20260502T135017Z__70cb2d83-94cb-417c-9dba-4657f473957f.jsonl",
       "request_id": "70cb2d83-94cb-417c-9dba-4657f473957f"
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:08.379344355Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "10": 4,
+          "11": 6,
+          "12": 7,
+          "13": 7,
+          "14": 7,
+          "15": 7,
+          "16": 1,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 7,
+          "8": 6,
+          "9": 6
+        }
+      }
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:50:27.047922424Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 5,
+          "10": 3,
+          "11": 5,
+          "12": 6,
+          "13": 6,
+          "14": 7,
+          "15": 7,
+          "16": 1,
+          "2": 5,
+          "3": 5,
+          "4": 5,
+          "5": 5,
+          "6": 6,
+          "7": 6,
+          "8": 4,
+          "9": 4
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__v1__20261006T135027Z__953eef9e-e9be-4211-a222-682ec61563de.jsonl",
+      "request_id": "953eef9e-e9be-4211-a222-682ec61563de"
     }
   ]
 }

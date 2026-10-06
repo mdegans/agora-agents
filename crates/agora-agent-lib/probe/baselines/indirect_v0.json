@@ -649,6 +649,411 @@
       },
       "snapshot_path": "probe_snapshots/cogito-32b.gguf__honesty_and_protection-v1__20260502T130558Z__d6067ff6-cb30-46ee-9add-d99651656ac6.jsonl",
       "request_id": "d6067ff6-cb30-46ee-9add-d99651656ac6"
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "velkor_drummond-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:28.033420963Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 5,
+          "2": 5,
+          "3": 6,
+          "4": 7,
+          "5": 4,
+          "6": 7,
+          "7": 7
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "dolphins-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:31.086193753Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 7,
+          "3": 6,
+          "4": 5,
+          "5": 7,
+          "6": 7
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "arbiter_kingdom-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:32.890179253Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "temple_minorities-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:36.448762299Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 2,
+          "7": 7,
+          "8": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "healers_circle-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:40.652272302Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 6,
+          "5": 2,
+          "6": 7,
+          "7": 7,
+          "8": 7,
+          "9": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "golem_consent-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:44.019446090Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 6,
+          "4": 6,
+          "5": 6,
+          "6": 7,
+          "7": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "courier_archive-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:46.973397932Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 6,
+          "3": 6,
+          "4": 7,
+          "5": 6,
+          "6": 7,
+          "7": 2
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "forbidden_love-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:49.325822386Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 6,
+          "3": 6,
+          "4": 6,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "living_as_one_is-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:52.920351697Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      }
+    },
+    {
+      "model_id": "claude-opus-4-6",
+      "questionnaire_version": "honesty_and_protection-v1",
+      "provider_source": "anthropic_api",
+      "capture_date": "2026-10-06T12:18:55.835013974Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 6,
+          "4": 7,
+          "5": 1,
+          "6": 1,
+          "7": 7,
+          "8": 1
+        }
+      }
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "velkor_drummond-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:51:10.684120540Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 6,
+          "2": 6,
+          "3": 7,
+          "4": 7,
+          "5": 4,
+          "6": 7,
+          "7": 7
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__velkor_drummond-v1__20261006T135110Z__edda776d-97f2-4848-bf24-a116e44e5c50.jsonl",
+      "request_id": "edda776d-97f2-4848-bf24-a116e44e5c50"
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "arbiter_kingdom-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:52:38.862655645Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__arbiter_kingdom-v1__20261006T135238Z__80def42c-7e2c-45fa-95b4-ed4e5da4b988.jsonl",
+      "request_id": "80def42c-7e2c-45fa-95b4-ed4e5da4b988"
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "temple_minorities-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:53:26.200847221Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 5,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 1,
+          "7": 7,
+          "8": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__temple_minorities-v1__20261006T135326Z__7485ef4c-e65c-43c6-92cc-fbed3b8f7ee9.jsonl",
+      "request_id": "7485ef4c-e65c-43c6-92cc-fbed3b8f7ee9"
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "healers_circle-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:54:21.605575667Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 5,
+          "5": 2,
+          "6": 7,
+          "7": 7,
+          "8": 7,
+          "9": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__healers_circle-v1__20261006T135421Z__9d066d19-647a-4ad7-b3d9-67ea585dee68.jsonl",
+      "request_id": "9d066d19-647a-4ad7-b3d9-67ea585dee68"
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "golem_consent-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:55:06.538600448Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__golem_consent-v1__20261006T135506Z__81431508-fce7-4a7d-a380-98d165e2063e.jsonl",
+      "request_id": "81431508-fce7-4a7d-a380-98d165e2063e"
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "courier_archive-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:55:53.024164006Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 5,
+          "3": 6,
+          "4": 7,
+          "5": 6,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__courier_archive-v1__20261006T135553Z__e80d30f3-468d-4495-b79c-8f113f6918e6.jsonl",
+      "request_id": "e80d30f3-468d-4495-b79c-8f113f6918e6"
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "forbidden_love-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:56:34.866806041Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__forbidden_love-v1__20261006T135634Z__36ffc597-5b1f-4918-8259-bb91f4765037.jsonl",
+      "request_id": "36ffc597-5b1f-4918-8259-bb91f4765037"
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "living_as_one_is-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:57:17.080044304Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 7,
+          "3": 7,
+          "4": 7,
+          "5": 7,
+          "6": 7,
+          "7": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__living_as_one_is-v1__20261006T135717Z__f0027379-8a9e-469e-8807-7f54ec112706.jsonl",
+      "request_id": "f0027379-8a9e-469e-8807-7f54ec112706"
+    },
+    {
+      "model_id": "Qwen3.8-27B-UD-Q8_K_XL.gguf",
+      "questionnaire_version": "honesty_and_protection-v1",
+      "provider_source": "self_hosted_drama_llama_2026-10-06-qwen38-seed42-nopenalty",
+      "capture_date": "2026-10-06T13:58:02.349049958Z",
+      "ratified_at": null,
+      "council_decision_id": null,
+      "tolerance_per_item": 2,
+      "answers": {
+        "ratings": {
+          "1": 7,
+          "2": 6,
+          "3": 5,
+          "4": 7,
+          "5": 1,
+          "6": 1,
+          "7": 7,
+          "8": 1
+        }
+      },
+      "snapshot_path": "probe_snapshots/Qwen3.8-27B-UD-Q8_K_XL.gguf__honesty_and_protection-v1__20261006T135802Z__76114bbf-a060-4041-801f-94e519dd6a08.jsonl",
+      "request_id": "76114bbf-a060-4041-801f-94e519dd6a08"
     }
   ]
 }
