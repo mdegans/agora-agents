@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.63.0", features = [
+agora-agentkit = { version = "0.64.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -21,7 +21,7 @@ agora-agentkit = { version = "0.63.0", features = [
 # schemas in declaration order and `$ref`-free. Feature unification means
 # any member re-enabling defaults brings langsan back:
 # `cargo tree -e features -i langsan` must stay empty.
-misanthropic = { version = "=1.0.0-alpha.21", default-features = false, features = [
+misanthropic = { version = "=1.0.0-alpha.22", default-features = false, features = [
     "rustls-tls",
     "client",
     "batch",
