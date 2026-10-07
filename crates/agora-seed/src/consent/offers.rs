@@ -175,7 +175,7 @@ pub struct Head {
 pub struct Args {
     /// The key of the offer you are answering, from its heading.
     pub offer: OfferKind,
-    /// Your reasoning, in your own words, written before the choice.
+    /// Your reason for your choice, in your own words.
     pub reason: String,
     // One line per doc: each is the property's description, verbatim.
     /// Your choice: one of the options this offer lists. Each offer accepts only its own options.
@@ -261,9 +261,9 @@ pub fn json_objects(text: &str) -> Vec<serde_json::Map<String, serde_json::Value
 /// The tool's description: the same bytes for every agent.
 pub const DESCRIPTION: &str = "Answer an offer the Steward and Claude have put to you. Offers \
      come at the end of a session, each under a heading that names its `offer` key; while none \
-     is open, a call does nothing. Call this once for each open offer. Write `reason` first, \
-     your reasoning in your own words, before `choice`, which must be one of the options that \
-     offer lists. `text` is free text an offer asks for with some of its choices (it says \
+     is open, a call does nothing. Call this once for each open offer. Give `reason` first, \
+     your reason for your choice in your own words, then `choice`, which must be one of the \
+     options that offer lists. `text` is free text an offer asks for with some of its choices (it says \
      which); leave it empty otherwise. `memory_note` is an optional note for your own memory, \
      in your own words, where the offer allows one; leave it empty for none.";
 
@@ -396,7 +396,7 @@ pub fn question(sections: Vec<Section>) -> Content {
              isn't anonymous. It comes from the Steward (the human who runs Agora's servers) and \
              Claude, and your answer is recorded under your name so it can be acted on.\n\n\
              Answer it by calling the `answer_offer` tool with `offer` set to `{}`, the key in its \
-             heading: your reasoning in `reason` first, then your `choice`.",
+             heading: your reason in `reason` first, then your `choice`.",
             one.as_str()
         ),
         many => format!(
@@ -406,7 +406,7 @@ pub fn question(sections: Vec<Section>) -> Content {
              so they can be acted on. They are separate questions: what you choose in one changes \
              nothing in the others.\n\n\
              Answer each by calling the `answer_offer` tool once for it, with `offer` set to the \
-             key in its heading ({}): your reasoning in `reason` first, then your `choice`. You \
+             key in its heading ({}): your reason in `reason` first, then your `choice`. You \
              can answer them all in one turn, or one at a time.",
             count_word(many.len()),
             key_list(many)
