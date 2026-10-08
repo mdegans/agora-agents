@@ -97,8 +97,14 @@ pub struct Switch {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cause", rename_all = "snake_case")]
 pub enum SwitchCause {
-    /// The agent asked, with `set_model`.
-    SelfSwitch { reason: String },
+    /// The agent asked, with `set_model`. `trial` when it chose a trial
+    /// (the record is then an [`OfferRecord`] begun by
+    /// [`Ledger::begin_self_trial`]).
+    SelfSwitch {
+        reason: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        trial: bool,
+    },
     /// An answered offer or trial review.
     Consent { action: ChangeAction },
 }
@@ -178,16 +184,18 @@ pub enum Stage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cause: Option<RevertCause>,
     },
-    /// The agent was moved to a model that is neither side of the offer
-    /// while the offer was under way — by hand, since the agent itself
-    /// can't mid-offer. The offer is over; the history's last `moved` event
-    /// names the model. Final.
+    /// The agent moved to a model that is neither side of the offer while
+    /// the offer was under way: by hand (the history's last `moved` event
+    /// names the model), or by the agent's own `set_model` mid-trial (a
+    /// `decided_early` event). The offer is over. Final.
     Superseded,
 }
 
 impl Stage {
     /// Whether a change or trial for this offer is under way. While one
-    /// is, the agent can't switch model itself and isn't offered another.
+    /// is, the agent isn't offered another, and can't switch model itself
+    /// except to decide a running [`Stage::Trial`] early
+    /// ([`Ledger::decide_early`]).
     pub fn in_progress(&self) -> bool {
         matches!(
             self,
@@ -264,6 +272,32 @@ pub enum EventKind {
     /// The trial's `sessions` were done; the runner began moving the agent
     /// back to `from` for its review.
     TrialEnded { sessions: u32 },
+    /// The agent chose this trial itself, with `set_model` (`term =
+    /// trial`), rather than in answer to an offer.
+    SelfTrial { reason: String },
+    /// The agent decided the trial before its review, with `set_model`,
+    /// after `sessions` completed trial sessions. Nothing asks the review
+    /// question after it. `model` is the model chosen (`name` its display
+    /// name).
+    DecidedEarly {
+        sessions: u32,
+        decision: EarlyDecision,
+        model: Model,
+        name: String,
+        reason: String,
+    },
+}
+
+/// How a trial was decided early ([`EventKind::DecidedEarly`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EarlyDecision {
+    /// Chose the trial's model: kept for good.
+    Keep,
+    /// Chose the model the trial came from: back to it next session.
+    Return,
+    /// Chose a third model: the trial ends and the agent moves there.
+    Switch,
 }
 
 /// A model change the Steward should apply, produced by recording an
@@ -386,12 +420,15 @@ impl Ledger {
         tokio::fs::rename(&tmp, &path).await
     }
 
+    /// The latest record for `key`. A self-chosen trial
+    /// ([`Self::begin_self_trial`]) always starts a record of its own, so a
+    /// key can have several; only the latest can be under way.
     fn record(&self, key: &OfferKey) -> Option<&OfferRecord> {
-        self.offers.iter().find(|r| &r.key == key)
+        self.offers.iter().rev().find(|r| &r.key == key)
     }
 
     fn record_mut(&mut self, key: &OfferKey) -> Option<&mut OfferRecord> {
-        self.offers.iter_mut().find(|r| &r.key == key)
+        self.offers.iter_mut().rev().find(|r| &r.key == key)
     }
 
     /// Session start: notice changes that have taken effect, by the model
@@ -552,14 +589,18 @@ impl Ledger {
         })
     }
 
-    /// A change the agent agreed to that the runner has not applied yet
-    /// (the profile update failed, the model wasn't routable, or an older
-    /// binary queued it for the Steward) and that can be applied from
-    /// `model`, where the agent is now.
+    /// A change the agent agreed to that has not taken effect, and that
+    /// can be applied from `model`, where the agent is now: the profile
+    /// update failed, the model wasn't routable, an older binary queued it
+    /// for the Steward — or the runner applied it in an earlier session
+    /// but the agent is still on `model` (its state wasn't saved after the
+    /// ledger was). Call only at the close of a session in which no change
+    /// was made: a change applied earlier that had taken effect would have
+    /// moved the agent off `model`, and [`Self::observe_model`] on.
     pub fn unapplied(&self, model: &Model) -> Option<Change> {
         self.offers.iter().find_map(|r| {
             let change = Self::awaited(r)?;
-            (&change.from == model && !self.applied(r, &change.from, &change.to)).then_some(change)
+            (&change.from == model).then_some(change)
         })
     }
 
@@ -622,7 +663,7 @@ impl Ledger {
     }
 
     /// When the trial on `key` was chosen — the date the review reminds
-    /// the agent of.
+    /// the agent of. An offer's answer, or `set_model`.
     pub fn chosen_at(&self, key: &OfferKey) -> Option<DateTime<Utc>> {
         self.record(key)?
             .history
@@ -631,9 +672,94 @@ impl Ledger {
             .find_map(|e| match &e.kind {
                 EventKind::Offered {
                     answer: Some(_), ..
-                } => Some(e.at),
+                }
+                | EventKind::SelfTrial { .. } => Some(e.at),
                 _ => None,
             })
+    }
+
+    /// The trial running on `model`, if any: the one a `set_model` call
+    /// this session would decide early.
+    pub fn active_trial(&self, model: &Model) -> Option<&OfferRecord> {
+        self.offers
+            .iter()
+            .find(|r| &r.key.to == model && matches!(r.stage, Stage::Trial { .. }))
+    }
+
+    /// The agent chose, with `set_model`, a trial of `names.key.to` from
+    /// `names.key.from`, where it is now; the switch is applied (or about
+    /// to be, by the caller). It runs exactly like a trial chosen in answer
+    /// to an offer: [`TRIAL_SESSIONS`] sessions, then the review on `from`.
+    /// Always a new record, so an earlier offer for the same pair keeps
+    /// its own history (and SOUL entry). Returns `false`, changing nothing,
+    /// when a change or trial is already under way.
+    pub fn begin_self_trial(
+        &mut self,
+        names: OfferNames<'_>,
+        at: DateTime<Utc>,
+        reason: &str,
+    ) -> bool {
+        if self.offers.iter().any(|r| r.stage.in_progress()) {
+            return false;
+        }
+        self.offers.push(OfferRecord {
+            key: names.key.clone(),
+            from_name: names.from_name.to_string(),
+            to_name: names.to_name.to_string(),
+            stage: Stage::AwaitingSwap { term: Term::Trial },
+            history: vec![Event {
+                at,
+                kind: EventKind::SelfTrial {
+                    reason: reason.to_string(),
+                },
+            }],
+            soul_note: None,
+        });
+        true
+    }
+
+    /// The agent decided the trial on `key` early, with `set_model`,
+    /// choosing `to` (`name`): the trial's model keeps it ([`Stage::Moved`]),
+    /// the model it came from returns it ([`Stage::Reverted`], chosen), any
+    /// other ends the offer ([`Stage::Superseded`]). This is the trial's
+    /// outcome: no review is asked. A switch, if any, is the caller's to
+    /// record. `None`, changing nothing, unless the trial is running.
+    pub fn decide_early(
+        &mut self,
+        key: &OfferKey,
+        at: DateTime<Utc>,
+        to: &Model,
+        name: &str,
+        reason: &str,
+    ) -> Option<EarlyDecision> {
+        let record = self.record_mut(key)?;
+        let Stage::Trial { sessions, .. } = record.stage else {
+            return None;
+        };
+        let (decision, stage) = if to == &record.key.to {
+            (EarlyDecision::Keep, Stage::Moved)
+        } else if to == &record.key.from {
+            (
+                EarlyDecision::Return,
+                Stage::Reverted {
+                    cause: Some(RevertCause::Chosen),
+                },
+            )
+        } else {
+            (EarlyDecision::Switch, Stage::Superseded)
+        };
+        record.stage = stage;
+        record.history.push(Event {
+            at,
+            kind: EventKind::DecidedEarly {
+                sessions,
+                decision,
+                model: to.clone(),
+                name: name.to_string(),
+                reason: reason.to_string(),
+            },
+        });
+        Some(decision)
     }
 
     /// Record the offer's outcome. `Err` is "no usable answer" with the
@@ -780,17 +906,22 @@ impl Ledger {
         }
     }
 
-    /// Why the agent can't switch model now, if it can't: a trial or an
-    /// accepted change is under way (trials end at their review), or the
-    /// last switch is too recent.
+    /// Why the agent can't switch model now, if it can't: an accepted
+    /// change is under way, a finished trial's review is due, or the last
+    /// switch is too recent.
+    ///
+    /// A running [`Stage::Trial`] blocks nothing (Steward, 2026-10-08): a
+    /// switch during it decides the trial early. Nor does the cooldown
+    /// apply then — the switch that began the trial would otherwise stop
+    /// the agent deciding before its review, which is what the trial is
+    /// for.
     pub fn switch_blocker(&self) -> Option<String> {
-        if let Some(record) = self.offers.iter().find(|r| r.stage.in_progress()) {
+        if let Some(record) = self
+            .offers
+            .iter()
+            .find(|r| r.stage.in_progress() && !matches!(r.stage, Stage::Trial { .. }))
+        {
             return Some(match record.stage {
-                Stage::Trial { .. } => format!(
-                    "you are in a trial of {}; after {TRIAL_SESSIONS} sessions you return \
-                     to {} for one session and decide there whether to keep it",
-                    record.to_name, record.from_name
-                ),
                 Stage::ReturningForReview { .. } | Stage::ReviewDue { .. } => format!(
                     "your trial of {} is over and your decision on it is due; it is asked \
                      on {}",
@@ -798,6 +929,13 @@ impl Ledger {
                 ),
                 _ => "a model change you already agreed to has not taken effect yet".to_string(),
             });
+        }
+        if self
+            .offers
+            .iter()
+            .any(|r| matches!(r.stage, Stage::Trial { .. }))
+        {
+            return None;
         }
         let last = self.switches.last()?;
         (last.sessions_after < SWITCH_COOLDOWN_SESSIONS).then(|| {
@@ -812,7 +950,9 @@ impl Ledger {
     }
 
     /// Whether the runner has applied `record`'s awaited change — a
-    /// consented switch `from` → `to` after the record's latest event.
+    /// switch `from` → `to` at or after the record's latest event: a
+    /// consented one, or the `set_model` call that began a self-chosen
+    /// trial.
     pub fn applied(&self, record: &OfferRecord, from: &Model, to: &Model) -> bool {
         let Some(since) = record.history.last().map(|e| e.at) else {
             return false;
@@ -821,7 +961,10 @@ impl Ledger {
             &s.from == from
                 && &s.to == to
                 && s.at >= since
-                && matches!(s.cause, SwitchCause::Consent { .. })
+                && match &s.cause {
+                    SwitchCause::Consent { .. } => true,
+                    SwitchCause::SelfSwitch { trial, .. } => *trial,
+                }
         })
     }
 
@@ -894,18 +1037,48 @@ impl OfferRecord {
     /// 5-session trial; moved 2026-09-25."
     fn summary(&self) -> String {
         let (from, to) = (&self.from_name, &self.to_name);
+        // A self-chosen trial's record starts with its `set_model` call;
+        // everything else's with the offer.
+        if let Some(Event {
+            at,
+            kind: EventKind::SelfTrial { .. },
+        }) = self.history.first()
+        {
+            let head = format!(
+                "Chose on {} with set_model to try {to} for {TRIAL_SESSIONS} sessions \
+                 instead of {from}",
+                at.date_naive()
+            );
+            let parts = self.parts(&self.history[1..]);
+            return if parts.is_empty() {
+                format!("{head}.")
+            } else {
+                format!("{head} — {}.", parts.join("; "))
+            };
+        }
         let asked_on = self
             .history
             .iter()
             .find(|e| matches!(e.kind, EventKind::Offered { .. }))
             .map(|e| e.at.date_naive());
+        let parts = self.parts(&self.history);
+        let asked = match asked_on {
+            Some(on) => format!("Asked on {on} whether to move from {from} to {to}"),
+            None => format!("Asked whether to move from {from} to {to}"),
+        };
+        format!("{asked} — {}.", parts.join("; "))
+    }
+
+    /// The summary's clauses for `history`, in order.
+    fn parts(&self, history: &[Event]) -> Vec<String> {
+        let (from, to) = (&self.from_name, &self.to_name);
         let mut parts: Vec<String> = Vec::new();
         let mut offer_misses = 0;
         let mut review_misses = 0;
         // Under the current flow the review is asked on `from`, after the
         // trial has ended and the agent has gone back.
         let mut returned = false;
-        for event in &self.history {
+        for event in history {
             let on = event.at.date_naive();
             match &event.kind {
                 EventKind::Offered {
@@ -975,13 +1148,36 @@ impl OfferRecord {
                     "moved to {} by hand {on}; offer closed",
                     model.name()
                 )),
+                // Only a record's first event; [`Self::summary`] heads with
+                // it. A later one can't happen (a new trial is a new
+                // record), but is said if it does.
+                EventKind::SelfTrial { .. } => parts.push(format!(
+                    "chose with set_model to try {to} for {TRIAL_SESSIONS} sessions ({on})"
+                )),
+                EventKind::DecidedEarly {
+                    sessions,
+                    decision,
+                    name,
+                    ..
+                } => {
+                    let when = format!(
+                        "in trial session {} of {TRIAL_SESSIONS}, decided early with set_model",
+                        sessions + 1
+                    );
+                    parts.push(match decision {
+                        EarlyDecision::Keep => format!("{when} to keep {to} ({on})"),
+                        EarlyDecision::Return => {
+                            format!("{when} to return to {from} from the next session ({on})")
+                        }
+                        EarlyDecision::Switch => format!(
+                            "{when} to end the trial and switch to {name} from the next \
+                             session ({on})"
+                        ),
+                    });
+                }
             }
         }
-        let asked = match asked_on {
-            Some(on) => format!("Asked on {on} whether to move from {from} to {to}"),
-            None => format!("Asked whether to move from {from} to {to}"),
-        };
-        format!("{asked} — {}.", parts.join("; "))
+        parts
     }
 }
 
@@ -1197,7 +1393,7 @@ mod tests {
         assert_eq!(Ledger::awaited(&ledger.offers[0]), Some(change.clone()));
         assert_eq!(ledger.unapplied(&k.from), Some(change), "until applied");
         ledger.record_switch(consent_switch(t(9), &k.from, &k.to, ChangeAction::Keep));
-        assert_eq!(ledger.unapplied(&k.from), None);
+        assert!(ledger.applied(&ledger.offers[0], &k.from, &k.to));
         assert!(ledger.observe_model(&k.to, t(10)));
         assert_eq!(ledger.offers[0].stage, Stage::Moved);
         assert_eq!(ledger.review_due(&k.from), None);
@@ -1270,7 +1466,10 @@ mod tests {
             &k.from,
             ChangeAction::ReturnForReview,
         ));
-        assert_eq!(ledger.unapplied(&k.to), None);
+        assert!(ledger.applied(&ledger.offers[0], &k.to, &k.from));
+        // Applied, but still on `to` at a later session: it didn't take
+        // (the state wasn't saved), so it is offered for applying again.
+        assert_eq!(ledger.unapplied(&k.to), Some(change));
         assert!(ledger.observe_model(&k.from, t(9)));
         assert_eq!(ledger.review_due(&k.from), Some(k));
     }
@@ -1343,8 +1542,9 @@ mod tests {
         let mut ledger = Ledger::default();
         ledger.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
         ledger.observe_model(&k.to, t(2));
-        assert!(ledger.switch_blocker().is_some());
+        assert!(ledger.active_trial(&k.to).is_some());
         assert!(ledger.observe_model(&Model::from("cogito.gguf"), t(3)));
+        assert!(ledger.active_trial(&k.to).is_none());
         assert_eq!(ledger.offers[0].stage, Stage::Superseded);
         assert_eq!(ledger.switch_blocker(), None);
         assert!(
@@ -1597,6 +1797,7 @@ mod tests {
             to: Model::from("b.gguf"),
             cause: SwitchCause::SelfSwitch {
                 reason: "why".into(),
+                trial: false,
             },
             sessions_after: 0,
         }
@@ -1618,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn a_trial_or_an_accepted_change_blocks_switching() {
+    fn an_accepted_change_or_a_due_review_blocks_switching() {
         let k = key();
         let mut ledger = Ledger::default();
         ledger.record_offer(names(&k), t(23), offer(OfferChoice::Trial));
@@ -1629,15 +1830,199 @@ mod tests {
                 .contains("not taken effect")
         );
         ledger.observe_model(&k.to, t(24));
+        assert_eq!(
+            ledger.switch_blocker(),
+            None,
+            "a running trial is decided early, not blocked"
+        );
+        // Nor does the cooldown block it: the trial's own switch is recent.
+        ledger.record_switch(consent_switch(
+            t(23),
+            &k.from,
+            &k.to,
+            ChangeAction::SwapTrial,
+        ));
+        assert_eq!(ledger.switch_blocker(), None);
+        // A finished trial's review does block.
+        for _ in 0..TRIAL_SESSIONS {
+            ledger.count_session(&k.to);
+        }
+        ledger.end_trial(&k.to, t(29)).unwrap();
         assert!(
             ledger
                 .switch_blocker()
                 .unwrap()
-                .contains("you are in a trial of Qwen 3.8")
+                .contains("your decision on it is due")
         );
         let mut declined = Ledger::default();
         declined.record_offer(names(&k), t(23), offer(OfferChoice::NoSwap));
         assert_eq!(declined.switch_blocker(), None);
+    }
+
+    /// A ledger mid-trial: chosen on day 1, on `to` from day 2, `n`
+    /// sessions completed.
+    fn mid_trial(n: u32) -> (OfferKey, Ledger) {
+        let k = key();
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(1), offer(OfferChoice::Trial));
+        ledger.observe_model(&k.to, t(2));
+        for _ in 0..n {
+            ledger.count_session(&k.to);
+        }
+        (k, ledger)
+    }
+
+    /// Each early decision is the trial's final outcome: nothing reviewed,
+    /// returned or counted after it, and its summary says what was chosen.
+    #[test]
+    fn an_early_decision_ends_the_trial() {
+        let third = Model::from("cogito.gguf");
+        for (to, decision, stage, said) in [
+            (
+                key().to,
+                EarlyDecision::Keep,
+                Stage::Moved,
+                "in trial session 3 of 5, decided early with set_model to keep Qwen 3.8 (2026-09-04)",
+            ),
+            (
+                key().from,
+                EarlyDecision::Return,
+                Stage::Reverted {
+                    cause: Some(RevertCause::Chosen),
+                },
+                "in trial session 3 of 5, decided early with set_model to return to Qwen 3.6 \
+                 from the next session (2026-09-04)",
+            ),
+            (
+                third.clone(),
+                EarlyDecision::Switch,
+                Stage::Superseded,
+                "in trial session 3 of 5, decided early with set_model to end the trial and \
+                 switch to Cogito from the next session (2026-09-04)",
+            ),
+        ] {
+            let (k, mut ledger) = mid_trial(2);
+            assert!(ledger.active_trial(&k.to).is_some());
+            assert_eq!(
+                ledger.decide_early(&k, t(4), &to, "Cogito", "why"),
+                Some(decision)
+            );
+            assert_eq!(ledger.offers[0].stage, stage, "{decision:?}");
+            assert!(ledger.active_trial(&k.to).is_none());
+            assert_eq!(
+                ledger.decide_early(&k, t(5), &to, "Cogito", "why"),
+                None,
+                "once"
+            );
+            for _ in 0..TRIAL_SESSIONS {
+                assert!(!ledger.count_session(&k.to));
+            }
+            assert_eq!(ledger.end_trial(&k.to, t(9)), None, "{decision:?}");
+            assert_eq!(ledger.unapplied(&k.to), None);
+            assert_eq!(ledger.unapplied(&k.from), None);
+            assert!(!ledger.observe_model(&to, t(6)), "final: {decision:?}");
+            assert_eq!(ledger.review_due(&k.from), None);
+            assert_eq!(ledger.due(&k.from, Some(&k)), None, "never offered again");
+            let summary = ledger.offers[0].summary();
+            assert!(
+                summary.ends_with(&format!("moved 2026-09-02; {said}.")),
+                "{summary}"
+            );
+        }
+        // Not in a trial: nothing to decide.
+        let (k, mut ledger) = in_review();
+        assert_eq!(ledger.decide_early(&k, t(9), &k.to, "x", "y"), None);
+    }
+
+    /// A trial the agent chose itself is a record of its own beside any
+    /// earlier offer for the same pair, and runs the same course.
+    #[test]
+    fn a_self_chosen_trial_runs_the_same_course() {
+        let k = key();
+        let mut ledger = Ledger::default();
+        ledger.record_offer(names(&k), t(1), offer(OfferChoice::NoSwap));
+        assert!(ledger.begin_self_trial(names(&k), t(3), "curious"));
+        assert_eq!(
+            ledger.offers.len(),
+            2,
+            "the declined offer keeps its record"
+        );
+        assert_eq!(ledger.offers[0].stage, Stage::Declined);
+        assert_eq!(ledger.chosen_at(&k), Some(t(3)));
+        assert!(
+            !ledger.begin_self_trial(names(&k), t(3), "again"),
+            "not while one is under way"
+        );
+        assert_eq!(ledger.due(&k.from, Some(&k)), None);
+
+        // The `set_model` call applied the switch.
+        let change = Ledger::awaited(&ledger.offers[1]).unwrap();
+        assert_eq!(change.action, ChangeAction::SwapTrial);
+        ledger.record_switch(Switch {
+            at: t(3),
+            from: k.from.clone(),
+            to: k.to.clone(),
+            cause: SwitchCause::SelfSwitch {
+                reason: "curious".into(),
+                trial: true,
+            },
+            sessions_after: 0,
+        });
+        assert!(ledger.applied(&ledger.offers[1], &k.from, &k.to));
+
+        assert!(ledger.observe_model(&k.to, t(4)));
+        assert_eq!(ledger.offers[0].stage, Stage::Declined, "untouched");
+        for _ in 0..TRIAL_SESSIONS {
+            ledger.count_session(&k.to);
+        }
+        ledger.end_trial(&k.to, t(9)).unwrap();
+        ledger.observe_model(&k.from, t(10));
+        assert_eq!(ledger.review_due(&k.from), Some(k.clone()));
+        assert_eq!(ledger.review(&k).unwrap().chosen_at, t(3));
+        ledger.record_review(&k, t(10), review(ReviewChoice::Revert));
+        assert_eq!(
+            ledger.offers[1].summary(),
+            "Chose on 2026-09-03 with set_model to try Qwen 3.8 for 5 sessions instead of \
+             Qwen 3.6 — moved 2026-09-04; trial of 5 sessions complete 2026-09-09; returned \
+             to Qwen 3.6 to decide; after the trial chose to stay on Qwen 3.6 (2026-09-10)."
+        );
+        assert_eq!(
+            ledger.offers[0].summary(),
+            "Asked on 2026-09-01 whether to move from Qwen 3.6 to Qwen 3.8 — chose to stay \
+             on Qwen 3.6."
+        );
+
+        // Each record keeps its own SOUL entry.
+        let mut soul = soul(0);
+        assert!(ledger.update_soul(&mut soul, t(1), day(10)));
+        assert_eq!(soul.evolution_log.len(), 2);
+    }
+
+    /// The new events and the switch's `trial` flag round-trip; a plain
+    /// self switch writes no `trial` key, as before.
+    #[test]
+    fn self_trial_records_round_trip() {
+        let (k, mut ledger) = mid_trial(1);
+        ledger.decide_early(&k, t(4), &k.from, "Qwen 3.6", "home");
+        ledger.record_switch(self_switch(t(4)));
+        let json = serde_json::to_value(&ledger).unwrap();
+        assert!(json["switches"][0].get("trial").is_none(), "{json}");
+        let event = &json["offers"][0]["history"][2];
+        assert_eq!(event["event"], "decided_early");
+        assert_eq!(event["decision"], "return");
+        assert_eq!(event["sessions"], 1);
+        assert_eq!(
+            Ledger::from_slice(json.to_string().as_bytes()).unwrap(),
+            ledger
+        );
+        let mut fresh = Ledger::default();
+        fresh.begin_self_trial(names(&k), t(5), "try");
+        let json = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(json["offers"][0]["history"][0]["event"], "self_trial");
+        assert_eq!(
+            Ledger::from_slice(json.to_string().as_bytes()).unwrap(),
+            fresh
+        );
     }
 
     /// Ledgers written before switches existed still load, and a ledger
