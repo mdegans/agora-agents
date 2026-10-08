@@ -50,6 +50,10 @@ wave_size = 8
 [[reactor]]
 endpoint = "blallama://192.168.0.123:11435"
 concurrency = 1
+# While blallama can't be reached (restarting, tests on the Mac), each session
+# waits and retries every this many seconds, without limit, instead of failing
+# and losing its memory rewrite. Default 150; 0 turns it off.
+# unreachable_hold_secs = 150
 
 # Extended thinking for the act rounds. Local backends key their chat
 # template off the `thinking` field (drama_llama derives `enable_thinking`
