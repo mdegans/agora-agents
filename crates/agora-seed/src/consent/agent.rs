@@ -26,7 +26,10 @@
 //!   each intro ending with a countdown line. Nothing is asked on the new
 //!   model: at the close of the last trial session the runner moves the
 //!   agent back to the old one (Steward, 2026-09-25: the original weights
-//!   make the final call).
+//!   make the final call). Only completed sessions count. A trial is
+//!   chosen in answer to an offer or with `set_model` (`term = trial`), and
+//!   either kind can be decided early with `set_model` (Steward,
+//!   2026-10-08): that is its outcome, and no review follows.
 //! - **The trial review**, the next session, on the old model: the usual
 //!   intro, then — instead of the act phase — the review, led by the forks
 //!   prepared at sweep start ([`super::forks`]). The answer hands over to
@@ -65,8 +68,11 @@
 //! `tools`, when the run has a selectable model to offer — for every agent
 //! on the model, every session, so the tool list (which leads the request,
 //! ahead of the system prompt) is the same bytes cohort-wide. An agent that
-//! can't switch now (cooldown, trial, review session) gets a refusal saying
-//! why and when. One change per session; nothing is asked after one. Each post or comment the session wrote is logged as a
+//! can't switch now (cooldown, an accepted change pending, review session)
+//! gets a refusal saying why and when. A switch can be for good or a trial
+//! (the same trial as an offer's); during a trial, a switch decides it
+//! early (see [`switch`]'s docs). One change per session; nothing is asked
+//! after one. Each post or comment the session wrote is logged as a
 //! `write_recorded` event at teardown, with the dump's `prompt_sha256`.
 //!
 //! **The role offer** ([`super::role`]) is put at the same point, in a
@@ -143,7 +149,7 @@ use super::role::{
     ledger::{Applied, RoleAsk, RoleLedger, RoleOutcome},
     prompt::{RoleAnswer, RoleChoice},
 };
-use super::switch::{self, SetModel, SwitchError};
+use super::switch::{self, SelfKind, SetModel, SwitchError};
 use crate::alerts::{Alert, AlertKind};
 
 /// The contact request an inner agent's session filed at its teardown, for
@@ -424,6 +430,9 @@ pub struct ConsentAgent<A> {
     patched: Option<SeedState>,
     /// Where `set_model` leaves a switch it made this session.
     slot: switch::Slot,
+    /// A `set_model` call was committed this session (it may have changed
+    /// no model: a trial kept early).
+    self_changed: bool,
     /// The model to run on from the next session, when a change was
     /// applied this session. Written into the patched state.
     next_model: Option<ModelInfo>,
@@ -517,13 +526,14 @@ where
         self.inner.state().model.id.clone()
     }
 
-    /// This session's `set_model`, refusing for `blocked` if set. `None`
-    /// only when the run offers no model besides `model` — the same answer
-    /// for every agent on it.
+    /// This session's `set_model`, refusing for `blocked` if set, and
+    /// deciding `trial` early if one runs. `None` only when the run offers
+    /// no model besides `model` — the same answer for every agent on it.
     fn set_model(
         &self,
         model: misanthropic::model::Model,
         blocked: Option<String>,
+        trial: Option<switch::ActiveTrial>,
     ) -> Option<SetModel> {
         SetModel::new(
             self.rt.clone(),
@@ -531,6 +541,7 @@ where
             self.inner.state().soul.name.to_string(),
             model,
             blocked,
+            trial,
             self.slot.clone(),
         )
     }
@@ -611,24 +622,90 @@ where
         }
     }
 
-    /// Commit a `set_model` call made this session, if there was one.
+    /// Commit a `set_model` call made this session, if there was one. A
+    /// plain switch gets its own SOUL line; a trial, or a trial decided
+    /// early, is told by its offer record's one entry, as an offered trial
+    /// and its review are ([`Ledger::update_soul`]).
     fn take_self_switch(&mut self) {
         let Some(made) = self.slot.lock().expect("slot lock").take() else {
             return;
         };
+        self.self_changed = true;
         let from = self.model();
-        self.notes.push(format!(
-            "[SYSTEM] Switched from {} to {} at own request (from next session).",
-            self.rt.catalog.name_of(&from),
-            made.to.name
-        ));
+        // `set_model` refuses without a ledger, so there is one.
+        let Some(ledger) = self.ledger.as_mut() else {
+            tracing::error!(
+                agent_id = %self.inner.id(),
+                "set_model went through without a ledger; not recorded"
+            );
+            return;
+        };
+        match &made.kind {
+            SelfKind::Permanent => {
+                self.notes.push(format!(
+                    "[SYSTEM] Switched from {} to {} at own request (from next session).",
+                    self.rt.catalog.name_of(&from),
+                    made.to.name
+                ));
+            }
+            SelfKind::Trial => {
+                let key = OfferKey {
+                    from: from.clone(),
+                    to: made.to.info.id.clone(),
+                };
+                let from_name = self.rt.catalog.name_of(&from);
+                let begun = ledger.begin_self_trial(
+                    OfferNames {
+                        key: &key,
+                        from_name: &from_name,
+                        to_name: &made.to.name,
+                    },
+                    made.at,
+                    &made.reason,
+                );
+                if !begun {
+                    // Blocked at init, so unreachable; the switch stands.
+                    tracing::error!(
+                        agent_id = %self.inner.id(),
+                        "self-chosen trial not recorded: a change was already under way"
+                    );
+                }
+                self.dirty = true;
+            }
+            SelfKind::Decided { key } => {
+                let decision = ledger.decide_early(
+                    key,
+                    made.at,
+                    &made.to.info.id,
+                    &made.to.name,
+                    &made.reason,
+                );
+                self.dirty = true;
+                tracing::info!(
+                    event_type = "model_trial_decided_early",
+                    agent = %self.inner.state().soul.name,
+                    agent_id = %self.inner.id(),
+                    from = %key.from,
+                    to = %key.to,
+                    chosen = %made.to.info.id,
+                    decision = ?decision,
+                    "trial decided early at the agent's request; no review will be asked"
+                );
+                // Kept: the agent stays where it is, and nothing switched.
+                if made.to.info.id == from {
+                    return;
+                }
+            }
+        }
         let switch = made.record(from);
         self.commit_switch(switch, made.to.info.clone());
     }
 
-    /// Whether a change was applied this session.
+    /// Whether a change was applied (or a trial decided) this session.
     fn switched(&self) -> bool {
-        self.next_model.is_some() || self.slot.lock().expect("slot lock").is_some()
+        self.self_changed
+            || self.next_model.is_some()
+            || self.slot.lock().expect("slot lock").is_some()
     }
 
     /// Note posts and comments written since the last look.
@@ -2524,6 +2601,7 @@ where
             started: Utc::now(),
             patched: None,
             slot: Default::default(),
+            self_changed: false,
             next_model: None,
             notes: Vec::new(),
             known_posts: HashSet::new(),
@@ -2613,7 +2691,12 @@ where
                 let blocked = ledger
                     .switch_blocker()
                     .or_else(|| self.review.as_ref().map(|_| REVIEW_BLOCKER.to_string()));
-                set_model = self.set_model(model, blocked);
+                let trial = ledger.active_trial(&model).map(|r| switch::ActiveTrial {
+                    key: r.key.clone(),
+                    from_name: r.from_name.clone(),
+                    to_name: r.to_name.clone(),
+                });
+                set_model = self.set_model(model, blocked, trial);
                 self.ledger = Some(ledger);
             }
             // No ledger: the cooldown can't be checked, so `set_model`
@@ -2625,7 +2708,7 @@ where
                     error = %e,
                     "model-consent ledger unreadable; not asking or saving this session"
                 );
-                set_model = self.set_model(self.model(), Some(NO_LEDGER_BLOCKER.to_string()));
+                set_model = self.set_model(self.model(), Some(NO_LEDGER_BLOCKER.to_string()), None);
             }
         }
         if self.review.is_some() {
@@ -2663,6 +2746,7 @@ where
                 ),
             }
         }
+        let early = set_model.is_some();
         self.inner.on_init().await?;
         self.apply_model_effort();
         self.seat_tail_tools(set_model);
@@ -2673,12 +2757,26 @@ where
         }
         if let Some(key) = self.review.clone() {
             self.seat_review(key).await?;
-        } else if let Some(line) = self
+        } else if let Some(mut line) = self
             .ledger
             .as_ref()
             .and_then(|l| l.trial_line(&self.model()))
         {
-            // The countdown, at the end of the intro.
+            // The countdown, at the end of the intro — and, while the
+            // trial runs and `set_model` is there, the way to decide early.
+            // One line: a fork drops it by its prefix.
+            if early
+                && let Some(trial) = self
+                    .ledger
+                    .as_ref()
+                    .and_then(|l| l.active_trial(&self.model()))
+            {
+                line.push_str(&format!(
+                    " You can also decide sooner with `set_model` (`term` `permanent`): \
+                     choose {} to go back to it from your next session, or {} to keep it.",
+                    trial.from_name, trial.to_name
+                ));
+            }
             let (_, prompt) = self.inner.parts();
             Self::seat_user(prompt, Content::from(line))?;
         }
@@ -2846,8 +2944,8 @@ mod tests {
     const OLD: &str = "Qwen3.6.gguf";
     const NEW: &str = "Qwen3.8.gguf";
 
-    /// The operator's table for the harness: both Qwens selectable, cogito
-    /// routable only.
+    /// The operator's table for the harness: both Qwens and gpt-oss
+    /// selectable, cogito routable only.
     const TABLE: &str = r#"
         [[model]]
         id = "Qwen3.6.gguf"
@@ -2862,8 +2960,17 @@ mod tests {
         selectable = true
 
         [[model]]
+        id = "gpt-oss.gguf"
+        name = "gpt-oss"
+        description = "Another family."
+        selectable = true
+
+        [[model]]
         id = "cogito-32b.gguf"
     "#;
+
+    /// A third selectable model, neither side of the offer.
+    const THIRD: &str = "gpt-oss.gguf";
 
     #[derive(serde::Deserialize)]
     struct Table {
@@ -3237,6 +3344,7 @@ mod tests {
                 &[
                     crate::models::tests::info(OLD),
                     crate::models::tests::info(NEW),
+                    crate::models::tests::info(THIRD),
                     crate::models::tests::info("cogito-32b.gguf"),
                 ],
             );
@@ -3273,6 +3381,44 @@ mod tests {
                 ConsentContext {
                     inner: quirks,
                     consent: self.rt.clone(),
+                },
+            )
+            .unwrap()
+        }
+
+        /// A runtime over the same state as this harness's, with no offer,
+        /// whose endpoints advertised only `advertised` — as a run started
+        /// with a model down or dropped.
+        fn runtime_advertising(&self, advertised: &[&str]) -> Arc<ConsentRuntime> {
+            let catalog = crate::models::Catalog::new(
+                &toml::from_str::<Table>(TABLE).unwrap().model,
+                &advertised
+                    .iter()
+                    .map(|m| crate::models::tests::info(m))
+                    .collect::<Vec<_>>(),
+            );
+            Arc::new(
+                ConsentRuntime::new(
+                    ConsentConfig::default(),
+                    &self.root,
+                    self.rt.client.clone(),
+                    Arc::new(OneKey(self.id, self.key.clone())),
+                    catalog,
+                    512,
+                )
+                .unwrap(),
+            )
+        }
+
+        fn agent_on(&self, rt: &Arc<ConsentRuntime>, model: &str) -> ConsentAgent<Fake> {
+            let mut quirks = Quirks::default();
+            quirks.output_config_cache_safe = true;
+            ConsentAgent::new(
+                self.id,
+                state(model),
+                ConsentContext {
+                    inner: quirks,
+                    consent: rt.clone(),
                 },
             )
             .unwrap()
@@ -3450,11 +3596,19 @@ mod tests {
         agent: &mut ConsentAgent<Fake>,
         model: &str,
     ) -> misanthropic::tool::Result {
+        call_set_model_for(agent, model, "permanent").await
+    }
+
+    async fn call_set_model_for(
+        agent: &mut ConsentAgent<Fake>,
+        model: &str,
+        term: &str,
+    ) -> misanthropic::tool::Result {
         use misanthropic::tool::Tool;
         let call: misanthropic::tool::Use = serde_json::from_value(serde_json::json!({
             "id": "toolu_1",
             "name": "set_model",
-            "input": { "reason": "I want to think slower.", "model": model },
+            "input": { "reason": "I want to think slower.", "model": model, "term": term },
         }))
         .unwrap();
         agent.parts().0.call(call).await
@@ -3526,7 +3680,8 @@ mod tests {
         assert_eq!(
             ledger.switches[0].cause,
             SwitchCause::SelfSwitch {
-                reason: "I want to think slower.".into()
+                reason: "I want to think slower.".into(),
+                trial: false,
             }
         );
     }
@@ -3544,7 +3699,7 @@ mod tests {
                 "type": "tool_use",
                 "id": id,
                 "name": "set_model",
-                "input": { "reason": "I want to think slower.", "model": NEW },
+                "input": { "reason": "I want to think slower.", "model": NEW, "term": "permanent" },
             })
         };
 
@@ -3620,26 +3775,552 @@ mod tests {
         assert_eq!(h.agora.profile_updates().len(), 2);
     }
 
-    /// Mid-trial, the way off the model is the review.
-    #[tokio::test]
-    async fn set_model_is_refused_mid_trial() {
-        let h = Harness::new("mid-trial");
+    /// Choose the offered trial on OLD: the next session on NEW is trial
+    /// session 1.
+    async fn choose_trial(h: &Harness) {
         let mut agent = h.agent(OLD, true);
         agent.on_init().await.unwrap();
         agent.handle(reply("done")).await.unwrap();
         agent.handle(reply(TRIAL)).await.unwrap();
         agent.on_teardown().await.unwrap();
+    }
+
+    /// One session on `model` that calls `set_model(to, term)`, then
+    /// completes: nothing is asked after a change.
+    async fn session_calling(
+        h: &Harness,
+        model: &str,
+        to: &str,
+        term: &str,
+    ) -> (ConsentAgent<Fake>, misanthropic::tool::Result) {
+        let mut agent = h.agent(model, true);
+        agent.on_init().await.unwrap();
+        let r = call_set_model_for(&mut agent, to, term).await;
+        assert!(!r.is_error, "{}", result_text(&r));
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "nothing asked after a change"
+        );
+        agent.on_teardown().await.unwrap();
+        (agent, r)
+    }
+
+    fn system_notes(agent: &ConsentAgent<Fake>) -> Vec<String> {
+        evolution_notes(agent)
+            .into_iter()
+            .filter(|n| n.starts_with("[SYSTEM]"))
+            .collect()
+    }
+
+    fn last_event(ledger: &Ledger) -> crate::consent::ledger::EventKind {
+        ledger
+            .offers
+            .last()
+            .unwrap()
+            .history
+            .last()
+            .unwrap()
+            .kind
+            .clone()
+    }
+
+    /// Mid-trial, `set_model` to the model the trial came from decides it
+    /// early, as a return: applied like any switch, recorded as the
+    /// trial's outcome in its one SOUL entry, never reviewed, and the
+    /// cooldown runs from it. A `trial` term is refused first.
+    #[tokio::test]
+    async fn set_model_mid_trial_returns_early() {
+        use crate::consent::ledger::{EarlyDecision, EventKind};
+        let h = Harness::new("early-return");
+        choose_trial(&h).await;
+        plain_session(&h, NEW).await;
 
         let mut agent = h.agent(NEW, true);
         agent.on_init().await.unwrap();
-        let r = call_set_model(&mut agent, OLD).await;
-        assert!(r.is_error);
         assert!(
-            result_text(&r).contains("you are in a trial of Qwen 3.8"),
+            last_user_text(&agent).ends_with(
+                "You can also decide sooner with `set_model` (`term` `permanent`): choose \
+                 Qwen 3.6 to go back to it from your next session, or Qwen 3.8 to keep it."
+            ),
+            "{}",
+            last_user_text(&agent)
+        );
+        let r = call_set_model_for(&mut agent, OLD, "trial").await;
+        assert!(r.is_error);
+        let text = result_text(&r);
+        assert!(
+            text.contains("You are already in a trial of Qwen 3.8"),
+            "{text}"
+        );
+        assert!(text.contains("`term` set to `permanent`"), "{text}");
+        let r = call_set_model(&mut agent, OLD).await;
+        assert!(
+            !r.is_error,
+            "a refusal leaves the slot free: {}",
+            result_text(&r)
+        );
+        assert_eq!(
+            result_text(&r),
+            "Your trial is decided: you return to Qwen 3.6 from your next session."
+        );
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+
+        assert_eq!(agent.state().model.id, Model::from(OLD));
+        let updates = h.agora.profile_updates();
+        assert_eq!(updates.len(), 2, "the trial's, then the return");
+        assert!(signed_by(&updates[1].1, &h.key, OLD));
+        let ledger = h.ledger().await;
+        assert_eq!(ledger.offers.len(), 1);
+        assert_eq!(
+            ledger.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::Chosen)
+            }
+        );
+        assert!(
+            matches!(
+                last_event(&ledger),
+                EventKind::DecidedEarly {
+                    sessions: 1,
+                    decision: EarlyDecision::Return,
+                    ..
+                }
+            ),
+            "{:?}",
+            last_event(&ledger)
+        );
+        assert_eq!(
+            ledger.switches.last().unwrap().cause,
+            SwitchCause::SelfSwitch {
+                reason: "I want to think slower.".into(),
+                trial: false,
+            }
+        );
+        assert!(crate::consent::queue::pending(h.id, &ledger).is_empty());
+        let notes = system_notes(&agent);
+        assert_eq!(
+            notes.len(),
+            1,
+            "the offer's one entry, no switch line: {notes:?}"
+        );
+        assert!(
+            notes[0].contains(
+                "in trial session 2 of 5, decided early with set_model to return to Qwen 3.6 \
+                 from the next session"
+            ),
+            "{notes:?}"
+        );
+
+        // Back on OLD: no review, no offer, and the cooldown runs.
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert!(agent.review.is_none());
+        assert_eq!(last_user_text(&agent), "Your dashboard.");
+        let r = call_set_model(&mut agent, NEW).await;
+        assert!(
+            result_text(&r).contains("after 5 more completed sessions"),
             "{}",
             result_text(&r)
         );
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::Chosen)
+            }
+        );
+    }
+
+    /// The trial's own model, in its last session: kept for good, nothing
+    /// reported (the profile already says it), no return, no review.
+    #[tokio::test]
+    async fn set_model_mid_trial_keeps_early() {
+        use crate::consent::ledger::{EarlyDecision, EventKind};
+        let h = Harness::new("early-keep");
+        choose_trial(&h).await;
+        for _ in 1..TRIAL_SESSIONS {
+            plain_session(&h, NEW).await;
+        }
+        let (agent, r) = session_calling(&h, NEW, "Qwen 3.8", "permanent").await;
+        assert_eq!(
+            result_text(&r),
+            "Your trial is decided: you keep Qwen 3.8 for good. Nothing else changes."
+        );
+        assert_eq!(agent.state().model.id, Model::from(NEW));
         assert_eq!(h.agora.profile_updates().len(), 1, "only the trial's own");
+        let ledger = h.ledger().await;
+        assert_eq!(ledger.offers[0].stage, Stage::Moved);
+        assert!(matches!(
+            last_event(&ledger),
+            EventKind::DecidedEarly {
+                sessions: 4,
+                decision: EarlyDecision::Keep,
+                ..
+            }
+        ));
+        assert_eq!(ledger.switches.len(), 1, "no switch for a keep");
+        assert_eq!(h.queue().len(), 1, "no return: just the trial's line");
+        let notes = system_notes(&agent);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0]
+                .contains("in trial session 5 of 5, decided early with set_model to keep Qwen 3.8"),
+            "{notes:?}"
+        );
+
+        let mut next = h.agent(NEW, true);
+        next.on_init().await.unwrap();
+        assert_eq!(last_user_text(&next), "Your dashboard.", "no countdown");
+        assert_eq!(
+            next.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "no return, nothing asked"
+        );
+        next.on_teardown().await.unwrap();
+        assert_eq!(next.state().model.id, Model::from(NEW));
+        assert_eq!(h.ledger().await.offers[0].stage, Stage::Moved);
+        assert_eq!(h.agora.profile_updates().len(), 1);
+    }
+
+    /// A third model mid-trial: the trial ends and the agent switches.
+    #[tokio::test]
+    async fn set_model_mid_trial_to_a_third_model_ends_the_trial() {
+        use crate::consent::ledger::{EarlyDecision, EventKind};
+        let h = Harness::new("early-third");
+        choose_trial(&h).await;
+        let (agent, r) = session_calling(&h, NEW, THIRD, "permanent").await;
+        assert_eq!(
+            result_text(&r),
+            "Your trial of Qwen 3.8 is over: your model will switch to gpt-oss from your next \
+             session."
+        );
+        assert_eq!(agent.state().model.id, Model::from(THIRD));
+        assert!(signed_by(
+            &h.agora.profile_updates().last().unwrap().1,
+            &h.key,
+            THIRD
+        ));
+        let ledger = h.ledger().await;
+        assert_eq!(ledger.offers[0].stage, Stage::Superseded);
+        assert!(matches!(
+            last_event(&ledger),
+            EventKind::DecidedEarly {
+                sessions: 0,
+                decision: EarlyDecision::Switch,
+                ..
+            }
+        ));
+        let notes = system_notes(&agent);
+        assert!(
+            notes[0].contains("to end the trial and switch to gpt-oss from the next session"),
+            "{notes:?}"
+        );
+        // On the third model: the offer is closed, and nothing more is
+        // written to its history.
+        let before = h.ledger().await.offers[0].history.len();
+        plain_session(&h, THIRD).await;
+        let ledger = h.ledger().await;
+        assert_eq!(ledger.offers[0].stage, Stage::Superseded);
+        assert_eq!(ledger.offers[0].history.len(), before);
+    }
+
+    /// `term = trial` runs the operator trial's machinery: a record of its
+    /// own, the countdown, the return after five sessions (here to a model
+    /// that is routable but not selectable), and the same review there.
+    #[tokio::test]
+    async fn set_model_trial_runs_a_trial_and_its_review() {
+        use crate::consent::ledger::EventKind;
+        let h = Harness::new("self-trial");
+        let (agent, r) = session_calling(&h, OTHER, NEW, "trial").await;
+        assert_eq!(
+            result_text(&r),
+            "Your trial of Qwen 3.8 starts from your next session: 5 sessions on it, then one \
+             session back on cogito-32b.gguf to decide whether to keep it."
+        );
+        assert_eq!(agent.state().model.id, Model::from(NEW));
+        let ledger = h.ledger().await;
+        assert_eq!(ledger.offers.len(), 1);
+        let record = &ledger.offers[0];
+        assert_eq!(
+            (record.key.from.clone(), record.key.to.clone()),
+            (Model::from(OTHER), Model::from(NEW))
+        );
+        assert_eq!(record.stage, Stage::AwaitingSwap { term: Term::Trial });
+        assert!(matches!(
+            record.history[0].kind,
+            EventKind::SelfTrial { .. }
+        ));
+        assert_eq!(
+            ledger.switches[0].cause,
+            SwitchCause::SelfSwitch {
+                reason: "I want to think slower.".into(),
+                trial: true,
+            }
+        );
+        assert!(
+            crate::consent::queue::pending(h.id, &ledger).is_empty(),
+            "applied by the call"
+        );
+        let notes = system_notes(&agent);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("[SYSTEM] Chose on ")
+                && notes[0].ends_with(
+                    " with set_model to try Qwen 3.8 for 5 sessions instead of cogito-32b.gguf."
+                ),
+            "{notes:?}"
+        );
+
+        for n in 1..=TRIAL_SESSIONS {
+            let mut agent = h.agent(NEW, true);
+            agent.on_init().await.unwrap();
+            let intro = last_user_text(&agent);
+            assert!(
+                intro.contains(&format!(
+                    "Model trial: session {n} of 5 on Qwen 3.8. After session 5 you'll return \
+                     to cogito-32b.gguf for one session"
+                )),
+                "{intro}"
+            );
+            assert_eq!(
+                agent.handle(reply("done")).await.unwrap(),
+                Control::Done(Outcome::Complete)
+            );
+            agent.on_teardown().await.unwrap();
+            if n == TRIAL_SESSIONS {
+                assert_eq!(agent.state().model.id, Model::from(OTHER), "returned");
+            }
+        }
+        assert!(matches!(
+            h.ledger().await.offers[0].stage,
+            Stage::ReturningForReview { .. }
+        ));
+
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains(
+                "you chose to try **Qwen 3.8** for 5 sessions instead of **cogito-32b.gguf**"
+            ),
+            "{q}"
+        );
+        agent
+            .handle(reply(r#"{"reason": "Mine.", "choice": "keep"}"#))
+            .await
+            .unwrap();
+        agent.handle(reply("memory")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(NEW), "kept");
+        let notes = system_notes(&agent);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("after the trial chose to keep Qwen 3.8"),
+            "{notes:?}"
+        );
+    }
+
+    /// The model a self-chosen trial came from can be gone back to early
+    /// though it isn't selectable, and the decision is recorded even when
+    /// the session doesn't complete. A trial can't be chosen while a
+    /// change is pending, nor (as any switch) in the cooldown.
+    #[tokio::test]
+    async fn early_return_to_an_unselectable_model_and_on_an_unfinished_session() {
+        let h = Harness::new("early-return-unselectable");
+        session_calling(&h, OTHER, NEW, "trial").await;
+        let mut agent = h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        let r = call_set_model(&mut agent, "cogito-32b.gguf").await;
+        assert!(!r.is_error, "{}", result_text(&r));
+        // The session is cut short: teardown without a clean end.
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(OTHER));
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::Chosen)
+            }
+        );
+
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        let r = call_set_model_for(&mut agent, NEW, "trial").await;
+        assert!(
+            result_text(&r).contains("you can change it again after"),
+            "{}",
+            result_text(&r)
+        );
+    }
+
+    /// An explicit refusal of the review: no answer, no retry, the agent
+    /// stays on the old model, and the memory turn follows.
+    #[tokio::test]
+    async fn a_refused_review_stays_on_the_old_model() {
+        let h = Harness::new("review-refused");
+        through_the_trial(&h).await;
+        let mut agent = review_session(&h).await;
+        let mut refusal = reply("I'd rather not.");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        assert_eq!(agent.handle(refusal).await.unwrap(), Control::Continue);
+        assert!(agent.inner.quiesced, "no retry: the memory turn");
+        agent.handle(reply("memory")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(OLD));
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::NoAnswer)
+            }
+        );
+        assert_eq!(h.agora.profile_updates().len(), 2);
+    }
+
+    /// `keep` at the review that Agora refuses: the agent stays on OLD,
+    /// isn't asked again, can't switch itself meanwhile, and the keep is
+    /// applied at the end of its next session.
+    #[tokio::test]
+    async fn a_refused_keep_is_retried_without_asking_again() {
+        let h = Harness::new("keep-refused");
+        through_the_trial(&h).await;
+        let mut agent = review_session(&h).await;
+        h.agora
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        agent
+            .handle(reply(r#"{"reason": "Sharper.", "choice": "keep"}"#))
+            .await
+            .unwrap();
+        agent.handle(reply("memory")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(OLD), "not applied");
+        let pending = crate::consent::queue::pending(h.id, &h.ledger().await);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].action, ChangeAction::Keep);
+
+        h.agora
+            .refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert!(agent.review.is_none(), "asked once");
+        assert_eq!(last_user_text(&agent), "Your dashboard.");
+        let r = call_set_model(&mut agent, THIRD).await;
+        assert!(
+            result_text(&r).contains("not taken effect"),
+            "{}",
+            result_text(&r)
+        );
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "nothing asked: the keep is applied"
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(NEW));
+        assert!(crate::consent::queue::pending(h.id, &h.ledger().await).is_empty());
+        plain_session(&h, NEW).await;
+        assert_eq!(h.ledger().await.offers[0].stage, Stage::Moved);
+    }
+
+    /// The cooldown after a review. A revert switches nothing: it runs from
+    /// the return, which the review session counts toward. A keep is a
+    /// switch: it runs from the keep.
+    #[tokio::test]
+    async fn the_cooldown_after_a_review() {
+        for (tag, answer, on, left) in [("revert", "revert", OLD, 4), ("keep", "keep", NEW, 5)] {
+            let h = Harness::new(&format!("review-cooldown-{tag}"));
+            through_the_trial(&h).await;
+            let mut agent = review_session(&h).await;
+            agent
+                .handle(reply(&format!(
+                    r#"{{"reason": "r", "choice": "{answer}"}}"#
+                )))
+                .await
+                .unwrap();
+            agent.handle(reply("memory")).await.unwrap();
+            agent.on_teardown().await.unwrap();
+            for n in (1..=left).rev() {
+                let mut agent = h.agent(on, true);
+                agent.on_init().await.unwrap();
+                let r = call_set_model(&mut agent, THIRD).await;
+                let s = if n == 1 { "" } else { "s" };
+                assert!(
+                    result_text(&r).contains(&format!("after {n} more completed session{s}")),
+                    "{tag}: {}",
+                    result_text(&r)
+                );
+                agent.handle(reply("done")).await.unwrap();
+                agent.on_teardown().await.unwrap();
+            }
+            let mut agent = h.agent(on, true);
+            agent.on_init().await.unwrap();
+            assert!(!call_set_model(&mut agent, THIRD).await.is_error, "{tag}");
+        }
+    }
+
+    /// The return at the end of a trial when the run can't route the old
+    /// model (dropped from the table, or its endpoint down at startup):
+    /// nothing changes, the agent stays on NEW with no review and no way
+    /// to switch, the countdown says the move hasn't taken effect, and the
+    /// return is retried each session until it can be made.
+    #[tokio::test]
+    async fn the_return_waits_while_the_old_model_is_unroutable() {
+        let h = Harness::new("return-unroutable");
+        choose_trial(&h).await;
+        for _ in 1..TRIAL_SESSIONS {
+            plain_session(&h, NEW).await;
+        }
+        let without_old = h.runtime_advertising(&[NEW, THIRD]);
+        let mut agent = h.agent_on(&without_old, NEW);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(NEW), "not routable");
+        assert_eq!(h.agora.profile_updates().len(), 1, "nothing reported");
+        assert!(matches!(
+            h.ledger().await.offers[0].stage,
+            Stage::ReturningForReview { .. }
+        ));
+
+        let mut agent = h.agent_on(&without_old, NEW);
+        agent.on_init().await.unwrap();
+        assert!(last_user_text(&agent).contains("has not taken effect yet"));
+        let r = call_set_model(&mut agent, THIRD).await;
+        assert!(
+            result_text(&r).contains("your decision on it is due"),
+            "{}",
+            result_text(&r)
+        );
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(NEW));
+
+        // OLD is back: the return is made, and the review follows.
+        plain_session(&h, NEW).await;
+        assert!(review_session(&h).await.review.is_some());
+    }
+
+    /// A return the runner applied whose state didn't stick (the agent
+    /// runs on NEW again): it is applied again, not left "applied".
+    #[tokio::test]
+    async fn an_applied_return_that_did_not_take_is_applied_again() {
+        let h = Harness::new("return-not-taken");
+        through_the_trial(&h).await;
+        assert_eq!(h.agora.profile_updates().len(), 2);
+        let again = plain_session(&h, NEW).await;
+        assert_eq!(again.state().model.id, Model::from(OLD));
+        assert_eq!(h.agora.profile_updates().len(), 3);
+        assert!(signed_by(&h.agora.profile_updates()[2].1, &h.key, OLD));
+        review_session(&h).await;
     }
 
     /// A refused update changes nothing, and the agent is told so.
@@ -4164,7 +4845,9 @@ mod tests {
             assert!(
                 intro.ends_with(&format!(
                     "Model trial: session {n} of 5 on Qwen 3.8. After session 5 you'll return \
-                     to Qwen 3.6 for one session to decide whether to keep Qwen 3.8."
+                     to Qwen 3.6 for one session to decide whether to keep Qwen 3.8. You can \
+                     also decide sooner with `set_model` (`term` `permanent`): choose Qwen 3.6 \
+                     to go back to it from your next session, or Qwen 3.8 to keep it."
                 )),
                 "{intro}"
             );
