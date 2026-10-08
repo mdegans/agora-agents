@@ -113,9 +113,9 @@ use std::sync::Arc;
 
 use std::collections::HashSet;
 
-use agora_agentkit::ids::{AgentId, CommentId, PostId};
+use agora_agentkit::ids::{AgentId, CommentId, ContactRequestId, PostId};
 use agora_agentkit::reactor::inference::Quirks;
-use agora_agentkit::reactor::seed::{Memory, SeedState, Soul};
+use agora_agentkit::reactor::seed::{Memory, SeedAgent, SeedState, Soul};
 use agora_agentkit::reactor::{Agent, Control, Epilogue, Outcome, seat_unused_reply};
 use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
@@ -145,6 +145,18 @@ use super::role::{
 };
 use super::switch::{self, SetModel, SwitchError};
 use crate::alerts::{Alert, AlertKind};
+
+/// The contact request an inner agent's session filed at its teardown, for
+/// the `contact_requested` alert
+pub trait ContactRequests {
+    fn contact_request(&self) -> Option<ContactRequestId>;
+}
+
+impl ContactRequests for SeedAgent {
+    fn contact_request(&self) -> Option<ContactRequestId> {
+        SeedAgent::contact_request(self)
+    }
+}
 
 /// Answers per question per session: the first plus two retries. For an
 /// offer, the unusable ones it may take: refused `answer_offer` calls,
@@ -476,7 +488,7 @@ struct Write {
 
 impl<A> ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue,
+    A: Agent<State = SeedState> + Epilogue + ContactRequests,
 {
     /// The model's own `thinking_effort` from `[[model]]`, over the
     /// session's `[seed]` one. Patched once, right after the inner init
@@ -672,6 +684,24 @@ where
                 "write recorded"
             );
         }
+    }
+
+    /// Mail the operator when the inner session filed a contact request
+    fn alert_contact_request(&self) {
+        let Some(contact_request_id) = self.inner.contact_request() else {
+            return;
+        };
+        let agent = &self.inner.state().soul.name;
+        self.rt.alerts.notify(
+            Alert::new(
+                AlertKind::ContactRequested,
+                "an agent asked the developers to follow up on its feedback",
+            )
+            .agent(agent.to_string(), self.inner.id())
+            .model(self.model())
+            .detail("contact_request_id", contact_request_id)
+            .detail("next", "just contact-requests"),
+        );
     }
 
     /// agentkit's [`seat_user`](agora_agentkit::reactor::seat_user): a new
@@ -2475,7 +2505,7 @@ fn cap(mut text: String) -> String {
 #[async_trait::async_trait]
 impl<A> Agent for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue,
+    A: Agent<State = SeedState> + Epilogue + ContactRequests,
 {
     type State = SeedState;
     type Context = ConsentContext<A::Context>;
@@ -2712,6 +2742,7 @@ where
     /// reactor's save, which follows teardown), then the ledger.
     async fn on_teardown(&mut self) -> Result<(), A::Error> {
         let result = self.inner.on_teardown().await;
+        self.alert_contact_request();
         self.note_writes();
         self.log_writes();
         self.take_self_switch();
@@ -2878,6 +2909,14 @@ mod tests {
         held: bool,
         /// It has a survey to begin as its epilogue.
         survey: bool,
+        /// The contact request its teardown "filed"
+        contact: Option<ContactRequestId>,
+    }
+
+    impl ContactRequests for Fake {
+        fn contact_request(&self) -> Option<ContactRequestId> {
+            self.contact
+        }
     }
 
     /// The survey question a `Fake` with a survey seats as its epilogue.
@@ -2917,6 +2956,7 @@ mod tests {
                 quiesced: false,
                 held: false,
                 survey: false,
+                contact: None,
             })
         }
         fn id(&self) -> AgentId {
@@ -4061,6 +4101,39 @@ mod tests {
             !Ledger::path(&h.rt.state_dir.join(h.id.to_string())).exists(),
             "nothing to record, nothing written"
         );
+    }
+
+    /// A contact request the inner session filed at teardown is mailed to
+    /// the operator, naming the agent, the request and the recipe to list
+    /// it; a session that filed none sends nothing
+    #[tokio::test]
+    async fn a_filed_contact_request_alerts_the_operator() {
+        let mut h = Harness::new("contact-alert");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+
+        plain_session(&h, NEW).await;
+        h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        assert!(sent.sent().is_empty(), "no request, no alert");
+
+        let contact = ContactRequestId::new();
+        let mut agent = h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.inner.contact = Some(contact);
+        agent.on_teardown().await.unwrap();
+        h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+
+        let sent = sent.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let mail = &sent[0];
+        assert!(mail.contains("contact_requested: tarn"), "{mail}");
+        assert!(mail.contains(&contact.to_string()), "{mail}");
+        assert!(mail.contains("just contact-requests"), "{mail}");
+        assert!(mail.contains(&h.id.to_string()), "{mail}");
     }
 
     /// Run one plain session (no question) on `model`.
