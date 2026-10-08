@@ -295,6 +295,17 @@ struct ReactorSpec {
     max_batch: Option<usize>,
     /// Batch poll period in seconds (default 5).
     poll_secs: Option<u64>,
+    /// While the endpoint can't be reached (refused, or no connection),
+    /// hold each session and retry every this many seconds, without limit,
+    /// rather than fail it and lose its memory rewrite (Steward,
+    /// 2026-10-08). 0 turns the hold off. Errors the endpoint answered
+    /// with keep the bounded retry budget.
+    #[serde(default = "default_unreachable_hold_secs")]
+    unreachable_hold_secs: u64,
+}
+
+fn default_unreachable_hold_secs() -> u64 {
+    150
 }
 
 fn default_concurrency() -> usize {
@@ -1216,6 +1227,7 @@ async fn run(held: &mut Held) -> Result<()> {
                     key_file: args.anthropic_key_file.clone(),
                     max_batch: None,
                     poll_secs: None,
+                    unreachable_hold_secs: default_unreachable_hold_secs(),
                 }],
             }
         }
@@ -1624,8 +1636,12 @@ async fn run(held: &mut Held) -> Result<()> {
             endpoint = %spec.endpoint,
             "reactor ready"
         );
-        let reactor: Reactor<_, _, SeedRunAgent> =
+        let mut reactor: Reactor<_, _, SeedRunAgent> =
             Reactor::new(inference, FsStorage::new(data_dir.join("state")), agents);
+        if spec.unreachable_hold_secs > 0 {
+            reactor = reactor
+                .with_unreachable_hold(std::time::Duration::from_secs(spec.unreachable_hold_secs));
+        }
         labels.insert(Run::id(&reactor), spec.endpoint.clone());
         orchestrator.push(reactor);
     }
@@ -1853,6 +1869,22 @@ mod config_file_tests {
         let alerts = config.alerts.expect("present");
         alerts.validate().unwrap();
         assert_eq!(alerts.min_interval_secs, 3600);
+    }
+
+    /// Sessions hold through an unreachable endpoint by default; 0 opts out
+    #[test]
+    fn the_unreachable_hold_defaults_on_and_can_be_turned_off() {
+        let parse = |extra: &str| -> RunConfig {
+            toml::from_str(&format!(
+                "[[reactor]]\nendpoint = \"blallama://h:1\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(parse("").reactors[0].unreachable_hold_secs, 150);
+        assert_eq!(
+            parse("unreachable_hold_secs = 0").reactors[0].unreachable_hold_secs,
+            0
+        );
     }
 }
 
@@ -2096,6 +2128,7 @@ mod agent_selection_tests {
             key_file: None,
             max_batch: None,
             poll_secs: None,
+            unreachable_hold_secs: default_unreachable_hold_secs(),
         }];
         let (pilot, raptor) = (pooled("pilot").0, pooled("raptor").0);
         let pool = |hours_ago: i64| {
