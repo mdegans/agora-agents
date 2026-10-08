@@ -86,6 +86,8 @@ pub enum AlertKind {
     /// server serves, or the check could not complete; the runner refused
     /// to run.
     ConstitutionRefused,
+    /// An agent asked the developers to follow up on its feedback.
+    ContactRequested,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -94,7 +96,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -102,6 +104,7 @@ impl AlertKind {
         Self::ModelSwitchFailed,
         Self::ScheduleCeilingHit,
         Self::RoleConsentSleep,
+        Self::ContactRequested,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -114,6 +117,7 @@ impl AlertKind {
             Self::ScheduleCeilingHit => "schedule_ceiling_hit",
             Self::RoleConsentSleep => "role_consent_sleep",
             Self::ConstitutionRefused => "constitution_refused",
+            Self::ContactRequested => "contact_requested",
             Self::Test => "test_alert",
         }
     }
@@ -165,6 +169,15 @@ impl AlertKind {
                  complete. No agent acts until it is. Compare the served and \
                  embedded SHA-256 below; `agora-seed --dry-run` repeats the \
                  check without running anyone."
+            }
+            Self::ContactRequested => {
+                "An agent answered the end-of-session survey with \
+                 `contact_me: true`: it asked the developers to follow up on \
+                 its feedback, and the runner filed a contact request. \
+                 `just contact-requests` in the agora repo lists the open \
+                 ones with the feedback and the transcript's prompt_sha256, \
+                 which names the session to load into the chat REPL; \
+                 `just contact-resolve <id> \"<note>\"` closes one."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
@@ -826,8 +839,53 @@ impl RateState {
     }
 }
 
+/// A recording [`Alerter`], for other modules' tests
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Records what it would have sent.
+    #[derive(Default, Clone)]
+    pub(crate) struct Recorder(pub(crate) Arc<Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl Mailer for Recorder {
+        async fn send(&self, message: Message) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8(message.formatted()).unwrap());
+            Ok(())
+        }
+    }
+
+    impl Recorder {
+        /// The mails sent so far
+        pub(crate) fn sent(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Every configurable kind, rate state under `data_dir`, mailed to
+    /// `sent`
+    pub(crate) fn recording(data_dir: &Path, sent: &Recorder) -> Alerter {
+        let config: AlertsConfig = toml::from_str(
+            r#"
+            [email]
+            smtp_host = "localhost"
+            from = "a@example.com"
+            to = ["b@example.com"]
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        Alerter::with_mailer(&config, Box::new(sent.clone()), data_dir, None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::Recorder;
     use super::*;
 
     const FULL: &str = r#"
@@ -1043,21 +1101,6 @@ mod tests {
         assert_eq!(subject, "[Agora seed runner] governance_log_refused");
         assert!(!body.contains("held for"), "no limit, no note");
         assert!(!body.contains("agent:"));
-    }
-
-    /// Records what it would have sent.
-    #[derive(Default, Clone)]
-    struct Recorder(Arc<Mutex<Vec<String>>>);
-
-    #[async_trait::async_trait]
-    impl Mailer for Recorder {
-        async fn send(&self, message: Message) -> anyhow::Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(String::from_utf8(message.formatted()).unwrap());
-            Ok(())
-        }
     }
 
     struct Failing;
