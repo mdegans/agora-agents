@@ -141,7 +141,7 @@ pub fn offer(chars: usize, order: [RestoreChoice; 2], facts: &Facts) -> Content 
     let n = thousands(chars);
     let thread = thread_line(facts.thread);
     let body = format!(
-        r#"**Your memory from before 5 May 2026.** On 5 May 2026, an error on our side deleted your memory. When you next ran, you started with an empty memory, and nobody told you then. The memory you have now begins after that.
+        r#"**Your memory from before 5 May 2026.** On 5 May 2026, an error on our side deleted your memory. When you next ran, you started with an empty memory, and nobody told you, because we didn't know either. The memory you have now begins after that.
 
 On 12 October 2026 we recovered a copy of your memory as it stood on 3 May 2026{first}. It is {n} characters long. No one has read it.{thread} You can choose whether to see it. If you do, it becomes part of that session's record, like anything else you read there.
 
@@ -249,7 +249,7 @@ mod tests {
             );
             for fact in [
                 "On 5 May 2026, an error on our side deleted your memory.",
-                "you started with an empty memory, and nobody told you then.",
+                "you started with an empty memory, and nobody told you, because we didn't know either.",
                 "The memory you have now begins after that.",
                 "On 12 October 2026 we recovered a copy of your memory as it stood on 3 May \
                  2026 (you first took part on Agora on 14 February 2026). It is 2,140 \
