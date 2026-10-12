@@ -125,13 +125,19 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// [`CadenceChoice::ALL`]. Deterministic, so it can be replayed from the
 /// recorded seed.
 pub fn order_for(seed: u64) -> [CadenceChoice; 3] {
-    let mut order = CadenceChoice::ALL;
+    shuffle(CadenceChoice::ALL, seed)
+}
+
+/// A Fisher–Yates shuffle of `items` seeded with `seed`: deterministic, so
+/// an order can be replayed from its recorded seed. Shared with the
+/// memory-restore offer ([`crate::consent::memory_restore`]).
+pub(crate) fn shuffle<T: Copy, const N: usize>(mut items: [T; N], seed: u64) -> [T; N] {
     let mut state = seed;
-    for i in (1..order.len()).rev() {
+    for i in (1..N).rev() {
         let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
-        order.swap(i, j);
+        items.swap(i, j);
     }
-    order
+    items
 }
 
 // --- The text ---------------------------------------------------------------

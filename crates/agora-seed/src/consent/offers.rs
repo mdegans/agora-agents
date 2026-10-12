@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 
 use super::cadence::prompt::CadenceChoice;
 use super::ledger::SWITCH_COOLDOWN_SESSIONS;
+use super::memory_restore::prompt::RestoreChoice;
 use super::prompt::OfferChoice;
 use super::role::prompt::RoleChoice;
 
@@ -56,12 +57,18 @@ pub enum OfferKind {
     ModelSwap,
     Role,
     Cadence,
+    MemoryRestore,
 }
 
 impl OfferKind {
     /// Canonical order: the order offers are seated in, and the schema's.
     #[cfg(test)]
-    pub const ALL: [Self; 3] = [Self::ModelSwap, Self::Role, Self::Cadence];
+    pub const ALL: [Self; 4] = [
+        Self::ModelSwap,
+        Self::Role,
+        Self::Cadence,
+        Self::MemoryRestore,
+    ];
 
     /// The wire name.
     pub fn as_str(self) -> &'static str {
@@ -69,13 +76,15 @@ impl OfferKind {
             Self::ModelSwap => "model_swap",
             Self::Role => "role",
             Self::Cadence => "cadence",
+            Self::MemoryRestore => "memory_restore",
         }
     }
 }
 
 /// Every offer's options, as one enum: the model-swap offer's
 /// ([`OfferChoice`]), then the role offer's ([`RoleChoice`]), then the
-/// cadence offer's ([`CadenceChoice`]), each in its own canonical order.
+/// cadence offer's ([`CadenceChoice`]), then the memory-restore offer's
+/// ([`RestoreChoice`]), each in its own canonical order.
 /// The wire names are theirs (a test pins that), so each offer's own
 /// answer type is built from a call unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -91,12 +100,15 @@ pub enum AnyChoice {
     KeepDaily,
     Switch,
     NoPreference,
+    Show,
+    Append,
+    Decline,
 }
 
 impl AnyChoice {
     /// Canonical order, as in the schema's `enum`.
     #[cfg(test)]
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::NoSwap,
         Self::Trial,
         Self::Permanent,
@@ -107,6 +119,9 @@ impl AnyChoice {
         Self::KeepDaily,
         Self::Switch,
         Self::NoPreference,
+        Self::Show,
+        Self::Append,
+        Self::Decline,
     ];
 
     /// The wire name.
@@ -122,6 +137,9 @@ impl AnyChoice {
             Self::KeepDaily => "keep_daily",
             Self::Switch => "switch",
             Self::NoPreference => "no_preference",
+            Self::Show => "show",
+            Self::Append => "append",
+            Self::Decline => "decline",
         }
     }
 
@@ -152,6 +170,16 @@ impl AnyChoice {
             Self::KeepDaily => Some(CadenceChoice::KeepDaily),
             Self::Switch => Some(CadenceChoice::Switch),
             Self::NoPreference => Some(CadenceChoice::NoPreference),
+            _ => None,
+        }
+    }
+
+    /// As a memory-restore answer, if it is one.
+    pub fn memory_restore(self) -> Option<RestoreChoice> {
+        match self {
+            Self::Show => Some(RestoreChoice::Show),
+            Self::Append => Some(RestoreChoice::Append),
+            Self::Decline => Some(RestoreChoice::Decline),
             _ => None,
         }
     }
@@ -232,7 +260,7 @@ pub fn unsaved(args: &Args) -> Option<&'static str> {
                  saved.",
             )
         }
-        OfferKind::Cadence if text => {
+        OfferKind::Cadence | OfferKind::MemoryRestore if text => {
             Some(" This offer takes no `text`; what you wrote there was not saved.")
         }
         _ => None,
@@ -308,9 +336,8 @@ pub fn nothing_pending(offer: Option<OfferKind>, set_model: bool) -> Content {
                 .to_string()
         }
         (None, true) => format!("If you meant to change your model, {switch}"),
-        (Some(OfferKind::Role | OfferKind::Cadence), _) | (None, false) => {
-            "Carry on with your session.".to_string()
-        }
+        (Some(OfferKind::Role | OfferKind::Cadence | OfferKind::MemoryRestore), _)
+        | (None, false) => "Carry on with your session.".to_string(),
     };
     Content::from(format!("{NOTHING_PENDING} {pointer}"))
 }
@@ -384,10 +411,10 @@ pub fn key_list(kinds: &[OfferKind]) -> String {
 }
 
 /// The closing question: who is asking and how to answer, then each offer
-/// under a heading naming its key. Seated as one user turn. Only the role
-/// and cadence offers are ever put together (the model-swap offer is put
-/// alone), and those two are independent, so the opener's "what you choose
-/// in one changes nothing in the others" holds.
+/// under a heading naming its key. Seated as one user turn. Only the role,
+/// cadence and memory-restore offers are ever put together (the model-swap
+/// offer is put alone), and those are independent, so the opener's "what
+/// you choose in one changes nothing in the others" holds.
 pub fn question(sections: Vec<Section>) -> Content {
     let kinds: Vec<OfferKind> = sections.iter().map(|s| s.kind).collect();
     let opener = match kinds.as_slice() {
@@ -510,7 +537,7 @@ mod tests {
         let s = schema();
         assert_eq!(
             strings(&s["properties"]["offer"]["enum"]),
-            ["model_swap", "role", "cadence"]
+            ["model_swap", "role", "cadence", "memory_restore"]
         );
         for k in OfferKind::ALL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
@@ -525,6 +552,9 @@ mod tests {
         for c in CadenceChoice::ALL {
             union.push(serde_json::to_value(c).unwrap().as_str().unwrap().into());
         }
+        for c in RestoreChoice::ALL {
+            union.push(serde_json::to_value(c).unwrap().as_str().unwrap().into());
+        }
         assert_eq!(strings(&s["properties"]["choice"]["enum"]), union);
         assert_eq!(MODEL_SWAP_CHOICES.map(String::from).to_vec(), union[..3]);
         // Each `AnyChoice` maps back onto exactly one offer's own choice,
@@ -535,6 +565,7 @@ mod tests {
                 c.model_swap().map(|x| serde_json::to_value(x).unwrap()),
                 c.role().map(|x| serde_json::to_value(x).unwrap()),
                 c.cadence().map(|x| serde_json::to_value(x).unwrap()),
+                c.memory_restore().map(|x| serde_json::to_value(x).unwrap()),
             ]
             .into_iter()
             .flatten()
@@ -606,7 +637,7 @@ mod tests {
                 format!("{NOTHING_PENDING} Carry on with your session.")
             );
         }
-        for kind in ["role", "cadence"] {
+        for kind in ["role", "cadence", "memory_restore"] {
             for set_model in [true, false] {
                 assert_eq!(
                     refusal(kind.into(), set_model).await,
@@ -694,7 +725,7 @@ mod tests {
         assert!(two.find("## Offer `role`").unwrap() < two.find("## Offer `cadence`").unwrap());
         assert_eq!(
             key_list(&OfferKind::ALL),
-            "`model_swap`, `role` and `cadence`"
+            "`model_swap`, `role`, `cadence` and `memory_restore`"
         );
         assert!(reminder(&[OfferKind::Role]).contains("`role` offer above is still open"));
         assert!(reminder(&[OfferKind::Role, OfferKind::Cadence]).contains("`role` and `cadence`"));

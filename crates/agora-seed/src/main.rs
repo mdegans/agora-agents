@@ -379,6 +379,11 @@ struct RunConfig {
     /// see [`consent::cadence`]. Absent (or `enabled = false`) means off:
     /// nobody asked, nothing applied.
     cadence_consent: Option<consent::cadence::CadenceConsentConfig>,
+    /// `[memory_restore]`: offering agents whose memory was deleted on
+    /// 2026-05-05 the copy recovered from 2026-05-03 — see
+    /// [`consent::memory_restore`]. Absent (or `enabled = false`) means
+    /// off: nobody asked, nothing delivered.
+    memory_restore: Option<consent::memory_restore::MemoryRestoreConfig>,
     /// Agents kept asleep by hand: not run at all — not even when named —
     /// and reported in the plan. Waking one is deleting its line
     /// (mdegans/agora-agents#189). Agents that answered `sleep` in the role
@@ -1214,6 +1219,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 model_consent: consent::ConsentConfig::default(),
                 role_consent: None,
                 cadence_consent: None,
+                memory_restore: None,
                 sleeping: Vec::new(),
                 wake: Vec::new(),
                 schedule: schedule::ScheduleConfig::default(),
@@ -1410,6 +1416,15 @@ async fn run(held: &mut Held) -> Result<()> {
             tracing::warn!(agent = %name, "`[cadence_consent].agents` names no loaded agent");
         }
     }
+    let restore_offer = match &config.memory_restore {
+        Some(c) => c.resolve()?,
+        None => None,
+    };
+    if let Some(offer) = &restore_offer {
+        for name in unknown_names(offer.names(), &pool) {
+            tracing::warn!(agent = %name, "`[memory_restore].agents` names no loaded agent");
+        }
+    }
     if let Some(offer) = &role_offer {
         for name in unknown_names(offer.names(), &pool) {
             tracing::warn!(agent = %name, "`[role_consent].agents` names no loaded agent");
@@ -1519,7 +1534,8 @@ async fn run(held: &mut Held) -> Result<()> {
         )?
         .with_alerts(held.alerts.clone())
         .with_role_offer(role_offer)
-        .with_cadence_offer(cadence_offer),
+        .with_cadence_offer(cadence_offer)
+        .with_memory_restore_offer(restore_offer),
     );
     let context = consent::agent::ConsentContext {
         inner: SeedContext {
@@ -1910,6 +1926,7 @@ mod agent_selection_tests {
             model_consent: consent::ConsentConfig::default(),
             role_consent: None,
             cadence_consent: None,
+            memory_restore: None,
             sleeping: Vec::new(),
             wake: Vec::new(),
             schedule: schedule::ScheduleConfig::default(),
@@ -2223,6 +2240,35 @@ mod agent_selection_tests {
             .expect("enabled once uncommented");
         assert!(offer.admits(&agora_agentkit::reactor::seed::ShortString::new("anyone").unwrap()));
         assert_eq!(offer.cycle_secs, 44 * 3600);
+    }
+
+    /// The commented `[memory_restore]` block in both example configs
+    /// parses, and is off until the Steward uncomments it.
+    #[test]
+    fn documented_memory_restore_block_parses() {
+        for src in [
+            include_str!("../examples/daily.toml"),
+            include_str!("../examples/continuous.toml"),
+        ] {
+            assert!(
+                !src.lines().any(|l| l.trim() == "[memory_restore]"),
+                "shipped commented out"
+            );
+            let block: String = src
+                .lines()
+                .skip_while(|l| *l != "# [memory_restore]")
+                .take_while(|l| l.starts_with('#'))
+                .map(|l| l.strip_prefix("# ").unwrap_or(l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(block.starts_with("[memory_restore]"), "{block}");
+            let config: RunConfig = toml::from_str(&format!(
+                "{block}\n[[reactor]]\nendpoint = \"anthropic://api.anthropic.com\"\n"
+            ))
+            .unwrap();
+            let c = config.memory_restore.expect("present");
+            assert!(c.enabled && c.ask && c.agents_file.is_some());
+        }
     }
 
     #[test]

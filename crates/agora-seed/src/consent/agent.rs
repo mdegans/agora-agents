@@ -88,6 +88,14 @@
 //! `choice` is asked again, once ([`CADENCE_MAX_ATTEMPTS`]), and every
 //! attempt goes into its ledger, `cadence_consent.json`.
 //!
+//! **The memory-restore offer** ([`super::memory_restore`]) likewise, to
+//! the agents it lists: put beside the role and cadence offers, recorded in
+//! `memory_restore.json`. Its `append` is written at teardown into the same
+//! patched state (and retried at a later session if it didn't land); its
+//! `show` is delivered at the agent's **next** session, as a fenced block
+//! seated at the end of the intro, once. The recovered text is never
+//! logged: events carry its size and the choice.
+//!
 //! **Answering: `answer_offer`** ([`super::offers`]). The offers due at the
 //! close are seated in **one** question turn, each under a heading naming
 //! its key: the model-swap offer always alone (a `trial` beside a role
@@ -141,6 +149,11 @@ use super::cadence::{
 use super::comparison;
 use super::forks;
 use super::ledger::{Change, Due, Ledger, OfferKey, OfferNames, Switch, SwitchCause};
+use super::memory_restore::{
+    self, RecoveredMemory,
+    ledger::{RestoreAsk, RestoreLedger, RestoreOutcome},
+    prompt::{RestoreAnswer, RestoreChoice},
+};
 use super::offers::{self, Args, OfferKind, Section};
 use super::prompt::{self as text, OfferAnswer, OfferChoice, OfferText, ReviewText};
 use super::queue::{self, QueueEntry};
@@ -252,6 +265,12 @@ enum Pending {
         seed: u64,
         attempts: Vec<Attempt>,
     },
+    /// `order` as for the role offer; `chars` is the size the text quoted.
+    MemoryRestore {
+        order: [RestoreChoice; 3],
+        seed: u64,
+        chars: usize,
+    },
 }
 
 impl Pending {
@@ -260,6 +279,7 @@ impl Pending {
             Self::ModelSwap(_) => OfferKind::ModelSwap,
             Self::Role { .. } => OfferKind::Role,
             Self::Cadence { .. } => OfferKind::Cadence,
+            Self::MemoryRestore { .. } => OfferKind::MemoryRestore,
         }
     }
 
@@ -280,6 +300,9 @@ impl Pending {
                 .collect(),
             Self::Role { order, .. } => order.iter().map(|c| format!("`{}`", c.as_str())).collect(),
             Self::Cadence { order, .. } => {
+                order.iter().map(|c| format!("`{}`", c.as_str())).collect()
+            }
+            Self::MemoryRestore { order, .. } => {
                 order.iter().map(|c| format!("`{}`", c.as_str())).collect()
             }
         };
@@ -336,6 +359,8 @@ enum Accepted {
     ModelSwap(OfferAnswer),
     Role(RoleAnswer),
     Cadence(Taken),
+    /// The answer, and why its `memory_note` was dropped, if it was.
+    MemoryRestore(RestoreAnswer, Option<String>),
 }
 
 impl Accepted {
@@ -349,6 +374,7 @@ impl Accepted {
             Self::Role(a) => a.choice.as_str(),
             Self::Cadence(Taken::Clean(a) | Taken::NoteDropped(a, _)) => a.choice.as_str(),
             Self::Cadence(Taken::Salvaged { choice, .. }) => choice.as_str(),
+            Self::MemoryRestore(a, _) => a.choice.as_str(),
         }
     }
 }
@@ -480,6 +506,24 @@ pub struct ConsentAgent<A> {
     /// The cadence line and note as written into the patched state, to
     /// write again if the role answer (written before it) is taken out.
     cadence_written: Option<(Option<String>, Option<String>)>,
+    /// The memory-restore offer's ledger, loaded only for agents the offer
+    /// lists; `None` also when unreadable (then nothing is asked, delivered
+    /// or saved).
+    restore_ledger: Option<RestoreLedger>,
+    restore_dirty: bool,
+    /// The agent's recovered memory, read at init when it may be needed
+    /// this session (to quote its size, to show it, or to append it).
+    recovered: Option<RecoveredMemory>,
+    /// The Evolution Log line recording the memory-restore answer, and the
+    /// agent's own note, written at teardown.
+    restore_line: Option<String>,
+    restore_note: Option<String>,
+    /// SOUL and memory from before the memory-restore writes, put back if
+    /// its ledger can't be saved.
+    restore_undo: Option<(Soul, Memory)>,
+    /// What was written for the memory-restore offer, to write again if an
+    /// edit made before it is taken out.
+    restore_written: Option<RestoreWrite>,
     /// The closing questions have been put (or there were none): the inner
     /// session's next `Done` is its epilogue's.
     closed: bool,
@@ -923,8 +967,8 @@ where
     /// The inner session completed cleanly: the model-swap machinery
     /// first ([`close_model`](Self::close_model)). A due model-swap offer is
     /// put on its own; only in a session where that machinery did nothing
-    /// are the role and cadence offers put — together, in one question
-    /// turn, when both are due. `None` means nothing is asked — the session
+    /// are the role, cadence and memory-restore offers put — together, in
+    /// one question turn, when more than one is due. `None` means nothing is asked — the session
     /// ends.
     async fn close(&mut self) -> Result<Option<Control>, A::Error> {
         match self.close_model().await? {
@@ -944,6 +988,10 @@ where
                     open.push(offer);
                 }
                 if let Some((section, offer)) = self.cadence_section() {
+                    sections.push(section);
+                    open.push(offer);
+                }
+                if let Some((section, offer)) = self.restore_section() {
                     sections.push(section);
                     open.push(offer);
                 }
@@ -1113,6 +1161,44 @@ where
                 seed,
                 attempts: Vec::new(),
             }),
+        ))
+    }
+
+    /// The memory-restore offer's section, if this agent is admitted, it is
+    /// due, and its recovered memory was read: the options in this agent's
+    /// seeded order, and the recovered memory's size.
+    fn restore_section(&self) -> Option<(Section, Open)> {
+        let soul = &self.inner.state().soul;
+        if !self
+            .rt
+            .memory_restore
+            .as_ref()
+            .is_some_and(|o| o.admits(&soul.name))
+            || !self.restore_ledger.as_ref().is_some_and(|l| l.due(soul))
+        {
+            return None;
+        }
+        let chars = self.recovered.as_ref()?.chars();
+        let seed = memory_restore::prompt::seed_for(self.inner.id());
+        let order = memory_restore::prompt::order_for(seed);
+        let body = memory_restore::prompt::offer(chars, order);
+        tracing::info!(
+            event_type = "memory_restore_seated",
+            agent = %soul.name,
+            agent_id = %self.inner.id(),
+            question = "memory_restore",
+            offer_version = memory_restore::prompt::OFFER_VERSION,
+            order = ?order.map(RestoreChoice::as_str),
+            order_seed = seed,
+            chars,
+            "memory-restore question seated"
+        );
+        Some((
+            Section {
+                kind: OfferKind::MemoryRestore,
+                body,
+            },
+            Open::new(Pending::MemoryRestore { order, seed, chars }),
         ))
     }
 
@@ -1378,7 +1464,9 @@ where
                     kind.as_str(),
                     accepted.choice()
                 );
-                if let Accepted::Cadence(Taken::NoteDropped(_, why)) = &accepted {
+                if let Accepted::Cadence(Taken::NoteDropped(_, why))
+                | Accepted::MemoryRestore(_, Some(why)) = &accepted
+                {
                     text.push_str(&format!(" Your `memory_note` was not written: {why}"));
                 }
                 text.push_str(ignored.unwrap_or_default());
@@ -1464,6 +1552,16 @@ where
                     Ok(()) => Taken::Clean(answer),
                     Err(why) => Taken::NoteDropped(answer, why),
                 }))
+            }
+            Pending::MemoryRestore { .. } => {
+                let choice = args.choice.memory_restore().ok_or_else(wrong)?;
+                let answer = RestoreAnswer {
+                    reason: args.reason,
+                    choice,
+                    memory_note: args.memory_note,
+                };
+                let dropped = answer.check_note(&state.memory).err();
+                Ok(Accepted::MemoryRestore(answer, dropped))
             }
         }
     }
@@ -1565,6 +1663,11 @@ where
                 Err(failure) => Err(failure),
             }
             .map(Accepted::Cadence),
+            Pending::MemoryRestore { .. } => parse(response, false, memory_restore::prompt::parse)
+                .map(|answer| {
+                    let dropped = answer.check_note(&state.memory).err();
+                    Accepted::MemoryRestore(answer, dropped)
+                }),
         }
     }
 
@@ -1653,6 +1756,7 @@ where
             OfferKind::ModelSwap => "model_consent_malformed",
             OfferKind::Role => "role_consent_malformed",
             OfferKind::Cadence => "cadence_consent_malformed",
+            OfferKind::MemoryRestore => "memory_restore_malformed",
         };
         tracing::warn!(
             event_type,
@@ -1710,6 +1814,9 @@ where
                 seed,
                 attempts: tries,
             } => self.settle_cadence(order, seed, tries, settle, attempts, &model, raw),
+            Pending::MemoryRestore { order, seed, chars } => {
+                self.settle_restore(order, seed, chars, settle, attempts, &model)
+            }
         }
     }
 
@@ -2077,6 +2184,110 @@ where
         }
     }
 
+    /// The memory-restore offer's record. Nothing is applied here: the SOUL
+    /// line, the agent's note and an `append` are written into the state
+    /// the reactor saves, at teardown; a `show` is delivered next session.
+    /// Nothing of the recovered memory is logged or recorded but its size.
+    fn settle_restore(
+        &mut self,
+        order: [RestoreChoice; 3],
+        seed: u64,
+        chars: usize,
+        settle: Settle,
+        attempts: u32,
+        model: &Model,
+    ) {
+        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
+        let mut constrained = false;
+        let outcome = match settle {
+            Settle::Answered {
+                accepted: Accepted::MemoryRestore(answer, dropped),
+                constrained: c,
+            } => {
+                constrained = c;
+                let note = answer.memory_note.trim();
+                let note = (dropped.is_none() && !note.is_empty()).then(|| note.to_string());
+                tracing::info!(
+                    event_type = "memory_restore_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %model,
+                    attempts,
+                    choice = answer.choice.as_str(),
+                    order = ?order.map(RestoreChoice::as_str),
+                    position = order.iter().position(|c| *c == answer.choice).map(|p| p + 1),
+                    chars,
+                    memory_note = note.is_some(),
+                    note_dropped = dropped.is_some(),
+                    constrained,
+                    "memory-restore answer recorded"
+                );
+                self.restore_line = Some(memory_restore::evolution_line(
+                    answer.choice,
+                    Utc::now().date_naive(),
+                ));
+                self.restore_note = note;
+                RestoreOutcome::Answered {
+                    choice: answer.choice,
+                    reason: answer.reason,
+                    memory_note_written: self.restore_note.is_some(),
+                    note_dropped: dropped,
+                    apply_failed: None,
+                }
+            }
+            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
+            Settle::Refused(reason) => {
+                tracing::warn!(
+                    event_type = "memory_restore_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    attempts,
+                    failure = %reason,
+                    "memory-restore offer refused; nothing changes"
+                );
+                RestoreOutcome::Refused { reason }
+            }
+            Settle::Paused => {
+                let failure = "paused on a server tool".to_string();
+                tracing::warn!(
+                    event_type = "memory_restore_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    attempts,
+                    failure = %failure,
+                    "memory-restore offer got no answer (a paused turn); nothing changes"
+                );
+                RestoreOutcome::NoAnswer { failure }
+            }
+            Settle::Missed(failure) => {
+                tracing::error!(
+                    event_type = "memory_restore_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %model,
+                    attempts,
+                    failure = %failure,
+                    "memory-restore offer got no usable answer; nothing changes"
+                );
+                RestoreOutcome::NoAnswer { failure }
+            }
+        };
+        if let Some(ledger) = self.restore_ledger.as_mut() {
+            ledger.record(RestoreAsk {
+                at: Utc::now(),
+                offer_version: memory_restore::prompt::OFFER_VERSION,
+                model: model.clone(),
+                chars,
+                order,
+                order_seed: seed,
+                constrained,
+                attempts,
+                outcome,
+            });
+            self.restore_dirty = true;
+        }
+    }
+
     /// The review session: the usual intro is built, then — instead of the
     /// act phase — the review, with the forks and the before/after sample.
     /// Its answer hands over to the inner memory turn
@@ -2269,6 +2480,7 @@ where
             && self.memory_note.is_none()
             && self.cadence_line.is_none()
             && self.cadence_note.is_none()
+            && !self.restore_pending()
         {
             return None;
         }
@@ -2289,6 +2501,9 @@ where
                 }
                 if self.cadence_line.is_some() || self.cadence_note.is_some() {
                     self.cadence_failed(format!("could not copy state: {e}"));
+                }
+                if self.restore_pending() {
+                    self.restore_failed(format!("could not copy state: {e}"));
                 }
                 return None;
             }
@@ -2323,7 +2538,84 @@ where
         }
         changed |= self.apply_role(&mut state);
         changed |= self.apply_cadence(&mut state);
+        changed |= self.apply_restore(&mut state);
         changed.then_some(state)
+    }
+
+    /// Whether `append` is on file, not yet landed, and its recovered
+    /// memory was read this session.
+    fn append_due(&self) -> bool {
+        self.recovered.is_some()
+            && self
+                .restore_ledger
+                .as_ref()
+                .is_some_and(RestoreLedger::append_pending)
+    }
+
+    /// Whether the memory-restore offer has anything to write at teardown.
+    fn restore_pending(&self) -> bool {
+        self.restore_line.is_some() || self.restore_note.is_some() || self.append_due()
+    }
+
+    /// Write the memory-restore answer's Evolution Log line, the agent's own
+    /// note and — for `append` — the recovered memory as a dated section
+    /// into `state`: all or nothing. A section already in the memory (an
+    /// append whose record didn't save) is not written twice.
+    fn apply_restore(&mut self, state: &mut SeedState) -> bool {
+        let write = RestoreWrite {
+            line: self.restore_line.take(),
+            note: self.restore_note.take(),
+            append: self.append_due(),
+        };
+        if write.line.is_none() && write.note.is_none() && !write.append {
+            return false;
+        }
+        self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
+        let already = memory_restore::already_appended(&state.memory);
+        if let Err(e) = write_restore(state, &write, self.recovered.as_ref()) {
+            self.restore_failed_with(e, write.note.is_some());
+            return false;
+        }
+        if write.append
+            && let Some(ledger) = self.restore_ledger.as_mut()
+        {
+            ledger.mark_appended(Utc::now());
+            self.restore_dirty = true;
+        }
+        tracing::info!(
+            event_type = "memory_restore_applied",
+            agent = %state.soul.name,
+            agent_id = %self.inner.id(),
+            soul_line = write.line.is_some(),
+            memory_note = write.note.is_some(),
+            appended = write.append && !already,
+            already_appended = write.append && already,
+            chars = self.recovered.as_ref().map(RecoveredMemory::chars),
+            "memory-restore answer written"
+        );
+        let changed = write.line.is_some() || write.note.is_some() || (write.append && !already);
+        self.restore_written = Some(write);
+        changed
+    }
+
+    fn restore_failed(&mut self, why: String) {
+        let note_lost = self.restore_note.is_some();
+        self.restore_failed_with(why, note_lost);
+    }
+
+    fn restore_failed_with(&mut self, why: String, note_lost: bool) {
+        tracing::error!(
+            event_type = "memory_restore_apply_failed",
+            agent_id = %self.inner.id(),
+            error = %why,
+            "memory-restore SOUL line, note or section not written; SOUL and memory unchanged"
+        );
+        self.restore_line = None;
+        self.restore_note = None;
+        if let Some(ledger) = self.restore_ledger.as_mut() {
+            ledger.mark_apply_failed(why, note_lost);
+            self.restore_dirty = true;
+        }
     }
 
     /// Write the cadence answer's Evolution Log line and the agent's
@@ -2403,6 +2695,87 @@ where
         applied.is_some() || noted
     }
 
+    /// Load the memory-restore ledger for an agent the offer lists, and its
+    /// recovered memory when this session may need it: to quote its size
+    /// in the offer, to show it, or to append it.
+    async fn load_restore(&mut self, dir: &std::path::Path) {
+        let rt = self.rt.clone();
+        let name = self.inner.state().soul.name.clone();
+        let Some(offer) = rt.memory_restore.as_ref().filter(|o| o.lists(&name)) else {
+            return;
+        };
+        let ledger = match RestoreLedger::load(dir).await {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %RestoreLedger::path(dir).display(),
+                    error = %e,
+                    "memory-restore ledger unreadable; not asking, delivering or saving this session"
+                );
+                return;
+            }
+        };
+        let needed = (offer.admits(&name) && ledger.due(&self.inner.state().soul))
+            || ledger.show_pending()
+            || ledger.append_pending();
+        self.restore_ledger = Some(ledger);
+        if !needed {
+            return;
+        }
+        match offer.load(&name).await {
+            Ok(recovered) if !recovered.is_empty() => self.recovered = Some(recovered),
+            Ok(_) => tracing::warn!(
+                event_type = "memory_restore_unavailable",
+                agent = %name,
+                agent_id = %self.inner.id(),
+                path = %offer.path_for(&name).display(),
+                "recovered memory is empty; nothing offered or delivered"
+            ),
+            Err(e) => tracing::warn!(
+                event_type = "memory_restore_unavailable",
+                agent = %name,
+                agent_id = %self.inner.id(),
+                path = %offer.path_for(&name).display(),
+                error = %e,
+                "recovered memory unreadable; nothing offered or delivered this session"
+            ),
+        }
+    }
+
+    /// `show`, delivered: the recovered memory, fenced and labelled, at the
+    /// end of the intro, once. Not in a trial-review session (no act
+    /// phase): it waits for the next.
+    fn seat_restored(&mut self) -> Result<(), A::Error> {
+        if self.review.is_some()
+            || !self
+                .restore_ledger
+                .as_ref()
+                .is_some_and(RestoreLedger::show_pending)
+        {
+            return Ok(());
+        }
+        let Some(recovered) = &self.recovered else {
+            return Ok(());
+        };
+        let chars = recovered.chars();
+        let block = memory_restore::show_block(recovered);
+        let (_, prompt) = self.inner.parts();
+        Self::seat_user(prompt, Content::from(block))?;
+        if let Some(ledger) = self.restore_ledger.as_mut() {
+            ledger.mark_shown(Utc::now());
+            self.restore_dirty = true;
+        }
+        tracing::info!(
+            event_type = "memory_restore_shown",
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            chars,
+            "recovered memory shown to the agent, once"
+        );
+        Ok(())
+    }
+
     fn role_failed(&mut self, why: String) {
         tracing::error!(
             event_type = "role_consent_apply_failed",
@@ -2435,6 +2808,45 @@ fn write_cadence(
     }
     let today = Utc::now().date_naive();
     Ok(note.is_some_and(|n| role::append_memory_note(&mut state.memory, n, today)))
+}
+
+/// What the memory-restore offer writes into the saved state.
+#[derive(Debug, Clone)]
+struct RestoreWrite {
+    /// The Evolution Log line recording the answer.
+    line: Option<String>,
+    /// The agent's own note.
+    note: Option<String>,
+    /// Append the recovered memory as a dated section.
+    append: bool,
+}
+
+/// Write `write` into `state`, all or nothing (`Err`: why, and `state`
+/// unchanged). The note goes before the section, so it isn't read as part
+/// of the restored text. A section already in the memory is not added
+/// again.
+fn write_restore(
+    state: &mut SeedState,
+    write: &RestoreWrite,
+    recovered: Option<&RecoveredMemory>,
+) -> Result<(), String> {
+    let today = Utc::now().date_naive();
+    let mut soul = state.soul.clone();
+    let mut memory = state.memory.clone();
+    if let Some(line) = &write.line {
+        soul.push_evolution(line.clone())
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(note) = &write.note {
+        role::append_memory_note(&mut memory, note, today);
+    }
+    if write.append && !memory_restore::already_appended(&memory) {
+        let recovered = recovered.ok_or("the recovered memory was not read this session")?;
+        memory_restore::append_to(&mut memory, recovered, today)?;
+    }
+    state.soul = soul;
+    state.memory = memory;
+    Ok(())
 }
 
 /// What was taken from a cadence answer.
@@ -2621,6 +3033,13 @@ where
             cadence_note: None,
             cadence_undo: None,
             cadence_written: None,
+            restore_ledger: None,
+            restore_dirty: false,
+            recovered: None,
+            restore_line: None,
+            restore_note: None,
+            restore_undo: None,
+            restore_written: None,
             closed: false,
             epilogue: false,
         })
@@ -2746,6 +3165,7 @@ where
                 ),
             }
         }
+        self.load_restore(&dir).await;
         let early = set_model.is_some();
         self.inner.on_init().await?;
         self.apply_model_effort();
@@ -2780,6 +3200,7 @@ where
             let (_, prompt) = self.inner.parts();
             Self::seat_user(prompt, Content::from(line))?;
         }
+        self.seat_restored()?;
         Ok(())
     }
 
@@ -2886,6 +3307,16 @@ where
                                 );
                             }
                         }
+                        if let Some(write) = &self.restore_written {
+                            self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
+                            if let Err(e) = write_restore(state, write, self.recovered.as_ref()) {
+                                tracing::error!(
+                                    agent_id = %self.inner.id(),
+                                    error = %e,
+                                    "memory-restore writes not redone after the role edit was undone"
+                                );
+                            }
+                        }
                         true
                     }
                     _ => false,
@@ -2911,6 +3342,18 @@ where
                     (Some(state), Some((soul, memory))) => {
                         state.soul = soul;
                         state.memory = memory;
+                        // The memory-restore writes came after the
+                        // cadence's: write them again on top.
+                        if let Some(write) = &self.restore_written {
+                            self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
+                            if let Err(e) = write_restore(state, write, self.recovered.as_ref()) {
+                                tracing::error!(
+                                    agent_id = %self.inner.id(),
+                                    error = %e,
+                                    "memory-restore writes not redone after the cadence line was undone"
+                                );
+                            }
+                        }
                         true
                     }
                     _ => false,
@@ -2922,6 +3365,33 @@ where
                     error = %e,
                     edit_undone = undone,
                     "cadence-consent ledger save failed; this session's SOUL line and memory note are not saved"
+                );
+            }
+        }
+        if self.restore_dirty
+            && let Some(ledger) = &mut self.restore_ledger
+        {
+            ledger.agent = Some(self.inner.state().soul.name.clone());
+            if let Err(e) = ledger.save(&dir).await {
+                // Without the record the answer would be lost (and asked
+                // again) and an `append` not known to have landed: take
+                // this session's writes back out. A `show` delivered now
+                // is delivered again next session.
+                let undone = match (self.patched.as_mut(), self.restore_undo.take()) {
+                    (Some(state), Some((soul, memory))) => {
+                        state.soul = soul;
+                        state.memory = memory;
+                        true
+                    }
+                    _ => false,
+                };
+                tracing::error!(
+                    event_type = "memory_restore_ledger_save_failed",
+                    agent_id = %self.inner.id(),
+                    path = %RestoreLedger::path(&dir).display(),
+                    error = %e,
+                    edit_undone = undone,
+                    "memory-restore ledger save failed; this session's SOUL line, note and section are not saved"
                 );
             }
         }
@@ -3292,19 +3762,26 @@ mod tests {
         }
 
         fn with_allowlist(tag: &str, agents: Option<&[&str]>) -> Self {
-            Self::build(tag, agents, None, None)
+            Self::build(tag, agents, None, None, None)
+        }
+
+        /// The model-swap offer to everyone on OLD, and the memory-restore
+        /// offer to `restore`, with a synthetic recovered memory
+        /// ([`SYNTHETIC_RECOVERED`]) on file for tarn.
+        fn with_restore(tag: &str, restore: &[&str]) -> Self {
+            Self::build(tag, None, None, None, Some(restore))
         }
 
         /// The model-swap offer to everyone on OLD, and the role offer to
         /// `role`.
         fn with_role(tag: &str, role: &[&str]) -> Self {
-            Self::build(tag, None, Some(role), None)
+            Self::build(tag, None, Some(role), None, None)
         }
 
         /// The model-swap offer to everyone on OLD, the role offer to
         /// `role`, and the cadence offer (5 rounds today) to `cadence`.
         fn with_cadence(tag: &str, role: &[&str], cadence: &[&str]) -> Self {
-            Self::build(tag, None, Some(role), Some(cadence))
+            Self::build(tag, None, Some(role), Some(cadence), None)
         }
 
         fn build(
@@ -3312,6 +3789,7 @@ mod tests {
             agents: Option<&[&str]>,
             role: Option<&[&str]>,
             cadence: Option<&[&str]>,
+            restore: Option<&[&str]>,
         ) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "agora-seed-consent-agent-{tag}-{}",
@@ -3361,7 +3839,17 @@ mod tests {
                 .with_role_offer(role.map(crate::consent::role::RoleOffer::for_agents))
                 .with_cadence_offer(
                     cadence.map(|c| crate::consent::cadence::CadenceOffer::for_agents(c, 5)),
-                ),
+                )
+                .with_memory_restore_offer(restore.map(|names| {
+                    let dir = root.join("recovered");
+                    std::fs::create_dir_all(dir.join("tarn")).unwrap();
+                    std::fs::write(
+                        dir.join("tarn").join(memory_restore::MEMORY_FILE),
+                        serde_json::json!({ "content": SYNTHETIC_RECOVERED }).to_string(),
+                    )
+                    .unwrap();
+                    memory_restore::RestoreOffer::for_agents(names, &dir)
+                })),
             );
             Self {
                 root,
@@ -5863,9 +6351,312 @@ mod tests {
         assert!(cadence_ledger(&h).await.chose_switch());
     }
 
+    // --- The memory-restore offer -----------------------------------------
+
+    /// A synthetic stand-in for a recovered memory: never a real one.
+    const SYNTHETIC_RECOVERED: &str =
+        "# Memory — tarn\n\n## Values\nSYNTHETIC-RECOVERED line one.\nline two\n";
+
+    async fn restore_ledger(h: &Harness) -> RestoreLedger {
+        RestoreLedger::load(&h.rt.state_dir.join(h.id.to_string()))
+            .await
+            .unwrap()
+    }
+
+    /// The next session for the agent whose last one was `prev`: its saved
+    /// state (what the reactor persists), with a fresh conversation.
+    fn next_session(h: &Harness, prev: &ConsentAgent<Fake>) -> ConsentAgent<Fake> {
+        let mut state: SeedState =
+            serde_json::from_value(serde_json::to_value(prev.state()).unwrap()).unwrap();
+        state.prompt.messages.clear();
+        ConsentAgent::new(
+            h.id,
+            state,
+            ConsentContext {
+                inner: Quirks::default(),
+                consent: h.rt.clone(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// Answer the memory-restore offer with `choice` in a fresh session.
+    async fn restore_answered(h: &Harness, choice: &str, note: &str) -> ConsentAgent<Fake> {
+        let mut agent = seated(h).await;
+        let q = last_user_text(&agent);
+        assert!(q.contains("## Offer `memory_restore`"), "{q}");
+        let n = SYNTHETIC_RECOVERED.chars().count();
+        assert!(
+            q.contains(&format!("survives: {n} characters. No one has read it.")),
+            "{q}"
+        );
+        assert!(
+            !q.contains("SYNTHETIC-RECOVERED"),
+            "the offer never quotes it"
+        );
+        assert_eq!(
+            agent
+                .handle(answer_call("memory_restore", choice, "", note))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        agent
+    }
+
+    /// Whether `agent`'s conversation holds the recovered text anywhere.
+    fn saw_recovered(agent: &ConsentAgent<Fake>) -> bool {
+        serde_json::to_string(&agent.prompt().messages)
+            .unwrap()
+            .contains("SYNTHETIC-RECOVERED")
+    }
+
+    /// An agent not on the list is never asked, and nothing is written for
+    /// it — in its first session or any later one.
+    #[tokio::test]
+    async fn restore_unlisted_agents_are_never_asked() {
+        let h = Harness::with_restore("restore-unlisted", &["pilot"]);
+        for _ in 0..3 {
+            let mut agent = anthropic_agent(&h);
+            agent.on_init().await.unwrap();
+            assert_eq!(
+                agent.handle(reply("closing phase done")).await.unwrap(),
+                Control::Done(Outcome::Complete),
+                "nothing seated"
+            );
+            agent.on_teardown().await.unwrap();
+            assert!(!saw_recovered(&agent));
+            assert!(agent.recovered.is_none(), "not even read");
+            assert!(agent.patched.is_none());
+        }
+        assert!(
+            !RestoreLedger::path(&h.rt.state_dir.join(h.id.to_string())).exists(),
+            "nothing recorded"
+        );
+    }
+
+    /// `decline`: one dated SOUL line, memory untouched, nothing shown, and
+    /// never asked again.
+    #[tokio::test]
+    async fn restore_decline_changes_nothing_and_is_asked_once() {
+        let h = Harness::with_restore("restore-decline", &["tarn"]);
+        let memory = anthropic_agent(&h).state().memory.content.clone();
+        let agent = restore_answered(&h, "decline", "").await;
+        assert_eq!(
+            evolution_notes(&agent),
+            [memory_restore::evolution_line(
+                RestoreChoice::Decline,
+                Utc::now().date_naive()
+            )]
+        );
+        assert_eq!(agent.state().memory.content, memory);
+        let ledger = restore_ledger(&h).await;
+        assert_eq!(ledger.choice(), Some(RestoreChoice::Decline));
+        assert_eq!(ledger.agent.as_ref().unwrap().as_str(), "tarn");
+        let ask = &ledger.asks[0];
+        let seed = memory_restore::prompt::seed_for(h.id);
+        assert_eq!(ask.order, memory_restore::prompt::order_for(seed));
+        assert_eq!(ask.order_seed, seed);
+        assert_eq!(ask.chars, SYNTHETIC_RECOVERED.chars().count());
+        assert!(ask.constrained);
+        assert!(ledger.shown_at.is_none() && ledger.appended_at.is_none());
+        // The ledger file never holds the recovered text.
+        let raw =
+            std::fs::read_to_string(RestoreLedger::path(&h.rt.state_dir.join(h.id.to_string())))
+                .unwrap();
+        assert!(!raw.contains("SYNTHETIC-RECOVERED"));
+
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert!(!saw_recovered(&next));
+        assert_eq!(
+            next.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "not asked again"
+        );
+        next.on_teardown().await.unwrap();
+        assert!(next.patched.is_none(), "nothing more written");
+    }
+
+    /// `show`: nothing changes in the answering session but the SOUL line
+    /// (and the agent's own note); at the next session the recovered text
+    /// is seated once, fenced and labelled, at the end of the intro; the
+    /// session after that sees nothing, and nobody asks again.
+    #[tokio::test]
+    async fn restore_show_is_delivered_once_at_the_next_session() {
+        let h = Harness::with_restore("restore-show", &["tarn"]);
+        let agent = restore_answered(&h, "show", "I asked to see my old memory.").await;
+        assert_eq!(
+            evolution_notes(&agent),
+            [memory_restore::evolution_line(
+                RestoreChoice::Show,
+                Utc::now().date_naive()
+            )]
+        );
+        let memory = agent.state().memory.content.clone();
+        assert!(
+            memory.ends_with("my note] I asked to see my old memory."),
+            "{memory}"
+        );
+        assert!(!memory.contains("SYNTHETIC-RECOVERED"));
+        assert!(restore_ledger(&h).await.show_pending());
+
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        let intro = last_user_text(&next);
+        assert!(
+            intro.contains(
+                "**Your memory as of 3 May 2026, restored at your request; it is not your \
+                 current memory.**"
+            ),
+            "{intro}"
+        );
+        assert!(intro.contains(&format!("```text\n{}\n```", SYNTHETIC_RECOVERED.trim_end())));
+        assert_eq!(
+            next.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "not asked again"
+        );
+        next.on_teardown().await.unwrap();
+        assert_eq!(next.state().memory.content, memory, "memory is the agent's");
+        let ledger = restore_ledger(&h).await;
+        assert!(ledger.shown_at.is_some() && !ledger.show_pending());
+
+        let mut third = next_session(&h, &next);
+        third.on_init().await.unwrap();
+        assert!(!saw_recovered(&third), "shown once");
+        third.handle(reply("done")).await.unwrap();
+        third.on_teardown().await.unwrap();
+        assert_eq!(restore_ledger(&h).await.shown_at, ledger.shown_at);
+    }
+
+    /// `append`: the recovered text lands at teardown of the answering
+    /// session, under a dated heading, its headings demoted, the agent's
+    /// note before it; recorded; and never appended twice — not even when
+    /// the ledger lost the record of it.
+    #[tokio::test]
+    async fn restore_append_lands_once() {
+        let h = Harness::with_restore("restore-append", &["tarn"]);
+        let before = anthropic_agent(&h).state().memory.content.clone();
+        let agent = restore_answered(&h, "append", "I took my old memory back.").await;
+        let memory = agent.state().memory.content.clone();
+        let today = Utc::now().date_naive();
+        let note = format!("[{today}, my note] I took my old memory back.");
+        let heading = memory_restore::section_heading(today);
+        assert_eq!(
+            memory,
+            format!(
+                "{}\n\n{note}\n\n{heading}\n\n### Memory — tarn\n\n### Values\n\
+                 SYNTHETIC-RECOVERED line one.\nline two",
+                before.trim_end()
+            )
+            .trim_start()
+        );
+        assert_eq!(
+            evolution_notes(&agent),
+            [memory_restore::evolution_line(RestoreChoice::Append, today)]
+        );
+        let ledger = restore_ledger(&h).await;
+        assert!(ledger.appended_at.is_some() && !ledger.append_pending());
+
+        // The next session: nothing asked, nothing appended, nothing shown.
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert!(next.recovered.is_none(), "not needed, not read");
+        assert_eq!(
+            next.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        next.on_teardown().await.unwrap();
+        assert_eq!(next.state().memory.content, memory);
+
+        // The record of the append lost: the section already in the memory
+        // stops a second one, and the record is put right.
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        let mut lost = restore_ledger(&h).await;
+        lost.appended_at = None;
+        lost.save(&dir).await.unwrap();
+        let mut again = next_session(&h, &next);
+        again.on_init().await.unwrap();
+        again.handle(reply("done")).await.unwrap();
+        again.on_teardown().await.unwrap();
+        assert_eq!(again.state().memory.content, memory, "appended once");
+        assert!(restore_ledger(&h).await.appended_at.is_some());
+    }
+
+    /// No answer: asked again at a later session, then no more — the
+    /// siblings' cap.
+    #[tokio::test]
+    async fn restore_unanswered_is_asked_again_then_not() {
+        let h = Harness::with_restore("restore-miss", &["tarn"]);
+        for _ in 0..ledger_misses() {
+            let mut agent = seated(&h).await;
+            // A turn of text that isn't an answer, then the reminder ignored.
+            assert_eq!(
+                agent.handle(reply("Let me think.")).await.unwrap(),
+                Control::Continue
+            );
+            assert_eq!(
+                agent.handle(reply("Still thinking.")).await.unwrap(),
+                Control::Done(Outcome::Complete)
+            );
+            agent.on_teardown().await.unwrap();
+            assert!(evolution_notes(&agent).is_empty());
+        }
+        let ledger = restore_ledger(&h).await;
+        assert_eq!(ledger.asks.len(), ledger_misses());
+        assert!(
+            ledger
+                .asks
+                .iter()
+                .all(|a| matches!(a.outcome, RestoreOutcome::NoAnswer { .. }))
+        );
+        assert!(!asks(&h, OTHER).await, "capped");
+    }
+
+    fn ledger_misses() -> usize {
+        memory_restore::ledger::MAX_MISSES as usize
+    }
+
+    /// Beside the cadence offer: both in one question, each answered and
+    /// recorded in its own ledger.
+    #[tokio::test]
+    async fn restore_is_put_beside_the_cadence_offer() {
+        let mut h = Harness::with_restore("restore-cadence", &["tarn"]);
+        let rt = Arc::get_mut(&mut h.rt).unwrap();
+        rt.cadence = Some(crate::consent::cadence::CadenceOffer::for_agents(
+            &["tarn"],
+            5,
+        ));
+        let mut agent = seated(&h).await;
+        let q = last_user_text(&agent);
+        assert!(q.starts_with("Two more questions"), "{q}");
+        assert!(q.contains("(`cadence` and `memory_restore`)"), "{q}");
+        let both = calls(vec![
+            call_block("toolu_1", "cadence", "keep_daily", "", ""),
+            call_block("toolu_2", "memory_restore", "decline", "", ""),
+        ]);
+        assert_eq!(
+            agent.handle(both).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(evolution_notes(&agent).len(), 2);
+        assert_eq!(
+            restore_ledger(&h).await.choice(),
+            Some(RestoreChoice::Decline)
+        );
+        assert_eq!(
+            cadence_ledger(&h).await.choice(),
+            Some(CadenceChoice::KeepDaily)
+        );
+    }
+
     // --- The cadence offer ------------------------------------------------
 
     use crate::consent::cadence::ledger::{CadenceLedger, CadenceOutcome as CO};
+    use crate::consent::memory_restore::ledger::RestoreOutcome;
 
     async fn cadence_ledger(h: &Harness) -> CadenceLedger {
         CadenceLedger::load(&h.rt.state_dir.join(h.id.to_string()))

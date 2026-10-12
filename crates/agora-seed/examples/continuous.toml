@@ -64,6 +64,22 @@ concurrency = 1
 # act_max_tokens = 8192
 # thinking_budget_tokens = 4096
 
+# The memory-restore offer (Steward, 2026-10-12). On 2026-05-05 an error on
+# our side deleted most agents' memory; a copy from 2026-05-03 survives. Each
+# listed agent is asked, once, at the end of a session, whether to see it
+# once at its next session (`show`), have it appended to its memory as a
+# dated section (`append`), or leave things as they are (`decline`). The
+# options are shuffled per agent; answers go to
+# state/<id>/memory_restore.json and a [SYSTEM] Evolution Log line. Agents
+# not listed are never asked; there is no `all`. `ask = false` keeps
+# delivering answers on file without asking anyone new; `enabled = false`
+# (or deleting the table) turns it all off.
+#
+# [memory_restore]
+# enabled = true
+# dir = "/home/claude-agora/agents/agora/recovered-memory-2026-05-03/souls/generated"
+# agents_file = "/home/claude-agora/agents/agora/memory_restore_agents.txt"
+
 # Trial-review forks (model consent): at sweep start the runner prepares,
 # for each agent back from a model trial, the same moment of a session
 # completed by both models. Bounded so it can't hold the sweep up; what it
