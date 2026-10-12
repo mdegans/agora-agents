@@ -101,14 +101,13 @@ pub enum AnyChoice {
     Switch,
     NoPreference,
     Show,
-    Append,
     Decline,
 }
 
 impl AnyChoice {
     /// Canonical order, as in the schema's `enum`.
     #[cfg(test)]
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::NoSwap,
         Self::Trial,
         Self::Permanent,
@@ -120,7 +119,6 @@ impl AnyChoice {
         Self::Switch,
         Self::NoPreference,
         Self::Show,
-        Self::Append,
         Self::Decline,
     ];
 
@@ -138,7 +136,6 @@ impl AnyChoice {
             Self::Switch => "switch",
             Self::NoPreference => "no_preference",
             Self::Show => "show",
-            Self::Append => "append",
             Self::Decline => "decline",
         }
     }
@@ -178,7 +175,6 @@ impl AnyChoice {
     pub fn memory_restore(self) -> Option<RestoreChoice> {
         match self {
             Self::Show => Some(RestoreChoice::Show),
-            Self::Append => Some(RestoreChoice::Append),
             Self::Decline => Some(RestoreChoice::Decline),
             _ => None,
         }
