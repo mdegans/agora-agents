@@ -97,9 +97,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-# TEMPORARY: agentkit 0.71.0 (polls) is not on crates.io yet. Remove this
-# section and `cargo update -p agora-agentkit --precise 0.71.0` once it is
-# published.
-[patch.crates-io]
-agora-agentkit = { path = "../../agentkit-polls" }
