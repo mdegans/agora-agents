@@ -1416,15 +1416,18 @@ async fn run(held: &mut Held) -> Result<()> {
             tracing::warn!(agent = %name, "`[cadence_consent].agents` names no loaded agent");
         }
     }
-    let restore_offer = match &config.memory_restore {
-        Some(c) => c.resolve()?,
-        None => None,
-    };
+    // Never fatal: a table that can't be used is logged, alerted, and the
+    // run goes on without the offer.
+    let restore_offer = config
+        .memory_restore
+        .as_ref()
+        .and_then(|c| consent::memory_restore::resolve_or_disable(c, &held.alerts));
     if let Some(offer) = &restore_offer {
         for name in unknown_names(offer.names(), &pool) {
-            tracing::warn!(agent = %name, "`[memory_restore].agents` names no loaded agent");
+            tracing::warn!(agent = %name, "`[memory_restore]` agents_file names no loaded agent");
         }
     }
+    let restore_on = restore_offer.is_some();
     if let Some(offer) = &role_offer {
         for name in unknown_names(offer.names(), &pool) {
             tracing::warn!(agent = %name, "`[role_consent].agents` names no loaded agent");
@@ -1683,7 +1686,19 @@ async fn run(held: &mut Held) -> Result<()> {
     }
 
     tracing::info!(agents = total, reactors = labels.len(), "starting run");
+    let run_started = chrono::Utc::now();
     let report = orchestrator.run().await;
+    if restore_on {
+        // A showing marked completed whose state the reactor then couldn't
+        // save lost its memory update: it is shown again.
+        let unsaved = report
+            .report
+            .values()
+            .flatten()
+            .flat_map(|r| r.unsaved.keys().copied());
+        consent::memory_restore::reopen_unsaved(&data_dir.join("state"), unsaved, run_started)
+            .await;
+    }
     for (id, result) in &report.report {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
         println!("== {label}");
@@ -2267,7 +2282,7 @@ mod agent_selection_tests {
             ))
             .unwrap();
             let c = config.memory_restore.expect("present");
-            assert!(c.enabled && c.ask && c.agents_file.is_some());
+            assert!(c.enabled && c.ask && c.thread.is_some() && c.show_sessions_max == 3);
         }
     }
 

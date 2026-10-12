@@ -112,6 +112,11 @@ pub struct Showing {
     /// When it was seated.
     pub at: DateTime<Utc>,
     pub outcome: ShowOutcome,
+    /// The session's prompt dump (the `prompt logged` event's
+    /// `prompt_sha256`), once torn down. **It holds the recovered text**:
+    /// never a fork or replay source, and not to be shared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_sha256: Option<String>,
 }
 
 /// How a showing session ended.
@@ -221,13 +226,32 @@ impl RestoreLedger {
         self.showings.push(Showing {
             at,
             outcome: ShowOutcome::Interrupted,
+            prompt_sha256: None,
         });
     }
 
-    /// The latest showing's session completed with its memory update.
-    pub fn complete_showing(&mut self) {
+    /// The latest showing's session was torn down: its dump, and whether it
+    /// completed with its memory update.
+    pub fn end_showing(&mut self, completed: bool, prompt_sha256: Option<String>) {
         if let Some(last) = self.showings.last_mut() {
-            last.outcome = ShowOutcome::Completed;
+            if completed {
+                last.outcome = ShowOutcome::Completed;
+            }
+            last.prompt_sha256 = prompt_sha256;
+        }
+    }
+
+    /// The reactor couldn't save the state of a session that completed a
+    /// showing at or after `since`: its memory update is lost, so the
+    /// showing counts as interrupted and it is shown again. Whether
+    /// anything changed.
+    pub fn reopen_since(&mut self, since: DateTime<Utc>) -> bool {
+        match self.showings.last_mut() {
+            Some(last) if last.at >= since && last.outcome == ShowOutcome::Completed => {
+                last.outcome = ShowOutcome::Interrupted;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -331,12 +355,18 @@ mod tests {
         l.record(ask(answered(RestoreChoice::Show)));
         l.begin_showing(Utc::now());
         assert!(l.show_pending(3), "interrupted: shown again");
-        l.begin_showing(Utc::now());
-        l.complete_showing();
+        let at = Utc::now();
+        l.begin_showing(at);
+        l.end_showing(true, Some("abc".into()));
         assert!(!l.show_pending(3), "completed: done");
+        assert_eq!(l.showings[1].prompt_sha256.as_deref(), Some("abc"));
+        // Its state not saved: shown again; an older showing is left alone.
+        assert!(!l.reopen_since(at + chrono::Duration::seconds(1)));
+        assert!(l.reopen_since(at));
+        assert!(l.show_pending(3));
         assert_eq!(
             l.showings.iter().map(|s| s.outcome).collect::<Vec<_>>(),
-            [ShowOutcome::Interrupted, ShowOutcome::Completed]
+            [ShowOutcome::Interrupted, ShowOutcome::Interrupted]
         );
 
         let mut l = RestoreLedger::default();
