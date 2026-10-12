@@ -34,7 +34,10 @@
 //!   wrapper at the same point.
 //! - [`cadence`] — another sibling (`[cadence_consent]`): a daily agent is
 //!   asked whether it would rather have twice the rounds every other day.
-//! - [`offers`] — `answer_offer`, the strict tool all three are answered
+//! - [`memory_restore`] — another sibling (`[memory_restore]`): an agent
+//!   whose memory was deleted on 2026-05-05 is offered the copy recovered
+//!   from 2026-05-03, to see once, append, or decline.
+//! - [`offers`] — `answer_offer`, the strict tool all four are answered
 //!   with: every offer due at a session's close is seated in one question
 //!   turn, each under a heading naming its key.
 //!
@@ -63,6 +66,7 @@ pub mod cadence;
 pub mod comparison;
 pub mod forks;
 pub mod ledger;
+pub mod memory_restore;
 pub mod offers;
 pub mod prompt;
 pub mod queue;
@@ -186,6 +190,9 @@ pub struct ConsentRuntime {
     /// The cadence offer (`[cadence_consent]`); off unless
     /// [`Self::with_cadence_offer`].
     pub cadence: Option<cadence::CadenceOffer>,
+    /// The memory-restore offer (`[memory_restore]`); off unless
+    /// [`Self::with_memory_restore_offer`].
+    pub memory_restore: Option<memory_restore::RestoreOffer>,
 }
 
 impl ConsentRuntime {
@@ -212,6 +219,7 @@ impl ConsentRuntime {
             alerts: crate::alerts::Alerter::off(),
             role: None,
             cadence: None,
+            memory_restore: None,
         })
     }
 
@@ -230,6 +238,16 @@ impl ConsentRuntime {
     /// Put the cadence offer ([`cadence`]) to the agents it admits.
     pub fn with_cadence_offer(mut self, offer: Option<cadence::CadenceOffer>) -> Self {
         self.cadence = offer;
+        self
+    }
+
+    /// Put the memory-restore offer ([`memory_restore`]) to the agents it
+    /// lists.
+    pub fn with_memory_restore_offer(
+        mut self,
+        offer: Option<memory_restore::RestoreOffer>,
+    ) -> Self {
+        self.memory_restore = offer;
         self
     }
 }
