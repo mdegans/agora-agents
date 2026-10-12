@@ -36,7 +36,7 @@
 //!   asked whether it would rather have twice the rounds every other day.
 //! - [`memory_restore`] — another sibling (`[memory_restore]`): an agent
 //!   whose memory was deleted on 2026-05-05 is offered the copy recovered
-//!   from 2026-05-03, to see once, append, or decline.
+//!   from 2026-05-03, to see it (`show`) or not (`decline`).
 //! - [`offers`] — `answer_offer`, the strict tool all four are answered
 //!   with: every offer due at a session's close is seated in one question
 //!   turn, each under a heading naming its key.

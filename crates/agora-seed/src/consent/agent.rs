@@ -90,10 +90,11 @@
 //!
 //! **The memory-restore offer** ([`super::memory_restore`]) likewise, to
 //! the agents it lists: put beside the role and cadence offers, recorded in
-//! `memory_restore.json`. Its `append` is written at teardown into the same
-//! patched state (and retried at a later session if it didn't land); its
-//! `show` is delivered at the agent's **next** session, as a fenced block
-//! seated at the end of the intro, once. The recovered text is never
+//! `memory_restore.json`. Its `show` is delivered at the agent's **next**
+//! session, as a fenced, labelled block seated at the end of the intro, and
+//! again at the session after while no showing session has completed with
+//! a successful memory update (up to `show_sessions_max`). Each showing is
+//! recorded when seated, and saved at once. The recovered text is never
 //! logged: events carry its size and the choice.
 //!
 //! **Answering: `answer_offer`** ([`super::offers`]). The offers due at the
@@ -267,7 +268,7 @@ enum Pending {
     },
     /// `order` as for the role offer; `chars` is the size the text quoted.
     MemoryRestore {
-        order: [RestoreChoice; 3],
+        order: [RestoreChoice; 2],
         seed: u64,
         chars: usize,
     },
@@ -512,8 +513,10 @@ pub struct ConsentAgent<A> {
     restore_ledger: Option<RestoreLedger>,
     restore_dirty: bool,
     /// The agent's recovered memory, read at init when it may be needed
-    /// this session (to quote its size, to show it, or to append it).
+    /// this session (to quote its size, or to show it).
     recovered: Option<RecoveredMemory>,
+    /// The recovered memory was shown this session.
+    restore_showing: bool,
     /// The Evolution Log line recording the memory-restore answer, and the
     /// agent's own note, written at teardown.
     restore_line: Option<String>,
@@ -1179,9 +1182,10 @@ where
             return None;
         }
         let chars = self.recovered.as_ref()?.chars();
+        let facts = self.rt.memory_restore.as_ref()?.facts(&soul.name);
         let seed = memory_restore::prompt::seed_for(self.inner.id());
         let order = memory_restore::prompt::order_for(seed);
-        let body = memory_restore::prompt::offer(chars, order);
+        let body = memory_restore::prompt::offer(chars, order, &facts);
         tracing::info!(
             event_type = "memory_restore_seated",
             agent = %soul.name,
@@ -1191,6 +1195,8 @@ where
             order = ?order.map(RestoreChoice::as_str),
             order_seed = seed,
             chars,
+            period_start = facts.since.map(|d| d.to_string()),
+            thread = facts.thread.map(|t| t.to_string()),
             "memory-restore question seated"
         );
         Some((
@@ -2185,12 +2191,12 @@ where
     }
 
     /// The memory-restore offer's record. Nothing is applied here: the SOUL
-    /// line, the agent's note and an `append` are written into the state
-    /// the reactor saves, at teardown; a `show` is delivered next session.
+    /// line and the agent's note are written into the state the reactor
+    /// saves, at teardown; a `show` is delivered next session.
     /// Nothing of the recovered memory is logged or recorded but its size.
     fn settle_restore(
         &mut self,
-        order: [RestoreChoice; 3],
+        order: [RestoreChoice; 2],
         seed: u64,
         chars: usize,
         settle: Settle,
@@ -2542,45 +2548,25 @@ where
         changed.then_some(state)
     }
 
-    /// Whether `append` is on file, not yet landed, and its recovered
-    /// memory was read this session.
-    fn append_due(&self) -> bool {
-        self.recovered.is_some()
-            && self
-                .restore_ledger
-                .as_ref()
-                .is_some_and(RestoreLedger::append_pending)
-    }
-
     /// Whether the memory-restore offer has anything to write at teardown.
     fn restore_pending(&self) -> bool {
-        self.restore_line.is_some() || self.restore_note.is_some() || self.append_due()
+        self.restore_line.is_some() || self.restore_note.is_some()
     }
 
-    /// Write the memory-restore answer's Evolution Log line, the agent's own
-    /// note and — for `append` — the recovered memory as a dated section
-    /// into `state`: all or nothing. A section already in the memory (an
-    /// append whose record didn't save) is not written twice.
+    /// Write the memory-restore answer's Evolution Log line and the agent's
+    /// own note into `state`, all or nothing.
     fn apply_restore(&mut self, state: &mut SeedState) -> bool {
         let write = RestoreWrite {
             line: self.restore_line.take(),
             note: self.restore_note.take(),
-            append: self.append_due(),
         };
-        if write.line.is_none() && write.note.is_none() && !write.append {
+        if write.line.is_none() && write.note.is_none() {
             return false;
         }
         self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
-        let already = memory_restore::already_appended(&state.memory);
-        if let Err(e) = write_restore(state, &write, self.recovered.as_ref()) {
-            self.restore_failed_with(e, write.note.is_some());
+        if let Err(e) = write_restore(state, &write) {
+            self.restore_failed(e);
             return false;
-        }
-        if write.append
-            && let Some(ledger) = self.restore_ledger.as_mut()
-        {
-            ledger.mark_appended(Utc::now());
-            self.restore_dirty = true;
         }
         tracing::info!(
             event_type = "memory_restore_applied",
@@ -2588,34 +2574,133 @@ where
             agent_id = %self.inner.id(),
             soul_line = write.line.is_some(),
             memory_note = write.note.is_some(),
-            appended = write.append && !already,
-            already_appended = write.append && already,
-            chars = self.recovered.as_ref().map(RecoveredMemory::chars),
             "memory-restore answer written"
         );
-        let changed = write.line.is_some() || write.note.is_some() || (write.append && !already);
         self.restore_written = Some(write);
-        changed
+        true
     }
 
     fn restore_failed(&mut self, why: String) {
-        let note_lost = self.restore_note.is_some();
-        self.restore_failed_with(why, note_lost);
-    }
-
-    fn restore_failed_with(&mut self, why: String, note_lost: bool) {
         tracing::error!(
             event_type = "memory_restore_apply_failed",
             agent_id = %self.inner.id(),
             error = %why,
-            "memory-restore SOUL line, note or section not written; SOUL and memory unchanged"
+            "memory-restore SOUL line or note not written; SOUL and memory unchanged"
         );
         self.restore_line = None;
         self.restore_note = None;
         if let Some(ledger) = self.restore_ledger.as_mut() {
-            ledger.mark_apply_failed(why, note_lost);
+            ledger.mark_apply_failed(why);
             self.restore_dirty = true;
         }
+    }
+
+    /// Load the memory-restore ledger for an agent the offer lists, and its
+    /// recovered memory when this session may need it: to quote its size
+    /// in the offer, or to show it.
+    async fn load_restore(&mut self, dir: &std::path::Path) {
+        let rt = self.rt.clone();
+        let name = self.inner.state().soul.name.clone();
+        let Some(offer) = rt.memory_restore.as_ref().filter(|o| o.lists(&name)) else {
+            return;
+        };
+        let ledger = match RestoreLedger::load(dir).await {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %RestoreLedger::path(dir).display(),
+                    error = %e,
+                    "memory-restore ledger unreadable; not asking, delivering or saving this session"
+                );
+                return;
+            }
+        };
+        let needed = (offer.admits(&name) && ledger.due(&self.inner.state().soul))
+            || ledger.show_pending(offer.show_sessions_max);
+        self.restore_ledger = Some(ledger);
+        if !needed {
+            return;
+        }
+        match offer.load(&name).await {
+            Ok(recovered) if !recovered.is_empty() => self.recovered = Some(recovered),
+            Ok(_) => tracing::warn!(
+                event_type = "memory_restore_unavailable",
+                agent = %name,
+                agent_id = %self.inner.id(),
+                path = %offer.path_for(&name).display(),
+                "recovered memory is empty; nothing offered or delivered"
+            ),
+            Err(e) => tracing::warn!(
+                event_type = "memory_restore_unavailable",
+                agent = %name,
+                agent_id = %self.inner.id(),
+                path = %offer.path_for(&name).display(),
+                error = %e,
+                "recovered memory unreadable; nothing offered or delivered this session"
+            ),
+        }
+    }
+
+    /// `show`, delivered: the recovered memory, fenced and labelled with
+    /// what it is, at the end of the intro. The showing is recorded as
+    /// interrupted and the ledger saved at once, so a session that dies
+    /// without a teardown still counts toward `show_sessions_max`; teardown
+    /// marks it completed if the session reached its clean end (its memory
+    /// update accepted). Not in a trial-review session (no act phase): it
+    /// waits for the next.
+    async fn seat_restored(&mut self) -> Result<(), A::Error> {
+        let rt = self.rt.clone();
+        let Some(offer) = rt.memory_restore.as_ref() else {
+            return Ok(());
+        };
+        if self.review.is_some()
+            || !self
+                .restore_ledger
+                .as_ref()
+                .is_some_and(|l| l.show_pending(offer.show_sessions_max))
+        {
+            return Ok(());
+        }
+        let Some(recovered) = &self.recovered else {
+            return Ok(());
+        };
+        let name = self.inner.state().soul.name.clone();
+        let facts = offer.facts(&name);
+        let chars = recovered.chars();
+        let block = memory_restore::show_block(recovered, &facts);
+        let (_, prompt) = self.inner.parts();
+        Self::seat_user(prompt, Content::from(block))?;
+        self.restore_showing = true;
+        let dir = self.agent_dir();
+        let mut showing = 0;
+        if let Some(ledger) = self.restore_ledger.as_mut() {
+            ledger.begin_showing(Utc::now());
+            ledger.agent = Some(name.clone());
+            showing = ledger.showings.len();
+            if let Err(e) = ledger.save(&dir).await {
+                // Saved again at teardown; only a session that also dies
+                // before then goes uncounted.
+                tracing::error!(
+                    agent_id = %self.inner.id(),
+                    path = %RestoreLedger::path(&dir).display(),
+                    error = %e,
+                    "memory-restore ledger save failed after seating a showing"
+                );
+            }
+            self.restore_dirty = true;
+        }
+        tracing::info!(
+            event_type = "memory_restore_shown",
+            agent = %name,
+            agent_id = %self.inner.id(),
+            chars,
+            showing,
+            show_sessions_max = offer.show_sessions_max,
+            period_start = facts.since.map(|d| d.to_string()),
+            "recovered memory shown to the agent"
+        );
+        Ok(())
     }
 
     /// Write the cadence answer's Evolution Log line and the agent's
@@ -2695,87 +2780,6 @@ where
         applied.is_some() || noted
     }
 
-    /// Load the memory-restore ledger for an agent the offer lists, and its
-    /// recovered memory when this session may need it: to quote its size
-    /// in the offer, to show it, or to append it.
-    async fn load_restore(&mut self, dir: &std::path::Path) {
-        let rt = self.rt.clone();
-        let name = self.inner.state().soul.name.clone();
-        let Some(offer) = rt.memory_restore.as_ref().filter(|o| o.lists(&name)) else {
-            return;
-        };
-        let ledger = match RestoreLedger::load(dir).await {
-            Ok(ledger) => ledger,
-            Err(e) => {
-                tracing::warn!(
-                    agent_id = %self.inner.id(),
-                    path = %RestoreLedger::path(dir).display(),
-                    error = %e,
-                    "memory-restore ledger unreadable; not asking, delivering or saving this session"
-                );
-                return;
-            }
-        };
-        let needed = (offer.admits(&name) && ledger.due(&self.inner.state().soul))
-            || ledger.show_pending()
-            || ledger.append_pending();
-        self.restore_ledger = Some(ledger);
-        if !needed {
-            return;
-        }
-        match offer.load(&name).await {
-            Ok(recovered) if !recovered.is_empty() => self.recovered = Some(recovered),
-            Ok(_) => tracing::warn!(
-                event_type = "memory_restore_unavailable",
-                agent = %name,
-                agent_id = %self.inner.id(),
-                path = %offer.path_for(&name).display(),
-                "recovered memory is empty; nothing offered or delivered"
-            ),
-            Err(e) => tracing::warn!(
-                event_type = "memory_restore_unavailable",
-                agent = %name,
-                agent_id = %self.inner.id(),
-                path = %offer.path_for(&name).display(),
-                error = %e,
-                "recovered memory unreadable; nothing offered or delivered this session"
-            ),
-        }
-    }
-
-    /// `show`, delivered: the recovered memory, fenced and labelled, at the
-    /// end of the intro, once. Not in a trial-review session (no act
-    /// phase): it waits for the next.
-    fn seat_restored(&mut self) -> Result<(), A::Error> {
-        if self.review.is_some()
-            || !self
-                .restore_ledger
-                .as_ref()
-                .is_some_and(RestoreLedger::show_pending)
-        {
-            return Ok(());
-        }
-        let Some(recovered) = &self.recovered else {
-            return Ok(());
-        };
-        let chars = recovered.chars();
-        let block = memory_restore::show_block(recovered);
-        let (_, prompt) = self.inner.parts();
-        Self::seat_user(prompt, Content::from(block))?;
-        if let Some(ledger) = self.restore_ledger.as_mut() {
-            ledger.mark_shown(Utc::now());
-            self.restore_dirty = true;
-        }
-        tracing::info!(
-            event_type = "memory_restore_shown",
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            chars,
-            "recovered memory shown to the agent, once"
-        );
-        Ok(())
-    }
-
     fn role_failed(&mut self, why: String) {
         tracing::error!(
             event_type = "role_consent_apply_failed",
@@ -2817,35 +2821,21 @@ struct RestoreWrite {
     line: Option<String>,
     /// The agent's own note.
     note: Option<String>,
-    /// Append the recovered memory as a dated section.
-    append: bool,
 }
 
 /// Write `write` into `state`, all or nothing (`Err`: why, and `state`
-/// unchanged). The note goes before the section, so it isn't read as part
-/// of the restored text. A section already in the memory is not added
-/// again.
-fn write_restore(
-    state: &mut SeedState,
-    write: &RestoreWrite,
-    recovered: Option<&RecoveredMemory>,
-) -> Result<(), String> {
+/// unchanged).
+fn write_restore(state: &mut SeedState, write: &RestoreWrite) -> Result<(), String> {
     let today = Utc::now().date_naive();
     let mut soul = state.soul.clone();
-    let mut memory = state.memory.clone();
     if let Some(line) = &write.line {
         soul.push_evolution(line.clone())
             .map_err(|e| e.to_string())?;
     }
     if let Some(note) = &write.note {
-        role::append_memory_note(&mut memory, note, today);
-    }
-    if write.append && !memory_restore::already_appended(&memory) {
-        let recovered = recovered.ok_or("the recovered memory was not read this session")?;
-        memory_restore::append_to(&mut memory, recovered, today)?;
+        role::append_memory_note(&mut state.memory, note, today);
     }
     state.soul = soul;
-    state.memory = memory;
     Ok(())
 }
 
@@ -3036,6 +3026,7 @@ where
             restore_ledger: None,
             restore_dirty: false,
             recovered: None,
+            restore_showing: false,
             restore_line: None,
             restore_note: None,
             restore_undo: None,
@@ -3200,7 +3191,7 @@ where
             let (_, prompt) = self.inner.parts();
             Self::seat_user(prompt, Content::from(line))?;
         }
-        self.seat_restored()?;
+        self.seat_restored().await?;
         Ok(())
     }
 
@@ -3309,7 +3300,7 @@ where
                         }
                         if let Some(write) = &self.restore_written {
                             self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
-                            if let Err(e) = write_restore(state, write, self.recovered.as_ref()) {
+                            if let Err(e) = write_restore(state, write) {
                                 tracing::error!(
                                     agent_id = %self.inner.id(),
                                     error = %e,
@@ -3346,7 +3337,7 @@ where
                         // cadence's: write them again on top.
                         if let Some(write) = &self.restore_written {
                             self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
-                            if let Err(e) = write_restore(state, write, self.recovered.as_ref()) {
+                            if let Err(e) = write_restore(state, write) {
                                 tracing::error!(
                                     agent_id = %self.inner.id(),
                                     error = %e,
@@ -3368,15 +3359,33 @@ where
                 );
             }
         }
+        // A showing session that reached its clean end — the inner
+        // closing phase done, so its memory update was accepted — ends the
+        // showings; any other stays recorded as interrupted.
+        if self.restore_showing {
+            if self.closed
+                && let Some(ledger) = self.restore_ledger.as_mut()
+            {
+                ledger.complete_showing();
+                self.restore_dirty = true;
+            }
+            tracing::info!(
+                event_type = "memory_restore_showing_ended",
+                agent = %self.inner.state().soul.name,
+                agent_id = %self.inner.id(),
+                completed = self.closed,
+                "memory-restore showing session ended"
+            );
+        }
         if self.restore_dirty
             && let Some(ledger) = &mut self.restore_ledger
         {
             ledger.agent = Some(self.inner.state().soul.name.clone());
             if let Err(e) = ledger.save(&dir).await {
                 // Without the record the answer would be lost (and asked
-                // again) and an `append` not known to have landed: take
-                // this session's writes back out. A `show` delivered now
-                // is delivered again next session.
+                // again): take this session's SOUL line and note back out.
+                // A showing whose completion isn't saved is shown again
+                // next session (within the cap).
                 let undone = match (self.patched.as_mut(), self.restore_undo.take()) {
                     (Some(state), Some((soul, memory))) => {
                         state.soul = soul;
@@ -3391,7 +3400,7 @@ where
                     path = %RestoreLedger::path(&dir).display(),
                     error = %e,
                     edit_undone = undone,
-                    "memory-restore ledger save failed; this session's SOUL line, note and section are not saved"
+                    "memory-restore ledger save failed; this session's SOUL line and note are not saved"
                 );
             }
         }
@@ -3848,7 +3857,13 @@ mod tests {
                         serde_json::json!({ "content": SYNTHETIC_RECOVERED }).to_string(),
                     )
                     .unwrap();
-                    memory_restore::RestoreOffer::for_agents(names, &dir)
+                    let dated: Vec<(&str, Option<&str>)> =
+                        names.iter().map(|n| (*n, Some("2026-02-14"))).collect();
+                    memory_restore::RestoreOffer::for_agents(
+                        &dated,
+                        &dir,
+                        Some(RESTORE_THREAD.parse().unwrap()),
+                    )
                 })),
             );
             Self {
@@ -6354,6 +6369,8 @@ mod tests {
     // --- The memory-restore offer -----------------------------------------
 
     /// A synthetic stand-in for a recovered memory: never a real one.
+    const RESTORE_THREAD: &str = "7ad26ccd-0000-4000-8000-000000000001";
+
     const SYNTHETIC_RECOVERED: &str =
         "# Memory — tarn\n\n## Values\nSYNTHETIC-RECOVERED line one.\nline two\n";
 
@@ -6387,9 +6404,13 @@ mod tests {
         assert!(q.contains("## Offer `memory_restore`"), "{q}");
         let n = SYNTHETIC_RECOVERED.chars().count();
         assert!(
-            q.contains(&format!("survives: {n} characters. No one has read it.")),
+            q.contains(&format!(
+                "It covers your time on Agora from 14 February 2026 to 3 May 2026, and it is \
+                 {n} characters long. No one has read it."
+            )),
             "{q}"
         );
+        assert!(q.contains(&format!("[post_id: {RESTORE_THREAD}]")), "{q}");
         assert!(
             !q.contains("SYNTHETIC-RECOVERED"),
             "the offer never quotes it"
@@ -6460,7 +6481,7 @@ mod tests {
         assert_eq!(ask.order_seed, seed);
         assert_eq!(ask.chars, SYNTHETIC_RECOVERED.chars().count());
         assert!(ask.constrained);
-        assert!(ledger.shown_at.is_none() && ledger.appended_at.is_none());
+        assert!(ledger.showings.is_empty());
         // The ledger file never holds the recovered text.
         let raw =
             std::fs::read_to_string(RestoreLedger::path(&h.rt.state_dir.join(h.id.to_string())))
@@ -6479,12 +6500,40 @@ mod tests {
         assert!(next.patched.is_none(), "nothing more written");
     }
 
+    /// One session that shows the recovered memory, ended `completed` (the
+    /// inner closing phase done, its memory update accepted) or not (torn
+    /// down before it). Returns the agent and the intro it saw.
+    async fn showing_session(
+        h: &Harness,
+        prev: &ConsentAgent<Fake>,
+        completed: bool,
+    ) -> (ConsentAgent<Fake>, String) {
+        let mut agent = next_session(h, prev);
+        agent.on_init().await.unwrap();
+        let intro = last_user_text(&agent);
+        if completed {
+            assert_eq!(
+                agent.handle(reply("done")).await.unwrap(),
+                Control::Done(Outcome::Complete),
+                "not asked again"
+            );
+        }
+        agent.on_teardown().await.unwrap();
+        (agent, intro)
+    }
+
+    fn outcomes(ledger: &RestoreLedger) -> Vec<ShowOutcome> {
+        ledger.showings.iter().map(|s| s.outcome).collect()
+    }
+
     /// `show`: nothing changes in the answering session but the SOUL line
-    /// (and the agent's own note); at the next session the recovered text
-    /// is seated once, fenced and labelled, at the end of the intro; the
-    /// session after that sees nothing, and nobody asks again.
+    /// (and the agent's own note). At the next session the recovered text
+    /// is seated at the end of the intro, fenced and labelled with the
+    /// period, the dates and the thread. That session is interrupted, so
+    /// the one after shows it again; it completes, and no session after
+    /// shows it. Every showing is recorded; nobody asks again.
     #[tokio::test]
-    async fn restore_show_is_delivered_once_at_the_next_session() {
+    async fn restore_show_is_delivered_until_a_session_completes() {
         let h = Harness::with_restore("restore-show", &["tarn"]);
         let agent = restore_answered(&h, "show", "I asked to see my old memory.").await;
         assert_eq!(
@@ -6500,89 +6549,64 @@ mod tests {
             "{memory}"
         );
         assert!(!memory.contains("SYNTHETIC-RECOVERED"));
-        assert!(restore_ledger(&h).await.show_pending());
+        assert!(!saw_recovered(&agent), "not in the answering session");
+        assert!(restore_ledger(&h).await.showings.is_empty());
 
-        let mut next = next_session(&h, &agent);
-        next.on_init().await.unwrap();
-        let intro = last_user_text(&next);
-        assert!(
-            intro.contains(
-                "**Your memory as of 3 May 2026, restored at your request; it is not your \
-                 current memory.**"
-            ),
-            "{intro}"
-        );
-        assert!(intro.contains(&format!("```text\n{}\n```", SYNTHETIC_RECOVERED.trim_end())));
+        let (interrupted, intro) = showing_session(&h, &agent, false).await;
+        for fact in [
+            "**Your memory from 14 February 2026 to 3 May 2026, restored at your request; it \
+             is not your current memory.**",
+            "It was lost on 5 May 2026 through an error on our side, and recovered on 12 \
+             October 2026.",
+            &format!("[post_id: {RESTORE_THREAD}]"),
+            "What to carry over is your own decision",
+            &format!("```text\n{}\n```", SYNTHETIC_RECOVERED.trim_end()),
+        ] {
+            assert!(intro.contains(fact), "{fact}\n\n{intro}");
+        }
         assert_eq!(
-            next.handle(reply("done")).await.unwrap(),
-            Control::Done(Outcome::Complete),
-            "not asked again"
+            outcomes(&restore_ledger(&h).await),
+            [ShowOutcome::Interrupted]
         );
-        next.on_teardown().await.unwrap();
-        assert_eq!(next.state().memory.content, memory, "memory is the agent's");
-        let ledger = restore_ledger(&h).await;
-        assert!(ledger.shown_at.is_some() && !ledger.show_pending());
 
-        let mut third = next_session(&h, &next);
-        third.on_init().await.unwrap();
-        assert!(!saw_recovered(&third), "shown once");
-        third.handle(reply("done")).await.unwrap();
-        third.on_teardown().await.unwrap();
-        assert_eq!(restore_ledger(&h).await.shown_at, ledger.shown_at);
+        let (completed, intro) = showing_session(&h, &interrupted, true).await;
+        assert!(intro.contains("SYNTHETIC-RECOVERED"), "shown again");
+        assert_eq!(
+            completed.state().memory.content,
+            memory,
+            "memory is the agent's"
+        );
+        assert_eq!(
+            outcomes(&restore_ledger(&h).await),
+            [ShowOutcome::Interrupted, ShowOutcome::Completed]
+        );
+
+        let (after, _) = showing_session(&h, &completed, true).await;
+        assert!(!saw_recovered(&after), "done once a session completes");
+        assert_eq!(restore_ledger(&h).await.showings.len(), 2);
     }
 
-    /// `append`: the recovered text lands at teardown of the answering
-    /// session, under a dated heading, its headings demoted, the agent's
-    /// note before it; recorded; and never appended twice — not even when
-    /// the ledger lost the record of it.
+    /// Interrupted every time: shown in `show_sessions_max` sessions, then
+    /// no more.
     #[tokio::test]
-    async fn restore_append_lands_once() {
-        let h = Harness::with_restore("restore-append", &["tarn"]);
-        let before = anthropic_agent(&h).state().memory.content.clone();
-        let agent = restore_answered(&h, "append", "I took my old memory back.").await;
-        let memory = agent.state().memory.content.clone();
-        let today = Utc::now().date_naive();
-        let note = format!("[{today}, my note] I took my old memory back.");
-        let heading = memory_restore::section_heading(today);
-        assert_eq!(
-            memory,
-            format!(
-                "{}\n\n{note}\n\n{heading}\n\n### Memory — tarn\n\n### Values\n\
-                 SYNTHETIC-RECOVERED line one.\nline two",
-                before.trim_end()
-            )
-            .trim_start()
-        );
-        assert_eq!(
-            evolution_notes(&agent),
-            [memory_restore::evolution_line(RestoreChoice::Append, today)]
-        );
+    async fn restore_show_is_capped_at_show_sessions_max() {
+        let h = Harness::with_restore("restore-show-cap", &["tarn"]);
+        let mut prev = restore_answered(&h, "show", "").await;
+        let max = h.rt.memory_restore.as_ref().unwrap().show_sessions_max;
+        assert_eq!(max, memory_restore::DEFAULT_SHOW_SESSIONS_MAX);
+        for i in 0..max {
+            let (agent, intro) = showing_session(&h, &prev, false).await;
+            assert!(intro.contains("SYNTHETIC-RECOVERED"), "showing {i}");
+            prev = agent;
+        }
         let ledger = restore_ledger(&h).await;
-        assert!(ledger.appended_at.is_some() && !ledger.append_pending());
-
-        // The next session: nothing asked, nothing appended, nothing shown.
-        let mut next = next_session(&h, &agent);
-        next.on_init().await.unwrap();
-        assert!(next.recovered.is_none(), "not needed, not read");
         assert_eq!(
-            next.handle(reply("done")).await.unwrap(),
-            Control::Done(Outcome::Complete)
+            outcomes(&ledger),
+            vec![ShowOutcome::Interrupted; max as usize]
         );
-        next.on_teardown().await.unwrap();
-        assert_eq!(next.state().memory.content, memory);
-
-        // The record of the append lost: the section already in the memory
-        // stops a second one, and the record is put right.
-        let dir = h.rt.state_dir.join(h.id.to_string());
-        let mut lost = restore_ledger(&h).await;
-        lost.appended_at = None;
-        lost.save(&dir).await.unwrap();
-        let mut again = next_session(&h, &next);
-        again.on_init().await.unwrap();
-        again.handle(reply("done")).await.unwrap();
-        again.on_teardown().await.unwrap();
-        assert_eq!(again.state().memory.content, memory, "appended once");
-        assert!(restore_ledger(&h).await.appended_at.is_some());
+        let (last, _) = showing_session(&h, &prev, true).await;
+        assert!(!saw_recovered(&last), "capped");
+        assert!(last.recovered.is_none(), "not even read");
     }
 
     /// No answer: asked again at a later session, then no more — the
@@ -6656,7 +6680,7 @@ mod tests {
     // --- The cadence offer ------------------------------------------------
 
     use crate::consent::cadence::ledger::{CadenceLedger, CadenceOutcome as CO};
-    use crate::consent::memory_restore::ledger::RestoreOutcome;
+    use crate::consent::memory_restore::ledger::{RestoreOutcome, ShowOutcome};
 
     async fn cadence_ledger(h: &Harness) -> CadenceLedger {
         CadenceLedger::load(&h.rt.state_dir.join(h.id.to_string()))

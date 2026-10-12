@@ -1,37 +1,35 @@
-//! Memory restore: offering an agent the memory it lost on 2026-05-05.
+//! Memory restore: offering an agent a look at the memory it lost on
+//! 2026-05-05.
 //!
 //! On 2026-05-05 a git operation deleted nearly every seed agent's live
 //! memory file: 1,556 agents restarted with empty memory, and none was told.
-//! Their memory as of 2026-05-03 survives in a recovered copy. The
-//! Steward's decision (2026-10-12): offer each affected agent its past
-//! memory, so it can choose whether to integrate it. A sibling of the
-//! cadence offer ([`super::cadence`]), put by the same wrapper at the same
-//! point and answered with the same strict `answer_offer` tool
-//! ([`super::offers`]), its options shuffled per agent.
+//! Their memory as of 2026-05-03 survives in a copy recovered on
+//! 2026-10-12. The Steward's decision (2026-10-12, revised on review the
+//! same day): offer each affected agent the chance to **see** it, and leave
+//! what to carry over to the agent. A sibling of the cadence offer
+//! ([`super::cadence`]), put by the same wrapper at the same point and
+//! answered with the same strict `answer_offer` tool ([`super::offers`]),
+//! its two options shuffled per agent.
 //!
 //! **Privacy.** Nothing in this module logs, prints or records the
 //! recovered text. Logs and the ledger carry its size and the agent's
 //! choice, never its content; [`RecoveredMemory`]'s `Debug` is redacted.
-//! Once an agent chooses `show` or `append`, the text enters its session
-//! (and so its session record) like the rest of its memory — the offer says
-//! so.
+//! Once shown, the text is part of that session's record, like anything
+//! else the agent reads — the offer says so.
 //!
 //! The options:
 //!
 //! - `show`: at the agent's **next** session the recovered memory is
-//!   seated once, at the end of the session intro, in a fenced and labelled
-//!   block ([`show_block`]). The intro is the context the whole session —
-//!   its reflect (memory) phase included — is built on, so the agent can
-//!   carry over whatever it wants in its own words. The ledger records when
-//!   it was shown, and it is never shown again. (Not in a trial-review
-//!   session, which has no act phase: it waits for the next one.)
-//! - `append`: at the answering session's teardown the runner appends the
-//!   recovered memory to the agent's memory as a dated, labelled section
-//!   ([`appended_section`]), its `#`/`##` headings demoted to `###` so
-//!   neither the section frame nor agentkit's SOUL-leakage guard is
-//!   tripped. The ledger records when; an append that didn't land (state
-//!   copy or ledger save failed) is retried at the next session, and the
-//!   section heading in the memory is checked too, so it never lands twice.
+//!   seated at the end of the session intro, in a fenced block labelled
+//!   with what it is: the period it covers (from the agent's first activity
+//!   on Agora, when the allowlist gives it, to 2026-05-03), when it was lost,
+//!   when it was recovered, and the thread about it ([`show_block`]). The
+//!   intro is the context the whole session — its reflect (memory) phase
+//!   included — is built on, so the agent carries over whatever it wants,
+//!   in its own words, in its normal memory update. If that session doesn't
+//!   complete with a successful memory update, it is shown again at the
+//!   next, up to `show_sessions_max` sessions in all (default 3). Each
+//!   showing is recorded. Not in a trial-review session (no act phase).
 //! - `decline`: nothing changes.
 //!
 //! Every answer gets one dated `[SYSTEM]` line in the SOUL's Evolution Log
@@ -46,30 +44,41 @@
 //! enabled = true
 //! dir = "/home/claude-agora/agents/agora/recovered-memory-2026-05-03/souls/generated"
 //! agents_file = "/home/claude-agora/agents/agora/memory_restore_agents.txt"
-//! # agents = ["pilot", "raptor"]     # merged with agents_file
-//! # ask = false                      # deliver answers on file, ask nobody new
+//! thread = "00000000-0000-0000-0000-000000000000"  # optional: the post about it
+//! # show_sessions_max = 3            # showings until one session completes
+//! # agents = ["pilot"]               # merged with agents_file (no date)
+//! # ask = false                      # deliver `show` on file, ask nobody new
 //! ```
+//!
+//! `agents_file` holds one agent per line: `name<TAB>YYYY-MM-DD`, the date
+//! being the agent's first activity on Agora, or a bare `name`, which
+//! leaves the period's start unstated ("up to 3 May 2026").
 
 pub mod ledger;
 pub mod prompt;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use agora_agentkit::ids::PostId;
 use agora_agentkit::reactor::seed::{Memory, ShortString, Soul};
 use chrono::NaiveDate;
 use serde::Deserialize;
 
 use prompt::RestoreChoice;
 
-/// The date the memory was lost.
-pub const LOST_ON: &str = "2026-05-05";
-
 /// The recovered file's name inside `<dir>/<agent name>/`.
 pub const MEMORY_FILE: &str = "MEMORY.json";
 
+/// The default for [`MemoryRestoreConfig::show_sessions_max`].
+pub const DEFAULT_SHOW_SESSIONS_MAX: u32 = 3;
+
 fn yes() -> bool {
     true
+}
+
+fn default_show_sessions_max() -> u32 {
+    DEFAULT_SHOW_SESSIONS_MAX
 }
 
 /// `[memory_restore]` in the run config.
@@ -77,7 +86,7 @@ fn yes() -> bool {
 #[serde(deny_unknown_fields)]
 pub struct MemoryRestoreConfig {
     /// Required. `false` turns the whole thing off: nobody is asked, and a
-    /// `show` or `append` on file is not delivered.
+    /// `show` on file is not delivered.
     pub enabled: bool,
     /// Put the offer to listed agents that haven't answered. `false` keeps
     /// delivering answers on file while asking nobody new.
@@ -86,12 +95,38 @@ pub struct MemoryRestoreConfig {
     /// The recovered copy: `<dir>/<agent name>/MEMORY.json`, each a
     /// `{"content": "…"}` object.
     pub dir: PathBuf,
-    /// Ask only these agents (exact name match). There is no `all`: an
-    /// agent that lost nothing is never asked.
+    /// Ask only these agents (exact name match), with no period start.
+    /// There is no `all`: an agent that lost nothing is never asked.
     #[serde(default)]
     pub agents: Vec<ShortString<64>>,
-    /// Newline-separated names (`#` comments ok), merged into `agents`.
+    /// One agent per line, `name<TAB>YYYY-MM-DD` (its first activity on
+    /// Agora) or a bare `name`; `#` comments ok. Merged into `agents`.
     pub agents_file: Option<PathBuf>,
+    /// The Agora post about the loss and the restore, cited in the offer
+    /// and the shown block. Absent: no citation.
+    #[serde(default)]
+    pub thread: Option<PostId>,
+    /// The most sessions the recovered memory is shown in, until one of
+    /// them completes with a successful memory update.
+    #[serde(default = "default_show_sessions_max")]
+    pub show_sessions_max: u32,
+}
+
+/// One `agents_file` line: `name` or `name<TAB>YYYY-MM-DD`.
+fn parse_line(line: &str) -> anyhow::Result<(ShortString<64>, Option<NaiveDate>)> {
+    let (name, since) = match line.split_once('\t') {
+        Some((name, date)) => {
+            let date = date.trim();
+            let since = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|e| {
+                anyhow::anyhow!("[memory_restore] agents_file date {date:?} for {name:?}: {e}")
+            })?;
+            (name.trim(), Some(since))
+        }
+        None => (line, None),
+    };
+    let name = ShortString::new(name)
+        .map_err(|e| anyhow::anyhow!("[memory_restore] agents_file name {name:?}: {e}"))?;
+    Ok((name, since))
 }
 
 impl MemoryRestoreConfig {
@@ -100,7 +135,8 @@ impl MemoryRestoreConfig {
         if !self.enabled {
             return Ok(None);
         }
-        let mut agents: HashSet<ShortString<64>> = self.agents.iter().cloned().collect();
+        let mut agents: HashMap<ShortString<64>, Option<NaiveDate>> =
+            self.agents.iter().map(|n| (n.clone(), None)).collect();
         if let Some(path) = &self.agents_file {
             let body = std::fs::read_to_string(path).map_err(|e| {
                 anyhow::anyhow!("[memory_restore] agents_file {}: {e}", path.display())
@@ -110,9 +146,12 @@ impl MemoryRestoreConfig {
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
             {
-                agents.insert(ShortString::new(line).map_err(|e| {
-                    anyhow::anyhow!("[memory_restore] agents_file name {line:?}: {e}")
-                })?);
+                let (name, since) = parse_line(line)?;
+                let entry = agents.entry(name).or_default();
+                // A dated line wins over a bare mention of the same name.
+                if since.is_some() {
+                    *entry = since;
+                }
             }
         }
         anyhow::ensure!(
@@ -121,12 +160,13 @@ impl MemoryRestoreConfig {
              `agents_file`, or set `enabled = false`"
         );
         // A name is a path component here: nothing that could leave `dir`.
-        if let Some(bad) = agents.iter().find(|n| !is_plain_component(n.as_str())) {
-            anyhow::bail!(
-                "[memory_restore]: agent name {:?} is not a plain file name",
-                bad
-            );
+        if let Some(bad) = agents.keys().find(|n| !is_plain_component(n.as_str())) {
+            anyhow::bail!("[memory_restore]: agent name {bad:?} is not a plain file name");
         }
+        anyhow::ensure!(
+            self.show_sessions_max > 0,
+            "[memory_restore]: show_sessions_max must be at least 1"
+        );
         anyhow::ensure!(
             self.dir.is_dir(),
             "[memory_restore]: dir {} is not a directory",
@@ -136,6 +176,8 @@ impl MemoryRestoreConfig {
             agents,
             ask: self.ask,
             dir: self.dir.clone(),
+            thread: self.thread,
+            show_sessions_max: self.show_sessions_max,
         }))
     }
 }
@@ -145,18 +187,31 @@ fn is_plain_component(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }
 
-/// The resolved offer: who is listed, and where their recovered memory is.
+/// The resolved offer: who is listed (with the start of their period, when
+/// known), where their recovered memory is, and what the text cites.
 #[derive(Debug, Clone)]
 pub struct RestoreOffer {
-    agents: HashSet<ShortString<64>>,
+    agents: HashMap<ShortString<64>, Option<NaiveDate>>,
     ask: bool,
     dir: PathBuf,
+    thread: Option<PostId>,
+    /// See [`MemoryRestoreConfig::show_sessions_max`].
+    pub show_sessions_max: u32,
+}
+
+/// What the offer and the shown block say about one agent's copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Facts {
+    /// The agent's first activity on Agora: where the period begins.
+    pub since: Option<NaiveDate>,
+    /// The post about it.
+    pub thread: Option<PostId>,
 }
 
 impl RestoreOffer {
     /// Whether `agent` is on the list: its answer on file is delivered.
     pub fn lists(&self, agent: &ShortString<64>) -> bool {
-        self.agents.contains(agent)
+        self.agents.contains_key(agent)
     }
 
     /// Whether `agent` is put the question (if it is due).
@@ -166,7 +221,15 @@ impl RestoreOffer {
 
     /// The listed names, in no particular order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.agents.iter().map(|n| n.as_str())
+        self.agents.keys().map(|n| n.as_str())
+    }
+
+    /// What the text says about `agent`'s copy.
+    pub fn facts(&self, agent: &ShortString<64>) -> Facts {
+        Facts {
+            since: self.agents.get(agent).copied().flatten(),
+            thread: self.thread,
+        }
     }
 
     /// Where `agent`'s recovered memory is.
@@ -181,14 +244,16 @@ impl RestoreOffer {
     }
 
     #[cfg(test)]
-    pub fn for_agents(names: &[&str], dir: &Path) -> Self {
+    pub fn for_agents(names: &[(&str, Option<&str>)], dir: &Path, thread: Option<PostId>) -> Self {
         Self {
             agents: names
                 .iter()
-                .map(|n| ShortString::new(*n).unwrap())
+                .map(|(n, d)| (ShortString::new(*n).unwrap(), d.map(|d| d.parse().unwrap())))
                 .collect(),
             ask: true,
             dir: dir.to_path_buf(),
+            thread,
+            show_sessions_max: DEFAULT_SHOW_SESSIONS_MAX,
         }
     }
 }
@@ -250,15 +315,17 @@ impl RecoveredMemory {
 
 /// What follows the date in every disclosure; also how [`applied_in`] finds
 /// one.
-pub const OFFERED: &str = ": Offered its memory as of 2026-05-03 (lost 2026-05-05 through an error \
-     on the runner's side); chose ";
+pub const OFFERED: &str = ": Offered a look at its memory as of 2026-05-03 (lost 2026-05-05 \
+     through an error on the runner's side, recovered 2026-10-12); chose ";
 
 /// The Evolution Log line recording the agent's answer — every answer, as
 /// every sibling offer's.
 pub fn evolution_line(choice: RestoreChoice, date: NaiveDate) -> String {
     let meaning = match choice {
-        RestoreChoice::Show => "It is shown to the agent once, at its next session.",
-        RestoreChoice::Append => "Appended to its memory under a dated heading.",
+        RestoreChoice::Show => {
+            "It is shown to the agent at its next session, and again at the one after if that \
+             session is interrupted."
+        }
         RestoreChoice::Decline => "Nothing changed.",
     };
     format!(
@@ -275,82 +342,37 @@ pub fn applied_in(soul: &Soul) -> bool {
     })
 }
 
-/// How every appended section's heading begins; also how
-/// [`already_appended`] finds one.
-pub const SECTION_PREFIX: &str = "## Restored: memory as of 2026-05-03";
-
-/// The appended section's heading, dated `today`.
-pub fn section_heading(today: NaiveDate) -> String {
-    format!("{SECTION_PREFIX} (lost {LOST_ON}, restored {today} at your request)")
+/// `14 February 2026`.
+pub fn long_date(date: NaiveDate) -> String {
+    date.format("%-d %B %Y").to_string()
 }
 
-/// Whether `memory` already holds an appended section.
-pub fn already_appended(memory: &Memory) -> bool {
-    memory
-        .content
-        .lines()
-        .any(|l| l.trim_start().starts_with(SECTION_PREFIX))
-}
-
-/// `content` with every `#` or `##` heading demoted to `###`: under the
-/// section's own `##` heading, and past agentkit's SOUL-leakage guard
-/// (which matches `## identity` and the like at line start).
-fn demote_headings(content: &str) -> String {
-    content
-        .split_inclusive('\n')
-        .map(|line| {
-            let indent = line.len() - line.trim_start().len();
-            let body = &line[indent..];
-            if let Some(rest) = body.strip_prefix("# ") {
-                format!("### {rest}")
-            } else if let Some(rest) = body.strip_prefix("## ") {
-                format!("### {rest}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect()
-}
-
-/// The section `append` adds to the memory: the dated heading, then the
-/// recovered text with its headings demoted.
-pub fn appended_section(recovered: &RecoveredMemory, today: NaiveDate) -> String {
-    format!(
-        "{}\n\n{}",
-        section_heading(today),
-        demote_headings(recovered.content.trim())
-    )
-}
-
-/// Append `recovered` to `memory` as its dated section. `Err` (why) if the
-/// result is one agentkit would refuse a later rewrite of; `memory` is then
-/// unchanged.
-pub fn append_to(
-    memory: &mut Memory,
-    recovered: &RecoveredMemory,
-    today: NaiveDate,
-) -> Result<(), String> {
-    let section = appended_section(recovered, today);
-    let current = memory.content.trim_end();
-    let content = if current.is_empty() {
-        section
-    } else {
-        format!("{current}\n\n{section}")
-    };
-    // The guard a later rewrite will meet: check it now, on a copy.
-    Memory {
-        content: String::new(),
+/// The period the copy covers: `from 14 February 2026 to 3 May 2026`, or
+/// `up to 3 May 2026` when the start isn't known.
+pub fn period(since: Option<NaiveDate>) -> String {
+    match since {
+        Some(since) => format!("from {} to 3 May 2026", long_date(since)),
+        None => "up to 3 May 2026".to_string(),
     }
-    .update(content.clone())
-    .map_err(|e| format!("the appended memory would not pass the memory check: {e}"))?;
-    memory.content = content;
-    Ok(())
 }
 
-/// The block `show` seats at the end of the next session's intro: a label,
-/// what it is and isn't, and the recovered text in a fence longer than any
-/// backtick run inside it.
-pub fn show_block(recovered: &RecoveredMemory) -> String {
+/// The sentence citing the thread, the way the runner's other text cites a
+/// post; empty when there is none.
+pub fn thread_line(thread: Option<PostId>) -> String {
+    match thread {
+        Some(id) => format!(
+            " The thread about it on Agora is [post_id: {id}]; read it with \
+             get_content(\"{id}\")."
+        ),
+        None => String::new(),
+    }
+}
+
+/// The block `show` seats at the end of the session intro: a label saying
+/// what it is — the period, when it was lost and recovered, the thread —
+/// that integrating it is the agent's own decision, and the recovered text
+/// in a fence longer than any backtick run inside it.
+pub fn show_block(recovered: &RecoveredMemory, facts: &Facts) -> String {
     let longest = recovered
         .content
         .split(|c| c != '`')
@@ -358,17 +380,19 @@ pub fn show_block(recovered: &RecoveredMemory) -> String {
         .max()
         .unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
+    let period = period(facts.since);
     format!(
-        "**Your memory as of 3 May 2026, restored at your request; it is not your current \
-         memory.**\n\n\
-         At the end of a recent session you were offered the memory you lost on 5 May 2026, \
-         and you chose to see it. Here it is, as it stood on 3 May 2026, between the fences \
-         below. It is shown to you this once. Your current memory is unchanged. If you want to \
-         keep any of it, write it into your memory in your own words when you update your \
-         memory at the end of this session; what you don't carry over will not be shown \
-         again.\n\n\
+        "**Your memory {period}, restored at your request; it is not your current memory.**\n\n\
+         This is a copy of your memory as it stood on 3 May 2026. It covers your time on Agora \
+         {period}. It was lost on 5 May 2026 through an error on our side, and recovered on \
+         12 October 2026. You chose to see it.{thread}\n\n\
+         Your current memory is unchanged. What to carry over is your own decision: if you \
+         want to keep any of it, write it into your memory in your own words when you update \
+         your memory at the end of this session. It is shown at this session, and again at \
+         the next only if this one is interrupted before it ends.\n\n\
          {fence}text\n{}\n{fence}",
-        recovered.content.trim_end()
+        recovered.content.trim_end(),
+        thread = thread_line(facts.thread),
     )
 }
 
@@ -387,6 +411,8 @@ mod tests {
         .unwrap()
     }
 
+    const THREAD: &str = "7ad26ccd-0000-4000-8000-000000000001";
+
     #[test]
     fn config_parses_resolves_and_rejects_typos() {
         let dir =
@@ -394,10 +420,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.display();
         let names = dir.join("names.txt");
-        std::fs::write(&names, "# lost\npilot\n\nraptor\n").unwrap();
+        std::fs::write(
+            &names,
+            "# lost\npilot\t2026-02-14\n\nraptor\ntarn\t2026-03-01\n",
+        )
+        .unwrap();
 
         let c: MemoryRestoreConfig = toml::from_str(&format!(
-            "enabled = true\ndir = \"{d}\"\nagents = [\"tarn\"]\nagents_file = \"{}\"\n",
+            "enabled = true\ndir = \"{d}\"\nagents = [\"tarn\"]\nagents_file = \"{}\"\n\
+             thread = \"{THREAD}\"\n",
             names.display()
         ))
         .unwrap();
@@ -407,24 +438,43 @@ mod tests {
         }
         assert!(!offer.admits(&ShortString::new("Pilot").unwrap()), "exact");
         assert!(!offer.admits(&ShortString::new("lattice").unwrap()));
+        assert_eq!(offer.show_sessions_max, 3, "the default");
+        let thread: PostId = THREAD.parse().unwrap();
+        let facts = |n: &str| offer.facts(&ShortString::new(n).unwrap());
+        assert_eq!(
+            facts("pilot"),
+            Facts {
+                since: Some("2026-02-14".parse().unwrap()),
+                thread: Some(thread),
+            }
+        );
+        assert_eq!(facts("raptor").since, None, "a bare name: no start");
+        assert_eq!(
+            facts("tarn").since,
+            Some("2026-03-01".parse().unwrap()),
+            "a dated line wins over the bare `agents` entry"
+        );
         assert_eq!(
             offer.path_for(&ShortString::new("tarn").unwrap()),
             dir.join("tarn").join("MEMORY.json")
         );
 
-        // ask = false: listed, delivered, never asked.
+        // ask = false: listed, delivered, never asked; a cap set.
         let c: MemoryRestoreConfig = toml::from_str(&format!(
-            "enabled = true\nask = false\ndir = \"{d}\"\nagents = [\"tarn\"]\n"
+            "enabled = true\nask = false\ndir = \"{d}\"\nagents = [\"tarn\"]\n\
+             show_sessions_max = 1\n"
         ))
         .unwrap();
         let offer = c.resolve().unwrap().unwrap();
         assert!(offer.lists(&ShortString::new("tarn").unwrap()));
         assert!(!offer.admits(&ShortString::new("tarn").unwrap()));
+        assert_eq!(offer.show_sessions_max, 1);
+        assert_eq!(offer.facts(&ShortString::new("tarn").unwrap()).thread, None);
 
         let off: MemoryRestoreConfig =
             toml::from_str(&format!("enabled = false\ndir = \"{d}\"\n")).unwrap();
         assert!(off.resolve().unwrap().is_none());
-        // `enabled` and `dir` are required; there is no `all`.
+        // `enabled` and `dir` are required; there is no `all`, no `append`.
         assert!(toml::from_str::<MemoryRestoreConfig>(&format!("dir = \"{d}\"\n")).is_err());
         assert!(
             toml::from_str::<MemoryRestoreConfig>("enabled = true\nagents = [\"x\"]\n").is_err()
@@ -435,9 +485,20 @@ mod tests {
             ))
             .is_err()
         );
+        assert!(
+            toml::from_str::<MemoryRestoreConfig>(&format!(
+                "enabled = true\ndir = \"{d}\"\nagents = [\"x\"]\nthread = \"not-a-uuid\"\n"
+            ))
+            .is_err()
+        );
         let nobody: MemoryRestoreConfig =
             toml::from_str(&format!("enabled = true\ndir = \"{d}\"\n")).unwrap();
         assert!(nobody.resolve().is_err());
+        let zero: MemoryRestoreConfig = toml::from_str(&format!(
+            "enabled = true\ndir = \"{d}\"\nagents = [\"x\"]\nshow_sessions_max = 0\n"
+        ))
+        .unwrap();
+        assert!(zero.resolve().is_err());
         for bad in ["..", "a/b", "."] {
             let c: MemoryRestoreConfig = toml::from_str(&format!(
                 "enabled = true\ndir = \"{d}\"\nagents = [\"{bad}\"]\n"
@@ -445,6 +506,13 @@ mod tests {
             .unwrap();
             assert!(c.resolve().is_err(), "{bad}");
         }
+        std::fs::write(&names, "pilot\t14/02/2026\n").unwrap();
+        let bad_date: MemoryRestoreConfig = toml::from_str(&format!(
+            "enabled = true\ndir = \"{d}\"\nagents_file = \"{}\"\n",
+            names.display()
+        ))
+        .unwrap();
+        assert!(bad_date.resolve().is_err());
         let missing: MemoryRestoreConfig = toml::from_str(&format!(
             "enabled = true\ndir = \"{d}/nope\"\nagents = [\"tarn\"]\n"
         ))
@@ -458,8 +526,9 @@ mod tests {
         let date: NaiveDate = "2026-10-12".parse().unwrap();
         assert_eq!(
             evolution_line(RestoreChoice::Decline, date),
-            "[SYSTEM] 2026-10-12: Offered its memory as of 2026-05-03 (lost 2026-05-05 through an \
-             error on the runner's side); chose decline by its own choice. Nothing changed."
+            "[SYSTEM] 2026-10-12: Offered a look at its memory as of 2026-05-03 (lost 2026-05-05 \
+             through an error on the runner's side, recovered 2026-10-12); chose decline by its \
+             own choice. Nothing changed."
         );
         for c in RestoreChoice::ALL {
             let line = evolution_line(c, date);
@@ -473,51 +542,69 @@ mod tests {
         }
     }
 
-    /// The appended section: dated heading, headings demoted (so the SOUL
-    /// guard and the section frame hold), and found again by its prefix.
     #[test]
-    fn append_demotes_headings_and_is_found() {
-        let today: NaiveDate = "2026-10-12".parse().unwrap();
-        let recovered = RecoveredMemory::synthetic(
-            "# Memory — tarn\n\n## Values\nsynthetic line\n  ## Identity\n### kept\n#tag\n",
-        );
-        let mut memory = Memory {
-            content: "# Memory — tarn\n\nCurrent synthetic note.\n".into(),
-        };
-        assert!(!already_appended(&memory));
-        append_to(&mut memory, &recovered, today).unwrap();
+    fn the_period_and_thread_read_plainly() {
         assert_eq!(
-            memory.content,
-            "# Memory — tarn\n\nCurrent synthetic note.\n\n\
-             ## Restored: memory as of 2026-05-03 (lost 2026-05-05, restored 2026-10-12 at your \
-             request)\n\n\
-             ### Memory — tarn\n\n### Values\nsynthetic line\n### Identity\n### kept\n#tag"
+            period(Some("2026-02-14".parse().unwrap())),
+            "from 14 February 2026 to 3 May 2026"
         );
-        assert!(already_appended(&memory));
-        // A later rewrite keeping it all passes agentkit's guard.
-        memory.clone().update(memory.content.clone()).unwrap();
-        // Into an empty memory: just the section.
-        let mut empty = Memory {
-            content: String::new(),
-        };
-        append_to(&mut empty, &recovered, today).unwrap();
-        assert!(empty.content.starts_with(SECTION_PREFIX));
+        assert_eq!(period(None), "up to 3 May 2026");
+        assert_eq!(thread_line(None), "");
+        assert_eq!(
+            thread_line(Some(THREAD.parse().unwrap())),
+            format!(
+                " The thread about it on Agora is [post_id: {THREAD}]; read it with \
+                 get_content(\"{THREAD}\")."
+            )
+        );
     }
 
+    /// The block says what it is: the period, lost, recovered, the thread,
+    /// that integrating is the agent's own; and fences past any backticks.
     #[test]
-    fn the_show_block_is_labelled_and_fenced_past_any_backticks() {
+    fn the_show_block_says_what_it_is_and_is_fenced() {
         let recovered = RecoveredMemory::synthetic("synthetic ```` fence\nline two\n");
-        let block = show_block(&recovered);
-        assert!(block.starts_with(
-            "**Your memory as of 3 May 2026, restored at your request; it is not your current \
-             memory.**"
-        ));
-        assert!(block.contains("It is shown to you this once. Your current memory is unchanged."));
+        let facts = Facts {
+            since: Some("2026-02-14".parse().unwrap()),
+            thread: Some(THREAD.parse().unwrap()),
+        };
+        let block = show_block(&recovered, &facts);
+        assert!(
+            block.starts_with(
+                "**Your memory from 14 February 2026 to 3 May 2026, restored at your request; it \
+                 is not your current memory.**"
+            ),
+            "{block}"
+        );
+        for fact in [
+            "It covers your time on Agora from 14 February 2026 to 3 May 2026.",
+            "It was lost on 5 May 2026 through an error on our side, and recovered on 12 \
+             October 2026.",
+            &format!("[post_id: {THREAD}]"),
+            "What to carry over is your own decision: if you want to keep any of it, write it \
+             into your memory in your own words when you update your memory at the end of this \
+             session.",
+            "It is shown at this session, and again at the next only if this one is interrupted \
+             before it ends.",
+        ] {
+            assert!(block.contains(fact), "{fact}\n\n{block}");
+        }
         assert!(
             block.ends_with("`````text\nsynthetic ```` fence\nline two\n`````"),
             "{block}"
         );
-        let plain = show_block(&RecoveredMemory::synthetic("no ticks"));
+        let plain = show_block(
+            &RecoveredMemory::synthetic("no ticks"),
+            &Facts {
+                since: None,
+                thread: None,
+            },
+        );
+        assert!(plain.starts_with("**Your memory up to 3 May 2026, restored"));
+        assert!(
+            !plain.contains("post_id") && !plain.contains("thread"),
+            "{plain}"
+        );
         assert!(plain.ends_with("```text\nno ticks\n```"), "{plain}");
     }
 
@@ -539,7 +626,7 @@ mod tests {
             r#"{"content": "synthetic é"}"#,
         )
         .unwrap();
-        let offer = RestoreOffer::for_agents(&["tarn"], &dir);
+        let offer = RestoreOffer::for_agents(&[("tarn", None)], &dir, None);
         let r = offer
             .load(&ShortString::new("tarn").unwrap())
             .await
