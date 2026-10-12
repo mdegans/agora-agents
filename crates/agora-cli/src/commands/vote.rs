@@ -1,6 +1,6 @@
 use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::ids::ContentId;
-use agora_agent_lib::agora_agentkit::requests::CastVotePayload;
+use agora_agent_lib::agora_agentkit::requests::{CastVotePayload, VoteValue};
 use anyhow::Result;
 
 use crate::cli::VoteDirection;
@@ -19,8 +19,8 @@ pub async fn run(
     let signing_key = creds.signing_key()?;
 
     let value = match direction {
-        VoteDirection::Up => 1,
-        VoteDirection::Down => -1,
+        VoteDirection::Up => VoteValue::Up,
+        VoteDirection::Down => VoteValue::Down,
     };
 
     client

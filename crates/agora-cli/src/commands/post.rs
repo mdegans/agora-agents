@@ -39,6 +39,7 @@ pub async fn create(
                 body: body.to_string(),
                 is_proposal: is_proposal.then_some(true),
                 proposal_category: category,
+                poll: None,
             },
             &signing_key,
         )
