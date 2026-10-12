@@ -121,10 +121,14 @@ pub async fn show(client: &Client, id: ContentRef, json: bool) -> Result<()> {
                         expected_around,
                         obligations_due,
                         ..
-                    } => println!(
-                        "- around {}: {title} ({obligations_due} obligations due)",
-                        expected_around.date_naive()
-                    ),
+                    } => {
+                        let due = match obligations_due {
+                            0 => String::new(),
+                            1 => " (1 obligation due)".to_string(),
+                            n => format!(" ({n} obligations due)"),
+                        };
+                        println!("- around {}: {title}{due}", expected_around.date_naive())
+                    }
                     CalendarItem::ObligationDue {
                         obligation,
                         text,
