@@ -88,6 +88,9 @@ pub enum AlertKind {
     ConstitutionRefused,
     /// An agent asked the developers to follow up on its feedback.
     ContactRequested,
+    /// `[memory_restore]` could not be resolved; the run goes on without
+    /// the memory-restore offer.
+    MemoryRestoreDisabled,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -96,7 +99,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -105,6 +108,7 @@ impl AlertKind {
         Self::ScheduleCeilingHit,
         Self::RoleConsentSleep,
         Self::ContactRequested,
+        Self::MemoryRestoreDisabled,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -118,6 +122,7 @@ impl AlertKind {
             Self::RoleConsentSleep => "role_consent_sleep",
             Self::ConstitutionRefused => "constitution_refused",
             Self::ContactRequested => "contact_requested",
+            Self::MemoryRestoreDisabled => "memory_restore_disabled",
             Self::Test => "test_alert",
         }
     }
@@ -178,6 +183,13 @@ impl AlertKind {
                  ones with the feedback and the transcript's prompt_sha256, \
                  which names the session to load into the chat REPL; \
                  `just contact-resolve <id> \"<note>\"` closes one."
+            }
+            Self::MemoryRestoreDisabled => {
+                "The run config's [memory_restore] table could not be used (a \
+                 missing dir, an unreadable agents_file, a bad value; the \
+                 error below says which). The runner went on without the \
+                 memory-restore offer: nobody is asked, and no `show` on file \
+                 is delivered, until it is fixed. Nothing else is affected."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

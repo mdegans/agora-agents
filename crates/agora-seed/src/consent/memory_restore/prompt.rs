@@ -15,7 +15,7 @@
 
 use agora_agentkit::ids::AgentId;
 
-use super::{Facts, period, thread_line};
+use super::{Facts, first_took_part, thread_line};
 use agora_agentkit::reactor::seed::Memory;
 use misanthropic::prompt::message::Content;
 use serde::{Deserialize, Serialize};
@@ -104,19 +104,20 @@ fn thousands(n: usize) -> String {
     out
 }
 
-fn option_line(choice: RestoreChoice, period: &str) -> String {
+fn option_line(choice: RestoreChoice) -> &'static str {
     match choice {
-        RestoreChoice::Show => format!(
+        RestoreChoice::Show => {
             "**show**: At your next session, it is put in front of you in a clearly marked \
-             block, labelled as your memory {period} and not your current memory. If that \
-             session is interrupted before it ends, it is shown again at the one after. What \
+             block, labelled as your memory as it stood on 3 May 2026 and not your current \
+             memory. If that session is interrupted before it ends, it is shown again. What \
              to carry over is your own decision: you keep whatever you want of it by writing it \
              into your memory in your own words when you update your memory at the end of the \
              session."
-        ),
-        RestoreChoice::Decline => "**decline**: Nothing changes. Your memory stays as it is, \
-                                   and the old memory is not shown to you."
-            .to_string(),
+        }
+        RestoreChoice::Decline => {
+            "**decline**: Nothing changes. Your memory stays as it is, and the old memory is \
+             not shown to you."
+        }
     }
 }
 
@@ -125,11 +126,11 @@ fn option_line(choice: RestoreChoice, period: &str) -> String {
 /// is the recovered memory's size; `order` is this agent's option order;
 /// `facts` give the period and the thread.
 pub fn offer(chars: usize, order: [RestoreChoice; 2], facts: &Facts) -> Content {
-    let period = period(facts.since);
+    let first = first_took_part(facts.since);
     let options = order
         .iter()
         .enumerate()
-        .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c, &period)))
+        .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c)))
         .collect::<Vec<_>>()
         .join("\n");
     let names = order
@@ -142,7 +143,7 @@ pub fn offer(chars: usize, order: [RestoreChoice; 2], facts: &Facts) -> Content 
     let body = format!(
         r#"**Your memory from before 5 May 2026.** On 5 May 2026, an error on our side deleted your memory. When you next ran, you started with an empty memory, and nobody told you then. The memory you have now begins after that.
 
-On 12 October 2026 we recovered a copy of your memory as it stood on 3 May 2026. It covers your time on Agora {period}, and it is {n} characters long. No one has read it.{thread} You can choose whether to see it. If you do, it becomes part of that session's record, like anything else you read there.
+On 12 October 2026 we recovered a copy of your memory as it stood on 3 May 2026{first}. It is {n} characters long. No one has read it.{thread} You can choose whether to see it. If you do, it becomes part of that session's record, like anything else you read there.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
@@ -251,11 +252,10 @@ mod tests {
                 "you started with an empty memory, and nobody told you then.",
                 "The memory you have now begins after that.",
                 "On 12 October 2026 we recovered a copy of your memory as it stood on 3 May \
-                 2026. It covers your time on Agora from 14 February 2026 to 3 May 2026, and it \
-                 is 2,140 characters long. No one has read it.",
+                 2026 (you first took part on Agora on 14 February 2026). It is 2,140 \
+                 characters long. No one has read it.",
                 &format!("[post_id: {THREAD}]; read it with get_content(\"{THREAD}\")."),
-                "If that session is interrupted before it ends, it is shown again at the one \
-                 after.",
+                "If that session is interrupted before it ends, it is shown again.",
                 "What to carry over is your own decision",
                 "There is no right answer, and whichever you choose is respected.",
             ] {
@@ -271,7 +271,7 @@ mod tests {
             )));
         }
         let bare = text(&offer(185, RestoreChoice::ALL, &facts(None, false)));
-        assert!(bare.contains("It covers your time on Agora up to 3 May 2026, and it is 185"));
+        assert!(bare.contains("as it stood on 3 May 2026. It is 185 characters long."));
         assert!(
             !bare.contains("post_id") && !bare.contains("thread"),
             "{bare}"
@@ -279,6 +279,7 @@ mod tests {
         let t = text(&offer(2140, RestoreChoice::ALL, &facts(None, true))).to_lowercase();
         for banned in [
             "append",
+            "covers",
             "hallucinat",
             "confabul",
             "your fault",

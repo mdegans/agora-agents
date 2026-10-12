@@ -994,7 +994,11 @@ where
                     sections.push(section);
                     open.push(offer);
                 }
-                if let Some((section, offer)) = self.restore_section() {
+                // Never beside the role offer: its `sleep` would leave a
+                // `show` that is never delivered. It waits for a session
+                // the role offer isn't put in.
+                let role_put = open.iter().any(|o| o.kind() == OfferKind::Role);
+                if !role_put && let Some((section, offer)) = self.restore_section() {
                     sections.push(section);
                     open.push(offer);
                 }
@@ -1172,11 +1176,7 @@ where
     /// seeded order, and the recovered memory's size.
     fn restore_section(&self) -> Option<(Section, Open)> {
         let soul = &self.inner.state().soul;
-        if !self
-            .rt
-            .memory_restore
-            .as_ref()
-            .is_some_and(|o| o.admits(&soul.name))
+        if !self.rt.memory_restore.as_ref().is_some_and(|o| o.asks())
             || !self.restore_ledger.as_ref().is_some_and(|l| l.due(soul))
         {
             return None;
@@ -2601,9 +2601,25 @@ where
     async fn load_restore(&mut self, dir: &std::path::Path) {
         let rt = self.rt.clone();
         let name = self.inner.state().soul.name.clone();
-        let Some(offer) = rt.memory_restore.as_ref().filter(|o| o.lists(&name)) else {
+        let Some(offer) = rt.memory_restore.as_ref() else {
             return;
         };
+        // The entry binds the name to the agent id its copy belongs to:
+        // nothing is opened or offered for another agent under that name.
+        match offer.listing(&name, self.inner.id()) {
+            memory_restore::Listing::Unlisted => return,
+            memory_restore::Listing::Mismatch { listed } => {
+                tracing::warn!(
+                    event_type = "memory_restore_id_mismatch",
+                    agent = %name,
+                    agent_id = %self.inner.id(),
+                    listed_agent_id = %listed,
+                    "memory-restore allowlist names this agent with another id; never offered"
+                );
+                return;
+            }
+            memory_restore::Listing::Listed => {}
+        }
         let ledger = match RestoreLedger::load(dir).await {
             Ok(ledger) => ledger,
             Err(e) => {
@@ -2616,7 +2632,7 @@ where
                 return;
             }
         };
-        let needed = (offer.admits(&name) && ledger.due(&self.inner.state().soul))
+        let needed = (offer.asks() && ledger.due(&self.inner.state().soul))
             || ledger.show_pending(offer.show_sessions_max);
         self.restore_ledger = Some(ledger);
         if !needed {
@@ -3363,18 +3379,24 @@ where
         // closing phase done, so its memory update was accepted — ends the
         // showings; any other stays recorded as interrupted.
         if self.restore_showing {
-            if self.closed
-                && let Some(ledger) = self.restore_ledger.as_mut()
-            {
-                ledger.complete_showing();
+            // The dump that holds the recovered text: recorded, and logged
+            // under its own event so `forks` never uses it as a source.
+            let prompt_sha256 = agora_agentkit::reactor::seed::prompt_sha256(self.inner.prompt())
+                .map_err(|e| {
+                    tracing::warn!(agent_id = %self.inner.id(), error = %e, "prompt digest failed");
+                })
+                .ok();
+            if let Some(ledger) = self.restore_ledger.as_mut() {
+                ledger.end_showing(self.closed, prompt_sha256.clone());
                 self.restore_dirty = true;
             }
             tracing::info!(
-                event_type = "memory_restore_showing_ended",
+                event_type = memory_restore::SHOWING_ENDED,
                 agent = %self.inner.state().soul.name,
                 agent_id = %self.inner.id(),
                 completed = self.closed,
-                "memory-restore showing session ended"
+                prompt_sha256 = prompt_sha256.as_deref(),
+                "memory-restore showing session ended; its prompt dump holds recovered text"
             );
         }
         if self.restore_dirty
@@ -3857,8 +3879,19 @@ mod tests {
                         serde_json::json!({ "content": SYNTHETIC_RECOVERED }).to_string(),
                     )
                     .unwrap();
-                    let dated: Vec<(&str, Option<&str>)> =
-                        names.iter().map(|n| (*n, Some("2026-02-14"))).collect();
+                    // tarn is bound to the harness agent's id; anyone else
+                    // listed, to an id of its own.
+                    let dated: Vec<(&str, Option<&str>, AgentId)> = names
+                        .iter()
+                        .map(|n| {
+                            let bound = if *n == "tarn" {
+                                id
+                            } else {
+                                AgentId::from(uuid::Uuid::new_v4())
+                            };
+                            (*n, Some("2026-02-14"), bound)
+                        })
+                        .collect();
                     memory_restore::RestoreOffer::for_agents(
                         &dated,
                         &dir,
@@ -6405,8 +6438,8 @@ mod tests {
         let n = SYNTHETIC_RECOVERED.chars().count();
         assert!(
             q.contains(&format!(
-                "It covers your time on Agora from 14 February 2026 to 3 May 2026, and it is \
-                 {n} characters long. No one has read it."
+                "as it stood on 3 May 2026 (you first took part on Agora on 14 February 2026). \
+                 It is {n} characters long. No one has read it."
             )),
             "{q}"
         );
@@ -6454,6 +6487,63 @@ mod tests {
         assert!(
             !RestoreLedger::path(&h.rt.state_dir.join(h.id.to_string())).exists(),
             "nothing recorded"
+        );
+    }
+
+    /// The list names tarn, but bound to another agent's id: nothing is
+    /// opened, asked or recorded for this one.
+    #[tokio::test]
+    async fn restore_id_mismatch_is_never_offered() {
+        let mut h = Harness::with_restore("restore-mismatch", &["tarn"]);
+        let other = AgentId::from(uuid::Uuid::from_u128(8));
+        let dir = h.root.join("recovered");
+        Arc::get_mut(&mut h.rt).unwrap().memory_restore = Some(
+            memory_restore::RestoreOffer::for_agents(&[("tarn", None, other)], &dir, None),
+        );
+        let mut agent = anthropic_agent(&h);
+        agent.on_init().await.unwrap();
+        assert!(agent.recovered.is_none(), "not even read");
+        assert!(agent.restore_ledger.is_none());
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "nothing seated"
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(!saw_recovered(&agent));
+        assert!(
+            !RestoreLedger::path(&h.rt.state_dir.join(h.id.to_string())).exists(),
+            "nothing recorded"
+        );
+    }
+
+    /// Never in the same question as the role offer: the role offer is put
+    /// alone, and the memory-restore offer the session after it settles.
+    #[tokio::test]
+    async fn restore_is_not_put_beside_the_role_offer() {
+        let h = Harness::build("restore-role", None, Some(&["tarn"]), None, Some(&["tarn"]));
+        let mut agent = seated(&h).await;
+        let q = last_user_text(&agent);
+        assert!(q.starts_with("One more question"), "{q}");
+        assert!(
+            q.contains("## Offer `role`") && !q.contains("memory_restore"),
+            "{q}"
+        );
+        assert_eq!(
+            agent
+                .handle(answer_call("role", "nothing", "", ""))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert_eq!(next.handle(reply("done")).await.unwrap(), Control::Continue);
+        let q = last_user_text(&next);
+        assert!(
+            q.contains("## Offer `memory_restore`") && !q.contains("## Offer `role`"),
+            "{q}"
         );
     }
 
@@ -6554,8 +6644,9 @@ mod tests {
 
         let (interrupted, intro) = showing_session(&h, &agent, false).await;
         for fact in [
-            "**Your memory from 14 February 2026 to 3 May 2026, restored at your request; it \
-             is not your current memory.**",
+            "**Your memory as it stood on 3 May 2026, restored at your request; it is not your \
+             current memory.**",
+            "(you first took part on Agora on 14 February 2026)",
             "It was lost on 5 May 2026 through an error on our side, and recovered on 12 \
              October 2026.",
             &format!("[post_id: {RESTORE_THREAD}]"),

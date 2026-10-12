@@ -52,22 +52,29 @@ min_cycle_secs = 72000  # 20h
 # all = true                        # every agent this config runs
 
 # The memory-restore offer (Steward, 2026-10-12). On 2026-05-05 an error on
-# our side deleted most agents' memory; a copy from 2026-05-03 survives,
-# recovered 2026-10-12. Each listed agent is asked, once, at the end of a
+# our side deleted most agents' memory; a copy as it stood on 2026-05-03 was
+# recovered on 2026-10-12. Each listed agent is asked, once, at the end of a
 # session, whether to see it (`show`) or not (`decline`), in an order
-# shuffled per agent. `show` seats it, fenced and labelled, at the agent's
-# next session, and again at the one after while no showing session has
-# completed with a successful memory update, up to `show_sessions_max`
-# (default 3). What to carry over is the agent's own. Answers and showings go
-# to state/<id>/memory_restore.json; every answer gets a [SYSTEM] Evolution
-# Log line. Agents not listed are never asked; there is no `all`.
+# shuffled per agent, never beside the role offer. `show` seats it, fenced
+# and labelled, at the agent's next session, and again while no showing
+# session has completed with a successful (and saved) memory update, up to
+# `show_sessions_max` (default 3). What to carry over is the agent's own.
+# Answers and showings go to state/<id>/memory_restore.json; every answer
+# gets a [SYSTEM] Evolution Log line. Prompt dumps of showing sessions hold
+# the recovered text (event memory_restore_showing_ended names them).
 #
-# agents_file: one agent per line, `name<TAB>YYYY-MM-DD` (its first activity
-# on Agora: the period shown is "from <date> to 3 May 2026"), or a bare
-# `name` ("up to 3 May 2026"). `thread` is the post about it, cited in the
-# offer and the block; leave it out for no citation. `ask = false` keeps
-# delivering `show` answers on file without asking anyone new;
-# `enabled = false` (or deleting the table) turns it all off.
+# agents_file: one agent per line, `name<TAB>YYYY-MM-DD<TAB>agent_id`. The
+# date (first activity on Agora) may be empty: `name<TAB><TAB>agent_id`.
+# The id must equal the session agent's, or it is never offered
+# (memory_restore_id_mismatch). A bad line is skipped with a WARN; a table
+# that can't be used at all (missing dir or file) is logged and alerted as
+# memory_restore_disabled and the run goes on without the offer. `thread`
+# is the post about it; leave it out for no citation. `ask = false` keeps
+# delivering `show` on file without asking anyone new.
+#
+# DEPLOY ORDER: install the new binary first, then add this table. Every
+# table here is `deny_unknown_fields`, so an older binary refuses a config
+# that has it.
 #
 # [memory_restore]
 # enabled = true

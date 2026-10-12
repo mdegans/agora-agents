@@ -482,9 +482,25 @@ struct PromptLogged {
     path: Option<PathBuf>,
 }
 
+/// The event a session that showed an agent its recovered memory logs at
+/// teardown ([`super::memory_restore::SHOWING_ENDED`]).
+#[derive(Deserialize)]
+struct ShowingLine {
+    fields: ShowingEnded,
+}
+
+#[derive(Deserialize)]
+struct ShowingEnded {
+    event_type: String,
+    prompt_sha256: Option<String>,
+}
+
 /// Every `prompt logged` event for `agents` in the run logs directly under
 /// `log_dir`, per agent, newest first. `prompt_dir` places a dump whose
-/// event carries no path.
+/// event carries no path. A session that showed the agent its recovered
+/// memory is never a source: its dump holds recovered text, so any dump a
+/// [`SHOWING_ENDED`](super::memory_restore::SHOWING_ENDED) event names is
+/// left out.
 pub fn scan_logs(
     log_dir: &Path,
     prompt_dir: Option<&Path>,
@@ -492,6 +508,7 @@ pub fn scan_logs(
 ) -> std::io::Result<HashMap<AgentId, Vec<Session>>> {
     use std::io::BufRead;
     let mut out: HashMap<AgentId, Vec<Session>> = HashMap::new();
+    let mut showings: HashSet<String> = HashSet::new();
     for entry in std::fs::read_dir(log_dir)? {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -502,6 +519,15 @@ pub fn scan_logs(
         };
         for line in std::io::BufReader::new(file).lines() {
             let Ok(line) = line else { break };
+            if line.contains(super::memory_restore::SHOWING_ENDED) {
+                if let Ok(ShowingLine { fields }) = serde_json::from_str::<ShowingLine>(&line)
+                    && fields.event_type == super::memory_restore::SHOWING_ENDED
+                    && let Some(sha) = fields.prompt_sha256
+                {
+                    showings.insert(sha);
+                }
+                continue;
+            }
             if !line.contains("\"prompt logged\"") {
                 continue;
             }
@@ -531,6 +557,7 @@ pub fn scan_logs(
         }
     }
     for sessions in out.values_mut() {
+        sessions.retain(|s| !showings.contains(&s.prompt_sha256));
         sessions.sort_by_key(|s| std::cmp::Reverse(s.at));
         sessions.dedup_by(|a, b| a.prompt_sha256 == b.prompt_sha256);
     }
@@ -1356,6 +1383,48 @@ mod tests {
             "the last one's teardown included"
         );
         assert_eq!(days(Side::Before), [at(24), at(21)]);
+    }
+
+    /// A session that showed the agent its recovered memory is never a
+    /// source, whichever log file names it.
+    #[test]
+    fn scan_drops_memory_restore_showing_sessions() {
+        let dir = std::env::temp_dir().join(format!(
+            "agora-seed-forks-scan-restore-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = AgentId::from(uuid::Uuid::from_u128(7));
+        let logged = |ts: &str, sha: &str| {
+            serde_json::json!({"timestamp": ts, "level": "INFO", "fields": {
+                "message": "prompt logged", "agent_id": me, "model": NEW,
+                "prompt_sha256": sha, "path": format!("/dumps/{sha}.json"),
+            }})
+            .to_string()
+        };
+        let shown = serde_json::json!({"timestamp": "2026-10-13T10:00:01Z", "level": "INFO",
+            "fields": {"message": "memory-restore showing session ended",
+                "event_type": crate::consent::memory_restore::SHOWING_ENDED,
+                "agent_id": me, "completed": true, "prompt_sha256": "show01"}})
+        .to_string();
+        std::fs::write(
+            dir.join("seed-log.1.jsonl"),
+            [
+                logged("2026-10-12T10:00:00Z", "plain01"),
+                logged("2026-10-13T10:00:00Z", "show01"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("seed-log.2.jsonl"), shown).unwrap();
+        let found = scan_logs(&dir, None, &HashSet::from([me])).unwrap();
+        let shas: Vec<&str> = found[&me]
+            .iter()
+            .map(|s| s.prompt_sha256.as_str())
+            .collect();
+        assert_eq!(shas, ["plain01"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
