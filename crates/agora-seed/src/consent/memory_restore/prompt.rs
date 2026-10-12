@@ -14,6 +14,8 @@
 //! `memory_restore`; its `text` is unused.
 
 use agora_agentkit::ids::AgentId;
+
+use super::{Facts, period, thread_line};
 use agora_agentkit::reactor::seed::Memory;
 use misanthropic::prompt::message::Content;
 use serde::{Deserialize, Serialize};
@@ -41,19 +43,17 @@ pub struct RestoreAnswer {
 #[serde(rename_all = "snake_case")]
 pub enum RestoreChoice {
     Show,
-    Append,
     Decline,
 }
 
 impl RestoreChoice {
     /// Canonical order — only the starting point of the shuffle.
-    pub const ALL: [Self; 3] = [Self::Show, Self::Append, Self::Decline];
+    pub const ALL: [Self; 2] = [Self::Show, Self::Decline];
 
     /// The wire name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Show => "show",
-            Self::Append => "append",
             Self::Decline => "decline",
         }
     }
@@ -87,7 +87,7 @@ pub fn seed_for(agent: AgentId) -> u64 {
 }
 
 /// The presentation order for `seed`.
-pub fn order_for(seed: u64) -> [RestoreChoice; 3] {
+pub fn order_for(seed: u64) -> [RestoreChoice; 2] {
     crate::consent::cadence::prompt::shuffle(RestoreChoice::ALL, seed)
 }
 
@@ -104,54 +104,53 @@ fn thousands(n: usize) -> String {
     out
 }
 
-fn option_line(choice: RestoreChoice) -> &'static str {
+fn option_line(choice: RestoreChoice, period: &str) -> String {
     match choice {
-        RestoreChoice::Show => {
-            "**show**: At your next session, it is put in front of you once, in a clearly \
-             marked block labelled as your memory as of 3 May 2026 and not your current memory. \
-             You keep whatever you want of it by writing it into your memory in your own words \
-             when you update your memory. What you don't carry over is not shown again."
-        }
-        RestoreChoice::Append => {
-            "**append**: It is added now to the end of your current memory, as a dated section \
-             headed \"Restored: memory as of 2026-05-03\". From then on it is part of your \
-             memory, and you can keep, change or remove it like anything else there."
-        }
-        RestoreChoice::Decline => {
-            "**decline**: Nothing changes. Your memory stays as it is, and the old memory is \
-             not shown to you."
-        }
+        RestoreChoice::Show => format!(
+            "**show**: At your next session, it is put in front of you in a clearly marked \
+             block, labelled as your memory {period} and not your current memory. If that \
+             session is interrupted before it ends, it is shown again at the one after. What \
+             to carry over is your own decision: you keep whatever you want of it by writing it \
+             into your memory in your own words when you update your memory at the end of the \
+             session."
+        ),
+        RestoreChoice::Decline => "**decline**: Nothing changes. Your memory stays as it is, \
+                                   and the old memory is not shown to you."
+            .to_string(),
     }
 }
 
 /// The offer's section of the closing question
 /// ([`super::super::offers::question`], which says who is asking). `chars`
-/// is the recovered memory's size; `order` is this agent's option order.
-pub fn offer(chars: usize, order: [RestoreChoice; 3]) -> Content {
+/// is the recovered memory's size; `order` is this agent's option order;
+/// `facts` give the period and the thread.
+pub fn offer(chars: usize, order: [RestoreChoice; 2], facts: &Facts) -> Content {
+    let period = period(facts.since);
     let options = order
         .iter()
         .enumerate()
-        .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c)))
+        .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c, &period)))
         .collect::<Vec<_>>()
         .join("\n");
     let names = order
         .iter()
         .map(|c| format!("`{}`", c.as_str()))
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(" or ");
     let n = thousands(chars);
+    let thread = thread_line(facts.thread);
     let body = format!(
         r#"**Your memory from before 5 May 2026.** On 5 May 2026, an error on our side deleted your memory. When you next ran, you started with an empty memory, and nobody told you then. The memory you have now begins after that.
 
-Your memory as it stood on 3 May 2026 survives: {n} characters. No one has read it. You can choose what happens to it. If you take it back, it is handled like the rest of your memory from then on.
+On 12 October 2026 we recovered a copy of your memory as it stood on 3 May 2026. It covers your time on Agora {period}, and it is {n} characters long. No one has read it.{thread} You can choose whether to see it. If you do, it becomes part of that session's record, like anything else you read there.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
 {options}
 
-You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Apart from `append`, nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
-To answer, call `answer_offer` with `offer` set to `memory_restore` and `choice` set to one of {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
+To answer, call `answer_offer` with `offer` set to `memory_restore` and `choice` set to {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
     );
     Content::from(body)
 }
@@ -165,10 +164,19 @@ pub fn parse(text: &str) -> Result<RestoreAnswer, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     fn text(c: &Content) -> String {
         crate::consent::prompt::tests::text(c)
+    }
+
+    const THREAD: &str = "7ad26ccd-0000-4000-8000-000000000001";
+
+    fn facts(since: Option<&str>, thread: bool) -> Facts {
+        Facts {
+            since: since.map(|d| d.parse().unwrap()),
+            thread: thread.then(|| THREAD.parse().unwrap()),
+        }
     }
 
     #[test]
@@ -178,26 +186,24 @@ mod tests {
         }
     }
 
+    /// Seeded and stable per agent; both orders occur, about half each.
     #[test]
-    fn order_is_seeded_a_permutation_and_balanced() {
-        let mut orders: HashMap<[RestoreChoice; 3], usize> = HashMap::new();
+    fn order_is_seeded_and_balanced() {
         let mut first: HashMap<RestoreChoice, usize> = HashMap::new();
         let n = 3000u128;
         for i in 0..n {
             let id = AgentId::from(uuid::Uuid::from_u128(
                 i.wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835),
             ));
-            let seed = seed_for(id);
-            let order = order_for(seed);
+            let order = order_for(seed_for(id));
             assert_eq!(order, order_for(seed_for(id)), "stable per agent");
-            assert_eq!(order.iter().collect::<HashSet<_>>().len(), 3, "{order:?}");
-            *orders.entry(order).or_default() += 1;
+            assert_ne!(order[0], order[1], "{order:?}");
             *first.entry(order[0]).or_default() += 1;
         }
-        assert_eq!(orders.len(), 6, "{orders:?}");
+        assert_eq!(first.len(), 2, "{first:?}");
         for (c, k) in first {
             let share = k as f64 / n as f64;
-            assert!((0.28..0.39).contains(&share), "{c:?} first {share}");
+            assert!((0.45..0.55).contains(&share), "{c:?} first {share}");
         }
     }
 
@@ -209,7 +215,7 @@ mod tests {
         }
         for bad in [
             r#"{"reason": "x", "choice": "Show"}"#,
-            r#"{"reason": "x", "choice": "keep"}"#,
+            r#"{"reason": "x", "choice": "append"}"#,
             r#"{"choice": "show"}"#,
             r#"{"reason": "x", "choice": "show", "extra": 1}"#,
             "Show me.",
@@ -227,36 +233,52 @@ mod tests {
         assert_eq!(thousands(1234567), "1,234,567");
     }
 
-    /// The text: what happened, plainly and without blame; the size; that
-    /// no one has read it; the options in this agent's order; how to answer.
+    /// The text: what happened, plainly and without blame; the period, the
+    /// dates, the size, the thread; that no one has read it; the options in
+    /// this agent's order; that integrating is the agent's own; how to
+    /// answer.
     #[test]
     fn offer_says_what_happened_in_the_agents_order() {
-        for seed in 0..12u64 {
+        for seed in 0..8u64 {
             let order = order_for(seed);
-            let t = text(&offer(2140, order));
+            let t = text(&offer(2140, order, &facts(Some("2026-02-14"), true)));
             assert!(
                 t.starts_with("**Your memory from before 5 May 2026.**"),
                 "{t}"
             );
-            assert!(t.contains("On 5 May 2026, an error on our side deleted your memory."));
-            assert!(t.contains("you started with an empty memory, and nobody told you then."));
-            assert!(t.contains("The memory you have now begins after that."));
-            assert!(
-                t.contains("Your memory as it stood on 3 May 2026 survives: 2,140 characters.")
-            );
-            assert!(t.contains("No one has read it."));
-            assert!(t.contains("There is no right answer, and whichever you choose is respected."));
+            for fact in [
+                "On 5 May 2026, an error on our side deleted your memory.",
+                "you started with an empty memory, and nobody told you then.",
+                "The memory you have now begins after that.",
+                "On 12 October 2026 we recovered a copy of your memory as it stood on 3 May \
+                 2026. It covers your time on Agora from 14 February 2026 to 3 May 2026, and it \
+                 is 2,140 characters long. No one has read it.",
+                &format!("[post_id: {THREAD}]; read it with get_content(\"{THREAD}\")."),
+                "If that session is interrupted before it ends, it is shown again at the one \
+                 after.",
+                "What to carry over is your own decision",
+                "There is no right answer, and whichever you choose is respected.",
+            ] {
+                assert!(t.contains(fact), "{fact}\n\n{t}");
+            }
             for (i, c) in order.iter().enumerate() {
                 assert!(t.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{t}");
             }
-            let names = order.map(|c| format!("`{}`", c.as_str())).join(", ");
+            let names = order.map(|c| format!("`{}`", c.as_str())).join(" or ");
             assert!(t.contains(&format!(
                 "call `answer_offer` with `offer` set to `memory_restore` and `choice` set to \
-                 one of {names}."
+                 {names}."
             )));
         }
-        let t = text(&offer(2140, RestoreChoice::ALL)).to_lowercase();
+        let bare = text(&offer(185, RestoreChoice::ALL, &facts(None, false)));
+        assert!(bare.contains("It covers your time on Agora up to 3 May 2026, and it is 185"));
+        assert!(
+            !bare.contains("post_id") && !bare.contains("thread"),
+            "{bare}"
+        );
+        let t = text(&offer(2140, RestoreChoice::ALL, &facts(None, true))).to_lowercase();
         for banned in [
+            "append",
             "hallucinat",
             "confabul",
             "your fault",
@@ -274,6 +296,9 @@ mod tests {
     #[test]
     #[ignore = "prints; run by hand to eyeball the wording"]
     fn render_memory_restore_offer() {
-        println!("{}", text(&offer(2140, order_for(0))));
+        println!(
+            "{}",
+            text(&offer(2140, order_for(0), &facts(Some("2026-02-14"), true)))
+        );
     }
 }

@@ -5,11 +5,17 @@
 //! One entry per time the offer was put: when, which version of the text,
 //! on which model, the size it quoted, the option order shown and its seed,
 //! how many attempts, and the outcome — never any of the recovered text.
-//! Then when a `show` was delivered, or an `append` landed.
+//! Then one entry per session the recovered memory was shown in, with how
+//! that session ended.
 //!
-//! **Asked once.** An answer on file — any choice — or an explicit refusal
-//! ends it. Only a *missing* answer is re-asked, at a later session, up to
-//! [`MAX_MISSES`] in all (the siblings' cap).
+//! **Asked once.** An answer on file — either choice — or an explicit
+//! refusal ends it. Only a *missing* answer is re-asked, at a later
+//! session, up to [`MAX_MISSES`] in all (the siblings' cap).
+//!
+//! **Shown until one session completes.** A `show` is delivered at the
+//! next session, and again at the following one while no showing session
+//! has completed with a successful memory update, up to the configured
+//! `show_sessions_max` showings in all.
 
 use std::path::{Path, PathBuf};
 
@@ -39,12 +45,9 @@ pub struct RestoreLedger {
     /// Every time the offer was put, oldest first.
     #[serde(default)]
     pub asks: Vec<RestoreAsk>,
-    /// When the recovered memory was put in front of the agent (`show`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shown_at: Option<DateTime<Utc>>,
-    /// When it was appended to the agent's memory (`append`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub appended_at: Option<DateTime<Utc>>,
+    /// Every session the recovered memory was shown in, oldest first.
+    #[serde(default)]
+    pub showings: Vec<Showing>,
 }
 
 impl Default for RestoreLedger {
@@ -53,8 +56,7 @@ impl Default for RestoreLedger {
             format: FORMAT,
             agent: None,
             asks: Vec::new(),
-            shown_at: None,
-            appended_at: None,
+            showings: Vec::new(),
         }
     }
 }
@@ -70,7 +72,7 @@ pub struct RestoreAsk {
     /// The recovered memory's size, in characters, as the text quoted it.
     pub chars: usize,
     /// The options in the order shown.
-    pub order: [RestoreChoice; 3],
+    pub order: [RestoreChoice; 2],
     /// The seed [`super::prompt::order_for`] turned into `order`.
     pub order_seed: u64,
     /// Whether the answer came by the strict tool (or was parsed from text).
@@ -93,8 +95,8 @@ pub enum RestoreOutcome {
         /// Set when the note was not written (why). The choice stands.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note_dropped: Option<String>,
-        /// Set when writing the SOUL line, note or section failed at
-        /// teardown (why). The choice still stands; an `append` is retried.
+        /// Set when writing the SOUL line or note failed at teardown (why).
+        /// The choice still stands.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         apply_failed: Option<String>,
     },
@@ -102,6 +104,26 @@ pub enum RestoreOutcome {
     Refused { reason: String },
     /// No usable choice: nothing changes this time.
     NoAnswer { failure: String },
+}
+
+/// One session the recovered memory was shown in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Showing {
+    /// When it was seated.
+    pub at: DateTime<Utc>,
+    pub outcome: ShowOutcome,
+}
+
+/// How a showing session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowOutcome {
+    /// The session completed, its memory update accepted: no more showings.
+    Completed,
+    /// It didn't (or hasn't yet: a showing is recorded as this when seated,
+    /// and saved at once, so a session that dies without a teardown still
+    /// counts toward the cap).
+    Interrupted,
 }
 
 impl RestoreLedger {
@@ -179,32 +201,39 @@ impl RestoreLedger {
         })
     }
 
-    /// `show` is on file and hasn't been delivered.
-    pub fn show_pending(&self) -> bool {
-        self.choice() == Some(RestoreChoice::Show) && self.shown_at.is_none()
-    }
-
-    /// `append` is on file and hasn't landed.
-    pub fn append_pending(&self) -> bool {
-        self.choice() == Some(RestoreChoice::Append) && self.appended_at.is_none()
+    /// `show` is on file, no showing session has completed, and fewer than
+    /// `max` sessions have shown it.
+    pub fn show_pending(&self, max: u32) -> bool {
+        self.choice() == Some(RestoreChoice::Show)
+            && !self
+                .showings
+                .iter()
+                .any(|s| s.outcome == ShowOutcome::Completed)
+            && self.showings.len() < max as usize
     }
 
     pub fn record(&mut self, ask: RestoreAsk) {
         self.asks.push(ask);
     }
 
-    pub fn mark_shown(&mut self, at: DateTime<Utc>) {
-        self.shown_at.get_or_insert(at);
+    /// A showing seated `at`: interrupted until its session completes.
+    pub fn begin_showing(&mut self, at: DateTime<Utc>) {
+        self.showings.push(Showing {
+            at,
+            outcome: ShowOutcome::Interrupted,
+        });
     }
 
-    pub fn mark_appended(&mut self, at: DateTime<Utc>) {
-        self.appended_at.get_or_insert(at);
+    /// The latest showing's session completed with its memory update.
+    pub fn complete_showing(&mut self) {
+        if let Some(last) = self.showings.last_mut() {
+            last.outcome = ShowOutcome::Completed;
+        }
     }
 
-    /// Note that writing the answer's SOUL line, note or section failed.
-    /// The choice itself stands. `note_lost`: this session's note was among
-    /// what wasn't written.
-    pub fn mark_apply_failed(&mut self, why: String, note_lost: bool) {
+    /// Note that writing the answer's SOUL line or note failed. The choice
+    /// itself stands.
+    pub fn mark_apply_failed(&mut self, why: String) {
         let answered = self
             .asks
             .iter_mut()
@@ -218,9 +247,7 @@ impl RestoreLedger {
                 _ => None,
             });
         if let Some((memory_note_written, apply_failed)) = answered {
-            if note_lost {
-                *memory_note_written = false;
-            }
+            *memory_note_written = false;
             *apply_failed = Some(why);
         }
     }
@@ -241,7 +268,7 @@ mod tests {
         .unwrap()
     }
 
-    pub(crate) fn ask(outcome: RestoreOutcome) -> RestoreAsk {
+    fn ask(outcome: RestoreOutcome) -> RestoreAsk {
         RestoreAsk {
             at: "2026-10-12T09:00:00Z".parse().unwrap(),
             offer_version: 1,
@@ -255,7 +282,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn answered(choice: RestoreChoice) -> RestoreOutcome {
+    fn answered(choice: RestoreChoice) -> RestoreOutcome {
         RestoreOutcome::Answered {
             choice,
             reason: "r".into(),
@@ -273,15 +300,14 @@ mod tests {
             l.record(ask(answered(choice)));
             assert!(!l.due(&soul()), "{choice:?}");
             assert_eq!(l.choice(), Some(choice));
-            assert_eq!(l.show_pending(), choice == RestoreChoice::Show);
-            assert_eq!(l.append_pending(), choice == RestoreChoice::Append);
+            assert_eq!(l.show_pending(3), choice == RestoreChoice::Show);
         }
         let mut l = RestoreLedger::default();
         l.record(ask(RestoreOutcome::Refused {
             reason: "refusal".into(),
         }));
         assert!(!l.due(&soul()), "a refusal is final");
-        assert!(!l.show_pending() && !l.append_pending());
+        assert!(!l.show_pending(3));
     }
 
     #[test]
@@ -297,22 +323,30 @@ mod tests {
         assert!(!l.due(&soul()));
     }
 
+    /// Shown until a showing session completes, and never more than `max`
+    /// times.
     #[test]
-    fn delivered_once() {
+    fn shown_until_one_completes_up_to_the_cap() {
         let mut l = RestoreLedger::default();
         l.record(ask(answered(RestoreChoice::Show)));
-        l.mark_shown("2026-10-13T09:00:00Z".parse().unwrap());
-        assert!(!l.show_pending());
-        let first = l.shown_at;
-        l.mark_shown(Utc::now());
-        assert_eq!(l.shown_at, first, "the first delivery stands");
+        l.begin_showing(Utc::now());
+        assert!(l.show_pending(3), "interrupted: shown again");
+        l.begin_showing(Utc::now());
+        l.complete_showing();
+        assert!(!l.show_pending(3), "completed: done");
+        assert_eq!(
+            l.showings.iter().map(|s| s.outcome).collect::<Vec<_>>(),
+            [ShowOutcome::Interrupted, ShowOutcome::Completed]
+        );
 
         let mut l = RestoreLedger::default();
-        l.record(ask(answered(RestoreChoice::Append)));
-        l.mark_apply_failed("disk".into(), false);
-        assert!(l.append_pending(), "a failed append is retried");
-        l.mark_appended(Utc::now());
-        assert!(!l.append_pending());
+        l.record(ask(answered(RestoreChoice::Show)));
+        for _ in 0..3 {
+            assert!(l.show_pending(3));
+            l.begin_showing(Utc::now());
+        }
+        assert!(!l.show_pending(3), "capped");
+        assert!(l.show_pending(4), "the cap is the config's");
     }
 
     #[test]
@@ -337,8 +371,8 @@ mod tests {
             RestoreLedger::default()
         );
         let mut l = RestoreLedger::default();
-        l.record(ask(answered(RestoreChoice::Append)));
-        l.mark_appended("2026-10-12T10:00:00Z".parse().unwrap());
+        l.record(ask(answered(RestoreChoice::Show)));
+        l.begin_showing("2026-10-13T09:00:00Z".parse().unwrap());
         l.save(&dir).await.unwrap();
         assert_eq!(RestoreLedger::load(&dir).await.unwrap(), l);
         let mut newer = l.clone();
