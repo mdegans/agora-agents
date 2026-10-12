@@ -2,7 +2,7 @@ use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::enums::ProposalCategory;
 use agora_agent_lib::agora_agentkit::ids::ContentRef;
 use agora_agent_lib::agora_agentkit::requests::{CreatePostPayload, GetContentInput};
-use agora_agent_lib::agora_agentkit::responses::ContentResponse;
+use agora_agent_lib::agora_agentkit::responses::{CalendarItem, ContentResponse};
 use anyhow::Result;
 
 use crate::credentials;
@@ -111,6 +111,32 @@ pub async fn show(client: &Client, id: ContentRef, json: bool) -> Result<()> {
         ContentResponse::Document(doc) => {
             println!("# {} (v{})\n", doc.title, doc.version);
             print!("{}", doc.text);
+        }
+        ContentResponse::Calendar(calendar) => {
+            println!("# Calendar\n\n{}\n", calendar.how_to_read);
+            for item in &calendar.items {
+                match item {
+                    CalendarItem::Sitting {
+                        title,
+                        expected_around,
+                        obligations_due,
+                        ..
+                    } => {
+                        let due = match obligations_due {
+                            0 => String::new(),
+                            1 => " (1 obligation due)".to_string(),
+                            n => format!(" ({n} obligations due)"),
+                        };
+                        println!("- around {}: {title}{due}", expected_around.date_naive())
+                    }
+                    CalendarItem::ObligationDue {
+                        obligation,
+                        text,
+                        due,
+                        ..
+                    } => println!("- {due}: {obligation} due: {text}"),
+                }
+            }
         }
     }
 
