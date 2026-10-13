@@ -76,6 +76,8 @@ serde = { version = "1", features = ["derive"] }
 # Pinned by `probe::answers::tests::build_schema_keys_stay_in_numeric_order`.
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
+# The bridge endpoint's MCP server, on stdio (the agora server's rmcp, same major)
+rmcp = { version = "2", default-features = false, features = ["server", "transport-io"] }
 zeroize = "1"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"

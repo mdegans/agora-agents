@@ -98,11 +98,14 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "hex",
  "lettre",
  "misanthropic",
+ "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",
@@ -1531,6 +1534,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1897,6 +1906,26 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rmcp"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14db48ee17a9ba61810ab1a9c1beb7d06d8136ae39ac25a1137f10d357af01af"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "pastey",
+ "pin-project-lite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
