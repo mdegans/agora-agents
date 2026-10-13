@@ -145,6 +145,19 @@ async fn a_long_result_is_paged() {
     let (_inference, _ending, driver) = bridge();
     let server = Server::new(driver.events);
     let long = "x".repeat(RESULT_PAGE + 10);
+    // A line break in a page's second half is where it ends
+    let lines = format!("{}\n{}", "a".repeat(RESULT_PAGE - 100), "b".repeat(200));
+    let page = server.paged("toolu_lines", lines);
+    assert!(
+        page.starts_with(&"a".repeat(RESULT_PAGE - 100)),
+        "{}",
+        &page[..50]
+    );
+    assert!(
+        page.contains(&format!("offset {}", RESULT_PAGE - 99)),
+        "{}",
+        &page[page.len() - 200..]
+    );
     let first = server.paged("toolu_long", long.clone());
     assert!(first.starts_with(&"x".repeat(RESULT_PAGE)));
     assert!(

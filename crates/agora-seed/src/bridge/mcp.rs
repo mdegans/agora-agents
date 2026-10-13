@@ -764,8 +764,15 @@ mod tests;
 /// One page of a long result, saying where it continues
 fn page_of(full: &str, call: &str, offset: usize) -> String {
     let total = full.chars().count();
-    let page: String = full.chars().skip(offset).take(RESULT_PAGE).collect();
-    let end = (offset + RESULT_PAGE).min(total);
+    let mut page: String = full.chars().skip(offset).take(RESULT_PAGE).collect();
+    // End a page at its last line break, when there is one in its second
+    // half, so a line (an id) is not split across pages
+    if offset + RESULT_PAGE < total
+        && let Some(cut) = page.rfind('\n').filter(|&i| i > page.len() / 2)
+    {
+        page.truncate(cut + 1);
+    }
+    let end = offset + page.chars().count();
     match end < total {
         true => format!(
             "{page}\n\n[bridge] Characters {offset} to {end} of {total} of this result \
