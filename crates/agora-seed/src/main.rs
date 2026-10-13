@@ -1324,8 +1324,11 @@ async fn run(held: &mut Held) -> Result<()> {
         alerts.validate()?;
     }
 
-    let data_dir = match &config.data_dir {
-        Some(d) => d.clone(),
+    // The flag wins over the config, as for `--consent-queue`: until
+    // 2026-10-13 a `--data-dir` given with `--config` was silently ignored,
+    // and the run used the config's (by default the fleet's) tree
+    let data_dir = match args.data_dir.clone().or_else(|| config.data_dir.clone()) {
+        Some(d) => d,
         None => dirs::home_dir()
             .context("no home directory")?
             .join("agents/agora"),
