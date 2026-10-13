@@ -483,6 +483,9 @@ pub struct ConsentAgent<A> {
     /// This session's journal of its writes ([`crate::interrupted`]); `None`
     /// when it couldn't be read, and then it is neither written nor cleared.
     journal: Option<SessionJournal>,
+    /// A notice was due but held back (a trial review session, which can't
+    /// act on it): the journal outlives this session's save.
+    notice_held: bool,
     /// The offer whose trial review this session is for: asked first,
     /// with the act phase skipped (see [`ConsentAgent::seat_review`]).
     review: Option<OfferKey>,
@@ -848,18 +851,19 @@ where
             ),
         }
         if notice.is_some() {
-            Self::log_interrupted(self.inner.id(), &leftover);
+            Self::log_interrupted(self.inner.id(), &leftover, self.review.is_some());
         }
         notice
     }
 
-    fn log_interrupted(agent_id: AgentId, leftover: &Journal) {
+    fn log_interrupted(agent_id: AgentId, leftover: &Journal, held: bool) {
         tracing::info!(
             event_type = "interrupted_session_notice",
             agent_id = %agent_id,
             sessions = leftover.interrupted().count(),
             writes = leftover.writes(),
-            "interrupted session noticed to the agent"
+            held,
+            "interrupted session noticed to the agent (or held for its next act session)"
         );
     }
 
@@ -3110,6 +3114,7 @@ where
             known_comments: HashSet::new(),
             writes: Vec::new(),
             journal: None,
+            notice_held: false,
             review: None,
             reviewed: false,
             seen_before_review: None,
@@ -3268,9 +3273,15 @@ where
             self.known_posts = ledger.created_posts.clone();
             self.known_comments = ledger.created_comments.clone();
         }
+        // Not in a trial review: it has no act phase to read the writes in,
+        // and the notice would sit before the review's answer. It waits.
         if let Some(notice) = interrupted {
-            let (_, prompt) = self.inner.parts();
-            Self::seat_user(prompt, Content::from(notice))?;
+            if self.review.is_some() {
+                self.notice_held = true;
+            } else {
+                let (_, prompt) = self.inner.parts();
+                Self::seat_user(prompt, Content::from(notice))?;
+            }
         }
         if let Some(key) = self.review.clone() {
             self.seat_review(key).await?;
@@ -3352,6 +3363,7 @@ where
     async fn on_saved(&mut self) -> Result<(), A::Error> {
         let result = self.inner.on_saved().await;
         if let Some(journal) = &self.journal
+            && !self.notice_held
             && let Err(e) = journal.clear().await
         {
             tracing::warn!(
@@ -6771,6 +6783,43 @@ mod tests {
         assert!(path.is_dir(), "left alone");
     }
 
+    /// A trial review session can't act on the notice: it is held, and the
+    /// journal outlives that session's save for the next one to show.
+    #[tokio::test]
+    async fn a_review_session_holds_the_notice_for_the_next() {
+        let h = journal_harness("journal-review");
+        through_the_trial(&h).await;
+        let post = PostId::new();
+        journal_of(&h)
+            .append(
+                &Written::Post(PostWrite {
+                    at: Utc::now(),
+                    id: post,
+                })
+                .into(),
+            )
+            .await
+            .unwrap();
+        let mut review = review_session(&h).await;
+        assert!(
+            !intro(&review).contains("Interrupted"),
+            "{}",
+            intro(&review)
+        );
+        assert!(review.notice_held);
+        review.on_saved().await.unwrap();
+        assert!(journal_of(&h).path().exists(), "kept past the review");
+
+        // (Another model: on OLD the unanswered review is asked again.)
+        let mut next = h.agent(JOURNAL_MODEL, true);
+        next.on_init().await.unwrap();
+        assert!(
+            intro(&next).contains(&format!("you wrote post {}.", short(post))),
+            "{}",
+            intro(&next)
+        );
+    }
+
     /// The notice goes first in what the runner seats after the intro, and
     /// leaves the cohort-shared prefix (tools, system prompt) as it was.
     #[tokio::test]
@@ -6803,6 +6852,19 @@ mod tests {
     /// The drill's agents: every other one of the first `DRILL_AGENTS`
     /// (default 200) in id order writes before it is killed.
     fn drill_ids(data: &std::path::Path) -> Vec<AgentId> {
+        // Never the live fleet: the drill saves Fake sessions over what it runs.
+        let data = data.canonicalize().unwrap();
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        let live = home
+            .join("agents")
+            .canonicalize()
+            .unwrap_or(home.join("agents"));
+        assert!(
+            !data.starts_with(&live),
+            "DRILL_DATA {} is under {}: use a cp -a copy",
+            data.display(),
+            live.display()
+        );
         let n: usize = std::env::var("DRILL_AGENTS")
             .ok()
             .and_then(|n| n.parse().ok())

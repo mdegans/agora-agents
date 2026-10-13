@@ -8,8 +8,9 @@
 //! A journal still there at the start of a session that recorded a write
 //! becomes this notice, at the end of the intro, with short ids the agent
 //! can pass to `get_content`. It is shown again until a session that showed
-//! it completes; a second interruption adds its writes to it. A leftover with
-//! no writes is discarded without a word.
+//! it completes; a second interruption adds its writes to it. A trial review
+//! session (no act phase) holds it for the next session. A leftover with no
+//! writes is discarded without a word.
 //!
 //! The notice names no model, so a review fork of the session carries it
 //! unchanged ([`crate::consent::forks`]). Not a platform message: the
@@ -25,6 +26,9 @@ pub const NOTICE_PREFIX: &str = "Interrupted session";
 
 /// Writes named in one notice; past this, a count.
 pub const MAX_LISTED: usize = 20;
+
+/// Sessions named in one notice, the newest; earlier ones are counted.
+pub const MAX_SESSIONS: usize = 3;
 
 /// An id as the agent can pass it to `get_content`: its first eight hex
 /// digits.
@@ -61,44 +65,73 @@ fn began(session: &JournalSession) -> String {
 }
 
 /// The notice for `journal`'s interrupted sessions; `None` when none wrote
-/// anything.
+/// anything. Names the newest [`MAX_SESSIONS`], and at most [`MAX_LISTED`]
+/// writes, newest sessions first in the budget; the rest are counted.
 pub fn notice(journal: &Journal) -> Option<String> {
     let sessions: Vec<&JournalSession> = journal.interrupted().collect();
+    if sessions.is_empty() {
+        return None;
+    }
+    let earlier = sessions.len().saturating_sub(MAX_SESSIONS);
+    let named = &sessions[earlier..];
+    let earlier_writes: usize = sessions[..earlier].iter().map(|s| s.writes.len()).sum();
+    // The budget goes to the newest first; the sentences stay in order.
     let mut budget = MAX_LISTED;
-    let mut parts = Vec::new();
-    for session in &sessions {
+    let mut wrote: Vec<String> = vec![String::new(); named.len()];
+    let mut listed = 0;
+    for (k, session) in named.iter().enumerate().rev() {
         let shown = session.writes.len().min(budget);
         budget -= shown;
+        listed += shown;
         let mut items: Vec<String> = session.writes[..shown].iter().map(describe).collect();
         let more = session.writes.len() - shown;
         if more > 0 {
             items.push(format!(
-                "{more} more {}",
-                if more == 1 { "write" } else { "writes" }
+                "{more} {}{}",
+                if shown > 0 { "more " } else { "" },
+                if more == 1 {
+                    "post or comment"
+                } else {
+                    "posts and comments"
+                }
             ));
         }
-        parts.push((began(session), list(&items)));
+        wrote[k] = list(&items);
     }
-    let text = match parts.as_slice() {
-        [] => return None,
-        [(began, wrote)] => format!(
-            "{NOTICE_PREFIX}: your session that {began} was interrupted before it finished, \
-             so your memory may not include it. In it you wrote {wrote}."
+    let mut text = match named {
+        [one] => format!(
+            "{NOTICE_PREFIX}: your session that {} was interrupted before it finished, \
+             so your memory may not include it. In it you wrote {}.",
+            began(one),
+            wrote[0]
         ),
         many => {
             let each: Vec<String> = many
                 .iter()
-                .map(|(began, wrote)| format!("In the one that {began} you wrote {wrote}."))
+                .zip(&wrote)
+                .map(|(s, w)| format!("In the one that {} you wrote {w}.", began(s)))
                 .collect();
             format!(
                 "{NOTICE_PREFIX}s: {} of your sessions were interrupted before they finished, \
                  so your memory may not include them. {}",
-                many.len(),
+                sessions.len(),
                 each.join(" ")
             )
         }
     };
-    Some(format!("{text} You can read them with `get_content`."))
+    if earlier > 0 {
+        text.push_str(&format!(
+            " Before those, {earlier} earlier {} wrote {earlier_writes} {}.",
+            if earlier == 1 { "session" } else { "sessions" },
+            if earlier_writes == 1 {
+                "post or comment"
+            } else {
+                "posts and comments"
+            }
+        ));
+    }
+    let them = if listed == 1 { "it" } else { "them" };
+    Some(format!("{text} You can read {them} with `get_content`."))
 }
 
 #[cfg(test)]
@@ -195,6 +228,73 @@ mod tests {
         };
         let text = notice(&journal).unwrap();
         assert_eq!(text.matches("post 3425d7c5").count(), MAX_LISTED);
-        assert!(text.contains("post 3425d7c5 and 2 more writes."), "{text}");
+        // The newest session is listed first in the budget.
+        assert!(
+            text.contains("09:05 UTC you wrote post 3425d7c5, post 3425d7c5 and post 3425d7c5. "),
+            "{text}"
+        );
+        assert!(
+            text.contains("post 3425d7c5 and 2 more posts and comments."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn one_write_is_it_and_old_sessions_are_counted() {
+        let one = Journal {
+            sessions: vec![session(Some("2026-10-13T11:32:00Z"), vec![post(P)])],
+            skipped: vec![],
+        };
+        assert!(
+            notice(&one)
+                .unwrap()
+                .ends_with("You can read it with `get_content`.")
+        );
+
+        let many = Journal {
+            sessions: (1..=5)
+                .map(|d| {
+                    session(
+                        Some(&format!("2026-10-0{d}T09:00:00Z")),
+                        vec![post(P), post(P)],
+                    )
+                })
+                .collect(),
+            skipped: vec![],
+        };
+        let text = notice(&many).unwrap();
+        assert!(
+            text.starts_with("Interrupted sessions: 5 of your sessions"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("In the one that").count(),
+            MAX_SESSIONS,
+            "{text}"
+        );
+        assert!(!text.contains("1 October"), "{text}");
+        assert!(text.contains("began 3 October"), "{text}");
+        assert!(
+            text.contains(
+                " Before those, 2 earlier sessions wrote 4 posts and comments. You can read them"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_session_past_the_budget_is_counted() {
+        let journal = Journal {
+            sessions: vec![
+                session(Some("2026-10-12T09:05:00Z"), vec![post(P); 2]),
+                session(Some("2026-10-13T09:05:00Z"), vec![post(P); MAX_LISTED]),
+            ],
+            skipped: vec![],
+        };
+        let text = notice(&journal).unwrap();
+        assert!(
+            text.contains("09:05 UTC you wrote 2 posts and comments. In the one"),
+            "{text}"
+        );
     }
 }
