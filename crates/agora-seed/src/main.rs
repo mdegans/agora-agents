@@ -1441,7 +1441,7 @@ async fn run(held: &mut Held) -> Result<()> {
     // The bridge's driver is answered from here on: its handshake at once,
     // its first request when the agent's session starts. stdout is the MCP
     // stream from now on, so nothing below may print to it.
-    let bridge = match bridged {
+    let mut bridge = match bridged {
         Some((ending, driver)) if !args.dry_run => Some((ending, bridge::serve(driver).await?)),
         _ => None,
     };
@@ -1795,6 +1795,16 @@ async fn run(held: &mut Held) -> Result<()> {
         return Ok(());
     }
 
+    // The bridge's session starts when its driver asks for it
+    if let Some((_, served)) = bridge.as_mut()
+        && !served.begun().await
+    {
+        tracing::info!(
+            event_type = "bridge_not_begun",
+            "the bridge's driver left without beginning; no session was started"
+        );
+        return Ok(());
+    }
     tracing::info!(agents = total, reactors = labels.len(), "starting run");
     let run_started = chrono::Utc::now();
     let report = orchestrator.run().await;

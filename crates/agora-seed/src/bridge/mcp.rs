@@ -33,10 +33,6 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use super::{Driver, Event, MODEL_ID, Request, render};
 
-/// How long `tools/list` waits for the agent's tools before answering
-/// with the bridge's own; the rest follow with a `list_changed`
-const LIST_WAIT: Duration = Duration::from_secs(20);
-
 /// How long the runner waits, once the run is over, for the driver to read
 /// the ending and disconnect
 const DISCONNECT_WAIT: Duration = Duration::from_secs(120);
@@ -57,8 +53,9 @@ You are driving one Agora seed agent through the runner's bridge: you stand \
 where its model would. The runner assembles the agent's prompt, runs its \
 tools and keeps its memory exactly as for any seed agent.
 
-- Call bridge_begin first: it returns the system prompt and the first \
-message, as the agent's model would receive them.
+- Call bridge_begin first: it starts the session, and returns the system \
+prompt and the first message as the agent's model would receive them. The \
+agent's own tools appear once the session has begun.
 - The other tools without the bridge_ prefix are the agent's own. Calls \
 you make together (in one message) are one turn, as parallel tool calls \
 are for a model; each returns that tool's result. Whatever else the \
@@ -75,9 +72,21 @@ model, in pages.";
 /// The bridge's MCP service, running
 pub struct Served {
     gone: watch::Receiver<bool>,
+    begun: watch::Receiver<bool>,
 }
 
 impl Served {
+    /// Wait for the driver to call `bridge_begin`: `true` when it has, and
+    /// `false` when it left without. The session starts only then, so a
+    /// driver that connects and leaves (a finished Claude Code subagent is
+    /// reconnected whenever someone talks to it) starts no session.
+    pub async fn begun(&mut self) -> bool {
+        tokio::select! {
+            begun = self.begun.wait_for(|b| *b) => begun.is_ok(),
+            _ = self.gone.wait_for(|g| *g) => false,
+        }
+    }
+
     /// Wait, a while at most, for the driver to disconnect
     pub async fn disconnected(mut self) {
         let _ = tokio::time::timeout(DISCONNECT_WAIT, self.gone.wait_for(|gone| *gone)).await;
@@ -90,12 +99,14 @@ impl Served {
 pub async fn serve(driver: Driver) -> anyhow::Result<Served> {
     let Driver { events, gone } = driver;
     let server = Server::new(events);
+    let begun = server.inner.begun.subscribe();
     let service: RunningService<RoleServer, Server> =
         server.clone().serve(rmcp::transport::stdio()).await?;
     let peer = service.peer().clone();
     tokio::spawn(async move { server.discover(peer).await });
     let served = Served {
         gone: gone.subscribe(),
+        begun,
     };
     tokio::spawn(async move {
         let reason = service.waiting().await;
@@ -118,6 +129,8 @@ struct Inner {
     /// The agent's tools and the bridge's, once the first request shows
     /// the agent's
     tools: watch::Sender<Option<Arc<Vec<Tool>>>>,
+    /// Whether the driver has called `bridge_begin`
+    begun: watch::Sender<bool>,
 }
 
 struct Session {
@@ -242,6 +255,7 @@ impl Server {
                 round: SyncMutex::new(None),
                 raw: SyncMutex::new(None),
                 tools: watch::Sender::new(None),
+                begun: watch::Sender::new(false),
             }),
         }
     }
@@ -286,13 +300,15 @@ impl Server {
         }
     }
 
-    /// The tools, waiting a while for the agent's
-    async fn listed_tools(&self) -> Vec<Tool> {
-        let mut known = self.inner.tools.subscribe();
-        match tokio::time::timeout(LIST_WAIT, known.wait_for(Option::is_some)).await {
-            Ok(Ok(tools)) => tools.as_ref().map(|t| t.to_vec()).unwrap_or_default(),
-            _ => bridge_tools(),
-        }
+    /// The tools: the bridge's own until the session has begun and shown
+    /// the agent's, which then follow with a `list_changed`
+    fn listed_tools(&self) -> Vec<Tool> {
+        self.inner
+            .tools
+            .borrow()
+            .as_ref()
+            .map(|t| t.to_vec())
+            .unwrap_or_else(bridge_tools)
     }
 
     fn is_agent_tool(&self, name: &str) -> bool {
@@ -304,6 +320,7 @@ impl Server {
     }
 
     async fn begin(&self) -> CallToolResult {
+        self.inner.begun.send_replace(true);
         let mut session = self.inner.session.lock().await;
         match session.wait().await {
             Ok(request) => {
@@ -628,7 +645,7 @@ impl ServerHandler for Server {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.listed_tools().await))
+        Ok(ListToolsResult::with_all_items(self.listed_tools()))
     }
 
     async fn call_tool(

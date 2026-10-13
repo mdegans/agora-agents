@@ -136,3 +136,28 @@ async fn a_driver_that_disconnects_fails_the_request_rather_than_hanging() {
         Err(crate::bridge::BridgeError::Disconnected)
     ));
 }
+
+#[tokio::test]
+async fn nothing_starts_until_the_driver_begins() {
+    let (inference, _ending, driver) = bridge();
+    let server = Server::new(driver.events);
+    let begun = server.inner.begun.subscribe();
+    // Before bridge_begin: the bridge's own tools only, and no session
+    let names: Vec<String> = server
+        .listed_tools()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(names, [BEGIN, REPLY, RAW]);
+    assert!(!*begun.borrow());
+
+    let reactor = tokio::spawn(async move {
+        inference
+            .infer(request(json!([{"role": "user", "content": "Hello."}])))
+            .await
+    });
+    let first = text(&server.begin().await);
+    assert!(first.contains("Hello."));
+    assert!(*begun.borrow(), "bridge_begin starts the session");
+    reactor.abort();
+}
