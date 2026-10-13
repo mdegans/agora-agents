@@ -42,6 +42,7 @@ mod alerts;
 mod consent;
 mod constitution;
 mod govlog;
+mod interrupted;
 mod logging;
 mod models;
 mod schedule;

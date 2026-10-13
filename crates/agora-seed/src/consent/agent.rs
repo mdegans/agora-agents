@@ -75,6 +75,12 @@
 //! after one. Each post or comment the session wrote is logged as a
 //! `write_recorded` event at teardown, with the dump's `prompt_sha256`.
 //!
+//! **The session journal** ([`crate::interrupted`]): each write is also
+//! appended to the agent's journal as the turn that made it ends, and the
+//! journal is removed in [`Agent::on_saved`]. One left by a session that
+//! never saved, if it recorded a write, is noticed to the agent at the end
+//! of the intro, before anything else seated there.
+//!
 //! **The role offer** ([`super::role`]) is put at the same point, in a
 //! session where the model-swap half did nothing — no offer, switch,
 //! review, trial end or retried change, and not mid-trial. Its answer is applied at
@@ -130,6 +136,9 @@ use std::collections::HashSet;
 
 use agora_agentkit::ids::{AgentId, CommentId, ContactRequestId, PostId};
 use agora_agentkit::reactor::inference::Quirks;
+use agora_agentkit::reactor::journal::{
+    CommentWrite, Journal, PostWrite, SessionHeader, SessionJournal, Written,
+};
 use agora_agentkit::reactor::seed::{Memory, SeedAgent, SeedState, Soul};
 use agora_agentkit::reactor::{Agent, Control, Epilogue, Outcome, seat_unused_reply};
 use chrono::{DateTime, Utc};
@@ -470,7 +479,10 @@ pub struct ConsentAgent<A> {
     known_posts: HashSet<PostId>,
     known_comments: HashSet<CommentId>,
     /// This session's writes, logged as `write_recorded` at teardown.
-    writes: Vec<Write>,
+    writes: Vec<Written>,
+    /// This session's journal of its writes ([`crate::interrupted`]); `None`
+    /// when it couldn't be read, and then it is neither written nor cleared.
+    journal: Option<SessionJournal>,
     /// The offer whose trial review this session is for: asked first,
     /// with the act phase skipped (see [`ConsentAgent::seat_review`]).
     review: Option<OfferKey>,
@@ -532,14 +544,6 @@ pub struct ConsentAgent<A> {
     closed: bool,
     /// The inner epilogue (the survey) has been begun.
     epilogue: bool,
-}
-
-/// A post or comment written this session.
-#[derive(Debug, Clone, Copy)]
-struct Write {
-    at: DateTime<Utc>,
-    kind: &'static str,
-    id: uuid::Uuid,
 }
 
 impl<A> ConsentAgent<A>
@@ -755,32 +759,108 @@ where
             || self.slot.lock().expect("slot lock").is_some()
     }
 
-    /// Note posts and comments written since the last look.
-    fn note_writes(&mut self) {
-        let (posts, comments) = {
+    /// Note posts and comments written since the last look, and journal
+    /// them ([`crate::interrupted`]).
+    async fn note_writes(&mut self) {
+        let (posts, comments, on) = {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
+            let on: std::collections::HashMap<CommentId, PostId> =
+                ledger.post_comments.iter().map(|(p, c)| (*c, *p)).collect();
             (
                 ledger.created_posts.clone(),
                 ledger.created_comments.clone(),
+                on,
             )
         };
-        let now = Utc::now();
+        let at = Utc::now();
+        let first = self.writes.len();
         for id in posts.difference(&self.known_posts) {
-            self.writes.push(Write {
-                at: now,
-                kind: "post",
-                id: *id.as_uuid(),
-            });
+            self.writes.push(Written::Post(PostWrite { at, id: *id }));
         }
         for id in comments.difference(&self.known_comments) {
-            self.writes.push(Write {
-                at: now,
-                kind: "comment",
-                id: *id.as_uuid(),
-            });
+            self.writes.push(Written::Comment(CommentWrite {
+                at,
+                id: *id,
+                on: on.get(id).copied(),
+            }));
         }
         self.known_posts = posts;
         self.known_comments = comments;
+        if let Some(journal) = &self.journal {
+            for write in &self.writes[first..] {
+                if let Err(e) = journal.append(&(*write).into()).await {
+                    tracing::warn!(
+                        agent_id = %self.inner.id(),
+                        path = %journal.path().display(),
+                        error = %e,
+                        "session journal append failed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The inner agent's turn, then its writes noted (and journaled) however
+    /// the turn ended.
+    async fn handle_inner(&mut self, response: response::Message) -> Result<Control, A::Error> {
+        let control = self.inner.handle(response).await;
+        self.note_writes().await;
+        control
+    }
+
+    /// Read the journal a session left unsaved, begin this session's, and
+    /// return the notice due ([`crate::interrupted`]). Never fatal: a journal
+    /// that can't be read is left alone, and this session keeps none.
+    async fn open_journal(&mut self) -> Option<String> {
+        let journal = SessionJournal::in_dir(self.agent_dir());
+        let leftover = match journal.read().await {
+            Ok(leftover) => leftover,
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %journal.path().display(),
+                    error = %e,
+                    "session journal unreadable; left alone, none kept this session"
+                );
+                return None;
+            }
+        };
+        if !leftover.skipped.is_empty() {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                path = %journal.path().display(),
+                skipped = leftover.skipped.len(),
+                "session journal lines unreadable; skipped"
+            );
+        }
+        let notice = crate::interrupted::notice(&leftover);
+        let header = SessionHeader {
+            started_at: self.started,
+            model: self.model(),
+        };
+        match journal.begin(header, &leftover).await {
+            Ok(()) => self.journal = Some(journal),
+            Err(e) => tracing::warn!(
+                agent_id = %self.inner.id(),
+                path = %journal.path().display(),
+                error = %e,
+                "session journal not begun; none kept this session"
+            ),
+        }
+        if notice.is_some() {
+            Self::log_interrupted(self.inner.id(), &leftover);
+        }
+        notice
+    }
+
+    fn log_interrupted(agent_id: AgentId, leftover: &Journal) {
+        tracing::info!(
+            event_type = "interrupted_session_notice",
+            agent_id = %agent_id,
+            sessions = leftover.interrupted().count(),
+            writes = leftover.writes(),
+            "interrupted session noticed to the agent"
+        );
     }
 
     /// One `write_recorded` per write, tagged with the dump that holds the
@@ -796,14 +876,18 @@ where
             .ok();
         let model = self.model();
         for w in &self.writes {
+            let (kind, id) = match w {
+                Written::Post(p) => ("post", p.id.to_string()),
+                Written::Comment(c) => ("comment", c.id.to_string()),
+            };
             tracing::info!(
                 event_type = "write_recorded",
                 agent = %self.inner.state().soul.name,
                 agent_id = %self.inner.id(),
-                kind = w.kind,
-                id = %w.id,
+                kind,
+                id,
                 model = %model,
-                written_at = %w.at,
+                written_at = %w.at(),
                 prompt_sha256 = prompt_sha256.as_deref(),
                 "write recorded"
             );
@@ -3025,6 +3109,7 @@ where
             known_posts: HashSet::new(),
             known_comments: HashSet::new(),
             writes: Vec::new(),
+            journal: None,
             review: None,
             reviewed: false,
             seen_before_review: None,
@@ -3173,6 +3258,7 @@ where
             }
         }
         self.load_restore(&dir).await;
+        let interrupted = self.open_journal().await;
         let early = set_model.is_some();
         self.inner.on_init().await?;
         self.apply_model_effort();
@@ -3181,6 +3267,10 @@ where
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
             self.known_posts = ledger.created_posts.clone();
             self.known_comments = ledger.created_comments.clone();
+        }
+        if let Some(notice) = interrupted {
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(prompt, Content::from(notice))?;
         }
         if let Some(key) = self.review.clone() {
             self.seat_review(key).await?;
@@ -3238,12 +3328,7 @@ where
                 attempt,
             } => self.answer(due, constrained, attempt, response).await?,
             Phase::Offers { open } => self.answer_offers(open, response).await?,
-            Phase::Inner => match self
-                .inner
-                .handle(response)
-                .await
-                .inspect(|_| self.note_writes())?
-            {
+            Phase::Inner => match self.handle_inner(response).await? {
                 DONE if !self.closed => {
                     self.closed = true;
                     self.close().await?.unwrap_or(DONE)
@@ -3262,6 +3347,23 @@ where
         self.inner.stall_reason()
     }
 
+    /// The session is complete and saved: its journal, and any notice shown
+    /// from an earlier one, are done with.
+    async fn on_saved(&mut self) -> Result<(), A::Error> {
+        let result = self.inner.on_saved().await;
+        if let Some(journal) = &self.journal
+            && let Err(e) = journal.clear().await
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                path = %journal.path().display(),
+                error = %e,
+                "session journal not removed after the save"
+            );
+        }
+        result
+    }
+
     /// Inner teardown (which redacts an anonymous survey, then archives the
     /// transcript, questions included),
     /// then the SOUL changelog (served by [`state`](Agent::state) for the
@@ -3269,7 +3371,7 @@ where
     async fn on_teardown(&mut self) -> Result<(), A::Error> {
         let result = self.inner.on_teardown().await;
         self.alert_contact_request();
-        self.note_writes();
+        self.note_writes().await;
         self.log_writes();
         self.take_self_switch();
         self.patched = self.patch_soul();
@@ -3519,6 +3621,9 @@ mod tests {
         survey: bool,
         /// The contact request its teardown "filed"
         contact: Option<ContactRequestId>,
+        /// Each response "writes" a post and a comment on it, as the
+        /// `agora` tool would record them (the kill drill).
+        writes: bool,
     }
 
     impl ContactRequests for Fake {
@@ -3565,6 +3670,7 @@ mod tests {
                 held: false,
                 survey: false,
                 contact: None,
+                writes: false,
             })
         }
         fn id(&self) -> AgentId {
@@ -3596,6 +3702,14 @@ mod tests {
         }
         async fn handle(&mut self, response: response::Message) -> Result<Control, SeedError> {
             self.state.prompt.push_message(response.inner).unwrap();
+            if std::mem::take(&mut self.writes) {
+                let (post, comment) = (PostId::new(), CommentId::new());
+                let mut ledger = self.state.ledger.write().unwrap();
+                ledger.created_posts.insert(post);
+                ledger.created_comments.insert(comment);
+                ledger.commented_posts.insert(post);
+                ledger.post_comments.insert(post, comment);
+            }
             Ok(Control::Done(Outcome::Complete))
         }
         async fn on_quiesce(&mut self, _: &response::Message) -> Result<Control, SeedError> {
@@ -6397,6 +6511,594 @@ mod tests {
             )]
         );
         assert!(cadence_ledger(&h).await.chose_switch());
+    }
+
+    // --- The session journal (interrupted sessions) --------------------------
+
+    const JOURNAL_MODEL: &str = "cogito-32b.gguf";
+
+    /// A harness whose agent has its state directory, as every live agent
+    /// does (the journal is never what creates it).
+    fn journal_harness(tag: &str) -> Harness {
+        let h = Harness::new(tag);
+        std::fs::create_dir_all(h.rt.state_dir.join(h.id.to_string())).unwrap();
+        h
+    }
+
+    fn journal_of(h: &Harness) -> SessionJournal {
+        SessionJournal::in_dir(h.rt.state_dir.join(h.id.to_string()))
+    }
+
+    async fn journal(h: &Harness) -> Journal {
+        journal_of(h).read().await.unwrap()
+    }
+
+    /// A post, as the `agora` tool records one in the shared ledger.
+    fn write_post(agent: &ConsentAgent<Fake>) -> PostId {
+        let id = PostId::new();
+        agent
+            .inner
+            .state
+            .ledger
+            .write()
+            .unwrap()
+            .created_posts
+            .insert(id);
+        id
+    }
+
+    /// A top-level comment on `on`, as the `agora` tool records one.
+    fn write_comment(agent: &ConsentAgent<Fake>, on: PostId) -> CommentId {
+        let id = CommentId::new();
+        let mut ledger = agent.inner.state.ledger.write().unwrap();
+        ledger.created_comments.insert(id);
+        ledger.commented_posts.insert(on);
+        ledger.post_comments.insert(on, id);
+        id
+    }
+
+    fn short(id: impl std::fmt::Display) -> String {
+        id.to_string()[..8].to_string()
+    }
+
+    /// The text seated at the end of the intro, before any turn.
+    fn intro(agent: &ConsentAgent<Fake>) -> String {
+        last_user_text(agent)
+    }
+
+    /// A session that writes one post and is killed (no teardown, no save)
+    /// after the turn that wrote it.
+    async fn killed_after_a_post(h: &Harness) -> PostId {
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        let post = write_post(&agent);
+        agent.handle(reply("done")).await.unwrap();
+        drop(agent);
+        post
+    }
+
+    /// A whole session, through the reactor's teardown and its `on_saved`.
+    async fn completed(h: &Harness) -> ConsentAgent<Fake> {
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        let control = agent.handle(reply("done")).await.unwrap();
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+        agent.on_saved().await.unwrap();
+        agent
+    }
+
+    #[tokio::test]
+    async fn journal_records_each_write_as_its_turn_ends_and_goes_on_save() {
+        let h = journal_harness("journal-append");
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        let j = journal(&h).await;
+        assert_eq!(j.sessions.len(), 1);
+        assert_eq!(j.writes(), 0, "a header, no writes yet");
+        assert_eq!(
+            j.sessions[0].header.as_ref().unwrap().model,
+            Model::from(JOURNAL_MODEL)
+        );
+
+        let post = write_post(&agent);
+        let comment = write_comment(&agent, post);
+        agent.handle(reply("done")).await.unwrap();
+        let j = journal(&h).await;
+        assert_eq!(j.writes(), 2, "{j:?}");
+        let ids: Vec<String> = j.sessions[0]
+            .writes
+            .iter()
+            .map(|w| match w {
+                Written::Post(p) => format!("post {}", p.id),
+                Written::Comment(c) => format!("comment {} on {:?}", c.id, c.on),
+            })
+            .collect();
+        assert!(ids.contains(&format!("post {post}")), "{ids:?}");
+        assert!(
+            ids.contains(&format!("comment {comment} on {:?}", Some(post))),
+            "{ids:?}"
+        );
+
+        // Teardown alone (a session whose save didn't commit) keeps it.
+        agent.on_teardown().await.unwrap();
+        assert!(journal_of(&h).path().exists());
+        agent.on_saved().await.unwrap();
+        assert!(!journal_of(&h).path().exists(), "removed once saved");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_session_is_noticed_next_session_until_one_saves() {
+        let h = journal_harness("journal-notice");
+        let mut first = h.agent(JOURNAL_MODEL, true);
+        first.on_init().await.unwrap();
+        let started = first.started;
+        let post = write_post(&first);
+        let comment = write_comment(&first, post);
+        first.handle(reply("done")).await.unwrap();
+        drop(first); // SIGTERM: no teardown, no save
+
+        let mut next = h.agent(JOURNAL_MODEL, true);
+        next.on_init().await.unwrap();
+        let text = intro(&next);
+        let expected = format!(
+            "Interrupted session: your session that began {} was interrupted before it \
+             finished, so your memory may not include it. In it you wrote ",
+            started.format("%-d %B %Y at %H:%M UTC")
+        );
+        assert!(text.contains(&expected), "{text}");
+        assert!(text.contains(&format!("post {}", short(post))), "{text}");
+        assert!(
+            text.contains(&format!(
+                "comment {} on post {}",
+                short(comment),
+                short(post)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("You can read them with `get_content`."),
+            "{text}"
+        );
+        assert!(!text.contains(JOURNAL_MODEL), "names no model: {text}");
+        next.handle(reply("done")).await.unwrap();
+        next.on_teardown().await.unwrap();
+        next.on_saved().await.unwrap();
+
+        let after = completed(&h).await;
+        assert!(
+            !intro_of_session(&after).contains("Interrupted session"),
+            "shown until a session that showed it saved"
+        );
+    }
+
+    /// The intro of a session that has since run: its first user turn.
+    fn intro_of_session(agent: &ConsentAgent<Fake>) -> String {
+        let first = agent
+            .prompt()
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        crate::consent::prompt::tests::text(&first.content)
+    }
+
+    #[tokio::test]
+    async fn a_session_killed_before_writing_is_discarded_silently() {
+        let h = journal_harness("journal-empty");
+        let mut first = h.agent(JOURNAL_MODEL, true);
+        first.on_init().await.unwrap();
+        first.handle(reply("done")).await.unwrap();
+        drop(first);
+        assert_eq!(journal(&h).await.sessions.len(), 1);
+
+        let mut next = h.agent(JOURNAL_MODEL, true);
+        next.on_init().await.unwrap();
+        assert!(!intro(&next).contains("Interrupted"), "{}", intro(&next));
+        let j = journal(&h).await;
+        assert_eq!(j.sessions.len(), 1, "the empty leftover is gone: {j:?}");
+        assert_eq!(
+            j.sessions[0].header.as_ref().unwrap().started_at,
+            next.started
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_interruption_adds_to_the_notice() {
+        let h = journal_harness("journal-twice");
+        let a = killed_after_a_post(&h).await;
+        let b = {
+            let mut agent = h.agent(JOURNAL_MODEL, true);
+            agent.on_init().await.unwrap();
+            assert!(intro(&agent).contains(&short(a)));
+            let b = write_post(&agent);
+            agent.handle(reply("done")).await.unwrap();
+            // Killed after teardown, before the save committed.
+            agent.on_teardown().await.unwrap();
+            b
+        };
+        let mut third = h.agent(JOURNAL_MODEL, true);
+        third.on_init().await.unwrap();
+        let text = intro(&third);
+        assert!(
+            text.contains("Interrupted sessions: 2 of your sessions were interrupted"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("you wrote post {}.", short(a))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("you wrote post {}.", short(b))),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_journal_never_blocks_the_session() {
+        let h = journal_harness("journal-corrupt");
+        let post = killed_after_a_post(&h).await;
+        // A line torn by power loss, then garbage.
+        let path = journal_of(&h).path().to_path_buf();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"line\":\"comment\",\"at\":\"2026\n\xff garbage\n");
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut next = h.agent(JOURNAL_MODEL, true);
+        next.on_init().await.unwrap();
+        let text = intro(&next);
+        assert!(
+            text.contains(&format!("you wrote post {}.", short(post))),
+            "{text}"
+        );
+        next.handle(reply("done")).await.unwrap();
+        next.on_teardown().await.unwrap();
+        next.on_saved().await.unwrap();
+        assert!(!path.exists());
+
+        // Unreadable altogether (here, a directory): no notice, none kept,
+        // nothing removed, and the session runs.
+        std::fs::create_dir_all(&path).unwrap();
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        assert!(agent.journal.is_none());
+        assert!(!intro(&agent).contains("Interrupted"));
+        write_post(&agent);
+        let control = agent.handle(reply("done")).await.unwrap();
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+        agent.on_saved().await.unwrap();
+        assert!(path.is_dir(), "left alone");
+    }
+
+    /// The notice goes first in what the runner seats after the intro, and
+    /// leaves the cohort-shared prefix (tools, system prompt) as it was.
+    #[tokio::test]
+    async fn the_notice_leaves_the_shared_prefix_alone() {
+        let h = journal_harness("journal-prefix");
+        let clean = {
+            let mut agent = h.agent(JOURNAL_MODEL, true);
+            agent.on_init().await.unwrap();
+            prefix(&agent)
+        };
+        killed_after_a_post(&h).await;
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        assert!(intro(&agent).contains("Interrupted session"));
+        assert_eq!(prefix(&agent), clean);
+    }
+
+    // --- The kill drill ----------------------------------------------------
+    //
+    // A real process, killed with SIGTERM mid-session (as systemd stops the
+    // runner), over a copy of the fleet's state, through agentkit's own
+    // `Reactor` and `FsStorage`. The backend is a stub: `Fake` stands in for
+    // the seed agent and records writes as the `agora` tool would, and
+    // `Stub` answers inference locally. Nothing reaches Agora or a model.
+    //
+    //   cp -a ~/agents/agora/state <scratch>/data/state
+    //   DRILL_DATA=<scratch>/data cargo test -p agora-seed kill_drill -- \
+    //       --ignored --exact consent::agent::tests::kill_drill --nocapture
+
+    /// The drill's agents: every other one of the first `DRILL_AGENTS`
+    /// (default 200) in id order writes before it is killed.
+    fn drill_ids(data: &std::path::Path) -> Vec<AgentId> {
+        let n: usize = std::env::var("DRILL_AGENTS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(200);
+        let mut ids: Vec<AgentId> = std::fs::read_dir(data.join("state"))
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok()?.parse().ok())
+            .filter(|id: &AgentId| {
+                data.join("state")
+                    .join(id.to_string())
+                    .join("state.json")
+                    .exists()
+            })
+            .collect();
+        ids.sort();
+        ids.truncate(n);
+        ids
+    }
+
+    /// Answers every prompt with a plain text turn; with `hang`, hangs
+    /// instead on a prompt ending in the survey, so the session is in
+    /// flight, after its writes, when the process is killed. Records each
+    /// session's intro (its first user turn).
+    struct Stub {
+        models: Vec<ModelInfo>,
+        hang: bool,
+        hanging: std::sync::atomic::AtomicUsize,
+        firsts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl agora_agentkit::reactor::Inference for Stub {
+        type Error = misanthropic::client::Error;
+        async fn infer<P>(&self, prompt: P) -> Result<response::Message, Self::Error>
+        where
+            P: serde::Serialize + Send,
+        {
+            let p: Prompt = serde_json::from_value(serde_json::to_value(&prompt).unwrap()).unwrap();
+            let last = crate::consent::prompt::tests::text(&p.messages.last().unwrap().content);
+            if self.hang && last.contains(FAKE_SURVEY) {
+                self.hanging
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            let first = crate::consent::prompt::tests::text(&p.messages[0].content);
+            let mut firsts = self.firsts.lock().unwrap();
+            if !firsts.contains(&first) {
+                firsts.push(first);
+            }
+            drop(firsts);
+            Ok(reply("done"))
+        }
+        async fn infer_batch<P>(
+            &self,
+            prompts: &[&P],
+        ) -> Result<Vec<Result<response::Message, Self::Error>>, Self::Error>
+        where
+            P: serde::Serialize + Send + Sync,
+        {
+            // One by one: a round of surveys hangs on its first.
+            let mut out = Vec::with_capacity(prompts.len());
+            for p in prompts {
+                out.push(self.infer(*p).await);
+            }
+            Ok(out)
+        }
+        async fn models(&self) -> Result<misanthropic::model::Models, Self::Error> {
+            Ok(self.models.iter().cloned().collect())
+        }
+        fn max_concurrency(&self) -> std::num::NonZeroUsize {
+            // All at once: a hung session must not hold back the rest.
+            std::num::NonZeroUsize::new(4096).unwrap()
+        }
+    }
+
+    /// The drill's agents, loaded from `data`, as the runner wraps them.
+    async fn drill_agents(
+        data: &std::path::Path,
+        writes: bool,
+    ) -> (Vec<ConsentAgent<Fake>>, Vec<ModelInfo>) {
+        use agora_agentkit::reactor::{FsStorage, Storage};
+        let storage = FsStorage::new(data.join("state"));
+        let ids = drill_ids(data);
+        let agora = MockAgora::start();
+        let (key, _) = agora_agentkit::crypto::generate_keypair();
+        let rt = Arc::new(
+            ConsentRuntime::new(
+                ConsentConfig::default(),
+                data,
+                agora_agentkit::client::Client::new(agora.url.clone()).unwrap(),
+                Arc::new(OneKey(AgentId::new(), key)),
+                crate::models::Catalog::new(&[], &[]),
+                512,
+            )
+            .unwrap(),
+        );
+        let mut agents = Vec::new();
+        let mut models: Vec<ModelInfo> = Vec::new();
+        for (i, id) in ids.into_iter().enumerate() {
+            let mut state = storage.load::<ConsentAgent<Fake>>(id).await.unwrap();
+            // The seed agent builds each session's prompt afresh; so does
+            // the drill.
+            state.prompt = Prompt::default();
+            state.prompt.model = state.model.id.clone();
+            // Each spec as requested, so every agent is admitted.
+            let spec = serde_json::to_value(&state.model).unwrap();
+            if !models
+                .iter()
+                .any(|m| serde_json::to_value(m).unwrap() == spec)
+            {
+                models.push(state.model.clone());
+            }
+            let mut agent = ConsentAgent::<Fake>::new(
+                id,
+                state,
+                ConsentContext {
+                    inner: Quirks::default(),
+                    consent: rt.clone(),
+                },
+            )
+            .unwrap();
+            agent.inner.survey = writes;
+            agent.inner.writes = writes && i % 2 == 0;
+            agents.push(agent);
+        }
+        (agents, models)
+    }
+
+    /// The child: run the drill's agents until each is hung in its survey,
+    /// after its writes, and wait there to be killed.
+    #[tokio::test]
+    #[ignore = "the kill drill's child process"]
+    async fn kill_drill_child() {
+        let data = std::path::PathBuf::from(std::env::var("DRILL_DATA").unwrap());
+        let (agents, models) = drill_agents(&data, true).await;
+        let stub = Stub {
+            models,
+            hang: true,
+            hanging: Default::default(),
+            firsts: Default::default(),
+        };
+        let mut reactor: agora_agentkit::reactor::Reactor<_, _, ConsentAgent<Fake>> =
+            agora_agentkit::reactor::Reactor::new(
+                stub,
+                agora_agentkit::reactor::FsStorage::new(data.join("state")),
+                agents,
+            );
+        use agora_agentkit::reactor::Run;
+        let _ = reactor.run().await;
+        unreachable!("every session hangs until the process is killed");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DRILL_DATA: a scratch copy of the fleet's state"]
+    async fn kill_drill() {
+        use agora_agentkit::reactor::Run;
+        let data = std::path::PathBuf::from(std::env::var("DRILL_DATA").unwrap());
+        let ids = drill_ids(&data);
+        let journal =
+            |id: &AgentId| SessionJournal::in_dir(data.join("state").join(id.to_string()));
+        assert!(
+            ids.iter().all(|id| !journal(id).path().exists()),
+            "no journal before the drill"
+        );
+
+        // 1. The runner, killed mid-session.
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "consent::agent::tests::kill_drill_child",
+            ])
+            .env("DRILL_DATA", &data)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Killed however the drill ends.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let pid = child.id();
+        let child = Reap(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        // Every session begun (a journal with its header) and nothing new
+        // written for two seconds: each is hung in its survey, after its
+        // writes, or waiting on a question (a trial review asks first, and
+        // writes nothing).
+        let mut last = usize::MAX;
+        let mut still = 0;
+        loop {
+            let journals: Vec<Journal> = ids
+                .iter()
+                .map(|id| Journal::parse(&std::fs::read(journal(id).path()).unwrap_or_default()))
+                .collect();
+            let begun = journals.iter().all(|j| j.sessions.len() == 1);
+            let writes: usize = journals.iter().map(Journal::writes).sum();
+            still = if begun && writes == last {
+                still + 1
+            } else {
+                0
+            };
+            last = writes;
+            if still >= 10 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never got there"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        eprintln!("killing the child mid-session: {last} writes journaled");
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut child = child;
+        let exit = child.0.wait().unwrap();
+        eprintln!("child: {exit:?} (SIGTERM, mid-session)");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit.signal(), Some(15), "killed by the SIGTERM, not ended");
+
+        // 2. The next sweep: each writer is told, by short id; the rest are
+        // told nothing, and their empty leftovers go.
+        let (agents, models) = drill_agents(&data, false).await;
+        let expected: Vec<(AgentId, Journal)> = ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    Journal::parse(&std::fs::read(journal(id).path()).unwrap()),
+                )
+            })
+            .collect();
+        let firsts: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let stub = Stub {
+            models,
+            hang: false,
+            hanging: Default::default(),
+            firsts: firsts.clone(),
+        };
+        let mut reactor: agora_agentkit::reactor::Reactor<_, _, ConsentAgent<Fake>> =
+            agora_agentkit::reactor::Reactor::new(
+                stub,
+                agora_agentkit::reactor::FsStorage::new(data.join("state")),
+                agents,
+            );
+        let report = reactor.run().await.unwrap();
+        assert_eq!(report.done, ids.len(), "{report:?}");
+
+        let firsts = firsts.lock().unwrap().clone();
+        let notices = firsts
+            .iter()
+            .filter(|t| t.contains("Interrupted session"))
+            .count();
+        let wrote = expected.iter().filter(|(_, j)| j.writes() > 0).count();
+        assert_eq!(notices, wrote);
+        assert!(
+            expected.iter().all(|(_, j)| j.writes() % 2 == 0),
+            "a post and its comment each"
+        );
+        for (id, leftover) in &expected {
+            let Some(text) = crate::interrupted::notice(leftover) else {
+                continue;
+            };
+            let short_ids: Vec<String> = leftover.sessions[0]
+                .writes
+                .iter()
+                .map(|w| match w {
+                    Written::Post(p) => short(p.id),
+                    Written::Comment(c) => short(c.id),
+                })
+                .collect();
+            assert!(
+                firsts.iter().any(|t| t.contains(&text)),
+                "{id}: notice not shown"
+            );
+            assert!(short_ids.iter().all(|s| text.contains(s.as_str())));
+        }
+        if let Some(sample) = firsts.iter().find(|t| t.contains("Interrupted session")) {
+            let at = sample.find("Interrupted session").unwrap();
+            eprintln!("sample notice: {}", &sample[at..]);
+        }
+        // 3. Complete and saved: no journal is left.
+        assert!(ids.iter().all(|id| !journal(id).path().exists()));
+        eprintln!(
+            "drill: {} agents, {} wrote and were told, {} journals left",
+            ids.len(),
+            notices,
+            ids.iter().filter(|id| journal(id).path().exists()).count()
+        );
     }
 
     // --- The memory-restore offer -----------------------------------------
