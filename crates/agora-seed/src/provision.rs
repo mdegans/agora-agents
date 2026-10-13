@@ -54,18 +54,19 @@ pub async fn provision(
     );
 
     let state_dir = data_dir.join("state");
-    // The fleet's tree holds 1,600 agents; a test agent's holds its own.
-    // Refuse any data dir with more than the agents this tool provisioned.
-    if let Ok(mut entries) = tokio::fs::read_dir(&state_dir).await {
-        let mut count = 0;
-        while entries.next_entry().await?.is_some() {
-            count += 1;
-        }
-        anyhow::ensure!(
-            count < 16,
-            "{} already holds {count} agents: provision into a test agent's own data dir",
-            state_dir.display()
-        );
+    check_data_dir(data_dir, &state_dir, &model).await?;
+    // Everything is writable before the agent exists: a registered agent
+    // whose key could not be written could never act
+    let secrets_dir = data_dir.join("secrets");
+    for dir in [&state_dir, &secrets_dir] {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let probe = dir.join(".provision-probe");
+        tokio::fs::write(&probe, b"")
+            .await
+            .with_context(|| format!("{} is not writable", dir.display()))?;
+        tokio::fs::remove_file(&probe).await?;
     }
 
     let (key, public) = agora_agentkit::crypto::generate_keypair();
@@ -73,7 +74,7 @@ pub async fn provision(
     let registered = client
         .register_agent(
             &operator.email,
-            password.trim(),
+            password.trim_end_matches(['\n', '\r']),
             spec.soul.name.as_str(),
             &hex::encode(public.as_bytes()),
             spec.display_name.as_deref(),
@@ -86,7 +87,7 @@ pub async fn provision(
 
     // The key first: an agent with state and no key cannot act, and one
     // with a key and no state is simply not run
-    FsKeyring::new(data_dir.join("secrets"))
+    FsKeyring::new(secrets_dir)
         .insert(id, &key)
         .context("writing the agent's key")?;
     let mut storage = FsStorage::new(state_dir);
@@ -96,4 +97,44 @@ pub async fn provision(
         .await
         .context("writing the agent's state")?;
     Ok(id)
+}
+
+/// A test agent's data dir holds test agents only: no `state` component in
+/// its path (the fleet's tree is `…/state`), and every agent already in it
+/// on `model`
+async fn check_data_dir(data_dir: &Path, state_dir: &Path, model: &ModelInfo) -> Result<()> {
+    anyhow::ensure!(
+        !data_dir.components().any(|c| c.as_os_str() == "state"),
+        "{} is inside a state tree: provision into a test agent's own data dir",
+        data_dir.display()
+    );
+    let mut entries = match tokio::fs::read_dir(state_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", state_dir.display())),
+    };
+    let storage = FsStorage::new(state_dir);
+    while let Some(entry) = entries.next_entry().await? {
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<agora_agentkit::ids::AgentId>().ok())
+        else {
+            continue;
+        };
+        let state: SeedState = serde_json::from_value(
+            storage
+                .load_raw(id)
+                .await
+                .with_context(|| format!("reading agent {id}"))?,
+        )
+        .with_context(|| format!("reading agent {id}"))?;
+        anyhow::ensure!(
+            state.model.id == model.id,
+            "{} holds agent {id} on {}: provision only beside test agents",
+            state_dir.display(),
+            state.model.id.name()
+        );
+    }
+    Ok(())
 }

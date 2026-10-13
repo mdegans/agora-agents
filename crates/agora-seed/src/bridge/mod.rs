@@ -26,7 +26,7 @@ use misanthropic::model::{Model, ModelInfo, Models};
 use misanthropic::prompt::Prompt;
 use misanthropic::response::Message;
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// The model id the bridge offers. Only an agent whose persisted model is
 /// this one is ever routed to it, so no fleet agent can be.
@@ -58,6 +58,8 @@ pub(crate) enum Event {
 #[derive(Clone)]
 pub struct BridgeInference {
     events: mpsc::Sender<Event>,
+    /// Whether the driver has disconnected
+    gone: watch::Receiver<bool>,
 }
 
 /// The runner's handle for telling the driver the run is over
@@ -76,16 +78,21 @@ impl Ending {
 /// The driver's side, handed to [`serve`]
 pub struct Driver {
     events: mpsc::Receiver<Event>,
+    gone: watch::Sender<bool>,
 }
 
 /// A bridge: the reactor's [`BridgeInference`], the runner's [`Ending`], and
 /// the [`Driver`] for [`serve`]
 pub fn bridge() -> (BridgeInference, Ending, Driver) {
     let (tx, rx) = mpsc::channel(1);
+    let (gone, gone_rx) = watch::channel(false);
     (
-        BridgeInference { events: tx.clone() },
+        BridgeInference {
+            events: tx.clone(),
+            gone: gone_rx,
+        },
         Ending { events: tx },
-        Driver { events: rx },
+        Driver { events: rx, gone },
     )
 }
 
@@ -112,15 +119,23 @@ impl Inference for BridgeInference {
         let raw = serde_json::to_value(&prompt)?;
         let prompt: Prompt = serde_json::from_value(raw.clone())?;
         let (answer, answered) = oneshot::channel();
-        self.events
-            .send(Event::Request(Box::new(Request {
-                prompt,
-                raw,
-                answer,
-            })))
-            .await
-            .map_err(|_| BridgeError::Disconnected)?;
-        answered.await.map_err(|_| BridgeError::Disconnected)
+        let request = Event::Request(Box::new(Request {
+            prompt,
+            raw,
+            answer,
+        }));
+        let asked = async {
+            self.events
+                .send(request)
+                .await
+                .map_err(|_| BridgeError::Disconnected)?;
+            answered.await.map_err(|_| BridgeError::Disconnected)
+        };
+        let mut gone = self.gone.clone();
+        tokio::select! {
+            answer = asked => answer,
+            _ = gone.wait_for(|gone| *gone) => Err(BridgeError::Disconnected),
+        }
     }
 
     async fn models(&self) -> Result<Models, BridgeError> {

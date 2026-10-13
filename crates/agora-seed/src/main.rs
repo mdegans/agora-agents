@@ -1408,6 +1408,11 @@ async fn run(held: &mut Held) -> Result<()> {
             EndpointKind::Messages(_) => endpoint::Endpoint::Messages(build_inference(spec)?),
             EndpointKind::Bridge => {
                 anyhow::ensure!(bridged.is_none(), "a run may have one bridge endpoint");
+                // Never the default, which is the fleet's tree
+                anyhow::ensure!(
+                    args.data_dir.is_some(),
+                    "a bridge endpoint needs --data-dir: the test agent's own, never the fleet's"
+                );
                 bridge::take_stdout();
                 let (inference, ending, driver) = bridge::bridge();
                 bridged = Some((ending, driver));
@@ -1846,15 +1851,15 @@ async fn run(held: &mut Held) -> Result<()> {
             tracing::error!(%reactor, %agent, "rejected");
         }
     }
-    if let Some((ending, service)) = bridge {
+    if let Some((ending, served)) = bridge {
         ending
             .ended(format!(
                 "the runner finished: {done} session(s) complete, {failed} failed. \
                  The run log has the details."
             ))
             .await;
-        // Until the driver has read the ending and disconnects
-        let _ = service.waiting().await;
+        // Until the driver has read the ending and disconnects, a while
+        served.disconnected().await;
     }
     Ok(())
 }

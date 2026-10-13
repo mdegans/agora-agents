@@ -24,13 +24,22 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock as Content, JsonObject, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
+use rmcp::service::Peer;
 use rmcp::service::{RequestContext, RunningService};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use super::{Driver, Event, MODEL_ID, Request, render};
+
+/// How long `tools/list` waits for the agent's tools before answering
+/// with the bridge's own; the rest follow with a `list_changed`
+const LIST_WAIT: Duration = Duration::from_secs(20);
+
+/// How long the runner waits, once the run is over, for the driver to read
+/// the ending and disconnect
+const DISCONNECT_WAIT: Duration = Duration::from_secs(120);
 
 /// Calls arriving within this long of the one before are one turn. Claude
 /// Code sends a turn's parallel calls about 0.1 s apart.
@@ -58,11 +67,42 @@ harness sends with the results comes back with the last call of the turn.
 bridge_reply. When the harness then asks for something else (rewriting \
 the agent's memory, for example), its request comes back as the result, \
 with any response format it requires; answer that with bridge_reply too.
+- Make a turn's calls together, in one message: a call made after the \
+others have returned is a turn of its own.
 - bridge_raw_prompt shows the exact request the runner would send to a \
 model, in pages.";
 
-pub async fn serve(driver: Driver) -> anyhow::Result<RunningService<RoleServer, Server>> {
-    Ok(Server::new(driver).serve(rmcp::transport::stdio()).await?)
+/// The bridge's MCP service, running
+pub struct Served {
+    gone: watch::Receiver<bool>,
+}
+
+impl Served {
+    /// Wait, a while at most, for the driver to disconnect
+    pub async fn disconnected(mut self) {
+        let _ = tokio::time::timeout(DISCONNECT_WAIT, self.gone.wait_for(|gone| *gone)).await;
+    }
+}
+
+/// Serve `driver` over stdio. When the driver disconnects, the bridge's
+/// inference fails (`Disconnected`), so the session ends and is saved
+/// rather than waiting on an answer that will not come.
+pub async fn serve(driver: Driver) -> anyhow::Result<Served> {
+    let Driver { events, gone } = driver;
+    let server = Server::new(events);
+    let service: RunningService<RoleServer, Server> =
+        server.clone().serve(rmcp::transport::stdio()).await?;
+    let peer = service.peer().clone();
+    tokio::spawn(async move { server.discover(peer).await });
+    let served = Served {
+        gone: gone.subscribe(),
+    };
+    tokio::spawn(async move {
+        let reason = service.waiting().await;
+        tracing::info!(event_type = "bridge_driver_gone", reason = ?reason, "the bridge's driver disconnected");
+        let _ = gone.send(true);
+    });
+    Ok(served)
 }
 
 #[derive(Clone)]
@@ -75,7 +115,9 @@ struct Inner {
     round: SyncMutex<Option<Round>>,
     /// The latest request, pretty-printed, for `bridge_raw_prompt`
     raw: SyncMutex<Option<Arc<str>>>,
-    tools: OnceCell<Vec<Tool>>,
+    /// The agent's tools and the bridge's, once the first request shows
+    /// the agent's
+    tools: watch::Sender<Option<Arc<Vec<Tool>>>>,
 }
 
 struct Session {
@@ -188,18 +230,18 @@ fn bridge_tools() -> Vec<Tool> {
 }
 
 impl Server {
-    fn new(driver: Driver) -> Self {
+    fn new(events: mpsc::Receiver<Event>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 session: Mutex::new(Session {
-                    events: driver.events,
+                    events,
                     current: None,
                     ended: None,
                     turns: 0,
                 }),
                 round: SyncMutex::new(None),
                 raw: SyncMutex::new(None),
-                tools: OnceCell::new(),
+                tools: watch::Sender::new(None),
             }),
         }
     }
@@ -210,36 +252,55 @@ impl Server {
         *self.inner.raw.lock().expect("not poisoned") = Some(pretty.into());
     }
 
-    async fn tools(&self) -> &[Tool] {
+    /// Learn the agent's tools from the first request, and tell the
+    /// driver they changed
+    async fn discover(&self, peer: Peer<RoleServer>) {
+        let mut tools: Vec<Tool> = {
+            let mut session = self.inner.session.lock().await;
+            match session.wait().await {
+                Ok(request) => {
+                    self.remember_raw(request);
+                    request
+                        .prompt
+                        .tools
+                        .iter()
+                        .flatten()
+                        .filter_map(|t| t.as_method())
+                        .map(|t| {
+                            Tool::new(
+                                t.name.clone(),
+                                t.description.clone(),
+                                object(t.schema.clone()),
+                            )
+                            .with_annotations(concurrent())
+                        })
+                        .collect()
+                }
+                Err(_) => Vec::new(),
+            }
+        };
+        tools.extend(bridge_tools());
+        self.inner.tools.send_replace(Some(Arc::new(tools)));
+        if let Err(e) = peer.notify_tool_list_changed().await {
+            tracing::warn!(error = %e, "the bridge could not tell its driver the tools changed");
+        }
+    }
+
+    /// The tools, waiting a while for the agent's
+    async fn listed_tools(&self) -> Vec<Tool> {
+        let mut known = self.inner.tools.subscribe();
+        match tokio::time::timeout(LIST_WAIT, known.wait_for(Option::is_some)).await {
+            Ok(Ok(tools)) => tools.as_ref().map(|t| t.to_vec()).unwrap_or_default(),
+            _ => bridge_tools(),
+        }
+    }
+
+    fn is_agent_tool(&self, name: &str) -> bool {
         self.inner
             .tools
-            .get_or_init(|| async {
-                let mut session = self.inner.session.lock().await;
-                let mut tools = match session.wait().await {
-                    Ok(request) => {
-                        self.remember_raw(request);
-                        request
-                            .prompt
-                            .tools
-                            .iter()
-                            .flatten()
-                            .filter_map(|t| t.as_method())
-                            .map(|t| {
-                                Tool::new(
-                                    t.name.clone(),
-                                    t.description.clone(),
-                                    object(t.schema.clone()),
-                                )
-                                .with_annotations(concurrent())
-                            })
-                            .collect()
-                    }
-                    Err(_) => Vec::new(),
-                };
-                tools.extend(bridge_tools());
-                tools
-            })
-            .await
+            .borrow()
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|t| t.name == name))
     }
 
     async fn begin(&self) -> CallToolResult {
@@ -392,7 +453,20 @@ impl Server {
                 return;
             }
         };
+        tracing::info!(
+            event_type = "bridge_turn",
+            turn,
+            calls = calls.len(),
+            replies = replies.len(),
+            stop_reason,
+            "the bridge answered for the model"
+        );
         let answered = request.prompt.messages.len();
+        let last_blocks = request
+            .prompt
+            .messages
+            .last()
+            .map_or(0, |m| m.content.len());
         let previous_tools = tool_names(&request);
         let _ = request.answer.send(message);
 
@@ -430,7 +504,22 @@ impl Server {
                         extra.push(render::blocks(&rest.into_iter().collect()));
                     }
                 }
-                if fresh.is_empty() {
+                // A retry the harness could not seat as a new turn is
+                // appended to the last message instead
+                let appended: Option<misanthropic::prompt::message::Content> = match fresh {
+                    [] => next
+                        .prompt
+                        .messages
+                        .last()
+                        .filter(|_| next.prompt.messages.len() == answered)
+                        .and_then(|m| m.content.get(last_blocks..))
+                        .filter(|blocks| !blocks.is_empty())
+                        .map(|blocks| blocks.iter().cloned().collect()),
+                    _ => None,
+                };
+                if let Some(appended) = appended {
+                    extra.push(render::blocks(&appended));
+                } else if fresh.is_empty() {
                     extra.push(
                         "[bridge] The harness sent its last request again, \
                          without this turn in it: the turn was not usable \
@@ -525,8 +614,13 @@ fn tool_names(request: &Request) -> Vec<String> {
 
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(INSTRUCTIONS)
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_instructions(INSTRUCTIONS)
     }
 
     async fn list_tools(
@@ -534,7 +628,7 @@ impl ServerHandler for Server {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.tools().await.to_vec()))
+        Ok(ListToolsResult::with_all_items(self.listed_tools().await))
     }
 
     async fn call_tool(
@@ -552,6 +646,11 @@ impl ServerHandler for Server {
         Ok(match &*request.name {
             BEGIN => self.begin().await,
             REPLY => match serde_json::from_value::<ReplyInput>(input) {
+                Ok(ReplyInput { text }) if text.trim().is_empty() => {
+                    CallToolResult::error(vec![Content::text(
+                        "[bridge] A reply needs text: a model's reply is never empty.",
+                    )])
+                }
                 Ok(ReplyInput { text }) => self.join(Entry::Reply(text)).await,
                 Err(e) => invalid(e),
             },
@@ -559,7 +658,7 @@ impl ServerHandler for Server {
                 Ok(RawInput { offset }) => self.raw(offset),
                 Err(e) => invalid(e),
             },
-            name if self.tools().await.iter().any(|t| t.name == name) => {
+            name if self.is_agent_tool(name) => {
                 self.join(Entry::Call {
                     name: name.to_string(),
                     input,
@@ -572,3 +671,6 @@ impl ServerHandler for Server {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
