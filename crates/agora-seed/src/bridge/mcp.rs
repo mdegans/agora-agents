@@ -627,7 +627,8 @@ impl Server {
 
         let extra = extra.join("\n\n");
         let n_calls = calls.len();
-        let last = calls.last().map(|c| c.1.clone());
+        // Named with its id: a turn may call one tool twice
+        let last = calls.last().map(|c| format!("{} ({})", c.1, c.0));
         let mut calls = calls.into_iter().peekable();
         while let Some((id, name, _, tx)) = calls.next() {
             let found = results.iter().find(|(rid, _, _)| *rid == id);
