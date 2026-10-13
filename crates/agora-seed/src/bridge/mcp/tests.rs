@@ -136,3 +136,22 @@ async fn a_driver_that_disconnects_fails_the_request_rather_than_hanging() {
         Err(crate::bridge::BridgeError::Disconnected)
     ));
 }
+
+/// A result longer than a page comes in pages: Claude Code would move it
+/// to a file its subagent cannot read, where the model would have had it
+/// whole (beta-governance, 2026-10-13)
+#[tokio::test]
+async fn a_long_result_is_paged() {
+    let (_inference, _ending, driver) = bridge();
+    let server = Server::new(driver.events);
+    let long = "x".repeat(RESULT_PAGE + 10);
+    let first = server.paged("toolu_long", long.clone());
+    assert!(first.starts_with(&"x".repeat(RESULT_PAGE)));
+    assert!(
+        first.contains("bridge_result") && first.contains("offset 40000"),
+        "{first}"
+    );
+    let rest = text(&server.result_page("toolu_long", RESULT_PAGE));
+    assert_eq!(rest, "x".repeat(10));
+    assert_eq!(server.paged("toolu_short", "short".into()), "short");
+}

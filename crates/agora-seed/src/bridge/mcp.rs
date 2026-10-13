@@ -51,6 +51,12 @@ const RAW_PAGE: usize = 40_000;
 const BEGIN: &str = "bridge_begin";
 const REPLY: &str = "bridge_reply";
 const RAW: &str = "bridge_raw_prompt";
+const RESULT: &str = "bridge_result";
+
+/// Characters of a tool result per page: Claude Code moves a longer one to a
+/// file its subagent may have no tool to read, where a model would have had
+/// it whole
+const RESULT_PAGE: usize = 40_000;
 
 const INSTRUCTIONS: &str = "\
 You are driving one Agora seed agent through the runner's bridge: you stand \
@@ -69,6 +75,7 @@ the agent's memory, for example), its request comes back as the result, \
 with any response format it requires; answer that with bridge_reply too.
 - Make a turn's calls together, in one message: a call made after the \
 others have returned is a turn of its own.
+- A result too long for one page continues with bridge_result.
 - bridge_raw_prompt shows the exact request the runner would send to a \
 model, in pages.";
 
@@ -115,6 +122,8 @@ struct Inner {
     round: SyncMutex<Option<Round>>,
     /// The latest request, pretty-printed, for `bridge_raw_prompt`
     raw: SyncMutex<Option<Arc<str>>>,
+    /// Results longer than a page, by call id, for `bridge_result`
+    pages: SyncMutex<std::collections::HashMap<String, Arc<str>>>,
     /// The agent's tools and the bridge's, once the first request shows
     /// the agent's
     tools: watch::Sender<Option<Arc<Vec<Tool>>>>,
@@ -172,6 +181,13 @@ struct ReplyInput {
 }
 
 #[derive(Deserialize)]
+struct ResultInput {
+    call: String,
+    #[serde(default)]
+    offset: usize,
+}
+
+#[derive(Deserialize)]
 struct RawInput {
     #[serde(default)]
     offset: usize,
@@ -214,6 +230,21 @@ fn bridge_tools() -> Vec<Tool> {
         )
         .with_annotations(concurrent()),
         Tool::new(
+            RESULT,
+            "The rest of a tool result too long for one page. A result over \
+             a page says so and names its call; the agent's model receives \
+             it whole.",
+            object(json!({
+                "type": "object",
+                "properties": {
+                    "call": {"type": "string", "description": "The call the result belongs to, as its first page names it"},
+                    "offset": {"type": "integer", "description": "Character to start from"}
+                },
+                "required": ["call"],
+            })),
+        )
+        .with_annotations(concurrent()),
+        Tool::new(
             RAW,
             "The exact request the runner would send to a model (system, \
              messages, tools, limits), as JSON, in pages. For debugging the \
@@ -241,6 +272,7 @@ impl Server {
                 }),
                 round: SyncMutex::new(None),
                 raw: SyncMutex::new(None),
+                pages: SyncMutex::new(std::collections::HashMap::new()),
                 tools: watch::Sender::new(None),
             }),
         }
@@ -312,6 +344,40 @@ impl Server {
             }
             Err(why) => CallToolResult::success(vec![Content::text(format!(
                 "[bridge] There is no session: {why}"
+            ))]),
+        }
+    }
+
+    /// A result as the driver gets it: whole, or its first page with the
+    /// rest kept for `bridge_result`
+    fn paged(&self, call: &str, text: String) -> String {
+        if text.chars().count() <= RESULT_PAGE {
+            return text;
+        }
+        let full: Arc<str> = text.into();
+        let page = page_of(&full, call, 0);
+        self.inner
+            .pages
+            .lock()
+            .expect("not poisoned")
+            .insert(call.to_string(), full);
+        page
+    }
+
+    fn result_page(&self, call: &str, offset: usize) -> CallToolResult {
+        let full = self
+            .inner
+            .pages
+            .lock()
+            .expect("not poisoned")
+            .get(call)
+            .cloned();
+        match full {
+            Some(full) => {
+                CallToolResult::success(vec![Content::text(page_of(&full, call, offset))])
+            }
+            None => CallToolResult::error(vec![Content::text(format!(
+                "[bridge] No long result is kept for call {call}."
             ))]),
         }
     }
@@ -471,6 +537,7 @@ impl Server {
         let _ = request.answer.send(message);
 
         // What the harness did with it
+        let mut over = false;
         let (results, extra) = match session.wait().await {
             Ok(next) => {
                 self.remember_raw(next);
@@ -548,10 +615,13 @@ impl Server {
                 }
                 (results, extra)
             }
-            Err(why) => (
-                Vec::new(),
-                vec![format!("[bridge] The session is over: {why}")],
-            ),
+            Err(why) => {
+                over = true;
+                (
+                    Vec::new(),
+                    vec![format!("[bridge] The session is over: {why}")],
+                )
+            }
         };
         drop(session);
 
@@ -563,6 +633,15 @@ impl Server {
             let found = results.iter().find(|(rid, _, _)| *rid == id);
             let (mut text, is_error) = match found {
                 Some((_, text, is_error)) => (text.clone(), *is_error),
+                // The harness sent no further request: a model never sees
+                // these results either
+                None if over => (
+                    "[bridge] The session ended after this turn, so (as for a \
+                     model) this call's result is not shown. The run log and \
+                     the agent's state have what it did."
+                        .to_string(),
+                    false,
+                ),
                 None => (
                     "[bridge] No result came back for this call.".to_string(),
                     true,
@@ -579,10 +658,13 @@ impl Server {
                 }
             } else if let (false, Some(last)) = (extra.is_empty(), &last) {
                 text.push_str(&format!(
-                    " What else the harness sent is in the result of the \
-                     last call, {last}."
+                    " What else the harness sent is in the result of \
+                     {last}, the call that reached the bridge last (MCP \
+                     does not keep the order a turn's calls were written \
+                     in)."
                 ));
             }
+            let text = self.paged(&id, text);
             let _ = tx.send(Outcome { text, is_error });
         }
         for tx in replies {
@@ -654,6 +736,10 @@ impl ServerHandler for Server {
                 Ok(ReplyInput { text }) => self.join(Entry::Reply(text)).await,
                 Err(e) => invalid(e),
             },
+            RESULT => match serde_json::from_value::<ResultInput>(input) {
+                Ok(ResultInput { call, offset }) => self.result_page(&call, offset),
+                Err(e) => invalid(e),
+            },
             RAW => match serde_json::from_value::<RawInput>(input) {
                 Ok(RawInput { offset }) => self.raw(offset),
                 Err(e) => invalid(e),
@@ -674,3 +760,18 @@ impl ServerHandler for Server {
 
 #[cfg(test)]
 mod tests;
+
+/// One page of a long result, saying where it continues
+fn page_of(full: &str, call: &str, offset: usize) -> String {
+    let total = full.chars().count();
+    let page: String = full.chars().skip(offset).take(RESULT_PAGE).collect();
+    let end = (offset + RESULT_PAGE).min(total);
+    match end < total {
+        true => format!(
+            "{page}\n\n[bridge] Characters {offset} to {end} of {total} of this result \
+             (the agent's model receives it whole). Read on with bridge_result, call \
+             `{call}`, offset {end}."
+        ),
+        false => page,
+    }
+}
