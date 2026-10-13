@@ -72,13 +72,9 @@ serde = { version = "1", features = ["derive"] }
 # `BTreeMap` those keys sort lexicographically -- 1, 10, 11, 2, 3 -- while
 # the `required` array stays a Vec in numeric order, so the two disagree.
 # Only at N >= 10, which is where the small-N tests would not see it.
-# `soul.rs` also writes SOUL.json with `to_vec_pretty`, so a key-order flip
-# would rewrite every soul file wholesale on the next mutation.
 #
 # Pinned by `probe::answers::tests::build_schema_keys_stay_in_numeric_order`.
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_path_to_error = "0.1"
-strsim = "0.11"
 thiserror = "2"
 zeroize = "1"
 tokio = { version = "1", features = ["full"] }
