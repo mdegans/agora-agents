@@ -659,10 +659,11 @@ impl Server {
                 }
             } else if let (false, Some(last)) = (extra.is_empty(), &last) {
                 text.push_str(&format!(
-                    " What else the harness sent is in the result of \
+                    " The harness's next instruction is in the result of \
                      {last}, the call that reached the bridge last (MCP \
                      does not keep the order a turn's calls were written \
-                     in)."
+                     in). A notice the runner adds to one tool result (a \
+                     round count, say) stays on that result."
                 ));
             }
             let text = self.paged(&id, text);
