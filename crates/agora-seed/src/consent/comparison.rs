@@ -8,6 +8,10 @@
 //! rarely bites. Each side keeps its [`PER_SIDE`] most recent items, which
 //! for "before" is the writing closest to the swap: the fairest comparison,
 //! and the least likely to reach back to a model older than the offer's.
+//!
+//! What could not be fetched, and the cap when it bites, are counted in
+//! the [`Comparison`] and said in the review: a short sample must not read
+//! as an agent that wrote little.
 
 use agora_agentkit::client::Client;
 use agora_agentkit::ids::{AgentId, CommentId};
@@ -41,11 +45,24 @@ pub struct Sample {
     pub excerpt: String,
 }
 
-/// The two sides of the review.
+/// The two sides of the review, and what the sample is missing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Comparison {
     pub before: Vec<Sample>,
     pub after: Vec<Sample>,
+    /// The agent's post listing could not be fetched.
+    pub posts_unavailable: bool,
+    /// Comments whose fetch failed.
+    pub comments_unavailable: usize,
+    /// Comments in the ledger past [`MAX_COMMENT_FETCHES`], not looked at.
+    pub comments_not_fetched: usize,
+}
+
+impl Comparison {
+    /// Whether anything that should be in the sample may be missing.
+    pub fn incomplete(&self) -> bool {
+        self.posts_unavailable || self.comments_unavailable > 0 || self.comments_not_fetched > 0
+    }
 }
 
 /// Cut `body` to at most `max` bytes on a char boundary, marking the cut.
@@ -69,11 +86,12 @@ pub fn select(mut samples: Vec<Sample>, boundary: DateTime<Utc>) -> Comparison {
     Comparison {
         before: before.into_iter().take(PER_SIDE).collect(),
         after: after.into_iter().take(PER_SIDE).collect(),
+        ..Comparison::default()
     }
 }
 
 /// Fetch the agent's writing and [`select`] from it. Best-effort: a failed
-/// fetch shrinks the sample (logged), it never fails the session.
+/// fetch never fails the session; it is logged and counted in the result.
 pub async fn gather(
     client: &Client,
     agent_id: AgentId,
@@ -81,6 +99,8 @@ pub async fn gather(
     boundary: DateTime<Utc>,
 ) -> Comparison {
     let mut samples = Vec::new();
+    let mut posts_unavailable = false;
+    let mut comments_unavailable = 0;
     match client.get_agent_posts(agent_id).await {
         Ok(posts) => samples.extend(posts.into_iter().filter(|p| !p.deleted).filter_map(|p| {
             Some(Sample {
@@ -92,11 +112,14 @@ pub async fn gather(
                 },
             })
         })),
-        Err(e) => tracing::warn!(
-            agent_id = %agent_id,
-            error = %e,
-            "trial review: own posts unavailable"
-        ),
+        Err(e) => {
+            posts_unavailable = true;
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %e,
+                "trial review: own posts unavailable"
+            );
+        }
     }
     let total = comments.len();
     for id in comments.into_iter().take(MAX_COMMENT_FETCHES) {
@@ -119,23 +142,32 @@ pub async fn gather(
                     });
                 }
             }
-            Err(e) => tracing::debug!(
-                agent_id = %agent_id,
-                comment_id = %id,
-                error = %e,
-                "trial review: comment unavailable"
-            ),
+            Err(e) => {
+                comments_unavailable += 1;
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    comment_id = %id,
+                    error = %e,
+                    "trial review: comment unavailable"
+                );
+            }
         }
     }
-    if total > MAX_COMMENT_FETCHES {
-        tracing::debug!(
+    let comments_not_fetched = total.saturating_sub(MAX_COMMENT_FETCHES);
+    if comments_not_fetched > 0 {
+        tracing::info!(
             agent_id = %agent_id,
             total,
             fetched = MAX_COMMENT_FETCHES,
             "trial review: comment sample capped"
         );
     }
-    select(samples, boundary)
+    Comparison {
+        posts_unavailable,
+        comments_unavailable,
+        comments_not_fetched,
+        ..select(samples, boundary)
+    }
 }
 
 #[cfg(test)]

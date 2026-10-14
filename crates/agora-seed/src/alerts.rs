@@ -91,6 +91,9 @@ pub enum AlertKind {
     /// `[memory_restore]` could not be resolved; the run goes on without
     /// the memory-restore offer.
     MemoryRestoreDisabled,
+    /// An agent was left out of the sweep before its session could start:
+    /// its state would not load, or the agent could not be built from it.
+    AgentSkipped,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -99,7 +102,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -109,6 +112,7 @@ impl AlertKind {
         Self::RoleConsentSleep,
         Self::ContactRequested,
         Self::MemoryRestoreDisabled,
+        Self::AgentSkipped,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -123,6 +127,7 @@ impl AlertKind {
             Self::ConstitutionRefused => "constitution_refused",
             Self::ContactRequested => "contact_requested",
             Self::MemoryRestoreDisabled => "memory_restore_disabled",
+            Self::AgentSkipped => "agent_skipped",
             Self::Test => "test_alert",
         }
     }
@@ -191,6 +196,16 @@ impl AlertKind {
                  memory-restore offer: nobody is asked, and no `show` on file \
                  is delivered, until it is fixed. Nothing else is affected."
             }
+            Self::AgentSkipped => {
+                "An agent was left out of this sweep before its session could \
+                 start: its saved state would not load (unreadable or \
+                 malformed state.json), or the agent could not be built from \
+                 it (the error below says which). It is left out of every \
+                 sweep until that is fixed, and nothing tells the agent. Do not \
+                 edit the state in place: copy it out, find the cause, and \
+                 follow the agent-state review rules before any repair. The \
+                 sweep's `agents_skipped` event counts them."
+            }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
                  you are reading it, the runner's [alerts.email] settings \
@@ -235,6 +250,13 @@ impl Alert {
 
     pub fn agent(mut self, name: impl Into<String>, id: AgentId) -> Self {
         self.agent = Some(name.into());
+        self.agent_id = Some(id);
+        self
+    }
+
+    /// The agent it concerns, when its name can't be known (its state
+    /// would not load).
+    pub fn agent_id(mut self, id: AgentId) -> Self {
         self.agent_id = Some(id);
         self
     }

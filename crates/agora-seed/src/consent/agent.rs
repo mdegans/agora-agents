@@ -1414,29 +1414,45 @@ where
 
     /// The fallback with several offers open: each JSON object in the text
     /// that names an open offer (`offer`) and passes that offer's checks
-    /// answers it; the rest are an unanswered turn.
+    /// answers it; the rest are an unanswered turn. An object that names an
+    /// open offer but can't be used keeps its error, so the reminder says
+    /// what was wrong with it rather than that no answer came.
     async fn offers_text(
         &mut self,
         open: Vec<Open>,
         response: response::Message,
     ) -> Result<Control, A::Error> {
+        /// Just the `offer` key, to pin an object that fails the full
+        /// shape on the offer it meant to answer.
+        #[derive(serde::Deserialize)]
+        struct Named {
+            offer: OfferKind,
+        }
         let raw = raw_text(&response);
         let mut answers: Vec<(OfferKind, Accepted)> = Vec::new();
+        let mut errors: Vec<(OfferKind, String)> = Vec::new();
         for object in offers::json_objects(&raw) {
-            let Ok(args) =
-                serde_json::from_value::<offers::TextArgs>(serde_json::Value::Object(object))
-            else {
-                continue;
+            let object = serde_json::Value::Object(object);
+            let (kind, taken) = match serde_json::from_value::<offers::TextArgs>(object.clone()) {
+                Ok(args) => {
+                    let Some(kind) = args.offer else { continue };
+                    let Some(o) = open.iter().find(|o| o.kind() == kind) else {
+                        continue;
+                    };
+                    (kind, self.accept(&o.offer, args.into_args(kind)))
+                }
+                Err(e) => match serde_json::from_value::<Named>(object) {
+                    Ok(Named { offer: kind }) => (kind, Err(e.to_string())),
+                    Err(_) => continue,
+                },
             };
-            let Some(kind) = args.offer else { continue };
             if answers.iter().any(|(k, _)| *k == kind) {
                 continue; // the first answer to an offer stands
             }
-            let Some(o) = open.iter().find(|o| o.kind() == kind) else {
-                continue;
-            };
-            if let Ok(accepted) = self.accept(&o.offer, args.into_args(kind)) {
-                answers.push((kind, accepted));
+            match taken {
+                Ok(accepted) => answers.push((kind, accepted)),
+                Err(why) if !errors.iter().any(|(k, _)| *k == kind) => errors.push((kind, why)),
+                Err(_) => {}
             }
         }
         let mut still = Vec::new();
@@ -1450,14 +1466,19 @@ where
                     };
                     self.settle(o, settle, &response, &raw).await;
                 }
-                None => still.push(o),
+                None => {
+                    let reason = match errors.iter().find(|(k, _)| *k == o.kind()) {
+                        Some((_, why)) => format!("could not be used ({why})"),
+                        None => "not answered: no `answer_offer` call for it".to_string(),
+                    };
+                    still.push((o, reason));
+                }
             }
         }
         if still.is_empty() {
             return Ok(Control::Done(Outcome::Complete));
         }
-        let reason = "not answered: no `answer_offer` call for it";
-        self.unanswered(still, &response, reason).await
+        self.unanswered_each(still, &response).await
     }
 
     /// A turn with tool calls: seat it, answer each call, and seat the
@@ -1771,17 +1792,29 @@ where
     /// the one holding the reply's tool results.
     async fn unanswered(
         &mut self,
-        mut open: Vec<Open>,
+        open: Vec<Open>,
         response: &response::Message,
         reason: &str,
     ) -> Result<Control, A::Error> {
+        let open = open.into_iter().map(|o| (o, reason.to_string())).collect();
+        self.unanswered_each(open, response).await
+    }
+
+    /// [`Self::unanswered`], each offer with its own reason.
+    async fn unanswered_each(
+        &mut self,
+        open: Vec<(Open, String)>,
+        response: &response::Message,
+    ) -> Result<Control, A::Error> {
         let raw = raw_text(response);
-        for o in &mut open {
-            self.log_unusable(o.kind(), reason, response, &raw);
-            o.fail(reason, &raw);
+        let mut failed = Vec::with_capacity(open.len());
+        for (mut o, reason) in open {
+            self.log_unusable(o.kind(), &reason, response, &raw);
+            o.fail(&reason, &raw);
+            failed.push(o);
         }
         let mut still = Vec::new();
-        for o in open {
+        for o in failed {
             if o.reminded || o.exhausted() {
                 let missed = o.missed();
                 self.settle(o, Settle::Missed(missed), response, &raw).await;
@@ -1797,11 +1830,22 @@ where
         }
         let kinds: Vec<OfferKind> = still.iter().map(Open::kind).collect();
         let mut note = String::new();
-        if let [only] = still.as_slice()
-            && let Some(why) = only.last_failure.as_deref()
-            && why.starts_with("could not be used")
-        {
-            note.push_str(&format!("Your answer {why}. "));
+        let usable_why = |o: &Open| {
+            o.last_failure
+                .as_deref()
+                .filter(|why| why.starts_with("could not be used"))
+                .map(str::to_owned)
+        };
+        if let [only] = still.as_slice() {
+            if let Some(why) = usable_why(only) {
+                note.push_str(&format!("Your answer {why}. "));
+            }
+        } else {
+            for o in &still {
+                if let Some(why) = usable_why(o) {
+                    note.push_str(&format!("Your answer to `{}` {why}. ", o.kind().as_str()));
+                }
+            }
         }
         note.push_str(&offers::reminder(&kinds));
         tracing::info!(
@@ -6341,6 +6385,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Two offers open and a text reply whose objects name them but can't
+    /// be used: the reminder says what was wrong with each, rather than
+    /// that no answer came (audit 2026-10-14, finding 17).
+    #[tokio::test]
+    async fn unusable_text_objects_keep_their_errors() {
+        let h = Harness::with_cadence("text-two-bad", &["tarn"], &["tarn"]);
+        let mut agent = seated(&h).await;
+        let text = "{\"offer\": \"role\", \"reason\": \"r\", \"choice\": \"sideways\", \
+                    \"text\": \"\", \"memory_note\": \"\"}\n{\"offer\": \"cadence\", \
+                    \"choice\": \"switch\"}";
+        assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains("Your answer to `role` could not be used ("),
+            "{q}"
+        );
+        assert!(
+            q.contains("Your answer to `cadence` could not be used ("),
+            "{q}"
+        );
+        assert!(q.contains("missing field `reason`"), "{q}");
+        assert!(
+            q.ends_with(
+                "These offers above are still open: `role` and `cadence`. Answer each by calling \
+             `answer_offer` once, with `offer` set to its key. Any still unanswered after \
+             this turn is recorded as no answer."
+            ),
+            "{q}"
+        );
+
+        // One usable, one not: the one left open gets its own error.
+        let h = Harness::with_cadence("text-one-bad", &["tarn"], &["tarn"]);
+        let mut agent = seated(&h).await;
+        let text = "{\"offer\": \"role\", \"reason\": \"r\", \"choice\": \"nothing\", \
+                    \"text\": \"\", \"memory_note\": \"\"}\n{\"offer\": \"cadence\", \
+                    \"reason\": \"r\", \"choice\": \"sideways\", \"text\": \"\", \
+                    \"memory_note\": \"\"}";
+        assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
+        let q = last_user_text(&agent);
+        assert!(q.starts_with("Your answer could not be used ("), "{q}");
+        assert!(
+            q.contains("The `cadence` offer above is still open."),
+            "{q}"
+        );
     }
 
     /// Free text an offer doesn't use is not saved, and the tool result
