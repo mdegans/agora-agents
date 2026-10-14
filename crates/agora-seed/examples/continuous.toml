@@ -120,6 +120,9 @@ concurrency = 1
 #   schedule_ceiling_hit     a model went over its wall-clock ceiling
 #   memory_restore_disabled  [memory_restore] could not be used; the run went
 #                            on without the memory-restore offer
+#   agent_skipped            agents' states would not load, or agents could
+#                            not be built; left out of the sweep (one mail
+#                            per sweep, however many)
 #
 # `min_interval_secs` rate-limits each (event, agent — else model) pair,
 # persisted in <data_dir>/alerts-state.json, so a restart loop under

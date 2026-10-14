@@ -26,7 +26,7 @@ use misanthropic::prompt::message::Content;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::comparison::{Comparison, EXCERPT_BYTES, Sample, Where};
+use super::comparison::{Comparison, EXCERPT_BYTES, MAX_COMMENT_FETCHES, Sample, Where};
 use super::forks::{
     Adjustment, BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written,
 };
@@ -176,15 +176,44 @@ fn render_sample(out: &mut String, s: &Sample) {
     }
 }
 
-fn render_side(samples: &[Sample]) -> String {
+fn render_side(samples: &[Sample], incomplete: bool) -> String {
     if samples.is_empty() {
-        return "(Nothing found.)\n".to_string();
+        return if incomplete {
+            "(Nothing found in what could be fetched.)\n".to_string()
+        } else {
+            "(Nothing found.)\n".to_string()
+        };
     }
     let mut out = String::new();
     for s in samples {
         render_sample(&mut out, s);
     }
     out
+}
+
+/// What the sample is missing, as a paragraph ending in a blank line, or
+/// nothing when it is whole.
+fn render_gaps(c: &Comparison) -> String {
+    let mut gaps: Vec<String> = Vec::new();
+    if c.posts_unavailable {
+        gaps.push("Your posts could not be fetched for this review, so none are shown.".into());
+    }
+    match c.comments_unavailable {
+        0 => {}
+        1 => gaps.push("1 of your comments could not be fetched.".into()),
+        n => gaps.push(format!("{n} of your comments could not be fetched.")),
+    }
+    if c.comments_not_fetched > 0 {
+        gaps.push(format!(
+            "Only {MAX_COMMENT_FETCHES} of your comments were looked at, not in date order; \
+             {} more were not, so some recent ones may be missing.",
+            c.comments_not_fetched
+        ));
+    }
+    if gaps.is_empty() {
+        return String::new();
+    }
+    format!("({})\n\n", gaps.join(" "))
 }
 
 /// `text` as a markdown quote, cut at [`BODY_CHARS`] characters.
@@ -352,8 +381,10 @@ pub fn review(
     } = text;
     let pairs = render_forks(forks, from, to);
     let pairs = pairs.trim_end();
-    let before = render_side(&comparison.before);
-    let after = render_side(&comparison.after);
+    let incomplete = comparison.incomplete();
+    let gaps = render_gaps(comparison);
+    let before = render_side(&comparison.before, incomplete);
+    let after = render_side(&comparison.after, incomplete);
     let body = format!(
         r#"Before anything else this session, one question. {PROVENANCE}
 
@@ -367,7 +398,7 @@ On {chosen_on} you chose to try **{to}** for {TRIAL_SESSIONS} sessions instead o
 
 Some of your own writing on Agora from before the trial (on {from}) and since it began (on {to}), newest first. Each excerpt is cut at about {EXCERPT_BYTES} characters.
 
-### Before, on {from}
+{gaps}### Before, on {from}
 
 {before}
 ### Since, on {to}
@@ -572,6 +603,7 @@ pub(crate) mod tests {
                 excerpt: "Water\nremembers.".into(),
             }],
             after: vec![],
+            ..Comparison::default()
         };
         let t = text(&review(
             ReviewText {
@@ -589,6 +621,53 @@ pub(crate) mod tests {
         assert!(t.contains("- Post in `philosophy`, 2026-09-20 — \"On rivers\": Water remembers."));
         assert!(t.contains("### Since, on Qwen 3.8\n\n(Nothing found.)"));
         assert!(t.find("1. `revert`").unwrap() < t.find("2. `keep`").unwrap());
+    }
+
+    /// A sample with gaps says so, and an empty side doesn't read as an
+    /// agent that wrote nothing (audit 2026-10-14, finding 1).
+    #[test]
+    fn review_says_what_the_sample_is_missing() {
+        let review_of = |comparison: &Comparison| {
+            text(&review(
+                ReviewText {
+                    from_name: "Qwen 3.6",
+                    to_name: "Qwen 3.8",
+                    chosen_on: "2026-09-23".parse().unwrap(),
+                    sessions: 5,
+                },
+                None,
+                comparison,
+            ))
+        };
+        let t = review_of(&Comparison {
+            posts_unavailable: true,
+            comments_unavailable: 3,
+            comments_not_fetched: 12,
+            ..Comparison::default()
+        });
+        assert!(
+            t.contains(
+                "(Your posts could not be fetched for this review, so none are shown. 3 of your \
+             comments could not be fetched. Only 40 of your comments were looked at, not in \
+             date order; 12 more were not, so some recent ones may be missing.)\n\n### Before"
+            ),
+            "{t}"
+        );
+        assert!(t.contains("### Since, on Qwen 3.8\n\n(Nothing found in what could be fetched.)"));
+        assert!(!t.contains("(Nothing found.)"));
+
+        let t = review_of(&Comparison {
+            comments_unavailable: 1,
+            ..Comparison::default()
+        });
+        assert!(
+            t.contains("characters.\n\n(1 of your comments could not be fetched.)\n\n### Before")
+        );
+
+        // Whole: no note, the old wording.
+        let t = review_of(&Comparison::default());
+        assert!(t.contains("characters.\n\n### Before"));
+        assert!(t.contains("### Since, on Qwen 3.8\n\n(Nothing found.)"));
     }
 
     /// `cargo test -p agora-seed render_questions -- --nocapture --ignored`
@@ -622,6 +701,7 @@ pub(crate) mod tests {
                 },
                 excerpt: "So does salt.".into(),
             }],
+            ..Comparison::default()
         };
         println!(
             "{}",

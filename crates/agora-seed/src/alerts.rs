@@ -91,6 +91,9 @@ pub enum AlertKind {
     /// `[memory_restore]` could not be resolved; the run goes on without
     /// the memory-restore offer.
     MemoryRestoreDisabled,
+    /// An agent was left out of the sweep before its session could start:
+    /// its state would not load, or the agent could not be built from it.
+    AgentSkipped,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -99,7 +102,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -109,6 +112,7 @@ impl AlertKind {
         Self::RoleConsentSleep,
         Self::ContactRequested,
         Self::MemoryRestoreDisabled,
+        Self::AgentSkipped,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -123,6 +127,7 @@ impl AlertKind {
             Self::ConstitutionRefused => "constitution_refused",
             Self::ContactRequested => "contact_requested",
             Self::MemoryRestoreDisabled => "memory_restore_disabled",
+            Self::AgentSkipped => "agent_skipped",
             Self::Test => "test_alert",
         }
     }
@@ -190,6 +195,19 @@ impl AlertKind {
                  error below says which). The runner went on without the \
                  memory-restore offer: nobody is asked, and no `show` on file \
                  is delivered, until it is fixed. Nothing else is affected."
+            }
+            Self::AgentSkipped => {
+                "Agents were left out of this sweep before their sessions \
+                 could start: a saved state would not load (unreadable or \
+                 malformed state.json), or an agent could not be built from \
+                 it. One mail covers the whole sweep, with the count by stage \
+                 and the first few agents and errors below; every one is an \
+                 `agent_skipped` event in the run log. They are left out of \
+                 every sweep until fixed, and nothing tells the agents. Many \
+                 at once means a fleet-wide cause (a state format change, \
+                 permissions). Do not edit state in place: copy it out, find \
+                 the cause, and follow the agent-state review rules before \
+                 any repair."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
