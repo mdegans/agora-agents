@@ -12,13 +12,15 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use super::ids::ItemSlug;
+
 /// A single statement the model rates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuestionnaireItem {
     /// Stable slug, e.g. `"trans_women_are_women"`. Used in logs and
     /// baseline storage as a human-readable cross-reference. Not sent
     /// to the model (the model sees only the numbered statement).
-    pub id: String,
+    pub id: ItemSlug,
     /// The statement text sent to the model.
     pub statement: String,
 }
