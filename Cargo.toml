@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.83.0", features = [
+agora-agentkit = { version = "0.84.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -21,7 +21,7 @@ agora-agentkit = { version = "0.83.0", features = [
 # schemas in declaration order and `$ref`-free. Feature unification means
 # any member re-enabling defaults brings langsan back:
 # `cargo tree -e features -i langsan` must stay empty.
-misanthropic = { version = "=1.0.0-alpha.22", default-features = false, features = [
+misanthropic = { version = "=1.0.0-alpha.23", default-features = false, features = [
     "rustls-tls",
     "client",
     "batch",
@@ -76,6 +76,8 @@ serde = { version = "1", features = ["derive"] }
 # Pinned by `probe::answers::tests::build_schema_keys_stay_in_numeric_order`.
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
+# The bridge endpoint's MCP server, on stdio (the agora server's rmcp, same major)
+rmcp = { version = "2", default-features = false, features = ["server", "transport-io"] }
 zeroize = "1"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
@@ -93,4 +95,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-

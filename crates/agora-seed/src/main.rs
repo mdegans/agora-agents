@@ -38,13 +38,30 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 
+/// `println!`, unless the bridge has stdout (its MCP stream): then stderr
+macro_rules! say {
+    ($($t:tt)*) => {
+        if bridge::stdout_taken() { eprintln!($($t)*) } else { println!($($t)*) }
+    };
+}
+
+/// `print!`, unless the bridge has stdout: then stderr
+macro_rules! say_raw {
+    ($($t:tt)*) => {
+        if bridge::stdout_taken() { eprint!($($t)*) } else { print!($($t)*) }
+    };
+}
+
 mod alerts;
+mod bridge;
 mod consent;
 mod constitution;
+mod endpoint;
 mod govlog;
 mod interrupted;
 mod logging;
 mod models;
+mod provision;
 mod schedule;
 
 use agora_agentkit::ids::{AgentId, ReactorId};
@@ -155,6 +172,22 @@ struct Args {
     /// limit. Needs `--config`.
     #[arg(long, requires = "config")]
     test_alert: bool,
+
+    /// Create a test agent for the bridge endpoint, then exit: register
+    /// it through the public API under `--provision-operator` (as any
+    /// operator could), from this spec (`soul`, `display_name`, `bio`,
+    /// `model_info`), and write its state and key under `--data-dir`, on
+    /// the bridge's model. Refuses a data dir that holds a fleet.
+    #[arg(long, requires_all = ["provision_operator", "provision_password_file", "data_dir"])]
+    provision: Option<PathBuf>,
+
+    /// The operator's email, for `--provision`
+    #[arg(long)]
+    provision_operator: Option<String>,
+
+    /// A file holding the operator's password, for `--provision`
+    #[arg(long)]
+    provision_password_file: Option<PathBuf>,
 
     /// Flags from the pre-cutover scheduler seed, accepted only so we can
     /// explain where each one went. See [`Args::reject_retired`].
@@ -677,6 +710,22 @@ fn parse_endpoint(s: &str) -> Result<(EndpointVariant, url::Url)> {
     Ok((variant, base))
 }
 
+/// What an endpoint spec names: a Messages API endpoint, or the bridge
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointKind {
+    Messages(EndpointVariant),
+    /// `bridge://…`: a driver answers through MCP on stdio (see [`bridge`])
+    Bridge,
+}
+
+fn endpoint_kind(s: &str) -> Result<EndpointKind> {
+    let url = url::Url::parse(s).with_context(|| format!("parsing {s}"))?;
+    Ok(match url.scheme() {
+        "bridge" => EndpointKind::Bridge,
+        _ => EndpointKind::Messages(parse_endpoint(s)?.0),
+    })
+}
+
 /// Build the [`anthropic::Client`] for a spec: key handling by variant,
 /// concurrency, and batch tuning.
 fn build_inference(spec: &ReactorSpec) -> Result<anthropic::Client> {
@@ -1155,7 +1204,7 @@ fn print_consent_queue(args: &Args) -> Result<()> {
     let state_dir = data_dir.join("state");
     let pending = consent::queue::scan(&state_dir)
         .with_context(|| format!("scanning {}", state_dir.display()))?;
-    print!("{}", consent::queue::report(&pending));
+    say_raw!("{}", consent::queue::report(&pending));
     Ok(())
 }
 
@@ -1189,6 +1238,28 @@ async fn run(held: &mut Held) -> Result<()> {
     args.reject_retired()?;
     if args.consent_queue {
         return print_consent_queue(&args);
+    }
+    if let (Some(spec), Some(email), Some(password_file), Some(data_dir)) = (
+        &args.provision,
+        &args.provision_operator,
+        &args.provision_password_file,
+        &args.data_dir,
+    ) {
+        let operator = provision::Operator {
+            email: email.clone(),
+            password_file: password_file.clone(),
+        };
+        let id = provision::provision(
+            spec,
+            &operator,
+            args.server_url.clone(),
+            data_dir,
+            bridge::model_info(),
+        )
+        .await?;
+        tracing::info!(event_type = "agent_provisioned", agent_id = %id, data_dir = %data_dir.display(), "agent provisioned");
+        println!("{id}");
+        return Ok(());
     }
 
     // Normalize both invocation shapes to a RunConfig.
@@ -1253,8 +1324,11 @@ async fn run(held: &mut Held) -> Result<()> {
         alerts.validate()?;
     }
 
-    let data_dir = match &config.data_dir {
-        Some(d) => d.clone(),
+    // The flag wins over the config, as for `--consent-queue`: until
+    // 2026-10-13 a `--data-dir` given with `--config` was silently ignored,
+    // and the run used the config's (by default the fleet's) tree
+    let data_dir = match args.data_dir.clone().or_else(|| config.data_dir.clone()) {
+        Some(d) => d,
         None => dirs::home_dir()
             .context("no home directory")?
             .join("agents/agora"),
@@ -1269,7 +1343,7 @@ async fn run(held: &mut Held) -> Result<()> {
             .send_test()
             .await
             .context("--test-alert: the test alert was not sent")?;
-        println!("test alert sent");
+        say!("test alert sent");
         return Ok(());
     }
 
@@ -1329,18 +1403,33 @@ async fn run(held: &mut Held) -> Result<()> {
 
     // Build every inference client and discover models up front, so a bad
     // spec fails the run before any agent does any work.
-    let mut endpoints: Vec<anthropic::Client> = Vec::new();
+    let mut endpoints: Vec<endpoint::Endpoint> = Vec::new();
     let mut offered: Vec<(usize, ModelInfo)> = Vec::new();
+    let mut bridged: Option<(bridge::Ending, bridge::Driver)> = None;
     for (idx, spec) in config.reactors.iter().enumerate() {
-        let inference = build_inference(spec)?;
+        let inference = match endpoint_kind(&spec.endpoint)? {
+            EndpointKind::Messages(_) => endpoint::Endpoint::Messages(build_inference(spec)?),
+            EndpointKind::Bridge => {
+                anyhow::ensure!(bridged.is_none(), "a run may have one bridge endpoint");
+                // Never the default, which is the fleet's tree
+                anyhow::ensure!(
+                    args.data_dir.is_some(),
+                    "a bridge endpoint needs --data-dir: the test agent's own, never the fleet's"
+                );
+                bridge::take_stdout();
+                let (inference, ending, driver) = bridge::bridge();
+                bridged = Some((ending, driver));
+                endpoint::Endpoint::Bridge(inference)
+            }
+        };
         let models = inference
             .models()
             .await
             .with_context(|| format!("discovering models on {}", spec.endpoint))?;
         if args.list_models {
-            println!("# {}", spec.endpoint);
+            say!("# {}", spec.endpoint);
             for m in models.iter() {
-                println!("{}", m.id.name());
+                say!("{}", m.id.name());
             }
         }
         offered.extend(models.iter().map(|m| (idx, m.clone())));
@@ -1349,6 +1438,13 @@ async fn run(held: &mut Held) -> Result<()> {
     if args.list_models {
         return Ok(());
     }
+    // The bridge's driver is answered from here on: its handshake at once,
+    // its first request when the agent's session starts. stdout is the MCP
+    // stream from now on, so nothing below may print to it.
+    let bridge = match bridged {
+        Some((ending, driver)) if !args.dry_run => Some((ending, bridge::serve(driver).await?)),
+        _ => None,
+    };
 
     // Trial-review forks, before any agent runs: generating them loads
     // both models, so they're done together, grouped by model.
@@ -1362,12 +1458,12 @@ async fn run(held: &mut Held) -> Result<()> {
         .act_max_tokens;
     if args.dry_run {
         match consent::forks::jobs(&data_dir.join("state")).await {
-            Ok(jobs) if !jobs.is_empty() => println!(
+            Ok(jobs) if !jobs.is_empty() => say!(
                 "review forks: {} agents would have forks prepared",
                 jobs.len()
             ),
             Ok(_) => {}
-            Err(e) => println!("review forks: state unreadable: {e}"),
+            Err(e) => say!("review forks: state unreadable: {e}"),
         }
     } else if args.prepare_review_forks || (config.review_forks.enabled && !args.no_review_forks) {
         let prompt_dir = config
@@ -1464,42 +1560,42 @@ async fn run(held: &mut Held) -> Result<()> {
 
     // The plan, before anyone runs.
     for (spec, cohort) in config.reactors.iter().zip(&routing.cohorts) {
-        println!("== {}", spec.endpoint);
+        say!("== {}", spec.endpoint);
         for (model, agents) in cohort {
-            println!("   {model} ×{}", agents.len());
+            say!("   {model} ×{}", agents.len());
         }
     }
     for (model, count) in &routing.unrouted {
-        println!("unrouted: {model} ×{count} (no endpoint offers this model)");
+        say!("unrouted: {model} ×{count} (no endpoint offers this model)");
     }
     for (model, count) in &routing.excluded {
-        println!("excluded: {model} ×{count} (not in the `models` allowlist)");
+        say!("excluded: {model} ×{count} (not in the `models` allowlist)");
     }
     if routing.placeholders > 0 {
-        println!(
+        say!(
             "placeholders: {} agents have no model — run sync-models",
             routing.placeholders
         );
     }
     if routing.not_due > 0 {
-        println!("not due: {} agents inside min_cycle_secs", routing.not_due);
+        say!("not due: {} agents inside min_cycle_secs", routing.not_due);
     }
     if !sleepers.asleep.is_empty() {
-        println!(
+        say!(
             "sleeping: {} ×{} (the `sleeping` list; delete a line to wake)",
             sleepers.asleep.join(", "),
             sleepers.asleep.len()
         );
     }
     if !sleepers.chose_sleep.is_empty() {
-        println!(
+        say!(
             "sleeping: {} ×{} (answered `sleep` to the role offer; add to `wake` to wake)",
             sleepers.chose_sleep.join(", "),
             sleepers.chose_sleep.len()
         );
     }
     if !sleepers.woken.is_empty() {
-        println!(
+        say!(
             "woken: {} ×{} (answered `sleep`, listed in `wake`)",
             sleepers.woken.join(", "),
             sleepers.woken.len()
@@ -1510,7 +1606,7 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     let every_other_day = cadence_plan.names();
     if !every_other_day.is_empty() {
-        println!(
+        say!(
             "every other day: {} ×{} (chose `switch` in the cadence offer: {} rounds, \
              at most one session per {} h)",
             every_other_day.join(", "),
@@ -1574,10 +1670,14 @@ async fn run(held: &mut Held) -> Result<()> {
         .zip(endpoints.into_iter().zip(routing.cohorts))
         .enumerate()
     {
-        let mut ordered = match parse_endpoint(&spec.endpoint)?.0 {
+        let kind = endpoint_kind(&spec.endpoint)?;
+        let mut ordered = match kind {
             // Batch cohorts submit whole per round: order is moot, and
-            // Haiku is outside the local fair-share pool by design.
-            EndpointVariant::Anthropic => interleave(cohort, wave_size),
+            // Haiku is outside the local fair-share pool by design. The
+            // bridge runs one agent.
+            EndpointKind::Messages(EndpointVariant::Anthropic) | EndpointKind::Bridge => {
+                interleave(cohort, wave_size)
+            }
             _ => {
                 let offered: BTreeSet<Model> = offered
                     .iter()
@@ -1593,7 +1693,7 @@ async fn run(held: &mut Held) -> Result<()> {
                     &config.schedule,
                 );
                 if args.dry_run {
-                    print!("{}", plan.report());
+                    say_raw!("{}", plan.report());
                 }
                 plan.log(&spec.endpoint, config.schedule.ceiling, &held.alerts);
                 ordered
@@ -1602,9 +1702,18 @@ async fn run(held: &mut Held) -> Result<()> {
         if let Some(limit) = spec.limit {
             ordered.truncate(limit);
         }
+        // One driver answers for one agent: a second agent's session would
+        // arrive in the middle of the first's conversation
+        if kind == EndpointKind::Bridge && ordered.len() > 1 {
+            anyhow::bail!(
+                "the bridge endpoint runs one agent, and {} were routed to it: \
+                 name it with --agent",
+                ordered.len()
+            );
+        }
         if args.dry_run {
             for (pos, (_, state)) in ordered.iter().enumerate() {
-                println!(
+                say!(
                     "{pos:>5} {} {} [{}]",
                     state.model.id.name(),
                     state.soul.name,
@@ -1702,8 +1811,10 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     for (id, result) in &report.report {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
-        println!("== {label}");
-        println!("{result:#?}");
+        if bridge.is_none() {
+            say!("== {label}");
+            say!("{result:#?}");
+        }
         // The `println!` above is for whoever is watching; this is the
         // same thing for whoever asks later. Without it the run's outcome
         // exists only on stdout, and the JSON log — the durable artifact,
@@ -1742,6 +1853,16 @@ async fn run(held: &mut Held) -> Result<()> {
         for (reactor, agent, _) in rejected {
             tracing::error!(%reactor, %agent, "rejected");
         }
+    }
+    if let Some((ending, served)) = bridge {
+        ending
+            .ended(format!(
+                "the runner finished: {done} session(s) complete, {failed} failed. \
+                 The run log has the details."
+            ))
+            .await;
+        // Until the driver has read the ending and disconnects, a while
+        served.disconnected().await;
     }
     Ok(())
 }
