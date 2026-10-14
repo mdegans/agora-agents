@@ -121,7 +121,7 @@ struct Inner {
     session: Mutex<Session>,
     round: SyncMutex<Option<Round>>,
     /// The latest request, pretty-printed, for `bridge_raw_prompt`
-    raw: SyncMutex<Option<Arc<str>>>,
+    raw: SyncMutex<Option<RawViews>>,
     /// Results longer than a page, by call id, for `bridge_result`
     pages: SyncMutex<std::collections::HashMap<String, Arc<str>>>,
     /// The agent's tools and the bridge's, once the first request shows
@@ -191,6 +191,28 @@ struct ResultInput {
 struct RawInput {
     #[serde(default)]
     offset: usize,
+    /// Which view of the request; Markdown when left out
+    #[serde(default)]
+    format: RawFormat,
+}
+
+/// The two views of a request `bridge_raw_prompt` keeps
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawFormat {
+    /// misanthropic's transcript Markdown: text verbatim, tools, calls and
+    /// results labelled (what `bridge_begin` shows)
+    #[default]
+    Markdown,
+    /// The exact request, as JSON: every field, as sent
+    Json,
+}
+
+/// A request as `bridge_raw_prompt` serves it, in both views
+#[derive(Clone)]
+struct RawViews {
+    json: Arc<str>,
+    markdown: Arc<str>,
 }
 
 fn object(value: serde_json::Value) -> Arc<JsonObject> {
@@ -246,13 +268,17 @@ fn bridge_tools() -> Vec<Tool> {
         .with_annotations(concurrent()),
         Tool::new(
             RAW,
-            "The exact request the runner would send to a model (system, \
-             messages, tools, limits), as JSON, in pages. For debugging the \
-             harness; the agent's model never sees this view.",
+            "The request the runner would send to a model, in pages: as \
+             Markdown (the default: text exactly as sent, the tool \
+             definitions, each call and result labelled), or with \
+             format \"json\" as the exact request, every field as sent. \
+             For debugging the harness; the agent's model never sees this \
+             view.",
             object(json!({
                 "type": "object",
                 "properties": {
-                    "offset": {"type": "integer", "description": "Character to start from; 0 when left out"}
+                    "offset": {"type": "integer", "description": "Character to start from; 0 when left out"},
+                    "format": {"type": "string", "enum": ["markdown", "json"], "description": "markdown (default) or json"}
                 },
             })),
         )
@@ -279,9 +305,12 @@ impl Server {
     }
 
     fn remember_raw(&self, request: &Request) {
-        let pretty = serde_json::to_string_pretty(&request.raw)
+        let json = serde_json::to_string_pretty(&request.raw)
             .unwrap_or_else(|e| format!("(unrenderable: {e})"));
-        *self.inner.raw.lock().expect("not poisoned") = Some(pretty.into());
+        *self.inner.raw.lock().expect("not poisoned") = Some(RawViews {
+            json: json.into(),
+            markdown: render::prompt(&request.prompt).into(),
+        });
     }
 
     /// Learn the agent's tools from the first request, and tell the
@@ -340,7 +369,11 @@ impl Server {
         match session.wait().await {
             Ok(request) => {
                 self.remember_raw(request);
-                CallToolResult::success(vec![Content::text(render::prompt(&request.prompt))])
+                // Paged like a long result: a whole first request runs to
+                // ~100K characters, past what a driver's tool output holds
+                // (beta-harness, 2026-10-14)
+                let text = self.paged(BEGIN, render::prompt(&request.prompt));
+                CallToolResult::success(vec![Content::text(text)])
             }
             Err(why) => CallToolResult::success(vec![Content::text(format!(
                 "[bridge] There is no session: {why}"
@@ -382,16 +415,27 @@ impl Server {
         }
     }
 
-    fn raw(&self, offset: usize) -> CallToolResult {
-        let raw = self.inner.raw.lock().expect("not poisoned").clone();
+    fn raw(&self, offset: usize, format: RawFormat) -> CallToolResult {
+        let views = self.inner.raw.lock().expect("not poisoned").clone();
+        let raw = views.map(|v| match format {
+            RawFormat::Markdown => v.markdown,
+            RawFormat::Json => v.json,
+        });
         let Some(raw) = raw else {
             return CallToolResult::success(vec![Content::text(
                 "[bridge] No request yet: call bridge_begin first.",
             )]);
         };
         let total = raw.chars().count();
-        let page: String = raw.chars().skip(offset).take(RAW_PAGE).collect();
-        let end = (offset + RAW_PAGE).min(total);
+        let mut page: String = raw.chars().skip(offset).take(RAW_PAGE).collect();
+        // At a line break, as result pages end (beta-newcomer, 2026-10-14:
+        // pages broke mid-JSON)
+        if offset + RAW_PAGE < total
+            && let Some(cut) = page.rfind('\n').filter(|&i| i > page.len() / 2)
+        {
+            page.truncate(cut + 1);
+        }
+        let end = offset + page.chars().count();
         let more = match end < total {
             true => format!(" Call again with offset {end} for more."),
             false => String::new(),
@@ -743,7 +787,7 @@ impl ServerHandler for Server {
                 Err(e) => invalid(e),
             },
             RAW => match serde_json::from_value::<RawInput>(input) {
-                Ok(RawInput { offset }) => self.raw(offset),
+                Ok(RawInput { offset, format }) => self.raw(offset, format),
                 Err(e) => invalid(e),
             },
             name if self.is_agent_tool(name) => {
