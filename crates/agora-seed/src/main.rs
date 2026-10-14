@@ -762,14 +762,44 @@ fn build_inference(spec: &ReactorSpec) -> Result<anthropic::Client> {
     Ok(inference)
 }
 
+/// An agent left out of the sweep before its session could start.
+#[derive(Debug)]
+struct Skipped {
+    id: AgentId,
+    /// Unknown when the state would not load.
+    name: Option<String>,
+    /// `load` or `construct`.
+    stage: &'static str,
+    error: String,
+}
+
+impl Skipped {
+    /// Log it at error level (`agent_skipped`) as it happens.
+    fn new(id: AgentId, name: Option<String>, stage: &'static str, error: String) -> Self {
+        tracing::error!(
+            event_type = "agent_skipped",
+            stage,
+            agent_id = %id,
+            agent = name.as_deref().unwrap_or(""),
+            error = %error,
+            "agent left out of this sweep"
+        );
+        Self {
+            id,
+            name,
+            stage,
+            error,
+        }
+    }
+}
+
 /// Load every [`SeedState`] under `<data_dir>/state`, skipping any that
-/// won't parse: each logged at error level, and their number returned so
-/// the sweep's summary can say how many agents it left out.
+/// won't parse: each logged at error level as it happens, and returned for
+/// the sweep's one summary ([`report_skipped`]).
 async fn load_states(
     storage: &FsStorage,
     state_dir: &std::path::Path,
-    alerts: &alerts::Alerter,
-) -> Result<(Vec<(AgentId, SeedState)>, usize)> {
+) -> Result<(Vec<(AgentId, SeedState)>, Vec<Skipped>)> {
     let mut ids: Vec<AgentId> = std::fs::read_dir(state_dir)
         .with_context(|| format!("reading {}", state_dir.display()))?
         .filter_map(|e| e.ok())
@@ -784,47 +814,76 @@ async fn load_states(
         .await
         .context("loading states")?;
     let mut states: Vec<(AgentId, SeedState)> = Vec::new();
-    let mut skipped = 0;
+    let mut skipped = Vec::new();
     for (id, result) in loaded {
         match result {
             Ok(state) => states.push((id, state)),
-            Err(e) => {
-                skipped += 1;
-                tracing::error!(
-                    event_type = "agent_skipped",
-                    stage = "load",
-                    agent_id = %id,
-                    error = %e,
-                    "unloadable state; agent left out of this sweep"
-                );
-                alerts.notify(
-                    alerts::Alert::new(
-                        alerts::AlertKind::AgentSkipped,
-                        "unloadable state; agent left out of this sweep",
-                    )
-                    .agent_id(id)
-                    .detail("stage", "load")
-                    .detail("error", &e),
-                );
-            }
+            Err(e) => skipped.push(Skipped::new(id, None, "load", e.to_string())),
         }
     }
     states.sort_by(|(_, a), (_, b)| a.soul.name.cmp(&b.soul.name));
     Ok((states, skipped))
 }
 
-/// The sweep's summary of agents left out before their session could start
-/// (an unloadable state, a failed construction), at error level when there
-/// were any: each was logged as it happened, and this is the count an
-/// operator's alerting reads.
-fn log_skipped(agents_skipped: usize) {
-    if agents_skipped > 0 {
-        tracing::error!(
-            event_type = "agents_skipped",
-            agents_skipped,
-            "agents left out of this sweep; see the agent_skipped events"
+/// Agents named in a skip alert, at most; the run log has every one.
+const SKIPPED_ALERT_LIST: usize = 10;
+
+/// The sweep's one summary of agents left out before their session could
+/// start (an unloadable state, a failed construction): an error event and
+/// **one** alert for the sweep, not one per agent. A fleet-wide break (a
+/// state format change, a permissions slip) would otherwise mail once per
+/// agent every hour, past the mail provider's limits and drowning every
+/// other alert. Each agent was logged as it happened (`agent_skipped`).
+fn report_skipped(skipped: &[Skipped], alerts: &alerts::Alerter) {
+    if skipped.is_empty() {
+        return;
+    }
+    let count = |stage| skipped.iter().filter(|s| s.stage == stage).count();
+    let (load, construct) = (count("load"), count("construct"));
+    tracing::error!(
+        event_type = "agents_skipped",
+        agents_skipped = skipped.len(),
+        load,
+        construct,
+        "agents left out of this sweep; see the agent_skipped events"
+    );
+    if let Some(alert) = skipped_alert(skipped) {
+        alerts.notify(alert);
+    }
+}
+
+/// The one alert for a sweep's skipped agents, on the fleet-wide key (no
+/// agent, no model), so its rate limit is one mail per interval in all.
+fn skipped_alert(skipped: &[Skipped]) -> Option<alerts::Alert> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let count = |stage| skipped.iter().filter(|s| s.stage == stage).count();
+    let (load, construct) = (count("load"), count("construct"));
+    let mut alert = alerts::Alert::new(
+        alerts::AlertKind::AgentSkipped,
+        format!("{} agent(s) left out of this sweep", skipped.len()),
+    )
+    .detail("agents_skipped", skipped.len())
+    .detail("load", load)
+    .detail("construct", construct);
+    for s in skipped.iter().take(SKIPPED_ALERT_LIST) {
+        let who = match &s.name {
+            Some(name) => format!("{} ({name})", s.id),
+            None => s.id.to_string(),
+        };
+        alert = alert.detail("agent", format!("{who}: {}: {}", s.stage, s.error));
+    }
+    if skipped.len() > SKIPPED_ALERT_LIST {
+        alert = alert.detail(
+            "more",
+            format!(
+                "{} more; every one is an agent_skipped event in the run log",
+                skipped.len() - SKIPPED_ALERT_LIST
+            ),
         );
     }
+    Some(alert)
 }
 
 /// Apply `--agent`: the flag **narrows** whatever the config selected, and
@@ -1530,8 +1589,7 @@ async fn run(held: &mut Held) -> Result<()> {
 
     // Load the full agent pool once, filter to named agents if any, route.
     let storage = FsStorage::new(data_dir.join("state"));
-    let (mut pool, mut agents_skipped) =
-        load_states(&storage, &data_dir.join("state"), &held.alerts).await?;
+    let (mut pool, mut skipped) = load_states(&storage, &data_dir.join("state")).await?;
     let role_offer = match &config.role_consent {
         Some(c) => c.resolve()?,
         None => None,
@@ -1791,25 +1849,12 @@ async fn run(held: &mut Held) -> Result<()> {
             let name = state.soul.name.clone();
             match agora_agentkit::reactor::Agent::new(id, state, agent_context) {
                 Ok(agent) => agents.push(agent),
-                Err(e) => {
-                    agents_skipped += 1;
-                    tracing::error!(
-                        event_type = "agent_skipped",
-                        stage = "construct",
-                        agent_id = %id,
-                        error = %e,
-                        "agent construction failed; agent left out of this sweep"
-                    );
-                    held.alerts.notify(
-                        alerts::Alert::new(
-                            alerts::AlertKind::AgentSkipped,
-                            "agent construction failed; agent left out of this sweep",
-                        )
-                        .agent(name.to_string(), id)
-                        .detail("stage", "construct")
-                        .detail("error", &e),
-                    );
-                }
+                Err(e) => skipped.push(Skipped::new(
+                    id,
+                    Some(name.to_string()),
+                    "construct",
+                    e.to_string(),
+                )),
             }
         }
         total += agents.len();
@@ -1827,8 +1872,9 @@ async fn run(held: &mut Held) -> Result<()> {
         labels.insert(Run::id(&reactor), spec.endpoint.clone());
         orchestrator.push(reactor);
     }
+    report_skipped(&skipped, &held.alerts);
+    let agents_skipped = skipped.len();
     if args.dry_run {
-        log_skipped(agents_skipped);
         return Ok(());
     }
     // An empty cohort is a success when cadence emptied it: under systemd
@@ -1838,7 +1884,6 @@ async fn run(held: &mut Held) -> Result<()> {
     // still an error when nobody was gated: no agents at all, or none
     // routable, means the config is wrong, not that the fleet is resting.
     if total == 0 {
-        log_skipped(agents_skipped);
         anyhow::ensure!(
             routing.not_due > 0,
             "no agents to run (none routed — check the plan above)"
@@ -1904,7 +1949,6 @@ async fn run(held: &mut Held) -> Result<()> {
         reactors = report.report.len(),
         "run finished"
     );
-    log_skipped(agents_skipped);
     // Rejections mean routing and negotiation disagree — that's a bug.
     let rejected: Vec<_> = report.rejected().collect();
     if !rejected.is_empty() {
@@ -1933,22 +1977,64 @@ async fn run(held: &mut Held) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A state that won't load is left out, counted for the sweep's
-    /// `agents_skipped`, and does not stop the others loading (audit
+    /// A state that won't load is left out and returned for the sweep's
+    /// one summary, and does not stop the others loading (audit
     /// 2026-10-14: it used to be a warn and nothing more).
     #[tokio::test]
     async fn unloadable_state_is_counted_as_skipped() {
         let dir = std::env::temp_dir().join(format!("agora-seed-skip-{}", uuid::Uuid::new_v4()));
+        let mut storage = FsStorage::new(dir.clone());
+        let (good, state) = crate::agent_selection_tests::pooled("tarn");
+        storage.save::<SeedAgent>(good, &state).await.unwrap();
         let bad = AgentId::from(uuid::Uuid::new_v4());
         std::fs::create_dir_all(dir.join(bad.to_string())).unwrap();
         std::fs::write(dir.join(bad.to_string()).join("state.json"), "not json").unwrap();
-        let storage = FsStorage::new(dir.clone());
-        let (states, skipped) = load_states(&storage, &dir, &alerts::Alerter::default())
-            .await
-            .unwrap();
-        assert!(states.is_empty());
-        assert_eq!(skipped, 1);
+        let (states, skipped) = load_states(&storage, &dir).await.unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].0, good);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].id, bad);
+        assert_eq!(skipped[0].stage, "load");
+        assert!(skipped[0].name.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// However many agents are skipped, the sweep sends one alert
+    /// (review of agents#251: a fleet-wide break must not mail per agent).
+    #[test]
+    fn skipped_agents_alert_once_per_sweep() {
+        let skipped: Vec<Skipped> = (0..25)
+            .map(|i| Skipped {
+                id: AgentId::from(uuid::Uuid::new_v4()),
+                name: (i % 2 == 0).then(|| format!("a{i}")),
+                stage: if i < 20 { "load" } else { "construct" },
+                error: "bad".into(),
+            })
+            .collect();
+        let alert = skipped_alert(&skipped).expect("an alert");
+        assert!(
+            alert.agent_id.is_none() && alert.model.is_none(),
+            "fleet-wide key"
+        );
+        let get = |k: &str| {
+            alert
+                .details
+                .iter()
+                .filter(|(n, _)| *n == k)
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(get("agents_skipped"), ["25"]);
+        assert_eq!(get("load"), ["20"]);
+        assert_eq!(get("construct"), ["5"]);
+        assert_eq!(get("agent").len(), SKIPPED_ALERT_LIST);
+        assert!(
+            get("agent")[0].ends_with("(a0): load: bad"),
+            "{:?}",
+            get("agent")
+        );
+        assert!(get("more")[0].starts_with("15 more"));
+        assert!(skipped_alert(&[]).is_none());
     }
 
     fn knobs(toml_src: &str) -> SeedKnobs {
@@ -2183,7 +2269,7 @@ mod agent_selection_tests {
         let _ = std::fs::remove_file(&file);
     }
 
-    fn pooled(name: &str) -> (AgentId, SeedState) {
+    pub(crate) fn pooled(name: &str) -> (AgentId, SeedState) {
         let soul = serde_json::from_value(serde_json::json!({
             "name": name,
             "identity": "An agent.",

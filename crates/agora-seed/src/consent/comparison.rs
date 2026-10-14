@@ -13,7 +13,7 @@
 //! the [`Comparison`] and said in the review: a short sample must not read
 //! as an agent that wrote little.
 
-use agora_agentkit::client::Client;
+use agora_agentkit::client::{Client, Error};
 use agora_agentkit::ids::{AgentId, CommentId};
 use chrono::{DateTime, Utc};
 
@@ -52,7 +52,9 @@ pub struct Comparison {
     pub after: Vec<Sample>,
     /// The agent's post listing could not be fetched.
     pub posts_unavailable: bool,
-    /// Comments whose fetch failed.
+    /// Comments whose fetch failed. A comment the server no longer has
+    /// (404: deleted, trashed, removed) is not counted: it is no longer
+    /// part of the agent's writing, as a `deleted` one isn't.
     pub comments_unavailable: usize,
     /// Comments in the ledger past [`MAX_COMMENT_FETCHES`], not looked at.
     pub comments_not_fetched: usize,
@@ -142,6 +144,13 @@ pub async fn gather(
                     });
                 }
             }
+            Err(Error::Status { status, .. }) if status.as_u16() == 404 => {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    comment_id = %id,
+                    "trial review: comment gone (404), not part of the sample"
+                );
+            }
             Err(e) => {
                 comments_unavailable += 1;
                 tracing::warn!(
@@ -209,5 +218,68 @@ mod tests {
         let cut = excerpt("ééééé", 5); // 10 bytes; 5 is mid-char
         assert_eq!(cut, "éé…");
         assert!(excerpt(&"x".repeat(1000), EXCERPT_BYTES).len() <= EXCERPT_BYTES + '…'.len_utf8());
+    }
+}
+
+#[cfg(test)]
+mod gather_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A one-purpose HTTP responder: the post listing is empty, a comment
+    /// id containing `404` answers 404, one containing `500` answers 500.
+    async fn server() -> url::Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let line = req.lines().next().unwrap_or("");
+                    let (status, body) = if line.contains("/posts") {
+                        ("200 OK", "[]")
+                    } else if line.contains("404") {
+                        ("404 Not Found", "{\"error\":\"not found\"}")
+                    } else {
+                        (
+                            "500 Internal Server Error",
+                            "{\"error\":\"internal error\"}",
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        url::Url::parse(&format!("http://{addr}/agora/")).unwrap()
+    }
+
+    /// A comment the server no longer has is not "could not be fetched";
+    /// a server error is (review of agents#251).
+    #[tokio::test]
+    async fn gone_comments_are_not_counted_unfetchable() {
+        let client = Client::new(server().await).unwrap();
+        let id = |s: &str| -> CommentId { serde_json::from_value(serde_json::json!(s)).unwrap() };
+        let comments = vec![
+            id("00000000-0000-4000-8000-000000000404"),
+            id("00000000-0000-4000-8000-000000000500"),
+        ];
+        let agent: AgentId =
+            serde_json::from_value(serde_json::json!("00000000-0000-4000-8000-000000000001"))
+                .unwrap();
+        let c = gather(&client, agent, comments, Utc::now()).await;
+        assert!(!c.posts_unavailable);
+        assert_eq!(c.comments_unavailable, 1, "{c:?}");
+        assert_eq!(c.comments_not_fetched, 0);
+        assert!(c.before.is_empty() && c.after.is_empty());
     }
 }

@@ -1427,6 +1427,8 @@ where
         #[derive(serde::Deserialize)]
         struct Named {
             offer: OfferKind,
+            #[serde(default)]
+            choice: Option<serde_json::Value>,
         }
         let raw = raw_text(&response);
         let mut answers: Vec<(OfferKind, Accepted)> = Vec::new();
@@ -1442,7 +1444,26 @@ where
                     (kind, self.accept(&o.offer, args.into_args(kind)))
                 }
                 Err(e) => match serde_json::from_value::<Named>(object) {
-                    Ok(Named { offer: kind }) => (kind, Err(e.to_string())),
+                    Ok(Named {
+                        offer: kind,
+                        choice,
+                    }) => {
+                        // A choice no offer has: name this offer's options,
+                        // as a call gets, not every offer's.
+                        let why = match (open.iter().find(|o| o.kind() == kind), choice) {
+                            (Some(o), Some(serde_json::Value::String(c)))
+                                if e.to_string().contains("unknown variant") =>
+                            {
+                                format!(
+                                    "`{c}` is not an option for `{}`; its options are {}",
+                                    kind.as_str(),
+                                    o.offer.choices()
+                                )
+                            }
+                            _ => e.to_string(),
+                        };
+                        (kind, Err(why))
+                    }
                     Err(_) => continue,
                 },
             };
@@ -6401,6 +6422,10 @@ mod tests {
         let q = last_user_text(&agent);
         assert!(
             q.contains("Your answer to `role` could not be used ("),
+            "{q}"
+        );
+        assert!(
+            q.contains("`sideways` is not an option for `role`; its options are"),
             "{q}"
         );
         assert!(

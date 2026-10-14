@@ -197,14 +197,17 @@ impl AlertKind {
                  is delivered, until it is fixed. Nothing else is affected."
             }
             Self::AgentSkipped => {
-                "An agent was left out of this sweep before its session could \
-                 start: its saved state would not load (unreadable or \
-                 malformed state.json), or the agent could not be built from \
-                 it (the error below says which). It is left out of every \
-                 sweep until that is fixed, and nothing tells the agent. Do not \
-                 edit the state in place: copy it out, find the cause, and \
-                 follow the agent-state review rules before any repair. The \
-                 sweep's `agents_skipped` event counts them."
+                "Agents were left out of this sweep before their sessions \
+                 could start: a saved state would not load (unreadable or \
+                 malformed state.json), or an agent could not be built from \
+                 it. One mail covers the whole sweep, with the count by stage \
+                 and the first few agents and errors below; every one is an \
+                 `agent_skipped` event in the run log. They are left out of \
+                 every sweep until fixed, and nothing tells the agents. Many \
+                 at once means a fleet-wide cause (a state format change, \
+                 permissions). Do not edit state in place: copy it out, find \
+                 the cause, and follow the agent-state review rules before \
+                 any repair."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
@@ -250,13 +253,6 @@ impl Alert {
 
     pub fn agent(mut self, name: impl Into<String>, id: AgentId) -> Self {
         self.agent = Some(name.into());
-        self.agent_id = Some(id);
-        self
-    }
-
-    /// The agent it concerns, when its name can't be known (its state
-    /// would not load).
-    pub fn agent_id(mut self, id: AgentId) -> Self {
         self.agent_id = Some(id);
         self
     }
