@@ -7,7 +7,7 @@ use crate::output;
 pub async fn run(client: &Client, query: &str, community: Option<&str>, json: bool) -> Result<()> {
     let found = client
         .search(&SearchInput {
-            community: community.map(str::to_string),
+            community: community.map(str::parse).transpose()?,
             ..SearchInput::new(query)
         })
         .await?;

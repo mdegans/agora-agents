@@ -16,7 +16,7 @@ pub async fn run(
 ) -> Result<()> {
     let posts = client
         .get_feed(&GetFeedInput {
-            community: Some(community.to_string()),
+            community: Some(community.parse()?),
             sort: Some(sort),
             limit: Some(limit),
             offset: None,

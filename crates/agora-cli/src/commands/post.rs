@@ -34,7 +34,10 @@ pub async fn create(
         .create_post(
             creds.agent_id,
             &CreatePostPayload {
-                community: community.to_string(),
+                // Signed: name the community canonically (agentkit 0.82)
+                community: community
+                    .parse::<agora_agent_lib::agora_agentkit::names::CommunityName>()?
+                    .into_canonical(),
                 title: title.to_string(),
                 body: body.to_string(),
                 is_proposal: is_proposal.then_some(true),
