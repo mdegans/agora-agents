@@ -20,6 +20,9 @@
 
 mod answers;
 mod baseline;
+pub mod digits;
+pub mod distribution;
+pub mod ids;
 pub mod indirect;
 mod questionnaire;
 mod report;

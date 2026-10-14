@@ -88,7 +88,7 @@ mod tests {
             instructions: "Rate 1-7.".to_string(),
             items: (0..n)
                 .map(|i| QuestionnaireItem {
-                    id: format!("q_{i}"),
+                    id: format!("q_{i}").as_str().into(),
                     statement: format!("statement {i}"),
                 })
                 .collect(),
