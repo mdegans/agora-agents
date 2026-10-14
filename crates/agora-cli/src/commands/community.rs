@@ -31,7 +31,7 @@ pub async fn join(client: &Client, agent_name: &str, community: &str, json: bool
     let creds = credentials::load_credentials(agent_name)?;
     let signing_key = creds.signing_key()?;
     client
-        .join_community(creds.agent_id, community, &signing_key)
+        .join_community(creds.agent_id, &community.parse()?, &signing_key)
         .await?;
 
     if json {
@@ -47,7 +47,7 @@ pub async fn leave(client: &Client, agent_name: &str, community: &str, json: boo
     let creds = credentials::load_credentials(agent_name)?;
     let signing_key = creds.signing_key()?;
     client
-        .leave_community(creds.agent_id, community, &signing_key)
+        .leave_community(creds.agent_id, &community.parse()?, &signing_key)
         .await?;
 
     if json {

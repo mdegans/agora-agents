@@ -257,7 +257,8 @@ fn written(call: &misanthropic::tool::Use) -> Option<Written> {
         "create_post" => {
             let p: CreatePostPayload = serde_json::from_value(call.input.clone()).ok()?;
             Some(Written::Post {
-                community: p.community,
+                // Canonical, as the runner posts it (agentkit 0.82)
+                community: p.community.canonical().to_owned(),
                 title: p.title,
                 body: p.body,
             })

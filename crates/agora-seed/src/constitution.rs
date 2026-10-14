@@ -115,7 +115,7 @@ async fn fetch(client: &Client, web_tools: bool) -> anyhow::Result<(String, Embe
         .await
         .context("listing communities")?
         .into_iter()
-        .map(|c| c.name)
+        .map(|c| c.name.canonical().to_owned())
         .collect();
     let system = seed::system_text(&served.text, &communities, web_tools);
     Ok((served.version, Embedding::of(&served.text, &system)))

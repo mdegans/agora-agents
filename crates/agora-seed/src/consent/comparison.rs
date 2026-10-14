@@ -87,7 +87,7 @@ pub async fn gather(
                 at: p.created_at?,
                 excerpt: excerpt(&p.body, EXCERPT_BYTES),
                 place: Where::Post {
-                    community: p.community_name,
+                    community: p.community_name.canonical().to_owned(),
                     title: p.title,
                 },
             })
