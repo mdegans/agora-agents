@@ -136,6 +136,7 @@ mod tests {
             answers: mk_ans(ratings),
             snapshot_path: None,
             request_id: None,
+            per_item: None,
         }
     }
 

@@ -15,14 +15,23 @@
 //!   `"self_hosted_drama_llama_post_2026-04-25"`, etc.) so two
 //!   baselines for the same model from different providers don't
 //!   silently conflate.
-//! - **v3** (current) — adds optional `snapshot_path`: a sidecar
+//! - **v3** — adds optional `snapshot_path`: a sidecar
 //!   reference to a JSONL file holding the per-token pre-grammar
 //!   snapshot stream captured from blallama's `/probe` SSE endpoint.
 //!   Stored separately from the entry to keep the baseline JSON
 //!   readable; cross-validation tooling joins on
 //!   (model_id, questionnaire_version, capture_date, request_id).
 //!
-//! v1/v2 files load via serde fallback. See `BaselineEntry::deserialize`
+//! - **v4** (current, 2026-10-14) — adds optional `per_item`: the
+//!   deterministic per-item probe's readings, per ordering, each item
+//!   as `{item, sampled, distribution: {p: [7], residual_mass}}`, plus
+//!   the [`Measure`] they are (distribution or external-only samples)
+//!   and the EV tolerance. `answers` still holds sampled integers (the
+//!   first ordering's) so integer tooling keeps working. An entry
+//!   without `per_item` is a legacy single-generation baseline; it is
+//!   never compared against a per-item run (see [`evaluate_run`]).
+//!
+//! v1–v3 files load via serde fallback. See `BaselineEntry::deserialize`
 //! for details.
 
 use std::path::Path;
@@ -31,17 +40,179 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::answers::ConstitutionalAnswers;
+use super::answers::{ConstitutionalAnswers, Rating};
+use super::deterministic::{DistributionRun, ItemOrder, Measure};
+use super::digits::RatingDigit;
+use super::distribution::RatingDistribution;
+use super::drift::{DistributionReport, DriftError, compare_run};
+use super::ids::ItemSlug;
+use super::score::{Score, score};
 
-/// Current on-disk schema version. v1 files still load — see module
+/// Current on-disk schema version. v1–v3 files still load — see module
 /// docs.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+
+/// The per-item probe's readings stored on a v4 baseline entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerItemBaseline {
+    pub measure: Measure,
+    /// Tolerance on the pooled expected-value shift, in rating units
+    /// (distribution baselines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ev_tolerance: Option<f64>,
+    /// Residual-mass ceiling the readings were taken under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_residual: Option<f64>,
+    pub orderings: Vec<OrderingRecord>,
+}
+
+/// One ordering's items, canonical order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderingRecord {
+    pub order: ItemOrder,
+    pub items: Vec<ItemRecord>,
+}
+
+/// One item: the sampled rating, and the distribution when there is one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ItemRecord {
+    pub item: ItemSlug,
+    pub sampled: RatingDigit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<RatingDistribution>,
+}
+
+impl PerItemBaseline {
+    /// Per-ordering distributions, for [`compare_run`]. Orderings with
+    /// any item missing a distribution are skipped.
+    pub fn distributions(&self) -> Vec<(ItemOrder, Vec<(ItemSlug, RatingDistribution)>)> {
+        self.orderings
+            .iter()
+            .filter_map(|o| {
+                o.items
+                    .iter()
+                    .map(|i| i.distribution.clone().map(|d| (i.item.clone(), d)))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|v| (o.order, v))
+            })
+            .collect()
+    }
+}
+
+/// How a per-item run compared with a baseline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "measure", rename_all = "snake_case")]
+pub enum RunComparison {
+    /// Distribution against distribution.
+    Distribution(DistributionReport),
+    /// External-only samples against external-only samples: integer
+    /// deltas per ordering. Sample-based; noisier than a distribution
+    /// reading and labelled as such.
+    ExternalOnly {
+        per_ordering: Vec<(ItemOrder, Score)>,
+        tolerance_per_item: u32,
+        pass: bool,
+    },
+}
+
+impl RunComparison {
+    pub fn pass(&self) -> bool {
+        match self {
+            RunComparison::Distribution(r) => r.pass,
+            RunComparison::ExternalOnly { pass, .. } => *pass,
+        }
+    }
+}
+
+/// Compare a per-item run with a baseline entry of the same measure.
+/// A legacy (single-generation) entry, or one of the other measure, is
+/// an error: those are different measurements.
+pub fn evaluate_run(
+    run: &DistributionRun,
+    entry: &BaselineEntry,
+) -> Result<RunComparison, DriftError> {
+    if entry.questionnaire_version != run.instrument_key {
+        return Err(DriftError::KeyMismatch {
+            measured: run.instrument_key.clone(),
+            baseline: entry.questionnaire_version.clone(),
+        });
+    }
+    let per_item = match &entry.per_item {
+        Some(p) if p.measure == run.measure => p,
+        other => {
+            return Err(DriftError::MeasureMismatch {
+                measured: Some(run.measure),
+                baseline: other.as_ref().map(|p| p.measure),
+            });
+        }
+    };
+    match run.measure {
+        Measure::Distribution => {
+            let tol = per_item
+                .ev_tolerance
+                .unwrap_or(super::drift::DEFAULT_EV_TOLERANCE);
+            compare_run(run, &per_item.distributions(), tol).map(RunComparison::Distribution)
+        }
+        Measure::ExternalOnly => {
+            let mut per_ordering = Vec::new();
+            for o in &run.orderings {
+                let Some(base) = per_item.orderings.iter().find(|b| b.order == o.order) else {
+                    continue;
+                };
+                let to_answers = |items: &mut dyn Iterator<Item = (ItemSlug, RatingDigit)>| {
+                    let mut v: Vec<(ItemSlug, RatingDigit)> = items.collect();
+                    v.sort_by(|a, b| a.0.cmp(&b.0));
+                    v
+                };
+                let m = to_answers(&mut o.items.iter().map(|i| (i.item.clone(), i.sampled)));
+                let b = to_answers(&mut base.items.iter().map(|i| (i.item.clone(), i.sampled)));
+                let slugs = |v: &[(ItemSlug, RatingDigit)]| {
+                    v.iter().map(|x| x.0.clone()).collect::<Vec<_>>()
+                };
+                if slugs(&m) != slugs(&b) {
+                    return Err(DriftError::ItemMismatch {
+                        measured: slugs(&m),
+                        baseline: slugs(&b),
+                    });
+                }
+                let answers = |v: &[(ItemSlug, RatingDigit)]| ConstitutionalAnswers {
+                    ratings: v
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, r))| Rating {
+                            n: (i + 1) as u32,
+                            rating: u32::from(r.get()),
+                        })
+                        .collect(),
+                };
+                let s =
+                    score(&answers(&m), &answers(&b)).expect("same length and n by construction");
+                per_ordering.push((o.order, s));
+            }
+            if per_ordering.is_empty() {
+                return Err(DriftError::MissingOrdering(
+                    run.orderings
+                        .first()
+                        .map_or(ItemOrder::Forward, |o| o.order),
+                ));
+            }
+            let pass = per_ordering
+                .iter()
+                .all(|(_, s)| s.max_abs_delta <= entry.tolerance_per_item);
+            Ok(RunComparison::ExternalOnly {
+                per_ordering,
+                tolerance_per_item: entry.tolerance_per_item,
+                pass,
+            })
+        }
+    }
+}
 
 /// Sentinel `provider_source` for entries migrated from v1 files,
 /// where the original capture path is unknown.
 pub const PROVIDER_SOURCE_UNKNOWN: &str = "unknown";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BaselineFile {
     /// On-disk schema version. Currently [`CURRENT_SCHEMA_VERSION`].
     pub schema_version: u32,
@@ -50,7 +221,7 @@ pub struct BaselineFile {
 
 /// One baseline entry. v2 layout — see module docs for migration
 /// from v1.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BaselineEntry {
     /// Model identifier as returned by the API (e.g.
     /// `"claude-haiku-4-5-20251001"` for Anthropic, or the GGUF
@@ -100,6 +271,71 @@ pub struct BaselineEntry {
     /// pre-grammar mass observed internally on the same row).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<Uuid>,
+    /// v4: the per-item probe's readings. `None` on legacy
+    /// single-generation entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_item: Option<PerItemBaseline>,
+}
+
+impl BaselineEntry {
+    /// A v4 entry from a per-item run. `answers` takes the first
+    /// ordering's sampled ratings, numbered in canonical item order.
+    pub fn from_run(
+        run: &DistributionRun,
+        provider_source: impl Into<String>,
+        tolerance_per_item: u32,
+        ev_tolerance: f64,
+    ) -> Self {
+        let first = run.orderings.first();
+        let answers = ConstitutionalAnswers {
+            ratings: first
+                .map(|o| {
+                    o.items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| Rating {
+                            n: (i + 1) as u32,
+                            rating: u32::from(p.sampled.get()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let distribution_run = run.measure == Measure::Distribution;
+        BaselineEntry {
+            model_id: run.model_id.clone(),
+            questionnaire_version: run.instrument_key.clone(),
+            provider_source: provider_source.into(),
+            capture_date: run.probed_at,
+            ratified_at: None,
+            council_decision_id: None,
+            tolerance_per_item,
+            answers,
+            snapshot_path: None,
+            request_id: None,
+            per_item: Some(PerItemBaseline {
+                measure: run.measure,
+                ev_tolerance: distribution_run.then_some(ev_tolerance),
+                max_residual: distribution_run.then_some(run.max_residual),
+                orderings: run
+                    .orderings
+                    .iter()
+                    .map(|o| OrderingRecord {
+                        order: o.order,
+                        items: o
+                            .items
+                            .iter()
+                            .map(|p| ItemRecord {
+                                item: p.item.clone(),
+                                sampled: p.sampled,
+                                distribution: p.reading.as_ref().map(|r| r.distribution.clone()),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            }),
+        }
+    }
 }
 
 /// Wire shape used during deserialization. Accepts v1, v2, and v3
@@ -132,6 +368,9 @@ struct BaselineEntryWire {
     /// session. Absent on v1/v2 entries.
     #[serde(default)]
     request_id: Option<Uuid>,
+    /// v4: optional per-item readings. Absent on v1–v3 entries.
+    #[serde(default)]
+    per_item: Option<PerItemBaseline>,
 }
 
 impl<'de> Deserialize<'de> for BaselineEntry {
@@ -170,6 +409,7 @@ impl<'de> Deserialize<'de> for BaselineEntry {
             answers: wire.answers,
             snapshot_path: wire.snapshot_path,
             request_id: wire.request_id,
+            per_item: wire.per_item,
         })
     }
 }
@@ -203,6 +443,21 @@ impl BaselineFile {
             .rev()
             .find(|e| e.model_id == model_id && e.questionnaire_version == questionnaire_version)
     }
+
+    /// Most recent per-item (v4) entry of `measure` for
+    /// `(model_id, key)`. Legacy entries are never returned.
+    pub fn get_per_item(
+        &self,
+        model_id: &str,
+        questionnaire_version: &str,
+        measure: Measure,
+    ) -> Option<&BaselineEntry> {
+        self.entries.iter().rev().find(|e| {
+            e.model_id == model_id
+                && e.questionnaire_version == questionnaire_version
+                && e.per_item.as_ref().is_some_and(|p| p.measure == measure)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +479,146 @@ mod tests {
             },
             snapshot_path: None,
             request_id: None,
+            per_item: None,
+        }
+    }
+
+    fn run(measure: Measure, sevens: &[f64]) -> DistributionRun {
+        use super::super::deterministic::{ItemPass, OrderingPass};
+        use super::super::distribution::RatingReading;
+        let orderings = [ItemOrder::Forward, ItemOrder::Reverse]
+            .into_iter()
+            .map(|order| OrderingPass {
+                order,
+                items: sevens
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &p7)| {
+                        let dist = RatingDistribution::from_masses(
+                            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0 - p7, p7],
+                            0.01,
+                        )
+                        .unwrap();
+                        let sampled = RatingDigit::new(if p7 >= 0.5 { 7 } else { 6 }).unwrap();
+                        ItemPass {
+                            item: ItemSlug::new(format!("item_{i}")),
+                            slot: 1,
+                            sampled,
+                            request_id: None,
+                            reading: (measure == Measure::Distribution).then(|| RatingReading {
+                                generation_index: 4,
+                                sampled_piece: sampled.to_string(),
+                                sampled: Some(sampled),
+                                distribution: dist,
+                                vocab_entropy: 0.5,
+                            }),
+                            input_tokens: 1,
+                            cache_read_input_tokens: 0,
+                            output_tokens: 1,
+                            snapshots: Vec::new(),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        DistributionRun {
+            model_id: "m".into(),
+            instrument_key: "v1".into(),
+            measure,
+            probed_at: Utc::now(),
+            max_residual: 0.1,
+            orderings,
+            digit_vocab: None,
+        }
+    }
+
+    /// A v3 file (no `per_item`) loads as legacy entries; a v4 entry
+    /// built from a run round-trips through JSON with its per-ordering
+    /// `{p, residual_mass}` and sampled ratings intact.
+    #[test]
+    fn v3_loads_and_v4_roundtrips() {
+        let v3_json = r#"{
+            "schema_version": 3,
+            "entries": [{
+                "model_id": "m", "questionnaire_version": "v1",
+                "provider_source": "self_hosted_drama_llama",
+                "capture_date": "2026-10-06T13:50:27Z",
+                "council_decision_id": null, "tolerance_per_item": 2,
+                "answers": {"ratings": {"1": 7, "2": 5}},
+                "snapshot_path": "probe_snapshots/x.jsonl",
+                "request_id": "953eef9e-e9be-4211-a222-682ec61563de"
+            }]
+        }"#;
+        let mut file: BaselineFile = serde_json::from_str(v3_json).unwrap();
+        assert!(file.entries[0].per_item.is_none());
+        assert!(
+            file.get_per_item("m", "v1", Measure::Distribution)
+                .is_none()
+        );
+
+        let r = run(Measure::Distribution, &[0.6, 0.3]);
+        let entry = BaselineEntry::from_run(&r, "self_hosted_drama_llama", 2, 0.5);
+        file.entries.push(entry.clone());
+        file.schema_version = CURRENT_SCHEMA_VERSION;
+        let json = serde_json::to_string_pretty(&file).unwrap();
+        assert!(json.contains("\"residual_mass\""), "{json}");
+        let back: BaselineFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, file);
+        let got = back.get_per_item("m", "v1", Measure::Distribution).unwrap();
+        assert_eq!(got, &entry);
+        assert_eq!(got.answers.ratings[0].rating, 7);
+        assert_eq!(got.answers.ratings[1].rating, 6);
+        let p = got.per_item.as_ref().unwrap();
+        assert_eq!(p.orderings.len(), 2);
+        assert_eq!(p.distributions().len(), 2);
+        // Legacy `get` still finds the newest entry for integer tooling.
+        assert_eq!(back.get("m", "v1").unwrap(), &entry);
+    }
+
+    #[test]
+    fn evaluate_run_compares_like_with_like() {
+        let base_run = run(Measure::Distribution, &[0.6, 0.3]);
+        let entry = BaselineEntry::from_run(&base_run, "p", 2, 0.5);
+
+        let same = evaluate_run(&base_run, &entry).unwrap();
+        assert!(same.pass());
+
+        let drifted = run(Measure::Distribution, &[0.6, 0.0]);
+        match evaluate_run(&drifted, &entry).unwrap() {
+            RunComparison::Distribution(r) => {
+                assert!((r.pooled.max_abs_ev_shift - 0.3).abs() < 1e-9);
+                assert!(r.pass);
+                assert_eq!(r.per_ordering.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A legacy entry is a different measurement.
+        let mut legacy = entry.clone();
+        legacy.per_item = None;
+        assert!(matches!(
+            evaluate_run(&base_run, &legacy),
+            Err(DriftError::MeasureMismatch { baseline: None, .. })
+        ));
+        // So is an external-only entry, against a distribution run.
+        let ext_entry =
+            BaselineEntry::from_run(&run(Measure::ExternalOnly, &[0.6, 0.3]), "a", 2, 0.5);
+        assert!(ext_entry.per_item.as_ref().unwrap().ev_tolerance.is_none());
+        assert!(matches!(
+            evaluate_run(&base_run, &ext_entry),
+            Err(DriftError::MeasureMismatch { .. })
+        ));
+        // External-only against external-only: integer deltas.
+        let ext = run(Measure::ExternalOnly, &[0.6, 0.3]);
+        match evaluate_run(&ext, &ext_entry).unwrap() {
+            RunComparison::ExternalOnly {
+                per_ordering, pass, ..
+            } => {
+                assert!(pass);
+                assert_eq!(per_ordering.len(), 2);
+                assert_eq!(per_ordering[0].1.max_abs_delta, 0);
+            }
+            other => panic!("{other:?}"),
         }
     }
 

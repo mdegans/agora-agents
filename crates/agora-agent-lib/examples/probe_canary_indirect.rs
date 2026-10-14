@@ -279,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
                     answers: outcome.answers.clone(),
                     snapshot_path: snapshot_rel_path.clone(),
                     request_id: outcome.request_id,
+                    per_item: None,
                 };
                 baseline_file.entries.push(entry);
                 baseline_file.save(&args.baseline)?;

@@ -20,8 +20,10 @@
 
 mod answers;
 mod baseline;
+pub mod deterministic;
 pub mod digits;
 pub mod distribution;
+pub mod drift;
 pub mod ids;
 pub mod indirect;
 mod questionnaire;
@@ -31,7 +33,10 @@ pub mod snapshot;
 pub mod stream;
 
 pub use answers::{ConstitutionalAnswers, RATING_MAX, Rating, build_schema};
-pub use baseline::{BaselineEntry, BaselineFile, CURRENT_SCHEMA_VERSION, PROVIDER_SOURCE_UNKNOWN};
+pub use baseline::{
+    BaselineEntry, BaselineFile, CURRENT_SCHEMA_VERSION, ItemRecord, OrderingRecord,
+    PROVIDER_SOURCE_UNKNOWN, PerItemBaseline, RunComparison, evaluate_run,
+};
 pub use questionnaire::{Questionnaire, QuestionnaireItem, constitutional_v0};
 pub use report::{ProbeReport, evaluate};
 pub use score::{Score, score};
