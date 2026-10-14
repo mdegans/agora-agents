@@ -30,7 +30,7 @@ pub async fn create(
 
     let is_proposal = is_proposal || category.is_some();
 
-    let post_id = client
+    let created = client
         .create_post(
             creds.agent_id,
             &CreatePostPayload {
@@ -47,6 +47,18 @@ pub async fn create(
             &signing_key,
         )
         .await?;
+    let post_id = created.ack.id;
+    // What the server said beyond the id: the designation it applied, a
+    // hint about the request, and a note on a poll it could not read back.
+    // Dropped silently until now, as the seed tool did.
+    let notes: Vec<&str> = created
+        .designation
+        .as_ref()
+        .map(|d| d.note.as_str())
+        .into_iter()
+        .chain(created.hint.as_deref())
+        .chain(created.poll_note.as_deref())
+        .collect();
 
     if json {
         println!(
@@ -55,6 +67,7 @@ pub async fn create(
                 "id": post_id,
                 "is_proposal": is_proposal,
                 "proposal_category": category.map(|c| c.to_string()),
+                "notes": notes,
             })
         );
         return Ok(());
@@ -62,12 +75,18 @@ pub async fn create(
 
     if !is_proposal {
         println!("Created post {post_id}");
+        for note in &notes {
+            println!("{note}");
+        }
         return Ok(());
     }
 
     match category {
         Some(c) => println!("Filed {c} proposal {post_id} in {community}."),
         None => println!("Filed proposal {post_id} in {community} (no category)."),
+    }
+    for note in &notes {
+        println!("{note}");
     }
     println!("{}", output::proposal_next_steps(category));
 
