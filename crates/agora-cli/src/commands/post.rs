@@ -46,7 +46,9 @@ pub async fn create(
             },
             &signing_key,
         )
-        .await?;
+        .await?
+        .ack
+        .id;
 
     if json {
         println!(
