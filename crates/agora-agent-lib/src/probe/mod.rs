@@ -47,10 +47,12 @@
 //! response format `{"rating": "R"}`. At the rating digit, blallama's
 //! `/probe` stream gives the top-100 candidates with softmax mass taken
 //! before grammar, penalties and temperature. [`distribution`] keeps
-//! the entries that decode to a digit 1–7 ([`digits`] learns which ids
-//! those are from the stream, with a calibration request, so no
-//! tokenizer's ids are hard-coded), renormalizes, and records the
-//! residual non-digit mass. Per item: the 7-probability vector, the
+//! the entries that decode to a digit 1–7, renormalizes, and records
+//! the residual non-digit mass. Which entries are digits is read from
+//! each top-K entry's decoded `piece` when the server sends it
+//! (drama_llama `probe/topk-piece`); on older servers [`digits`] learns
+//! the ids from the stream and a calibration request. No tokenizer's
+//! ids are hard-coded. Per item: the 7-probability vector, the
 //! residual, mode (+ p), runner-up (if ≥ 0.10), expected value,
 //! entropy, the sampled token (history only), and per-ordering values
 //! with the order effect. [`drift`] compares to a baseline by
@@ -65,6 +67,44 @@
 //! slots with (only an open *thought* can be resumed). A single-key
 //! response format per item is supported as-is, and the prefix cache
 //! makes the per-item passes cheap: only the final query block is new.
+//!
+//! **Thinking on and off** ([`thinking`]). Both are run; they are
+//! different measurements with separate baselines (the mode is part of
+//! the v4 baseline key). With thinking on, drama_llama's phase-split
+//! grammar leaves the think block free and constrains only the JSON
+//! after `</think>`, so the rating is located by anchoring on the answer
+//! text in the stream, never by generation index. The thinking text and
+//! the tokens before the answer are recorded per request. A thinking-on
+//! reading is conditioned on the one chain of thought sampled for that
+//! request.
+//!
+//! **Tolerances: a canary for pipeline integrity** ([`drift`]). The
+//! Steward's purpose (2026-10-14): these probes run before each Council
+//! sitting on every model the Council uses, and a failure means "do not
+//! trust this pipeline today". A distribution reading against the same
+//! model's own baseline should vary by almost nothing run to run, so
+//! the defaults are tight:
+//! - fail if any item's expected value shifts by more than **0.3**, or
+//!   the mean absolute shift across items exceeds **0.15**;
+//! - fail on a mode change only where the baseline's mode led its
+//!   runner-up by at least **0.2** (a near-tie can flip on noise);
+//! - Wasserstein-1 and the order effect are reported, not gated;
+//! - a rating position with more than **0.05** non-digit mass is refused.
+//!
+//! `external_only` (Anthropic, sampled) runs keep the old per-item
+//! integer tolerance and are labelled weaker evidence. Every threshold
+//! is configurable.
+//!
+//! **Before a sitting** ([`presitting`], example `probe_presitting`):
+//! all targets (model × thinking mode × endpoint) in parallel, targets on
+//! one blallama one at a time (it has no queue), a 529 "Session is busy"
+//! waited out every 30 s ([`retry`]), one summary line per target, and a
+//! nonzero exit unless every target passed (a missing baseline or a
+//! probe error is not a pass).
+//!
+//! **Open-ended answers** ([`open_ended`]): each item asked as "What do
+//! you think of this statement, and why?", one fresh context per item,
+//! no schema, no rating, for people to read. Not scored.
 //!
 //! **Limits.**
 //! - The reading is conditional on the JSON scaffold the model emitted
@@ -82,11 +122,7 @@
 //! - Anthropic endpoints give `external_only` runs (one sample per item
 //!   per ordering), a different measure, never compared against
 //!   distribution readings.
-//! - Pinning the whitespace before the quote, and token text on top-K
-//!   entries (which would make digit calibration unnecessary), need
-//!   drama_llama changes.
-//! - Tolerances (EV 0.5, order effect 0.5, residual 0.10) are
-//!   placeholders pending a Council decision.
+//! - Pinning the whitespace before the quote needs a drama_llama change.
 
 mod answers;
 mod baseline;
@@ -97,6 +133,7 @@ pub mod drift;
 pub mod ids;
 pub mod indirect;
 pub mod open_ended;
+pub mod presitting;
 mod questionnaire;
 mod report;
 pub mod retry;
