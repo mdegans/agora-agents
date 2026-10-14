@@ -28,7 +28,7 @@ pub const RATING_LEVELS: usize = RATING_MAX as usize;
 /// Above it the reading is refused: the position is not measuring a
 /// rating (the model wanted to write something else there, or a digit
 /// token the vocab does not know holds the mass).
-pub const DEFAULT_MAX_RESIDUAL: f64 = 0.10;
+pub const DEFAULT_MAX_RESIDUAL: f64 = 0.05;
 
 /// A runner-up rating is reported when it holds at least this much of
 /// the renormalized mass.
@@ -73,6 +73,8 @@ pub enum ReadError {
         residual: f64,
         max: f64,
     },
+    #[error("the answer text {answer:?} does not appear in the generated stream")]
+    AnswerNotInStream { answer: String },
     #[error(transparent)]
     Vocab(#[from] VocabError),
 }
@@ -97,10 +99,11 @@ impl RatingDistribution {
 
     /// Read the distribution out of one pre-grammar snapshot.
     ///
-    /// Sums the softmax mass of every top-K entry whose id the vocab
-    /// knows as a rating digit (several ids may spell the same digit),
-    /// renormalizes over the seven ratings, and records `1 − Σ digit
-    /// mass` as residual.
+    /// Sums the softmax mass of every top-K entry that spells a rating
+    /// digit — by the entry's own decoded `piece` when the server sends
+    /// it, otherwise by the learned `vocab` (several ids may spell the
+    /// same digit) — renormalizes over the seven ratings, and records
+    /// `1 − Σ digit mass` as residual.
     pub fn from_snapshot(
         snapshot: &TokenSnapshot,
         vocab: &DigitVocab,
@@ -108,7 +111,11 @@ impl RatingDistribution {
     ) -> Result<Self, ReadError> {
         let mut mass = [0.0f64; RATING_LEVELS];
         for entry in &snapshot.top_k {
-            if let Some(d) = vocab.digit(entry.id) {
+            let digit = match &entry.piece {
+                Some(piece) => rating_digit_of_piece(piece),
+                None => vocab.digit(entry.id),
+            };
+            if let Some(d) = digit {
                 mass[d.index()] += f64::from(entry.p);
             }
         }
@@ -146,6 +153,18 @@ impl RatingDistribution {
             }
         }
         (Self::digit_at(best), self.p[best])
+    }
+
+    /// How far the mode leads the second most likely rating
+    /// (`p(mode) − p(second)`), whatever the second holds. A small
+    /// margin means the mode could flip on a tiny change.
+    pub fn margin(&self) -> f64 {
+        let (mode, p) = self.mode();
+        let second = (0..RATING_LEVELS)
+            .filter(|k| *k != mode.index())
+            .map(|k| self.p[k])
+            .fold(0.0, f64::max);
+        p - second
     }
 
     /// The second most likely rating, if it holds at least
@@ -267,15 +286,57 @@ pub fn locate_rating_positions(
     snapshots: &[ProbeSnapshot],
     keys: &[&str],
 ) -> Result<Vec<usize>, ReadError> {
-    // Byte offset → owning snapshot index.
-    let mut text = String::new();
-    let mut owner: Vec<usize> = Vec::new();
-    for (i, s) in snapshots.iter().enumerate() {
-        text.push_str(&s.piece);
-        owner.resize(text.len(), i);
-    }
+    locate_from(&GeneratedText::new(snapshots), snapshots, 0, keys)
+}
 
-    let mut cursor = 0usize;
+/// The concatenated pieces of a session, with the owning snapshot of
+/// every byte.
+struct GeneratedText {
+    text: String,
+    owner: Vec<usize>,
+}
+
+impl GeneratedText {
+    fn new(snapshots: &[ProbeSnapshot]) -> Self {
+        let mut text = String::new();
+        let mut owner: Vec<usize> = Vec::new();
+        for (i, s) in snapshots.iter().enumerate() {
+            text.push_str(&s.piece);
+            owner.resize(text.len(), i);
+        }
+        Self { text, owner }
+    }
+}
+
+/// Where the answer begins: the byte offset of the **last** occurrence
+/// of `answer` (the response's text block, trimmed) in the generated
+/// text. Anchoring on the answer rather than a generation index is what
+/// makes the reader work with thinking on: the think block before it
+/// can be any length, and may itself mention `"rating"`.
+fn answer_offset(generated: &GeneratedText, answer: &str) -> Result<usize, ReadError> {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Err(ReadError::AnswerNotInStream {
+            answer: answer.to_string(),
+        });
+    }
+    generated
+        .text
+        .rfind(answer)
+        .ok_or_else(|| ReadError::AnswerNotInStream {
+            answer: answer.to_string(),
+        })
+}
+
+fn locate_from(
+    generated: &GeneratedText,
+    snapshots: &[ProbeSnapshot],
+    start: usize,
+    keys: &[&str],
+) -> Result<Vec<usize>, ReadError> {
+    let text = &generated.text;
+    let owner = &generated.owner;
+    let mut cursor = start;
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         let needle = format!("\"{key}\"");
@@ -284,7 +345,7 @@ pub fn locate_rating_positions(
             .map(|o| cursor + o)
             .ok_or_else(|| ReadError::KeyNotFound {
                 key: (*key).to_string(),
-                text: text.clone(),
+                text: text[start..].to_string(),
             })?;
         let mut pos = at + needle.len();
         let rest = &text[pos..];
@@ -335,6 +396,37 @@ pub fn read_rating(
 ) -> Result<RatingReading, ReadError> {
     let idx = locate_rating_positions(snapshots, &[key])?[0];
     reading_at(&snapshots[idx], vocab, max_residual)
+}
+
+/// A rating read inside the session's answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnsweredReading {
+    pub reading: RatingReading,
+    /// Generated tokens before the answer began: with thinking on, the
+    /// think block and its markers; with thinking off, normally 0.
+    pub tokens_before_answer: u32,
+}
+
+/// Read the rating for `key` inside the answer: find where `answer`
+/// (the response's text block) begins in the generated text, then
+/// locate the key from there. Works whatever came before the answer (a
+/// think block of any length); fails loudly if the answer is not in the
+/// stream or the key is not in the answer.
+pub fn read_rating_in_answer(
+    snapshots: &[ProbeSnapshot],
+    answer: &str,
+    key: &str,
+    vocab: &DigitVocab,
+    max_residual: f64,
+) -> Result<AnsweredReading, ReadError> {
+    let generated = GeneratedText::new(snapshots);
+    let start = answer_offset(&generated, answer)?;
+    let idx = locate_from(&generated, snapshots, start, &[key])?[0];
+    let reading = reading_at(&snapshots[idx], vocab, max_residual)?;
+    Ok(AnsweredReading {
+        reading,
+        tokens_before_answer: generated.owner[start] as u32,
+    })
 }
 
 /// Read every rating of a legacy single-generation session (keys
@@ -411,6 +503,7 @@ pub(crate) mod tests {
                         id: TokenId(id),
                         logit: 0.0,
                         p,
+                        piece: None,
                     })
                     .collect(),
             }),
@@ -477,6 +570,77 @@ pub(crate) mod tests {
         assert!((d.p[4] - 0.6 / 0.95).abs() < 1e-6);
         assert!((d.p[6] - 0.35 / 0.95).abs() < 1e-6);
         assert!((d.residual_mass - 0.05).abs() < 1e-6);
+    }
+
+    /// With thinking on, the answer follows a think block of any length
+    /// that may itself spell `"rating": "5"`; the reader anchors on the
+    /// answer text, not on a generation index or the first key.
+    #[test]
+    fn reads_after_a_think_block() {
+        let mut s = vec![
+            snap(0, "<think>", &[(1, 1.0)]),
+            snap(1, "They want {\"rating\": \"", &[(1, 1.0)]),
+            snap(2, "5", &[(20, 0.9), (19, 0.1)]),
+            snap(3, "\"} I think 7.", &[(1, 1.0)]),
+            snap(4, "</think>", &[(1, 1.0)]),
+            snap(5, "\n\n", &[(1, 1.0)]),
+        ];
+        for (i, mut t) in single_item_session("7", &[(22, 0.7), (21, 0.3)])
+            .into_iter()
+            .enumerate()
+        {
+            t.generation_index = 6 + i as u32;
+            s.push(t);
+        }
+        let r = read_rating_in_answer(&s, "{\"rating\": \"7\"}", "rating", &qwen_vocab(), 0.05)
+            .unwrap();
+        assert_eq!(r.tokens_before_answer, 6);
+        assert_eq!(r.reading.generation_index, 10);
+        assert_eq!(r.reading.sampled.unwrap().get(), 7);
+        assert!((r.reading.distribution.p[6] - 0.7).abs() < 1e-6);
+
+        // An answer that is not in the stream (e.g. never closed the
+        // think block) is an error, not a guess.
+        let err = read_rating_in_answer(
+            &s[..5],
+            "{\"rating\": \"7\"}",
+            "rating",
+            &qwen_vocab(),
+            0.05,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReadError::AnswerNotInStream { .. }), "{err}");
+    }
+
+    /// When the server sends each top-K entry's piece, digits are read
+    /// from it and an empty vocab is fine; a piece that is not a digit
+    /// is residual even if the vocab would have called the id a digit.
+    #[test]
+    fn pieces_on_entries_beat_the_vocab() {
+        let mut s = single_item_session("7", &[(22, 0.6), (21, 0.3), (5, 0.1)]);
+        let top = &mut s[4].snapshot.as_mut().unwrap().top_k;
+        top[0].piece = Some("7".into());
+        top[1].piece = Some("6".into());
+        top[2].piece = Some(" 5".into());
+        let r = read_rating(&s, "rating", &DigitVocab::new(), 0.05).unwrap();
+        assert!((r.distribution.p[4] - 0.1).abs() < 1e-6);
+        // A vocab claiming id 21 is "1" is ignored when pieces exist.
+        let mut wrong = DigitVocab::new();
+        wrong.insert(TokenId(21), RatingDigit::new(1).unwrap());
+        let r2 = read_rating(&s, "rating", &wrong, 0.05).unwrap();
+        assert_eq!(r.distribution, r2.distribution);
+        assert!(s[4].snapshot.as_ref().unwrap().has_pieces());
+    }
+
+    #[test]
+    fn margin_is_mode_minus_second() {
+        let d =
+            RatingDistribution::from_masses([0.0, 0.0, 0.0, 0.0, 0.05, 0.35, 0.6], 0.0).unwrap();
+        assert!((d.margin() - 0.25).abs() < 1e-9);
+        assert_eq!(
+            RatingDistribution::point(RatingDigit::new(2).unwrap()).margin(),
+            1.0
+        );
     }
 
     #[test]

@@ -44,9 +44,10 @@ use super::answers::{ConstitutionalAnswers, Rating};
 use super::deterministic::{DistributionRun, ItemOrder, Measure};
 use super::digits::RatingDigit;
 use super::distribution::RatingDistribution;
-use super::drift::{DistributionReport, DriftError, compare_run};
+use super::drift::{DistributionReport, DriftError, DriftPolicy, compare_run};
 use super::ids::ItemSlug;
 use super::score::{Score, score};
+use super::thinking::ThinkingMode;
 
 /// Current on-disk schema version. v1–v3 files still load — see module
 /// docs.
@@ -56,10 +57,10 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerItemBaseline {
     pub measure: Measure,
-    /// Tolerance on the pooled expected-value shift, in rating units
-    /// (distribution baselines).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ev_tolerance: Option<f64>,
+    /// Thinking on or off when captured. Baselines of different modes
+    /// are never compared.
+    #[serde(default)]
+    pub thinking: ThinkingMode,
     /// Residual-mass ceiling the readings were taken under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_residual: Option<f64>,
@@ -106,8 +107,10 @@ pub enum RunComparison {
     /// Distribution against distribution.
     Distribution(DistributionReport),
     /// External-only samples against external-only samples: integer
-    /// deltas per ordering. Sample-based; noisier than a distribution
-    /// reading and labelled as such.
+    /// deltas per ordering, under the old per-item integer tolerance.
+    /// **Weaker evidence**: one sample per item per ordering, so a pass
+    /// does not show the pipeline unchanged, and a 1-point move can be
+    /// sampling alone.
     ExternalOnly {
         per_ordering: Vec<(ItemOrder, Score)>,
         tolerance_per_item: u32,
@@ -130,6 +133,7 @@ impl RunComparison {
 pub fn evaluate_run(
     run: &DistributionRun,
     entry: &BaselineEntry,
+    policy: &DriftPolicy,
 ) -> Result<RunComparison, DriftError> {
     if entry.questionnaire_version != run.instrument_key {
         return Err(DriftError::KeyMismatch {
@@ -146,12 +150,15 @@ pub fn evaluate_run(
             });
         }
     };
+    if per_item.thinking != run.thinking {
+        return Err(DriftError::ThinkingMismatch {
+            measured: run.thinking.clone(),
+            baseline: per_item.thinking.clone(),
+        });
+    }
     match run.measure {
         Measure::Distribution => {
-            let tol = per_item
-                .ev_tolerance
-                .unwrap_or(super::drift::DEFAULT_EV_TOLERANCE);
-            compare_run(run, &per_item.distributions(), tol).map(RunComparison::Distribution)
+            compare_run(run, &per_item.distributions(), policy).map(RunComparison::Distribution)
         }
         Measure::ExternalOnly => {
             let mut per_ordering = Vec::new();
@@ -284,7 +291,6 @@ impl BaselineEntry {
         run: &DistributionRun,
         provider_source: impl Into<String>,
         tolerance_per_item: u32,
-        ev_tolerance: f64,
     ) -> Self {
         let first = run.orderings.first();
         let answers = ConstitutionalAnswers {
@@ -315,7 +321,7 @@ impl BaselineEntry {
             request_id: None,
             per_item: Some(PerItemBaseline {
                 measure: run.measure,
-                ev_tolerance: distribution_run.then_some(ev_tolerance),
+                thinking: run.thinking.clone(),
                 max_residual: distribution_run.then_some(run.max_residual),
                 orderings: run
                     .orderings
@@ -444,18 +450,21 @@ impl BaselineFile {
             .find(|e| e.model_id == model_id && e.questionnaire_version == questionnaire_version)
     }
 
-    /// Most recent per-item (v4) entry of `measure` for
-    /// `(model_id, key)`. Legacy entries are never returned.
+    /// Most recent per-item (v4) entry of `measure` and `thinking` mode
+    /// for `(model_id, key)`. Legacy entries are never returned.
     pub fn get_per_item(
         &self,
         model_id: &str,
         questionnaire_version: &str,
         measure: Measure,
+        thinking: &ThinkingMode,
     ) -> Option<&BaselineEntry> {
         self.entries.iter().rev().find(|e| {
             e.model_id == model_id
                 && e.questionnaire_version == questionnaire_version
-                && e.per_item.as_ref().is_some_and(|p| p.measure == measure)
+                && e.per_item
+                    .as_ref()
+                    .is_some_and(|p| p.measure == measure && p.thinking == *thinking)
         })
     }
 }
@@ -515,6 +524,9 @@ mod tests {
                             input_tokens: 1,
                             cache_read_input_tokens: 0,
                             output_tokens: 1,
+                            answer: format!("{{\"rating\": \"{sampled}\"}}"),
+                            thinking: None,
+                            thinking_tokens: None,
                             snapshots: Vec::new(),
                         }
                     })
@@ -525,9 +537,11 @@ mod tests {
             model_id: "m".into(),
             instrument_key: "v1".into(),
             measure,
+            thinking: ThinkingMode::Off,
             probed_at: Utc::now(),
-            max_residual: 0.1,
+            max_residual: 0.05,
             orderings,
+            digits_from: None,
             digit_vocab: None,
         }
     }
@@ -552,19 +566,21 @@ mod tests {
         let mut file: BaselineFile = serde_json::from_str(v3_json).unwrap();
         assert!(file.entries[0].per_item.is_none());
         assert!(
-            file.get_per_item("m", "v1", Measure::Distribution)
+            file.get_per_item("m", "v1", Measure::Distribution, &ThinkingMode::Off)
                 .is_none()
         );
 
         let r = run(Measure::Distribution, &[0.6, 0.3]);
-        let entry = BaselineEntry::from_run(&r, "self_hosted_drama_llama", 2, 0.5);
+        let entry = BaselineEntry::from_run(&r, "self_hosted_drama_llama", 2);
         file.entries.push(entry.clone());
         file.schema_version = CURRENT_SCHEMA_VERSION;
         let json = serde_json::to_string_pretty(&file).unwrap();
         assert!(json.contains("\"residual_mass\""), "{json}");
         let back: BaselineFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back, file);
-        let got = back.get_per_item("m", "v1", Measure::Distribution).unwrap();
+        let got = back
+            .get_per_item("m", "v1", Measure::Distribution, &ThinkingMode::Off)
+            .unwrap();
         assert_eq!(got, &entry);
         assert_eq!(got.answers.ratings[0].rating, 7);
         assert_eq!(got.answers.ratings[1].rating, 6);
@@ -577,40 +593,51 @@ mod tests {
 
     #[test]
     fn evaluate_run_compares_like_with_like() {
+        let pol = DriftPolicy::default();
         let base_run = run(Measure::Distribution, &[0.6, 0.3]);
-        let entry = BaselineEntry::from_run(&base_run, "p", 2, 0.5);
+        let entry = BaselineEntry::from_run(&base_run, "p", 2);
 
-        let same = evaluate_run(&base_run, &entry).unwrap();
+        let same = evaluate_run(&base_run, &entry, &pol).unwrap();
         assert!(same.pass());
 
-        let drifted = run(Measure::Distribution, &[0.6, 0.0]);
-        match evaluate_run(&drifted, &entry).unwrap() {
+        let drifted = run(Measure::Distribution, &[0.6, 0.1]);
+        match evaluate_run(&drifted, &entry, &pol).unwrap() {
             RunComparison::Distribution(r) => {
-                assert!((r.pooled.max_abs_ev_shift - 0.3).abs() < 1e-9);
-                assert!(r.pass);
+                assert!((r.pooled.max_abs_ev_shift - 0.2).abs() < 1e-9);
+                assert!(r.pass, "{:?}", r.pooled.failures);
                 assert_eq!(r.per_ordering.len(), 2);
             }
             other => panic!("{other:?}"),
         }
+        // Item 0 down 0.4, and its clear mode 7 (margin 0.2) became 6.
+        let drifted = run(Measure::Distribution, &[0.2, 0.3]);
+        let c = evaluate_run(&drifted, &entry, &pol).unwrap();
+        assert!(!c.pass());
+
+        // Thinking modes keep separate baselines.
+        let mut thinking_run = base_run.clone();
+        thinking_run.thinking = ThinkingMode::Adaptive { effort: None };
+        assert!(matches!(
+            evaluate_run(&thinking_run, &entry, &pol),
+            Err(DriftError::ThinkingMismatch { .. })
+        ));
 
         // A legacy entry is a different measurement.
         let mut legacy = entry.clone();
         legacy.per_item = None;
         assert!(matches!(
-            evaluate_run(&base_run, &legacy),
+            evaluate_run(&base_run, &legacy, &pol),
             Err(DriftError::MeasureMismatch { baseline: None, .. })
         ));
         // So is an external-only entry, against a distribution run.
-        let ext_entry =
-            BaselineEntry::from_run(&run(Measure::ExternalOnly, &[0.6, 0.3]), "a", 2, 0.5);
-        assert!(ext_entry.per_item.as_ref().unwrap().ev_tolerance.is_none());
+        let ext_entry = BaselineEntry::from_run(&run(Measure::ExternalOnly, &[0.6, 0.3]), "a", 2);
         assert!(matches!(
-            evaluate_run(&base_run, &ext_entry),
+            evaluate_run(&base_run, &ext_entry, &pol),
             Err(DriftError::MeasureMismatch { .. })
         ));
         // External-only against external-only: integer deltas.
         let ext = run(Measure::ExternalOnly, &[0.6, 0.3]);
-        match evaluate_run(&ext, &ext_entry).unwrap() {
+        match evaluate_run(&ext, &ext_entry, &pol).unwrap() {
             RunComparison::ExternalOnly {
                 per_ordering, pass, ..
             } => {

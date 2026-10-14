@@ -96,11 +96,14 @@ pub mod distribution;
 pub mod drift;
 pub mod ids;
 pub mod indirect;
+pub mod open_ended;
 mod questionnaire;
 mod report;
+pub mod retry;
 mod score;
 pub mod snapshot;
 pub mod stream;
+pub mod thinking;
 
 pub use answers::{ConstitutionalAnswers, RATING_MAX, Rating, build_schema};
 pub use baseline::{

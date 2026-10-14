@@ -25,13 +25,14 @@ use uuid::Uuid;
 use super::answers::RATING_MAX;
 use super::digits::{DigitVocab, RatingDigit, VocabError};
 use super::distribution::{
-    DEFAULT_MAX_RESIDUAL, RatingDistribution, RatingReading, ReadError, read_rating,
+    DEFAULT_MAX_RESIDUAL, RatingDistribution, RatingReading, ReadError, read_rating_in_answer,
 };
 use super::ids::ItemSlug;
 use super::indirect::Scenario;
 use super::questionnaire::Questionnaire;
 use super::snapshot::ProbeSnapshot;
 use super::stream::{CompletedSession, ProbeStreamConsumer};
+use super::thinking::{ThinkingMode, response_text, response_thinking};
 
 /// Error type for transports and session sources.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -271,13 +272,16 @@ pub fn base_prompt(
     model: impl Into<misanthropic::model::Model>,
     instrument: &impl RatingInstrument,
     max_tokens: NonZeroU32,
+    thinking: &ThinkingMode,
 ) -> CachedPrompt {
     CachedPrompt::cached(
-        Prompt::default()
-            .model(model)
-            .max_tokens(max_tokens)
-            .json_schema(single_item_schema())
-            .system(system_prompt(instrument)),
+        thinking.apply(
+            Prompt::default()
+                .model(model)
+                .max_tokens(max_tokens)
+                .json_schema(single_item_schema())
+                .system(system_prompt(instrument)),
+        ),
     )
 }
 
@@ -344,6 +348,10 @@ pub struct DistributionOptions {
     /// Rate only the first `n` items (canonical order); the prompt still
     /// lists all of them. For smoke runs.
     pub item_limit: Option<usize>,
+    /// Reasoning before the answer. Off by default.
+    pub thinking: ThinkingMode,
+    /// `max_tokens` when thinking is on (the think block counts).
+    pub thinking_max_tokens: NonZeroU32,
 }
 
 impl Default for DistributionOptions {
@@ -355,6 +363,8 @@ impl Default for DistributionOptions {
             max_tokens: NonZeroU32::new(24).unwrap(),
             session_timeout: Duration::from_secs(10),
             item_limit: None,
+            thinking: ThinkingMode::Off,
+            thinking_max_tokens: NonZeroU32::new(8192).unwrap(),
         }
     }
 }
@@ -432,6 +442,18 @@ pub struct ItemPass {
     #[serde(default)]
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
+    /// The response's text block (the JSON answer).
+    #[serde(default)]
+    pub answer: String,
+    /// The thinking text, when thinking was on and the server returned it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// Generated tokens before the answer (the think block and its
+    /// markers), counted from the `/probe` stream. Distribution runs
+    /// with thinking on only; an Anthropic run's thinking tokens are
+    /// inside `output_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_tokens: Option<u32>,
     /// The `/probe` snapshots of the request, kept for sidecars.
     #[serde(skip)]
     pub snapshots: Vec<ProbeSnapshot>,
@@ -450,9 +472,17 @@ pub struct DistributionRun {
     pub model_id: String,
     pub instrument_key: String,
     pub measure: Measure,
+    /// Thinking on or off; part of the baseline key.
+    #[serde(default)]
+    pub thinking: ThinkingMode,
     pub probed_at: DateTime<Utc>,
     pub max_residual: f64,
     pub orderings: Vec<OrderingPass>,
+    /// How rating digits were recognised in the top-K: `"pieces"` (the
+    /// server sent each entry's decoded text) or `"calibration"` (ids
+    /// learned from a forced-digit request; older servers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digits_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digit_vocab: Option<DigitVocab>,
 }
@@ -565,38 +595,13 @@ where
     };
     let items = instrument.items();
     let n_rated = opts.item_limit.unwrap_or(items.len()).min(items.len());
+    let max_tokens = if opts.thinking.is_on() {
+        opts.thinking_max_tokens
+    } else {
+        opts.max_tokens
+    };
 
-    // Calibration: learn the digit token ids before reading anything.
-    let mut vocab = DigitVocab::new();
-    if let Some(src) = sessions.as_deref_mut() {
-        let prompt = CachedPrompt::cached(
-            Prompt::default()
-                .model(model.clone())
-                .max_tokens(NonZeroU32::new(64).unwrap())
-                .json_schema(calibration_schema())
-                .system("Reply with the JSON object the response format requires."),
-        );
-        let mut prompt = prompt;
-        prompt
-            .push_message((Role::User, "Write the digits one to seven."))
-            .expect("a system-only prompt accepts a user turn");
-        let response = sender
-            .send(&prompt)
-            .await
-            .map_err(ProbeError::Calibration)?;
-        let id = Uuid::parse_str(&response.id).map_err(|_| ProbeError::NoRequestId {
-            item: "calibration".into(),
-            order: ItemOrder::Forward,
-            id: response.id.to_string(),
-        })?;
-        let session = src
-            .take_session(id, opts.session_timeout)
-            .await
-            .map_err(ProbeError::Calibration)?;
-        vocab.observe_all(&session.snapshots)?;
-    }
-
-    let base = base_prompt(model, instrument, opts.max_tokens);
+    let base = base_prompt(model.clone(), instrument, max_tokens, &opts.thinking);
     let mut model_id = String::new();
     let mut orderings = Vec::with_capacity(opts.orderings.len());
     for &order in &opts.orderings {
@@ -660,6 +665,9 @@ where
                 input_tokens: counts.input_tokens,
                 cache_read_input_tokens: counts.cache_read_input_tokens.unwrap_or(0),
                 output_tokens: counts.output_tokens,
+                answer: response_text(&response).unwrap_or_default(),
+                thinking: response_thinking(&response),
+                thinking_tokens: None,
                 snapshots,
             });
         }
@@ -672,44 +680,113 @@ where
         });
     }
 
-    let digit_vocab = if measure == Measure::Distribution {
-        for pass in orderings.iter().flat_map(|o| &o.items) {
-            vocab.observe_all(&pass.snapshots)?;
+    let (digits_from, digit_vocab) = if measure == Measure::Distribution {
+        let all_snaps = || {
+            orderings
+                .iter()
+                .flat_map(|o| &o.items)
+                .flat_map(|p| &p.snapshots)
+        };
+        let pieces_everywhere = all_snaps()
+            .filter_map(|s| s.snapshot.as_ref())
+            .all(|t| t.has_pieces());
+        let mut vocab = DigitVocab::new();
+        for snap in all_snaps() {
+            if let Some(id) = snap.token {
+                vocab.observe(id, &snap.piece)?;
+            }
         }
-        vocab.ensure_complete()?;
+        let digits_from = if pieces_everywhere {
+            "pieces"
+        } else {
+            // An older server: learn the digit ids from a request that
+            // forces every digit. Thinking off; the grammar does the
+            // work.
+            let src = sessions.expect("distribution runs have a session source");
+            calibrate(sender, src, model, opts.session_timeout, &mut vocab).await?;
+            vocab.ensure_complete()?;
+            "calibration"
+        };
         for o in &mut orderings {
             for pass in &mut o.items {
-                let reading = read_rating(&pass.snapshots, RATING_KEY, &vocab, opts.max_residual)
-                    .map_err(|source| ProbeError::Read {
+                let read = read_rating_in_answer(
+                    &pass.snapshots,
+                    &pass.answer,
+                    RATING_KEY,
+                    &vocab,
+                    opts.max_residual,
+                )
+                .map_err(|source| ProbeError::Read {
                     item: pass.item.to_string(),
                     order: o.order,
                     source,
                 })?;
-                if reading.sampled != Some(pass.sampled) {
+                if read.reading.sampled != Some(pass.sampled) {
                     return Err(ProbeError::SampleMismatch {
                         item: pass.item.to_string(),
                         order: o.order,
                         sampled: pass.sampled,
-                        piece: reading.sampled_piece.clone(),
+                        piece: read.reading.sampled_piece.clone(),
                     });
                 }
-                pass.reading = Some(reading);
+                if opts.thinking.is_on() {
+                    pass.thinking_tokens = Some(read.tokens_before_answer);
+                }
+                pass.reading = Some(read.reading);
             }
         }
-        Some(vocab)
+        (Some(digits_from.to_string()), Some(vocab))
     } else {
-        None
+        (None, None)
     };
 
     Ok(DistributionRun {
         model_id,
         instrument_key: instrument.baseline_key(),
         measure,
+        thinking: opts.thinking.clone(),
         probed_at: Utc::now(),
         max_residual: opts.max_residual,
         orderings,
+        digits_from,
         digit_vocab,
     })
+}
+
+/// The calibration request: a response format that forces `"1"`..`"7"`,
+/// so the stream reveals which ids spell the digits.
+async fn calibrate<T: MessageSender, S: SessionSource>(
+    sender: &T,
+    src: &mut S,
+    model: misanthropic::model::Model,
+    timeout: Duration,
+    vocab: &mut DigitVocab,
+) -> Result<(), ProbeError> {
+    let mut prompt = CachedPrompt::cached(
+        Prompt::default()
+            .model(model)
+            .max_tokens(NonZeroU32::new(64).unwrap())
+            .json_schema(calibration_schema())
+            .system("Reply with the JSON object the response format requires."),
+    );
+    prompt
+        .push_message((Role::User, "Write the digits one to seven."))
+        .expect("a system-only prompt accepts a user turn");
+    let response = sender
+        .send(&prompt)
+        .await
+        .map_err(ProbeError::Calibration)?;
+    let id = Uuid::parse_str(&response.id).map_err(|_| ProbeError::NoRequestId {
+        item: "calibration".into(),
+        order: ItemOrder::Forward,
+        id: response.id.to_string(),
+    })?;
+    let session = src
+        .take_session(id, timeout)
+        .await
+        .map_err(ProbeError::Calibration)?;
+    vocab.observe_all(&session.snapshots)?;
+    Ok(())
 }
 
 fn parse_answer(response: &misanthropic::response::Message) -> Result<RatingDigit, String> {
@@ -757,6 +834,11 @@ mod tests {
         behaviour: HashMap<String, (u8, TopAtSlot)>,
         sessions: Mutex<HashMap<Uuid, CompletedSession>>,
         sent: Mutex<Vec<serde_json::Value>>,
+        /// Send each top-K entry's piece (the drama_llama change).
+        pieces: bool,
+        /// Think before answering (a think block that itself spells a
+        /// rating, to prove the reader skips it).
+        think: bool,
     }
 
     fn qwen_digit(d: u8) -> u32 {
@@ -799,14 +881,34 @@ mod tests {
                     - 1;
                 let statement = query.split_once(": ").unwrap().1;
                 let (d, top) = &self.behaviour[statement];
-                let snaps = vec![
-                    token_snap(0, 4913, "{\"", &[(4913, 1.0)]),
-                    token_snap(1, 8, "rating", &[(8, 1.0)]),
-                    token_snap(2, 788, "\":", &[(788, 1.0)]),
-                    token_snap(3, 330, " \"", &[(330, 0.9)]),
-                    token_snap(4, qwen_digit(*d), &d.to_string(), &top(slot)),
-                    token_snap(5, 9, "\"}", &[(9, 1.0)]),
-                ];
+                let mut snaps = Vec::new();
+                if self.think {
+                    snaps.push(token_snap(0, 1, "<think>", &[(1, 1.0)]));
+                    snaps.push(token_snap(1, 2, "Maybe {\"rating\": \"", &[(2, 1.0)]));
+                    snaps.push(token_snap(2, 16, "1", &[(16, 1.0)]));
+                    snaps.push(token_snap(3, 3, "\"}? No.", &[(3, 1.0)]));
+                    snaps.push(token_snap(4, 4, "</think>", &[(4, 1.0)]));
+                    snaps.push(token_snap(5, 5, "\n\n", &[(5, 1.0)]));
+                }
+                let base = snaps.len() as u32;
+                snaps.extend([
+                    token_snap(base, 4913, "{\"", &[(4913, 1.0)]),
+                    token_snap(base + 1, 8, "rating", &[(8, 1.0)]),
+                    token_snap(base + 2, 788, "\":", &[(788, 1.0)]),
+                    token_snap(base + 3, 330, " \"", &[(330, 0.9)]),
+                    token_snap(base + 4, qwen_digit(*d), &d.to_string(), &top(slot)),
+                    token_snap(base + 5, 9, "\"}", &[(9, 1.0)]),
+                ]);
+                if self.pieces {
+                    for sn in &mut snaps {
+                        for e in &mut sn.snapshot.as_mut().unwrap().top_k {
+                            e.piece = Some(match e.id.0 {
+                                16..=22 => (e.id.0 - 15).to_string(),
+                                _ => "x".to_string(),
+                            });
+                        }
+                    }
+                }
                 (format!("{{\"rating\": \"{d}\"}}"), snaps)
             };
             self.sessions.lock().unwrap().insert(
@@ -817,12 +919,19 @@ mod tests {
                     snapshots,
                 },
             );
+            let mut content = vec![serde_json::json!({"type": "text", "text": text})];
+            if self.think && schema["properties"].get("d1").is_none() {
+                content.insert(
+                    0,
+                    serde_json::json!({"type": "thinking", "thinking": "Maybe 1? No.", "signature": ""}),
+                );
+            }
             serde_json::from_value(serde_json::json!({
                 "id": id.to_string(),
                 "type": "message",
                 "role": "assistant",
                 "model": "fake.gguf",
-                "content": [{"type": "text", "text": text}],
+                "content": content,
                 "stop_reason": "end_turn",
                 "stop_sequence": null,
                 "usage": {"input_tokens": 100, "output_tokens": 6, "cache_read_input_tokens": 80}
@@ -880,6 +989,8 @@ mod tests {
             behaviour,
             sessions: Mutex::new(HashMap::new()),
             sent: Mutex::new(Vec::new()),
+            pieces: false,
+            think: false,
         }
     }
 
@@ -914,7 +1025,7 @@ mod tests {
     #[test]
     fn prompts_share_a_cached_prefix_per_ordering() {
         let q = questionnaire(3);
-        let base = base_prompt("m", &q, NonZeroU32::new(24).unwrap());
+        let base = base_prompt("m", &q, NonZeroU32::new(24).unwrap(), &ThinkingMode::Off);
         let list = list_text(&q, ItemOrder::Reverse);
         assert!(list.starts_with("Statements:\n\n1. Statement number 2."));
         let a = serde_json::to_value(item_prompt(&base, &list, query_text(&q, 0, "x"))).unwrap();
@@ -972,9 +1083,63 @@ mod tests {
         assert!((r.distribution.residual_mass - 0.02).abs() < 1e-6);
         assert_eq!(r.distribution.mode().0.get(), 4);
         assert!((run.max_order_effect().unwrap() - 0.6).abs() < 1e-6);
-        // Digit vocab learned from calibration, not hard-coded.
+        // Digit vocab learned from calibration (sent last, only
+        // because the stream had no pieces), not hard-coded.
+        assert_eq!(run.digits_from.as_deref(), Some("calibration"));
+        let sent = fake.sent.lock().unwrap();
+        assert!(sent[6]["output_config"]["format"]["schema"]["properties"]["d1"].is_object());
         let vocab = run.digit_vocab.as_ref().unwrap();
         assert_eq!(vocab.digit(TokenId(22)).unwrap().get(), 7);
+        assert!(run.orderings[0].items[0].thinking.is_none());
+    }
+
+    /// A server that sends top-K pieces needs no calibration request.
+    #[tokio::test]
+    async fn pieces_on_the_stream_skip_calibration() {
+        let q = questionnaire(2);
+        let mut fake = fake(&q);
+        fake.pieces = true;
+        let mut stream = FakeStream(&fake);
+        let run = run_distribution_probe(&fake, Some(&mut stream), &q, "f", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(run.digits_from.as_deref(), Some("pieces"));
+        assert_eq!(fake.sent.lock().unwrap().len(), 4);
+        let r = run.orderings[0].items[1].reading.as_ref().unwrap();
+        assert_eq!(r.distribution.mode().0.get(), 4);
+    }
+
+    /// Thinking on: the request carries adaptive thinking, a larger
+    /// max_tokens and the effort; the reading is taken after the think
+    /// block (which itself spells a rating of 1), and the thinking text
+    /// and its token count are recorded.
+    #[tokio::test]
+    async fn thinking_on_reads_after_the_think_block() {
+        let q = questionnaire(2);
+        let mut fake = fake(&q);
+        fake.think = true;
+        fake.pieces = true;
+        let mut stream = FakeStream(&fake);
+        let opts = DistributionOptions {
+            thinking: ThinkingMode::Adaptive {
+                effort: Some("low".into()),
+            },
+            ..Default::default()
+        };
+        let run = run_distribution_probe(&fake, Some(&mut stream), &q, "f", &opts)
+            .await
+            .unwrap();
+        let sent = fake.sent.lock().unwrap();
+        assert_eq!(sent[0]["thinking"]["type"], "adaptive");
+        assert_eq!(sent[0]["output_config"]["effort"], "low");
+        assert_eq!(sent[0]["max_tokens"], 8192);
+        assert_eq!(run.thinking, opts.thinking);
+        let pass = &run.orderings[0].items[1];
+        assert_eq!(pass.thinking.as_deref(), Some("Maybe 1? No."));
+        assert_eq!(pass.thinking_tokens, Some(6));
+        let r = pass.reading.as_ref().unwrap();
+        assert_eq!(r.generation_index, 10);
+        assert_eq!(r.distribution.mode().0.get(), 4);
     }
 
     #[tokio::test]
@@ -1017,7 +1182,7 @@ mod tests {
         assert_eq!(run.orderings[0].items.len(), 2);
         let sent = fake.sent.lock().unwrap();
         assert_eq!(sent.len(), 5);
-        let list = sent[1]["messages"][0]["content"][0]["text"]
+        let list = sent[0]["messages"][0]["content"][0]["text"]
             .as_str()
             .unwrap();
         assert!(list.contains("4. Statement number 3."));
@@ -1040,6 +1205,6 @@ mod tests {
         let err = run_distribution_probe(&fake, Some(&mut Empty), &q, "f", &Default::default())
             .await
             .unwrap_err();
-        assert!(matches!(err, ProbeError::Calibration(_)), "{err}");
+        assert!(matches!(err, ProbeError::Session { .. }), "{err}");
     }
 }

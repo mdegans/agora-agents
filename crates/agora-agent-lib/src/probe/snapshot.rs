@@ -80,6 +80,12 @@ pub struct TopKEntry {
     pub logit: f32,
     /// Post-softmax probability mass.
     pub p: f32,
+    /// Decoded text of this candidate, when the producer sends it
+    /// (drama_llama `TopKEntry` on the `/probe` stream, from the
+    /// `probe/topk-piece` change on). Absent from older servers and
+    /// sidecars; the digit vocab is the fallback then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub piece: Option<String>,
 }
 
 impl TokenSnapshot {
@@ -106,6 +112,11 @@ impl TokenSnapshot {
     /// signals a flat distribution where K=100 isn't enough coverage.
     pub fn top_k_cumulative_mass(&self) -> f32 {
         self.top_k.iter().map(|t| t.p).sum()
+    }
+
+    /// Whether every top-K entry carries its decoded piece.
+    pub fn has_pieces(&self) -> bool {
+        !self.top_k.is_empty() && self.top_k.iter().all(|t| t.piece.is_some())
     }
 }
 

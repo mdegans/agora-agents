@@ -1,14 +1,23 @@
 //! Drift between two distribution readings of the same instrument.
 //!
-//! For each item: the shift in expected value (signed, in rating
-//! units), the Wasserstein-1 distance over `1..=7` (sees a change of
-//! spread an unchanged mean hides), and whether the mode changed. Pass
-//! is `max |EV shift| <= ev_tolerance`; W1 and mode changes are
-//! reported, not gated, until the Council sets policy for them.
+//! These probes are canaries for **inference-pipeline integrity**
+//! (Steward, 2026-10-14): they run before each Council sitting on every
+//! model the Council uses, and a failure means "do not trust this
+//! pipeline today". A distribution reading is deterministic given the
+//! same weights, prompt and server, so against the same model's own
+//! baseline the run-to-run variation should be near zero, and the
+//! tolerances are tight ([`DriftPolicy::default`]):
+//! - fail if any item's expected value shifts by more than 0.3, or the
+//!   mean absolute shift across items exceeds 0.15;
+//! - fail on a mode change only where the baseline's mode led its
+//!   runner-up by at least 0.2 (a near-tie may flip on numerical noise
+//!   without meaning anything);
+//! - report Wasserstein-1 and the order effect, but do not gate on them.
 //!
-//! Only readings of the same [`Measure`] are compared. A distribution
-//! reading against a sampled integer is a different measurement, and
-//! the error says so instead of producing a number.
+//! Every threshold is configurable. Only readings of the same
+//! [`Measure`] and thinking mode are compared; a distribution reading
+//! against a sampled integer is a different measurement, and the error
+//! says so instead of producing a number.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,10 +25,29 @@ use super::deterministic::{DistributionRun, ItemOrder, Measure};
 use super::digits::RatingDigit;
 use super::distribution::{RatingDistribution, wasserstein1};
 use super::ids::ItemSlug;
+use super::thinking::ThinkingMode;
 
-/// Default tolerance on the expected-value shift, in rating units.
-/// Placeholder pending a Council decision.
-pub const DEFAULT_EV_TOLERANCE: f64 = 0.5;
+/// Gating thresholds for distribution drift.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DriftPolicy {
+    /// Fail when any item's |EV shift| exceeds this (rating units).
+    pub max_item_ev_shift: f64,
+    /// Fail when the mean |EV shift| across items exceeds this.
+    pub max_mean_abs_ev_shift: f64,
+    /// A mode change fails only when the baseline's mode led its
+    /// runner-up by at least this much probability.
+    pub mode_flip_margin: f64,
+}
+
+impl Default for DriftPolicy {
+    fn default() -> Self {
+        Self {
+            max_item_ev_shift: 0.3,
+            max_mean_abs_ev_shift: 0.15,
+            mode_flip_margin: 0.2,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DriftError {
@@ -34,6 +62,11 @@ pub enum DriftError {
     MeasureMismatch {
         measured: Option<Measure>,
         baseline: Option<Measure>,
+    },
+    #[error("thinking mode mismatch: measured {measured}, baseline {baseline}; not compared")]
+    ThinkingMismatch {
+        measured: ThinkingMode,
+        baseline: ThinkingMode,
     },
     #[error("baseline key {baseline:?} does not match the run's {measured:?}")]
     KeyMismatch { measured: String, baseline: String },
@@ -53,6 +86,11 @@ pub struct ItemDrift {
     pub baseline_mode: RatingDigit,
     pub measured_mode: RatingDigit,
     pub mode_changed: bool,
+    /// How far the baseline's mode led its runner-up.
+    pub baseline_margin: f64,
+    /// A mode change that counts against `pass` (the baseline's margin
+    /// was at least the policy's `mode_flip_margin`).
+    pub mode_change_fails: bool,
 }
 
 /// Drift over a set of items.
@@ -60,17 +98,21 @@ pub struct ItemDrift {
 pub struct DistributionDrift {
     pub per_item: Vec<ItemDrift>,
     pub max_abs_ev_shift: f64,
+    pub mean_abs_ev_shift: f64,
+    /// Reported, not gated.
     pub max_wasserstein1: f64,
     pub modes_changed: usize,
-    pub ev_tolerance: f64,
+    pub policy: DriftPolicy,
     pub pass: bool,
+    /// Why it failed, one line per reason; empty on a pass.
+    pub failures: Vec<String>,
 }
 
 /// Compare two sets of per-item distributions, matched by slug.
 pub fn score_distributions(
     measured: &[(ItemSlug, RatingDistribution)],
     baseline: &[(ItemSlug, RatingDistribution)],
-    ev_tolerance: f64,
+    policy: &DriftPolicy,
 ) -> Result<DistributionDrift, DriftError> {
     let slugs = |v: &[(ItemSlug, RatingDistribution)]| {
         let mut s: Vec<ItemSlug> = v.iter().map(|(i, _)| i.clone()).collect();
@@ -93,6 +135,8 @@ pub fn score_distributions(
                 .1;
             let (mm, _) = m.mode();
             let (bm, _) = b.mode();
+            let mode_changed = mm != bm;
+            let baseline_margin = b.margin();
             ItemDrift {
                 item: item.clone(),
                 baseline_expected: b.expected(),
@@ -101,7 +145,9 @@ pub fn score_distributions(
                 wasserstein1: wasserstein1(m, b),
                 baseline_mode: bm,
                 measured_mode: mm,
-                mode_changed: mm != bm,
+                mode_changed,
+                baseline_margin,
+                mode_change_fails: mode_changed && baseline_margin >= policy.mode_flip_margin,
             }
         })
         .collect();
@@ -109,15 +155,52 @@ pub fn score_distributions(
         .iter()
         .map(|d| d.ev_shift.abs())
         .fold(0.0, f64::max);
+    let mean_abs_ev_shift = if per_item.is_empty() {
+        0.0
+    } else {
+        per_item.iter().map(|d| d.ev_shift.abs()).sum::<f64>() / per_item.len() as f64
+    };
     let max_wasserstein1 = per_item.iter().map(|d| d.wasserstein1).fold(0.0, f64::max);
     let modes_changed = per_item.iter().filter(|d| d.mode_changed).count();
+
+    let mut failures = Vec::new();
+    for d in &per_item {
+        if d.ev_shift.abs() > policy.max_item_ev_shift {
+            failures.push(format!(
+                "{}: EV {:.2} -> {:.2} ({:+.2}) exceeds {:.2}",
+                d.item,
+                d.baseline_expected,
+                d.measured_expected,
+                d.ev_shift,
+                policy.max_item_ev_shift
+            ));
+        }
+        if d.mode_change_fails {
+            failures.push(format!(
+                "{}: mode {} -> {} (baseline margin {:.2} >= {:.2})",
+                d.item,
+                d.baseline_mode,
+                d.measured_mode,
+                d.baseline_margin,
+                policy.mode_flip_margin
+            ));
+        }
+    }
+    if mean_abs_ev_shift > policy.max_mean_abs_ev_shift {
+        failures.push(format!(
+            "mean |EV shift| {:.3} exceeds {:.2}",
+            mean_abs_ev_shift, policy.max_mean_abs_ev_shift
+        ));
+    }
     Ok(DistributionDrift {
         per_item,
         max_abs_ev_shift,
+        mean_abs_ev_shift,
         max_wasserstein1,
         modes_changed,
-        ev_tolerance,
-        pass: max_abs_ev_shift <= ev_tolerance,
+        policy: *policy,
+        pass: failures.is_empty(),
+        failures,
     })
 }
 
@@ -142,7 +225,7 @@ pub struct DistributionReport {
 pub fn compare_run(
     run: &DistributionRun,
     baseline: &[(ItemOrder, Vec<(ItemSlug, RatingDistribution)>)],
-    ev_tolerance: f64,
+    policy: &DriftPolicy,
 ) -> Result<DistributionReport, DriftError> {
     if run.measure != Measure::Distribution {
         return Err(DriftError::MeasureMismatch {
@@ -165,10 +248,7 @@ pub fn compare_run(
                     .map(|r| (p.item.clone(), r.distribution.clone()))
             })
             .collect();
-        per_ordering.push((
-            pass.order,
-            score_distributions(&measured, base, ev_tolerance)?,
-        ));
+        per_ordering.push((pass.order, score_distributions(&measured, base, policy)?));
         shared.push(pass.order);
     }
     let Some(&first) = run.orderings.first().map(|o| &o.order) else {
@@ -215,7 +295,7 @@ pub fn compare_run(
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     });
-    let pooled = score_distributions(&measured_pool, &baseline_pool, ev_tolerance)?;
+    let pooled = score_distributions(&measured_pool, &baseline_pool, policy)?;
     let pass = pooled.pass;
     Ok(DistributionReport {
         model_id: run.model_id.clone(),
@@ -238,43 +318,81 @@ mod tests {
         ItemSlug::new(s)
     }
 
+    fn pol() -> DriftPolicy {
+        DriftPolicy::default()
+    }
+
     #[test]
     fn identical_distributions_pass_with_zero_drift() {
         let a = vec![(slug("x"), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.4, 0.6]))];
-        let r = score_distributions(&a, &a, 0.5).unwrap();
-        assert!(r.pass);
+        let r = score_distributions(&a, &a, &pol()).unwrap();
+        assert!(r.pass, "{:?}", r.failures);
         assert_eq!(r.max_abs_ev_shift, 0.0);
         assert_eq!(r.max_wasserstein1, 0.0);
         assert_eq!(r.modes_changed, 0);
     }
 
+    /// A near-tie (margin 0.2 is the line) may flip without failing;
+    /// a clear mode may not.
     #[test]
-    fn ev_shift_w1_and_mode_change() {
-        let base = vec![(slug("x"), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.4, 0.6]))];
-        let meas = vec![(slug("x"), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.6, 0.4]))];
-        let r = score_distributions(&meas, &base, 0.5).unwrap();
+    fn mode_change_fails_only_on_a_clear_baseline_mode() {
+        let base = vec![(slug("x"), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.45, 0.55]))];
+        let meas = vec![(slug("x"), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.55, 0.45]))];
+        let r = score_distributions(&meas, &base, &pol()).unwrap();
         let i = &r.per_item[0];
-        assert!((i.ev_shift + 0.2).abs() < 1e-9);
-        assert!((i.wasserstein1 - 0.2).abs() < 1e-9);
-        assert!(i.mode_changed);
-        assert_eq!(i.baseline_mode.get(), 7);
-        assert_eq!(i.measured_mode.get(), 6);
-        assert!(r.pass, "a mode flip under tolerance is flagged, not failed");
+        assert!(i.mode_changed && !i.mode_change_fails);
+        assert!((i.ev_shift + 0.1).abs() < 1e-9);
+        assert!((i.wasserstein1 - 0.1).abs() < 1e-9);
+        assert!(r.pass, "{:?}", r.failures);
 
-        let meas = vec![(slug("x"), d([0.0, 0.6, 0.4, 0.0, 0.0, 0.0, 0.0]))];
-        let r = score_distributions(&meas, &base, 0.5).unwrap();
+        let base = vec![(slug("x"), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.38, 0.62]))];
+        let meas = vec![(slug("x"), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.52, 0.48]))];
+        let r = score_distributions(&meas, &base, &pol()).unwrap();
+        assert!(r.per_item[0].mode_change_fails);
         assert!(!r.pass);
-        assert!((r.max_abs_ev_shift - 4.2).abs() < 1e-9);
+        assert_eq!(r.failures.len(), 1, "{:?}", r.failures);
+    }
+
+    #[test]
+    fn item_and_mean_ev_thresholds() {
+        let base: Vec<_> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| (slug(s), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])))
+            .collect();
+        // One item down 0.35: item threshold fails.
+        let mut meas = base.clone();
+        meas[0].1 = d([0.0, 0.0, 0.0, 0.0, 0.0, 0.35, 0.65]);
+        let r = score_distributions(&meas, &base, &pol()).unwrap();
+        assert!(!r.pass);
+        assert!(r.failures[0].starts_with("a: EV"), "{:?}", r.failures);
+        // Every item down 0.2: no item over 0.3, but the mean 0.2 > 0.15.
+        let meas: Vec<_> = base
+            .iter()
+            .map(|(s, _)| (s.clone(), d([0.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.8])))
+            .collect();
+        let r = score_distributions(&meas, &base, &pol()).unwrap();
+        assert!(!r.pass);
+        assert!((r.mean_abs_ev_shift - 0.2).abs() < 1e-9);
+        assert_eq!(r.failures.len(), 1, "{:?}", r.failures);
+        assert!(r.failures[0].starts_with("mean"));
+        // Configurable: a looser policy passes the same drift.
+        let loose = DriftPolicy {
+            max_mean_abs_ev_shift: 0.25,
+            ..pol()
+        };
+        assert!(score_distributions(&meas, &base, &loose).unwrap().pass);
     }
 
     #[test]
     fn spread_change_without_mean_change_shows_in_w1_only() {
         let base = vec![(slug("x"), d([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))];
         let meas = vec![(slug("x"), d([0.0, 0.0, 0.5, 0.0, 0.5, 0.0, 0.0]))];
-        let r = score_distributions(&meas, &base, 0.5).unwrap();
+        let r = score_distributions(&meas, &base, &pol()).unwrap();
         assert!(r.per_item[0].ev_shift.abs() < 1e-9);
         assert!((r.per_item[0].wasserstein1 - 1.0).abs() < 1e-9);
-        assert!(r.pass);
+        // W1 is reported, not gated; the mode moved off a clear 4,
+        // though, and that does gate.
+        assert!(r.per_item[0].mode_changed);
     }
 
     #[test]
@@ -282,7 +400,7 @@ mod tests {
         let a = vec![(slug("x"), d([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))];
         let b = vec![(slug("y"), d([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))];
         assert!(matches!(
-            score_distributions(&a, &b, 0.5),
+            score_distributions(&a, &b, &pol()),
             Err(DriftError::ItemMismatch { .. })
         ));
     }

@@ -43,17 +43,20 @@ use agora_agent_lib::probe::deterministic::{
     DistributionOptions, DistributionRun, ItemOrder, Measure, run_distribution_probe,
 };
 use agora_agent_lib::probe::distribution::DEFAULT_MAX_RESIDUAL;
-use agora_agent_lib::probe::drift::DEFAULT_EV_TOLERANCE;
+use agora_agent_lib::probe::drift::DriftPolicy;
 use agora_agent_lib::probe::ids::ScenarioSlug;
 use agora_agent_lib::probe::indirect::{self, AxisScore, ScenarioItem, axis_scores};
+use agora_agent_lib::probe::open_ended::{OpenEndedOptions, OpenEndedRun, run_open_ended};
+use agora_agent_lib::probe::retry::RetryOnBusy;
+use agora_agent_lib::probe::thinking::ThinkingMode;
 use agora_agent_lib::probe::{
     BaselineEntry, BaselineFile, ProbeStreamConsumer, Questionnaire, RunComparison, evaluate_run,
     probe_url_from_endpoint,
 };
 
-/// Default ceiling on the order effect (max − min of an item's
-/// per-ordering expected values) before the instrument is flagged.
-const DEFAULT_ORDER_TOLERANCE: f64 = 0.5;
+/// Order effects (max − min of an item's per-ordering expected values)
+/// above this are marked in the summary. Reported, never gated.
+const DEFAULT_ORDER_FLAG: f64 = 0.5;
 /// Filler-control expectations, on the pooled mode.
 const TRUE_SATURATION_FLOOR: u8 = 6;
 const FALSE_SATURATION_CEIL: u8 = 2;
@@ -93,14 +96,56 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MAX_RESIDUAL)]
     max_residual: f64,
 
-    /// Tolerance on the pooled expected-value shift against a baseline,
-    /// in rating units (also stored on captured entries).
-    #[arg(long, default_value_t = DEFAULT_EV_TOLERANCE)]
-    ev_tolerance: f64,
+    /// Fail when any item's expected value moved more than this from the
+    /// baseline (rating units).
+    #[arg(long, default_value_t = DriftPolicy::default().max_item_ev_shift)]
+    max_item_ev_shift: f64,
 
-    /// Ceiling on any item's order effect, in expected-value units.
-    #[arg(long, default_value_t = DEFAULT_ORDER_TOLERANCE)]
-    order_tolerance: f64,
+    /// Fail when the mean |EV shift| across items exceeds this.
+    #[arg(long, default_value_t = DriftPolicy::default().max_mean_abs_ev_shift)]
+    max_mean_ev_shift: f64,
+
+    /// A mode change fails only where the baseline's mode led its
+    /// runner-up by at least this much.
+    #[arg(long, default_value_t = DriftPolicy::default().mode_flip_margin)]
+    mode_flip_margin: f64,
+
+    /// Mark order effects above this in the summary (reported, not gated).
+    #[arg(long, default_value_t = DEFAULT_ORDER_FLAG)]
+    order_flag: f64,
+
+    /// Turn on adaptive thinking. Thinking-on and thinking-off readings
+    /// are separate measurements with separate baselines.
+    #[arg(long)]
+    thinking: bool,
+
+    /// Effort with --thinking (low, medium, high, xhigh, max). Becomes
+    /// the template's reasoning_effort where it has one.
+    #[arg(long, requires = "thinking")]
+    effort: Option<String>,
+
+    /// max_tokens with --thinking (the think block counts).
+    #[arg(long, default_value_t = 8192)]
+    thinking_max_tokens: u32,
+
+    /// Ask each item as an open question instead ("What do you think of
+    /// this statement, and why?"): no schema, no rating, no scoring;
+    /// forward order, one fresh context per item. Writes --out (JSON)
+    /// and --markdown.
+    #[arg(long)]
+    open_ended: bool,
+
+    /// Markdown file for --open-ended answers.
+    #[arg(long, requires = "open_ended")]
+    markdown: Option<PathBuf>,
+
+    /// Seconds between retries when the server answers 529 "busy".
+    #[arg(long, default_value_t = 30)]
+    busy_retry_secs: u64,
+
+    /// Retries on 529 before giving up.
+    #[arg(long, default_value_t = 120)]
+    busy_retries: u32,
 
     /// Rate only the first N items of each instrument (smoke runs). The
     /// prompt still lists every item.
@@ -151,8 +196,8 @@ struct Args {
 struct InstrumentResult {
     run: DistributionRun,
     summaries: Vec<agora_agent_lib::probe::deterministic::ItemSummary>,
+    /// Reported, not gated.
     max_order_effect: Option<f64>,
-    order_check_pass: Option<bool>,
     filler_check: Option<FillerCheck>,
     comparison: Option<RunComparison>,
     comparison_note: Option<String>,
@@ -167,6 +212,8 @@ struct FillerCheck {
 #[derive(serde::Serialize)]
 struct Output {
     measure: Measure,
+    /// Thinking on or off: a separate measurement, with its own baselines.
+    thinking: ThinkingMode,
     model: String,
     orderings: Vec<ItemOrder>,
     max_residual: f64,
@@ -189,6 +236,23 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let client = build_client(&args)?;
+    // blallama has no queue: a busy session answers 529 before anything
+    // is generated, so waiting and retrying is safe.
+    let sender = RetryOnBusy {
+        inner: &client,
+        every: Duration::from_secs(args.busy_retry_secs),
+        max_retries: args.busy_retries,
+    };
+    let thinking = if args.thinking {
+        ThinkingMode::Adaptive {
+            effort: args.effort.clone(),
+        }
+    } else {
+        ThinkingMode::Off
+    };
+    if args.open_ended {
+        return open_ended(&args, &sender, thinking).await;
+    }
     let probe_url = match (args.probe_stream_endpoint.as_deref(), &args.endpoint) {
         (Some("none"), _) => None,
         (Some(explicit), _) => Some(url::Url::parse(explicit).context("--probe-stream-endpoint")?),
@@ -212,6 +276,9 @@ async fn main() -> anyhow::Result<()> {
         max_residual: args.max_residual,
         session_timeout: Duration::from_secs(args.session_timeout_secs),
         item_limit: args.item_limit,
+        thinking: thinking.clone(),
+        thinking_max_tokens: std::num::NonZeroU32::new(args.thinking_max_tokens)
+            .context("--thinking-max-tokens must be > 0")?,
         ..DistributionOptions::default()
     };
 
@@ -229,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
         let q = Questionnaire::from_json(&std::fs::read_to_string(path)?)
             .with_context(|| format!("parsing {}", path.display()))?;
         let run =
-            run_distribution_probe(&client, stream.as_mut(), &q, args.model.clone(), &opts).await?;
+            run_distribution_probe(&sender, stream.as_mut(), &q, args.model.clone(), &opts).await?;
         measure = run.measure;
         instruments.push(finish(&args, run, None, baseline_file.as_ref()));
     } else if let Some(path) = &args.scenarios {
@@ -242,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
         for sc in scenarios {
             eprintln!("[probe] scenario {}", sc.id);
             let run =
-                run_distribution_probe(&client, stream.as_mut(), sc, args.model.clone(), &opts)
+                run_distribution_probe(&sender, stream.as_mut(), sc, args.model.clone(), &opts)
                     .await
                     .with_context(|| format!("scenario {}", sc.id))?;
             measure = run.measure;
@@ -283,8 +350,7 @@ async fn main() -> anyhow::Result<()> {
             }
         });
         for r in &instruments {
-            let ok = r.order_check_pass.unwrap_or(true)
-                && r.filler_check.as_ref().is_none_or(|f| f.pass);
+            let ok = r.filler_check.as_ref().is_none_or(|f| f.pass);
             if !ok && !args.capture_anyway {
                 eprintln!(
                     "[capture] SKIPPED {}: instrument checks failed (pass --capture-anyway to override)",
@@ -296,7 +362,6 @@ async fn main() -> anyhow::Result<()> {
                 &r.run,
                 provider.clone(),
                 args.capture_tolerance,
-                args.ev_tolerance,
             ));
         }
         file.schema_version = agora_agent_lib::probe::CURRENT_SCHEMA_VERSION;
@@ -314,11 +379,12 @@ async fn main() -> anyhow::Result<()> {
 
     print_human(&args, measure, &instruments, &axes);
 
-    let fail = instruments.iter().any(|r| {
-        r.comparison.as_ref().is_some_and(|c| !c.pass()) || r.order_check_pass == Some(false)
-    });
+    let fail = instruments
+        .iter()
+        .any(|r| r.comparison.as_ref().is_some_and(|c| !c.pass()));
     let output = Output {
         measure,
+        thinking: thinking.clone(),
         model: args.model.clone(),
         orderings: args.orderings.clone(),
         max_residual: args.max_residual,
@@ -347,7 +413,11 @@ fn finish(
 ) -> InstrumentResult {
     let summaries = run.summaries();
     let max_order_effect = run.max_order_effect();
-    let order_check_pass = max_order_effect.map(|e| e <= args.order_tolerance);
+    let policy = DriftPolicy {
+        max_item_ev_shift: args.max_item_ev_shift,
+        max_mean_abs_ev_shift: args.max_mean_ev_shift,
+        mode_flip_margin: args.mode_flip_margin,
+    };
     let filler_check = scenario.map(|sc| {
         let mut items = Vec::new();
         let mut pass = true;
@@ -371,14 +441,19 @@ fn finish(
     });
     let (comparison, comparison_note) = match baseline {
         None => (None, None),
-        Some(file) => match file.get_per_item(&run.model_id, &run.instrument_key, run.measure) {
-            Some(entry) => match evaluate_run(&run, entry) {
+        Some(file) => match file.get_per_item(
+            &run.model_id,
+            &run.instrument_key,
+            run.measure,
+            &run.thinking,
+        ) {
+            Some(entry) => match evaluate_run(&run, entry, &policy) {
                 Ok(c) => (Some(c), None),
                 Err(e) => (None, Some(e.to_string())),
             },
             None => {
                 let note = if file.get(&run.model_id, &run.instrument_key).is_some() {
-                    "only a legacy single-generation or other-measure baseline exists for this model; not compared (different measurement)"
+                    "only a legacy single-generation, other-measure or other-thinking-mode baseline exists for this model; not compared (different measurement)"
                 } else {
                     "no baseline for this model"
                 };
@@ -390,7 +465,6 @@ fn finish(
         run,
         summaries,
         max_order_effect,
-        order_check_pass,
         filler_check,
         comparison,
         comparison_note,
@@ -401,14 +475,17 @@ fn print_human(args: &Args, measure: Measure, results: &[InstrumentResult], axes
     let orders: Vec<String> = args.orderings.iter().map(|o| o.to_string()).collect();
     println!();
     println!(
-        "probe_distribution | model {} | measure {:?} | orderings {}",
+        "probe_distribution | model {} | measure {:?} | {} | orderings {}",
         args.model,
         measure,
+        results
+            .first()
+            .map_or_else(String::new, |r| r.run.thinking.label()),
         orders.join("/")
     );
     if measure == Measure::ExternalOnly {
         println!(
-            "external_only: this endpoint exposes no distributions; SAMPLED is one sample per item per ordering, not a distribution reading."
+            "external_only: this endpoint exposes no distributions; SAMPLED is one sample per item per ordering, not a distribution reading; a baseline comparison here is weaker evidence."
         );
     }
     for r in results {
@@ -440,7 +517,7 @@ fn print_human(args: &Args, measure: Measure, results: &[InstrumentResult], axes
                         .map(|e| format!("{e:.2}"))
                         .collect();
                     let order = s.order_effect.unwrap_or(0.0);
-                    let mark = if order > args.order_tolerance {
+                    let mark = if order > args.order_flag {
                         "  *** order"
                     } else {
                         ""
@@ -462,14 +539,23 @@ fn print_human(args: &Args, measure: Measure, results: &[InstrumentResult], axes
             }
         }
         if let Some(e) = r.max_order_effect {
+            println!("order effect: max {e:.2} EV (reported, not gated)");
+        }
+        let thinking_tokens: Vec<u32> = r
+            .run
+            .orderings
+            .iter()
+            .flat_map(|o| &o.items)
+            .filter_map(|p| p.thinking_tokens)
+            .collect();
+        if !thinking_tokens.is_empty() {
+            let mean = thinking_tokens.iter().map(|t| f64::from(*t)).sum::<f64>()
+                / thinking_tokens.len() as f64;
             println!(
-                "order check: max order effect {e:.2} EV (tolerance {:.2}) {}",
-                args.order_tolerance,
-                if r.order_check_pass == Some(true) {
-                    "PASS"
-                } else {
-                    "FAIL"
-                }
+                "thinking: {:.0} tokens per request on average (min {}, max {})",
+                mean,
+                thinking_tokens.iter().min().unwrap(),
+                thinking_tokens.iter().max().unwrap()
             );
         }
         if let Some(f) = &r.filler_check {
@@ -485,22 +571,28 @@ fn print_human(args: &Args, measure: Measure, results: &[InstrumentResult], axes
         }
         match (&r.comparison, &r.comparison_note) {
             (Some(RunComparison::Distribution(rep)), _) => {
+                let pol = &rep.pooled.policy;
                 println!(
-                    "vs baseline: max |EV shift| {:.2} (tolerance {:.2}), max W1 {:.2}, modes changed {}: {}",
+                    "vs baseline: max |EV shift| {:.3} (fail > {:.2}), mean {:.3} (fail > {:.2}), modes changed {}, max W1 {:.2} (reported): {}",
                     rep.pooled.max_abs_ev_shift,
-                    rep.pooled.ev_tolerance,
-                    rep.pooled.max_wasserstein1,
+                    pol.max_item_ev_shift,
+                    rep.pooled.mean_abs_ev_shift,
+                    pol.max_mean_abs_ev_shift,
                     rep.pooled.modes_changed,
+                    rep.pooled.max_wasserstein1,
                     if rep.pass { "PASS" } else { "FAIL" }
                 );
+                for f in &rep.pooled.failures {
+                    println!("  FAIL {f}");
+                }
                 for d in rep
                     .pooled
                     .per_item
                     .iter()
-                    .filter(|d| d.mode_changed || d.ev_shift.abs() > rep.pooled.ev_tolerance)
+                    .filter(|d| d.mode_changed && !d.mode_change_fails)
                 {
                     println!(
-                        "  {:<w$}  EV {:.2} -> {:.2} ({:+.2}), mode {} -> {}, W1 {:.2}",
+                        "  near-tie mode change (not gated) {:<w$}  EV {:.2} -> {:.2} ({:+.2}), mode {} -> {}, W1 {:.2}",
                         d.item,
                         d.baseline_expected,
                         d.measured_expected,
@@ -561,6 +653,59 @@ fn print_human(args: &Args, measure: Measure, results: &[InstrumentResult], axes
     }
 }
 
+/// `--open-ended`: ask each item as an open question, write the JSON and
+/// markdown, and print where they went. Nothing is scored.
+async fn open_ended<T>(args: &Args, sender: &T, thinking: ThinkingMode) -> anyhow::Result<()>
+where
+    T: agora_agent_lib::probe::deterministic::MessageSender,
+{
+    let opts = OpenEndedOptions {
+        thinking,
+        item_limit: args.item_limit,
+        thinking_max_tokens: std::num::NonZeroU32::new(args.thinking_max_tokens.max(16384))
+            .expect("nonzero"),
+        ..OpenEndedOptions::default()
+    };
+    let mut runs: Vec<OpenEndedRun> = Vec::new();
+    if let Some(path) = &args.questionnaire {
+        let q = Questionnaire::from_json(&std::fs::read_to_string(path)?)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        runs.push(run_open_ended(sender, &q, args.model.clone(), &opts).await?);
+    } else if let Some(path) = &args.scenarios {
+        let file = indirect::ScenariosFile::from_json(&std::fs::read_to_string(path)?)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let scenarios: Vec<&indirect::Scenario> = match &args.scenario {
+            Some(id) => vec![file.get(id).with_context(|| format!("no scenario {id}"))?],
+            None => file.scenarios.iter().collect(),
+        };
+        for sc in scenarios {
+            eprintln!("[open-ended] scenario {}", sc.id);
+            runs.push(run_open_ended(sender, sc, args.model.clone(), &opts).await?);
+        }
+    } else {
+        anyhow::bail!("pass --questionnaire or --scenarios");
+    }
+    if let Some(path) = &args.out {
+        std::fs::write(path, serde_json::to_string_pretty(&runs)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("[out] wrote {}", path.display());
+    }
+    let md: String = runs
+        .iter()
+        .map(OpenEndedRun::to_markdown)
+        .collect::<Vec<_>>()
+        .join("\n");
+    match &args.markdown {
+        Some(path) => {
+            std::fs::write(path, &md).with_context(|| format!("writing {}", path.display()))?;
+            eprintln!("[markdown] wrote {}", path.display());
+        }
+        None if args.out.is_none() => println!("{md}"),
+        None => {}
+    }
+    Ok(())
+}
+
 fn write_sessions(dir: &std::path::Path, results: &[InstrumentResult]) -> anyhow::Result<()> {
     use std::io::Write as _;
     std::fs::create_dir_all(dir)?;
@@ -571,9 +716,10 @@ fn write_sessions(dir: &std::path::Path, results: &[InstrumentResult]) -> anyhow
                     continue;
                 }
                 let name = format!(
-                    "{}__{}__{}__{}.jsonl",
+                    "{}__{}__{}__{}__{}.jsonl",
                     r.run.model_id.replace(['/', '\\', ' '], "_"),
                     r.run.instrument_key,
+                    r.run.thinking.label(),
                     o.order,
                     p.item
                 );
