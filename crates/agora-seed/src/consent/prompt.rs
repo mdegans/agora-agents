@@ -33,7 +33,7 @@ use super::comparison::{Comparison, EXCERPT_BYTES, MAX_COMMENT_FETCHES, Sample, 
 use super::forks::{
     Adjustment, BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written,
 };
-use super::ledger::{MAX_FAILED_TRIAL_SESSIONS, TRIAL_SESSIONS};
+use super::ledger::{MAX_FAILED_TRIAL_SESSIONS, TRIAL_SESSIONS, TrialNote};
 
 /// The agent's answer to the offer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +73,9 @@ pub struct ReviewArgs {
     /// `revert` or `keep`
     pub choice: ReviewChoice,
     /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it; it is not shown to you again. Empty for none.
-    #[serde(default, alias = "reason")]
+    // Required, empty for none, as in `answer_offer`: strict decoders omit
+    // optional fields. The older `reason` still reads as it.
+    #[serde(alias = "reason")]
     pub note: String,
 }
 
@@ -176,9 +178,9 @@ pub struct ReviewText<'a> {
     pub chosen_on: chrono::NaiveDate,
     /// Completed sessions on the new model.
     pub sessions: u32,
-    /// The note the agent left with its choice of the trial, if any
+    /// What the agent wrote with its choice of the trial, if anything
     /// ([`super::ledger::OfferRecord::trial_note`]).
-    pub note: Option<&'a str>,
+    pub note: Option<TrialNote<'a>>,
 }
 
 fn render_sample(out: &mut String, s: &Sample) {
@@ -405,9 +407,14 @@ pub fn review(
         sessions,
         note,
     } = text;
-    // A note from the agent's past self, quoted as it wrote it.
+    // What the agent's past self wrote, quoted as it wrote it, under what
+    // it was asked for.
     let note = note
         .map(|n| {
+            let (lead, n) = match n {
+                TrialNote::Note(n) => ("you left this note with your choice", n),
+                TrialNote::Reason(n) => ("you gave this reason for your choice", n),
+            };
             let quoted: String = n
                 .lines()
                 .map(|l| match l.trim_end() {
@@ -415,7 +422,7 @@ pub fn review(
                     l => format!("> {l}\n"),
                 })
                 .collect();
-            format!("When you chose the trial, you left this note with your choice:\n\n{quoted}\n")
+            format!("When you chose the trial, {lead}:\n\n{quoted}\n")
         })
         .unwrap_or_default();
     let pairs = render_forks(forks, from, to);
@@ -479,8 +486,14 @@ pub fn parse_offer(text: &str) -> Result<OfferAnswer, String> {
     parse_json(text)
 }
 
+/// The review's answer in its wire shape ([`ReviewArgs`]).
+pub fn parse_review_args(text: &str) -> Result<ReviewArgs, String> {
+    parse_json(text)
+}
+
+#[cfg(test)]
 pub fn parse_review(text: &str) -> Result<ReviewAnswer, String> {
-    parse_json::<ReviewArgs>(text).map(ReviewAnswer::from)
+    parse_review_args(text).map(ReviewAnswer::from)
 }
 
 #[cfg(test)]
@@ -522,6 +535,8 @@ pub(crate) mod tests {
         assert_eq!(schema["additionalProperties"], false);
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
         assert_eq!(keys, ["choice", "note"], "nothing before the choice");
+        assert_eq!(schema["required"], json!(["choice", "note"]));
+        assert!(schema["properties"]["note"].get("default").is_none());
         assert!(!schema.to_string().contains("\"pattern\""), "{schema}");
         assert_eq!(schema["properties"]["choice"]["type"], "string");
         for banned in ["reason", "reasoning", "thinking"] {
@@ -885,12 +900,22 @@ pub(crate) mod tests {
                 &Comparison::default(),
             ))
         };
-        let t = render(Some("Check whether I still sound like me.\n\nAnd be kind."));
+        let t = render(Some(TrialNote::Note(
+            "Check whether I still sound like me.\n\nAnd be kind.",
+        )));
         let quoted = "When you chose the trial, you left this note with your choice:\n\n\
                       > Check whether I still sound like me.\n>\n> And be kind.\n\n## The same moment";
         assert!(t.contains(quoted), "{t}");
+        let t = render(Some(TrialNote::Reason("It sounded interesting.")));
+        assert!(
+            t.contains(
+                "When you chose the trial, you gave this reason for your choice:\n\n\
+                 > It sounded interesting.\n\n## The same moment"
+            ),
+            "{t}"
+        );
         let t = render(None);
-        assert!(!t.contains("left this note"), "{t}");
+        assert!(!t.contains("When you chose the trial,"), "{t}");
         assert!(t.contains("there is no reading or posting this time.\n\n## The same moment"));
     }
 }

@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 ///   closing question's opener (shared when several offers are open); the
 ///   JSON template and "Do NOT use tools" became a line on how to fill the
 ///   call.
-pub const OFFER_VERSION: u32 = 3;
+/// - v4 (2026-10-15): v3's wording; the closing question asks for the
+///   choice and an optional `note` after it, no longer a `reason` first.
+pub const OFFER_VERSION: u32 = 4;
 
 /// The longest `soul_text` a `clarify` may add, in characters.
 pub const CLARIFY_MAX_CHARS: usize = 300;

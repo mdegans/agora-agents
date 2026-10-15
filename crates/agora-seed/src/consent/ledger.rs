@@ -117,6 +117,21 @@ pub enum SwitchCause {
     Consent { action: ChangeAction },
 }
 
+/// When the answer tools' `reason` (required, before the choice) became an
+/// optional `note` after it: the deploy of agents#259, before the Haiku run
+/// of 2026-10-16. Text stored before this is labelled as a reason.
+pub const NOTE_SINCE: DateTime<Utc> = DateTime::from_timestamp(1_792_108_800, 0).unwrap();
+
+/// What an agent wrote with its choice of a trial, as its review shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialNote<'a> {
+    /// A `reason`, required and written before the choice (before
+    /// [`NOTE_SINCE`]).
+    Reason(&'a str),
+    /// An optional `note`, written after the choice.
+    Note(&'a str),
+}
+
 /// Everything about one offer for one agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OfferRecord {
@@ -1094,24 +1109,29 @@ impl Ledger {
 }
 
 impl OfferRecord {
-    /// The note the agent left with the choice that began this trial (an
-    /// answer to the offer, or a `set_model` trial), if it left one: shown
-    /// back to it at the trial's review, a note from its past self
-    /// (Steward, 2026-10-15). Before that day the field was `reason`, and
-    /// was written before the choice.
-    pub fn trial_note(&self) -> Option<&str> {
-        self.history
-            .iter()
-            .rev()
-            .find_map(|e| match &e.kind {
+    /// What the agent wrote with the choice that began this trial (an
+    /// answer to the offer, or a `set_model` trial), if anything: shown back
+    /// to it at the trial's review, a note from its past self (Steward,
+    /// 2026-10-15). Before [`NOTE_SINCE`] it was a required `reason`, written
+    /// before the choice, and is labelled as one ([`TrialNote::Reason`]).
+    pub fn trial_note(&self) -> Option<TrialNote<'_>> {
+        self.history.iter().rev().find_map(|e| {
+            let text = match &e.kind {
                 EventKind::Offered {
                     answer: Some(a), ..
-                } if a.choice == OfferChoice::Trial => Some(a.reason.as_str()),
-                EventKind::SelfTrial { reason } => Some(reason.as_str()),
-                _ => None,
-            })
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
+                } if a.choice == OfferChoice::Trial => a.reason.trim(),
+                EventKind::SelfTrial { reason } => reason.trim(),
+                _ => return None,
+            };
+            // The choice is found; an empty note is none.
+            Some((!text.is_empty()).then(|| {
+                if e.at < NOTE_SINCE {
+                    TrialNote::Reason(text)
+                } else {
+                    TrialNote::Note(text)
+                }
+            }))
+        })?
     }
 
     /// Whether the trial review has been answered (or gone unanswered).
@@ -2151,7 +2171,7 @@ mod tests {
     #[test]
     fn trial_note_is_the_note_left_with_the_trial_choice() {
         let event = |kind| Event {
-            at: Utc::now(),
+            at: NOTE_SINCE + chrono::Duration::hours(9),
             kind,
         };
         let offered = |reason: &str, choice| EventKind::Offered {
@@ -2177,16 +2197,42 @@ mod tests {
             "  see if I sound like me \n",
             OfferChoice::Trial,
         )));
-        assert_eq!(record.trial_note(), Some("see if I sound like me"));
+        assert_eq!(
+            record.trial_note(),
+            Some(TrialNote::Note("see if I sound like me"))
+        );
         record
             .history
             .push(event(EventKind::TrialEnded { sessions: 5 }));
-        assert_eq!(record.trial_note(), Some("see if I sound like me"));
+        assert_eq!(
+            record.trial_note(),
+            Some(TrialNote::Note("see if I sound like me"))
+        );
         record.history = vec![event(EventKind::SelfTrial {
             reason: "my own".into(),
         })];
-        assert_eq!(record.trial_note(), Some("my own"));
+        assert_eq!(record.trial_note(), Some(TrialNote::Note("my own")));
         record.history = vec![event(offered(" ", OfferChoice::Trial))];
         assert_eq!(record.trial_note(), None);
+        // A later empty trial answer is the choice; an older reason isn't
+        // shown in its place.
+        record.history = vec![
+            event(offered("older", OfferChoice::Trial)),
+            event(offered("", OfferChoice::Trial)),
+        ];
+        assert_eq!(record.trial_note(), None);
+        // Written before the change: a reason, labelled as one. Read from a
+        // ledger in the stored shape, as the live ones are.
+        let old: Event = serde_json::from_value(serde_json::json!({
+            "at": "2026-10-03T12:00:00Z",
+            "event": "offered",
+            "answer": {"reason": "It sounded interesting.", "choice": "trial"},
+        }))
+        .unwrap();
+        record.history = vec![old];
+        assert_eq!(
+            record.trial_note(),
+            Some(TrialNote::Reason("It sounded interesting."))
+        );
     }
 }

@@ -14,9 +14,9 @@
 //! **Answered with `answer_offer`** ([`super::super::offers`]), the strict
 //! tool every offer shares (`offer` = `cadence`; its `text` is unused). Its
 //! schema is the same for every agent, so the per-agent order lives only in
-//! the text; `reason` is declared before `choice` there, so the decoder
-//! writes the reasoning before the decision (CLAUDE.md, "Never ship a
-//! `$ref` schema; `strict` only on `$ref`-free schemas").
+//! the text. Its `note` comes after `choice`: no field before the
+//! decision asks for reasons (CLAUDE.md, "Never ship a `$ref` schema",
+//! rule 5; until 2026-10-15 a `reason` came first).
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::seed::Memory;
@@ -32,7 +32,9 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   tool. Who is asking moved into the closing question's opener (shared
 ///   when several offers are open); the JSON template and "Do NOT use
 ///   tools" became a line on how to fill the call.
-pub const OFFER_VERSION: u32 = 2;
+/// - v3 (2026-10-15): v2's wording; the closing question asks for the
+///   choice and an optional `note` after it, no longer a `reason` first.
+pub const OFFER_VERSION: u32 = 3;
 
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +60,8 @@ pub struct ChoiceOnly {
 /// string.
 #[derive(Debug, Deserialize)]
 pub struct ReasonOnly {
+    /// `note` since 2026-10-15.
+    #[serde(alias = "note")]
     pub reason: String,
 }
 

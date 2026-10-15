@@ -2512,7 +2512,10 @@ where
             review.sessions,
             review.chosen_at.date_naive(),
         );
-        let note = review.record.trial_note().map(str::to_string);
+        let note = review.record.trial_note().map(|n| match n {
+            super::ledger::TrialNote::Note(t) => (true, t.to_string()),
+            super::ledger::TrialNote::Reason(t) => (false, t.to_string()),
+        });
         let forks = forks::load(&dir, &key, started_at).await;
         if forks.is_none() {
             tracing::warn!(
@@ -2540,7 +2543,13 @@ where
                 to_name: &to_name,
                 chosen_on,
                 sessions,
-                note: note.as_deref(),
+                note: note.as_ref().map(|(new, t)| {
+                    if *new {
+                        super::ledger::TrialNote::Note(t)
+                    } else {
+                        super::ledger::TrialNote::Reason(t)
+                    }
+                }),
             },
             forks.as_ref(),
             &sample,
@@ -2565,7 +2574,10 @@ where
         if self.ledger.is_none() {
             return Ok(Control::Done(Outcome::Complete));
         }
-        let review = parse(&response, constrained, text::parse_review);
+        // Decoded in the wire shape on both paths (a constrained reply is
+        // `ReviewArgs`' schema), then kept in the ledger's.
+        let review =
+            parse(&response, constrained, text::parse_review_args).map(text::ReviewAnswer::from);
         let failure = review.as_ref().err().cloned();
         // Seated whatever it is, so a retry or the memory turn after it
         // extends this request.
@@ -4988,8 +5000,15 @@ mod tests {
             ),
             "{q}"
         );
+        // The note left with `set_model` comes back (labelled by its date:
+        // a reason before `NOTE_SINCE`, a note after).
+        assert!(q.contains("When you chose the trial, you "), "{q}");
+        assert!(
+            q.contains("your choice:\n\n> I want to think slower.\n"),
+            "{q}"
+        );
         agent
-            .handle(reply(r#"{"reason": "Mine.", "choice": "keep"}"#))
+            .handle(reply(r#"{"choice": "keep", "note": "Mine."}"#))
             .await
             .unwrap();
         agent.handle(reply("memory")).await.unwrap();
