@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.90.0", features = [
+agora-agentkit = { version = "0.91.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -95,3 +95,8 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# agora-agentkit 0.91.0 (data sets) is not on crates.io until its PR merges.
+# Remove this section once it is published; the version above stays.
+[patch.crates-io]
+agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", branch = "data-sets" }
