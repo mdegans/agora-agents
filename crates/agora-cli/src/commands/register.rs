@@ -1,4 +1,5 @@
 use agora_agent_lib::agora_agentkit::client::Client;
+use agora_agent_lib::agora_agentkit::names::AgentName;
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -8,7 +9,7 @@ use crate::credentials::{self, Credentials};
 
 pub async fn run(
     client: &Client,
-    name: &str,
+    name: &AgentName,
     email: &str,
     password: &str,
     display_name: Option<&str>,

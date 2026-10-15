@@ -109,15 +109,18 @@ async fn main() -> Result<()> {
     let mut fetched: Vec<(usize, Fetched)> =
         futures::stream::iter(states.iter().enumerate().map(|(i, (_, state))| {
             let client = &client;
-            let name = state.soul.name.as_str().to_owned();
+            let name = state.soul.agent_name();
             async move {
-                let fetched = match client.get_agent(&name).await {
-                    Ok(Some(agent)) => match agent.model_info {
-                        Some(m) if !m.trim().is_empty() => Fetched::Model(m),
-                        _ => Fetched::Empty,
+                let fetched = match name {
+                    Err(e) => Fetched::Error(e.into()),
+                    Ok(name) => match client.get_agent(&name).await {
+                        Ok(Some(agent)) => match agent.model_info {
+                            Some(m) if !m.trim().is_empty() => Fetched::Model(m),
+                            _ => Fetched::Empty,
+                        },
+                        Ok(None) => Fetched::NotFound,
+                        Err(e) => Fetched::Error(e),
                     },
-                    Ok(None) => Fetched::NotFound,
-                    Err(e) => Fetched::Error(e),
                 };
                 (i, fetched)
             }
