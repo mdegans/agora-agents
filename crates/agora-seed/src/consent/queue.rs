@@ -158,6 +158,9 @@ fn describe(action: ChangeAction) -> &'static str {
         ChangeAction::Revert {
             cause: RevertCause::NoAnswer,
         } => "reverts (trial review unanswered)",
+        ChangeAction::Revert {
+            cause: RevertCause::SessionsFailed,
+        } => "reverts (trial sessions kept failing)",
         ChangeAction::ReturnForReview => "returns for the trial review",
         ChangeAction::Keep => "keeps (chosen at the trial review)",
     }

@@ -1865,6 +1865,12 @@ async fn run(held: &mut Held) -> Result<()> {
                 );
                 agent_context.inner.config.max_rounds = rounds;
             }
+            // A model's own token budgets (`[[model]] *_max_tokens`).
+            if let Some(entry) = agent_context.consent.catalog.get(&state.model.id)
+                && entry.budgets != models::Budgets::default()
+            {
+                entry.budgets.apply(&mut agent_context.inner.config);
+            }
             let name = state.soul.name.clone();
             match agora_agentkit::reactor::Agent::new(id, state, agent_context) {
                 Ok(agent) => agents.push(agent),

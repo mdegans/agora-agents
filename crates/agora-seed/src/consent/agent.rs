@@ -1162,6 +1162,43 @@ where
         }
     }
 
+    /// This session did not complete (it never reached its close): count
+    /// it against a trial running on this model, and at
+    /// [`MAX_FAILED_TRIAL_SESSIONS`](super::ledger::MAX_FAILED_TRIAL_SESSIONS)
+    /// in a row end the trial and move the agent back. The SOUL's offer
+    /// line says so, so the agent reads it at its next session.
+    async fn fail_trial_session(&mut self) {
+        let model = self.model();
+        let now = Utc::now();
+        let Some(ledger) = self.ledger.as_mut() else {
+            return;
+        };
+        let (changed, change) = ledger.fail_session(&model, now);
+        self.dirty |= changed;
+        let Some(change) = change else {
+            if changed {
+                tracing::warn!(
+                    event_type = "model_trial_session_failed",
+                    agent = %self.inner.state().soul.name,
+                    agent_id = %self.inner.id(),
+                    model = %model,
+                    "a trial session did not complete; it does not count toward the trial"
+                );
+            }
+            return;
+        };
+        tracing::error!(
+            event_type = "model_trial_abandoned",
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            from = %change.from,
+            to = %change.to,
+            failed = super::ledger::MAX_FAILED_TRIAL_SESSIONS,
+            "trial sessions kept failing; ending the trial and returning the agent"
+        );
+        self.apply_consented(&change, now, true).await;
+    }
+
     /// The model-swap offer's section of the closing question.
     fn model_swap_section(&self, key: OfferKey) -> (Section, Open) {
         let offer = self
@@ -3450,6 +3487,9 @@ where
         self.alert_contact_request();
         self.note_writes().await;
         self.log_writes();
+        if !self.closed {
+            self.fail_trial_session().await;
+        }
         self.take_self_switch();
         self.patched = self.patch_soul();
         let dir = self.agent_dir();
@@ -4298,6 +4338,101 @@ mod tests {
             h.ledger().await.offers[0].stage,
             Stage::Trial { sessions: 1, .. }
         ));
+    }
+
+    /// Sessions on the trial model that never complete don't count toward
+    /// the trial; a completed one resets the run; at
+    /// `MAX_FAILED_TRIAL_SESSIONS` in a row the trial ends early, the agent
+    /// is moved back (signed profile update, next session on OLD), and its
+    /// SOUL line says so.
+    #[tokio::test]
+    async fn a_trial_whose_sessions_keep_failing_returns_the_agent() {
+        use crate::consent::ledger::{MAX_FAILED_TRIAL_SESSIONS, RevertCause};
+        let h = Harness::new("trial-fails");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("closing phase done")).await.unwrap();
+        agent
+            .handle(answer_call("model_swap", "trial", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+
+        // A session on NEW that fails (never reaches its close), then one
+        // that completes: the count resets.
+        let failed = |h: &Harness| {
+            let mut agent = h.agent(NEW, true);
+            async move {
+                agent.on_init().await.unwrap();
+                agent.on_teardown().await.unwrap();
+                agent
+            }
+        };
+        failed(&h).await;
+        assert!(matches!(
+            h.ledger().await.offers[0].stage,
+            Stage::Trial {
+                sessions: 0,
+                failed_in_a_row: 1,
+                ..
+            }
+        ));
+        let mut agent = h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert!(matches!(
+            h.ledger().await.offers[0].stage,
+            Stage::Trial {
+                sessions: 1,
+                failed_in_a_row: 0,
+                ..
+            }
+        ));
+
+        let updates_before = h.agora.profile_updates().len();
+        let mut last = None;
+        for _ in 0..MAX_FAILED_TRIAL_SESSIONS {
+            last = Some(failed(&h).await);
+        }
+        let agent = last.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::AwaitingRevert {
+                cause: RevertCause::SessionsFailed
+            }
+        );
+        assert_eq!(agent.state().model.id, Model::from(OLD), "back on OLD next");
+        let updates = h.agora.profile_updates();
+        assert_eq!(updates.len(), updates_before + 1);
+        assert!(signed_by(&updates.last().unwrap().1, &h.key, OLD));
+        let notes = evolution_notes(&agent);
+        assert!(
+            notes
+                .last()
+                .unwrap()
+                .contains("sessions in a row on Qwen 3.8 could not finish"),
+            "{notes:?}"
+        );
+
+        // The next session runs on OLD: the trial is over, nothing to review.
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::AwaitingRevert {
+                cause: RevertCause::SessionsFailed
+            },
+            "observed at the next save"
+        );
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::SessionsFailed)
+            }
+        );
     }
 
     /// Agora refusing the update leaves everything as it was, and the

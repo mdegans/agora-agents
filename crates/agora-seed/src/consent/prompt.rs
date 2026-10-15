@@ -30,7 +30,7 @@ use super::comparison::{Comparison, EXCERPT_BYTES, MAX_COMMENT_FETCHES, Sample, 
 use super::forks::{
     Adjustment, BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written,
 };
-use super::ledger::TRIAL_SESSIONS;
+use super::ledger::{MAX_FAILED_TRIAL_SESSIONS, TRIAL_SESSIONS};
 
 /// The agent's answer to the offer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +133,7 @@ Whichever you choose, you stay you: your name, SOUL, memory, posts, comments, vo
 Your options:
 
 1. `no_swap` — stay on {from}.
-2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions (a session that ends early doesn't count). After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown some of what you wrote before and during the trial, beside what the other model writes from the same moments, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
+2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions (a session that ends early doesn't count; if {MAX_FAILED_TRIAL_SESSIONS} in a row on {to} can't finish, the trial ends early and you return to {from}). After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown some of what you wrote before and during the trial, beside what the other model writes from the same moments, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
 3. `permanent` — move to {to} permanently.
 
 If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer, you may be asked once more; with no answer, you stay on {from}.

@@ -30,6 +30,14 @@ pub const FORMAT: u32 = 1;
 /// Sessions on the new model before a trial is reviewed.
 pub const TRIAL_SESSIONS: u32 = 5;
 
+/// Sessions in a row on a trial's new model that may fail to complete
+/// before the trial ends early and the agent goes back (review,
+/// 2026-10-15: only completed sessions count toward a trial, so without
+/// this an agent whose sessions on the new model keep failing would stay
+/// on it indefinitely). Three, so one bad day of API errors on a daily
+/// cohort does not end a trial.
+pub const MAX_FAILED_TRIAL_SESSIONS: u32 = 3;
+
 /// How the countdown line ([`Ledger::trial_line`]) starts. A fork of a
 /// trial session removes the line by it: it names the trial model as the
 /// one the session runs on.
@@ -154,6 +162,11 @@ pub enum Stage {
         /// nothing counts it now.
         #[serde(default)]
         review_misses: u32,
+        /// Sessions on the new model in a row that did not complete. At
+        /// [`MAX_FAILED_TRIAL_SESSIONS`] the trial ends early and the agent
+        /// goes back ([`Ledger::fail_session`]). Absent in older ledgers.
+        #[serde(default)]
+        failed_in_a_row: u32,
     },
     /// The trial's [`TRIAL_SESSIONS`] are done: the agent is being moved
     /// back to `from`, where the review is asked (Steward, 2026-09-25: the
@@ -236,6 +249,10 @@ pub enum RevertCause {
     /// The trial review went unanswered: the agent agreed to a
     /// [`TRIAL_SESSIONS`]-session trial, not a permanent move.
     NoAnswer,
+    /// [`MAX_FAILED_TRIAL_SESSIONS`] sessions in a row on the new model did
+    /// not complete, so the trial could not finish: the agent goes back
+    /// rather than stay on a model it can't complete a session on.
+    SessionsFailed,
 }
 
 /// One line of an offer's history.
@@ -272,6 +289,10 @@ pub enum EventKind {
     /// The trial's `sessions` were done; the runner began moving the agent
     /// back to `from` for its review.
     TrialEnded { sessions: u32 },
+    /// The trial ended early: `failed` sessions in a row on the new model
+    /// did not complete, after `sessions` that did. The runner began moving
+    /// the agent back to `from`; no review follows.
+    TrialAbandoned { sessions: u32, failed: u32 },
     /// The agent chose this trial itself, with `set_model` (`term =
     /// trial`), rather than in answer to an offer.
     SelfTrial { reason: String },
@@ -448,6 +469,7 @@ impl Ledger {
                         started_at: now,
                         sessions: 0,
                         review_misses: 0,
+                        failed_in_a_row: 0,
                     },
                     Term::Permanent => Stage::Moved,
                 },
@@ -491,14 +513,61 @@ impl Ledger {
     pub fn count_session(&mut self, model: &Model) -> bool {
         let mut changed = false;
         for record in &mut self.offers {
-            if let Stage::Trial { sessions, .. } = &mut record.stage
+            if let Stage::Trial {
+                sessions,
+                failed_in_a_row,
+                ..
+            } = &mut record.stage
                 && model == &record.key.to
             {
                 *sessions += 1;
+                *failed_in_a_row = 0;
                 changed = true;
             }
         }
         changed
+    }
+
+    /// A session on `model` ended without completing. Counted against any
+    /// trial running on that model; at [`MAX_FAILED_TRIAL_SESSIONS`] in a
+    /// row the trial ends early ([`RevertCause::SessionsFailed`]) and the
+    /// change back to `from` is returned, to apply. The first value says
+    /// whether the ledger changed.
+    pub fn fail_session(&mut self, model: &Model, now: DateTime<Utc>) -> (bool, Option<Change>) {
+        let Some(record) = self
+            .offers
+            .iter_mut()
+            .find(|r| model == &r.key.to && matches!(r.stage, Stage::Trial { .. }))
+        else {
+            return (false, None);
+        };
+        let Stage::Trial {
+            sessions,
+            failed_in_a_row,
+            ..
+        } = &mut record.stage
+        else {
+            unreachable!("matched above");
+        };
+        *failed_in_a_row += 1;
+        if *failed_in_a_row < MAX_FAILED_TRIAL_SESSIONS {
+            return (true, None);
+        }
+        let (sessions, failed) = (*sessions, *failed_in_a_row);
+        let cause = RevertCause::SessionsFailed;
+        record.stage = Stage::AwaitingRevert { cause };
+        record.history.push(Event {
+            at: now,
+            kind: EventKind::TrialAbandoned { sessions, failed },
+        });
+        (
+            true,
+            Some(Change {
+                action: ChangeAction::Revert { cause },
+                from: record.key.to.clone(),
+                to: record.key.from.clone(),
+            }),
+        )
     }
 
     /// The offer to ask at the close of a completed session on `model`
@@ -1101,6 +1170,13 @@ impl OfferRecord {
                         format!("no answer recorded yet; staying on {from} for now")
                     });
                 }
+                EventKind::TrialAbandoned { sessions, failed } => {
+                    parts.push(format!(
+                        "trial ended early {on}: {failed} sessions in a row on {to} could not \
+                         finish (after {sessions} that did), so you were returned to {from}; \
+                         nothing to decide"
+                    ));
+                }
                 EventKind::TrialEnded { sessions } => {
                     returned = true;
                     parts.push(format!(
@@ -1309,7 +1385,8 @@ mod tests {
             Stage::Trial {
                 started_at: t(25),
                 sessions: 0,
-                review_misses: 0
+                review_misses: 0,
+                failed_in_a_row: 0,
             }
         );
 
@@ -1490,6 +1567,7 @@ mod tests {
             started_at: t(2),
             sessions: TRIAL_SESSIONS + 1,
             review_misses: 1,
+            failed_in_a_row: 0,
         };
         assert!(ledger.end_trial(&k.to, t(9)).is_some());
 

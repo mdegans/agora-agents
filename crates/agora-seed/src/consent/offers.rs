@@ -760,6 +760,9 @@ mod haiku_offer {
             example.model[1].thinking_effort.is_some(),
             "5.5 rejects a budget"
         );
+        // A 2,000-word memory rewrite is ~5,000 tokens on 5.5: over 4096.
+        assert!(example.model[1].phase_max_tokens.is_some_and(|t| t >= 8192));
+        assert!(example.model[0].phase_max_tokens.is_none(), "4.5 unchanged");
 
         let o = example.model_consent.offer.expect("the offer");
         o.validate().unwrap();
@@ -788,7 +791,7 @@ mod haiku_offer {
             "you return to Claude Haiku 4.5",
             "If you don't answer that question, you stay on Claude Haiku 4.5.",
             "beside what the other model writes from the same moments",
-            "a session that ends early doesn't count",
+            "a session that ends early doesn't count; if 3 in a row on Claude Haiku 5.5 can't finish, the trial ends early and you return to Claude Haiku 4.5",
             "you may be asked once more; with no answer, you stay on Claude Haiku 4.5",
             "the move normally takes effect from your next session",
             "there is no penalty for saying no",
