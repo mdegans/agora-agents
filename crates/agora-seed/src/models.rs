@@ -54,6 +54,12 @@ pub struct ModelSpec {
     pub act_max_tokens: Option<u32>,
     pub phase_max_tokens: Option<u32>,
     pub evolve_max_tokens: Option<u32>,
+    /// This model's session context window, in tokens, over `[seed]
+    /// context_window` (Steward, 2026-10-15: Haiku 5.5 gets 1.5x the
+    /// cohort's, since its tokenizer counts ~1.43x the tokens for the same
+    /// text). Still bounded by what the endpoint says the model takes
+    /// (agentkit's `on_admit`). At least [`MIN_MODEL_CONTEXT_WINDOW`].
+    pub context_window: Option<u64>,
 }
 
 fn default_share() -> f64 {
@@ -73,6 +79,7 @@ impl ModelSpec {
             act_max_tokens: None,
             phase_max_tokens: None,
             evolve_max_tokens: None,
+            context_window: None,
         }
     }
 }
@@ -100,6 +107,11 @@ pub fn validate(specs: &[ModelSpec]) -> anyhow::Result<()> {
             "[[model]] {id}: a selectable model needs a `description` — agents \
              choose on it"
         );
+        anyhow::ensure!(
+            spec.context_window
+                .is_none_or(|w| w >= MIN_MODEL_CONTEXT_WINDOW),
+            "[[model]] {id}: `context_window` must be at least {MIN_MODEL_CONTEXT_WINDOW}"
+        );
         for (knob, value) in [
             ("act_max_tokens", spec.act_max_tokens),
             ("phase_max_tokens", spec.phase_max_tokens),
@@ -118,6 +130,9 @@ pub fn validate(specs: &[ModelSpec]) -> anyhow::Result<()> {
 /// closing phase.
 pub const MIN_MODEL_MAX_TOKENS: u32 = 1024;
 
+/// The least a `[[model]] context_window` may be.
+pub const MIN_MODEL_CONTEXT_WINDOW: u64 = 16_384;
+
 /// A model's own token budgets ([`ModelSpec::act_max_tokens`] and its
 /// siblings), each `None` where `[seed]`'s apply.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -125,6 +140,7 @@ pub struct Budgets {
     pub act: Option<u32>,
     pub phase: Option<u32>,
     pub evolve: Option<u32>,
+    pub context_window: Option<u64>,
 }
 
 impl Budgets {
@@ -151,6 +167,9 @@ impl Budgets {
         }
         if let Some(evolve) = self.evolve {
             config.evolve_max_tokens = evolve;
+        }
+        if let Some(window) = self.context_window {
+            config.context_window = window;
         }
     }
 }
@@ -208,6 +227,7 @@ impl Catalog {
                     act: s.act_max_tokens,
                     phase: s.phase_max_tokens,
                     evolve: s.evolve_max_tokens,
+                    context_window: s.context_window,
                 }),
             });
         }
@@ -376,6 +396,18 @@ pub(crate) mod tests {
             (8192, 12288)
         );
         assert_eq!(config.evolve_max_tokens, 4096, "unset stays the run's");
+        assert_eq!(
+            config.context_window,
+            agora_agentkit::reactor::seed::DEFAULT_CONTEXT_WINDOW,
+            "unset stays the run's"
+        );
+        let wide = Budgets {
+            context_window: Some(192_000),
+            ..Default::default()
+        };
+        wide.apply(&mut config);
+        assert_eq!(config.context_window, 192_000);
+        assert!(validate(&specs("[[model]]\nid = \"a\"\ncontext_window = 1000\n")).is_err());
         // A run's thinking budget at or over the model's act budget keeps
         // the run's act budget.
         let mut config = agora_agentkit::reactor::seed::SeedConfig {
