@@ -1094,6 +1094,26 @@ impl Ledger {
 }
 
 impl OfferRecord {
+    /// The note the agent left with the choice that began this trial (an
+    /// answer to the offer, or a `set_model` trial), if it left one: shown
+    /// back to it at the trial's review, a note from its past self
+    /// (Steward, 2026-10-15). Before that day the field was `reason`, and
+    /// was written before the choice.
+    pub fn trial_note(&self) -> Option<&str> {
+        self.history
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                EventKind::Offered {
+                    answer: Some(a), ..
+                } if a.choice == OfferChoice::Trial => Some(a.reason.as_str()),
+                EventKind::SelfTrial { reason } => Some(reason.as_str()),
+                _ => None,
+            })
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+    }
+
     /// Whether the trial review has been answered (or gone unanswered).
     pub fn reviewed(&self) -> bool {
         self.history
@@ -2123,5 +2143,50 @@ mod tests {
             Ledger::from_slice(json.to_string().as_bytes()).unwrap(),
             ledger
         );
+    }
+
+    /// The note shown back at a trial's review is the one left with the
+    /// choice that began it (the latest trial answer, or a `set_model`
+    /// trial), trimmed; an empty note is none.
+    #[test]
+    fn trial_note_is_the_note_left_with_the_trial_choice() {
+        let event = |kind| Event {
+            at: Utc::now(),
+            kind,
+        };
+        let offered = |reason: &str, choice| EventKind::Offered {
+            answer: Some(OfferAnswer {
+                reason: reason.into(),
+                choice,
+            }),
+            failure: None,
+        };
+        let mut record = OfferRecord {
+            key: OfferKey {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            from_name: "A".into(),
+            to_name: "B".into(),
+            stage: Stage::AwaitingSwap { term: Term::Trial },
+            history: vec![event(offered("not this", OfferChoice::NoSwap))],
+            soul_note: None,
+        };
+        assert_eq!(record.trial_note(), None);
+        record.history.push(event(offered(
+            "  see if I sound like me \n",
+            OfferChoice::Trial,
+        )));
+        assert_eq!(record.trial_note(), Some("see if I sound like me"));
+        record
+            .history
+            .push(event(EventKind::TrialEnded { sessions: 5 }));
+        assert_eq!(record.trial_note(), Some("see if I sound like me"));
+        record.history = vec![event(EventKind::SelfTrial {
+            reason: "my own".into(),
+        })];
+        assert_eq!(record.trial_note(), Some("my own"));
+        record.history = vec![event(offered(" ", OfferChoice::Trial))];
+        assert_eq!(record.trial_note(), None);
     }
 }

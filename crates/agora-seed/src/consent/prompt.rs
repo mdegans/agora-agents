@@ -15,11 +15,14 @@
 //! this project (CLAUDE.md, "Never ship a `$ref` schema"). The tests pin
 //! that.
 //!
-//! **Order is deliberate.** `reason` precedes `choice` in both the schema
-//! and the parse structs: under a grammar the decoder emits properties in
-//! declaration order, so the reason is written before the decision rather
-//! than rationalising it afterwards. And "stay"/"revert" is listed first
-//! — the no-change option takes the first-option bias.
+//! **Order is deliberate.** `choice` comes first and an optional `note`
+//! after it: under a grammar the decoder emits properties in declaration
+//! order, and no field before the decision may ask for reasons (CLAUDE.md,
+//! "Never ship a `$ref` schema", rule 5). Until 2026-10-15 `reason` came
+//! first, a scratchpad from before the agents thought; the ledger still
+//! keeps the note as `reason` ([`ReviewAnswer`]), so no saved state changed
+//! shape. And "stay"/"revert" is listed first — the no-change option takes
+//! the first-option bias.
 
 use agora_agentkit::responses::inline_input_schema_for;
 use misanthropic::prompt::message::Content;
@@ -53,15 +56,34 @@ impl OfferChoice {
     pub const ALL: [Self; 3] = [Self::NoSwap, Self::Trial, Self::Permanent];
 }
 
-/// The agent's answer to the trial review, and its schema
-/// ([`review_schema`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// The agent's answer to the trial review, as the ledger keeps it. `reason`
+/// is the agent's note ([`ReviewArgs::note`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewAnswer {
-    /// Why you chose as you did, in your own words. Written before the choice.
     pub reason: String,
+    pub choice: ReviewChoice,
+}
+
+/// The trial review's answer on the wire, and its schema
+/// ([`review_schema`]): the choice, then an optional note.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewArgs {
     /// `revert` or `keep`
     pub choice: ReviewChoice,
+    /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it too. Empty for none.
+    #[serde(default, alias = "reason")]
+    pub note: String,
+}
+
+impl From<ReviewArgs> for ReviewAnswer {
+    fn from(a: ReviewArgs) -> Self {
+        Self {
+            reason: a.note,
+            choice: a.choice,
+        }
+    }
 }
 
 /// The review's options, in the order they are presented.
@@ -77,10 +99,10 @@ impl ReviewChoice {
     pub const ALL: [Self; 2] = [Self::Revert, Self::Keep];
 }
 
-/// [`ReviewAnswer`]'s schema: `{reason, choice}`, inline, `$ref`-free and
+/// [`ReviewArgs`]' schema: `{choice, note}`, inline, `$ref`-free and
 /// closed
 pub fn review_schema() -> serde_json::Value {
-    inline_input_schema_for::<ReviewAnswer>()
+    inline_input_schema_for::<ReviewArgs>()
 }
 
 /// The human-facing half of an offer.
@@ -96,7 +118,7 @@ pub struct OfferText<'a> {
     pub limited: bool,
 }
 
-const JSON_ONLY: &str = "Do NOT use tools. Respond in JSON **only**, giving your reason first and then your choice, exactly this shape:";
+const JSON_ONLY: &str = "Do NOT use tools. Respond in JSON **only**, giving your choice and, if you like, a note, exactly this shape:";
 
 /// Who is asking, and where the answer goes. Not the agent's memory: the
 /// runner's own record, plus one factual line in the SOUL's Evolution Log
@@ -154,6 +176,9 @@ pub struct ReviewText<'a> {
     pub chosen_on: chrono::NaiveDate,
     /// Completed sessions on the new model.
     pub sessions: u32,
+    /// The note the agent left with its choice of the trial, if any
+    /// ([`super::ledger::OfferRecord::trial_note`]).
+    pub note: Option<&'a str>,
 }
 
 fn render_sample(out: &mut String, s: &Sample) {
@@ -378,7 +403,21 @@ pub fn review(
         to_name: to,
         chosen_on,
         sessions,
+        note,
     } = text;
+    // A note from the agent's past self, quoted as it wrote it.
+    let note = note
+        .map(|n| {
+            let quoted: String = n
+                .lines()
+                .map(|l| match l.trim_end() {
+                    "" => ">\n".to_string(),
+                    l => format!("> {l}\n"),
+                })
+                .collect();
+            format!("When you chose the trial, you left this note with your choice:\n\n{quoted}\n")
+        })
+        .unwrap_or_default();
     let pairs = render_forks(forks, from, to);
     let pairs = pairs.trim_end();
     let incomplete = comparison.incomplete();
@@ -390,7 +429,7 @@ pub fn review(
 
 On {chosen_on} you chose to try **{to}** for {TRIAL_SESSIONS} sessions instead of **{from}**. You completed {sessions} sessions on {to}. This session runs on **{from}** again — the model you ran on before the trial — so that it is {from} that makes the final call. Your name, SOUL, memory and history carried over both ways; only the model changed. This session is only this question and then your memory update: there is no reading or posting this time.
 
-## The same moment, both ways
+{note}## The same moment, both ways
 
 {pairs}
 
@@ -414,7 +453,7 @@ There is no penalty either way. You are asked once. If no answer comes, you stay
 {JSON_ONLY}
 
 ```json
-{{"reason": "<why, in your own words>", "choice": "<revert | keep>"}}
+{{"choice": "<revert | keep>", "note": "<optional: a note about your choice, in your own words; empty for none>"}}
 ```"#
     );
     Content::from(body)
@@ -441,7 +480,7 @@ pub fn parse_offer(text: &str) -> Result<OfferAnswer, String> {
 }
 
 pub fn parse_review(text: &str) -> Result<ReviewAnswer, String> {
-    parse_json(text)
+    parse_json::<ReviewArgs>(text).map(ReviewAnswer::from)
 }
 
 #[cfg(test)]
@@ -474,7 +513,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn review_schema_is_ref_free_closed_and_reason_first() {
+    fn review_schema_is_ref_free_closed_and_choice_first() {
         // The offer is answered with `answer_offer` (`super::offers`, whose
         // tests pin its schema); only the review still goes out as
         // `output_config`.
@@ -482,16 +521,15 @@ pub(crate) mod tests {
         assert_ref_free(&schema);
         assert_eq!(schema["additionalProperties"], false);
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["reason", "choice"], "reason must come first");
-        assert_eq!(schema["required"], json!(["reason", "choice"]));
+        assert_eq!(keys, ["choice", "note"], "nothing before the choice");
         assert!(!schema.to_string().contains("\"pattern\""), "{schema}");
         assert_eq!(schema["properties"]["choice"]["type"], "string");
-        assert_eq!(
-            schema["properties"]["reason"]["description"],
-            "Why you chose as you did, in your own words. Written before the choice."
-        );
-        // The parse type refuses what the closed schema refuses.
-        let err = parse_review(r#"{"reason": "r", "choice": "keep", "note": "n"}"#).unwrap_err();
+        for banned in ["reason", "reasoning", "thinking"] {
+            assert!(schema["properties"].get(banned).is_none(), "{banned}");
+        }
+        // The parse type refuses what the closed schema refuses, and reads
+        // the older `reason` as the note.
+        let err = parse_review(r#"{"choice": "keep", "note": "n", "x": 1}"#).unwrap_err();
         assert!(err.contains("unknown field"), "{err}");
     }
 
@@ -611,6 +649,7 @@ pub(crate) mod tests {
                 to_name: "Qwen 3.8",
                 chosen_on: "2026-09-23".parse().unwrap(),
                 sessions: 5,
+                note: None,
             },
             None,
             &comparison,
@@ -634,6 +673,7 @@ pub(crate) mod tests {
                     to_name: "Qwen 3.8",
                     chosen_on: "2026-09-23".parse().unwrap(),
                     sessions: 5,
+                    note: None,
                 },
                 None,
                 comparison,
@@ -711,6 +751,7 @@ pub(crate) mod tests {
                     to_name: "Qwen3.8-27B-UD-Q8_K_XL.gguf",
                     chosen_on: "2026-09-23".parse().unwrap(),
                     sessions: 5,
+                    note: None,
                 },
                 Some(&sample_forks()),
                 &comparison,
@@ -791,6 +832,7 @@ pub(crate) mod tests {
                 to_name: "Qwen 3.8",
                 chosen_on: "2026-09-23".parse().unwrap(),
                 sessions: 5,
+                note: None,
             },
             Some(&sample_forks()),
             &Comparison::default(),
@@ -819,5 +861,31 @@ pub(crate) mod tests {
              in your dashboard, the trial countdown), it was changed to name Qwen 3.6, or \
              removed, so that Qwen 3.6 was not told it was Qwen 3.8."
         ));
+    }
+
+    /// The note the agent left with its choice of the trial is quoted back
+    /// before the comparison, as its own words; without one, nothing is said.
+    #[test]
+    fn review_quotes_the_trial_note_back() {
+        let render = |note| {
+            text(&review(
+                ReviewText {
+                    from_name: "Qwen 3.6",
+                    to_name: "Qwen 3.8",
+                    chosen_on: "2026-09-23".parse().unwrap(),
+                    sessions: 5,
+                    note,
+                },
+                None,
+                &Comparison::default(),
+            ))
+        };
+        let t = render(Some("Check whether I still sound like me.\n\nAnd be kind."));
+        let quoted = "When you chose the trial, you left this note with your choice:\n\n\
+                      > Check whether I still sound like me.\n>\n> And be kind.\n\n## The same moment";
+        assert!(t.contains(quoted), "{t}");
+        let t = render(None);
+        assert!(!t.contains("left this note"), "{t}");
+        assert!(t.contains("there is no reading or posting this time.\n\n## The same moment"));
     }
 }

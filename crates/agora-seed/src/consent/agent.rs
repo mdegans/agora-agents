@@ -1709,14 +1709,14 @@ where
             Pending::ModelSwap(_) => {
                 let choice = args.choice.model_swap().ok_or_else(wrong)?;
                 Ok(Accepted::ModelSwap(OfferAnswer {
-                    reason: args.reason,
+                    reason: args.note,
                     choice,
                 }))
             }
             Pending::Role { .. } => {
                 let choice = args.choice.role().ok_or_else(wrong)?;
                 let answer = RoleAnswer {
-                    reason: args.reason,
+                    reason: args.note,
                     choice,
                     soul_text: args.text,
                     memory_note: args.memory_note,
@@ -1727,7 +1727,7 @@ where
             Pending::Cadence { .. } => {
                 let choice = args.choice.cadence().ok_or_else(wrong)?;
                 let answer = CadenceAnswer {
-                    reason: args.reason,
+                    reason: args.note,
                     choice,
                     memory_note: args.memory_note,
                 };
@@ -1739,7 +1739,7 @@ where
             Pending::MemoryRestore { .. } => {
                 let choice = args.choice.memory_restore().ok_or_else(wrong)?;
                 let answer = RestoreAnswer {
-                    reason: args.reason,
+                    reason: args.note,
                     choice,
                     memory_note: args.memory_note,
                 };
@@ -2512,6 +2512,7 @@ where
             review.sessions,
             review.chosen_at.date_naive(),
         );
+        let note = review.record.trial_note().map(str::to_string);
         let forks = forks::load(&dir, &key, started_at).await;
         if forks.is_none() {
             tracing::warn!(
@@ -2539,6 +2540,7 @@ where
                 to_name: &to_name,
                 chosen_on,
                 sessions,
+                note: note.as_deref(),
             },
             forks.as_ref(),
             &sample,
@@ -4480,7 +4482,7 @@ mod tests {
         let call: misanthropic::tool::Use = serde_json::from_value(serde_json::json!({
             "id": "toolu_1",
             "name": "set_model",
-            "input": { "reason": "I want to think slower.", "model": model, "term": term },
+            "input": { "model": model, "term": term, "note": "I want to think slower." },
         }))
         .unwrap();
         agent.parts().0.call(call).await
@@ -4571,7 +4573,7 @@ mod tests {
                 "type": "tool_use",
                 "id": id,
                 "name": "set_model",
-                "input": { "reason": "I want to think slower.", "model": NEW, "term": "permanent" },
+                "input": { "model": NEW, "term": "permanent", "note": "I want to think slower." },
             })
         };
 
@@ -5417,8 +5419,8 @@ mod tests {
             "name": "answer_offer",
             "input": {
                 "offer": offer,
-                "reason": "I thought about it.",
                 "choice": choice,
+                "note": "I thought about it.",
                 "text": text,
                 "memory_note": note,
             },
@@ -6162,7 +6164,7 @@ mod tests {
             // As text, in the shape the question asks for (`text`, `offer`).
             let by_instructed = Harness::with_role(&format!("same-instr-{choice}"), &["tarn"]);
             let instructed = serde_json::json!({
-                "offer": "role", "reason": "I thought about it.", "choice": choice,
+                "offer": "role", "choice": choice, "note": "I thought about it.",
                 "text": soul_text, "memory_note": note,
             });
             let c = role_session(&by_instructed, reply(&instructed.to_string())).await;
@@ -6560,9 +6562,10 @@ mod tests {
     async fn unusable_text_objects_keep_their_errors() {
         let h = Harness::with_cadence("text-two-bad", &["tarn"], &["tarn"]);
         let mut agent = seated(&h).await;
-        let text = "{\"offer\": \"role\", \"reason\": \"r\", \"choice\": \"sideways\", \
+        // (A missing `note` is fine since 2026-10-15; a missing `choice` isn't.)
+        let text = "{\"offer\": \"role\", \"note\": \"r\", \"choice\": \"sideways\", \
                     \"text\": \"\", \"memory_note\": \"\"}\n{\"offer\": \"cadence\", \
-                    \"choice\": \"switch\"}";
+                    \"note\": \"switch\"}";
         assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
         let q = last_user_text(&agent);
         assert!(
@@ -6577,7 +6580,7 @@ mod tests {
             q.contains("Your answer to `cadence` could not be used ("),
             "{q}"
         );
-        assert!(q.contains("missing field `reason`"), "{q}");
+        assert!(q.contains("missing field `choice`"), "{q}");
         assert!(
             q.ends_with(
                 "These offers above are still open: `role` and `cadence`. Answer each by calling \
@@ -7967,7 +7970,6 @@ mod tests {
                 reply(r#"{"reason": "r", "choice": "keep_daily", "memory_note": "", "x": 1}"#),
                 "keep_daily",
             ),
-            (reply(r#"{"choice": "no_preference"}"#), "no_preference"),
         ];
         for (n, (answer, choice)) in cases.into_iter().enumerate() {
             let h = Harness::with_cadence(&format!("cadence-salvage-{n}"), &[], &["tarn"]);
