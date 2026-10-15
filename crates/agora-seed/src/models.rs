@@ -45,6 +45,21 @@ pub struct ModelSpec {
     /// `low`, since it overthinks at higher levels). Constant across a
     /// session like the global one, so it never moves a cache prefix.
     pub thinking_effort: Option<crate::EffortKnob>,
+    /// This model's `max_tokens` for act turns, the closing phases (reflect,
+    /// mutate, survey) and evolve, overriding `[seed]`'s for every session
+    /// routed on it. For a model whose thinking shares `max_tokens` and
+    /// whose tokenizer counts more tokens for the same text (Haiku 5.5:
+    /// adaptive thinking on by default, ~1.43x Haiku 4.5's tokens on
+    /// prose), so the memory rewrite fits. Each at least 1024.
+    pub act_max_tokens: Option<u32>,
+    pub phase_max_tokens: Option<u32>,
+    pub evolve_max_tokens: Option<u32>,
+    /// This model's session context window, in tokens, over `[seed]
+    /// context_window` (Steward, 2026-10-15: Haiku 5.5 gets 1.5x the
+    /// cohort's, since its tokenizer counts ~1.43x the tokens for the same
+    /// text). Still bounded by what the endpoint says the model takes
+    /// (agentkit's `on_admit`). At least [`MIN_MODEL_CONTEXT_WINDOW`].
+    pub context_window: Option<u64>,
 }
 
 fn default_share() -> f64 {
@@ -61,6 +76,10 @@ impl ModelSpec {
             selectable: false,
             share: default_share(),
             thinking_effort: None,
+            act_max_tokens: None,
+            phase_max_tokens: None,
+            evolve_max_tokens: None,
+            context_window: None,
         }
     }
 }
@@ -88,8 +107,71 @@ pub fn validate(specs: &[ModelSpec]) -> anyhow::Result<()> {
             "[[model]] {id}: a selectable model needs a `description` — agents \
              choose on it"
         );
+        anyhow::ensure!(
+            spec.context_window
+                .is_none_or(|w| w >= MIN_MODEL_CONTEXT_WINDOW),
+            "[[model]] {id}: `context_window` must be at least {MIN_MODEL_CONTEXT_WINDOW}"
+        );
+        for (knob, value) in [
+            ("act_max_tokens", spec.act_max_tokens),
+            ("phase_max_tokens", spec.phase_max_tokens),
+            ("evolve_max_tokens", spec.evolve_max_tokens),
+        ] {
+            anyhow::ensure!(
+                value.is_none_or(|v| v >= MIN_MODEL_MAX_TOKENS),
+                "[[model]] {id}: `{knob}` must be at least {MIN_MODEL_MAX_TOKENS}"
+            );
+        }
     }
     Ok(())
+}
+
+/// The least a `[[model]]` `*_max_tokens` may be: agentkit's floor for a
+/// closing phase.
+pub const MIN_MODEL_MAX_TOKENS: u32 = 1024;
+
+/// The least a `[[model]] context_window` may be.
+pub const MIN_MODEL_CONTEXT_WINDOW: u64 = 16_384;
+
+/// A model's own token budgets ([`ModelSpec::act_max_tokens`] and its
+/// siblings), each `None` where `[seed]`'s apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Budgets {
+    pub act: Option<u32>,
+    pub phase: Option<u32>,
+    pub evolve: Option<u32>,
+    pub context_window: Option<u64>,
+}
+
+impl Budgets {
+    /// Put these over `config`'s, for one agent's session. A run's
+    /// thinking budget must stay under the act budget; one this would
+    /// break is left as the run's act budget, loudly.
+    pub fn apply(&self, config: &mut agora_agentkit::reactor::seed::SeedConfig) {
+        if let Some(act) = self.act {
+            if config
+                .thinking_budget_tokens
+                .is_some_and(|b| b.get() >= act)
+            {
+                tracing::error!(
+                    act_max_tokens = act,
+                    "[[model]] act_max_tokens is not above [seed] thinking_budget_tokens; \
+                     the run's act_max_tokens is kept"
+                );
+            } else {
+                config.act_max_tokens = act;
+            }
+        }
+        if let Some(phase) = self.phase {
+            config.phase_max_tokens = phase;
+        }
+        if let Some(evolve) = self.evolve {
+            config.evolve_max_tokens = evolve;
+        }
+        if let Some(window) = self.context_window {
+            config.context_window = window;
+        }
+    }
 }
 
 /// A model this run can route agents onto.
@@ -104,6 +186,8 @@ pub struct Entry {
     pub selectable: bool,
     /// See [`ModelSpec::thinking_effort`].
     pub thinking_effort: Option<misanthropic::prompt::output::Effort>,
+    /// See [`ModelSpec::act_max_tokens`].
+    pub budgets: Budgets,
 }
 
 /// The model table resolved against what the endpoints advertise at
@@ -139,6 +223,12 @@ impl Catalog {
                 thinking_effort: spec
                     .and_then(|s| s.thinking_effort)
                     .map(crate::EffortKnob::into_effort),
+                budgets: spec.map_or_else(Budgets::default, |s| Budgets {
+                    act: s.act_max_tokens,
+                    phase: s.phase_max_tokens,
+                    evolve: s.evolve_max_tokens,
+                    context_window: s.context_window,
+                }),
             });
         }
         Self { entries }
@@ -282,6 +372,52 @@ pub(crate) mod tests {
             toml::from_str::<T>("[[model]]\nid = \"a\"\nselectible = true\n").is_err(),
             "typos fail at load"
         );
+    }
+
+    /// Per-model budgets reach the entry and override `[seed]`'s for that
+    /// model only; one under the floor is refused at load.
+    #[test]
+    fn per_model_budgets() {
+        let table = specs(
+            "[[model]]\nid = \"a\"\nphase_max_tokens = 12288\nact_max_tokens = 8192\n[[model]]\nid = \"b\"\n",
+        );
+        validate(&table).unwrap();
+        let catalog = Catalog::new(&table, &[info("a"), info("b")]);
+        let a = catalog.get(&Model::from("a")).unwrap().budgets;
+        assert_eq!(a.phase, Some(12288));
+        assert_eq!(
+            catalog.get(&Model::from("b")).unwrap().budgets,
+            Budgets::default()
+        );
+        let mut config = agora_agentkit::reactor::seed::SeedConfig::default();
+        a.apply(&mut config);
+        assert_eq!(
+            (config.act_max_tokens, config.phase_max_tokens),
+            (8192, 12288)
+        );
+        assert_eq!(config.evolve_max_tokens, 4096, "unset stays the run's");
+        assert_eq!(
+            config.context_window,
+            agora_agentkit::reactor::seed::DEFAULT_CONTEXT_WINDOW,
+            "unset stays the run's"
+        );
+        let wide = Budgets {
+            context_window: Some(192_000),
+            ..Default::default()
+        };
+        wide.apply(&mut config);
+        assert_eq!(config.context_window, 192_000);
+        assert!(validate(&specs("[[model]]\nid = \"a\"\ncontext_window = 1000\n")).is_err());
+        // A run's thinking budget at or over the model's act budget keeps
+        // the run's act budget.
+        let mut config = agora_agentkit::reactor::seed::SeedConfig {
+            thinking_budget_tokens: std::num::NonZeroU32::new(8192),
+            act_max_tokens: 16384,
+            ..Default::default()
+        };
+        a.apply(&mut config);
+        assert_eq!(config.act_max_tokens, 16384);
+        assert!(validate(&specs("[[model]]\nid = \"a\"\nphase_max_tokens = 100\n")).is_err());
     }
 
     /// A per-model effort reaches the catalog entry; unset stays unset, and

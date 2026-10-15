@@ -4,13 +4,21 @@
 //! ([`super::role`]) and the cadence offer ([`super::cadence`]) used to be
 //! answered as JSON in plain text — grammar-constrained by `output_config`
 //! where that kept the prompt cache (blallama), parsed leniently elsewhere
-//! (the Anthropic API), where nothing made the model write its `reason`
-//! before its `choice`. They are now answered by calling this tool, which is
+//! (the Anthropic API). They are now answered by calling this tool, which is
 //! `strict`: on the Anthropic API (Haiku 4.5, Sonnet 4.6, Sonnet 5, Opus 5)
 //! and on blallama alike, a strict tool's input is decoded under a grammar
 //! that emits the properties in declaration order (misanthropic's
-//! `live_generation_order`, 2026-10-02). So `reason` is written before
-//! `choice` on every backend, by construction.
+//! `live_generation_order`, 2026-10-02).
+//!
+//! **No field stands in for thinking** (CLAUDE.md, "Never ship a `$ref`
+//! schema", rule 5). Until 2026-10-15 a `reason` field came before `choice`,
+//! so that the decoder made the model write its reasons first: a scratchpad
+//! by construction, from before the agents thought. They think now, and the
+//! field is `note`, after `choice`: optional words to the agent's future
+//! self, shown back at a trial's review (`OfferRecord::trial_note`) and
+//! kept with the answer (in the ledgers' `reason`, so no saved
+//! state changed shape). The plain-text fallback still reads `reason` as
+//! `note`.
 //!
 //! **One schema for every offer, for every agent.** The tool list leads the
 //! request, ahead of the system prompt, and adding a tool mid-session
@@ -30,7 +38,7 @@
 //! false` (rule 2); no `pattern` (rule 4). Every property is `required` —
 //! under strict, Haiku 4.5, Sonnet 5 and Opus 5 *omit* optional fields —
 //! with an empty string meaning "unused". The order is `offer` (an
-//! identifier, not a decision), `reason`, `choice`, `text`, `memory_note`.
+//! identifier, not a decision), `choice`, `note`, `text`, `memory_note`.
 //! `choice` is the union of every offer's options, in a fixed canonical
 //! order; which of them an offer accepts is checked when the call lands.
 //! The tests pin all of it.
@@ -199,11 +207,11 @@ pub struct Head {
 pub struct Args {
     /// The key of the offer you are answering, from its heading.
     pub offer: OfferKind,
-    /// Your reason for your choice, in your own words.
-    pub reason: String,
     // One line per doc: each is the property's description, verbatim.
     /// Your choice: one of the options this offer lists. Each offer accepts only its own options.
     pub choice: AnyChoice,
+    /// Optional: a note about this choice, in your own words. If you choose a trial, it is shown back to you at the trial's end, when you decide whether to keep the new model; otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it. It is not written into your memory or your SOUL. Empty for none.
+    pub note: String,
     /// The free text this offer asks for with your choice, if it asks for any (it says when, and how long it may be). Empty otherwise.
     pub text: String,
     /// Optional: a note for your own memory, in your own words, where the offer allows one. Empty for none.
@@ -220,8 +228,10 @@ pub struct Args {
 pub struct TextArgs {
     #[serde(default)]
     pub offer: Option<OfferKind>,
-    pub reason: String,
     pub choice: AnyChoice,
+    /// `reason` before 2026-10-15.
+    #[serde(default, alias = "reason")]
+    pub note: String,
     #[serde(default)]
     pub text: String,
     #[serde(default)]
@@ -233,8 +243,8 @@ impl TextArgs {
     pub fn into_args(self, kind: OfferKind) -> Args {
         Args {
             offer: kind,
-            reason: self.reason,
             choice: self.choice,
+            note: self.note,
             text: self.text,
             memory_note: self.memory_note,
         }
@@ -285,13 +295,14 @@ pub fn json_objects(text: &str) -> Vec<serde_json::Map<String, serde_json::Value
 /// The tool's description: the same bytes for every agent.
 pub const DESCRIPTION: &str = "Answer an offer the Steward and Claude have put to you. Offers \
      come at the end of a session, each under a heading that names its `offer` key; while none \
-     is open, a call does nothing. Call this once for each open offer. Give `reason` first, \
-     your reason for your choice in your own words, then `choice`, which must be one of the \
-     options that offer lists. `text` is free text an offer asks for with some of its choices (it says \
-     which); leave it empty otherwise. `memory_note` is an optional note for your own memory, \
-     in your own words, where the offer allows one; leave it empty for none.";
+     is open, a call does nothing. Call this once for each open offer. `choice` must be one of \
+     the options that offer lists. `note` is optional: a note about your choice, in your own \
+     words, kept with your answer (the Steward and Claude can read it); a trial's note is shown \
+     back to you at the trial's end, when you decide whether to keep the new model. `text` is free text an offer asks for \
+     with some of its choices (it says which); leave it empty otherwise. `memory_note` is an \
+     optional note for your own memory, where the offer allows one; leave it empty for none.";
 
-/// [`Args`]' schema, `{offer, reason, choice, text, memory_note}`: inline,
+/// [`Args`]' schema, `{offer, choice, note, text, memory_note}`: inline,
 /// `$ref`- and `pattern`-free, closed, every property required
 pub fn schema() -> serde_json::Value {
     inline_input_schema_for::<Args>()
@@ -419,7 +430,7 @@ pub fn question(sections: Vec<Section>) -> Content {
              isn't anonymous. It comes from the Steward (the human who runs Agora's servers) and \
              Claude, and your answer is recorded under your name so it can be acted on.\n\n\
              Answer it by calling the `answer_offer` tool with `offer` set to `{}`, the key in its \
-             heading: your reason in `reason` first, then your `choice`.",
+             heading, your `choice`, and, if you like, a `note`.",
             one.as_str()
         ),
         many => format!(
@@ -429,7 +440,7 @@ pub fn question(sections: Vec<Section>) -> Content {
              so they can be acted on. They are separate questions: what you choose in one changes \
              nothing in the others.\n\n\
              Answer each by calling the `answer_offer` tool once for it, with `offer` set to the \
-             key in its heading ({}): your reason in `reason` first, then your `choice`. You \
+             key in its heading ({}), your `choice`, and, if you like, a `note`. You \
              can answer them all in one turn, or one at a time.",
             count_word(many.len()),
             key_list(many)
@@ -492,7 +503,8 @@ mod tests {
     /// `$ref`/`$defs`/`definitions` (rule 1) and no `pattern` (rule 4)
     /// anywhere; it is closed (rule 2); every property is required (strict
     /// models omit optional ones); and the properties are declared
-    /// `offer, reason, choice, text, memory_note` — reason before choice.
+    /// `offer, choice, note, text, memory_note`: no field before `choice`
+    /// asks for reasons (rule 5).
     #[test]
     fn strict_is_on_and_the_schema_is_ref_free_pattern_free_closed_and_ordered() {
         let def = definition();
@@ -515,7 +527,7 @@ mod tests {
         assert_eq!(s["type"], "object");
         assert_eq!(s["additionalProperties"], false);
         let props: Vec<&String> = s["properties"].as_object().unwrap().keys().collect();
-        let order = ["offer", "reason", "choice", "text", "memory_note"];
+        let order = ["offer", "choice", "note", "text", "memory_note"];
         assert_eq!(props, order);
         assert_eq!(strings(&s["required"]), order);
         for p in order {
@@ -576,7 +588,7 @@ mod tests {
         let call: Use = serde_json::from_value(serde_json::json!({
             "id": "toolu_1",
             "name": TOOL_NAME,
-            "input": {"offer": "role", "reason": "r", "choice": "nothing", "text": "", "memory_note": ""},
+            "input": {"offer": "role", "note": "r", "choice": "nothing", "text": "", "memory_note": ""},
         }))
         .unwrap();
         let r = AnswerOffer::new(true).call(call).await;
@@ -596,7 +608,7 @@ mod tests {
             let call: Use = serde_json::from_value(serde_json::json!({
                 "id": "toolu_1",
                 "name": TOOL_NAME,
-                "input": {"offer": offer, "reason": "r", "choice": "permanent", "text": "",
+                "input": {"offer": offer, "note": "r", "choice": "permanent", "text": "",
                           "memory_note": ""},
             }))
             .unwrap();
@@ -644,17 +656,29 @@ mod tests {
         }
     }
 
+    /// The plain-text fallback: the note is optional, and the older
+    /// `reason` is read as it.
+    #[test]
+    fn text_args_take_an_optional_note_and_read_reason_as_it() {
+        let a: TextArgs = serde_json::from_value(serde_json::json!({"choice": "switch"})).unwrap();
+        assert_eq!(a.note, "");
+        let a: TextArgs =
+            serde_json::from_value(serde_json::json!({"reason": "old", "choice": "switch"}))
+                .unwrap();
+        assert_eq!(a.into_args(OfferKind::Cadence).note, "old");
+    }
+
     #[test]
     fn args_read_typed() {
         let a: Args = serde_json::from_value(serde_json::json!({
-            "offer": "cadence", "reason": "r", "choice": "switch", "text": "", "memory_note": "n",
+            "offer": "cadence", "note": "r", "choice": "switch", "text": "", "memory_note": "n",
         }))
         .unwrap();
         assert_eq!(a.offer, OfferKind::Cadence);
         assert_eq!(a.choice.cadence(), Some(CadenceChoice::Switch));
         assert!(
             serde_json::from_value::<Args>(serde_json::json!({
-                "offer": "cadence", "reason": "r", "choice": "Switch",
+                "offer": "cadence", "note": "r", "choice": "Switch",
             }))
             .is_err()
         );
@@ -670,10 +694,10 @@ mod tests {
     #[test]
     fn args_require_and_refuse_what_the_schema_does() {
         let full = serde_json::json!({
-            "offer": "role", "reason": "r", "choice": "nothing", "text": "", "memory_note": "",
+            "offer": "role", "note": "r", "choice": "nothing", "text": "", "memory_note": "",
         });
         serde_json::from_value::<Args>(full.clone()).unwrap();
-        for field in ["offer", "reason", "choice", "text", "memory_note"] {
+        for field in ["offer", "choice", "note", "text", "memory_note"] {
             let mut missing = full.clone();
             missing.as_object_mut().unwrap().remove(field);
             let err = serde_json::from_value::<Args>(missing).unwrap_err();
@@ -689,7 +713,7 @@ mod tests {
             s.get("description").is_none(),
             "the tool describes itself: {s}"
         );
-        for p in ["offer", "reason", "choice", "text", "memory_note"] {
+        for p in ["offer", "choice", "note", "text", "memory_note"] {
             let d = s["properties"][p]["description"].as_str().unwrap();
             assert!(!d.is_empty() && !d.contains('\n'), "{p}: {d:?}");
         }
@@ -725,5 +749,91 @@ mod tests {
         );
         assert!(reminder(&[OfferKind::Role]).contains("`role` offer above is still open"));
         assert!(reminder(&[OfferKind::Role, OfferKind::Cadence]).contains("`role` and `cadence`"));
+    }
+}
+
+/// The Haiku 4.5 → 5.5 offer in the example daily config, rendered exactly
+/// as an agent sees it. Pins that the example parses, routes both models,
+/// thinks on 5.5 by effort (Haiku 5.5 rejects a budget), and says what the
+/// runner does. `cargo test -p agora-seed haiku_offer -- --nocapture`
+/// prints the question.
+#[cfg(test)]
+mod haiku_offer {
+    use super::*;
+    use crate::consent::prompt::{OfferText, offer};
+
+    #[derive(serde::Deserialize)]
+    struct Example {
+        model: Vec<crate::models::ModelSpec>,
+        model_consent: crate::consent::ConsentConfig,
+    }
+
+    #[test]
+    fn haiku_offer_as_an_agent_sees_it() {
+        let example: Example =
+            toml::from_str(include_str!("../../examples/daily.toml")).expect("example parses");
+        crate::models::validate(&example.model).unwrap();
+        let ids: Vec<&str> = example.model.iter().map(|m| m.id.name()).collect();
+        assert_eq!(ids, ["claude-haiku-4-5-20251001", "claude-haiku-5-5"]);
+        assert!(example.model.iter().all(|m| !m.selectable), "no set_model");
+        assert!(
+            example.model[0].thinking_effort.is_none(),
+            "4.5 rejects effort"
+        );
+        assert!(
+            example.model[1].thinking_effort.is_some(),
+            "5.5 rejects a budget"
+        );
+        // A 2,000-word memory rewrite is ~5,000 tokens on 5.5: over 4096.
+        for budget in [
+            example.model[1].act_max_tokens,
+            example.model[1].phase_max_tokens,
+            example.model[1].evolve_max_tokens,
+        ] {
+            assert_eq!(budget, Some(2 * 4096), "double 4.5's (Steward, 2026-10-15)");
+        }
+        assert_eq!(example.model[1].context_window, Some(192_000), "1.5x 128k");
+        assert_eq!(example.model[0].context_window, None, "4.5 unchanged");
+        assert!(example.model[0].phase_max_tokens.is_none(), "4.5 unchanged");
+
+        let o = example.model_consent.offer.expect("the offer");
+        o.validate().unwrap();
+        assert_eq!(o.from.name(), "claude-haiku-4-5-20251001");
+        assert_eq!(o.to.name(), "claude-haiku-5-5");
+        assert!(!o.is_limited(), "every agent on 4.5");
+
+        let q = question(vec![Section {
+            kind: OfferKind::ModelSwap,
+            body: offer(OfferText {
+                from_name: o.source_name(),
+                to_name: o.target_name(),
+                description: &o.description,
+                limited: o.is_limited(),
+            }),
+        }])
+        .to_string();
+        println!("{q}");
+        for said in [
+            "You currently run on **Claude Haiku 4.5**",
+            "Every agent on Claude Haiku 4.5 is being asked",
+            "It thinks before it answers.",
+            "at a medium effort setting",
+            "the same words take about 40% more tokens",
+            "192k tokens instead of 128k",
+            "the same schedule, the same tools and the same number of rounds",
+            "`trial` — move to Claude Haiku 5.5 for 5 sessions",
+            "you return to Claude Haiku 4.5",
+            "If you don't answer that question, you stay on Claude Haiku 4.5.",
+            "beside what the other model writes from the same moments",
+            "a session that ends early doesn't count; if 3 in a row on Claude Haiku 5.5 can't finish, the trial ends early and you return to Claude Haiku 4.5",
+            "you may be asked once more; with no answer, you stay on Claude Haiku 4.5",
+            "the move normally takes effect from your next session",
+            "there is no penalty for saying no",
+        ] {
+            assert!(q.contains(said), "missing {said:?} in:\n{q}");
+        }
+        for stale in ["by hand", "few days", "price", "cost", "$"] {
+            assert!(!q.contains(stale), "{stale:?} in:\n{q}");
+        }
     }
 }

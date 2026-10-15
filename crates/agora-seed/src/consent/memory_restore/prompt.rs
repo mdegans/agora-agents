@@ -25,7 +25,9 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 /// Bump whenever [`offer`]'s wording changes. Recorded with every answer.
 ///
 /// - v1 (2026-10-12): first text.
-pub const OFFER_VERSION: u32 = 1;
+/// - v2 (2026-10-15): v1's wording; the closing question asks for the
+///   choice and an optional `note` after it, no longer a `reason` first.
+pub const OFFER_VERSION: u32 = 2;
 
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

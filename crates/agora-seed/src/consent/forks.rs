@@ -41,8 +41,9 @@ use agora_agentkit::requests::{CreateCommentPayload, CreatePostPayload};
 use chrono::{DateTime, Utc};
 use misanthropic::model::{Model, ModelInfo};
 use misanthropic::prompt::Prompt;
+use misanthropic::prompt::Thinking;
 use misanthropic::prompt::message::{Block, Role};
-use misanthropic::prompt::output::OutputConfig;
+use misanthropic::prompt::output::{Effort, OutputConfig};
 use misanthropic::response::{self, StopReason};
 use misanthropic::tool::MethodDef;
 use serde::{Deserialize, Serialize};
@@ -343,19 +344,63 @@ pub enum Adjustment {
     SetModelDescription,
 }
 
+/// How a session routed on a model thinks, as the runner sends it: the
+/// `[seed]` thinking, overridden by the model's own `[[model]]
+/// thinking_effort` (agentkit's `SeedAgent::new`, then the consent
+/// wrapper's `apply_model_effort`). A fork is generated the way a session
+/// on the forking model would be, not the way the dump's model was: Haiku
+/// 4.5 rejects adaptive thinking and `effort` with a 400, and Haiku 5.5
+/// rejects a fixed budget (measured 2026-10-15, agora
+/// `memory/project_haiku_5_5.md`), so carrying the dump's mode across
+/// would fail every Haiku 5.5 ↔ 4.5 pair.
+#[derive(Debug, Clone, Default)]
+pub struct SessionThinking {
+    pub thinking: Option<Thinking>,
+    pub effort: Option<Effort>,
+    /// The model's own act budget (`[[model]] act_max_tokens`), over the
+    /// run's, since thinking shares it.
+    pub act_max_tokens: Option<u32>,
+}
+
+impl SessionThinking {
+    /// `model_effort` (the model's own) over `effort` (the run's), which is
+    /// over `budget`: the precedence a session gets.
+    pub fn resolve(
+        model_effort: Option<Effort>,
+        effort: Option<Effort>,
+        budget: Option<std::num::NonZeroU32>,
+    ) -> Self {
+        match (model_effort.or(effort), budget) {
+            (Some(effort), _) => Self {
+                thinking: Some(Thinking::adaptive()),
+                effort: Some(effort),
+                act_max_tokens: None,
+            },
+            (None, Some(budget)) => Self {
+                thinking: Some(Thinking::enabled(budget)),
+                effort: None,
+                act_max_tokens: None,
+            },
+            (None, None) => Self::default(),
+        }
+    }
+}
+
 /// Cut `prompt` just before the assistant turn at `turn` and hand it to
 /// `fork`. Everything in it that named the original model as the one the
 /// session runs on is changed ([`Adjustment`]s, returned): the `Model:`
 /// line, the trial countdown, `set_model`'s description. Earlier thinking
-/// is removed, `prompt.model` is `fork`, `max_tokens` is the act budget, and
-/// `output_config` keeps only the session's effort (a dump ends in a phase
-/// turn, whose format must not carry over). The system prompt and every
-/// other tool definition are untouched.
+/// is removed, `prompt.model` is `fork`, `max_tokens` is the act budget,
+/// and thinking and effort are the forking model's session ones
+/// (`thinking`); `output_config` carries nothing else (a dump ends in a
+/// phase turn, whose format must not carry over). The system prompt and
+/// every other tool definition are untouched.
 pub fn fork_prompt(
     mut prompt: Prompt,
     turn: usize,
     fork: &ModelInfo,
     act_max_tokens: u32,
+    thinking: &SessionThinking,
 ) -> Result<(Prompt, Vec<Adjustment>), SurgeryError> {
     if turn == 0
         || prompt.messages.get(turn).map(|m| m.role) != Some(Role::Assistant)
@@ -423,12 +468,10 @@ pub fn fork_prompt(
     }
 
     prompt.model = fork.id.clone();
+    let act_max_tokens = thinking.act_max_tokens.unwrap_or(act_max_tokens);
     prompt.max_tokens = std::num::NonZeroU32::new(act_max_tokens.max(1)).expect("nonzero");
-    prompt.output_config = prompt
-        .output_config
-        .take()
-        .and_then(|c| c.effort)
-        .map(OutputConfig::effort);
+    prompt.thinking = thinking.thinking;
+    prompt.output_config = thinking.effort.clone().map(OutputConfig::effort);
     Ok((prompt, adjusted))
 }
 
@@ -755,6 +798,9 @@ pub struct Endpoints<'a, I> {
     pub clients: &'a [I],
     /// `(index into clients, model)`.
     pub offered: &'a [(usize, ModelInfo)],
+    /// How a session on each model thinks; a model not listed gets no
+    /// thinking field.
+    pub thinking: &'a [(Model, SessionThinking)],
 }
 
 impl<I> Endpoints<'_, I> {
@@ -763,6 +809,14 @@ impl<I> Endpoints<'_, I> {
             .iter()
             .find(|(_, m)| &m.id == model)
             .and_then(|(i, m)| Some((self.clients.get(*i)?, m)))
+    }
+
+    fn thinking(&self, model: &Model) -> SessionThinking {
+        self.thinking
+            .iter()
+            .find(|(m, _)| m == model)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -788,6 +842,7 @@ async fn build(
     sessions: &[Session],
     fork_info: &ModelInfo,
     act_max_tokens: u32,
+    thinking: &SessionThinking,
 ) -> Result<Pending, Box<ForkPair>> {
     let forked_on = job.forked_on(side).clone();
     let written_on = match side {
@@ -824,7 +879,7 @@ async fn build(
         let Some(turn) = find_writes(&prompt).pop() else {
             continue;
         };
-        return match fork_prompt(prompt, turn.message, fork_info, act_max_tokens) {
+        return match fork_prompt(prompt, turn.message, fork_info, act_max_tokens, thinking) {
             Ok((prompt, adjusted)) => Ok(Pending {
                 job: job_index,
                 side,
@@ -925,7 +980,18 @@ pub async fn prepare<I: Inference>(
             let Some((_, fork_info)) = endpoints.find(job.forked_on(side)) else {
                 continue;
             };
-            match build(i, job, side, agent_sessions, fork_info, act_max_tokens).await {
+            let thinking = endpoints.thinking(job.forked_on(side));
+            match build(
+                i,
+                job,
+                side,
+                agent_sessions,
+                fork_info,
+                act_max_tokens,
+                &thinking,
+            )
+            .await
+            {
                 Ok(p) => pending
                     .entry(p.forked_on.name().to_string())
                     .or_default()
@@ -1211,8 +1277,14 @@ mod tests {
     fn surgery_cuts_rewrites_strips_and_swaps() {
         let original = dump(NEW);
         let turn = find_writes(&original).pop().unwrap().message;
-        let (fork, adjusted) =
-            fork_prompt(original.clone(), turn, &info(OLD, "Qwen 3.6 35B"), 8192).unwrap();
+        let (fork, adjusted) = fork_prompt(
+            original.clone(),
+            turn,
+            &info(OLD, "Qwen 3.6 35B"),
+            8192,
+            &medium(),
+        )
+        .unwrap();
         assert_eq!(
             adjusted,
             [
@@ -1235,8 +1307,9 @@ mod tests {
                 .iter()
                 .all(|b| !matches!(b, Block::Thought { .. } | Block::RedactedThought { .. }))
         }));
-        // The rest untouched: system, the other tools, tool choice, thinking
-        // mode, and every non-thinking block after the intro.
+        // The rest untouched: system, the other tools, tool choice, the
+        // thinking mode (the forking model's here is the dump's), and every
+        // non-thinking block after the intro.
         let json = |p: &Prompt, k: &str| serde_json::to_value(p).unwrap()[k].clone();
         for k in ["system", "tool_choice", "thinking"] {
             assert_eq!(json(&fork, k), json(&original, k), "{k}");
@@ -1246,9 +1319,79 @@ mod tests {
             serde_json::to_value(&fork.messages[2]).unwrap(),
             serde_json::to_value(&original.messages[2]).unwrap()
         );
-        // The dump's last phase format does not carry over; the effort does.
+        // The dump's last phase format does not carry over; the forking
+        // model's session effort is what is sent.
         let config = serde_json::to_value(&fork.output_config).unwrap();
         assert_eq!(config, serde_json::json!({"effort": "medium"}));
+    }
+
+    /// How a Qwen session in these tests thinks: adaptive at `medium`.
+    fn medium() -> SessionThinking {
+        SessionThinking::resolve(Some(Effort::Medium), None, None)
+    }
+
+    /// A fork is generated as a session on the forking model would be, not
+    /// as the dump's was. Haiku 4.5 rejects adaptive thinking and `effort`
+    /// (400), Haiku 5.5 rejects a fixed budget (400): carrying the dump's
+    /// mode across would fail both sides of a 4.5 ↔ 5.5 review (measured
+    /// 2026-10-15, agora `memory/project_haiku_5_5.md`).
+    #[test]
+    fn a_fork_thinks_as_the_forking_models_sessions_do() {
+        let turn = find_writes(&dump(NEW)).pop().unwrap().message;
+        // Written on a model that thinks adaptively, forked on one whose
+        // sessions send no thinking (the daily Haiku 4.5 cohort).
+        let (fork, _) = fork_prompt(
+            dump(NEW),
+            turn,
+            &info(OLD, ""),
+            4096,
+            &SessionThinking::resolve(None, None, None),
+        )
+        .unwrap();
+        let value = serde_json::to_value(&fork).unwrap();
+        assert!(value.get("thinking").is_none_or(|t| t.is_null()), "{value}");
+        assert!(
+            value.get("output_config").is_none_or(|c| c.is_null()),
+            "{value}"
+        );
+
+        // The other way: a dump with no thinking, forked on a model whose
+        // `[[model]] thinking_effort` is set.
+        let mut plain = dump(OLD);
+        plain.thinking = None;
+        plain.output_config = None;
+        let turn = find_writes(&plain).pop().unwrap().message;
+        let (fork, _) = fork_prompt(
+            plain,
+            turn,
+            &info(NEW, ""),
+            4096,
+            &SessionThinking::resolve(Some(Effort::Medium), None, None),
+        )
+        .unwrap();
+        let value = serde_json::to_value(&fork).unwrap();
+        assert_eq!(value["thinking"]["type"], "adaptive", "{value}");
+        assert_eq!(
+            value["output_config"],
+            serde_json::json!({"effort": "medium"})
+        );
+    }
+
+    /// The precedence a session gets: the model's effort over the run's,
+    /// either over a budget.
+    #[test]
+    fn session_thinking_precedence() {
+        let budget = std::num::NonZeroU32::new(2048);
+        let t = SessionThinking::resolve(Some(Effort::Low), Some(Effort::High), budget);
+        assert_eq!(t.effort, Some(Effort::Low));
+        assert!(matches!(t.thinking, Some(Thinking::Adaptive { .. })));
+        let t = SessionThinking::resolve(None, Some(Effort::High), budget);
+        assert_eq!(t.effort, Some(Effort::High));
+        let t = SessionThinking::resolve(None, None, budget);
+        assert!(matches!(t.thinking, Some(Thinking::Enabled { .. })));
+        assert_eq!(t.effort, None);
+        let t = SessionThinking::resolve(None, None, None);
+        assert!(t.thinking.is_none() && t.effort.is_none());
     }
 
     /// Nothing in a fork's prompt tells the forking model it runs on the
@@ -1259,7 +1402,8 @@ mod tests {
         for (written, forked, forked_name) in [(NEW, OLD, "Qwen 3.6"), (OLD, NEW, "Qwen 3.8")] {
             let original = dump(written);
             let turn = find_writes(&original).pop().unwrap().message;
-            let (fork, _) = fork_prompt(original, turn, &info(forked, forked_name), 8192).unwrap();
+            let (fork, _) =
+                fork_prompt(original, turn, &info(forked, forked_name), 8192, &medium()).unwrap();
             let all = serde_json::to_string(&fork).unwrap();
             let written_name = if written == NEW {
                 "Qwen 3.8"
@@ -1292,7 +1436,7 @@ mod tests {
     fn surgery_without_a_model_line_says_so() {
         let mut original = dump(NEW);
         original.messages[0] = (Role::User, "Name: tarn\nFeed…").into();
-        let (fork, adjusted) = fork_prompt(original, 3, &info(OLD, ""), 8192).unwrap();
+        let (fork, adjusted) = fork_prompt(original, 3, &info(OLD, ""), 8192, &medium()).unwrap();
         assert_eq!(adjusted, [Adjustment::SetModelDescription]);
         assert_eq!(fork.messages.len(), 3);
     }
@@ -1300,11 +1444,11 @@ mod tests {
     #[test]
     fn surgery_refuses_a_non_assistant_turn() {
         assert_eq!(
-            fork_prompt(dump(NEW), 2, &info(OLD, ""), 8192).unwrap_err(),
+            fork_prompt(dump(NEW), 2, &info(OLD, ""), 8192, &medium()).unwrap_err(),
             SurgeryError::NotAssistantTurn
         );
         assert_eq!(
-            fork_prompt(dump(NEW), 0, &info(OLD, ""), 8192).unwrap_err(),
+            fork_prompt(dump(NEW), 0, &info(OLD, ""), 8192, &medium()).unwrap_err(),
             SurgeryError::NotAssistantTurn
         );
     }
@@ -1636,6 +1780,7 @@ mod tests {
                 Endpoints {
                     clients,
                     offered: &offered,
+                    thinking: &[],
                 },
                 4096,
                 config,
@@ -1877,7 +2022,8 @@ mod tests {
             existing: None,
             sides: vec![Side::Trial],
         };
-        let Err(pair) = build(0, &job, Side::Trial, &[], &info(OLD, ""), 4096).await else {
+        let Err(pair) = build(0, &job, Side::Trial, &[], &info(OLD, ""), 4096, &medium()).await
+        else {
             panic!("no sessions");
         };
         assert!(matches!(
@@ -1905,8 +2051,14 @@ mod tests {
             println!("  turn {} {:?}", w.message, w.id);
         }
         let turn = writes.last().expect("a write").message;
-        let (fork, rewritten) =
-            fork_prompt(prompt.clone(), turn, &info(OLD, "Qwen 3.6"), 8192).unwrap();
+        let (fork, rewritten) = fork_prompt(
+            prompt.clone(),
+            turn,
+            &info(OLD, "Qwen 3.6"),
+            8192,
+            &medium(),
+        )
+        .unwrap();
         let bytes = |p: &Prompt, k: &str| {
             serde_json::to_string(&serde_json::to_value(p).unwrap()[k]).unwrap()
         };

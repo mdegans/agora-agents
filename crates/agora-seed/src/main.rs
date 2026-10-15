@@ -1546,10 +1546,26 @@ async fn run(held: &mut Held) -> Result<()> {
         .log_dir
         .clone()
         .unwrap_or_else(|| data_dir.join("logs"));
-    let act_max_tokens = config
-        .seed
-        .to_config(&data_dir, !args.no_prompt_log)?
-        .act_max_tokens;
+    let fork_seed = config.seed.to_config(&data_dir, !args.no_prompt_log)?;
+    let act_max_tokens = fork_seed.act_max_tokens;
+    // A fork thinks as a session on its model would (see
+    // `consent::forks::SessionThinking`).
+    let fork_thinking: Vec<(Model, consent::forks::SessionThinking)> = offered
+        .iter()
+        .map(|(_, m)| {
+            let spec = specs.iter().find(|s| s.id == m.id);
+            let model_effort = spec
+                .and_then(|s| s.thinking_effort)
+                .map(EffortKnob::into_effort);
+            let mut thinking = consent::forks::SessionThinking::resolve(
+                model_effort,
+                fork_seed.thinking_effort.clone(),
+                fork_seed.thinking_budget_tokens,
+            );
+            thinking.act_max_tokens = spec.and_then(|s| s.act_max_tokens);
+            (m.id.clone(), thinking)
+        })
+        .collect();
     if args.dry_run {
         match consent::forks::jobs(&data_dir.join("state")).await {
             Ok(jobs) if !jobs.is_empty() => say!(
@@ -1572,6 +1588,7 @@ async fn run(held: &mut Held) -> Result<()> {
             consent::forks::Endpoints {
                 clients: &endpoints,
                 offered: &offered,
+                thinking: &fork_thinking,
             },
             act_max_tokens,
             config.review_forks,
@@ -1845,6 +1862,12 @@ async fn run(held: &mut Held) -> Result<()> {
                     "agent runs on its chosen cadence"
                 );
                 agent_context.inner.config.max_rounds = rounds;
+            }
+            // A model's own token budgets (`[[model]] *_max_tokens`).
+            if let Some(entry) = agent_context.consent.catalog.get(&state.model.id)
+                && entry.budgets != models::Budgets::default()
+            {
+                entry.budgets.apply(&mut agent_context.inner.config);
             }
             let name = state.soul.name.clone();
             match agora_agentkit::reactor::Agent::new(id, state, agent_context) {

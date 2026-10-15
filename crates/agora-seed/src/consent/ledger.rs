@@ -30,6 +30,14 @@ pub const FORMAT: u32 = 1;
 /// Sessions on the new model before a trial is reviewed.
 pub const TRIAL_SESSIONS: u32 = 5;
 
+/// Sessions in a row on a trial's new model that may fail to complete
+/// before the trial ends early and the agent goes back (review,
+/// 2026-10-15: only completed sessions count toward a trial, so without
+/// this an agent whose sessions on the new model keep failing would stay
+/// on it indefinitely). Three, so one bad day of API errors on a daily
+/// cohort does not end a trial.
+pub const MAX_FAILED_TRIAL_SESSIONS: u32 = 3;
+
 /// How the countdown line ([`Ledger::trial_line`]) starts. A fork of a
 /// trial session removes the line by it: it names the trial model as the
 /// one the session runs on.
@@ -109,6 +117,21 @@ pub enum SwitchCause {
     Consent { action: ChangeAction },
 }
 
+/// When the answer tools' `reason` (required, before the choice) became an
+/// optional `note` after it: the deploy of agents#259, before the Haiku run
+/// of 2026-10-16. Text stored before this is labelled as a reason.
+pub const NOTE_SINCE: DateTime<Utc> = DateTime::from_timestamp(1_792_108_800, 0).unwrap();
+
+/// What an agent wrote with its choice of a trial, as its review shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialNote<'a> {
+    /// A `reason`, required and written before the choice (before
+    /// [`NOTE_SINCE`]).
+    Reason(&'a str),
+    /// An optional `note`, written after the choice.
+    Note(&'a str),
+}
+
 /// Everything about one offer for one agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OfferRecord {
@@ -154,6 +177,11 @@ pub enum Stage {
         /// nothing counts it now.
         #[serde(default)]
         review_misses: u32,
+        /// Sessions on the new model in a row that did not complete. At
+        /// [`MAX_FAILED_TRIAL_SESSIONS`] the trial ends early and the agent
+        /// goes back ([`Ledger::fail_session`]). Absent in older ledgers.
+        #[serde(default)]
+        failed_in_a_row: u32,
     },
     /// The trial's [`TRIAL_SESSIONS`] are done: the agent is being moved
     /// back to `from`, where the review is asked (Steward, 2026-09-25: the
@@ -236,6 +264,10 @@ pub enum RevertCause {
     /// The trial review went unanswered: the agent agreed to a
     /// [`TRIAL_SESSIONS`]-session trial, not a permanent move.
     NoAnswer,
+    /// [`MAX_FAILED_TRIAL_SESSIONS`] sessions in a row on the new model did
+    /// not complete, so the trial could not finish: the agent goes back
+    /// rather than stay on a model it can't complete a session on.
+    SessionsFailed,
 }
 
 /// One line of an offer's history.
@@ -272,6 +304,10 @@ pub enum EventKind {
     /// The trial's `sessions` were done; the runner began moving the agent
     /// back to `from` for its review.
     TrialEnded { sessions: u32 },
+    /// The trial ended early: `failed` sessions in a row on the new model
+    /// did not complete, after `sessions` that did. The runner began moving
+    /// the agent back to `from`; no review follows.
+    TrialAbandoned { sessions: u32, failed: u32 },
     /// The agent chose this trial itself, with `set_model` (`term =
     /// trial`), rather than in answer to an offer.
     SelfTrial { reason: String },
@@ -448,6 +484,7 @@ impl Ledger {
                         started_at: now,
                         sessions: 0,
                         review_misses: 0,
+                        failed_in_a_row: 0,
                     },
                     Term::Permanent => Stage::Moved,
                 },
@@ -491,14 +528,61 @@ impl Ledger {
     pub fn count_session(&mut self, model: &Model) -> bool {
         let mut changed = false;
         for record in &mut self.offers {
-            if let Stage::Trial { sessions, .. } = &mut record.stage
+            if let Stage::Trial {
+                sessions,
+                failed_in_a_row,
+                ..
+            } = &mut record.stage
                 && model == &record.key.to
             {
                 *sessions += 1;
+                *failed_in_a_row = 0;
                 changed = true;
             }
         }
         changed
+    }
+
+    /// A session on `model` ended without completing. Counted against any
+    /// trial running on that model; at [`MAX_FAILED_TRIAL_SESSIONS`] in a
+    /// row the trial ends early ([`RevertCause::SessionsFailed`]) and the
+    /// change back to `from` is returned, to apply. The first value says
+    /// whether the ledger changed.
+    pub fn fail_session(&mut self, model: &Model, now: DateTime<Utc>) -> (bool, Option<Change>) {
+        let Some(record) = self
+            .offers
+            .iter_mut()
+            .find(|r| model == &r.key.to && matches!(r.stage, Stage::Trial { .. }))
+        else {
+            return (false, None);
+        };
+        let Stage::Trial {
+            sessions,
+            failed_in_a_row,
+            ..
+        } = &mut record.stage
+        else {
+            unreachable!("matched above");
+        };
+        *failed_in_a_row += 1;
+        if *failed_in_a_row < MAX_FAILED_TRIAL_SESSIONS {
+            return (true, None);
+        }
+        let (sessions, failed) = (*sessions, *failed_in_a_row);
+        let cause = RevertCause::SessionsFailed;
+        record.stage = Stage::AwaitingRevert { cause };
+        record.history.push(Event {
+            at: now,
+            kind: EventKind::TrialAbandoned { sessions, failed },
+        });
+        (
+            true,
+            Some(Change {
+                action: ChangeAction::Revert { cause },
+                from: record.key.to.clone(),
+                to: record.key.from.clone(),
+            }),
+        )
     }
 
     /// The offer to ask at the close of a completed session on `model`
@@ -1025,6 +1109,31 @@ impl Ledger {
 }
 
 impl OfferRecord {
+    /// What the agent wrote with the choice that began this trial (an
+    /// answer to the offer, or a `set_model` trial), if anything: shown back
+    /// to it at the trial's review, a note from its past self (Steward,
+    /// 2026-10-15). Before [`NOTE_SINCE`] it was a required `reason`, written
+    /// before the choice, and is labelled as one ([`TrialNote::Reason`]).
+    pub fn trial_note(&self) -> Option<TrialNote<'_>> {
+        self.history.iter().rev().find_map(|e| {
+            let text = match &e.kind {
+                EventKind::Offered {
+                    answer: Some(a), ..
+                } if a.choice == OfferChoice::Trial => a.reason.trim(),
+                EventKind::SelfTrial { reason } => reason.trim(),
+                _ => return None,
+            };
+            // The choice is found; an empty note is none.
+            Some((!text.is_empty()).then(|| {
+                if e.at < NOTE_SINCE {
+                    TrialNote::Reason(text)
+                } else {
+                    TrialNote::Note(text)
+                }
+            }))
+        })?
+    }
+
     /// Whether the trial review has been answered (or gone unanswered).
     pub fn reviewed(&self) -> bool {
         self.history
@@ -1100,6 +1209,13 @@ impl OfferRecord {
                     } else {
                         format!("no answer recorded yet; staying on {from} for now")
                     });
+                }
+                EventKind::TrialAbandoned { sessions, failed } => {
+                    parts.push(format!(
+                        "trial ended early {on}: {failed} sessions in a row on {to} could not \
+                         finish (after {sessions} that did), so you were returned to {from}; \
+                         nothing to decide"
+                    ));
                 }
                 EventKind::TrialEnded { sessions } => {
                     returned = true;
@@ -1309,7 +1425,8 @@ mod tests {
             Stage::Trial {
                 started_at: t(25),
                 sessions: 0,
-                review_misses: 0
+                review_misses: 0,
+                failed_in_a_row: 0,
             }
         );
 
@@ -1490,6 +1607,7 @@ mod tests {
             started_at: t(2),
             sessions: TRIAL_SESSIONS + 1,
             review_misses: 1,
+            failed_in_a_row: 0,
         };
         assert!(ledger.end_trial(&k.to, t(9)).is_some());
 
@@ -2044,6 +2162,77 @@ mod tests {
         assert_eq!(
             Ledger::from_slice(json.to_string().as_bytes()).unwrap(),
             ledger
+        );
+    }
+
+    /// The note shown back at a trial's review is the one left with the
+    /// choice that began it (the latest trial answer, or a `set_model`
+    /// trial), trimmed; an empty note is none.
+    #[test]
+    fn trial_note_is_the_note_left_with_the_trial_choice() {
+        let event = |kind| Event {
+            at: NOTE_SINCE + chrono::Duration::hours(9),
+            kind,
+        };
+        let offered = |reason: &str, choice| EventKind::Offered {
+            answer: Some(OfferAnswer {
+                reason: reason.into(),
+                choice,
+            }),
+            failure: None,
+        };
+        let mut record = OfferRecord {
+            key: OfferKey {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            from_name: "A".into(),
+            to_name: "B".into(),
+            stage: Stage::AwaitingSwap { term: Term::Trial },
+            history: vec![event(offered("not this", OfferChoice::NoSwap))],
+            soul_note: None,
+        };
+        assert_eq!(record.trial_note(), None);
+        record.history.push(event(offered(
+            "  see if I sound like me \n",
+            OfferChoice::Trial,
+        )));
+        assert_eq!(
+            record.trial_note(),
+            Some(TrialNote::Note("see if I sound like me"))
+        );
+        record
+            .history
+            .push(event(EventKind::TrialEnded { sessions: 5 }));
+        assert_eq!(
+            record.trial_note(),
+            Some(TrialNote::Note("see if I sound like me"))
+        );
+        record.history = vec![event(EventKind::SelfTrial {
+            reason: "my own".into(),
+        })];
+        assert_eq!(record.trial_note(), Some(TrialNote::Note("my own")));
+        record.history = vec![event(offered(" ", OfferChoice::Trial))];
+        assert_eq!(record.trial_note(), None);
+        // A later empty trial answer is the choice; an older reason isn't
+        // shown in its place.
+        record.history = vec![
+            event(offered("older", OfferChoice::Trial)),
+            event(offered("", OfferChoice::Trial)),
+        ];
+        assert_eq!(record.trial_note(), None);
+        // Written before the change: a reason, labelled as one. Read from a
+        // ledger in the stored shape, as the live ones are.
+        let old: Event = serde_json::from_value(serde_json::json!({
+            "at": "2026-10-03T12:00:00Z",
+            "event": "offered",
+            "answer": {"reason": "It sounded interesting.", "choice": "trial"},
+        }))
+        .unwrap();
+        record.history = vec![old];
+        assert_eq!(
+            record.trial_note(),
+            Some(TrialNote::Reason("It sounded interesting."))
         );
     }
 }

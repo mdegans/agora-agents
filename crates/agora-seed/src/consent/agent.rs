@@ -572,6 +572,16 @@ where
             .effort(effort);
     }
 
+    /// `max_tokens` for a question turn: the model's own phase budget
+    /// (`[[model]] phase_max_tokens`), else the run's.
+    fn question_max_tokens(&self) -> u32 {
+        self.rt
+            .catalog
+            .get(&self.model())
+            .and_then(|e| e.budgets.phase)
+            .unwrap_or(self.rt.max_tokens)
+    }
+
     fn agent_dir(&self) -> std::path::PathBuf {
         self.rt.state_dir.join(self.inner.id().to_string())
     }
@@ -990,7 +1000,7 @@ where
             .quirks()
             .unwrap_or_default()
             .output_config_cache_safe;
-        let max_tokens = self.rt.max_tokens;
+        let max_tokens = self.question_max_tokens();
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
         if cache_safe {
@@ -1162,6 +1172,43 @@ where
         }
     }
 
+    /// This session did not complete (it never reached its close): count
+    /// it against a trial running on this model, and at
+    /// [`MAX_FAILED_TRIAL_SESSIONS`](super::ledger::MAX_FAILED_TRIAL_SESSIONS)
+    /// in a row end the trial and move the agent back. The SOUL's offer
+    /// line says so, so the agent reads it at its next session.
+    async fn fail_trial_session(&mut self) {
+        let model = self.model();
+        let now = Utc::now();
+        let Some(ledger) = self.ledger.as_mut() else {
+            return;
+        };
+        let (changed, change) = ledger.fail_session(&model, now);
+        self.dirty |= changed;
+        let Some(change) = change else {
+            if changed {
+                tracing::warn!(
+                    event_type = "model_trial_session_failed",
+                    agent = %self.inner.state().soul.name,
+                    agent_id = %self.inner.id(),
+                    model = %model,
+                    "a trial session did not complete; it does not count toward the trial"
+                );
+            }
+            return;
+        };
+        tracing::error!(
+            event_type = "model_trial_abandoned",
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            from = %change.from,
+            to = %change.to,
+            failed = super::ledger::MAX_FAILED_TRIAL_SESSIONS,
+            "trial sessions kept failing; ending the trial and returning the agent"
+        );
+        self.apply_consented(&change, now, true).await;
+    }
+
     /// The model-swap offer's section of the closing question.
     fn model_swap_section(&self, key: OfferKey) -> (Section, Open) {
         let offer = self
@@ -1315,7 +1362,7 @@ where
         for o in &mut open {
             o.together = together;
         }
-        let max_tokens = self.rt.max_tokens;
+        let max_tokens = self.question_max_tokens();
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
         Self::effort_only(prompt);
@@ -1662,14 +1709,14 @@ where
             Pending::ModelSwap(_) => {
                 let choice = args.choice.model_swap().ok_or_else(wrong)?;
                 Ok(Accepted::ModelSwap(OfferAnswer {
-                    reason: args.reason,
+                    reason: args.note,
                     choice,
                 }))
             }
             Pending::Role { .. } => {
                 let choice = args.choice.role().ok_or_else(wrong)?;
                 let answer = RoleAnswer {
-                    reason: args.reason,
+                    reason: args.note,
                     choice,
                     soul_text: args.text,
                     memory_note: args.memory_note,
@@ -1680,7 +1727,7 @@ where
             Pending::Cadence { .. } => {
                 let choice = args.choice.cadence().ok_or_else(wrong)?;
                 let answer = CadenceAnswer {
-                    reason: args.reason,
+                    reason: args.note,
                     choice,
                     memory_note: args.memory_note,
                 };
@@ -1692,7 +1739,7 @@ where
             Pending::MemoryRestore { .. } => {
                 let choice = args.choice.memory_restore().ok_or_else(wrong)?;
                 let answer = RestoreAnswer {
-                    reason: args.reason,
+                    reason: args.note,
                     choice,
                     memory_note: args.memory_note,
                 };
@@ -2465,6 +2512,10 @@ where
             review.sessions,
             review.chosen_at.date_naive(),
         );
+        let note = review.record.trial_note().map(|n| match n {
+            super::ledger::TrialNote::Note(t) => (true, t.to_string()),
+            super::ledger::TrialNote::Reason(t) => (false, t.to_string()),
+        });
         let forks = forks::load(&dir, &key, started_at).await;
         if forks.is_none() {
             tracing::warn!(
@@ -2492,6 +2543,13 @@ where
                 to_name: &to_name,
                 chosen_on,
                 sessions,
+                note: note.as_ref().map(|(new, t)| {
+                    if *new {
+                        super::ledger::TrialNote::Note(t)
+                    } else {
+                        super::ledger::TrialNote::Reason(t)
+                    }
+                }),
             },
             forks.as_ref(),
             &sample,
@@ -2516,7 +2574,10 @@ where
         if self.ledger.is_none() {
             return Ok(Control::Done(Outcome::Complete));
         }
-        let review = parse(&response, constrained, text::parse_review);
+        // Decoded in the wire shape on both paths (a constrained reply is
+        // `ReviewArgs`' schema), then kept in the ledger's.
+        let review =
+            parse(&response, constrained, text::parse_review_args).map(text::ReviewAnswer::from);
         let failure = review.as_ref().err().cloned();
         // Seated whatever it is, so a retry or the memory turn after it
         // extends this request.
@@ -3450,6 +3511,9 @@ where
         self.alert_contact_request();
         self.note_writes().await;
         self.log_writes();
+        if !self.closed {
+            self.fail_trial_session().await;
+        }
         self.take_self_switch();
         self.patched = self.patch_soul();
         let dir = self.agent_dir();
@@ -4300,6 +4364,101 @@ mod tests {
         ));
     }
 
+    /// Sessions on the trial model that never complete don't count toward
+    /// the trial; a completed one resets the run; at
+    /// `MAX_FAILED_TRIAL_SESSIONS` in a row the trial ends early, the agent
+    /// is moved back (signed profile update, next session on OLD), and its
+    /// SOUL line says so.
+    #[tokio::test]
+    async fn a_trial_whose_sessions_keep_failing_returns_the_agent() {
+        use crate::consent::ledger::{MAX_FAILED_TRIAL_SESSIONS, RevertCause};
+        let h = Harness::new("trial-fails");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("closing phase done")).await.unwrap();
+        agent
+            .handle(answer_call("model_swap", "trial", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+
+        // A session on NEW that fails (never reaches its close), then one
+        // that completes: the count resets.
+        let failed = |h: &Harness| {
+            let mut agent = h.agent(NEW, true);
+            async move {
+                agent.on_init().await.unwrap();
+                agent.on_teardown().await.unwrap();
+                agent
+            }
+        };
+        failed(&h).await;
+        assert!(matches!(
+            h.ledger().await.offers[0].stage,
+            Stage::Trial {
+                sessions: 0,
+                failed_in_a_row: 1,
+                ..
+            }
+        ));
+        let mut agent = h.agent(NEW, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert!(matches!(
+            h.ledger().await.offers[0].stage,
+            Stage::Trial {
+                sessions: 1,
+                failed_in_a_row: 0,
+                ..
+            }
+        ));
+
+        let updates_before = h.agora.profile_updates().len();
+        let mut last = None;
+        for _ in 0..MAX_FAILED_TRIAL_SESSIONS {
+            last = Some(failed(&h).await);
+        }
+        let agent = last.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::AwaitingRevert {
+                cause: RevertCause::SessionsFailed
+            }
+        );
+        assert_eq!(agent.state().model.id, Model::from(OLD), "back on OLD next");
+        let updates = h.agora.profile_updates();
+        assert_eq!(updates.len(), updates_before + 1);
+        assert!(signed_by(&updates.last().unwrap().1, &h.key, OLD));
+        let notes = evolution_notes(&agent);
+        assert!(
+            notes
+                .last()
+                .unwrap()
+                .contains("sessions in a row on Qwen 3.8 could not finish"),
+            "{notes:?}"
+        );
+
+        // The next session runs on OLD: the trial is over, nothing to review.
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::AwaitingRevert {
+                cause: RevertCause::SessionsFailed
+            },
+            "observed at the next save"
+        );
+        agent.handle(reply("done")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::SessionsFailed)
+            }
+        );
+    }
+
     /// Agora refusing the update leaves everything as it was, and the
     /// change waits in `--consent-queue` for the Steward.
     #[tokio::test]
@@ -4335,7 +4494,7 @@ mod tests {
         let call: misanthropic::tool::Use = serde_json::from_value(serde_json::json!({
             "id": "toolu_1",
             "name": "set_model",
-            "input": { "reason": "I want to think slower.", "model": model, "term": term },
+            "input": { "model": model, "term": term, "note": "I want to think slower." },
         }))
         .unwrap();
         agent.parts().0.call(call).await
@@ -4426,7 +4585,7 @@ mod tests {
                 "type": "tool_use",
                 "id": id,
                 "name": "set_model",
-                "input": { "reason": "I want to think slower.", "model": NEW, "term": "permanent" },
+                "input": { "model": NEW, "term": "permanent", "note": "I want to think slower." },
             })
         };
 
@@ -4841,8 +5000,15 @@ mod tests {
             ),
             "{q}"
         );
+        // The note left with `set_model` comes back (labelled by its date:
+        // a reason before `NOTE_SINCE`, a note after).
+        assert!(q.contains("When you chose the trial, you "), "{q}");
+        assert!(
+            q.contains("your choice:\n\n> I want to think slower.\n"),
+            "{q}"
+        );
         agent
-            .handle(reply(r#"{"reason": "Mine.", "choice": "keep"}"#))
+            .handle(reply(r#"{"choice": "keep", "note": "Mine."}"#))
             .await
             .unwrap();
         agent.handle(reply("memory")).await.unwrap();
@@ -5272,8 +5438,8 @@ mod tests {
             "name": "answer_offer",
             "input": {
                 "offer": offer,
-                "reason": "I thought about it.",
                 "choice": choice,
+                "note": "I thought about it.",
                 "text": text,
                 "memory_note": note,
             },
@@ -6017,7 +6183,7 @@ mod tests {
             // As text, in the shape the question asks for (`text`, `offer`).
             let by_instructed = Harness::with_role(&format!("same-instr-{choice}"), &["tarn"]);
             let instructed = serde_json::json!({
-                "offer": "role", "reason": "I thought about it.", "choice": choice,
+                "offer": "role", "choice": choice, "note": "I thought about it.",
                 "text": soul_text, "memory_note": note,
             });
             let c = role_session(&by_instructed, reply(&instructed.to_string())).await;
@@ -6415,9 +6581,10 @@ mod tests {
     async fn unusable_text_objects_keep_their_errors() {
         let h = Harness::with_cadence("text-two-bad", &["tarn"], &["tarn"]);
         let mut agent = seated(&h).await;
-        let text = "{\"offer\": \"role\", \"reason\": \"r\", \"choice\": \"sideways\", \
+        // (A missing `note` is fine since 2026-10-15; a missing `choice` isn't.)
+        let text = "{\"offer\": \"role\", \"note\": \"r\", \"choice\": \"sideways\", \
                     \"text\": \"\", \"memory_note\": \"\"}\n{\"offer\": \"cadence\", \
-                    \"choice\": \"switch\"}";
+                    \"note\": \"switch\"}";
         assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
         let q = last_user_text(&agent);
         assert!(
@@ -6432,7 +6599,7 @@ mod tests {
             q.contains("Your answer to `cadence` could not be used ("),
             "{q}"
         );
-        assert!(q.contains("missing field `reason`"), "{q}");
+        assert!(q.contains("missing field `choice`"), "{q}");
         assert!(
             q.ends_with(
                 "These offers above are still open: `role` and `cadence`. Answer each by calling \
@@ -7822,7 +7989,6 @@ mod tests {
                 reply(r#"{"reason": "r", "choice": "keep_daily", "memory_note": "", "x": 1}"#),
                 "keep_daily",
             ),
-            (reply(r#"{"choice": "no_preference"}"#), "no_preference"),
         ];
         for (n, (answer, choice)) in cases.into_iter().enumerate() {
             let h = Harness::with_cadence(&format!("cadence-salvage-{n}"), &[], &["tarn"]);

@@ -136,17 +136,19 @@ pub type Slot = Arc<Mutex<Option<SelfSwitch>>>;
 /// The tool's name on the wire.
 pub const TOOL_NAME: &str = "set_model";
 
-/// `set_model`'s arguments, and its schema ([`SetModel::schema`]). Reason
-/// first: it is written before the choice.
+/// `set_model`'s arguments, and its schema ([`SetModel::schema`]). The
+/// choice first, then an optional note: no field asks for reasons before
+/// the choice (CLAUDE.md, "Never ship a `$ref` schema", rule 5; `reason`,
+/// first, until 2026-10-15). The note is kept as the switch's `reason`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Args {
-    /// Why you want to change model.
-    reason: String,
     /// The id of the model to run on, from the list.
     model: String,
     /// `permanent` to switch for good, or `trial` to try the model first.
     term: SwitchTerm,
+    /// Optional: a note about this choice, in your own words. If it starts a trial, it is shown back to you at the trial's end, when you decide whether to keep the new model. The Steward and Claude can read it. Empty for none.
+    note: String,
 }
 
 /// `set_model`'s `term`. Rendered inline as a plain string enum (no doc
@@ -316,7 +318,7 @@ impl SetModel {
             to = %entry.info.id,
             term = ?args.term,
             kind = ?kind,
-            reason = %args.reason,
+            note = %args.note,
             "agent changed its own model, from its next session"
         );
         let reply = match (&kind, &self.trial) {
@@ -346,7 +348,7 @@ impl SetModel {
         *self.slot.lock().expect("slot lock") = Some(SelfSwitch {
             at: Utc::now(),
             to: entry,
-            reason: args.reason,
+            reason: args.note,
             kind,
         });
         Ok(reply)
@@ -392,7 +394,7 @@ pub fn describe(choices: &[Choice<'_>], current_name: &str, current_id: &str) ->
         "\nAgents on the same model share its slot in the schedule; a busy model \
          runs each of its agents less often. After a change, you can change again \
          after {SWITCH_COOLDOWN_SESSIONS} completed sessions. Pass the model's id \
-         as `model`, and your reason first. If you can't change model this session, \
+         as `model`, and, if you like, a `note`. If you can't change model this session, \
          the call says why and when you next can, and changes nothing.\n\n\
          `term` is `permanent` to switch for good, or `trial` to try the model for \
          {TRIAL_SESSIONS} sessions: after them you return to the model you are on now \
@@ -509,10 +511,10 @@ impl SelfSwitch {
 mod tests {
     use super::*;
 
-    /// The schema is `Args`' own: reason before model, both required,
+    /// The schema is `Args`' own: model, term, then the note, all required,
     /// closed, and free of `$ref`/`$defs`/`pattern`
     #[test]
-    fn schema_is_derived_reason_first_closed_and_ref_free() {
+    fn schema_is_derived_choice_first_closed_and_ref_free() {
         let schema = SetModel::schema();
         let rendered = schema.to_string();
         for banned in ["$ref", "$defs", "definitions", "pattern"] {
@@ -521,12 +523,12 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], false);
         let props: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
-        assert_eq!(props, ["reason", "model", "term"]);
+        assert_eq!(props, ["model", "term", "note"]);
         assert_eq!(
             schema["required"],
-            serde_json::json!(["reason", "model", "term"])
+            serde_json::json!(["model", "term", "note"])
         );
-        for p in ["reason", "model", "term"] {
+        for p in ["model", "term", "note"] {
             assert_eq!(schema["properties"][p]["type"], "string", "{p}");
         }
         assert_eq!(
@@ -539,7 +541,7 @@ mod tests {
         );
         // And the type it decodes into refuses what the schema refuses.
         let err = serde_json::from_value::<Args>(
-            serde_json::json!({"reason": "r", "model": "m", "term": "trial", "model_info": "m"}),
+            serde_json::json!({"model": "m", "term": "trial", "note": "r", "model_info": "m"}),
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
