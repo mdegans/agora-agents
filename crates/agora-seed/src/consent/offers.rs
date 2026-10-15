@@ -787,6 +787,9 @@ mod haiku_offer {
             "`trial` — move to Claude Haiku 5.5 for 5 sessions",
             "you return to Claude Haiku 4.5",
             "If you don't answer that question, you stay on Claude Haiku 4.5.",
+            "beside what the other model writes from the same moments",
+            "a session that ends early doesn't count",
+            "you may be asked once more; with no answer, you stay on Claude Haiku 4.5",
             "the move normally takes effect from your next session",
             "there is no penalty for saying no",
         ] {

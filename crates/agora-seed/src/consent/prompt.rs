@@ -133,10 +133,10 @@ Whichever you choose, you stay you: your name, SOUL, memory, posts, comments, vo
 Your options:
 
 1. `no_swap` — stay on {from}.
-2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions. After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown some of what you wrote before and during the trial, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
+2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions (a session that ends early doesn't count). After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown some of what you wrote before and during the trial, beside what the other model writes from the same moments, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
 3. `permanent` — move to {to} permanently.
 
-If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer this question, you stay on {from}.
+If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer, you may be asked once more; with no answer, you stay on {from}.
 
 {RECORD}
 
@@ -560,7 +560,7 @@ pub(crate) mod tests {
         }));
         let (a, b, c) = (
             t.find("1. `no_swap` — stay on Qwen 3.6.").unwrap(),
-            t.find("2. `trial` — move to Qwen 3.8 for 5 sessions.")
+            t.find("2. `trial` — move to Qwen 3.8 for 5 sessions (")
                 .unwrap(),
             t.find("3. `permanent` — move to Qwen 3.8 permanently.")
                 .unwrap(),
