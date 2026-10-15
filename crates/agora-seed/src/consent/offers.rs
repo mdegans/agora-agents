@@ -761,7 +761,13 @@ mod haiku_offer {
             "5.5 rejects a budget"
         );
         // A 2,000-word memory rewrite is ~5,000 tokens on 5.5: over 4096.
-        assert!(example.model[1].phase_max_tokens.is_some_and(|t| t >= 8192));
+        for budget in [
+            example.model[1].act_max_tokens,
+            example.model[1].phase_max_tokens,
+            example.model[1].evolve_max_tokens,
+        ] {
+            assert_eq!(budget, Some(2 * 4096), "double 4.5's (Steward, 2026-10-15)");
+        }
         assert!(example.model[0].phase_max_tokens.is_none(), "4.5 unchanged");
 
         let o = example.model_consent.offer.expect("the offer");

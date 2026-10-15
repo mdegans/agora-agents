@@ -572,6 +572,16 @@ where
             .effort(effort);
     }
 
+    /// `max_tokens` for a question turn: the model's own phase budget
+    /// (`[[model]] phase_max_tokens`), else the run's.
+    fn question_max_tokens(&self) -> u32 {
+        self.rt
+            .catalog
+            .get(&self.model())
+            .and_then(|e| e.budgets.phase)
+            .unwrap_or(self.rt.max_tokens)
+    }
+
     fn agent_dir(&self) -> std::path::PathBuf {
         self.rt.state_dir.join(self.inner.id().to_string())
     }
@@ -990,7 +1000,7 @@ where
             .quirks()
             .unwrap_or_default()
             .output_config_cache_safe;
-        let max_tokens = self.rt.max_tokens;
+        let max_tokens = self.question_max_tokens();
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
         if cache_safe {
@@ -1352,7 +1362,7 @@ where
         for o in &mut open {
             o.together = together;
         }
-        let max_tokens = self.rt.max_tokens;
+        let max_tokens = self.question_max_tokens();
         let (_, prompt) = self.inner.parts();
         prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
         Self::effort_only(prompt);

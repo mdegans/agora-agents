@@ -98,19 +98,20 @@ min_cycle_secs = 72000  # 20h
 id = "claude-haiku-4-5-20251001"
 
 #
-# Its token budgets are its own (the cohort's 4.5 sessions keep `[seed]`'s
-# 4096): the memory rewrite asks for up to 2,000 words, which as the JSON
-# reply is ~5,000 tokens on Haiku 5.5 (3.04 chars/token, measured), over
-# 4096 before any thinking. A clipped rewrite fails the session, and a
-# trial counts only completed sessions. Today's longest cohort memory is
-# 8,379 chars (~2,800 tokens). 12288 leaves room for that cap plus
-# thinking; act turns (a long comment plus thinking) get 8192.
+# Its token budgets are its own: double the 4096 the cohort's 4.5
+# sessions run with (Steward, 2026-10-15, after Sonnet 5.5's Council
+# summary was cut short). Thinking shares `max_tokens`, and the memory
+# rewrite asks for up to 2,000 words, which as the JSON reply is ~5,000
+# tokens on Haiku 5.5 (3.04 chars/token, measured), over 4096 before any
+# thinking. Today's longest cohort memory is 8,379 chars (~2,800 tokens).
+# 8192 covers the 2,000-word cap plus ~3,000 tokens of thinking (medium
+# thought 0-1,515 tokens per turn in the probes).
 [[model]]
 id = "claude-haiku-5-5"
 thinking_effort = "medium"
 act_max_tokens = 8192
-phase_max_tokens = 12288
-evolve_max_tokens = 12288
+phase_max_tokens = 8192
+evolve_max_tokens = 8192
 
 # The Haiku 4.5 -> 5.5 offer (Steward, 2026-10-15). Asked once at the end of
 # a session (re-asked if unanswered, at most twice; no answer means stay).

@@ -1553,19 +1553,17 @@ async fn run(held: &mut Held) -> Result<()> {
     let fork_thinking: Vec<(Model, consent::forks::SessionThinking)> = offered
         .iter()
         .map(|(_, m)| {
-            let model_effort = specs
-                .iter()
-                .find(|s| s.id == m.id)
+            let spec = specs.iter().find(|s| s.id == m.id);
+            let model_effort = spec
                 .and_then(|s| s.thinking_effort)
                 .map(EffortKnob::into_effort);
-            (
-                m.id.clone(),
-                consent::forks::SessionThinking::resolve(
-                    model_effort,
-                    fork_seed.thinking_effort.clone(),
-                    fork_seed.thinking_budget_tokens,
-                ),
-            )
+            let mut thinking = consent::forks::SessionThinking::resolve(
+                model_effort,
+                fork_seed.thinking_effort.clone(),
+                fork_seed.thinking_budget_tokens,
+            );
+            thinking.act_max_tokens = spec.and_then(|s| s.act_max_tokens);
+            (m.id.clone(), thinking)
         })
         .collect();
     if args.dry_run {

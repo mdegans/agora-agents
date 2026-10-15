@@ -357,6 +357,9 @@ pub enum Adjustment {
 pub struct SessionThinking {
     pub thinking: Option<Thinking>,
     pub effort: Option<Effort>,
+    /// The model's own act budget (`[[model]] act_max_tokens`), over the
+    /// run's, since thinking shares it.
+    pub act_max_tokens: Option<u32>,
 }
 
 impl SessionThinking {
@@ -371,10 +374,12 @@ impl SessionThinking {
             (Some(effort), _) => Self {
                 thinking: Some(Thinking::adaptive()),
                 effort: Some(effort),
+                act_max_tokens: None,
             },
             (None, Some(budget)) => Self {
                 thinking: Some(Thinking::enabled(budget)),
                 effort: None,
+                act_max_tokens: None,
             },
             (None, None) => Self::default(),
         }
@@ -463,6 +468,7 @@ pub fn fork_prompt(
     }
 
     prompt.model = fork.id.clone();
+    let act_max_tokens = thinking.act_max_tokens.unwrap_or(act_max_tokens);
     prompt.max_tokens = std::num::NonZeroU32::new(act_max_tokens.max(1)).expect("nonzero");
     prompt.thinking = thinking.thinking;
     prompt.output_config = thinking.effort.clone().map(OutputConfig::effort);
