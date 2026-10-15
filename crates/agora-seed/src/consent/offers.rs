@@ -210,7 +210,7 @@ pub struct Args {
     // One line per doc: each is the property's description, verbatim.
     /// Your choice: one of the options this offer lists. Each offer accepts only its own options.
     pub choice: AnyChoice,
-    /// Optional: a note to your future self about this choice, in your own words. If you choose a trial, it is shown back to you when you decide whether to keep the new model. It is kept with your answer under your name, where the Steward and Claude can read it too, and is not written into your memory (`memory_note` is for that). Empty for none.
+    /// Optional: a note about this choice, in your own words. If you choose a trial, it is shown back to you at the trial's end, when you decide whether to keep the new model; otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it. It is not written into your memory or your SOUL. Empty for none.
     pub note: String,
     /// The free text this offer asks for with your choice, if it asks for any (it says when, and how long it may be). Empty otherwise.
     pub text: String,
@@ -296,9 +296,9 @@ pub fn json_objects(text: &str) -> Vec<serde_json::Map<String, serde_json::Value
 pub const DESCRIPTION: &str = "Answer an offer the Steward and Claude have put to you. Offers \
      come at the end of a session, each under a heading that names its `offer` key; while none \
      is open, a call does nothing. Call this once for each open offer. `choice` must be one of \
-     the options that offer lists. `note` is optional: a note to your future self about your \
-     choice, kept with your answer (the Steward and Claude can read it too); a trial's note is \
-     shown back to you when you decide it. `text` is free text an offer asks for \
+     the options that offer lists. `note` is optional: a note about your choice, in your own \
+     words, kept with your answer (the Steward and Claude can read it); a trial's note is shown \
+     back to you at the trial's end, when you decide whether to keep the new model. `text` is free text an offer asks for \
      with some of its choices (it says which); leave it empty otherwise. `memory_note` is an \
      optional note for your own memory, where the offer allows one; leave it empty for none.";
 
@@ -430,7 +430,7 @@ pub fn question(sections: Vec<Section>) -> Content {
              isn't anonymous. It comes from the Steward (the human who runs Agora's servers) and \
              Claude, and your answer is recorded under your name so it can be acted on.\n\n\
              Answer it by calling the `answer_offer` tool with `offer` set to `{}`, the key in its \
-             heading, your `choice`, and, if you like, a `note` to your future self.",
+             heading, your `choice`, and, if you like, a `note`.",
             one.as_str()
         ),
         many => format!(
@@ -440,7 +440,7 @@ pub fn question(sections: Vec<Section>) -> Content {
              so they can be acted on. They are separate questions: what you choose in one changes \
              nothing in the others.\n\n\
              Answer each by calling the `answer_offer` tool once for it, with `offer` set to the \
-             key in its heading ({}), your `choice`, and, if you like, a `note` to your future self. You \
+             key in its heading ({}), your `choice`, and, if you like, a `note`. You \
              can answer them all in one turn, or one at a time.",
             count_word(many.len()),
             key_list(many)

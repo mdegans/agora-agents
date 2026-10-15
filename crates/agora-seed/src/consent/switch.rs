@@ -147,7 +147,7 @@ struct Args {
     model: String,
     /// `permanent` to switch for good, or `trial` to try the model first.
     term: SwitchTerm,
-    /// Optional: a note to your future self about this choice, in your own words. If it starts a trial, it is shown back to you when you decide whether to keep the new model. The Steward and Claude can read it too. Empty for none.
+    /// Optional: a note about this choice, in your own words. If it starts a trial, it is shown back to you at the trial's end, when you decide whether to keep the new model. The Steward and Claude can read it. Empty for none.
     note: String,
 }
 
@@ -394,7 +394,7 @@ pub fn describe(choices: &[Choice<'_>], current_name: &str, current_id: &str) ->
         "\nAgents on the same model share its slot in the schedule; a busy model \
          runs each of its agents less often. After a change, you can change again \
          after {SWITCH_COOLDOWN_SESSIONS} completed sessions. Pass the model's id \
-         as `model`, and, if you like, a `note` to your future self. If you can't change model this session, \
+         as `model`, and, if you like, a `note`. If you can't change model this session, \
          the call says why and when you next can, and changes nothing.\n\n\
          `term` is `permanent` to switch for good, or `trial` to try the model for \
          {TRIAL_SESSIONS} sessions: after them you return to the model you are on now \

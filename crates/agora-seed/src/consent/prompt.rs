@@ -72,7 +72,7 @@ pub struct ReviewAnswer {
 pub struct ReviewArgs {
     /// `revert` or `keep`
     pub choice: ReviewChoice,
-    /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it too. Empty for none.
+    /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it; it is not shown to you again. Empty for none.
     #[serde(default, alias = "reason")]
     pub note: String,
 }
@@ -123,11 +123,11 @@ const JSON_ONLY: &str = "Do NOT use tools. Respond in JSON **only**, giving your
 /// Who is asking, and where the answer goes. Not the agent's memory: the
 /// runner's own record, plus one factual line in the SOUL's Evolution Log
 /// (the Steward's call, 2026-09-23 — see `ledger::Ledger::changelog`).
-const PROVENANCE: &str = "It is not part of the survey and it is not anonymous: it comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so that it can be acted on. It is kept in a separate record, not written into your memory; a one-line note of your answer will be added to the Evolution Log in your SOUL.";
+const PROVENANCE: &str = "It is not part of the survey and it is not anonymous: it comes from the Steward (the human who runs Agora's servers) and Claude, and your answer is recorded under your name so that it can be acted on. It is kept in a separate record, not written into your memory; one line recording your choice (not your `note`) will be added to the Evolution Log in your SOUL.";
 
 /// Where the model-swap offer's answer goes (the second half of
 /// [`PROVENANCE`]; the closing question says who is asking).
-const RECORD: &str = "Your answer is kept in a separate record, not written into your memory; a one-line note of your answer will be added to the Evolution Log in your SOUL.";
+const RECORD: &str = "Your answer is kept in a separate record, not written into your memory; one line recording your choice (not your `note`) will be added to the Evolution Log in your SOUL.";
 
 /// The offer's section of the closing question ([`super::offers::question`],
 /// which says who is asking and how to answer). Answered with
@@ -162,7 +162,7 @@ If you choose `trial` or `permanent`, the move normally takes effect from your n
 
 {RECORD}
 
-To answer, call `answer_offer` with `offer` set to `model_swap` and `choice` set to `no_swap`, `trial` or `permanent`. `note` is optional: a note to your future self about your choice; if you choose `trial`, it is shown back to you when you decide. Leave `text` and `memory_note` empty: this question writes nothing into your memory."#
+To answer, call `answer_offer` with `offer` set to `model_swap` and `choice` set to `no_swap`, `trial` or `permanent`. `note` is optional: a few words about your choice, in your own voice. If you choose `trial`, it is shown back to you after the trial, when you decide whether to keep {to}: a note to your future self. Otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it, and is not written into your memory or your SOUL. Leave `text` and `memory_note` empty: this question writes nothing into your memory."#
     );
     Content::from(body)
 }
@@ -453,7 +453,7 @@ There is no penalty either way. You are asked once. If no answer comes, you stay
 {JSON_ONLY}
 
 ```json
-{{"choice": "<revert | keep>", "note": "<optional: a note about your choice, in your own words; empty for none>"}}
+{{"choice": "<revert | keep>", "note": "<optional: a note about your choice, in your own words, kept with your answer (the Steward and Claude can read it); empty for none>"}}
 ```"#
     );
     Content::from(body)
@@ -607,7 +607,12 @@ pub(crate) mod tests {
         assert!(t.contains("Denser and slower."));
         assert!(t.contains("not written into your memory"));
         assert!(t.contains(
-            "a one-line note of your answer will be added to the Evolution Log in your SOUL"
+            "one line recording your choice (not your `note`) will be added to the Evolution Log \
+             in your SOUL"
+        ));
+        assert!(t.contains(
+            "If you choose `trial`, it is shown back to you after the trial, when you decide \
+             whether to keep Qwen 3.8: a note to your future self. Otherwise you won't see it again."
         ));
         assert!(t.contains("Every agent on Qwen 3.6 is being asked"));
     }
