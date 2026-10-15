@@ -1546,10 +1546,28 @@ async fn run(held: &mut Held) -> Result<()> {
         .log_dir
         .clone()
         .unwrap_or_else(|| data_dir.join("logs"));
-    let act_max_tokens = config
-        .seed
-        .to_config(&data_dir, !args.no_prompt_log)?
-        .act_max_tokens;
+    let fork_seed = config.seed.to_config(&data_dir, !args.no_prompt_log)?;
+    let act_max_tokens = fork_seed.act_max_tokens;
+    // A fork thinks as a session on its model would (see
+    // `consent::forks::SessionThinking`).
+    let fork_thinking: Vec<(Model, consent::forks::SessionThinking)> = offered
+        .iter()
+        .map(|(_, m)| {
+            let model_effort = specs
+                .iter()
+                .find(|s| s.id == m.id)
+                .and_then(|s| s.thinking_effort)
+                .map(EffortKnob::into_effort);
+            (
+                m.id.clone(),
+                consent::forks::SessionThinking::resolve(
+                    model_effort,
+                    fork_seed.thinking_effort.clone(),
+                    fork_seed.thinking_budget_tokens,
+                ),
+            )
+        })
+        .collect();
     if args.dry_run {
         match consent::forks::jobs(&data_dir.join("state")).await {
             Ok(jobs) if !jobs.is_empty() => say!(
@@ -1572,6 +1590,7 @@ async fn run(held: &mut Held) -> Result<()> {
             consent::forks::Endpoints {
                 clients: &endpoints,
                 offered: &offered,
+                thinking: &fork_thinking,
             },
             act_max_tokens,
             config.review_forks,

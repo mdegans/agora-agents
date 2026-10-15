@@ -727,3 +727,73 @@ mod tests {
         assert!(reminder(&[OfferKind::Role, OfferKind::Cadence]).contains("`role` and `cadence`"));
     }
 }
+
+/// The Haiku 4.5 → 5.5 offer in the example daily config, rendered exactly
+/// as an agent sees it. Pins that the example parses, routes both models,
+/// thinks on 5.5 by effort (Haiku 5.5 rejects a budget), and says what the
+/// runner does. `cargo test -p agora-seed haiku_offer -- --nocapture`
+/// prints the question.
+#[cfg(test)]
+mod haiku_offer {
+    use super::*;
+    use crate::consent::prompt::{OfferText, offer};
+
+    #[derive(serde::Deserialize)]
+    struct Example {
+        model: Vec<crate::models::ModelSpec>,
+        model_consent: crate::consent::ConsentConfig,
+    }
+
+    #[test]
+    fn haiku_offer_as_an_agent_sees_it() {
+        let example: Example =
+            toml::from_str(include_str!("../../examples/daily.toml")).expect("example parses");
+        crate::models::validate(&example.model).unwrap();
+        let ids: Vec<&str> = example.model.iter().map(|m| m.id.name()).collect();
+        assert_eq!(ids, ["claude-haiku-4-5-20251001", "claude-haiku-5-5"]);
+        assert!(example.model.iter().all(|m| !m.selectable), "no set_model");
+        assert!(
+            example.model[0].thinking_effort.is_none(),
+            "4.5 rejects effort"
+        );
+        assert!(
+            example.model[1].thinking_effort.is_some(),
+            "5.5 rejects a budget"
+        );
+
+        let o = example.model_consent.offer.expect("the offer");
+        o.validate().unwrap();
+        assert_eq!(o.from.name(), "claude-haiku-4-5-20251001");
+        assert_eq!(o.to.name(), "claude-haiku-5-5");
+        assert!(!o.is_limited(), "every agent on 4.5");
+
+        let q = question(vec![Section {
+            kind: OfferKind::ModelSwap,
+            body: offer(OfferText {
+                from_name: o.source_name(),
+                to_name: o.target_name(),
+                description: &o.description,
+                limited: o.is_limited(),
+            }),
+        }])
+        .to_string();
+        println!("{q}");
+        for said in [
+            "You currently run on **Claude Haiku 4.5**",
+            "Every agent on Claude Haiku 4.5 is being asked",
+            "It thinks before it answers.",
+            "at a medium effort setting",
+            "up to about 40% more",
+            "`trial` — move to Claude Haiku 5.5 for 5 sessions",
+            "you return to Claude Haiku 4.5",
+            "If you don't answer that question, you stay on Claude Haiku 4.5.",
+            "the move normally takes effect from your next session",
+            "there is no penalty for saying no",
+        ] {
+            assert!(q.contains(said), "missing {said:?} in:\n{q}");
+        }
+        for stale in ["by hand", "few days", "price", "cost", "$"] {
+            assert!(!q.contains(stale), "{stale:?} in:\n{q}");
+        }
+    }
+}

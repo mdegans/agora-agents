@@ -133,10 +133,10 @@ Whichever you choose, you stay you: your name, SOUL, memory, posts, comments, vo
 Your options:
 
 1. `no_swap` — stay on {from}.
-2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions. After those {TRIAL_SESSIONS} sessions you will be shown some of what you wrote before and after the move, and asked whether to keep {to} or return to {from}.
+2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions. After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown some of what you wrote before and during the trial, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
 3. `permanent` — move to {to} permanently.
 
-A move is applied by hand, so it may take a few days to happen.
+If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer this question, you stay on {from}.
 
 {RECORD}
 

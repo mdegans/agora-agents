@@ -545,9 +545,25 @@ pub struct ConsentAgent<A> {
     /// The closing questions have been put (or there were none): the inner
     /// session's next `Done` is its epilogue's.
     closed: bool,
+    /// API refusals (`stop_reason: refusal`) this session. See
+    /// [`MAX_SESSION_REFUSALS`].
+    refusals: u32,
     /// The inner epilogue (the survey) has been begun.
     epilogue: bool,
 }
+
+/// API refusals after which a session ends, failed, sending nothing more.
+///
+/// A refusal is reported loudly by agentkit (`inference_refusal`), and the
+/// first one is left to the session: in acting it ends acting and the
+/// memory rewrite follows; in a closing phase or a question it is retried
+/// like any unusable answer. A second means the material itself draws
+/// refusals, and re-sending it is what can get an API account flagged
+/// (repeat refusals; the Steward, 2026-09-23 and 2026-10-15, for Haiku
+/// 5.5, whose safety classifiers stop with `refusal` and no fallback). The
+/// session's state is saved as it stands (agentkit `Outcome::Failed`): the
+/// memory is whatever its last successful rewrite left.
+pub const MAX_SESSION_REFUSALS: u32 = 2;
 
 impl<A> ConsentAgent<A>
 where
@@ -3203,6 +3219,7 @@ where
             restore_undo: None,
             restore_written: None,
             closed: false,
+            refusals: 0,
             epilogue: false,
         })
     }
@@ -3395,8 +3412,26 @@ where
 
     /// The inner session first; at its clean end the closing questions
     /// ([`close`](Self::close)), then its held epilogue — the survey, last.
+    ///
+    /// A session's [`MAX_SESSION_REFUSALS`]th API refusal ends it, failed,
+    /// before anything else is sent.
     async fn handle(&mut self, response: response::Message) -> Result<Control, A::Error> {
         const DONE: Control = Control::Done(Outcome::Complete);
+        if matches!(response.stop_reason, Some(StopReason::Refusal)) {
+            self.refusals += 1;
+            if self.refusals >= MAX_SESSION_REFUSALS {
+                tracing::error!(
+                    event_type = "session_ended_on_refusal",
+                    agent = %self.inner.state().soul.name,
+                    agent_id = %self.inner.id(),
+                    model = %self.model(),
+                    refusals = self.refusals,
+                    "a second API refusal in one session: the session ends here, \
+                     failed, and nothing more is sent (memory as last saved)"
+                );
+                return Ok(Control::Done(Outcome::Failed));
+            }
+        }
         let control = match std::mem::replace(&mut self.phase, Phase::Inner) {
             Phase::Asking {
                 due,
@@ -4298,6 +4333,49 @@ mod tests {
             h.ledger().await.offers[0].stage,
             Stage::Trial { sessions: 1, .. }
         ));
+    }
+
+    fn refusal() -> response::Message {
+        serde_json::from_value(serde_json::json!({
+            "id": "msg_refused",
+            "role": "assistant",
+            "content": [],
+            "model": "test",
+            "stop_reason": "refusal",
+            "stop_sequence": null,
+        }))
+        .unwrap()
+    }
+
+    /// The first refusal goes to the session as any response would; the
+    /// second ends it, failed, with nothing more sent, and no answer to the
+    /// open offer is recorded (it is asked again next session).
+    #[tokio::test]
+    async fn a_second_refusal_ends_the_session() {
+        let h = Harness::new("refusals");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        let control = agent.handle(refusal()).await.unwrap();
+        assert_eq!(
+            control,
+            Control::Continue,
+            "first refusal: the offer is put"
+        );
+        let sent = agent.prompt().messages.len();
+        let control = agent.handle(refusal()).await.unwrap();
+        assert_eq!(control, Control::Done(Outcome::Failed));
+        assert_eq!(agent.prompt().messages.len(), sent, "nothing seated");
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(OLD));
+        let ledger = h.ledger().await;
+        assert!(
+            ledger.offers.iter().all(|o| !matches!(
+                o.stage,
+                Stage::AwaitingSwap { .. } | Stage::Declined | Stage::NoAnswer
+            )),
+            "{:?}",
+            ledger.offers
+        );
     }
 
     /// Agora refusing the update leaves everything as it was, and the
