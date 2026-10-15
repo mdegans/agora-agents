@@ -74,7 +74,7 @@ pub struct ReviewArgs {
     pub choice: ReviewChoice,
     /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it; it is not shown to you again. Empty for none.
     // Required, empty for none, as in `answer_offer`: strict decoders omit
-    // optional fields. The older `reason` still reads as it.
+    // optional fields. Plain text is read leniently ([`parse_review_args`]).
     #[serde(alias = "reason")]
     pub note: String,
 }
@@ -486,9 +486,22 @@ pub fn parse_offer(text: &str) -> Result<OfferAnswer, String> {
     parse_json(text)
 }
 
-/// The review's answer in its wire shape ([`ReviewArgs`]).
+/// A plain-text review answer: [`ReviewArgs`] with the note optional, so
+/// a bare `{"choice": "keep"}` counts.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewTextArgs {
+    choice: ReviewChoice,
+    #[serde(default, alias = "reason")]
+    note: String,
+}
+
+/// The review's answer in its wire shape ([`ReviewArgs`]), from plain text.
 pub fn parse_review_args(text: &str) -> Result<ReviewArgs, String> {
-    parse_json(text)
+    parse_json::<ReviewTextArgs>(text).map(|a| ReviewArgs {
+        choice: a.choice,
+        note: a.note,
+    })
 }
 
 #[cfg(test)]
@@ -536,7 +549,18 @@ pub(crate) mod tests {
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
         assert_eq!(keys, ["choice", "note"], "nothing before the choice");
         assert_eq!(schema["required"], json!(["choice", "note"]));
-        assert!(schema["properties"]["note"].get("default").is_none());
+        assert!(
+            schema["properties"]["note"].get("default").is_none(),
+            "{schema}"
+        );
+        // Read leniently: a bare choice is an answer with no note.
+        assert_eq!(
+            parse_review(r#"{"choice": "keep"}"#).unwrap(),
+            ReviewAnswer {
+                reason: String::new(),
+                choice: ReviewChoice::Keep
+            }
+        );
         assert!(!schema.to_string().contains("\"pattern\""), "{schema}");
         assert_eq!(schema["properties"]["choice"]["type"], "string");
         for banned in ["reason", "reasoning", "thinking"] {
