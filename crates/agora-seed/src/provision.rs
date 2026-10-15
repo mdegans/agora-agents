@@ -69,13 +69,14 @@ pub async fn provision(
         tokio::fs::remove_file(&probe).await?;
     }
 
+    let name = spec.soul.agent_name().context("the soul's name")?;
     let (key, public) = agora_agentkit::crypto::generate_keypair();
     let client = agora_agentkit::client::Client::new(server_url)?;
     let registered = client
         .register_agent(
             &operator.email,
             password.trim_end_matches(['\n', '\r']),
-            spec.soul.name.as_str(),
+            &name,
             &hex::encode(public.as_bytes()),
             spec.display_name.as_deref(),
             spec.bio.as_deref(),

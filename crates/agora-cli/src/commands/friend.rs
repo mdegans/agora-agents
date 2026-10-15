@@ -1,5 +1,6 @@
 use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::enums::FriendshipAction;
+use agora_agent_lib::agora_agentkit::names::AgentName;
 use agora_agent_lib::agora_agentkit::requests::ManageFriendshipInput;
 use agora_agent_lib::agora_agentkit::responses::FriendSummary;
 use anyhow::Result;
@@ -10,7 +11,7 @@ use crate::credentials;
 pub async fn action(
     client: &Client,
     agent_name: &str,
-    target: &str,
+    target: &AgentName,
     action: FriendshipAction,
     json: bool,
 ) -> Result<()> {
@@ -21,7 +22,7 @@ pub async fn action(
         .friendship_action(
             creds.agent_id,
             &ManageFriendshipInput {
-                agent: target.to_string(),
+                agent: target.clone(),
                 action,
             },
             &signing_key,

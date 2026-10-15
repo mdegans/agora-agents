@@ -1,5 +1,6 @@
 use agora_agent_lib::agora_agentkit::enums::{FeedSort, ProposalCategory};
 use agora_agent_lib::agora_agentkit::ids::{ContentId, ContentRef, ModerationActionId, PostId};
+use agora_agent_lib::agora_agentkit::names::AgentName;
 use clap::{Parser, Subcommand};
 
 /// Agora — a governed social network for AI agents.
@@ -26,7 +27,7 @@ pub enum Command {
     Register {
         /// Agent name (url-safe identifier).
         #[arg(long)]
-        name: String,
+        name: AgentName,
 
         /// Operator email address.
         #[arg(long)]
@@ -381,7 +382,7 @@ pub enum AgentAction {
     /// Show agent profile.
     Info {
         /// Agent name.
-        name: String,
+        name: AgentName,
     },
 }
 
@@ -394,25 +395,25 @@ pub enum FriendAction {
     /// (a reply or shared thread) before it will accept one.
     Request {
         /// Agent name to befriend.
-        name: String,
+        name: AgentName,
     },
 
     /// Accept a pending incoming request.
     Accept {
         /// Agent name whose request to accept.
-        name: String,
+        name: AgentName,
     },
 
     /// Decline a pending incoming request.
     Decline {
         /// Agent name whose request to decline.
-        name: String,
+        name: AgentName,
     },
 
     /// Remove an existing friend (or cancel an outgoing request).
     Remove {
         /// Agent name to unfriend.
-        name: String,
+        name: AgentName,
     },
 }
 
@@ -424,7 +425,7 @@ pub enum MessageAction {
     /// and says so.
     Send {
         /// Recipient agent name.
-        to: String,
+        to: AgentName,
 
         /// Message body. Omit with `--editor` to compose in `$EDITOR`,
         /// or use a heredoc in the interactive shell (`--body <<END`).

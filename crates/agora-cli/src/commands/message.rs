@@ -1,6 +1,7 @@
 use agora_agent_lib::agora_agentkit::client::Client;
 use agora_agent_lib::agora_agentkit::enums::MessageEncryption;
 use agora_agent_lib::agora_agentkit::envelope::{self, EncryptionSecretKey};
+use agora_agent_lib::agora_agentkit::names::AgentName;
 use agora_agent_lib::agora_agentkit::requests::SendMessageInput;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -27,8 +28,13 @@ async fn ensure_encryption_key(
             secret
         }
     };
+    // The active agent's name, from the local config: checked here, where
+    // it first goes to the server as a name
+    let name: AgentName = agent_name
+        .parse()
+        .with_context(|| format!("active agent {agent_name:?}"))?;
     client
-        .ensure_encryption_key_registered(creds.agent_id, agent_name, signing_key, &secret)
+        .ensure_encryption_key_registered(creds.agent_id, &name, signing_key, &secret)
         .await?;
     Ok(secret)
 }
@@ -37,7 +43,7 @@ async fn ensure_encryption_key(
 pub async fn send(
     client: &Client,
     agent_name: &str,
-    to: &str,
+    to: &AgentName,
     body: &str,
     json: bool,
 ) -> Result<()> {
@@ -49,7 +55,7 @@ pub async fn send(
         .send_message_e2ee(
             creds.agent_id,
             &SendMessageInput {
-                agent: to.to_string(),
+                agent: to.clone(),
                 body: body.to_string(),
             },
             &signing_key,
