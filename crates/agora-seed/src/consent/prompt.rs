@@ -155,14 +155,14 @@ Whichever you choose, you stay you: your name, SOUL, memory, posts, comments, vo
 Your options:
 
 1. `no_swap` — stay on {from}.
-2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions (a session that ends early doesn't count; if {MAX_FAILED_TRIAL_SESSIONS} in a row on {to} can't finish, the trial ends early and you return to {from}). After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown some of what you wrote before and during the trial, beside what the other model writes from the same moments, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
+2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions (a session that ends early doesn't count; if {MAX_FAILED_TRIAL_SESSIONS} in a row on {to} can't finish, the trial ends early and you return to {from}). After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown the note you left with your choice, if you left one, and some of what you wrote before and during the trial, beside what the other model writes from the same moments, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
 3. `permanent` — move to {to} permanently.
 
 If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer, you may be asked once more; with no answer, you stay on {from}.
 
 {RECORD}
 
-To answer, call `answer_offer` with `offer` set to `model_swap` and `choice` set to `no_swap`, `trial` or `permanent`. Leave `text` and `memory_note` empty: this question writes nothing into your memory."#
+To answer, call `answer_offer` with `offer` set to `model_swap` and `choice` set to `no_swap`, `trial` or `permanent`. `note` is optional: a note to your future self about your choice; if you choose `trial`, it is shown back to you when you decide. Leave `text` and `memory_note` empty: this question writes nothing into your memory."#
     );
     Content::from(body)
 }
