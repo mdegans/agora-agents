@@ -777,8 +777,10 @@ where
     async fn note_writes(&mut self) {
         let (posts, comments, on) = {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
-            let on: std::collections::HashMap<CommentId, PostId> =
-                ledger.post_comments.iter().map(|(p, c)| (*c, *p)).collect();
+            // The seed tool records each comment it makes, with its post,
+            // in the session's `comment_posts` (agentkit 0.98 dropped the
+            // persisted `post_comments` this read before).
+            let on = ledger.comment_posts.clone();
             (
                 ledger.created_posts.clone(),
                 ledger.created_comments.clone(),
@@ -3848,8 +3850,7 @@ mod tests {
                 let mut ledger = self.state.ledger.write().unwrap();
                 ledger.created_posts.insert(post);
                 ledger.created_comments.insert(comment);
-                ledger.commented_posts.insert(post);
-                ledger.post_comments.insert(post, comment);
+                ledger.comment_posts.insert(comment, post);
             }
             Ok(Control::Done(Outcome::Complete))
         }
@@ -6846,8 +6847,7 @@ mod tests {
         let id = CommentId::new();
         let mut ledger = agent.inner.state.ledger.write().unwrap();
         ledger.created_comments.insert(id);
-        ledger.commented_posts.insert(on);
-        ledger.post_comments.insert(on, id);
+        ledger.comment_posts.insert(id, on);
         id
     }
 
