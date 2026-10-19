@@ -118,14 +118,14 @@ async fn without_the_marker_the_turn_waits_out_the_window() {
 }
 
 /// A reply after the calls ends the turn as the marker does; a marker
-/// with nothing before it sends nothing, and says so
+/// with nothing before it sends nothing, and says so without an error
 #[tokio::test]
 async fn a_reply_after_calls_ends_the_turn_and_a_lone_marker_is_refused() {
     let (inference, ending, driver) = bridge();
     let server = Server::with_windows(driver.events, SHORT);
     let lone = server.join(Joining::End).await;
-    assert!(lone.is_error == Some(true), "{}", text(&lone));
-    assert!(text(&lone).contains("no turn to send"), "{}", text(&lone));
+    assert!(lone.is_error != Some(true), "{}", text(&lone));
+    assert!(text(&lone).contains("Nothing to send"), "{}", text(&lone));
 
     let reactor = one_turn(inference, ending);
     let started = Instant::now();

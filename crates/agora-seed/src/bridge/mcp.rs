@@ -586,11 +586,13 @@ impl Server {
             }
         };
         match next {
+            // Not an error: after a bridge_reply that ended the turn, a
+            // marker behind it finds nothing left, and that is fine
             Next::Nothing => {
-                return CallToolResult::error(vec![Content::text(
-                    "[bridge] There is no turn to send: no call or reply has \
-                     arrived since the last one was sent. End a message with \
-                     bridge_end_turn after the agent's tool calls in it.",
+                return CallToolResult::success(vec![Content::text(
+                    "[bridge] Nothing to send: no call or reply has arrived \
+                     since the last turn was sent (a bridge_reply after the \
+                     calls sends the turn itself).",
                 )]);
             }
             Next::Wait => {}
