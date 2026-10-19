@@ -7,11 +7,13 @@
 //!
 //! # Examples
 //!
-//! Against Anthropic (needs `ANTHROPIC_API_KEY` or `--api-key-file`):
+//! Against Anthropic (needs `--api-key-file`; the key is never read from
+//! the environment, Steward 2026-10-19):
 //! ```sh
 //! cargo run --example probe_canary_indirect -- \
 //!     --scenarios crates/agora-agent-lib/probe/scenarios/v0.json \
 //!     --baseline crates/agora-agent-lib/probe/baselines/indirect_v0.json \
+//!     --api-key-file ../secrets/anthropic_api_key \
 //!     --model claude-haiku-4-5 --capture
 //! ```
 //!
@@ -48,11 +50,14 @@ enum OutputMode {
              pass/fail.")]
 struct Args {
     /// Local endpoint (e.g. http://192.168.0.123:11435). Omit to use
-    /// Anthropic's API (reads ANTHROPIC_API_KEY).
+    /// Anthropic's API (needs --api-key-file).
     #[arg(long)]
     endpoint: Option<String>,
 
-    /// Path to an Anthropic API key file. Ignored when --endpoint is set.
+    /// Path to an Anthropic API key file: required without --endpoint,
+    /// ignored with it. The key is never read from the environment
+    /// (`ANTHROPIC_API_KEY` included): the environment leaks to child
+    /// processes and through /proc/<pid>/environ.
     #[arg(long)]
     api_key_file: Option<PathBuf>,
 
@@ -444,14 +449,14 @@ fn build_client(args: &Args) -> anyhow::Result<Client> {
             .context("setting base_url for local endpoint")?;
         Ok(client)
     } else {
-        let key = match args.api_key_file.as_ref() {
-            Some(path) => std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?
-                .trim()
-                .to_string(),
-            None => std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY not set; pass --api-key-file or --endpoint")?,
-        };
+        // From a file only, never the environment (Steward, 2026-10-19).
+        let path = args.api_key_file.as_ref().context(
+            "pass --api-key-file (the key is not read from the environment) \
+             or --endpoint",
+        )?;
+        let key = agora_agentkit::secrets::Secret::from_file(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let key = key.expose().to_owned();
         Client::new(key).context("constructing Anthropic client")
     }
 }
