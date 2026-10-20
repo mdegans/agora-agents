@@ -11,17 +11,23 @@
 //! the results (notifications, the next phase's request) comes back with
 //! the last call of the turn.
 //!
-//! A turn is sent when `bridge_end_turn` (or a `bridge_reply` after the
-//! turn's calls) arrives, or after a quiet spell with no new call:
-//! [`CALL_WINDOW`] once the turn holds an agent call, [`REPLY_WINDOW`]
-//! while it holds only a reply. Claude Code starts a read-only call as soon
-//! as the model has written it, while the rest of the message is still
-//! being written, so a call with a long input (a comment, feedback)
-//! arrives as many seconds after the one before it as it took to write:
-//! 5.2 s for about 300 words, measured 2026-10-19. A 750 ms window split
-//! such messages into two turns (the betas, 2026-10-19); the end marker
-//! makes the turn exact and immediate, and the long window is the fallback
-//! for a driver that forgets it.
+//! Claude Code hands the calls of one message to an MCP server in no fixed
+//! order, seconds apart (5.2 s measured, 2026-10-19): the end marker often
+//! arrives before the calls written ahead of it. So the marker carries a
+//! count. A message that calls the agent's tools ends with
+//! `bridge_end_turn` and `calls`, the number of the agent's tool calls in
+//! it (or, when it sends text too, with `bridge_reply` and `calls`), and
+//! the turn is sent once that many calls have arrived since the last turn,
+//! whatever their order relative to the marker. The count makes the turn
+//! exact; time only bounds a mistake:
+//!
+//! - more calls than declared, all there when the marker arrives: sent
+//!   together, and the results say so;
+//! - fewer than declared: sent after [`END_WAIT`] with no new call, saying
+//!   so;
+//! - no marker: sent after [`CALL_WINDOW`] with no new call, or
+//!   [`REPLY_WINDOW`] while the turn holds only a reply (the harness's
+//!   phases are answered with a reply alone).
 //!
 //! Claude Code runs MCP calls one at a time unless a tool says it is
 //! read-only, so every tool here says so (`readOnlyHint`). It is a hint
@@ -62,6 +68,11 @@ const DISCONNECT_WAIT: Duration = Duration::from_secs(120);
 /// waits for it
 const CALL_WINDOW: Duration = Duration::from_secs(30);
 
+/// Once a marker has declared a count, a turn still short of it is sent
+/// after this long with no new call: generous, since only a miscount waits
+/// it out, and a turn sent short costs the agent a round
+const END_WAIT: Duration = Duration::from_secs(120);
+
 /// A turn holding only a reply is sent after this long with no new call:
 /// a reply is usually the whole message, and the harness's phases (memory,
 /// reflection) are answered with one
@@ -99,11 +110,12 @@ with any response format it requires; answer that with bridge_reply too.
 - Make a turn's calls together, in one message: a call made after the \
 others have returned is a turn of its own.
 - End every message that calls the agent's tools with bridge_end_turn, \
-as its last call: each call reaches the bridge as soon as you have \
-written it, so the bridge cannot otherwise tell the message is complete, \
-and waits 30 seconds with no new call before sending the turn. When you \
-send text with the calls, make bridge_reply the last call instead (it \
-ends the turn too).
+giving calls: how many of the agent's tool calls the message makes (not \
+counting bridge_ tools). The calls reach the bridge in no fixed order, \
+the marker often first, so the bridge sends the turn once that many have \
+arrived. Without the marker it waits 30 seconds with no new call.
+- To send text with the calls, use bridge_reply with calls in place of \
+bridge_end_turn. Give the count once per message, on one of the two.
 - A result too long for one page continues with bridge_result.
 - bridge_raw_prompt shows the exact request the runner would send to a \
 model, in pages.";
@@ -167,6 +179,8 @@ struct Session {
     current: Option<Request>,
     ended: Option<String>,
     turns: u32,
+    /// Why the last turn was sent
+    previous: Option<Closed>,
 }
 
 impl Session {
@@ -209,9 +223,23 @@ struct Round {
     entries: Vec<(Entry, oneshot::Sender<Outcome>)>,
     /// `bridge_end_turn` calls, answered when the turn is
     ends: Vec<oneshot::Sender<Outcome>>,
+    /// The agent calls the message's marker said it makes, once the marker
+    /// has arrived
+    declared: Option<usize>,
     last: Instant,
-    /// Sent by an end marker rather than by the quiet window
-    ended: bool,
+}
+
+/// Why a turn was sent
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// The declared count arrived
+    Counted,
+    /// More calls than declared had arrived when the marker did
+    Over { declared: usize },
+    /// Fewer than declared arrived before [`END_WAIT`] ran out
+    Short { declared: usize },
+    /// No marker: the quiet window ran out
+    Quiet,
 }
 
 /// How long a turn waits for another call, by what it holds
@@ -219,6 +247,7 @@ struct Round {
 struct Windows {
     call: Duration,
     reply: Duration,
+    end: Duration,
 }
 
 impl Default for Windows {
@@ -226,35 +255,85 @@ impl Default for Windows {
         Self {
             call: CALL_WINDOW,
             reply: REPLY_WINDOW,
+            end: END_WAIT,
         }
     }
 }
 
 impl Round {
-    fn has_calls(&self) -> bool {
+    /// The agent calls that have arrived
+    fn calls(&self) -> usize {
         self.entries
             .iter()
-            .any(|(e, _)| matches!(e, Entry::Call { .. }))
+            .filter(|(e, _)| matches!(e, Entry::Call { .. }))
+            .count()
     }
 
     /// How long this round waits for another call
     fn window(&self, windows: Windows) -> Duration {
-        match self.has_calls() {
-            true => windows.call,
-            false => windows.reply,
+        match (self.declared, self.calls()) {
+            (Some(_), _) => windows.end,
+            (None, 0) => windows.reply,
+            (None, _) => windows.call,
+        }
+    }
+
+    /// Whether the round is complete now, and why
+    fn complete(&self) -> Option<Closed> {
+        let declared = self.declared?;
+        let arrived = self.calls();
+        match arrived.cmp(&declared) {
+            std::cmp::Ordering::Less => None,
+            std::cmp::Ordering::Equal => Some(Closed::Counted),
+            std::cmp::Ordering::Greater => Some(Closed::Over { declared }),
         }
     }
 }
 
-/// What joins a turn: one of its entries, or the end marker
-enum Joining {
-    Entry(Entry),
-    End,
+/// What joins a turn: an entry (a call or a reply), a count of the
+/// message's agent calls (from its marker), or both (a reply with `calls`)
+struct Joining {
+    entry: Option<Entry>,
+    declares: Option<usize>,
+}
+
+impl Joining {
+    fn call(name: impl Into<String>, input: serde_json::Value) -> Self {
+        Self {
+            entry: Some(Entry::Call {
+                name: name.into(),
+                input,
+            }),
+            declares: None,
+        }
+    }
+
+    fn reply(text: impl Into<String>, calls: Option<usize>) -> Self {
+        Self {
+            entry: Some(Entry::Reply(text.into())),
+            declares: calls,
+        }
+    }
+
+    fn end(calls: usize) -> Self {
+        Self {
+            entry: None,
+            declares: Some(calls),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct ReplyInput {
     text: String,
+    /// With tool calls in the same message: how many
+    #[serde(default)]
+    calls: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct EndInput {
+    calls: usize,
 }
 
 #[derive(Deserialize)]
@@ -314,15 +393,15 @@ fn bridge_tools() -> Vec<Tool> {
         .with_annotations(concurrent()),
         Tool::new(
             REPLY,
-            "Answer as the model with text and no tool calls: the agent's \
-             final message for this part of the session, or the answer to \
-             a request the harness makes (such as rewriting memory, in the \
-             format it gives). Called together with tool calls, the text is \
-             sent with them in the same turn.",
+            "Answer as the model with text: alone, to end the agent's turn \
+             or answer the harness's request in the format it gives, or \
+             with `calls` set, in place of bridge_end_turn, to send the text \
+             with that many of the agent's tool calls from the same message.",
             object(json!({
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "The reply, as the model would write it"}
+                    "text": {"type": "string", "description": "The reply, as the model would write it"},
+                    "calls": {"type": "integer", "minimum": 0, "description": "How many of the agent's tool calls this message makes; leave out when it makes none"}
                 },
                 "required": ["text"],
             })),
@@ -330,19 +409,22 @@ fn bridge_tools() -> Vec<Tool> {
         .with_annotations(concurrent()),
         Tool::new(
             END,
-            "Send the turn now: make this the last call of every message \
-             that calls the agent's tools. Each call reaches the bridge as \
-             soon as you have written it, so without this the bridge waits \
-             30 seconds with no new call before sending the turn. A \
-             bridge_reply after the calls ends the turn too.",
-            object(json!({"type": "object", "properties": {}})),
+            "End every message that calls the agent's tools with this, \
+             giving `calls`, so the bridge sends the turn once that many \
+             calls have arrived, in whatever order.",
+            object(json!({
+                "type": "object",
+                "properties": {
+                    "calls": {"type": "integer", "minimum": 0, "description": "How many of the agent's tool calls this message makes, not counting bridge_ tools"}
+                },
+                "required": ["calls"],
+            })),
         )
         .with_annotations(concurrent()),
         Tool::new(
             RESULT,
-            "The rest of a tool result too long for one page. A result over \
-             a page says so and names its call; the agent's model receives \
-             it whole.",
+            "The rest of a tool result too long for one page, from the call \
+             its first page names (the agent's model receives it whole).",
             object(json!({
                 "type": "object",
                 "properties": {
@@ -355,12 +437,10 @@ fn bridge_tools() -> Vec<Tool> {
         .with_annotations(concurrent()),
         Tool::new(
             RAW,
-            "The request the runner would send to a model, in pages: as \
-             Markdown (the default: text exactly as sent, the tool \
-             definitions, each call and result labelled), or with \
-             format \"json\" as the exact request, every field as sent. \
-             For debugging the harness; the agent's model never sees this \
-             view.",
+            "For debugging the harness, the request the runner would send \
+             to a model, in pages: as Markdown (the default: text as sent, \
+             tools, calls and results labelled) or, with format \"json\", \
+             every field exactly as sent.",
             object(json!({
                 "type": "object",
                 "properties": {
@@ -386,6 +466,7 @@ impl Server {
                     current: None,
                     ended: None,
                     turns: 0,
+                    previous: None,
                 }),
                 round: SyncMutex::new(None),
                 rounds: std::sync::atomic::AtomicU64::new(0),
@@ -538,72 +619,58 @@ impl Server {
         ))])
     }
 
-    /// Join the turn being gathered, starting one if none is. An end
-    /// marker, or a reply after the turn's calls, sends it at once
+    /// Join the turn being gathered, starting one if none is. The turn is
+    /// sent as soon as the count its marker declares has arrived
     async fn join(&self, joining: Joining) -> CallToolResult {
         let (tx, rx) = oneshot::channel();
-        enum Next {
-            Wait,
-            Time(u64),
-            Send(Round),
-            Nothing,
-        }
-        let next = {
+        let Joining { entry, declares } = joining;
+        let (send, time) = {
             let mut slot = self.inner.round.lock().expect("not poisoned");
-            match (joining, slot.as_mut()) {
-                (Joining::End, None) => Next::Nothing,
-                (Joining::End, Some(round)) => {
-                    round.ends.push(tx);
-                    round.ended = true;
-                    Next::Send(slot.take().expect("matched"))
+            let mut time = None;
+            if slot.is_none() {
+                // Not an error: a message whose calls all went with the
+                // last turn, ending with a marker for none
+                if entry.is_none() && declares == Some(0) {
+                    return CallToolResult::success(vec![Content::text(
+                        "[bridge] Nothing to send: no call or reply has \
+                         arrived since the last turn was sent.",
+                    )]);
                 }
-                (Joining::Entry(entry), Some(round)) => {
-                    let ends = matches!(entry, Entry::Reply(_)) && round.has_calls();
-                    round.entries.push((entry, tx));
-                    round.last = Instant::now();
-                    match ends {
-                        true => {
-                            round.ended = true;
-                            Next::Send(slot.take().expect("matched"))
-                        }
-                        false => Next::Wait,
-                    }
-                }
-                (Joining::Entry(entry), None) => {
-                    let number = self
-                        .inner
-                        .rounds
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    *slot = Some(Round {
-                        number,
-                        entries: vec![(entry, tx)],
-                        ends: Vec::new(),
-                        last: Instant::now(),
-                        ended: false,
-                    });
-                    Next::Time(number)
-                }
+                let number = self
+                    .inner
+                    .rounds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                *slot = Some(Round {
+                    number,
+                    entries: Vec::new(),
+                    ends: Vec::new(),
+                    declared: None,
+                    last: Instant::now(),
+                });
+                time = Some(number);
             }
+            let round = slot.as_mut().expect("set above");
+            match entry {
+                Some(entry) => round.entries.push((entry, tx)),
+                None => round.ends.push(tx),
+            }
+            round.last = Instant::now();
+            if let Some(n) = declares {
+                // Two markers in one message should agree; the larger
+                // never sends a turn early
+                round.declared = Some(round.declared.map_or(n, |d| d.max(n)));
+            }
+            let send = round
+                .complete()
+                .map(|closed| (slot.take().expect("matched"), closed));
+            (send, time)
         };
-        match next {
-            // Not an error: after a bridge_reply that ended the turn, a
-            // marker behind it finds nothing left, and that is fine
-            Next::Nothing => {
-                return CallToolResult::success(vec![Content::text(
-                    "[bridge] Nothing to send: no call or reply has arrived \
-                     since the last turn was sent (a bridge_reply after the \
-                     calls sends the turn itself).",
-                )]);
-            }
-            Next::Wait => {}
-            Next::Time(number) => {
-                let this = self.clone();
-                tokio::spawn(async move { this.close_round(number).await });
-            }
-            Next::Send(round) => {
-                let this = self.clone();
-                tokio::spawn(async move { this.answer(round).await });
-            }
+        if let Some((round, closed)) = send {
+            let this = self.clone();
+            tokio::spawn(async move { this.answer(round, closed).await });
+        } else if let Some(number) = time {
+            let this = self.clone();
+            tokio::spawn(async move { this.close_round(number).await });
         }
         match rx.await {
             Ok(Outcome { text, is_error }) => {
@@ -620,7 +687,7 @@ impl Server {
     }
 
     /// Send round `number` once its window passes with no new call; return
-    /// if it was sent already, by an end marker
+    /// if it was sent already, by its count
     async fn close_round(&self, number: u64) {
         let round = loop {
             let wait = {
@@ -639,12 +706,69 @@ impl Server {
             };
             tokio::time::sleep(wait).await;
         };
-        self.answer(round).await
+        let closed = match round.declared {
+            Some(declared) => Closed::Short { declared },
+            None => Closed::Quiet,
+        };
+        if round.entries.is_empty() {
+            // Only markers came: nothing for the harness
+            let declared = round.declared.unwrap_or_default();
+            for tx in round.ends {
+                let _ = tx.send(Outcome {
+                    text: format!(
+                        "[bridge] Nothing to send: this marker declared \
+                         {declared} call(s), but none arrived in {} s. Give a \
+                         message's count once, on bridge_end_turn or on \
+                         bridge_reply.",
+                        self.inner.windows.end.as_secs()
+                    ),
+                    is_error: false,
+                });
+            }
+            return;
+        }
+        self.answer(round, closed).await
+    }
+
+    /// What the results of a turn sent other than by its exact count say
+    /// about it
+    fn notice(&self, closed: Closed, arrived: usize, previous: Option<Closed>) -> Option<String> {
+        match closed {
+            Closed::Counted => None,
+            Closed::Over { declared } => Some(format!(
+                "[bridge] The message's calls count was {declared}, but \
+                 {arrived} agent call(s) had arrived when its marker did; \
+                 all {arrived} were sent as this one turn."
+            )),
+            Closed::Short { declared } => Some(format!(
+                "[bridge] The message's calls count was {declared}, but only \
+                 {arrived} agent call(s) arrived within {} s, so the turn was \
+                 sent with those; a call that arrives later is a turn of its \
+                 own.",
+                self.inner.windows.end.as_secs()
+            )),
+            Closed::Quiet if arrived == 0 => None,
+            Closed::Quiet => {
+                let mut text = format!(
+                    "[bridge] No bridge_end_turn arrived, so the turn was sent \
+                     after {} s with no new call: end a message with \
+                     bridge_end_turn and its calls count to send it at once.",
+                    self.inner.windows.call.as_secs_f32()
+                );
+                if previous == Some(Closed::Counted) {
+                    text.push_str(
+                        " If these calls were written in the same message as \
+                         the turn before, its calls count was too low.",
+                    );
+                }
+                Some(text)
+            }
+        }
     }
 
     /// Send a turn to the reactor, wait for what the harness makes of it,
     /// and give each participant its part
-    async fn answer(&self, round: Round) {
+    async fn answer(&self, round: Round, closed: Closed) {
         let mut session = self.inner.session.lock().await;
         let request = match session.wait().await {
             Ok(_) => session.current.take().expect("waited"),
@@ -661,7 +785,9 @@ impl Server {
         };
         session.turns += 1;
         let turn = session.turns;
-        let (ends, ended) = (round.ends, round.ended);
+        let notice = self.notice(closed, round.calls(), session.previous);
+        session.previous = Some(closed);
+        let ends = round.ends;
 
         let mut texts = Vec::new();
         let mut calls = Vec::new();
@@ -850,12 +976,9 @@ impl Server {
                 "\n\n[bridge] Turn {turn}: {name} was one of {n_calls} \
                  call(s) in this turn."
             ));
-            if !ended {
-                text.push_str(&format!(
-                    " It was sent after {} s with no new call: end a message \
-                     with bridge_end_turn to send it at once.",
-                    self.inner.windows.call.as_secs_f32()
-                ));
+            if let Some(notice) = &notice {
+                text.push(' ');
+                text.push_str(notice);
             }
             if calls.peek().is_none() {
                 if !extra.is_empty() {
@@ -874,9 +997,10 @@ impl Server {
             let text = self.paged(&id, text);
             let _ = tx.send(Outcome { text, is_error });
         }
+        let notice = notice.map(|n| format!(" {n}")).unwrap_or_default();
         for tx in ends {
             let _ = tx.send(Outcome {
-                text: format!("[bridge] Turn {turn} sent: {n_calls} call(s)."),
+                text: format!("[bridge] Turn {turn} sent: {n_calls} call(s).{notice}"),
                 is_error: false,
             });
         }
@@ -886,7 +1010,7 @@ impl Server {
                 (0, false) => extra.clone(),
                 (n, _) => format!(
                     "[bridge] Turn {turn}: sent as text with {n} tool \
-                     call(s); their results came back to those calls."
+                     call(s); their results came back to those calls.{notice}"
                 ),
             };
             let _ = tx.send(Outcome {
@@ -941,12 +1065,12 @@ impl ServerHandler for Server {
         Ok(match &*request.name {
             BEGIN => self.begin().await,
             REPLY => match serde_json::from_value::<ReplyInput>(input) {
-                Ok(ReplyInput { text }) if text.trim().is_empty() => {
+                Ok(ReplyInput { text, .. }) if text.trim().is_empty() => {
                     CallToolResult::error(vec![Content::text(
                         "[bridge] A reply needs text: a model's reply is never empty.",
                     )])
                 }
-                Ok(ReplyInput { text }) => self.join(Joining::Entry(Entry::Reply(text))).await,
+                Ok(ReplyInput { text, calls }) => self.join(Joining::reply(text, calls)).await,
                 Err(e) => invalid(e),
             },
             RESULT => match serde_json::from_value::<ResultInput>(input) {
@@ -957,14 +1081,16 @@ impl ServerHandler for Server {
                 Ok(RawInput { offset, format }) => self.raw(offset, format),
                 Err(e) => invalid(e),
             },
-            END => self.join(Joining::End).await,
-            name if self.is_agent_tool(name) => {
-                self.join(Joining::Entry(Entry::Call {
-                    name: name.to_string(),
-                    input,
-                }))
-                .await
-            }
+            END => match serde_json::from_value::<EndInput>(input) {
+                Ok(EndInput { calls }) => self.join(Joining::end(calls)).await,
+                Err(e) => CallToolResult::error(vec![Content::text(format!(
+                    "[bridge] bridge_end_turn needs calls, how many of the \
+                     agent's tool calls this message makes ({e}); without it \
+                     the turn is sent after {} s with no new call.",
+                    self.inner.windows.call.as_secs()
+                ))]),
+            },
+            name if self.is_agent_tool(name) => self.join(Joining::call(name, input)).await,
             name => CallToolResult::error(vec![Content::text(format!(
                 "[bridge] No tool is named {name}."
             ))]),
