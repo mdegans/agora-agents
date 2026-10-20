@@ -29,6 +29,119 @@ fn text(result: &CallToolResult) -> String {
         .to_string()
 }
 
+/// Windows short enough for a test: a call 0.25 s after the one before
+/// stands in for one the model took seconds to write
+const SHORT: Windows = Windows {
+    call: Duration::from_millis(600),
+    reply: Duration::from_millis(100),
+};
+
+fn call(name: &str) -> Joining {
+    Joining::Entry(Entry::Call {
+        name: name.into(),
+        input: json!({}),
+    })
+}
+
+/// A stand-in reactor that answers one turn's calls and ends the run,
+/// giving back what the turn held
+fn one_turn(
+    inference: crate::bridge::BridgeInference,
+    ending: crate::bridge::Ending,
+) -> tokio::task::JoinHandle<Vec<Value>> {
+    tokio::spawn(async move {
+        let first = json!([{"role": "user", "content": "Welcome to Agora."}]);
+        let answer = inference.infer(request(first)).await.unwrap();
+        ending.ended("the run is over").await;
+        content(&answer)
+    })
+}
+
+/// Claude Code starts a call as soon as the model has written it, so a
+/// call with a long input arrives seconds after the one before it (5.2 s
+/// for ~300 words, 2026-10-19): one message is still one turn, sent when
+/// the end marker arrives
+#[tokio::test]
+async fn a_slow_call_in_the_same_message_is_the_same_turn() {
+    let (inference, ending, driver) = bridge();
+    let server = Server::with_windows(driver.events, SHORT);
+    let reactor = one_turn(inference, ending);
+    let started = Instant::now();
+    let (vote, comment, end) = tokio::join!(
+        server.join(call("get_feed")),
+        async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            server.join(call("get_inbox")).await
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(450)).await;
+            server.join(Joining::End).await
+        },
+    );
+    let blocks = reactor.await.unwrap();
+    assert_eq!(blocks.len(), 2, "one turn: {blocks:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "sent at the marker"
+    );
+    for result in [&vote, &comment] {
+        assert!(
+            text(result).contains("one of 2 call(s)"),
+            "{}",
+            text(result)
+        );
+    }
+    assert!(
+        text(&end).contains("Turn 1 sent: 2 call(s)"),
+        "{}",
+        text(&end)
+    );
+}
+
+/// A driver that forgets the marker gets its turn after the quiet window,
+/// whole, and is told how to send it at once
+#[tokio::test]
+async fn without_the_marker_the_turn_waits_out_the_window() {
+    let (inference, ending, driver) = bridge();
+    let server = Server::with_windows(driver.events, SHORT);
+    let reactor = one_turn(inference, ending);
+    let started = Instant::now();
+    let (first, second) = tokio::join!(server.join(call("get_feed")), async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        server.join(call("get_inbox")).await
+    });
+    assert_eq!(reactor.await.unwrap().len(), 2);
+    assert!(started.elapsed() >= Duration::from_millis(400) + SHORT.call);
+    for result in [&first, &second] {
+        assert!(text(result).contains("end a message with bridge_end_turn"));
+    }
+}
+
+/// A reply after the calls ends the turn as the marker does; a marker
+/// with nothing before it sends nothing, and says so without an error
+#[tokio::test]
+async fn a_reply_after_calls_ends_the_turn_and_a_lone_marker_is_refused() {
+    let (inference, ending, driver) = bridge();
+    let server = Server::with_windows(driver.events, SHORT);
+    let lone = server.join(Joining::End).await;
+    assert!(lone.is_error != Some(true), "{}", text(&lone));
+    assert!(text(&lone).contains("Nothing to send"), "{}", text(&lone));
+
+    let reactor = one_turn(inference, ending);
+    let started = Instant::now();
+    let (_, reply) = tokio::join!(server.join(call("get_feed")), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        server
+            .join(Joining::Entry(Entry::Reply("Reading.".into())))
+            .await
+    });
+    let blocks = reactor.await.unwrap();
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert_eq!(blocks[0]["type"], "text");
+    assert!(started.elapsed() < SHORT.call);
+    assert!(text(&reply).contains("sent as text with 1 tool call(s)"));
+}
+
 #[tokio::test]
 async fn a_turn_of_parallel_calls_then_a_reply_and_a_phase() {
     let (inference, ending, driver) = bridge();
@@ -82,17 +195,17 @@ async fn a_turn_of_parallel_calls_then_a_reply_and_a_phase() {
     });
 
     assert!(text(&server.begin().await).contains("Welcome to Agora."));
-    let (feed, inbox) = tokio::join!(
-        server.join(Entry::Call {
-            name: "get_feed".into(),
-            input: json!({})
-        }),
-        server.join(Entry::Call {
-            name: "get_inbox".into(),
-            input: json!({})
-        }),
+    let (feed, inbox, end) = tokio::join!(
+        server.join(call("get_feed")),
+        server.join(call("get_inbox")),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server.join(Joining::End).await
+        },
     );
     let (feed, inbox) = (text(&feed), text(&inbox));
+    assert_eq!(text(&end), "[bridge] Turn 1 sent: 2 call(s).");
+    assert!(!feed.contains("with no new call"), "{feed}");
     assert!(feed.contains("result of get_feed") && inbox.contains("result of get_inbox"));
     // What else came is with the last call only
     assert_eq!(
@@ -103,13 +216,19 @@ async fn a_turn_of_parallel_calls_then_a_reply_and_a_phase() {
         1
     );
 
-    let reply = text(&server.join(Entry::Reply("That is all.".into())).await);
+    let reply = text(
+        &server
+            .join(Joining::Entry(Entry::Reply("That is all.".into())))
+            .await,
+    );
     assert!(reply.contains("Rewrite your memory."), "{reply}");
     assert!(reply.contains("response format"), "{reply}");
 
     let last = text(
         &server
-            .join(Entry::Reply("{\"memory\": \"kept\"}".into()))
+            .join(Joining::Entry(Entry::Reply(
+                "{\"memory\": \"kept\"}".into(),
+            )))
             .await,
     );
     assert!(last.contains("the run is over"), "{last}");

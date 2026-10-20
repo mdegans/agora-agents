@@ -1,14 +1,27 @@
 //! The driver's side of the bridge: an MCP server on stdio.
 //!
-//! It offers the agent's own tools, as the harness defines them, and three
-//! of its own, named `bridge_*` so they are never mistaken for the
-//! agent's: `bridge_begin` (the prompt so far), `bridge_reply` (an answer
-//! with no tool calls, or text sent with them) and `bridge_raw_prompt` (the
-//! exact request). The calls the driver makes together, within
-//! [`ROUND_WINDOW`] of each other, are one assistant turn: the harness runs
-//! them, and each call's result is that tool's result. What else the
-//! harness sends with the results (notifications, the next phase's
-//! request) comes back with the last call of the turn.
+//! It offers the agent's own tools, as the harness defines them, and its
+//! own, named `bridge_*` so they are never mistaken for the agent's:
+//! `bridge_begin` (the prompt so far), `bridge_reply` (an answer with no
+//! tool calls, or text sent with them), `bridge_end_turn` (the message is
+//! complete: send the turn), `bridge_result` (a long result's next page)
+//! and `bridge_raw_prompt` (the exact request). The calls the driver makes
+//! in one message are one assistant turn: the harness runs them, and each
+//! call's result is that tool's result. What else the harness sends with
+//! the results (notifications, the next phase's request) comes back with
+//! the last call of the turn.
+//!
+//! A turn is sent when `bridge_end_turn` (or a `bridge_reply` after the
+//! turn's calls) arrives, or after a quiet spell with no new call:
+//! [`CALL_WINDOW`] once the turn holds an agent call, [`REPLY_WINDOW`]
+//! while it holds only a reply. Claude Code starts a read-only call as soon
+//! as the model has written it, while the rest of the message is still
+//! being written, so a call with a long input (a comment, feedback)
+//! arrives as many seconds after the one before it as it took to write:
+//! 5.2 s for about 300 words, measured 2026-10-19. A 750 ms window split
+//! such messages into two turns (the betas, 2026-10-19); the end marker
+//! makes the turn exact and immediate, and the long window is the fallback
+//! for a driver that forgets it.
 //!
 //! Claude Code runs MCP calls one at a time unless a tool says it is
 //! read-only, so every tool here says so (`readOnlyHint`). It is a hint
@@ -16,7 +29,8 @@
 //! Agora exactly as they do for any agent.
 
 use std::sync::{Arc, Mutex as SyncMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use misanthropic::prompt::message::{Block, Role};
 use misanthropic::response::Message;
@@ -41,15 +55,24 @@ const LIST_WAIT: Duration = Duration::from_secs(20);
 /// the ending and disconnect
 const DISCONNECT_WAIT: Duration = Duration::from_secs(120);
 
-/// Calls arriving within this long of the one before are one turn. Claude
-/// Code sends a turn's parallel calls about 0.1 s apart.
-const ROUND_WINDOW: Duration = Duration::from_millis(750);
+/// Without an end marker, a turn holding an agent call is sent after this
+/// long with no new call. Long, because the gap between two calls of one
+/// message is the time the model took to write the second (see the module
+/// docs); a driver that ends its messages with `bridge_end_turn` never
+/// waits for it
+const CALL_WINDOW: Duration = Duration::from_secs(30);
+
+/// A turn holding only a reply is sent after this long with no new call:
+/// a reply is usually the whole message, and the harness's phases (memory,
+/// reflection) are answered with one
+const REPLY_WINDOW: Duration = Duration::from_millis(750);
 
 /// Characters of the raw request per `bridge_raw_prompt` page
 const RAW_PAGE: usize = 40_000;
 
 const BEGIN: &str = "bridge_begin";
 const REPLY: &str = "bridge_reply";
+const END: &str = "bridge_end_turn";
 const RAW: &str = "bridge_raw_prompt";
 const RESULT: &str = "bridge_result";
 
@@ -75,6 +98,12 @@ the agent's memory, for example), its request comes back as the result, \
 with any response format it requires; answer that with bridge_reply too.
 - Make a turn's calls together, in one message: a call made after the \
 others have returned is a turn of its own.
+- End every message that calls the agent's tools with bridge_end_turn, \
+as its last call: each call reaches the bridge as soon as you have \
+written it, so the bridge cannot otherwise tell the message is complete, \
+and waits 30 seconds with no new call before sending the turn. When you \
+send text with the calls, make bridge_reply the last call instead (it \
+ends the turn too).
 - A result too long for one page continues with bridge_result.
 - bridge_raw_prompt shows the exact request the runner would send to a \
 model, in pages.";
@@ -120,6 +149,10 @@ pub struct Server {
 struct Inner {
     session: Mutex<Session>,
     round: SyncMutex<Option<Round>>,
+    /// Numbers the rounds, so a round's timer closes only its own
+    rounds: std::sync::atomic::AtomicU64,
+    /// [`CALL_WINDOW`] and [`REPLY_WINDOW`]; shorter in tests
+    windows: Windows,
     /// The latest request, pretty-printed, for `bridge_raw_prompt`
     raw: SyncMutex<Option<RawViews>>,
     /// Results longer than a page, by call id, for `bridge_result`
@@ -171,8 +204,52 @@ enum Entry {
 
 /// The calls and replies of one turn, as they arrive
 struct Round {
+    /// Which round this is, for its timer
+    number: u64,
     entries: Vec<(Entry, oneshot::Sender<Outcome>)>,
+    /// `bridge_end_turn` calls, answered when the turn is
+    ends: Vec<oneshot::Sender<Outcome>>,
     last: Instant,
+    /// Sent by an end marker rather than by the quiet window
+    ended: bool,
+}
+
+/// How long a turn waits for another call, by what it holds
+#[derive(Debug, Clone, Copy)]
+struct Windows {
+    call: Duration,
+    reply: Duration,
+}
+
+impl Default for Windows {
+    fn default() -> Self {
+        Self {
+            call: CALL_WINDOW,
+            reply: REPLY_WINDOW,
+        }
+    }
+}
+
+impl Round {
+    fn has_calls(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|(e, _)| matches!(e, Entry::Call { .. }))
+    }
+
+    /// How long this round waits for another call
+    fn window(&self, windows: Windows) -> Duration {
+        match self.has_calls() {
+            true => windows.call,
+            false => windows.reply,
+        }
+    }
+}
+
+/// What joins a turn: one of its entries, or the end marker
+enum Joining {
+    Entry(Entry),
+    End,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +329,16 @@ fn bridge_tools() -> Vec<Tool> {
         )
         .with_annotations(concurrent()),
         Tool::new(
+            END,
+            "Send the turn now: make this the last call of every message \
+             that calls the agent's tools. Each call reaches the bridge as \
+             soon as you have written it, so without this the bridge waits \
+             30 seconds with no new call before sending the turn. A \
+             bridge_reply after the calls ends the turn too.",
+            object(json!({"type": "object", "properties": {}})),
+        )
+        .with_annotations(concurrent()),
+        Tool::new(
             RESULT,
             "The rest of a tool result too long for one page. A result over \
              a page says so and names its call; the agent's model receives \
@@ -288,6 +375,10 @@ fn bridge_tools() -> Vec<Tool> {
 
 impl Server {
     fn new(events: mpsc::Receiver<Event>) -> Self {
+        Self::with_windows(events, Windows::default())
+    }
+
+    fn with_windows(events: mpsc::Receiver<Event>, windows: Windows) -> Self {
         Self {
             inner: Arc::new(Inner {
                 session: Mutex::new(Session {
@@ -297,6 +388,8 @@ impl Server {
                     turns: 0,
                 }),
                 round: SyncMutex::new(None),
+                rounds: std::sync::atomic::AtomicU64::new(0),
+                windows,
                 raw: SyncMutex::new(None),
                 pages: SyncMutex::new(std::collections::HashMap::new()),
                 tools: watch::Sender::new(None),
@@ -445,23 +538,72 @@ impl Server {
         ))])
     }
 
-    /// Join the turn being gathered, starting one if none is
-    async fn join(&self, entry: Entry) -> CallToolResult {
+    /// Join the turn being gathered, starting one if none is. An end
+    /// marker, or a reply after the turn's calls, sends it at once
+    async fn join(&self, joining: Joining) -> CallToolResult {
         let (tx, rx) = oneshot::channel();
-        let start = {
-            let mut round = self.inner.round.lock().expect("not poisoned");
-            let start = round.is_none();
-            let round = round.get_or_insert_with(|| Round {
-                entries: Vec::new(),
-                last: Instant::now(),
-            });
-            round.entries.push((entry, tx));
-            round.last = Instant::now();
-            start
+        enum Next {
+            Wait,
+            Time(u64),
+            Send(Round),
+            Nothing,
+        }
+        let next = {
+            let mut slot = self.inner.round.lock().expect("not poisoned");
+            match (joining, slot.as_mut()) {
+                (Joining::End, None) => Next::Nothing,
+                (Joining::End, Some(round)) => {
+                    round.ends.push(tx);
+                    round.ended = true;
+                    Next::Send(slot.take().expect("matched"))
+                }
+                (Joining::Entry(entry), Some(round)) => {
+                    let ends = matches!(entry, Entry::Reply(_)) && round.has_calls();
+                    round.entries.push((entry, tx));
+                    round.last = Instant::now();
+                    match ends {
+                        true => {
+                            round.ended = true;
+                            Next::Send(slot.take().expect("matched"))
+                        }
+                        false => Next::Wait,
+                    }
+                }
+                (Joining::Entry(entry), None) => {
+                    let number = self
+                        .inner
+                        .rounds
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    *slot = Some(Round {
+                        number,
+                        entries: vec![(entry, tx)],
+                        ends: Vec::new(),
+                        last: Instant::now(),
+                        ended: false,
+                    });
+                    Next::Time(number)
+                }
+            }
         };
-        if start {
-            let this = self.clone();
-            tokio::spawn(async move { this.close_round().await });
+        match next {
+            // Not an error: after a bridge_reply that ended the turn, a
+            // marker behind it finds nothing left, and that is fine
+            Next::Nothing => {
+                return CallToolResult::success(vec![Content::text(
+                    "[bridge] Nothing to send: no call or reply has arrived \
+                     since the last turn was sent (a bridge_reply after the \
+                     calls sends the turn itself).",
+                )]);
+            }
+            Next::Wait => {}
+            Next::Time(number) => {
+                let this = self.clone();
+                tokio::spawn(async move { this.close_round(number).await });
+            }
+            Next::Send(round) => {
+                let this = self.clone();
+                tokio::spawn(async move { this.answer(round).await });
+            }
         }
         match rx.await {
             Ok(Outcome { text, is_error }) => {
@@ -477,16 +619,25 @@ impl Server {
         }
     }
 
-    async fn close_round(&self) {
+    /// Send round `number` once its window passes with no new call; return
+    /// if it was sent already, by an end marker
+    async fn close_round(&self, number: u64) {
         let round = loop {
-            tokio::time::sleep(ROUND_WINDOW).await;
-            let mut slot = self.inner.round.lock().expect("not poisoned");
-            if slot
-                .as_ref()
-                .is_some_and(|r| r.last.elapsed() >= ROUND_WINDOW)
-            {
-                break slot.take().expect("checked");
-            }
+            let wait = {
+                let mut slot = self.inner.round.lock().expect("not poisoned");
+                match slot.as_ref() {
+                    Some(r) if r.number == number => {
+                        let window = r.window(self.inner.windows);
+                        let quiet = r.last.elapsed();
+                        if quiet >= window {
+                            break slot.take().expect("matched");
+                        }
+                        window - quiet
+                    }
+                    _ => return,
+                }
+            };
+            tokio::time::sleep(wait).await;
         };
         self.answer(round).await
     }
@@ -498,7 +649,8 @@ impl Server {
         let request = match session.wait().await {
             Ok(_) => session.current.take().expect("waited"),
             Err(why) => {
-                for (_, tx) in round.entries {
+                let all = round.entries.into_iter().map(|(_, tx)| tx);
+                for tx in all.chain(round.ends) {
                     let _ = tx.send(Outcome {
                         text: format!("[bridge] The session is over: {why}"),
                         is_error: true,
@@ -509,6 +661,7 @@ impl Server {
         };
         session.turns += 1;
         let turn = session.turns;
+        let (ends, ended) = (round.ends, round.ended);
 
         let mut texts = Vec::new();
         let mut calls = Vec::new();
@@ -554,7 +707,8 @@ impl Server {
                 // The request stays unanswered: the driver may try again
                 session.current = Some(request);
                 let text = format!("[bridge] This turn could not be built: {e}");
-                for tx in replies.into_iter().chain(calls.into_iter().map(|c| c.3)) {
+                let all = replies.into_iter().chain(calls.into_iter().map(|c| c.3));
+                for tx in all.chain(ends) {
                     let _ = tx.send(Outcome {
                         text: text.clone(),
                         is_error: true,
@@ -696,6 +850,13 @@ impl Server {
                 "\n\n[bridge] Turn {turn}: {name} was one of {n_calls} \
                  call(s) in this turn."
             ));
+            if !ended {
+                text.push_str(&format!(
+                    " It was sent after {} s with no new call: end a message \
+                     with bridge_end_turn to send it at once.",
+                    self.inner.windows.call.as_secs_f32()
+                ));
+            }
             if calls.peek().is_none() {
                 if !extra.is_empty() {
                     text.push_str("\n\n");
@@ -712,6 +873,12 @@ impl Server {
             }
             let text = self.paged(&id, text);
             let _ = tx.send(Outcome { text, is_error });
+        }
+        for tx in ends {
+            let _ = tx.send(Outcome {
+                text: format!("[bridge] Turn {turn} sent: {n_calls} call(s)."),
+                is_error: false,
+            });
         }
         for tx in replies {
             let text = match (n_calls, extra.is_empty()) {
@@ -779,7 +946,7 @@ impl ServerHandler for Server {
                         "[bridge] A reply needs text: a model's reply is never empty.",
                     )])
                 }
-                Ok(ReplyInput { text }) => self.join(Entry::Reply(text)).await,
+                Ok(ReplyInput { text }) => self.join(Joining::Entry(Entry::Reply(text))).await,
                 Err(e) => invalid(e),
             },
             RESULT => match serde_json::from_value::<ResultInput>(input) {
@@ -790,11 +957,12 @@ impl ServerHandler for Server {
                 Ok(RawInput { offset, format }) => self.raw(offset, format),
                 Err(e) => invalid(e),
             },
+            END => self.join(Joining::End).await,
             name if self.is_agent_tool(name) => {
-                self.join(Entry::Call {
+                self.join(Joining::Entry(Entry::Call {
                     name: name.to_string(),
                     input,
-                })
+                }))
                 .await
             }
             name => CallToolResult::error(vec![Content::text(format!(
