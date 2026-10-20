@@ -34,11 +34,21 @@ fn call(name: &str) -> Joining {
 }
 
 /// A stand-in reactor that answers `turns` turns, each with a result per
-/// call, then ends the run, giving back what each turn held
+/// call naming the call, then ends the run, giving back what each turn held
 fn reactor(
     inference: crate::bridge::BridgeInference,
     ending: crate::bridge::Ending,
     turns: usize,
+) -> tokio::task::JoinHandle<Vec<Vec<Value>>> {
+    slow_reactor(inference, ending, turns, Duration::ZERO)
+}
+
+/// [`reactor`], taking `runs` to run each turn's tools
+fn slow_reactor(
+    inference: crate::bridge::BridgeInference,
+    ending: crate::bridge::Ending,
+    turns: usize,
+    runs: Duration,
 ) -> tokio::task::JoinHandle<Vec<Vec<Value>>> {
     tokio::spawn(async move {
         let mut messages = vec![json!({"role": "user", "content": "Welcome to Agora."})];
@@ -49,11 +59,15 @@ fn reactor(
                 .await
                 .unwrap();
             let blocks = content(&answer);
+            tokio::time::sleep(runs).await;
             messages.push(json!({"role": "assistant", "content": blocks.clone()}));
             let results: Vec<Value> = blocks
                 .iter()
                 .filter(|b| b["type"] == "tool_use")
-                .map(|b| json!({"type": "tool_result", "tool_use_id": b["id"], "content": "done"}))
+                .map(|b| {
+                    let id = b["id"].as_str().unwrap();
+                    json!({"type": "tool_result", "tool_use_id": id, "content": format!("result of {id}")})
+                })
                 .collect();
             let next = match results.is_empty() {
                 true => json!({"role": "user", "content": "Go on."}),
@@ -187,7 +201,9 @@ async fn an_over_count_sends_what_arrived_and_says_so() {
 async fn an_over_count_after_the_marker_is_named_in_the_next_turn() {
     let (inference, ending, driver) = bridge();
     let server = Server::new(driver.events);
-    let turns = reactor(inference, ending, 2);
+    // The harness takes 3 s to run the first turn's call: the straggler
+    // arrives while it does, so it is known to be one
+    let turns = slow_reactor(inference, ending, 3, Duration::from_secs(3));
     let results = arrive(
         &server,
         vec![
@@ -197,22 +213,36 @@ async fn an_over_count_after_the_marker_is_named_in_the_next_turn() {
         ],
     )
     .await;
-    let turns = turns.await.unwrap();
-    assert_eq!(
-        turns.iter().map(|t| tool_uses(t)).collect::<Vec<_>>(),
-        [1, 1]
-    );
     assert_eq!(results[0], "[bridge] Turn 1 sent: 1 call(s).");
     assert!(
-        !results[1].contains("[bridge] No bridge_end_turn"),
+        results[1].contains("result of toolu_bridge_1_0"),
         "{}",
         results[1]
     );
-    assert!(results[2].contains("Turn 2"), "{}", results[2]);
+    assert!(
+        results[2].contains("result of toolu_bridge_2_0"),
+        "{}",
+        results[2]
+    );
+    assert!(!results[2].contains("No bridge_end_turn"), "{}", results[2]);
     assert!(
         results[2].contains("calls count was too low"),
         "{}",
         results[2]
+    );
+    // A call after the results are back is a new message, and is not
+    // called a straggler
+    let late = arrive(&server, vec![(0, call("get_feed"))]).await;
+    assert!(
+        late[0].contains("No bridge_end_turn arrived"),
+        "{}",
+        late[0]
+    );
+    assert!(!late[0].contains("too low"), "{}", late[0]);
+    let turns = turns.await.unwrap();
+    assert_eq!(
+        turns.iter().map(|t| tool_uses(t)).collect::<Vec<_>>(),
+        [1, 1, 1]
     );
 }
 
@@ -237,7 +267,9 @@ async fn an_under_count_times_out_and_says_so() {
     assert_eq!(started.elapsed(), Duration::from_millis(2_000) + END_WAIT);
     for result in &results {
         assert!(
-            result.contains("calls count was 3, but only 2 agent call(s) arrived within 120 s"),
+            result.contains(
+                "calls count was 3, but only 2 agent call(s) arrived before 120 s passed"
+            ),
             "{result}"
         );
     }
@@ -301,6 +333,53 @@ async fn a_marker_with_nothing_to_send_is_not_an_error() {
     assert!(text(&stray).contains("none arrived"), "{}", text(&stray));
 }
 
+/// A second marker for a message whose turn is being answered says so at
+/// once, rather than waiting for calls that will not come
+#[tokio::test(start_paused = true)]
+async fn a_second_marker_while_the_turn_is_answered_returns_at_once() {
+    let (inference, ending, driver) = bridge();
+    let server = Server::new(driver.events);
+    let turns = slow_reactor(inference, ending, 1, Duration::from_secs(3));
+    let started = Instant::now();
+    let results = arrive(
+        &server,
+        vec![
+            (0, Joining::reply("Reading.", Some(1))),
+            (500, call("get_feed")),
+            (1_000, Joining::end(1)),
+        ],
+    )
+    .await;
+    assert_eq!(turns.await.unwrap()[0].len(), 2);
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(results[2].contains("Nothing to send"), "{}", results[2]);
+}
+
+/// A call whose caller has gone is not run, and its round is not joined by
+/// the next message
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_round_is_not_joined() {
+    let (inference, ending, driver) = bridge();
+    let server = Server::new(driver.events);
+    let turns = one_turn(inference, ending);
+    let gone = {
+        let server = server.clone();
+        tokio::spawn(async move { server.join(call("get_inbox")).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gone.abort();
+    let _ = gone.await;
+    let results = arrive(
+        &server,
+        vec![(1_000, call("get_feed")), (1_100, Joining::end(1))],
+    )
+    .await;
+    let blocks = turns.await.unwrap();
+    assert_eq!(tool_uses(&blocks), 1);
+    assert_eq!(blocks[0]["name"], "get_feed");
+    assert_eq!(results[1], "[bridge] Turn 1 sent: 1 call(s).");
+}
+
 #[test]
 fn the_end_marker_requires_its_count() {
     assert!(serde_json::from_value::<EndInput>(json!({})).is_err());
@@ -323,18 +402,88 @@ fn bridge_tool_descriptions_are_one_sentence() {
     }
 }
 
+/// One message's arrivals: `k` agent calls and its marker (a reply with
+/// the count when `with_text`) at `marker_at`, each after its gap; and
+/// when the last arrives
+fn message(
+    k: usize,
+    marker_at: usize,
+    gaps: &[u64],
+    with_text: bool,
+) -> (Vec<(u64, Joining)>, u64) {
+    let mut joinings: Vec<Joining> = (0..k)
+        .map(|i| call(["get_feed", "get_inbox"][i % 2]))
+        .collect();
+    let marker = match with_text {
+        true => Joining::reply("Here goes.", Some(k)),
+        false => Joining::end(k),
+    };
+    joinings.insert(marker_at.min(k), marker);
+    let mut at = 0;
+    let arrivals = joinings
+        .into_iter()
+        .zip(gaps)
+        .map(|(j, gap)| {
+            at += gap;
+            (at, j)
+        })
+        .collect();
+    (arrivals, at)
+}
+
+/// That a message's results are its turn's, each call's its own
+fn check(turn: usize, k: usize, marker_at: usize, with_text: bool, results: &[String]) {
+    let mut ids = std::collections::BTreeSet::new();
+    for (i, result) in results.iter().enumerate() {
+        assert!(!result.contains("calls count"), "{result}");
+        assert!(!result.contains("No bridge_end_turn"), "{result}");
+        match (i == marker_at.min(k), with_text) {
+            (true, false) => {
+                assert_eq!(result, &format!("[bridge] Turn {turn} sent: {k} call(s)."))
+            }
+            // A reply alone gets what the harness sent next
+            (true, true) if k == 0 => assert!(result.contains("Go on."), "{result}"),
+            (true, true) => assert!(
+                result.contains(&format!("sent as text with {k} tool call(s)")),
+                "{result}"
+            ),
+            (false, _) => {
+                assert!(
+                    result.contains(&format!("Turn {turn}: get_"))
+                        && result.contains(&format!("one of {k} call(s)")),
+                    "{result}"
+                );
+                let id = result
+                    .split("result of ")
+                    .nth(1)
+                    .and_then(|r| r.split_whitespace().next())
+                    .unwrap_or_else(|| panic!("no result: {result}"));
+                assert!(id.starts_with(&format!("toolu_bridge_{turn}_")), "{result}");
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    assert_eq!(ids.len(), k, "each call has its own result");
+}
+
 proptest::proptest! {
     /// One message is one turn, sent the moment its last call arrives,
     /// whatever the order of its calls and its marker and however far
-    /// apart they arrive (each gap under the quiet window)
+    /// apart they arrive (each gap under the quiet window); the next
+    /// message, begun once the first's results are back, is the next turn
     #[test]
     fn one_message_is_one_turn(
-        k in 1usize..=6,
+        k in 0usize..=6,
         marker_at in 0usize..=6,
         gaps in proptest::collection::vec(0u64..25_000, 7),
         with_text in proptest::bool::ANY,
+        k2 in 1usize..=6,
+        marker_at2 in 0usize..=6,
+        gaps2 in proptest::collection::vec(0u64..25_000, 7),
+        runs in 0u64..5_000,
     ) {
-        let marker_at = marker_at.min(k);
+        // A message with no calls answers with a reply
+        let with_text = with_text || k == 0;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -343,43 +492,29 @@ proptest::proptest! {
         runtime.block_on(async move {
             let (inference, ending, driver) = bridge();
             let server = Server::new(driver.events);
-            let turns = one_turn(inference, ending);
-            let mut joinings: Vec<Joining> = (0..k).map(|i| call(["get_feed", "get_inbox"][i % 2])).collect();
-            let marker = match with_text {
-                true => Joining::reply("Here goes.", Some(k)),
-                false => Joining::end(k),
-            };
-            joinings.insert(marker_at, marker);
-            let mut at = 0;
-            let arrivals: Vec<(u64, Joining)> = joinings
-                .into_iter()
-                .zip(&gaps)
-                .map(|(j, gap)| {
-                    at += gap;
-                    (at, j)
-                })
-                .collect();
-            let last = at;
+            // Three turns, so the second's results are real ones
+            let turns = slow_reactor(inference, ending, 3, Duration::from_millis(runs));
+
+            let (arrivals, last) = message(k, marker_at, &gaps, with_text);
             let started = Instant::now();
             let results = arrive(&server, arrivals).await;
-            let blocks = turns.await.unwrap();
-            assert_eq!(tool_uses(&blocks), k, "{blocks:?}");
-            assert_eq!(blocks.len(), k + usize::from(with_text));
-            assert_eq!(started.elapsed(), Duration::from_millis(last), "sent at once");
-            for (i, result) in results.iter().enumerate() {
-                assert!(!result.contains("calls count"), "{result}");
-                assert!(!result.contains("No bridge_end_turn"), "{result}");
-                match (i == marker_at, with_text) {
-                    (true, false) => assert_eq!(result, &format!("[bridge] Turn 1 sent: {k} call(s).")),
-                    (true, true) => assert!(result.contains(&format!("sent as text with {k} tool call(s)")), "{result}"),
-                    (false, _) => assert!(result.contains("Turn 1: get_") && result.contains(&format!("one of {k} call(s)")), "{result}"),
-                }
-            }
+            assert_eq!(started.elapsed(), Duration::from_millis(last + runs), "sent at once");
+            check(1, k, marker_at, with_text, &results);
+
+            let (arrivals, _) = message(k2, marker_at2, &gaps2, false);
+            let results = arrive(&server, arrivals).await;
+            check(2, k2, marker_at2, false, &results);
+            server.join(Joining::reply("Done.", None)).await;
+
+            let turns = turns.await.unwrap();
+            assert_eq!(tool_uses(&turns[0]), k, "{:?}", turns[0]);
+            assert_eq!(turns[0].len(), k + usize::from(with_text));
+            assert_eq!(turns[1].len(), k2, "{:?}", turns[1]);
         });
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_turn_of_parallel_calls_then_a_reply_and_a_phase() {
     let (inference, ending, driver) = bridge();
     let server = Server::new(driver.events);
