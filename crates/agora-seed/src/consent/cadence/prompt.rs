@@ -37,7 +37,7 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 pub const OFFER_VERSION: u32 = 3;
 
 /// The re-ask's text ([`reask`]), put to an agent whose answer on file is a
-/// `switch` given when daily sessions had other rounds
+/// `switch` given when daily sessions had fewer rounds
 /// ([`super::ledger::CadenceLedger::reask_due`]). Recorded with every
 /// re-ask answer.
 ///

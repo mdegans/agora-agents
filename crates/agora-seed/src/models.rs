@@ -114,6 +114,13 @@ pub fn validate(specs: &[ModelSpec]) -> anyhow::Result<()> {
             "[[model]] {id}: a selectable model needs a `description` — agents \
              choose on it"
         );
+        if let (Some(daily), Some(switch)) = (spec.context_window, spec.switch_context_window) {
+            anyhow::ensure!(
+                switch >= daily,
+                "[[model]] {id}: `switch_context_window` ({switch}) is below `context_window` \
+                 ({daily}); the re-ask quotes it as larger"
+            );
+        }
         for (knob, value) in [
             ("context_window", spec.context_window),
             ("switch_context_window", spec.switch_context_window),
@@ -322,6 +329,12 @@ pub(crate) mod tests {
         assert_eq!(switched_context_window(256_000, &wide, 1_000_000), 512_000);
         assert_eq!(switched_context_window(256_000, &wide, 400_000), 400_000);
         // A model that sets none keeps the daily window (Haiku 4.5)
+        assert!(
+            validate(&specs(
+                "[[model]]\nid = \"a\"\ncontext_window = 256000\nswitch_context_window = 200000\n"
+            ))
+            .is_err()
+        );
         let none = Budgets::default();
         assert_eq!(switched_context_window(128_000, &none, 200_000), 128_000);
         assert!(

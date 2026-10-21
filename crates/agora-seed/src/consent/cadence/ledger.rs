@@ -190,7 +190,7 @@ impl CadenceLedger {
 
     /// Whether the re-ask ([`super::prompt::reask`]) should be put this
     /// session: the latest answer on file is a `switch` given when a daily
-    /// session had other than `rounds` rounds, nothing refused since, fewer
+    /// session had fewer than `rounds` rounds (the text says they grew), nothing refused since, fewer
     /// than [`MAX_MISSES`] misses since, and no re-ask answer for `rounds`
     /// in `soul`'s Evolution Log (in case the ledger save failed after the
     /// SOUL's). Never beside [`Self::due`], which an answer on file rules
@@ -213,7 +213,7 @@ impl CadenceLedger {
                 choice: CadenceChoice::Switch,
                 ..
             }
-        ) || answer.rounds == rounds
+        ) || answer.rounds >= rounds
         {
             return false;
         }
@@ -358,6 +358,10 @@ mod tests {
         let mut l = CadenceLedger::default();
         l.record(switch());
         assert!(!l.reask_due(&soul(), 5), "today's rounds");
+        assert!(
+            !l.reask_due(&soul(), 3),
+            "fewer rounds: the text would be false"
+        );
         assert!(l.reask_due(&soul(), 10));
         l.record(ask(CadenceOutcome::NoAnswer {
             failure: "x".into(),
