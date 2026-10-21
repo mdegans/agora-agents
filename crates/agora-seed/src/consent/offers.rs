@@ -792,7 +792,11 @@ mod haiku_offer {
         ] {
             assert_eq!(budget, Some(2 * 4096), "double 4.5's (Steward, 2026-10-15)");
         }
-        assert_eq!(example.model[1].context_window, Some(192_000), "1.5x 128k");
+        assert_eq!(
+            example.model[1].context_window,
+            Some(256_000),
+            "256k with 10 rounds (Steward, 2026-10-21)"
+        );
         assert_eq!(example.model[0].context_window, None, "4.5 unchanged");
         assert!(example.model[0].phase_max_tokens.is_none(), "4.5 unchanged");
 

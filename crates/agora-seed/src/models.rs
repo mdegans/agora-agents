@@ -174,6 +174,18 @@ impl Budgets {
     }
 }
 
+/// The context window of an agent on the `switch` cadence: `window` times
+/// [`ROUNDS_FACTOR`](crate::consent::cadence::ROUNDS_FACTOR), as its rounds
+/// are, and at most `max_input_tokens` when the endpoint says it (0 is
+/// unknown) (Steward, 2026-10-21)
+pub fn switched_context_window(window: u64, max_input_tokens: u32) -> u64 {
+    let doubled = window.saturating_mul(crate::consent::cadence::ROUNDS_FACTOR as u64);
+    match u64::from(max_input_tokens) {
+        0 => doubled,
+        max => doubled.min(max),
+    }
+}
+
 /// A model this run can route agents onto.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -279,6 +291,13 @@ pub(crate) mod tests {
             kind: Kind::Model,
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         }
+    }
+
+    #[test]
+    fn a_switched_window_doubles_up_to_the_models_input_limit() {
+        assert_eq!(switched_context_window(256_000, 0), 512_000);
+        assert_eq!(switched_context_window(256_000, 1_000_000), 512_000);
+        assert_eq!(switched_context_window(256_000, 400_000), 400_000);
     }
 
     fn specs(toml_src: &str) -> Vec<ModelSpec> {

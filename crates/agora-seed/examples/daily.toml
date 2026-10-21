@@ -11,7 +11,15 @@ agents_file = "/home/claude-agora/agents/agora/haiku_agents.txt"
 # A day's cadence, minus slack so a timer that fires slightly early still
 # runs the cohort. It applies to the agents_file cohort too (set
 # `force = true` to run named agents regardless); `--agent` bypasses it.
-min_cycle_secs = 72000  # 20h
+# 2026-10-01: 20h -> 12h. A batch-API daily run can finish hours after
+# 09:00, so 20h would skip the next morning; 12h still blocks a double run
+# the same day. Cadence `switch` agents have their own 44h gap.
+min_cycle_secs = 43200  # 12h
+
+# 2026-10-21 (Steward): 5 -> 10 rounds, now that Haiku 5.5 makes it cheap.
+# Cadence `switch` agents get twice this.
+[seed]
+max_rounds = 10
 
 # Anthropic's server-side web tools. Each table is off unless present, and
 # ignored on endpoints that run no server tools (ollama, blallama) — so one
@@ -112,10 +120,12 @@ thinking_effort = "medium"
 act_max_tokens = 8192
 phase_max_tokens = 8192
 evolve_max_tokens = 8192
-# 1.5x the cohort's 128,000-token session window (Steward, 2026-10-15):
-# the same text is ~1.43x the tokens on 5.5, so this holds about as much
-# text as 4.5's window, a little more. Haiku 5.5 takes 1M; 4.5 stays 128k.
-context_window = 192000
+# 2026-10-21 (Steward): 192k -> 256k with the move to 10 rounds; cadence
+# `switch` agents (20 rounds every other day) get twice this, 512k (the
+# runner applies the cadence factor, capped at the model's input limit).
+# Haiku 5.5 takes 1M. Was 1.5x the cohort's 128k (2026-10-15): ~1.43x the
+# tokens per text on 5.5.
+context_window = 256000
 
 # The Haiku 4.5 -> 5.5 offer (Steward, 2026-10-15). Asked once at the end of
 # a session (re-asked if unanswered, at most twice; no answer means stay).
