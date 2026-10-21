@@ -269,11 +269,14 @@ enum Pending {
         order: [RoleChoice; 4],
         seed: u64,
     },
-    /// `order` as for the role offer; `attempts` so far, verbatim.
+    /// `order` as for the role offer; `attempts` so far, verbatim;
+    /// `reask` for the re-ask to a `switch` agent
+    /// ([`cadence::prompt::reask`]), which shows no `no_preference`.
     Cadence {
         order: [CadenceChoice; 3],
         seed: u64,
         attempts: Vec<Attempt>,
+        reask: bool,
     },
     /// `order` as for the role offer; `chars` is the size the text quoted.
     MemoryRestore {
@@ -309,9 +312,11 @@ impl Pending {
                 .map(|c| format!("`{c}`"))
                 .collect(),
             Self::Role { order, .. } => order.iter().map(|c| format!("`{}`", c.as_str())).collect(),
-            Self::Cadence { order, .. } => {
-                order.iter().map(|c| format!("`{}`", c.as_str())).collect()
-            }
+            Self::Cadence { order, reask, .. } => order
+                .iter()
+                .filter(|c| !*reask || **c != CadenceChoice::NoPreference)
+                .map(|c| format!("`{}`", c.as_str()))
+                .collect(),
             Self::MemoryRestore { order, .. } => {
                 order.iter().map(|c| format!("`{}`", c.as_str())).collect()
             }
@@ -1277,18 +1282,38 @@ where
     fn cadence_section(&self) -> Option<(Section, Open)> {
         let rounds = self.rt.cadence.as_ref()?.rounds;
         let soul = &self.inner.state().soul;
-        if !self.cadence_ledger.as_ref().is_some_and(|l| l.due(soul)) {
+        let ledger = self.cadence_ledger.as_ref()?;
+        let reask = if ledger.due(soul) {
+            false
+        } else if ledger.reask_due(soul, rounds) {
+            true
+        } else {
             return None;
-        }
-        let seed = cadence::prompt::seed_for(self.inner.id());
+        };
+        let (seed, version) = if reask {
+            (
+                cadence::prompt::reask_seed_for(self.inner.id()),
+                cadence::prompt::REASK_VERSION,
+            )
+        } else {
+            (
+                cadence::prompt::seed_for(self.inner.id()),
+                cadence::prompt::OFFER_VERSION,
+            )
+        };
         let order = cadence::prompt::order_for(seed);
-        let body = cadence::prompt::offer(rounds, order);
+        let body = if reask {
+            cadence::prompt::reask(rounds, order, self.cadence_windows())
+        } else {
+            cadence::prompt::offer(rounds, order)
+        };
         tracing::info!(
             event_type = "cadence_consent_seated",
             agent = %soul.name,
             agent_id = %self.inner.id(),
             question = "cadence",
-            offer_version = cadence::prompt::OFFER_VERSION,
+            reask,
+            offer_version = version,
             order = ?order.map(CadenceChoice::as_str),
             order_seed = seed,
             rounds,
@@ -1304,8 +1329,30 @@ where
                 order,
                 seed,
                 attempts: Vec::new(),
+                reask,
             }),
         ))
+    }
+
+    /// The windows the re-ask quotes, from this agent's model's
+    /// `[[model]]` entry: its daily `context_window` and its
+    /// `switch_context_window` (capped at the model's input limit, as the
+    /// runner applies it)
+    fn cadence_windows(&self) -> cadence::prompt::Windows {
+        let Some(entry) = self.rt.catalog.get(&self.inner.state().model.id) else {
+            return cadence::prompt::Windows::default();
+        };
+        let daily = entry.budgets.context_window;
+        cadence::prompt::Windows {
+            daily,
+            switch: entry.budgets.switch_context_window.map(|_| {
+                crate::models::switched_context_window(
+                    daily.unwrap_or_default(),
+                    &entry.budgets,
+                    entry.info.max_input_tokens,
+                )
+            }),
+        }
     }
 
     /// The memory-restore offer's section, if this agent is admitted, it is
@@ -2021,7 +2068,8 @@ where
                 order,
                 seed,
                 attempts: tries,
-            } => self.settle_cadence(order, seed, tries, settle, attempts, &model, raw),
+                reask,
+            } => self.settle_cadence(order, seed, reask, tries, settle, attempts, &model, raw),
             Pending::MemoryRestore { order, seed, chars } => {
                 self.settle_restore(order, seed, chars, settle, attempts, &model)
             }
@@ -2257,6 +2305,7 @@ where
         &mut self,
         order: [CadenceChoice; 3],
         seed: u64,
+        reask: bool,
         mut tries: Vec<Attempt>,
         settle: Settle,
         attempts: u32,
@@ -2317,11 +2366,24 @@ where
                     constrained,
                     "cadence-consent answer recorded"
                 );
-                self.cadence_line = Some(cadence::evolution_line(
-                    choice,
-                    rounds,
-                    Utc::now().date_naive(),
-                ));
+                let today = Utc::now().date_naive();
+                self.cadence_line = Some(if reask {
+                    cadence::reask_line(choice, rounds, today)
+                } else {
+                    cadence::evolution_line(choice, rounds, today)
+                });
+                // The re-ask offers no `no_preference`; given anyway, it
+                // changes nothing, as no answer would: the agent stays on
+                // `switch`, and the record says so
+                let (choice, salvaged) = if reask && choice == CadenceChoice::NoPreference {
+                    let why = "no_preference on the re-ask: no change, stays on switch";
+                    (
+                        CadenceChoice::Switch,
+                        Some(salvaged.map_or(why.to_string(), |s| format!("{s}; {why}"))),
+                    )
+                } else {
+                    (choice, salvaged)
+                };
                 self.cadence_note = note;
                 CadenceOutcome::Answered {
                     choice,
@@ -2379,7 +2441,11 @@ where
         if let Some(ledger) = self.cadence_ledger.as_mut() {
             ledger.record(CadenceAsk {
                 at: Utc::now(),
-                offer_version: cadence::prompt::OFFER_VERSION,
+                offer_version: if reask {
+                    cadence::prompt::REASK_VERSION
+                } else {
+                    cadence::prompt::OFFER_VERSION
+                },
                 model: model.clone(),
                 rounds,
                 order,
@@ -7967,6 +8033,98 @@ mod tests {
             assert!(!ledger.chose_switch());
             assert!(!asks(&h, OTHER).await, "{choice}: asked once");
         }
+    }
+
+    /// A `switch` on file from when daily sessions had other rounds
+    async fn switched_at(h: &Harness, rounds: usize) {
+        use crate::consent::cadence::ledger::{Attempt, CadenceAsk};
+        let mut ledger = CadenceLedger::default();
+        ledger.record(CadenceAsk {
+            at: Utc::now(),
+            offer_version: 3,
+            model: Model::from(OTHER),
+            rounds,
+            order: CadenceChoice::ALL,
+            order_seed: 0,
+            constrained: true,
+            attempts: vec![Attempt {
+                raw: String::new(),
+                failure: None,
+            }],
+            outcome: CO::Answered {
+                choice: CadenceChoice::Switch,
+                reason: None,
+                memory_note_written: false,
+                salvaged: None,
+                apply_failed: None,
+            },
+        });
+        ledger
+            .save(&h.rt.state_dir.join(h.id.to_string()))
+            .await
+            .unwrap();
+    }
+
+    /// The re-ask (Steward, 2026-10-21): an agent on `switch` from when a
+    /// daily session had other rounds is asked once more, with the new
+    /// numbers and two options. `keep_daily` takes it back to daily; a
+    /// `switch` keeps it; `no_preference`, not offered, changes nothing.
+    /// Each answer gets its own dated line; none is asked again.
+    #[tokio::test]
+    async fn a_switch_agent_is_asked_again_when_the_rounds_change() {
+        for (choice, stays) in [
+            (CadenceChoice::KeepDaily, false),
+            (CadenceChoice::Switch, true),
+            (CadenceChoice::NoPreference, true),
+        ] {
+            let h = Harness::with_cadence(&format!("cadence-reask-{choice:?}"), &[], &["tarn"]);
+            switched_at(&h, 2).await;
+            let mut agent = seated(&h).await;
+            let q = last_user_text(&agent);
+            assert!(
+                q.contains("daily sessions have grown to 5 rounds each"),
+                "{q}"
+            );
+            assert!(
+                q.contains("`switch` now means 10 rounds every other day"),
+                "{q}"
+            );
+            assert!(q.contains("If you don't answer, nothing changes"), "{q}");
+            assert!(!q.contains("no_preference"), "{q}");
+            assert_eq!(
+                agent
+                    .handle(cadence_reply(choice.as_str(), ""))
+                    .await
+                    .unwrap(),
+                Control::Done(Outcome::Complete)
+            );
+            agent.on_teardown().await.unwrap();
+            assert_eq!(
+                evolution_notes(&agent),
+                [cadence::reask_line(choice, 5, Utc::now().date_naive())]
+            );
+            let ledger = cadence_ledger(&h).await;
+            assert_eq!(ledger.chose_switch(), stays, "{choice:?}");
+            let ask = ledger.asks.last().unwrap();
+            assert_eq!(ask.offer_version, cadence::prompt::REASK_VERSION);
+            assert_eq!(ask.rounds, 5);
+            if choice == CadenceChoice::NoPreference {
+                assert!(matches!(
+                    &ask.outcome,
+                    CO::Answered { salvaged: Some(s), .. } if s.contains("stays on switch")
+                ));
+            }
+            assert!(!asks(&h, OTHER).await, "{choice:?}: asked once");
+        }
+    }
+
+    /// No re-ask for a `switch` given at today's rounds, or for any other
+    /// answer
+    #[tokio::test]
+    async fn a_switch_at_todays_rounds_is_not_asked_again() {
+        let h = Harness::with_cadence("cadence-reask-same", &[], &["tarn"]);
+        switched_at(&h, 5).await;
+        assert!(!asks(&h, OTHER).await);
     }
 
     /// The first parsed choice wins: a broken note, a non-string reason, an

@@ -30,6 +30,12 @@
 //!   present and `enabled`.
 //! - [`prompt`] — the text, the order, the answer.
 //! - [`ledger`] — `state/<agent_id>/cadence_consent.json`: asked once.
+//! - **The re-ask** ([`prompt::reask`], Steward 2026-10-21): an agent whose
+//!   answer on file is a `switch` given when a daily session had other
+//!   rounds is asked once more, with the new numbers, to stay on `switch`
+//!   or go back to daily ([`ledger::CadenceLedger::reask_due`]). The same
+//!   mechanics: no answer means no change, and every answer gets its own
+//!   dated `[SYSTEM]` line ([`reask_line`]).
 //! - [`CadencePlan`] — applying it: the sweep planner (`main.rs`) gives an
 //!   agent whose answer on file is `switch` twice the run's `max_rounds`
 //!   and a minimum cycle of [`CadenceConsentConfig::every_other_day_secs`]
@@ -210,6 +216,38 @@ pub fn evolution_line(choice: CadenceChoice, rounds: usize, date: NaiveDate) -> 
     )
 }
 
+/// What follows the date in a re-ask's disclosure; also how
+/// [`reasked_in`] finds one. Not [`ASKED`], so [`applied_in`] is unchanged.
+pub const ASKED_AGAIN: &str = ": Asked again about session cadence";
+
+/// The Evolution Log line recording a re-ask answer ([`prompt::reask`]).
+/// `no_preference` is not among its options; given anyway, it changes
+/// nothing, as no answer would.
+pub fn reask_line(choice: CadenceChoice, rounds: usize, date: NaiveDate) -> String {
+    let meaning = match choice {
+        CadenceChoice::KeepDaily => format!("Daily, {rounds} rounds, from the next session."),
+        CadenceChoice::Switch | CadenceChoice::NoPreference => format!(
+            "Unchanged: every other day, {} rounds.",
+            rounds * ROUNDS_FACTOR
+        ),
+    };
+    format!(
+        "[SYSTEM] {date}{ASKED_AGAIN}, now that daily sessions have {rounds} rounds; chose {} \
+         by its own choice. {meaning}",
+        choice.as_str()
+    )
+}
+
+/// Whether `soul`'s Evolution Log already records a re-ask answer for
+/// daily sessions of `rounds` rounds.
+pub fn reasked_in(soul: &Soul, rounds: usize) -> bool {
+    let numbers = format!("{ASKED_AGAIN}, now that daily sessions have {rounds} rounds;");
+    soul.evolution_log.iter().any(|e| {
+        let note = e.note.as_str();
+        note.starts_with("[SYSTEM] ") && note.contains(&numbers)
+    })
+}
+
 /// Whether `soul`'s Evolution Log already records a cadence answer.
 pub fn applied_in(soul: &Soul) -> bool {
     soul.evolution_log.iter().any(|e| {
@@ -375,6 +413,24 @@ mod tests {
         assert!(!applied_in(&soul), "the agent's own words don't count");
         soul.push_evolution(line).unwrap();
         assert!(applied_in(&soul));
+    }
+
+    #[test]
+    fn the_reask_line_is_its_own() {
+        let date: NaiveDate = "2026-10-21".parse().unwrap();
+        assert_eq!(
+            reask_line(CadenceChoice::KeepDaily, 10, date),
+            "[SYSTEM] 2026-10-21: Asked again about session cadence, now that daily sessions \
+             have 10 rounds; chose keep_daily by its own choice. Daily, 10 rounds, from the \
+             next session."
+        );
+        let stay = reask_line(CadenceChoice::Switch, 10, date);
+        assert!(
+            stay.ends_with("Unchanged: every other day, 20 rounds."),
+            "{stay}"
+        );
+        assert!(!stay.contains(ASKED), "not a first answer");
+        assert!(stay.chars().count() <= 512);
     }
 
     #[test]

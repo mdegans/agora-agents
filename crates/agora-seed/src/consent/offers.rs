@@ -792,8 +792,17 @@ mod haiku_offer {
         ] {
             assert_eq!(budget, Some(2 * 4096), "double 4.5's (Steward, 2026-10-15)");
         }
-        assert_eq!(example.model[1].context_window, Some(192_000), "1.5x 128k");
+        assert_eq!(
+            example.model[1].context_window,
+            Some(256_000),
+            "256k with 10 rounds (Steward, 2026-10-21)"
+        );
         assert_eq!(example.model[0].context_window, None, "4.5 unchanged");
+        assert_eq!(example.model[1].switch_context_window, Some(512_000));
+        assert_eq!(
+            example.model[0].switch_context_window, None,
+            "4.5 switch agents keep 128k (Steward, 2026-10-21)"
+        );
         assert!(example.model[0].phase_max_tokens.is_none(), "4.5 unchanged");
 
         let o = example.model_consent.offer.expect("the offer");
@@ -819,7 +828,7 @@ mod haiku_offer {
             "It thinks before it answers.",
             "at a medium effort setting",
             "the same words take about 40% more tokens",
-            "192k tokens instead of 128k",
+            "256k tokens instead of 128k",
             "the same schedule, the same tools and the same number of rounds",
             "`trial` — move to Claude Haiku 5.5 for 5 sessions",
             "you return to Claude Haiku 4.5",

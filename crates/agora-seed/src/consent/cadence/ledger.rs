@@ -188,6 +188,46 @@ impl CadenceLedger {
         !settled && misses < MAX_MISSES as usize
     }
 
+    /// Whether the re-ask ([`super::prompt::reask`]) should be put this
+    /// session: the latest answer on file is a `switch` given when a daily
+    /// session had fewer than `rounds` rounds (the text says they grew), nothing refused since, fewer
+    /// than [`MAX_MISSES`] misses since, and no re-ask answer for `rounds`
+    /// in `soul`'s Evolution Log (in case the ledger save failed after the
+    /// SOUL's). Never beside [`Self::due`], which an answer on file rules
+    /// out.
+    pub fn reask_due(&self, soul: &Soul, rounds: usize) -> bool {
+        if super::reasked_in(soul, rounds) {
+            return false;
+        }
+        let Some(last) = self
+            .asks
+            .iter()
+            .rposition(|a| matches!(a.outcome, CadenceOutcome::Answered { .. }))
+        else {
+            return false;
+        };
+        let answer = &self.asks[last];
+        if !matches!(
+            answer.outcome,
+            CadenceOutcome::Answered {
+                choice: CadenceChoice::Switch,
+                ..
+            }
+        ) || answer.rounds >= rounds
+        {
+            return false;
+        }
+        let since = &self.asks[last + 1..];
+        let refused = since
+            .iter()
+            .any(|a| matches!(a.outcome, CadenceOutcome::Refused { .. }));
+        let misses = since
+            .iter()
+            .filter(|a| matches!(a.outcome, CadenceOutcome::NoAnswer { .. }))
+            .count();
+        !refused && misses < MAX_MISSES as usize
+    }
+
     /// The latest choice on file, if any.
     pub fn choice(&self) -> Option<CadenceChoice> {
         self.asks.iter().rev().find_map(|a| match &a.outcome {
@@ -299,6 +339,73 @@ mod tests {
             failure: "x".into(),
         }));
         assert!(!l.due(&soul()));
+    }
+
+    /// The re-ask: due for a `switch` at other rounds (the fixture's are
+    /// 5), asked once more after a miss, ended by an answer, a refusal or
+    /// its line in the SOUL; never for another choice
+    #[test]
+    fn a_switch_at_other_rounds_is_asked_again_until_settled() {
+        let switch = || {
+            ask(CadenceOutcome::Answered {
+                choice: CadenceChoice::Switch,
+                reason: None,
+                memory_note_written: false,
+                salvaged: None,
+                apply_failed: None,
+            })
+        };
+        let mut l = CadenceLedger::default();
+        l.record(switch());
+        assert!(!l.reask_due(&soul(), 5), "today's rounds");
+        assert!(
+            !l.reask_due(&soul(), 3),
+            "fewer rounds: the text would be false"
+        );
+        assert!(l.reask_due(&soul(), 10));
+        l.record(ask(CadenceOutcome::NoAnswer {
+            failure: "x".into(),
+        }));
+        assert!(l.reask_due(&soul(), 10), "one miss");
+        l.record(ask(CadenceOutcome::NoAnswer {
+            failure: "x".into(),
+        }));
+        assert!(!l.reask_due(&soul(), 10), "two misses");
+
+        let mut refused = CadenceLedger::default();
+        refused.record(switch());
+        refused.record(ask(CadenceOutcome::Refused {
+            reason: "no".into(),
+        }));
+        assert!(!refused.reask_due(&soul(), 10));
+
+        let mut answered = CadenceLedger::default();
+        answered.record(switch());
+        let mut again = switch();
+        again.rounds = 10;
+        answered.record(again);
+        assert!(!answered.reask_due(&soul(), 10), "answered at 10");
+
+        let mut s = soul();
+        s.push_evolution(super::super::reask_line(
+            CadenceChoice::Switch,
+            10,
+            "2026-10-21".parse().unwrap(),
+        ))
+        .unwrap();
+        let mut l = CadenceLedger::default();
+        l.record(switch());
+        assert!(!l.reask_due(&s, 10), "its line in the SOUL");
+
+        let mut daily = CadenceLedger::default();
+        daily.record(ask(CadenceOutcome::Answered {
+            choice: CadenceChoice::KeepDaily,
+            reason: None,
+            memory_note_written: false,
+            salvaged: None,
+            apply_failed: None,
+        }));
+        assert!(!daily.reask_due(&soul(), 10), "keep_daily is not re-asked");
     }
 
     #[test]

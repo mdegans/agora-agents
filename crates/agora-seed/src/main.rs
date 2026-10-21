@@ -1849,25 +1849,36 @@ async fn run(held: &mut Held) -> Result<()> {
                     "encryption key backfill failed; agent messages server-mode"
                 );
             }
-            // An agent on its own every-other-day cadence gets its rounds
-            // doubled; everyone else shares the run's config.
+            // A model's own token budgets (`[[model]] *_max_tokens`).
             let mut agent_context = context.clone();
+            let entry = agent_context.consent.catalog.get(&state.model.id).cloned();
+            if let Some(entry) = &entry
+                && entry.budgets != models::Budgets::default()
+            {
+                entry.budgets.apply(&mut agent_context.inner.config);
+            }
+            // An agent on its own every-other-day cadence gets its rounds
+            // doubled, and its model's switch window if it sets one;
+            // everyone else shares the run's config.
             if let Some(rounds) = cadence_plan.max_rounds(&id) {
+                let config = &mut agent_context.inner.config;
+                config.max_rounds = rounds;
+                if let Some(entry) = &entry {
+                    config.context_window = models::switched_context_window(
+                        config.context_window,
+                        &entry.budgets,
+                        entry.info.max_input_tokens,
+                    );
+                }
                 tracing::info!(
                     event_type = "cadence_switch_applied",
                     agent = %state.soul.name,
                     agent_id = %id,
                     max_rounds = rounds,
+                    context_window = config.context_window,
                     min_cycle_secs = cadence_plan.cycle_secs(),
                     "agent runs on its chosen cadence"
                 );
-                agent_context.inner.config.max_rounds = rounds;
-            }
-            // A model's own token budgets (`[[model]] *_max_tokens`).
-            if let Some(entry) = agent_context.consent.catalog.get(&state.model.id)
-                && entry.budgets != models::Budgets::default()
-            {
-                entry.budgets.apply(&mut agent_context.inner.config);
             }
             let name = state.soul.name.clone();
             match agora_agentkit::reactor::Agent::new(id, state, agent_context) {
