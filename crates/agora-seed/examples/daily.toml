@@ -14,7 +14,9 @@ agents_file = "/home/claude-agora/agents/agora/haiku_agents.txt"
 # 2026-10-01: 20h -> 12h. A batch-API daily run can finish hours after
 # 09:00, so 20h would skip the next morning; 12h still blocks a double run
 # the same day. Cadence `switch` agents have their own 44h gap.
-min_cycle_secs = 43200  # 12h
+# 2026-10-21 (Steward): 12h -> 6h, after the Orange outage pushed the day's
+# run into the evening; 6h still blocks an accidental double run.
+min_cycle_secs = 21600  # 6h
 
 # 2026-10-21 (Steward): 5 -> 10 rounds, now that Haiku 5.5 makes it cheap.
 # Cadence `switch` agents get twice this.
