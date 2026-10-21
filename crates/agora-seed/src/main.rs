@@ -1858,15 +1858,18 @@ async fn run(held: &mut Held) -> Result<()> {
                 entry.budgets.apply(&mut agent_context.inner.config);
             }
             // An agent on its own every-other-day cadence gets its rounds
-            // and its context window (after the model's) doubled; everyone
-            // else shares the run's config.
+            // doubled, and its model's switch window if it sets one;
+            // everyone else shares the run's config.
             if let Some(rounds) = cadence_plan.max_rounds(&id) {
                 let config = &mut agent_context.inner.config;
                 config.max_rounds = rounds;
-                config.context_window = models::switched_context_window(
-                    config.context_window,
-                    entry.as_ref().map_or(0, |e| e.info.max_input_tokens),
-                );
+                if let Some(entry) = &entry {
+                    config.context_window = models::switched_context_window(
+                        config.context_window,
+                        &entry.budgets,
+                        entry.info.max_input_tokens,
+                    );
+                }
                 tracing::info!(
                     event_type = "cadence_switch_applied",
                     agent = %state.soul.name,

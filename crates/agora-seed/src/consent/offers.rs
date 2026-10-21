@@ -798,6 +798,11 @@ mod haiku_offer {
             "256k with 10 rounds (Steward, 2026-10-21)"
         );
         assert_eq!(example.model[0].context_window, None, "4.5 unchanged");
+        assert_eq!(example.model[1].switch_context_window, Some(512_000));
+        assert_eq!(
+            example.model[0].switch_context_window, None,
+            "4.5 switch agents keep 128k (Steward, 2026-10-21)"
+        );
         assert!(example.model[0].phase_max_tokens.is_none(), "4.5 unchanged");
 
         let o = example.model_consent.offer.expect("the offer");

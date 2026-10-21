@@ -60,6 +60,12 @@ pub struct ModelSpec {
     /// text). Still bounded by what the endpoint says the model takes
     /// (agentkit's `on_admit`). At least [`MIN_MODEL_CONTEXT_WINDOW`].
     pub context_window: Option<u64>,
+    /// The context window of an agent on this model that chose the
+    /// cadence `switch` (twice the rounds, every other day). Unset, a
+    /// switch agent keeps the daily window (Steward, 2026-10-21: Haiku 4.5
+    /// does worse near 200k, and a session's end is where memory is
+    /// written). At least [`MIN_MODEL_CONTEXT_WINDOW`].
+    pub switch_context_window: Option<u64>,
 }
 
 fn default_share() -> f64 {
@@ -80,6 +86,7 @@ impl ModelSpec {
             phase_max_tokens: None,
             evolve_max_tokens: None,
             context_window: None,
+            switch_context_window: None,
         }
     }
 }
@@ -107,11 +114,15 @@ pub fn validate(specs: &[ModelSpec]) -> anyhow::Result<()> {
             "[[model]] {id}: a selectable model needs a `description` — agents \
              choose on it"
         );
-        anyhow::ensure!(
-            spec.context_window
-                .is_none_or(|w| w >= MIN_MODEL_CONTEXT_WINDOW),
-            "[[model]] {id}: `context_window` must be at least {MIN_MODEL_CONTEXT_WINDOW}"
-        );
+        for (knob, value) in [
+            ("context_window", spec.context_window),
+            ("switch_context_window", spec.switch_context_window),
+        ] {
+            anyhow::ensure!(
+                value.is_none_or(|w| w >= MIN_MODEL_CONTEXT_WINDOW),
+                "[[model]] {id}: `{knob}` must be at least {MIN_MODEL_CONTEXT_WINDOW}"
+            );
+        }
         for (knob, value) in [
             ("act_max_tokens", spec.act_max_tokens),
             ("phase_max_tokens", spec.phase_max_tokens),
@@ -141,6 +152,10 @@ pub struct Budgets {
     pub phase: Option<u32>,
     pub evolve: Option<u32>,
     pub context_window: Option<u64>,
+    /// See [`ModelSpec::switch_context_window`]. Not applied by
+    /// [`Self::apply`]: only a switch agent's session takes it
+    /// ([`switched_context_window`]).
+    pub switch_context_window: Option<u64>,
 }
 
 impl Budgets {
@@ -174,15 +189,17 @@ impl Budgets {
     }
 }
 
-/// The context window of an agent on the `switch` cadence: `window` times
-/// [`ROUNDS_FACTOR`](crate::consent::cadence::ROUNDS_FACTOR), as its rounds
-/// are, and at most `max_input_tokens` when the endpoint says it (0 is
-/// unknown) (Steward, 2026-10-21)
-pub fn switched_context_window(window: u64, max_input_tokens: u32) -> u64 {
-    let doubled = window.saturating_mul(crate::consent::cadence::ROUNDS_FACTOR as u64);
+/// The context window of an agent on the `switch` cadence: its model's
+/// `switch_context_window`, at most `max_input_tokens` when the endpoint
+/// says it (0 is unknown); `window`, the daily one, when the model sets
+/// none (Steward, 2026-10-21)
+pub fn switched_context_window(window: u64, budgets: &Budgets, max_input_tokens: u32) -> u64 {
+    let Some(switch) = budgets.switch_context_window else {
+        return window;
+    };
     match u64::from(max_input_tokens) {
-        0 => doubled,
-        max => doubled.min(max),
+        0 => switch,
+        max => switch.min(max),
     }
 }
 
@@ -240,6 +257,7 @@ impl Catalog {
                     phase: s.phase_max_tokens,
                     evolve: s.evolve_max_tokens,
                     context_window: s.context_window,
+                    switch_context_window: s.switch_context_window,
                 }),
             });
         }
@@ -294,10 +312,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_switched_window_doubles_up_to_the_models_input_limit() {
-        assert_eq!(switched_context_window(256_000, 0), 512_000);
-        assert_eq!(switched_context_window(256_000, 1_000_000), 512_000);
-        assert_eq!(switched_context_window(256_000, 400_000), 400_000);
+    fn a_switch_window_is_the_models_own_up_to_its_input_limit() {
+        let wide = Budgets {
+            context_window: Some(256_000),
+            switch_context_window: Some(512_000),
+            ..Default::default()
+        };
+        assert_eq!(switched_context_window(256_000, &wide, 0), 512_000);
+        assert_eq!(switched_context_window(256_000, &wide, 1_000_000), 512_000);
+        assert_eq!(switched_context_window(256_000, &wide, 400_000), 400_000);
+        // A model that sets none keeps the daily window (Haiku 4.5)
+        let none = Budgets::default();
+        assert_eq!(switched_context_window(128_000, &none, 200_000), 128_000);
+        assert!(
+            validate(&specs(
+                "[[model]]\nid = \"a\"\nswitch_context_window = 1000\n"
+            ))
+            .is_err()
+        );
+        let mut config = agora_agentkit::reactor::seed::SeedConfig::default();
+        let before = config.context_window;
+        Budgets {
+            switch_context_window: Some(512_000),
+            ..Default::default()
+        }
+        .apply(&mut config);
+        assert_eq!(
+            config.context_window, before,
+            "apply leaves it to the switch"
+        );
     }
 
     fn specs(toml_src: &str) -> Vec<ModelSpec> {
