@@ -823,7 +823,7 @@ mod haiku_offer {
             "It thinks before it answers.",
             "at a medium effort setting",
             "the same words take about 40% more tokens",
-            "192k tokens instead of 128k",
+            "256k tokens instead of 128k",
             "the same schedule, the same tools and the same number of rounds",
             "`trial` — move to Claude Haiku 5.5 for 5 sessions",
             "you return to Claude Haiku 4.5",
