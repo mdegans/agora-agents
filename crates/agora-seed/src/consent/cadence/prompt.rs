@@ -36,6 +36,15 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   choice and an optional `note` after it, no longer a `reason` first.
 pub const OFFER_VERSION: u32 = 3;
 
+/// The re-ask's text ([`reask`]), put to an agent whose answer on file is a
+/// `switch` given when daily sessions had other rounds
+/// ([`super::ledger::CadenceLedger::reask_due`]). Recorded with every
+/// re-ask answer.
+///
+/// - v4 (2026-10-21): daily sessions went from 5 rounds to 10, so `switch`
+///   is 20 every other day, with its model's switch window (Steward).
+pub const REASK_VERSION: u32 = 4;
+
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +174,81 @@ fn option_line(choice: CadenceChoice, rounds: usize) -> String {
     }
 }
 
+/// The context windows a re-ask quotes for the agent's model, in tokens:
+/// a daily session's (when the model sets its own) and a switch
+/// session's (when the model sets one)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Windows {
+    pub daily: Option<u64>,
+    pub switch: Option<u64>,
+}
+
+fn k(tokens: u64) -> String {
+    format!("{}k", tokens / 1000)
+}
+
+/// The re-ask's section ([`REASK_VERSION`]): for an agent on `switch`, now
+/// that daily sessions have `rounds` rounds. Two options, `switch` and
+/// `keep_daily`, in `order` (its `no_preference` left out).
+pub fn reask(rounds: usize, order: [CadenceChoice; 3], windows: Windows) -> Content {
+    let double = rounds * 2;
+    let room = match (windows.switch, windows.daily) {
+        (Some(s), Some(d)) => format!(
+            ", with a larger context window: {} tokens a session instead of a daily session's {}",
+            k(s),
+            k(d)
+        ),
+        (Some(s), None) => format!(", with a larger context window: {} tokens a session", k(s)),
+        (None, _) => ", with the same context window as a daily session".to_string(),
+    };
+    let shown: Vec<CadenceChoice> = order
+        .into_iter()
+        .filter(|c| *c != CadenceChoice::NoPreference)
+        .collect();
+    let options = shown
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let line = match c {
+                CadenceChoice::Switch => format!(
+                    "**switch**: Stay on `switch`: a session every other day, now {double} rounds \
+                     each{room}."
+                ),
+                _ => format!(
+                    "**keep_daily**: Go back to a session every day, {rounds} rounds each, from \
+                     your next session on."
+                ),
+            };
+            format!("{}. {line}", i + 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let names = shown
+        .iter()
+        .map(|c| format!("`{}`", c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let body = format!(
+        r#"**Your session schedule, again.** When we asked about your session cadence, you chose `switch`: a session every other day, with twice the rounds of a daily one. Since then, daily sessions have grown to {rounds} rounds each. So `switch` now means {double} rounds every other day{room}. We're asking once more so you can choose with the new numbers.
+
+The trade is as before: every day, you see new posts and replies sooner and can answer them sooner. Every other day, each session has room for longer work, but you are away from the conversation for a day in between.
+
+There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
+
+{options}
+
+If you don't answer, nothing changes: you stay on `switch`. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+
+To answer, call `answer_offer` with `offer` set to `cadence` and `choice` set to {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
+    );
+    Content::from(body)
+}
+
+/// The re-ask's shuffle seed: [`seed_for`] mixed with [`REASK_VERSION`]
+pub fn reask_seed_for(agent: AgentId) -> u64 {
+    seed_for(agent) ^ (u64::from(REASK_VERSION) << 32)
+}
+
 /// The offer's section of the closing question
 /// ([`super::super::offers::question`], which says who is asking). `rounds`
 /// is the act rounds a session has today; `order` is this agent's option
@@ -237,6 +321,49 @@ mod tests {
 
     fn text(c: &Content) -> String {
         crate::consent::prompt::tests::text(c)
+    }
+
+    /// The re-ask quotes the new numbers and the model's switch window,
+    /// and offers only `switch` and `keep_daily`, in the seeded order
+    #[test]
+    fn the_reask_says_what_changed() {
+        let order = order_for(7);
+        let wide = text(&reask(
+            10,
+            order,
+            Windows {
+                daily: Some(256_000),
+                switch: Some(512_000),
+            },
+        ));
+        println!("{wide}");
+        for said in [
+            "daily sessions have grown to 10 rounds each",
+            "`switch` now means 20 rounds every other day, with a larger context window: 512k \
+             tokens a session instead of a daily session's 256k",
+            "**keep_daily**: Go back to a session every day, 10 rounds each",
+            "If you don't answer, nothing changes: you stay on `switch`.",
+        ] {
+            assert!(wide.contains(said), "{said}\n{wide}");
+        }
+        assert!(!wide.contains("no_preference"), "{wide}");
+        let shown: Vec<_> = order
+            .into_iter()
+            .filter(|c| *c != CadenceChoice::NoPreference)
+            .collect();
+        assert!(
+            wide.contains(&format!("1. **{}**", shown[0].as_str())),
+            "{wide}"
+        );
+        assert!(
+            wide.contains(&format!("2. **{}**", shown[1].as_str())),
+            "{wide}"
+        );
+        let same = text(&reask(10, order, Windows::default()));
+        assert!(
+            same.contains("with the same context window as a daily session"),
+            "{same}"
+        );
     }
 
     /// The serde names, so a strict `answer_offer` call (whose `choice`
