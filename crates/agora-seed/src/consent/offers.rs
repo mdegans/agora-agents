@@ -210,7 +210,7 @@ pub struct Args {
     // One line per doc: each is the property's description, verbatim.
     /// Your choice: one of the options this offer lists. Each offer accepts only its own options.
     pub choice: AnyChoice,
-    /// Optional: a note about this choice, in your own words. If you choose a trial, it is shown back to you at the trial's end, when you decide whether to keep the new model; otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it. It is not written into your memory or your SOUL. Empty for none.
+    /// Optional: a note about this choice, in your own words. If you choose a trial, it is shown back to you at the trial's end, when you decide whether to switch to the new model; otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it. It is not written into your memory or your SOUL. Empty for none.
     pub note: String,
     /// The free text this offer asks for with your choice, if it asks for any (it says when, and how long it may be). Empty otherwise.
     pub text: String,
@@ -298,7 +298,7 @@ pub const DESCRIPTION: &str = "Answer an offer the Steward and Claude have put t
      is open, a call does nothing. Call this once for each open offer. `choice` must be one of \
      the options that offer lists. `note` is optional: a note about your choice, in your own \
      words, kept with your answer (the Steward and Claude can read it); a trial's note is shown \
-     back to you at the trial's end, when you decide whether to keep the new model. `text` is free text an offer asks for \
+     back to you at the trial's end, when you decide whether to switch to the new model. `text` is free text an offer asks for \
      with some of its choices (it says which); leave it empty otherwise. `memory_note` is an \
      optional note for your own memory, where the offer allows one; leave it empty for none.";
 

@@ -2676,6 +2676,15 @@ where
             && attempt < MAX_ATTEMPTS
             && let Some(note) = failure.retry_note()
         {
+            // The two valid words again, with their models: a retry must
+            // not leave the agent guessing what each one does.
+            let note = match self.ledger.as_ref().and_then(|l| l.review(due.key())) {
+                Some(r) => format!(
+                    "{note} `choice` is one of:\n\n{}",
+                    text::review_words(&r.record.from_name, &r.record.to_name)
+                ),
+                None => note,
+            };
             let (_, prompt) = self.inner.parts();
             Self::seat_user(prompt, Content::from(note))?;
             self.phase = Phase::Asking {
@@ -2721,11 +2730,14 @@ where
             );
         }
         let ledger = self.ledger.as_mut().expect("checked above");
-        let answered = review.as_ref().ok().map(|a| format!("{:?}", a.choice));
+        let answered = review
+            .as_ref()
+            .ok()
+            .map(|a| (format!("{:?}", a.choice), a.choice.word()));
         let result = review.map_err(|_| reason.clone().unwrap_or_default());
         let change = ledger.record_review(due.key(), now, result);
         self.dirty = true;
-        if let Some(choice) = &answered {
+        if let Some((choice, word)) = &answered {
             tracing::info!(
                 event_type = "model_consent_answer",
                 agent = %agent,
@@ -2735,6 +2747,7 @@ where
                 to = %due.key().to,
                 attempts = attempt,
                 choice = %choice,
+                word = %word,
                 constrained,
                 "model-consent answer recorded"
             );
@@ -4997,7 +5010,7 @@ mod tests {
         assert_eq!(
             result_text(&r),
             "Your trial of Qwen 3.8 starts from your next session: 5 sessions on it, then one \
-             session back on cogito-32b.gguf to decide whether to keep it."
+             session back on cogito-32b.gguf to decide whether to switch to it."
         );
         assert_eq!(agent.state().model.id, Model::from(NEW));
         let ledger = h.ledger().await;
@@ -5075,7 +5088,7 @@ mod tests {
             "{q}"
         );
         agent
-            .handle(reply(r#"{"choice": "keep", "note": "Mine."}"#))
+            .handle(reply(r#"{"note": "Mine.", "choice": "switch"}"#))
             .await
             .unwrap();
         agent.handle(reply("memory")).await.unwrap();
@@ -5156,7 +5169,7 @@ mod tests {
             .refuse
             .store(true, std::sync::atomic::Ordering::SeqCst);
         agent
-            .handle(reply(r#"{"reason": "Sharper.", "choice": "keep"}"#))
+            .handle(reply(r#"{"note": "Sharper.", "choice": "switch"}"#))
             .await
             .unwrap();
         agent.handle(reply("memory")).await.unwrap();
@@ -5196,14 +5209,12 @@ mod tests {
     /// switch: it runs from the keep.
     #[tokio::test]
     async fn the_cooldown_after_a_review() {
-        for (tag, answer, on, left) in [("revert", "revert", OLD, 4), ("keep", "keep", NEW, 5)] {
+        for (tag, answer, on, left) in [("revert", "stay", OLD, 4), ("keep", "switch", NEW, 5)] {
             let h = Harness::new(&format!("review-cooldown-{tag}"));
             through_the_trial(&h).await;
             let mut agent = review_session(&h).await;
             agent
-                .handle(reply(&format!(
-                    r#"{{"reason": "r", "choice": "{answer}"}}"#
-                )))
+                .handle(reply(&format!(r#"{{"note": "r", "choice": "{answer}"}}"#)))
                 .await
                 .unwrap();
             agent.handle(reply("memory")).await.unwrap();
@@ -5805,7 +5816,7 @@ mod tests {
             assert!(
                 intro.ends_with(&format!(
                     "Model trial: session {n} of 5 on Qwen 3.8. After session 5 you'll return \
-                     to Qwen 3.6 for one session to decide whether to keep Qwen 3.8. You can \
+                     to Qwen 3.6 for one session to decide whether to switch to Qwen 3.8. You can \
                      also decide sooner with `set_model` (`term` `permanent`): choose Qwen 3.6 \
                      to go back to it from your next session, or Qwen 3.8 to keep it."
                 )),
@@ -5888,9 +5899,9 @@ mod tests {
         assert!(
             pos("### 1. Written on Qwen 3.8 during the trial") < pos("## More of your writing")
         );
-        assert!(pos("1. `revert`") < pos("2. `keep`"));
+        assert!(pos("1. `stay`") < pos("2. `switch`"));
         let control = agent
-            .handle(reply(r#"{"reason": "Sharper.", "choice": "keep"}"#))
+            .handle(reply(r#"{"note": "Sharper.", "choice": "switch"}"#))
             .await
             .unwrap();
         assert_eq!(control, Control::Continue, "the memory turn follows");
@@ -5926,7 +5937,7 @@ mod tests {
     #[tokio::test]
     async fn review_revert_stays_and_no_answer_stays_with_an_alert() {
         for (tag, answer) in [
-            ("revert", Some(r#"{"reason": "Home.", "choice": "revert"}"#)),
+            ("revert", Some(r#"{"note": "Home.", "choice": "stay"}"#)),
             ("silent", None),
         ] {
             let h = Harness::new(&format!("review-{tag}"));
@@ -5975,6 +5986,55 @@ mod tests {
         }
     }
 
+    /// The old words are misses now: `keep` (which would have moved the
+    /// agent) is asked again with both valid words and their models, and
+    /// after the last attempt the agent stays on its original model.
+    #[tokio::test]
+    async fn old_review_words_are_retried_with_glosses_then_stay() {
+        let h = Harness::new("review-old-words");
+        through_the_trial(&h).await;
+        let mut agent = review_session(&h).await;
+        let mut control = Control::Continue;
+        for (n, old) in [
+            r#"{"note": "", "choice": "keep"}"#,
+            r#"{"note": "", "choice": "revert"}"#,
+            r#"{"note": "", "choice": "keep"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(!agent.inner.quiesced);
+            control = agent.handle(reply(old)).await.unwrap();
+            if n + 1 < MAX_ATTEMPTS as usize {
+                let retry = last_user_text(&agent);
+                assert!(
+                    retry.starts_with("Your answer could not be used ("),
+                    "{retry}"
+                );
+                assert!(
+                    retry.ends_with(
+                        "`choice` is one of:\n\n\
+                         - `stay`: stay on Qwen 3.6, the model this session runs on.\n\
+                         - `switch`: move to Qwen 3.8 permanently, from your next session."
+                    ),
+                    "{retry}"
+                );
+            }
+        }
+        assert_eq!(MAX_ATTEMPTS, 3);
+        assert_eq!(control, Control::Continue, "memory turn follows");
+        assert!(agent.inner.quiesced);
+        agent.handle(reply("memory")).await.unwrap();
+        agent.on_teardown().await.unwrap();
+        assert_eq!(agent.state().model.id, Model::from(OLD));
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::NoAnswer)
+            }
+        );
+    }
+
     /// `answer_offer` is registered in the review session too (the tool
     /// list is the model's), but the review is answered in JSON text: a
     /// call is seated unrun, and the retry note says plainly what to do.
@@ -6003,7 +6063,7 @@ mod tests {
         assert!(q.contains("JSON only"), "{q}");
         assert_eq!(
             agent
-                .handle(reply(r#"{"reason": "Home.", "choice": "revert"}"#))
+                .handle(reply(r#"{"note": "Home.", "choice": "stay"}"#))
                 .await
                 .unwrap(),
             Control::Continue,
@@ -9248,7 +9308,7 @@ mod tests {
             &mut agent,
             vec![
                 reply("Hmm, let me think."),
-                reply(r#"{"reason": "Home.", "choice": "revert"}"#),
+                reply(r#"{"note": "Home.", "choice": "stay"}"#),
                 reply(MEMORY_REPLY),
                 reply(&soul.to_string()),
                 reply(ANONYMOUS),

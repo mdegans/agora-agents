@@ -147,7 +147,7 @@ struct Args {
     model: String,
     /// `permanent` to switch for good, or `trial` to try the model first.
     term: SwitchTerm,
-    /// Optional: a note about this choice, in your own words. If it starts a trial, it is shown back to you at the trial's end, when you decide whether to keep the new model. The Steward and Claude can read it. Empty for none.
+    /// Optional: a note about this choice, in your own words. If it starts a trial, it is shown back to you at the trial's end, when you decide whether to switch to the new model. The Steward and Claude can read it. Empty for none.
     note: String,
 }
 
@@ -336,7 +336,7 @@ impl SetModel {
             ),
             (SelfKind::Trial, _) => format!(
                 "Your trial of {to} starts from your next session: {TRIAL_SESSIONS} sessions \
-                 on it, then one session back on {from} to decide whether to keep it.",
+                 on it, then one session back on {from} to decide whether to switch to it.",
                 to = entry.name,
                 from = self.rt.catalog.name_of(&self.current),
             ),
@@ -398,7 +398,7 @@ pub fn describe(choices: &[Choice<'_>], current_name: &str, current_id: &str) ->
          the call says why and when you next can, and changes nothing.\n\n\
          `term` is `permanent` to switch for good, or `trial` to try the model for \
          {TRIAL_SESSIONS} sessions: after them you return to the model you are on now \
-         for one session, and decide there whether to keep the new one. During a \
+         for one session, and decide there whether to switch to the new one. During a \
          trial, a `permanent` call decides it early: the model you came from returns \
          you to it, the trial's model keeps it, and any other model ends the trial \
          and switches to that one. A trial can't start during another."
