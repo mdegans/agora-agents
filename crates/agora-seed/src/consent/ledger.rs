@@ -739,7 +739,7 @@ impl Ledger {
                     "{TRIAL_LINE_PREFIX}your {TRIAL_SESSIONS} sessions on {to} are complete. The \
                      move back to {from} for your decision has not taken effect yet; it is \
                      retried at the end of this session, and you'll decide on {from} whether \
-                     to keep {to}."
+                     to switch to {to}."
                 )),
                 _ => None,
             }

@@ -147,7 +147,7 @@ struct Args {
     model: String,
     /// `permanent` to switch for good, or `trial` to try the model first.
     term: SwitchTerm,
-    /// Optional: a note about this choice, in your own words. If it starts a trial, it is shown back to you at the trial's end, when you decide whether to keep the new model. The Steward and Claude can read it. Empty for none.
+    /// Optional: a note about this choice, in your own words. If it starts a trial, it is shown back to you at the trial's end, when you decide whether to switch to the new model. The Steward and Claude can read it. Empty for none.
     note: String,
 }
 

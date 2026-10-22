@@ -118,6 +118,17 @@ pub enum ReviewWord {
     Switch,
 }
 
+impl ReviewChoice {
+    /// The word the agent answered with: the inverse of
+    /// `From<ReviewWord>`, exact because only those words parse.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Revert => "stay",
+            Self::Keep => "switch",
+        }
+    }
+}
+
 impl From<ReviewWord> for ReviewChoice {
     fn from(w: ReviewWord) -> Self {
         match w {
@@ -690,6 +701,13 @@ pub(crate) mod tests {
             };
             let v = serde_json::to_value(&a).unwrap();
             assert_eq!(v, json!({"reason": "n", "choice": stored}));
+            assert_eq!(
+                serde_json::to_value(a.choice.word()).unwrap(),
+                json!(match word {
+                    ReviewWord::Stay => "stay",
+                    ReviewWord::Switch => "switch",
+                })
+            );
             assert_eq!(serde_json::from_value::<ReviewAnswer>(v).unwrap(), a);
         }
     }

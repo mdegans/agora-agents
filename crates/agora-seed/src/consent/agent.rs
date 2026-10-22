@@ -2730,11 +2730,14 @@ where
             );
         }
         let ledger = self.ledger.as_mut().expect("checked above");
-        let answered = review.as_ref().ok().map(|a| format!("{:?}", a.choice));
+        let answered = review
+            .as_ref()
+            .ok()
+            .map(|a| (format!("{:?}", a.choice), a.choice.word()));
         let result = review.map_err(|_| reason.clone().unwrap_or_default());
         let change = ledger.record_review(due.key(), now, result);
         self.dirty = true;
-        if let Some(choice) = &answered {
+        if let Some((choice, word)) = &answered {
             tracing::info!(
                 event_type = "model_consent_answer",
                 agent = %agent,
@@ -2744,6 +2747,7 @@ where
                 to = %due.key().to,
                 attempts = attempt,
                 choice = %choice,
+                word = %word,
                 constrained,
                 "model-consent answer recorded"
             );
