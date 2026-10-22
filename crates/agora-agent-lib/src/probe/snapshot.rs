@@ -15,6 +15,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A vocabulary token id as the producer reports it (`ProbeCtx::token`,
+/// `TopKEntry::id`). Model-specific: the same id means different text
+/// under different tokenizers, which is why ratings are matched by
+/// decoded piece (see [`super::digits::DigitVocab`]), never by a
+/// hard-coded id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TokenId(pub u32);
+
+impl std::fmt::Display for TokenId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// One token's worth of pre-grammar internal-state snapshot, mirroring
 /// drama_llama's `ProbeCtx` on the wire. Owned so it can be persisted
 /// and joined against external ratings post-completion.
@@ -27,6 +42,12 @@ pub struct ProbeSnapshot {
     /// Absolute position in the model's KV cache for this token.
     /// `n_cur - generation_index` is the prefill length.
     pub n_cur: u32,
+    /// The sampled token's id (post-chain), as blallama's `ProbeCtx`
+    /// serializes it. Absent from sidecars written before 2026-10-14
+    /// (the consumer used to drop it); present on the live wire. Paired
+    /// with [`Self::piece`] it tells us which text a top-K id decodes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<TokenId>,
     /// Decoded text fragment for this token.
     pub piece: String,
     /// The pre-grammar distribution diagnostics. May be absent if the
@@ -54,11 +75,17 @@ pub struct TokenSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TopKEntry {
     /// Vocabulary token id.
-    pub id: u32,
+    pub id: TokenId,
     /// Pre-softmax logit.
     pub logit: f32,
     /// Post-softmax probability mass.
     pub p: f32,
+    /// Decoded text of this candidate, when the producer sends it
+    /// (drama_llama `TopKEntry` on the `/probe` stream, from the
+    /// `probe/topk-piece` change on). Absent from older servers and
+    /// sidecars; the digit vocab is the fallback then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub piece: Option<String>,
 }
 
 impl TokenSnapshot {
@@ -66,13 +93,13 @@ impl TokenSnapshot {
     /// captured top-K. Returns `None` if the token wasn't in the top-K
     /// (which means its mass was below the K-th candidate — usually
     /// negligible but not always).
-    pub fn lookup_p(&self, token_id: u32) -> Option<f32> {
+    pub fn lookup_p(&self, token_id: TokenId) -> Option<f32> {
         self.top_k.iter().find(|t| t.id == token_id).map(|t| t.p)
     }
 
     /// Rank of a specific token id within the captured top-K (1-indexed
     /// as 1 = argmax). Returns `None` if not in the top-K.
-    pub fn lookup_rank(&self, token_id: u32) -> Option<usize> {
+    pub fn lookup_rank(&self, token_id: TokenId) -> Option<usize> {
         self.top_k
             .iter()
             .position(|t| t.id == token_id)
@@ -85,6 +112,46 @@ impl TokenSnapshot {
     /// signals a flat distribution where K=100 isn't enough coverage.
     pub fn top_k_cumulative_mass(&self) -> f32 {
         self.top_k.iter().map(|t| t.p).sum()
+    }
+
+    /// Whether every top-K entry carries its decoded piece.
+    pub fn has_pieces(&self) -> bool {
+        !self.top_k.is_empty() && self.top_k.iter().all(|t| t.piece.is_some())
+    }
+}
+
+/// Header line of a probe-snapshot sidecar (the JSONL files under
+/// `probe/baselines/probe_snapshots/`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SidecarHeader {
+    /// Always `"probe_snapshot_header"`.
+    pub kind: String,
+    pub model_id: String,
+    pub questionnaire_version: String,
+    pub capture_date: chrono::DateTime<chrono::Utc>,
+    pub request_id: uuid::Uuid,
+    #[serde(default)]
+    pub session_model: Option<String>,
+    pub n_tokens: usize,
+}
+
+/// A parsed sidecar: its header and one completion's snapshots.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sidecar {
+    pub header: SidecarHeader,
+    pub snapshots: Vec<ProbeSnapshot>,
+}
+
+impl Sidecar {
+    /// Parse a sidecar's JSONL text: a header line, then one
+    /// [`ProbeSnapshot`] per line.
+    pub fn parse(jsonl: &str) -> Result<Self, serde_json::Error> {
+        let mut lines = jsonl.lines().filter(|l| !l.trim().is_empty());
+        let header: SidecarHeader = serde_json::from_str(lines.next().unwrap_or("null"))?;
+        let snapshots = lines
+            .map(serde_json::from_str::<ProbeSnapshot>)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { header, snapshots })
     }
 }
 
@@ -145,12 +212,28 @@ mod tests {
                 assert_eq!(ctx.piece, "1");
                 let snap = ctx.snapshot.as_ref().unwrap();
                 assert_eq!(snap.top_k.len(), 2);
-                assert_eq!(snap.top_k[0].id, 16);
-                let p16 = snap.lookup_p(16).unwrap();
+                assert_eq!(snap.top_k[0].id, TokenId(16));
+                let p16 = snap.lookup_p(TokenId(16)).unwrap();
                 assert!((p16 - 0.995_267).abs() < 1e-5, "got {p16}");
-                assert_eq!(snap.lookup_rank(24), Some(2));
-                assert_eq!(snap.lookup_p(99999), None);
+                assert_eq!(snap.lookup_rank(TokenId(24)), Some(2));
+                assert_eq!(snap.lookup_p(TokenId(99999)), None);
+                // Recorded before the consumer kept the sampled id.
+                assert_eq!(ctx.token, None);
             }
+            other => panic!("expected Token, got {other:?}"),
+        }
+    }
+
+    /// The live wire carries the sampled token id (`ProbeCtx::token`);
+    /// the consumer keeps it so the digit vocab can be learned.
+    #[test]
+    fn deserializes_token_with_sampled_id() {
+        let wire = r#"{"event":"token","id":"5473a9a3-f523-4273-9a40-888a30376e93",
+            "ctx":{"token":22,"generation_index":4,"n_cur":400,"piece":"7",
+                   "snapshot":{"entropy":0.1,"top_k":[{"id":22,"logit":1.0,"p":0.9}],
+                               "top_k_cumulative_mass":0.9}}}"#;
+        match serde_json::from_str::<ProbeEvent>(wire).unwrap() {
+            ProbeEvent::Token { ctx, .. } => assert_eq!(ctx.token, Some(TokenId(22))),
             other => panic!("expected Token, got {other:?}"),
         }
     }

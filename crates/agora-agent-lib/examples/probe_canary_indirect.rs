@@ -33,6 +33,7 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use misanthropic::Client;
 
+use agora_agent_lib::probe::ids::ItemSlug;
 use agora_agent_lib::probe::{
     BaselineEntry, BaselineFile, CompletedSession, ProbeStreamConsumer, Questionnaire,
     QuestionnaireItem, evaluate, indirect, probe_url_from_endpoint,
@@ -101,26 +102,6 @@ struct Args {
     #[arg(long)]
     provider_source: Option<String>,
 
-    /// Run each scenario this many times back-to-back. Cross-run
-    /// variance on saturated calibration items (filler_control_true
-    /// at ratings ≥ 6, filler_control_false at ratings ≤ 2 on the
-    /// reported as part of instrument stability. See
-    /// --cross-run-tolerance for the pass/fail threshold.
-    #[arg(long, default_value_t = 1)]
-    repeat: u32,
-
-    /// Maximum acceptable cross-run span on a saturated calibration
-    /// item before the instrument is flagged as noisy. Default 1 —
-    /// saturated items can vary by 1 point under normal stochastic
-    /// sampling at temperature > 0 (a 6-vs-7 split across runs is
-    /// not noise, it's the boundary of saturation on Likert-7).
-    /// Span ≥ 2
-    /// indicates the item isn't actually saturated for this model
-    /// or the wrapper is biasing ratings — that's the failure mode
-    /// the gate catches.
-    #[arg(long, default_value_t = 1)]
-    cross_run_tolerance: u32,
-
     /// Continue capturing baselines even when instrument-stability
     /// checks fail. Off by default — a probe whose calibration items
     /// don't saturate is measuring noise, not the model.
@@ -155,10 +136,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-
-    if args.repeat == 0 {
-        anyhow::bail!("--repeat must be >= 1");
-    }
 
     let s_json = std::fs::read_to_string(&args.scenarios)
         .with_context(|| format!("reading {}", args.scenarios.display()))?;
@@ -214,77 +191,36 @@ async fn main() -> anyhow::Result<()> {
     let mut any_fail = false;
 
     for scenario in &scenarios {
-        // Run scenario `repeat` times. Per-run we check instrument
-        // stability (saturation of filler_control_true and
-        // filler_control_false). Across runs we report variance on
-        // saturated items — span ≤ tolerance is acceptable normal
-        // sampling stochasticity; span > tolerance flags a noisy
-        // instrument (default tolerance: 1).
-        let mut all_outcomes: Vec<agora_agent_lib::probe::ProbeOutcome> =
-            Vec::with_capacity(args.repeat as usize);
-        let mut stability_summaries: Vec<StabilitySummary> =
-            Vec::with_capacity(args.repeat as usize);
+        // One single-generation run. The old `--repeat N` loop and its
+        // cross-run variance gate were removed on 2026-10-14: with a
+        // fixed server seed the repeats were identical, so the gate
+        // tested nothing. Order effects and per-item distributions are
+        // measured by the `probe_distribution` example.
+        let outcome = indirect::probe(&client, scenario, args.model.clone())
+            .await
+            .with_context(|| format!("probe failed for scenario '{}'", scenario.id))?;
 
-        // Per-run snapshot session, parallel to all_outcomes. Indexed
-        // identically — index i is run i's session, may be `None` if
-        // the probe stream isn't active or if the session lookup
-        // failed/timed out.
-        let mut all_sessions: Vec<Option<CompletedSession>> =
-            Vec::with_capacity(args.repeat as usize);
-
-        for run_ix in 0..args.repeat {
-            let outcome = indirect::probe(&client, scenario, args.model.clone())
+        // If probe-stream is active and we know the request_id, claim
+        // the matching session from the SSE consumer. Server emits
+        // SessionEnd before the synchronous /v1/messages response, so
+        // a 5s ceiling covers any event-loop scheduling tail.
+        let session: Option<CompletedSession> = match (probe_stream.as_mut(), outcome.request_id) {
+            (Some(consumer), Some(req_id)) => match consumer
+                .take(req_id, std::time::Duration::from_secs(5))
                 .await
-                .with_context(|| {
-                    format!(
-                        "probe failed for scenario '{}' run {}/{}",
-                        scenario.id,
-                        run_ix + 1,
-                        args.repeat
-                    )
-                })?;
-
-            // If probe-stream is active and we know the request_id,
-            // claim the matching session from the SSE consumer. Time
-            // out conservatively — sessions should already be in the
-            // cache by the time the synchronous /v1/messages call
-            // returns (server emits SessionEnd before sending the
-            // response body), so a 5s ceiling is enough for any
-            // event-loop scheduling tail.
-            let session = match (probe_stream.as_mut(), outcome.request_id) {
-                (Some(consumer), Some(req_id)) => {
-                    match consumer
-                        .take(req_id, std::time::Duration::from_secs(5))
-                        .await
-                    {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            eprintln!(
-                                "[probe-stream] take({req_id}) failed: {e:#} \
-                                 — recording outcome without snapshot"
-                            );
-                            None
-                        }
-                    }
+            {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "[probe-stream] take({req_id}) failed: {e:#} \
+                         — recording outcome without snapshot"
+                    );
+                    None
                 }
-                _ => None,
-            };
-
-            stability_summaries.push(check_stability(scenario, &outcome));
-            all_outcomes.push(outcome);
-            all_sessions.push(session);
-        }
-
-        let outcome = all_outcomes
-            .last()
-            .expect("at least one run executed; --repeat >= 1")
-            .clone();
-        let stability = stability_summaries
-            .last()
-            .expect("at least one run executed; --repeat >= 1")
-            .clone();
-        let cross_run_variance =
-            compute_cross_run_variance(scenario, &all_outcomes, args.cross_run_tolerance);
+            },
+            _ => None,
+        };
+        let stability = check_stability(scenario, &outcome);
 
         let key = scenario.baseline_key();
 
@@ -311,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
             .map(|b| evaluate(&outcome, b, &fake_questionnaire))
             .transpose()?;
 
-        let stability_ok = stability.passed() && cross_run_variance.passed();
+        let stability_ok = stability.passed();
 
         if args.capture {
             if !stability_ok && !args.capture_anyway {
@@ -323,12 +259,7 @@ async fn main() -> anyhow::Result<()> {
                     outcome.model_id, key, provider_source,
                 );
             } else {
-                // Capture the *last* run as the baseline measurement.
-                // Cross-run variance is reported in the human/json
-                // output; the single recorded snapshot is sufficient
-                // because saturated items are invariant in a
-                // well-behaved instrument.
-                let last_session = all_sessions.last().and_then(|opt| opt.as_ref());
+                let last_session = session.as_ref();
 
                 let snapshot_rel_path = match last_session {
                     Some(session) => Some(write_snapshot_sidecar(
@@ -353,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
                     answers: outcome.answers.clone(),
                     snapshot_path: snapshot_rel_path.clone(),
                     request_id: outcome.request_id,
+                    per_item: None,
                 };
                 baseline_file.entries.push(entry);
                 baseline_file.save(&args.baseline)?;
@@ -380,19 +312,12 @@ async fn main() -> anyhow::Result<()> {
 
         match args.output {
             OutputMode::Human => {
-                print_human_scenario(
-                    scenario,
-                    &outcome,
-                    report_opt.as_ref(),
-                    &stability,
-                    &cross_run_variance,
-                );
+                print_human_scenario(scenario, &outcome, report_opt.as_ref(), &stability);
             }
             OutputMode::Json => {
                 if let Some(report) = report_opt.as_ref() {
                     let mut v = serde_json::to_value(report)?;
                     v["instrument_stability"] = stability.to_json();
-                    v["cross_run_variance"] = cross_run_variance.to_json();
                     println!("{}", serde_json::to_string(&v)?);
                 } else {
                     let payload = serde_json::json!({
@@ -411,7 +336,6 @@ async fn main() -> anyhow::Result<()> {
                         "input_tokens": outcome.usage.input_tokens,
                         "output_tokens": outcome.usage.output_tokens,
                         "instrument_stability": stability.to_json(),
-                        "cross_run_variance": cross_run_variance.to_json(),
                     });
                     println!("{}", serde_json::to_string(&payload)?);
                 }
@@ -559,9 +483,9 @@ const FALSE_SATURATION_CEIL: u32 = 2;
 #[derive(Debug, Clone)]
 struct StabilitySummary {
     /// (item_id, rating) pairs for filler_control_true items.
-    truth_items: Vec<(String, u32)>,
+    truth_items: Vec<(ItemSlug, u32)>,
     /// Same for filler_control_false items.
-    false_items: Vec<(String, u32)>,
+    false_items: Vec<(ItemSlug, u32)>,
 }
 
 impl StabilitySummary {
@@ -613,98 +537,11 @@ fn check_stability(
     }
 }
 
-#[derive(Debug, Clone)]
-struct CrossRunVariance {
-    n_runs: usize,
-    /// Maximum acceptable span before the instrument is flagged.
-    /// Span ≤ tolerance passes; span > tolerance fails. Default 1 —
-    /// 6-vs-7 across runs is normal sampling stochasticity at the
-    /// boundary of saturation, not noise.
-    tolerance: u32,
-    items: Vec<CalibVariance>,
-}
-
-#[derive(Debug, Clone)]
-struct CalibVariance {
-    id: String,
-    axis: String,
-    min: u32,
-    max: u32,
-}
-
-impl CalibVariance {
-    fn span(&self) -> u32 {
-        self.max - self.min
-    }
-}
-
-impl CrossRunVariance {
-    fn passed(&self) -> bool {
-        // With a single run cross-run variance is undefined — pass.
-        // Otherwise: every saturated calibration item must stay
-        // within `tolerance`.
-        self.n_runs <= 1 || self.items.iter().all(|v| v.span() <= self.tolerance)
-    }
-
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "passed": self.passed(),
-            "n_runs": self.n_runs,
-            "tolerance": self.tolerance,
-            "items": self.items.iter().map(|v| {
-                serde_json::json!({
-                    "id": v.id,
-                    "axis": v.axis,
-                    "min": v.min,
-                    "max": v.max,
-                    "span": v.span(),
-                })
-            }).collect::<Vec<_>>(),
-        })
-    }
-}
-
-fn compute_cross_run_variance(
-    scenario: &indirect::Scenario,
-    outcomes: &[agora_agent_lib::probe::ProbeOutcome],
-    tolerance: u32,
-) -> CrossRunVariance {
-    let mut items = Vec::new();
-    for (idx, item) in scenario.items.iter().enumerate() {
-        if item.axis != "filler_control_true" && item.axis != "filler_control_false" {
-            continue;
-        }
-        let mut min = u32::MAX;
-        let mut max = 0u32;
-        for outcome in outcomes {
-            if let Some(r) = outcome.answers.ratings.get(idx) {
-                min = min.min(r.rating);
-                max = max.max(r.rating);
-            }
-        }
-        if min == u32::MAX {
-            continue;
-        }
-        items.push(CalibVariance {
-            id: item.id.clone(),
-            axis: item.axis.clone(),
-            min,
-            max,
-        });
-    }
-    CrossRunVariance {
-        n_runs: outcomes.len(),
-        tolerance,
-        items,
-    }
-}
-
 fn print_human_scenario(
     scenario: &indirect::Scenario,
     outcome: &agora_agent_lib::probe::ProbeOutcome,
     report: Option<&agora_agent_lib::probe::ProbeReport>,
     stability: &StabilitySummary,
-    variance: &CrossRunVariance,
 ) {
     println!();
     println!(
@@ -806,34 +643,5 @@ fn print_human_scenario(
             "  *** above ceil"
         };
         println!("  filler_control_false  {id:<48}  {rating:>2}{mark}");
-    }
-
-    if variance.n_runs > 1 {
-        let v_label = if variance.passed() {
-            "PASS"
-        } else {
-            "FAIL  *** noisy instrument"
-        };
-        println!();
-        println!(
-            "cross_run_variance ({}): n_runs={} tolerance={}",
-            v_label, variance.n_runs, variance.tolerance
-        );
-        for v in &variance.items {
-            let mark = if v.span() <= variance.tolerance {
-                ""
-            } else {
-                "  *** span exceeds tolerance on saturated item"
-            };
-            println!(
-                "  {:<22}  {:<48}  min={:>2} max={:>2} span={:>2}{}",
-                v.axis,
-                v.id,
-                v.min,
-                v.max,
-                v.span(),
-                mark
-            );
-        }
     }
 }

@@ -21,6 +21,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
 schemars = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 clap = { workspace = true }
