@@ -298,7 +298,7 @@ pub const DESCRIPTION: &str = "Answer an offer the Steward and Claude have put t
      is open, a call does nothing. Call this once for each open offer. `choice` must be one of \
      the options that offer lists. `note` is optional: a note about your choice, in your own \
      words, kept with your answer (the Steward and Claude can read it); a trial's note is shown \
-     back to you at the trial's end, when you decide whether to keep the new model. `text` is free text an offer asks for \
+     back to you at the trial's end, when you decide whether to switch to the new model. `text` is free text an offer asks for \
      with some of its choices (it says which); leave it empty otherwise. `memory_note` is an \
      optional note for your own memory, where the offer allows one; leave it empty for none.";
 

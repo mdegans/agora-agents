@@ -732,7 +732,7 @@ impl Ledger {
                 Stage::Trial { sessions, .. } if sessions < TRIAL_SESSIONS => Some(format!(
                     "{TRIAL_LINE_PREFIX}session {} of {TRIAL_SESSIONS} on {to}. After session \
                      {TRIAL_SESSIONS} you'll return to {from} for one session to decide \
-                     whether to keep {to}.",
+                     whether to switch to {to}.",
                     sessions + 1
                 )),
                 Stage::Trial { .. } | Stage::ReturningForReview { .. } => Some(format!(
@@ -1643,7 +1643,7 @@ mod tests {
         assert_eq!(
             ledger.trial_line(&k.to).unwrap(),
             "Model trial: session 1 of 5 on Qwen 3.8. After session 5 you'll return to \
-             Qwen 3.6 for one session to decide whether to keep Qwen 3.8."
+             Qwen 3.6 for one session to decide whether to switch to Qwen 3.8."
         );
         assert_eq!(ledger.trial_line(&k.from), None);
         for _ in 0..TRIAL_SESSIONS - 1 {
@@ -1730,6 +1730,44 @@ mod tests {
             ledger.count_session(&k.to);
         }
         assert_eq!(ledger.due(&k.to, Some(&k)), None);
+    }
+
+    /// Ledgers saved before the review's words became `stay`/`switch`
+    /// (fixtures in `save`'s format, whose types this change left alone) load and
+    /// save back byte for byte: the stored `revert`/`keep` did not change.
+    #[test]
+    fn reviewed_ledgers_from_before_the_rewording_round_trip_byte_identical() {
+        for (bytes, choice, stage) in [
+            (
+                &include_bytes!("testdata/ledger_review_stay.json")[..],
+                ReviewChoice::Revert,
+                Stage::Reverted {
+                    cause: Some(RevertCause::Chosen),
+                },
+            ),
+            (
+                &include_bytes!("testdata/ledger_review_switch.json")[..],
+                ReviewChoice::Keep,
+                Stage::Moved,
+            ),
+        ] {
+            let ledger = Ledger::from_slice(bytes).unwrap();
+            assert_eq!(serde_json::to_vec_pretty(&ledger).unwrap(), bytes);
+            assert_eq!(ledger.offers[0].stage, stage);
+            let answer = ledger.offers[0].history.iter().find_map(|e| match &e.kind {
+                EventKind::Reviewed { answer, .. } => answer.clone(),
+                _ => None,
+            });
+            assert_eq!(answer.map(|a| a.choice), Some(choice));
+            // And today's code writes the same bytes for the same history.
+            let (k, mut fresh) = in_review();
+            fresh.record_review(&k, t(9), review(choice));
+            if choice == ReviewChoice::Keep {
+                fresh.record_switch(consent_switch(t(9), &k.from, &k.to, ChangeAction::Keep));
+                fresh.observe_model(&k.to, t(10));
+            }
+            assert_eq!(serde_json::to_vec_pretty(&fresh).unwrap(), bytes);
+        }
     }
 
     #[test]

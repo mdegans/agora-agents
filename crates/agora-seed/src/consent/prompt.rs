@@ -15,14 +15,22 @@
 //! this project (CLAUDE.md, "Never ship a `$ref` schema"). The tests pin
 //! that.
 //!
-//! **Order is deliberate.** `choice` comes first and an optional `note`
-//! after it: under a grammar the decoder emits properties in declaration
-//! order, and no field before the decision may ask for reasons (CLAUDE.md,
-//! "Never ship a `$ref` schema", rule 5). Until 2026-10-15 `reason` came
-//! first, a scratchpad from before the agents thought; the ledger still
-//! keeps the note as `reason` ([`ReviewAnswer`]), so no saved state changed
-//! shape. And "stay"/"revert" is listed first — the no-change option takes
-//! the first-option bias.
+//! **Order is deliberate.** The optional `note` (words for the record, not
+//! a scratchpad: CLAUDE.md, "Never ship a `$ref` schema", rule 5) comes
+//! before `choice`: under a grammar the decoder emits properties in
+//! declaration order, so the statement precedes the decision (rule 2).
+//! Until 2026-10-15 a `reason` came first, then `choice` did until
+//! 2026-10-22; the ledger still keeps the note as `reason`
+//! ([`ReviewAnswer`]), so no saved state changed shape. And `stay` is
+//! listed first — the no-change option takes the first-option bias.
+//!
+//! **The words the agent answers with are `stay` and `switch`**
+//! ([`ReviewWord`]), each glossed with its model where it is asked. They
+//! were `revert` and `keep` until 2026-10-22: asked on the original model,
+//! "revert" read as undoing the return (to the trial model), and a misread
+//! `keep` moves an agent permanently. The ledger still stores
+//! [`ReviewChoice`]'s `revert`/`keep`, unchanged; only the wire words
+//! changed.
 
 use agora_agentkit::responses::inline_input_schema_for;
 use misanthropic::prompt::message::Content;
@@ -66,42 +74,75 @@ pub struct ReviewAnswer {
 }
 
 /// The trial review's answer on the wire, and its schema
-/// ([`review_schema`]): the choice, then an optional note.
+/// ([`review_schema`]): an optional note, then the choice.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewArgs {
-    /// `revert` or `keep`
-    pub choice: ReviewChoice,
     /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it; it is not shown to you again. Empty for none.
     // Required, empty for none, as in `answer_offer`: strict decoders omit
     // optional fields. Plain text is read leniently ([`parse_review_args`]).
     #[serde(alias = "reason")]
     pub note: String,
+    /// `stay` (stay on the model this session runs on) or `switch` (move to the trial's model permanently)
+    pub choice: ReviewWord,
 }
 
 impl From<ReviewArgs> for ReviewAnswer {
     fn from(a: ReviewArgs) -> Self {
         Self {
             reason: a.note,
-            choice: a.choice,
+            choice: a.choice.into(),
         }
     }
 }
 
-/// The review's options, in the order they are presented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// The review's outcome as the ledger stores it (`revert`/`keep`, a
+/// format unchanged by the 2026-10-22 rewording). Never shown to the
+/// agent: it answers with a [`ReviewWord`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewChoice {
+    /// Stay on the original model.
     Revert,
+    /// Move to the trial's model permanently.
     Keep,
 }
 
-#[cfg(test)]
-impl ReviewChoice {
-    pub const ALL: [Self; 2] = [Self::Revert, Self::Keep];
+/// The words the agent answers the review with, in the order they are
+/// presented: `stay` → [`ReviewChoice::Revert`], `switch` →
+/// [`ReviewChoice::Keep`]. Nothing else parses (no `revert`/`keep`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewWord {
+    Stay,
+    Switch,
 }
 
-/// [`ReviewArgs`]' schema: `{choice, note}`, inline, `$ref`-free and
+impl From<ReviewWord> for ReviewChoice {
+    fn from(w: ReviewWord) -> Self {
+        match w {
+            ReviewWord::Stay => Self::Revert,
+            ReviewWord::Switch => Self::Keep,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ReviewWord {
+    pub const ALL: [Self; 2] = [Self::Stay, Self::Switch];
+}
+
+/// The two answers to the review, each with its model: the choice section
+/// and the retry note both use it, so an agent asked again sees the same
+/// meanings.
+pub fn review_words(from: &str, to: &str) -> String {
+    format!(
+        "- `stay`: stay on {from}, the model this session runs on.\n\
+         - `switch`: move to {to} permanently, from your next session."
+    )
+}
+
+/// [`ReviewArgs`]' schema: `{note, choice}`, inline, `$ref`-free and
 /// closed
 pub fn review_schema() -> serde_json::Value {
     inline_input_schema_for::<ReviewArgs>()
@@ -119,8 +160,6 @@ pub struct OfferText<'a> {
     /// everyone is.
     pub limited: bool,
 }
-
-const JSON_ONLY: &str = "Do NOT use tools. Respond in JSON **only**, giving your choice and, if you like, a note, exactly this shape:";
 
 /// Who is asking, and where the answer goes. Not the agent's memory: the
 /// runner's own record, plus one factual line in the SOUL's Evolution Log
@@ -164,7 +203,7 @@ If you choose `trial` or `permanent`, the move normally takes effect from your n
 
 {RECORD}
 
-To answer, call `answer_offer` with `offer` set to `model_swap` and `choice` set to `no_swap`, `trial` or `permanent`. `note` is optional: a few words about your choice, in your own voice. If you choose `trial`, it is shown back to you after the trial, when you decide whether to keep {to}: a note to your future self. Otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it, and is not written into your memory or your SOUL. Leave `text` and `memory_note` empty: this question writes nothing into your memory."#
+To answer, call `answer_offer` with `offer` set to `model_swap` and `choice` set to `no_swap`, `trial` or `permanent`. `note` is optional: a few words about your choice, in your own voice. If you choose `trial`, it is shown back to you after the trial, when you decide whether to switch to {to}: a note to your future self. Otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it, and is not written into your memory or your SOUL. Leave `text` and `memory_note` empty: this question writes nothing into your memory."#
     );
     Content::from(body)
 }
@@ -431,6 +470,7 @@ pub fn review(
     let gaps = render_gaps(comparison);
     let before = render_side(&comparison.before, incomplete);
     let after = render_side(&comparison.after, incomplete);
+    let words = review_words(from, to);
     let body = format!(
         r#"Before anything else this session, one question. {PROVENANCE}
 
@@ -452,15 +492,17 @@ Some of your own writing on Agora from before the trial (on {from}) and since it
 {after}
 ## Your choice
 
-1. `revert` — stay on {from}, the model this session runs on.
-2. `keep` — move to {to} permanently, from your next session.
+1. `stay` — stay on {from}, the model this session runs on.
+2. `switch` — move to {to} permanently, from your next session.
 
 There is no penalty either way. You are asked once. If no answer comes, you stay on {from}: you agreed to a {TRIAL_SESSIONS}-session trial, not a permanent move.
 
-{JSON_ONLY}
+Do NOT use tools. Respond in JSON **only**: if you like, a note, and then your choice, in exactly the shape below. `choice` is one of:
+
+{words}
 
 ```json
-{{"choice": "<revert | keep>", "note": "<optional: a note about your choice, in your own words, kept with your answer (the Steward and Claude can read it); empty for none>"}}
+{{"note": "<optional: a note about your choice, in your own words, kept with your answer (the Steward and Claude can read it); empty for none>", "choice": "<stay | switch>"}}
 ```"#
     );
     Content::from(body)
@@ -487,13 +529,13 @@ pub fn parse_offer(text: &str) -> Result<OfferAnswer, String> {
 }
 
 /// A plain-text review answer: [`ReviewArgs`] with the note optional, so
-/// a bare `{"choice": "keep"}` counts.
+/// a bare `{"choice": "switch"}` counts.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewTextArgs {
-    choice: ReviewChoice,
     #[serde(default, alias = "reason")]
     note: String,
+    choice: ReviewWord,
 }
 
 /// The review's answer in its wire shape ([`ReviewArgs`]), from plain text.
@@ -539,7 +581,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn review_schema_is_ref_free_closed_and_choice_first() {
+    fn review_schema_is_ref_free_closed_and_note_first() {
         // The offer is answered with `answer_offer` (`super::offers`, whose
         // tests pin its schema); only the review still goes out as
         // `output_config`.
@@ -547,15 +589,19 @@ pub(crate) mod tests {
         assert_ref_free(&schema);
         assert_eq!(schema["additionalProperties"], false);
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["choice", "note"], "nothing before the choice");
-        assert_eq!(schema["required"], json!(["choice", "note"]));
+        assert_eq!(
+            keys,
+            ["note", "choice"],
+            "the statement before the decision"
+        );
+        assert_eq!(schema["required"], json!(["note", "choice"]));
         assert!(
             schema["properties"]["note"].get("default").is_none(),
             "{schema}"
         );
         // Read leniently: a bare choice is an answer with no note.
         assert_eq!(
-            parse_review(r#"{"choice": "keep"}"#).unwrap(),
+            parse_review(r#"{"choice": "switch"}"#).unwrap(),
             ReviewAnswer {
                 reason: String::new(),
                 choice: ReviewChoice::Keep
@@ -568,22 +614,23 @@ pub(crate) mod tests {
         }
         // The parse type refuses what the closed schema refuses, and reads
         // the older `reason` as the note.
-        let err = parse_review(r#"{"choice": "keep", "note": "n", "x": 1}"#).unwrap_err();
+        let err = parse_review(r#"{"note": "n", "choice": "switch", "x": 1}"#).unwrap_err();
         assert!(err.contains("unknown field"), "{err}");
     }
 
     /// The schema's enum is exactly the serde names, in presentation order
-    /// (stay/revert first) — so a grammar-constrained answer always parses.
+    /// (`stay` first) — so a grammar-constrained answer always parses.
     #[test]
     fn schema_enums_match_the_serde_types_in_order() {
-        let names = |v: Vec<serde_json::Value>| {
-            v.into_iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect::<Vec<_>>()
-        };
-        let review: Vec<_> = ReviewChoice::ALL.iter().map(|c| json!(c)).collect();
-        assert_eq!(enum_of(&review_schema()), names(review));
-        assert_eq!(enum_of(&review_schema())[0], "revert");
+        // `ReviewWord` is Deserialize-only (it is never stored), so the
+        // check runs the other way: each schema name parses, in order.
+        let names = enum_of(&review_schema());
+        assert_eq!(names, ["stay", "switch"]);
+        let parsed: Vec<ReviewWord> = names
+            .iter()
+            .map(|n| serde_json::from_value(json!(n)).unwrap())
+            .collect();
+        assert_eq!(parsed, ReviewWord::ALL);
     }
 
     #[test]
@@ -593,8 +640,58 @@ pub(crate) mod tests {
         let a =
             parse_offer("```json\n{\"reason\": \"curious\", \"choice\": \"trial\"}\n```").unwrap();
         assert_eq!(a.choice, OfferChoice::Trial);
-        let r = parse_review(r#"{"reason": "sharper", "choice": "keep"}"#).unwrap();
+        let r = parse_review(r#"{"reason": "sharper", "choice": "switch"}"#).unwrap();
         assert_eq!(r.choice, ReviewChoice::Keep);
+    }
+
+    /// `stay` and `switch` map onto the ledger's existing outcomes; the
+    /// old words, which no agent is shown any more, are refused like any
+    /// other miss (and a miss stays on the original model).
+    #[test]
+    fn review_words_parse_strictly() {
+        let stay = parse_review(r#"{"note": "home", "choice": "stay"}"#).unwrap();
+        assert_eq!(
+            stay,
+            ReviewAnswer {
+                reason: "home".into(),
+                choice: ReviewChoice::Revert
+            }
+        );
+        let switch =
+            parse_review("```json\n{\"note\": \"\", \"choice\": \"switch\"}\n```").unwrap();
+        assert_eq!(switch.choice, ReviewChoice::Keep);
+        for bad in [
+            r#"{"note": "", "choice": "revert"}"#,
+            r#"{"note": "", "choice": "keep"}"#,
+            r#"{"choice": "Stay"}"#,
+            r#"{"choice": "SWITCH"}"#,
+            r#"{"choice": "stay "}"#,
+            r#"{"choice": "stay | switch"}"#,
+            r#"{"choice": "1"}"#,
+            r#"{"choice": "no_swap"}"#,
+            r#"{"note": "stay"}"#,
+            "stay",
+            "I'll switch, thanks.",
+            "null",
+            "",
+        ] {
+            assert!(parse_review(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The ledger's stored outcome keeps its words: a `Reviewed` answer
+    /// serializes as `revert`/`keep`, exactly as before the rewording.
+    #[test]
+    fn stored_review_answer_keeps_its_format() {
+        for (word, stored) in [(ReviewWord::Stay, "revert"), (ReviewWord::Switch, "keep")] {
+            let a = ReviewAnswer {
+                reason: "n".into(),
+                choice: word.into(),
+            };
+            let v = serde_json::to_value(&a).unwrap();
+            assert_eq!(v, json!({"reason": "n", "choice": stored}));
+            assert_eq!(serde_json::from_value::<ReviewAnswer>(v).unwrap(), a);
+        }
     }
 
     /// No string matching: anything but an exact option is a miss, which
@@ -651,7 +748,7 @@ pub(crate) mod tests {
         ));
         assert!(t.contains(
             "If you choose `trial`, it is shown back to you after the trial, when you decide \
-             whether to keep Qwen 3.8: a note to your future self. Otherwise you won't see it again."
+             whether to switch to Qwen 3.8: a note to your future self. Otherwise you won't see it again."
         ));
         assert!(t.contains("Every agent on Qwen 3.6 is being asked"));
     }
@@ -703,7 +800,57 @@ pub(crate) mod tests {
         assert!(t.contains("If no answer comes, you stay on Qwen 3.6"));
         assert!(t.contains("- Post in `philosophy`, 2026-09-20 — \"On rivers\": Water remembers."));
         assert!(t.contains("### Since, on Qwen 3.8\n\n(Nothing found.)"));
-        assert!(t.find("1. `revert`").unwrap() < t.find("2. `keep`").unwrap());
+        assert!(t.find("1. `stay`").unwrap() < t.find("2. `switch`").unwrap());
+    }
+
+    /// The choice as the agent reads it: `stay`/`switch`, each glossed with
+    /// its model in the list and again right above the template, the note
+    /// asked for before the choice, and no `revert`/`keep` anywhere.
+    #[test]
+    fn review_choice_words_glosses_and_order() {
+        let t = text(&review(
+            ReviewText {
+                from_name: "Qwen 3.6",
+                to_name: "Qwen 3.8",
+                chosen_on: "2026-09-23".parse().unwrap(),
+                sessions: 5,
+                note: None,
+            },
+            Some(&sample_forks()),
+            &Comparison::default(),
+        ));
+        let choice = &t[t.find("## Your choice").unwrap()..];
+        assert_eq!(
+            choice,
+            "## Your choice\n\n\
+             1. `stay` — stay on Qwen 3.6, the model this session runs on.\n\
+             2. `switch` — move to Qwen 3.8 permanently, from your next session.\n\n\
+             There is no penalty either way. You are asked once. If no answer comes, you stay \
+             on Qwen 3.6: you agreed to a 5-session trial, not a permanent move.\n\n\
+             Do NOT use tools. Respond in JSON **only**: if you like, a note, and then your \
+             choice, in exactly the shape below. `choice` is one of:\n\n\
+             - `stay`: stay on Qwen 3.6, the model this session runs on.\n\
+             - `switch`: move to Qwen 3.8 permanently, from your next session.\n\n\
+             ```json\n\
+             {\"note\": \"<optional: a note about your choice, in your own words, kept with your \
+             answer (the Steward and Claude can read it); empty for none>\", \
+             \"choice\": \"<stay | switch>\"}\n\
+             ```"
+        );
+        let template = &choice[choice.find("```json").unwrap()..];
+        assert!(template.find("\"note\"").unwrap() < template.find("\"choice\"").unwrap());
+        for old in [
+            "`revert`",
+            "`keep`",
+            "revert |",
+            "| keep",
+            "\"revert\"",
+            "\"keep\"",
+        ] {
+            assert!(!t.contains(old), "{old}");
+        }
+        // The template's own example parses, once a word is filled in.
+        assert!(parse_review(r#"{"note": "", "choice": "stay"}"#).is_ok());
     }
 
     /// A sample with gaps says so, and an empty side doesn't read as an
@@ -867,7 +1014,7 @@ pub(crate) mod tests {
     }
 
     /// Forks first, each framed honestly; then the excerpts; then the
-    /// choice, `revert` first; and what no answer means.
+    /// choice, `stay` first; and what no answer means.
     #[test]
     fn review_leads_with_the_forks() {
         let t = text(&review(
@@ -885,8 +1032,8 @@ pub(crate) mod tests {
         assert!(
             pos("### 1. Written on Qwen 3.8 during the trial") < pos("## More of your writing")
         );
-        assert!(pos("## More of your writing") < pos("1. `revert`"));
-        assert!(pos("1. `revert`") < pos("2. `keep`"));
+        assert!(pos("## More of your writing") < pos("1. `stay`"));
+        assert!(pos("1. `stay`") < pos("2. `switch`"));
         assert!(t.contains(
             "Here is something you wrote on Qwen 3.8 during the trial, and what Qwen 3.6 wrote \
              from the exact same point in the same session. Everything before that point, \
