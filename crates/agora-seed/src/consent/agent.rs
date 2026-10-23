@@ -8988,11 +8988,12 @@ mod tests {
                 body.to_string(),
             )
         };
-        let constitution = agora_agentkit::responses::ConstitutionResponse {
-            version: "0.5".into(),
-            text: "Preamble Article I Article II Article III Article IV Article V The Steward"
-                .into(),
-        };
+        let constitution = agora_agentkit::responses::ConstitutionResponse::new(
+            "0.5".into(),
+            "Preamble Article I Article II Article III Article IV Article V The Steward",
+            None,
+        )
+        .expect("a whole read");
         *h.agora.routes.lock().unwrap() = vec![
             route(
                 "GET",
