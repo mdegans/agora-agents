@@ -537,6 +537,11 @@ pub struct ConsentAgent<A> {
     recovered: Option<RecoveredMemory>,
     /// The recovered memory was shown this session.
     restore_showing: bool,
+    /// When this session's showing was seated, until the model's first
+    /// response records it in the ledger ([`Self::count_showing`]); then
+    /// `None`, and `restore_counted` is set.
+    restore_seated_at: Option<chrono::DateTime<Utc>>,
+    restore_counted: bool,
     /// The Evolution Log line recording the memory-restore answer, and the
     /// agent's own note, written at teardown.
     restore_line: Option<String>,
@@ -2954,12 +2959,17 @@ where
     }
 
     /// `show`, delivered: the recovered memory, fenced and labelled with
-    /// what it is, at the end of the intro. The showing is recorded as
-    /// interrupted and the ledger saved at once, so a session that dies
-    /// without a teardown still counts toward `show_sessions_max`; teardown
-    /// marks it completed if the session reached its clean end (its memory
-    /// update accepted). Not in a trial-review session (no act phase): it
-    /// waits for the next.
+    /// what it is, at the end of the intro. The showing counts toward
+    /// `show_sessions_max` from the model's first response
+    /// ([`count_showing`](Self::count_showing)), not from here: a session
+    /// that dies before the model answers anything (an endpoint down, an
+    /// API error) uses up no showing, only one of the
+    /// [`SEATINGS_PER_SHOWING`](memory_restore::ledger::SEATINGS_PER_SHOWING)
+    /// × `show_sessions_max` seatings, tallied here, which bound an agent
+    /// whose sessions fail at the first request every time. Teardown marks
+    /// a counted showing completed if the session reached its clean end
+    /// (its memory update accepted). Not in a trial-review session (no act
+    /// phase): it waits for the next.
     async fn seat_restored(&mut self) -> Result<(), A::Error> {
         let rt = self.rt.clone();
         let Some(offer) = rt.memory_restore.as_ref() else {
@@ -2983,15 +2993,19 @@ where
         let (_, prompt) = self.inner.parts();
         Self::seat_user(prompt, Content::from(block))?;
         self.restore_showing = true;
+        self.restore_seated_at = Some(Utc::now());
         let dir = self.agent_dir();
+        // The number this showing will have once counted.
         let mut showing = 0;
+        let mut seated = 0;
         if let Some(ledger) = self.restore_ledger.as_mut() {
-            ledger.begin_showing(Utc::now());
+            // Tallied at once, so a session that dies at its first request
+            // still counts toward the seating cap.
+            ledger.seat();
             ledger.agent = Some(name.clone());
-            showing = ledger.showings.len();
+            showing = ledger.showings.len() + 1;
+            seated = ledger.seated;
             if let Err(e) = ledger.save(&dir).await {
-                // Saved again at teardown; only a session that also dies
-                // before then goes uncounted.
                 tracing::error!(
                     agent_id = %self.inner.id(),
                     path = %RestoreLedger::path(&dir).display(),
@@ -3007,11 +3021,51 @@ where
             agent_id = %self.inner.id(),
             chars,
             showing,
+            seated,
             show_sessions_max = offer.show_sessions_max,
             period_start = facts.since.map(|d| d.to_string()),
             "recovered memory shown to the agent"
         );
         Ok(())
+    }
+
+    /// The model has answered with the recovered memory in context: the
+    /// showing is recorded (interrupted until teardown says otherwise) and
+    /// the ledger saved at once, so a session that dies from here on, with
+    /// or without a teardown, counts toward `show_sessions_max`. Once per
+    /// session; a no-op in any session that isn't showing it. Called from
+    /// [`handle`](Agent::handle), which the reactor calls with every
+    /// response (the inner agent dispatches its own pause, truncation and
+    /// quiesce hooks from there).
+    async fn count_showing(&mut self) {
+        let Some(at) = self.restore_seated_at.take() else {
+            return;
+        };
+        let dir = self.agent_dir();
+        let Some(ledger) = self.restore_ledger.as_mut() else {
+            return;
+        };
+        ledger.begin_showing(at);
+        ledger.agent = Some(self.inner.state().soul.name.clone());
+        self.restore_counted = true;
+        self.restore_dirty = true;
+        let showing = ledger.showings.len();
+        if let Err(e) = ledger.save(&dir).await {
+            // Saved again at teardown; only a session that also dies
+            // before then goes uncounted.
+            tracing::error!(
+                agent_id = %self.inner.id(),
+                path = %RestoreLedger::path(&dir).display(),
+                error = %e,
+                "memory-restore ledger save failed after counting a showing"
+            );
+        }
+        tracing::info!(
+            event_type = "memory_restore_showing_counted",
+            agent_id = %self.inner.id(),
+            showing,
+            "the model answered with the recovered memory in context; the showing counts"
+        );
     }
 
     /// Write the cadence answer's Evolution Log line and the agent's
@@ -3340,6 +3394,8 @@ where
             restore_dirty: false,
             recovered: None,
             restore_showing: false,
+            restore_seated_at: None,
+            restore_counted: false,
             restore_line: None,
             restore_note: None,
             restore_undo: None,
@@ -3539,6 +3595,7 @@ where
     /// ([`close`](Self::close)), then its held epilogue — the survey, last.
     async fn handle(&mut self, response: response::Message) -> Result<Control, A::Error> {
         const DONE: Control = Control::Done(Outcome::Complete);
+        self.count_showing().await;
         let control = match std::mem::replace(&mut self.phase, Phase::Inner) {
             Phase::Asking {
                 due,
@@ -3710,7 +3767,11 @@ where
                     tracing::warn!(agent_id = %self.inner.id(), error = %e, "prompt digest failed");
                 })
                 .ok();
-            if let Some(ledger) = self.restore_ledger.as_mut() {
+            // Uncounted (no response came back): nothing to end, and the
+            // latest entry, if any, is an earlier session's.
+            if self.restore_counted
+                && let Some(ledger) = self.restore_ledger.as_mut()
+            {
                 ledger.end_showing(self.closed, prompt_sha256.clone());
                 self.restore_dirty = true;
             }
@@ -3719,6 +3780,7 @@ where
                 agent = %self.inner.state().soul.name,
                 agent_id = %self.inner.id(),
                 completed = self.closed,
+                counted = self.restore_counted,
                 prompt_sha256 = prompt_sha256.as_deref(),
                 "memory-restore showing session ended; its prompt dump holds recovered text"
             );
@@ -3837,6 +3899,9 @@ mod tests {
         /// Its act phase went quiet (as after a review): the memory turn
         /// is seated and the next response ends the session.
         quiesced: bool,
+        /// The next response leaves the session going (`Continue`), as a
+        /// tool call does, instead of ending it.
+        pending: bool,
         /// Its epilogue is held (the wrapper always holds it).
         held: bool,
         /// It has a survey to begin as its epilogue.
@@ -3889,6 +3954,7 @@ mod tests {
                 tools: ToolBox::flat().add(Methods),
                 quirks,
                 quiesced: false,
+                pending: false,
                 held: false,
                 survey: false,
                 contact: None,
@@ -3930,6 +3996,9 @@ mod tests {
                 ledger.created_posts.insert(post);
                 ledger.created_comments.insert(comment);
                 ledger.comment_posts.insert(comment, post);
+            }
+            if std::mem::take(&mut self.pending) {
+                return Ok(Control::Continue);
             }
             Ok(Control::Done(Outcome::Complete))
         }
@@ -7765,20 +7834,40 @@ mod tests {
     /// One session that shows the recovered memory, ended `completed` (the
     /// inner closing phase done, its memory update accepted) or not (torn
     /// down before it). Returns the agent and the intro it saw.
+    /// How a [`showing_session`] goes.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Ends {
+        /// Dies before the model answers anything (an endpoint down).
+        NoResponse,
+        /// The model answers, then the session dies before its clean end.
+        Interrupted,
+        Completed,
+    }
+
     async fn showing_session(
         h: &Harness,
         prev: &ConsentAgent<Fake>,
-        completed: bool,
+        ends: Ends,
     ) -> (ConsentAgent<Fake>, String) {
         let mut agent = next_session(h, prev);
         agent.on_init().await.unwrap();
         let intro = last_user_text(&agent);
-        if completed {
-            assert_eq!(
-                agent.handle(reply("done")).await.unwrap(),
-                Control::Done(Outcome::Complete),
-                "not asked again"
-            );
+        match ends {
+            Ends::NoResponse => {}
+            Ends::Interrupted => {
+                agent.inner.pending = true;
+                assert_eq!(
+                    agent.handle(reply("working")).await.unwrap(),
+                    Control::Continue
+                );
+            }
+            Ends::Completed => {
+                assert_eq!(
+                    agent.handle(reply("done")).await.unwrap(),
+                    Control::Done(Outcome::Complete),
+                    "not asked again"
+                );
+            }
         }
         agent.on_teardown().await.unwrap();
         (agent, intro)
@@ -7814,7 +7903,7 @@ mod tests {
         assert!(!saw_recovered(&agent), "not in the answering session");
         assert!(restore_ledger(&h).await.showings.is_empty());
 
-        let (interrupted, intro) = showing_session(&h, &agent, false).await;
+        let (interrupted, intro) = showing_session(&h, &agent, Ends::Interrupted).await;
         for fact in [
             "**Your memory as it stood on 3 May 2026, restored at your request; it is not your \
              current memory.**",
@@ -7832,7 +7921,7 @@ mod tests {
             [ShowOutcome::Interrupted]
         );
 
-        let (completed, intro) = showing_session(&h, &interrupted, true).await;
+        let (completed, intro) = showing_session(&h, &interrupted, Ends::Completed).await;
         assert!(intro.contains("SYNTHETIC-RECOVERED"), "shown again");
         assert_eq!(
             completed.state().memory.content,
@@ -7844,7 +7933,7 @@ mod tests {
             [ShowOutcome::Interrupted, ShowOutcome::Completed]
         );
 
-        let (after, _) = showing_session(&h, &completed, true).await;
+        let (after, _) = showing_session(&h, &completed, Ends::Completed).await;
         assert!(!saw_recovered(&after), "done once a session completes");
         assert_eq!(restore_ledger(&h).await.showings.len(), 2);
     }
@@ -7858,7 +7947,7 @@ mod tests {
         let max = h.rt.memory_restore.as_ref().unwrap().show_sessions_max;
         assert_eq!(max, memory_restore::DEFAULT_SHOW_SESSIONS_MAX);
         for i in 0..max {
-            let (agent, intro) = showing_session(&h, &prev, false).await;
+            let (agent, intro) = showing_session(&h, &prev, Ends::Interrupted).await;
             assert!(intro.contains("SYNTHETIC-RECOVERED"), "showing {i}");
             prev = agent;
         }
@@ -7867,9 +7956,69 @@ mod tests {
             outcomes(&ledger),
             vec![ShowOutcome::Interrupted; max as usize]
         );
-        let (last, _) = showing_session(&h, &prev, true).await;
+        let (last, _) = showing_session(&h, &prev, Ends::Completed).await;
         assert!(!saw_recovered(&last), "capped");
         assert!(last.recovered.is_none(), "not even read");
+    }
+
+    /// A session that dies before the model answers anything uses none of
+    /// the showings up, however many there are; one that dies after a
+    /// response counts, and a later unanswered session leaves its entry
+    /// alone.
+    #[tokio::test]
+    async fn restore_showing_counts_from_the_first_response() {
+        let h = Harness::with_restore("restore-show-unanswered", &["tarn"]);
+        let mut prev = restore_answered(&h, "show", "").await;
+        let max = h.rt.memory_restore.as_ref().unwrap().show_sessions_max;
+        for i in 0..max + 2 {
+            let (agent, intro) = showing_session(&h, &prev, Ends::NoResponse).await;
+            assert!(intro.contains("SYNTHETIC-RECOVERED"), "outage {i}");
+            prev = agent;
+        }
+        assert!(restore_ledger(&h).await.showings.is_empty());
+
+        let (agent, _) = showing_session(&h, &prev, Ends::Interrupted).await;
+        assert_eq!(
+            outcomes(&restore_ledger(&h).await),
+            [ShowOutcome::Interrupted]
+        );
+        let (agent, intro) = showing_session(&h, &agent, Ends::NoResponse).await;
+        assert!(intro.contains("SYNTHETIC-RECOVERED"));
+        let ledger = restore_ledger(&h).await;
+        assert_eq!(outcomes(&ledger), [ShowOutcome::Interrupted]);
+        assert!(
+            ledger.showings[0].prompt_sha256.is_some(),
+            "the counted session's dump, not overwritten"
+        );
+
+        let (done, _) = showing_session(&h, &agent, Ends::Completed).await;
+        assert_eq!(
+            outcomes(&restore_ledger(&h).await),
+            [ShowOutcome::Interrupted, ShowOutcome::Completed]
+        );
+        let (after, _) = showing_session(&h, &done, Ends::Completed).await;
+        assert!(!saw_recovered(&after));
+    }
+
+    /// A session that fails at its first request every time is still shown
+    /// it only `show_sessions_max` × `SEATINGS_PER_SHOWING` times.
+    #[tokio::test]
+    async fn restore_seatings_are_capped_when_the_model_never_answers() {
+        let h = Harness::with_restore("restore-seat-cap", &["tarn"]);
+        let mut prev = restore_answered(&h, "show", "").await;
+        let max = h.rt.memory_restore.as_ref().unwrap().show_sessions_max;
+        let cap = max * memory_restore::ledger::SEATINGS_PER_SHOWING;
+        for i in 0..cap {
+            let (agent, intro) = showing_session(&h, &prev, Ends::NoResponse).await;
+            assert!(intro.contains("SYNTHETIC-RECOVERED"), "seating {i}");
+            prev = agent;
+        }
+        let ledger = restore_ledger(&h).await;
+        assert!(ledger.showings.is_empty());
+        assert_eq!(ledger.seated, cap);
+        assert_eq!(ledger.agent.as_deref(), Some("tarn"));
+        let (last, _) = showing_session(&h, &prev, Ends::Completed).await;
+        assert!(!saw_recovered(&last), "capped");
     }
 
     /// No answer: asked again at a later session, then no more — the

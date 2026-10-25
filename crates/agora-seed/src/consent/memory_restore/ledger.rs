@@ -35,6 +35,12 @@ pub const FORMAT: u32 = 1;
 /// Unanswered asks before the runner stops asking.
 pub const MAX_MISSES: u32 = 2;
 
+/// Seatings allowed per counted showing: a showing counts only once the
+/// model answers, so a session that fails at its first request every time
+/// (a prompt too big for its model, say) would otherwise be shown it
+/// forever. `show_sessions_max` × this, seatings in all.
+pub const SEATINGS_PER_SHOWING: u32 = 3;
+
 /// The whole per-agent file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RestoreLedger {
@@ -48,6 +54,14 @@ pub struct RestoreLedger {
     /// Every session the recovered memory was shown in, oldest first.
     #[serde(default)]
     pub showings: Vec<Showing>,
+    /// Sessions the recovered memory was seated in, answered by the model
+    /// or not ([`SEATINGS_PER_SHOWING`]). Older files have none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seated: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Default for RestoreLedger {
@@ -57,6 +71,7 @@ impl Default for RestoreLedger {
             agent: None,
             asks: Vec::new(),
             showings: Vec::new(),
+            seated: 0,
         }
     }
 }
@@ -109,7 +124,7 @@ pub enum RestoreOutcome {
 /// One session the recovered memory was shown in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Showing {
-    /// When it was seated.
+    /// When it was seated (recorded at the model's first response).
     pub at: DateTime<Utc>,
     pub outcome: ShowOutcome,
     /// The session's prompt dump (the `prompt logged` event's
@@ -125,9 +140,10 @@ pub struct Showing {
 pub enum ShowOutcome {
     /// The session completed, its memory update accepted: no more showings.
     Completed,
-    /// It didn't (or hasn't yet: a showing is recorded as this when seated,
-    /// and saved at once, so a session that dies without a teardown still
-    /// counts toward the cap).
+    /// It didn't (or hasn't yet: a showing is recorded as this at the
+    /// model's first response in its session, and saved at once, so a
+    /// session that dies from then on, without a teardown, still counts
+    /// toward the cap; one that died before any response isn't recorded).
     Interrupted,
 }
 
@@ -206,8 +222,9 @@ impl RestoreLedger {
         })
     }
 
-    /// `show` is on file, no showing session has completed, and fewer than
-    /// `max` sessions have shown it.
+    /// `show` is on file, no showing session has completed, fewer than
+    /// `max` sessions have shown it, and fewer than `max` ×
+    /// [`SEATINGS_PER_SHOWING`] have seated it.
     pub fn show_pending(&self, max: u32) -> bool {
         self.choice() == Some(RestoreChoice::Show)
             && !self
@@ -215,6 +232,12 @@ impl RestoreLedger {
                 .iter()
                 .any(|s| s.outcome == ShowOutcome::Completed)
             && self.showings.len() < max as usize
+            && self.seated < max.saturating_mul(SEATINGS_PER_SHOWING)
+    }
+
+    /// The recovered memory was seated in a session's intro.
+    pub fn seat(&mut self) {
+        self.seated = self.seated.saturating_add(1);
     }
 
     pub fn record(&mut self, ask: RestoreAsk) {

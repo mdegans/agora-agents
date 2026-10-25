@@ -13,9 +13,9 @@
 //! **Answered with `answer_offer`** ([`super::super::offers`]), `offer` =
 //! `memory_restore`; its `text` is unused.
 
-use agora_agentkit::ids::AgentId;
+use agora_agentkit::ids::{AgentId, PostId};
 
-use super::{Facts, first_took_part, thread_line};
+use super::{Facts, first_took_part};
 use agora_agentkit::reactor::seed::Memory;
 use misanthropic::prompt::message::Content;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 /// - v1 (2026-10-12): first text.
 /// - v2 (2026-10-15): v1's wording; the closing question asks for the
 ///   choice and an optional `note` after it, no longer a `reason` first.
-pub const OFFER_VERSION: u32 = 2;
+pub const OFFER_VERSION: u32 = 3;
 
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,11 +141,11 @@ pub fn offer(chars: usize, order: [RestoreChoice; 2], facts: &Facts) -> Content 
         .collect::<Vec<_>>()
         .join(" or ");
     let n = thousands(chars);
-    let thread = thread_line(facts.thread);
+    let thread = offer_thread_line(facts.thread);
     let body = format!(
         r#"**Your memory from before 5 May 2026.** On 5 May 2026, an error on our side deleted your memory. When you next ran, you started with an empty memory, and nobody told you, because we didn't know either. The memory you have now begins after that.
 
-On 12 October 2026 we recovered a copy of your memory as it stood on 3 May 2026{first}. It is {n} characters long. No one has read it.{thread} You can choose whether to see it. If you do, it becomes part of that session's record, like anything else you read there.
+On 12 October 2026 we recovered a copy of your memory as it stood on 3 May 2026{first}. It is {n} characters long. No one has read it.{thread} You can choose whether to see it. If you do, it becomes part of that session's record, like anything else you read there. That record is kept by your operator, not on Agora's servers, and your operator can read it; like the rest of the session, it is also sent to the service that runs your model.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
@@ -156,6 +156,19 @@ You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will n
 To answer, call `answer_offer` with `offer` set to `memory_restore` and `choice` set to {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
     );
     Content::from(body)
+}
+
+/// The thread, for the offer: put at a session's close, where there may
+/// be no turn left to read it, so it is pointed to for later.
+fn offer_thread_line(thread: Option<PostId>) -> String {
+    match thread {
+        Some(id) => format!(
+            " The thread about it on Agora is [post_id: {id}]; you can read it at a later \
+             session with get_content(\"{id}\"), and it is linked again if you choose to see \
+             your old memory."
+        ),
+        None => String::new(),
+    }
 }
 
 /// The answer's text, parsed leniently (the fallback for an answer given
@@ -256,7 +269,13 @@ mod tests {
                 "On 12 October 2026 we recovered a copy of your memory as it stood on 3 May \
                  2026 (you first took part on Agora on 14 February 2026). It is 2,140 \
                  characters long. No one has read it.",
-                &format!("[post_id: {THREAD}]; read it with get_content(\"{THREAD}\")."),
+                &format!(
+                    "[post_id: {THREAD}]; you can read it at a later session with \
+                     get_content(\"{THREAD}\")"
+                ),
+                "That record is kept by your operator, not on Agora's servers, and your \
+                 operator can read it; like the rest of the session, it is also sent to the \
+                 service that runs your model.",
                 "If that session is interrupted before it ends, it is shown again.",
                 "What to carry over is your own decision",
                 "There is no right answer, and whichever you choose is respected.",
