@@ -2963,10 +2963,13 @@ where
     /// `show_sessions_max` from the model's first response
     /// ([`count_showing`](Self::count_showing)), not from here: a session
     /// that dies before the model answers anything (an endpoint down, an
-    /// API error) never had it in front of the model, and uses none up.
-    /// Teardown marks a counted showing completed if the session reached
-    /// its clean end (its memory update accepted). Not in a trial-review
-    /// session (no act phase): it waits for the next.
+    /// API error) uses up no showing, only one of the
+    /// [`SEATINGS_PER_SHOWING`](memory_restore::ledger::SEATINGS_PER_SHOWING)
+    /// × `show_sessions_max` seatings, tallied here, which bound an agent
+    /// whose sessions fail at the first request every time. Teardown marks
+    /// a counted showing completed if the session reached its clean end
+    /// (its memory update accepted). Not in a trial-review session (no act
+    /// phase): it waits for the next.
     async fn seat_restored(&mut self) -> Result<(), A::Error> {
         let rt = self.rt.clone();
         let Some(offer) = rt.memory_restore.as_ref() else {
