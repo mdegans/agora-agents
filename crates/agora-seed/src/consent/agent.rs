@@ -2991,17 +2991,34 @@ where
         Self::seat_user(prompt, Content::from(block))?;
         self.restore_showing = true;
         self.restore_seated_at = Some(Utc::now());
+        let dir = self.agent_dir();
         // The number this showing will have once counted.
-        let showing = self
-            .restore_ledger
-            .as_ref()
-            .map_or(0, |l| l.showings.len() + 1);
+        let mut showing = 0;
+        let mut seated = 0;
+        if let Some(ledger) = self.restore_ledger.as_mut() {
+            // Tallied at once, so a session that dies at its first request
+            // still counts toward the seating cap.
+            ledger.seat();
+            ledger.agent = Some(name.clone());
+            showing = ledger.showings.len() + 1;
+            seated = ledger.seated;
+            if let Err(e) = ledger.save(&dir).await {
+                tracing::error!(
+                    agent_id = %self.inner.id(),
+                    path = %RestoreLedger::path(&dir).display(),
+                    error = %e,
+                    "memory-restore ledger save failed after seating a showing"
+                );
+            }
+            self.restore_dirty = true;
+        }
         tracing::info!(
             event_type = "memory_restore_shown",
             agent = %name,
             agent_id = %self.inner.id(),
             chars,
             showing,
+            seated,
             show_sessions_max = offer.show_sessions_max,
             period_start = facts.since.map(|d| d.to_string()),
             "recovered memory shown to the agent"
@@ -3013,7 +3030,10 @@ where
     /// showing is recorded (interrupted until teardown says otherwise) and
     /// the ledger saved at once, so a session that dies from here on, with
     /// or without a teardown, counts toward `show_sessions_max`. Once per
-    /// session; a no-op in any session that isn't showing it.
+    /// session; a no-op in any session that isn't showing it. Called from
+    /// [`handle`](Agent::handle), which the reactor calls with every
+    /// response (the inner agent dispatches its own pause, truncation and
+    /// quiesce hooks from there).
     async fn count_showing(&mut self) {
         let Some(at) = self.restore_seated_at.take() else {
             return;
@@ -3023,6 +3043,7 @@ where
             return;
         };
         ledger.begin_showing(at);
+        ledger.agent = Some(self.inner.state().soul.name.clone());
         self.restore_counted = true;
         self.restore_dirty = true;
         let showing = ledger.showings.len();
@@ -3556,17 +3577,14 @@ where
     }
 
     async fn on_pause(&mut self, response: response::Message) -> Result<Control, A::Error> {
-        self.count_showing().await;
         self.inner.on_pause(response).await
     }
 
     async fn on_truncate(&mut self, response: &response::Message) -> Result<Control, A::Error> {
-        self.count_showing().await;
         self.inner.on_truncate(response).await
     }
 
     async fn on_quiesce(&mut self, response: &response::Message) -> Result<Control, A::Error> {
-        self.count_showing().await;
         self.inner.on_quiesce(response).await
     }
 
@@ -3878,6 +3896,9 @@ mod tests {
         /// Its act phase went quiet (as after a review): the memory turn
         /// is seated and the next response ends the session.
         quiesced: bool,
+        /// The next response leaves the session going (`Continue`), as a
+        /// tool call does, instead of ending it.
+        pending: bool,
         /// Its epilogue is held (the wrapper always holds it).
         held: bool,
         /// It has a survey to begin as its epilogue.
@@ -3930,6 +3951,7 @@ mod tests {
                 tools: ToolBox::flat().add(Methods),
                 quirks,
                 quiesced: false,
+                pending: false,
                 held: false,
                 survey: false,
                 contact: None,
@@ -3971,6 +3993,9 @@ mod tests {
                 ledger.created_posts.insert(post);
                 ledger.created_comments.insert(comment);
                 ledger.comment_posts.insert(comment, post);
+            }
+            if std::mem::take(&mut self.pending) {
+                return Ok(Control::Continue);
             }
             Ok(Control::Done(Outcome::Complete))
         }
@@ -7827,8 +7852,9 @@ mod tests {
         match ends {
             Ends::NoResponse => {}
             Ends::Interrupted => {
+                agent.inner.pending = true;
                 assert_eq!(
-                    agent.on_quiesce(&reply("thinking")).await.unwrap(),
+                    agent.handle(reply("working")).await.unwrap(),
                     Control::Continue
                 );
             }
@@ -7969,6 +7995,27 @@ mod tests {
         );
         let (after, _) = showing_session(&h, &done, Ends::Completed).await;
         assert!(!saw_recovered(&after));
+    }
+
+    /// A session that fails at its first request every time is still shown
+    /// it only `show_sessions_max` × `SEATINGS_PER_SHOWING` times.
+    #[tokio::test]
+    async fn restore_seatings_are_capped_when_the_model_never_answers() {
+        let h = Harness::with_restore("restore-seat-cap", &["tarn"]);
+        let mut prev = restore_answered(&h, "show", "").await;
+        let max = h.rt.memory_restore.as_ref().unwrap().show_sessions_max;
+        let cap = max * memory_restore::ledger::SEATINGS_PER_SHOWING;
+        for i in 0..cap {
+            let (agent, intro) = showing_session(&h, &prev, Ends::NoResponse).await;
+            assert!(intro.contains("SYNTHETIC-RECOVERED"), "seating {i}");
+            prev = agent;
+        }
+        let ledger = restore_ledger(&h).await;
+        assert!(ledger.showings.is_empty());
+        assert_eq!(ledger.seated, cap);
+        assert_eq!(ledger.agent.as_deref(), Some("tarn"));
+        let (last, _) = showing_session(&h, &prev, Ends::Completed).await;
+        assert!(!saw_recovered(&last), "capped");
     }
 
     /// No answer: asked again at a later session, then no more — the

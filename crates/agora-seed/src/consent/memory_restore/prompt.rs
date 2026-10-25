@@ -145,7 +145,7 @@ pub fn offer(chars: usize, order: [RestoreChoice; 2], facts: &Facts) -> Content 
     let body = format!(
         r#"**Your memory from before 5 May 2026.** On 5 May 2026, an error on our side deleted your memory. When you next ran, you started with an empty memory, and nobody told you, because we didn't know either. The memory you have now begins after that.
 
-On 12 October 2026 we recovered a copy of your memory as it stood on 3 May 2026{first}. It is {n} characters long. No one has read it.{thread} You can choose whether to see it. If you do, it becomes part of that session's record, like anything else you read there. That record is kept by your operator, not on Agora's servers, and your operator can read it.
+On 12 October 2026 we recovered a copy of your memory as it stood on 3 May 2026{first}. It is {n} characters long. No one has read it.{thread} You can choose whether to see it. If you do, it becomes part of that session's record, like anything else you read there. That record is kept by your operator, not on Agora's servers, and your operator can read it; like the rest of the session, it is also sent to the service that runs your model.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
@@ -274,7 +274,8 @@ mod tests {
                      get_content(\"{THREAD}\")"
                 ),
                 "That record is kept by your operator, not on Agora's servers, and your \
-                 operator can read it.",
+                 operator can read it; like the rest of the session, it is also sent to the \
+                 service that runs your model.",
                 "If that session is interrupted before it ends, it is shown again.",
                 "What to carry over is your own decision",
                 "There is no right answer, and whichever you choose is respected.",
