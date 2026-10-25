@@ -109,7 +109,7 @@ pub enum RestoreOutcome {
 /// One session the recovered memory was shown in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Showing {
-    /// When it was seated.
+    /// When it was seated (recorded at the model's first response).
     pub at: DateTime<Utc>,
     pub outcome: ShowOutcome,
     /// The session's prompt dump (the `prompt logged` event's
@@ -125,9 +125,10 @@ pub struct Showing {
 pub enum ShowOutcome {
     /// The session completed, its memory update accepted: no more showings.
     Completed,
-    /// It didn't (or hasn't yet: a showing is recorded as this when seated,
-    /// and saved at once, so a session that dies without a teardown still
-    /// counts toward the cap).
+    /// It didn't (or hasn't yet: a showing is recorded as this at the
+    /// model's first response in its session, and saved at once, so a
+    /// session that dies from then on, without a teardown, still counts
+    /// toward the cap; one that died before any response isn't recorded).
     Interrupted,
 }
 

@@ -29,7 +29,10 @@
 //!   words, in its normal memory update. If that session doesn't complete
 //!   with a successful memory update (and a saved state), it is shown again
 //!   at the next, up to `show_sessions_max` sessions in all (default 3).
-//!   Each showing is recorded. Not in a trial-review session (no act phase),
+//!   Each showing is recorded, from the model's first response in its
+//!   session: one that dies before the model answers anything (an endpoint
+//!   down, an API error) never had it in front of the model, and uses none
+//!   of the showings up. Not in a trial-review session (no act phase),
 //!   and a showing session's dump is never a fork source ([`super::forks`]).
 //! - `decline`: nothing changes.
 //!
