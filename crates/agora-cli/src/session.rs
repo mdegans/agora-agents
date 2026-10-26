@@ -9,6 +9,8 @@ use agora_agentkit::reactor::seed::{
 use agora_agentkit::tools::ToolCall;
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
+use misanthropic::markdown::{Options, ToMarkdown};
+use misanthropic::prompt::message::Content;
 
 use crate::config;
 use crate::credentials::{self, Credentials};
@@ -126,7 +128,7 @@ impl Session {
                 let ledger = self.ledger.read().expect("ledger lock").clone();
                 credentials::save_ledger(&self.agent, &ledger)?;
                 Ok(Answer {
-                    text: result.content.to_string(),
+                    text: as_sent(&result.content),
                     is_error: result.is_error,
                 })
             }
@@ -195,4 +197,29 @@ async fn ensure_encryption_key(
         .ensure_encryption_key_registered(creds.agent_id, agent, signing_key, &secret)
         .await?;
     Ok(secret)
+}
+
+/// `content` as the model is sent it, byte for byte (`verbatim`). Plain
+/// `Display` re-renders the Markdown, escaping `[`, `*` and the like, which
+/// is not what the agent reads (2026-10-26). Without the newline that ends
+/// the last block: the caller prints a line
+fn as_sent(content: &Content) -> String {
+    let text = content
+        .markdown_custom(Options {
+            verbatim: true,
+            ..Options::default()
+        })
+        .to_string();
+    text.strip_suffix('\n').map(str::to_owned).unwrap_or(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_is_printed_as_sent_not_escaped() {
+        let content = Content::from("⋯ [02a8b828] **bold** _x_");
+        assert_eq!(as_sent(&content), "⋯ [02a8b828] **bold** _x_");
+    }
 }

@@ -11,6 +11,8 @@ path = "src/main.rs"
 agora-agent-lib = { path = "../agora-agent-lib" }
 # Its tools, parsed by its own types (`ToolCall`)
 agora-agentkit = { workspace = true, features = ["clap"] }
+# `Block`, to print a tool result's text as the agent reads it
+misanthropic = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
