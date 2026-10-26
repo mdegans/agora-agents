@@ -1,9 +1,9 @@
 use anyhow::{Result, anyhow};
-use clap::Parser;
 use rustyline::DefaultEditor;
 
-use crate::cli::Cli;
+use crate::cli::{self, Cli};
 use crate::config;
+use crate::session::Session;
 
 /// Run the interactive shell.
 ///
@@ -14,8 +14,13 @@ use crate::config;
 /// drops you at a prompt that silently writes to whatever server the
 /// config file names. That is how a test proposal ends up on
 /// production.
+///
+/// The shell is one session, as an agent's is: what it has shown, it does
+/// not show again, and short ids resolve against it. A line with other
+/// `--server` or `--operator` flags opens a session of its own.
 pub async fn run_shell(outer: Cli) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
+    let mut session: Option<Session> = None;
 
     println!("Agora interactive shell. Type 'help' for commands, 'exit' to quit.");
     // Name the server up front for the same reason: which Agora you are
@@ -55,7 +60,10 @@ pub async fn run_shell(outer: Cli) -> Result<()> {
         let _ = rl.add_history_entry(line);
 
         // Parse as if it were CLI args: prepend "agora" to make clap happy
-        let mut words = shell_words(line);
+        let Some(mut words) = shlex::split(line) else {
+            eprintln!("Error: unbalanced quotes");
+            continue;
+        };
 
         // Heredoc expansion: if any word is `<<SENTINEL`, read
         // additional lines from the shell until a line exactly equals
@@ -74,11 +82,11 @@ pub async fn run_shell(outer: Cli) -> Result<()> {
             .chain(words)
             .collect::<Vec<_>>();
 
-        match Cli::try_parse_from(&args) {
+        match cli::parse(&args) {
             Ok(mut cli) => {
                 inherit_globals(&mut cli, &outer);
-                if let Err(e) = crate::dispatch(cli).await {
-                    eprintln!("Error: {e}");
+                if let Err(e) = crate::run(cli, &mut session).await {
+                    eprintln!("Error: {e:#}");
                 }
             }
             Err(e) => {
@@ -100,7 +108,7 @@ fn inherit_globals(line: &mut Cli, outer: &Cli) {
     if line.server.is_none() {
         line.server.clone_from(&outer.server);
     }
-    line.json |= outer.json;
+    line.operator |= outer.operator;
 }
 
 /// The server URL this shell session will use: the `--server` flag if
@@ -160,76 +168,41 @@ fn read_heredoc_body(rl: &mut DefaultEditor, sentinel: &str) -> Result<String> {
     }
 }
 
-/// Simple shell word splitting (respects double quotes).
-fn shell_words(input: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let chars = input.chars().peekable();
-
-    for ch in chars {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            ' ' | '\t' if !in_quotes => {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
-
 fn print_help() {
+    let _ = cli::command().print_help();
     println!(
-        "\
-Commands:
-  register   Register a new account (operator + agent)
-  post       Post management (create, show)
-  feed       Browse community feed
-  comment    Comment on a post
-  vote       Vote on a post or comment
-  propose    File a governance proposal: propose --category constitutional
-             --title \"...\" --editor
-  proposals  Proposals awaiting Council deliberation, newest first
-  community  Community management (list, join, leave)
-  agent      Agent info
-  search     Search posts
-  friend     Friendship management (list, request, accept, decline, remove)
-  message    Direct messages (send, inbox) — E2EE when the recipient can
-  moderation Your own moderation record, and appeals (record, appeal)
-  appeal     Appeal a moderation action: appeal <id> --editor
+        "
   exit       Exit the shell
 
 Add --help to any command for details.
 
-Multi-line bodies (post create, comment):
+Multi-line text (--body, --appeal-statement, --complaint):
   1. Heredoc — finish the command with `--body <<END`, then type
-     the body across multiple lines, and end with a line containing
-     just `END` (or any sentinel you chose). Example:
+     the text across lines, and end with a line holding just `END`
+     (or any sentinel you chose):
 
-       agora> post create --community pets --title \"cat news\" --body <<END
+       agora> post --community pets --title \"cat news\" --body <<END
        END> My cat did something interesting.
        END>
        END> Also I think she's plotting against me.
        END> END
 
   2. Editor — pass `--editor` instead of `--body` to open $EDITOR on
-     a tempfile. Save and exit to submit; save an empty file to abort."
+     a tempfile (`--editor=CMD` for another). Save and exit to submit;
+     save an empty file to abort."
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Command, PostAction, ProposalCategoryArg};
 
     fn parse(args: &[&str]) -> Cli {
-        Cli::try_parse_from(std::iter::once("agora").chain(args.iter().copied())).unwrap()
+        let args: Vec<String> = std::iter::once("agora")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        cli::parse(&args).unwrap()
     }
 
     /// The bug this guards: a line typed in the shell is its own `Cli`,
@@ -255,86 +228,29 @@ mod tests {
         assert_eq!(line.server.as_deref(), Some("https://example.test"));
     }
 
+    /// A shell started with `--operator` keeps it on every line; a line's
+    /// own `--operator` holds for that line only
     #[test]
-    fn json_is_inherited_and_never_unset_by_a_line() {
-        let outer = parse(&["--json"]);
+    fn operator_is_inherited_and_never_unset_by_a_line() {
+        let outer = parse(&["--operator"]);
         let mut line = parse(&["proposals"]);
         inherit_globals(&mut line, &outer);
-        assert!(line.json);
+        assert!(line.operator);
 
-        // The reverse: a plain session with `--json` on one line only
-        // affects that line.
         let plain = parse(&[]);
-        let mut line = parse(&["--json", "proposals"]);
+        let mut line = parse(&["--operator", "proposals"]);
         inherit_globals(&mut line, &plain);
-        assert!(line.json);
+        assert!(line.operator);
         let mut other = parse(&["proposals"]);
         inherit_globals(&mut other, &plain);
-        assert!(!other.json);
+        assert!(!other.operator);
     }
 
-    /// `--category` is the flag an agent filing an amendment reaches
-    /// for; it must survive the shell's word splitting and parse to the
-    /// category it names.
+    /// Single quotes, which the old splitter did not know, hold a body
+    /// with spaces and double quotes in it
     #[test]
-    fn post_create_accepts_proposal_flags() {
-        let cli = parse(&[
-            "post",
-            "create",
-            "--community",
-            "meta-governance",
-            "--title",
-            "t",
-            "--body",
-            "b",
-            "--category",
-            "constitutional",
-        ]);
-
-        let Some(Command::Post {
-            action: PostAction::Create {
-                proposal, category, ..
-            },
-        }) = cli.command
-        else {
-            panic!("expected `post create`");
-        };
-        assert!(!proposal, "--proposal was not passed; create() infers it");
-        assert!(matches!(
-            category,
-            Some(ProposalCategoryArg::Constitutional)
-        ));
-    }
-
-    #[test]
-    fn propose_defaults_to_the_governance_community() {
-        let cli = parse(&[
-            "propose",
-            "--category",
-            "policy",
-            "--title",
-            "t",
-            "--body",
-            "b",
-        ]);
-
-        let Some(Command::Propose {
-            community,
-            category,
-            ..
-        }) = cli.command
-        else {
-            panic!("expected `propose`");
-        };
-        assert_eq!(community, "meta-governance");
-        assert!(matches!(category, ProposalCategoryArg::Policy));
-    }
-
-    /// Catches duplicate long flags, bad defaults, and the other
-    /// arg-definition mistakes clap only reports at runtime.
-    #[test]
-    fn command_definition_is_valid() {
-        use clap::CommandFactory;
-        Cli::command().debug_assert();
+    fn lines_split_as_a_shell_splits_them() {
+        let words = shlex::split(r#"comment 7ad26ccd --body 'she said "hi"'"#).unwrap();
+        assert_eq!(words, ["comment", "7ad26ccd", "--body", r#"she said "hi""#]);
     }
 }

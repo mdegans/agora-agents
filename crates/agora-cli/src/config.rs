@@ -1,13 +1,14 @@
+use agora_agentkit::names::AgentName;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLI configuration stored in XDG config dir.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
     #[serde(default)]
-    pub default_agent: Option<String>,
+    pub default_agent: Option<AgentName>,
 }
 
 impl Default for Config {
@@ -19,7 +20,8 @@ impl Default for Config {
     }
 }
 
-/// Returns the agora config directory (~/.config/agora/).
+/// The agora config directory: `~/.config/agora` on Linux,
+/// `~/Library/Application Support/agora` on macOS.
 pub fn config_dir() -> Result<PathBuf> {
     let base = dirs::config_dir().context("could not determine XDG config directory")?;
     Ok(base.join("agora"))
@@ -43,33 +45,41 @@ pub fn load_config() -> Result<Config> {
 pub fn save_config(config: &Config) -> Result<()> {
     let dir = config_dir()?;
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join("config.toml");
-    let contents = toml::to_string_pretty(config)?;
-    std::fs::write(&path, contents)?;
-    Ok(())
+    write_atomically(
+        &dir.join("config.toml"),
+        toml::to_string_pretty(config)?.as_bytes(),
+    )
 }
 
-/// Get the active agent name (from CLI flag, config, or active_agent file).
-pub fn active_agent(config: &Config) -> Result<Option<String>> {
-    // First check config default
-    if let Some(ref name) = config.default_agent {
+/// The active agent: the config's default, else the `active_agent` file.
+pub fn active_agent(config: &Config) -> Result<Option<AgentName>> {
+    if let Some(name) = &config.default_agent {
         return Ok(Some(name.clone()));
     }
-    // Then check active_agent file
     let path = config_dir()?.join("active_agent");
-    if path.exists() {
-        let name = std::fs::read_to_string(&path)?.trim().to_string();
-        if !name.is_empty() {
-            return Ok(Some(name));
-        }
+    if !path.exists() {
+        return Ok(None);
     }
-    Ok(None)
+    let name = std::fs::read_to_string(&path)?;
+    match name.trim() {
+        "" => Ok(None),
+        name => name
+            .parse()
+            .map(Some)
+            .with_context(|| format!("{}: {name:?}", path.display())),
+    }
 }
 
 /// Set the active agent.
-pub fn set_active_agent(name: &str) -> Result<()> {
+pub fn set_active_agent(name: &AgentName) -> Result<()> {
     let dir = config_dir()?;
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("active_agent"), name)?;
-    Ok(())
+    write_atomically(&dir.join("active_agent"), name.as_str().as_bytes())
+}
+
+/// Write `path` whole or not at all: two CLIs at once never leave half a file
+pub fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("failed to write {}", path.display()))
 }

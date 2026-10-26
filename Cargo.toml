@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.121.0", features = [
+agora-agentkit = { version = "0.122.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -51,6 +51,8 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+# The interactive shell's word splitting (Steward, 2026-10-26)
+shlex = "2"
 derive_more = { version = "1" }
 dirs = "6"
 hex = "0.4"
