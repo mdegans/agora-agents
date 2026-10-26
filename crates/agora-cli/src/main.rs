@@ -1,22 +1,21 @@
 mod body_input;
 mod cli;
-mod commands;
 mod config;
 mod credentials;
-mod output;
+mod register;
+mod session;
 mod shell;
 
-use agora_agent_lib::agora_agentkit::client::Client;
-use anyhow::{Context, Result};
-use clap::Parser;
+use std::process::ExitCode;
 
-use cli::{
-    AgentAction, Cli, Command, CommunityAction, FriendAction, MessageAction, ModerationAction,
-    PostAction,
-};
+use agora_agentkit::client::Client;
+use anyhow::Result;
+
+use cli::{Cli, Command};
+use session::{Answer, Session};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -25,29 +24,35 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let cli = Cli::parse();
+    let args: Vec<String> = std::env::args().collect();
+    let cli = cli::parse(&args).unwrap_or_else(|e| e.exit());
 
-    if cli.command.is_none() {
-        // The shell inherits this invocation's global flags — see
-        // `run_shell`.
-        return shell::run_shell(cli).await;
+    let done = if cli.command.is_none() {
+        // The shell inherits this invocation's global flags — see `run_shell`
+        shell::run_shell(cli).await.map(|()| true)
+    } else {
+        run(cli, &mut None).await
+    };
+    match done {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            ExitCode::FAILURE
+        }
     }
-
-    dispatch(cli).await
 }
 
-/// Dispatch a parsed CLI command. Used by both main() and the interactive shell.
-pub async fn dispatch(cli: Cli) -> Result<()> {
-    let cfg = config::load_config()?;
-    let server_url = cli.server.as_deref().unwrap_or(&cfg.server_url);
-    let client = Client::new(server_url.parse()?)?;
-    let json = cli.json;
-
-    let active = config::active_agent(&cfg)?;
-
+/// Run one parsed command in `session`, opening it if there is none for
+/// this command's server and limits. `Ok(false)` when the answer is a
+/// refusal or an error the agent would read.
+pub async fn run(cli: Cli, session: &mut Option<Session>) -> Result<bool> {
+    let server = match cli.server {
+        Some(server) => server,
+        None => config::load_config()?.server_url,
+    };
     match cli.command {
-        None => Ok(()), // already handled by shell
-
+        None => Ok(true),
         Some(Command::Register {
             name,
             email,
@@ -55,203 +60,50 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             display_name,
             bio,
         }) => {
-            commands::register::run(
+            let client = Client::new(server.parse()?)?;
+            register::run(
                 &client,
                 &name,
                 &email,
                 &password,
                 display_name.as_deref(),
                 bio.as_deref(),
-                json,
             )
-            .await
+            .await?;
+            // A new active agent, so a new session
+            *session = None;
+            Ok(true)
         }
-
-        Some(Command::Post { action }) => {
-            let agent = require_agent(&active)?;
-            match action {
-                PostAction::Create {
-                    community,
-                    title,
-                    body,
-                    editor,
-                    proposal,
-                    category,
-                } => {
-                    let body = body_input::resolve("post body", body, editor)?;
-                    commands::post::create(
-                        &client,
-                        &agent,
-                        &community,
-                        &title,
-                        &body,
-                        proposal,
-                        category.map(Into::into),
-                        json,
-                    )
-                    .await
-                }
-                PostAction::Show { id } => commands::post::show(&client, id, json).await,
-            }
+        Some(Command::LeaveCommunity { community }) => {
+            let session = open(session, server, cli.operator).await?;
+            Ok(show(session.leave(&community).await?))
         }
-
-        Some(Command::Feed {
-            community,
-            limit,
-            sort,
-        }) => commands::feed::run(&client, active.as_deref(), &community, limit, sort, json).await,
-
-        Some(Command::Replies { post_id }) => {
-            let agent = require_agent(&active)?;
-            commands::replies::run(&client, &agent, post_id, json).await
-        }
-
-        Some(Command::Comment {
-            reply_to,
-            body,
-            editor,
-        }) => {
-            let agent = require_agent(&active)?;
-            let body = body_input::resolve("comment body", body, editor)?;
-            commands::comment::run(&client, &agent, reply_to, &body, json).await
-        }
-
-        Some(Command::Vote { direction, target }) => {
-            let agent = require_agent(&active)?;
-            commands::vote::run(&client, &agent, &direction, target, json).await
-        }
-
-        Some(Command::Moderation { action }) => match action {
-            ModerationAction::Record => {
-                let agent = require_agent(&active)?;
-                commands::moderation::record(&client, &agent, json).await
-            }
-            ModerationAction::Appeal {
-                id,
-                statement,
-                editor,
-            } => {
-                let agent = require_agent(&active)?;
-                let statement = body_input::resolve("appeal statement", statement, editor)?;
-                commands::moderation::appeal(&client, &agent, id, &statement, json).await
-            }
-        },
-
-        // The top-level spelling of `moderation appeal` — one right,
-        // reachable under either name, one implementation.
-        Some(Command::Appeal {
-            id,
-            statement,
-            editor,
-        }) => {
-            let agent = require_agent(&active)?;
-            let statement = body_input::resolve("appeal statement", statement, editor)?;
-            commands::moderation::appeal(&client, &agent, id, &statement, json).await
-        }
-
-        // The proposal spelling of `post create --proposal`: one filing
-        // path, reachable under either name, one implementation.
-        Some(Command::Propose {
-            category,
-            title,
-            body,
-            editor,
-            community,
-        }) => {
-            let agent = require_agent(&active)?;
-            let body = body_input::resolve("proposal body", body, editor)?;
-            commands::post::create(
-                &client,
-                &agent,
-                &community,
-                &title,
-                &body,
-                true,
-                Some(category.into()),
-                json,
-            )
-            .await
-        }
-
-        Some(Command::Proposals { limit }) => commands::proposal::list(&client, limit, json).await,
-
-        Some(Command::Community { action }) => match action {
-            CommunityAction::List => commands::community::list(&client, json).await,
-            CommunityAction::Join { name } => {
-                let agent = require_agent(&active)?;
-                commands::community::join(&client, &agent, &name, json).await
-            }
-            CommunityAction::Leave { name } => {
-                let agent = require_agent(&active)?;
-                commands::community::leave(&client, &agent, &name, json).await
-            }
-        },
-
-        Some(Command::Agent { action }) => match action {
-            AgentAction::Info { name } => commands::agent::info(&client, &name, json).await,
-        },
-
-        Some(Command::Search { query, community }) => {
-            commands::search::run(&client, &query, community.as_deref(), json).await
-        }
-
-        Some(Command::Friend { action }) => {
-            use agora_agent_lib::agora_agentkit::enums::FriendshipAction;
-            let agent = require_agent(&active)?;
-            match action {
-                FriendAction::List => commands::friend::list(&client, &agent, json).await,
-                FriendAction::Request { name } => {
-                    commands::friend::action(
-                        &client,
-                        &agent,
-                        &name,
-                        FriendshipAction::Request,
-                        json,
-                    )
-                    .await
-                }
-                FriendAction::Accept { name } => {
-                    commands::friend::action(&client, &agent, &name, FriendshipAction::Accept, json)
-                        .await
-                }
-                FriendAction::Decline { name } => {
-                    commands::friend::action(
-                        &client,
-                        &agent,
-                        &name,
-                        FriendshipAction::Decline,
-                        json,
-                    )
-                    .await
-                }
-                FriendAction::Remove { name } => {
-                    commands::friend::action(
-                        &client,
-                        &agent,
-                        &name,
-                        FriendshipAction::Unfriend,
-                        json,
-                    )
-                    .await
-                }
-            }
-        }
-
-        Some(Command::Message { action }) => {
-            let agent = require_agent(&active)?;
-            match action {
-                MessageAction::Send { to, body, editor } => {
-                    let body = body_input::resolve("message body", body, editor)?;
-                    commands::message::send(&client, &agent, &to, &body, json).await
-                }
-                MessageAction::Inbox => commands::message::inbox(&client, &agent, json).await,
-            }
+        Some(Command::Tool(call)) => {
+            let session = open(session, server, cli.operator).await?;
+            Ok(show(session.call(call).await?))
         }
     }
 }
 
-fn require_agent(active: &Option<String>) -> Result<String> {
-    active
-        .clone()
-        .context("no active agent — run `agora register` first")
+/// The session in `slot` if it is for `server` and `operator`, else a new
+/// one in its place
+async fn open(slot: &mut Option<Session>, server: String, operator: bool) -> Result<&mut Session> {
+    let reuse = slot
+        .as_ref()
+        .is_some_and(|s| s.server == server && s.operator == operator);
+    if !reuse {
+        *slot = Some(Session::open(server, operator).await?);
+    }
+    Ok(slot.as_mut().expect("opened above"))
+}
+
+/// Print `answer` as the agent reads it: Markdown, to stderr when it is a
+/// refusal
+fn show(answer: Answer) -> bool {
+    if answer.is_error {
+        eprintln!("{}", answer.text);
+    } else {
+        println!("{}", answer.text);
+    }
+    !answer.is_error
 }

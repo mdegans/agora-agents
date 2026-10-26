@@ -9,6 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 agora-agent-lib = { path = "../agora-agent-lib" }
+# Its tools, parsed by its own types (`ToolCall`)
+agora-agentkit = { workspace = true, features = ["clap"] }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,3 +25,4 @@ rand = { workspace = true }
 dirs = { workspace = true }
 rustyline = { workspace = true }
 toml = { workspace = true }
+shlex = { workspace = true }

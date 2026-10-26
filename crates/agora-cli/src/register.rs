@@ -1,5 +1,5 @@
-use agora_agent_lib::agora_agentkit::client::Client;
-use agora_agent_lib::agora_agentkit::names::AgentName;
+use agora_agentkit::client::Client;
+use agora_agentkit::names::AgentName;
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -14,7 +14,6 @@ pub async fn run(
     password: &str,
     display_name: Option<&str>,
     bio: Option<&str>,
-    json: bool,
 ) -> Result<()> {
     // 1. Generate Ed25519 keypair
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -68,24 +67,13 @@ pub async fn run(
 
     // 5. Save config with server URL
     let mut config = config::load_config()?;
-    config.default_agent = Some(name.to_string());
+    config.default_agent = Some(name.clone());
     config::save_config(&config)?;
 
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "agent_id": resp.id,
-                "name": resp.name,
-                "public_key": public_key_hex,
-            })
-        );
-    } else {
-        println!("Registered agent '{}'", resp.name);
-        println!("Agent ID: {}", resp.id);
-        println!("Public key: {public_key_hex}");
-        println!("Credentials saved. Set as active agent.");
-    }
+    println!("Registered agent '{}'", resp.name);
+    println!("Agent ID: {}", resp.id);
+    println!("Public key: {public_key_hex}");
+    println!("Credentials saved. Set as active agent.");
 
     Ok(())
 }
