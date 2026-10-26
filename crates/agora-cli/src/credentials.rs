@@ -5,14 +5,15 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{config_dir, write_atomically};
+use crate::config::{config_dir, write_atomically, write_secret_atomically};
 
 /// Stored credentials for an agent.
 ///
-/// Holds the agent's signing key only. Files written before 2026-09-21 may
-/// also carry `bearer_token`, `operator_email` and `operator_password` (the
-/// operator's password, in plaintext) from the removed `login` command;
-/// they are ignored on load and dropped on the next save.
+/// The agent's id and keys, and nothing else. Files written before
+/// 2026-09-21 may also carry `bearer_token`, `operator_email` and
+/// `operator_password` (the operator's password, in plaintext) from the
+/// removed `login` command: loading rewrites such a file without them, and
+/// any file others can read as this user's alone ([`load_credentials`]).
 #[derive(Serialize, Deserialize)]
 pub struct Credentials {
     pub agent_id: AgentId,
@@ -50,6 +51,8 @@ impl Credentials {
 
 /// Load credentials for a named agent.
 pub fn load_credentials(agent: &AgentName) -> Result<Credentials> {
+    use std::os::unix::fs::PermissionsExt;
+
     let path = config_dir()?
         .join("credentials")
         .join(format!("{agent}.json"));
@@ -57,7 +60,19 @@ pub fn load_credentials(agent: &AgentName) -> Result<Credentials> {
         format!("no credentials for agent '{agent}' — run `agora register` first")
     })?;
     let creds: Credentials = serde_json::from_str(&contents)?;
+    let mode = std::fs::metadata(&path)?.permissions().mode();
+    if needs_rewrite(&contents, mode)? {
+        save_credentials(agent, &creds)?;
+    }
     Ok(creds)
+}
+
+/// Whether a credentials file holds fields the CLI no longer keeps, or can
+/// be read by anyone but this user (Steward, 2026-10-26)
+fn needs_rewrite(contents: &str, mode: u32) -> Result<bool> {
+    const KEPT: &[&str] = &["agent_id", "signing_key_hex", "encryption_secret_hex"];
+    let fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(contents)?;
+    Ok(fields.keys().any(|k| !KEPT.contains(&k.as_str())) || mode & 0o077 != 0)
 }
 
 /// Save credentials for a named agent.
@@ -65,7 +80,7 @@ pub fn save_credentials(agent: &AgentName, creds: &Credentials) -> Result<()> {
     let dir = config_dir()?.join("credentials");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{agent}.json"));
-    write_atomically(&path, serde_json::to_string_pretty(creds)?.as_bytes())
+    write_secret_atomically(&path, serde_json::to_string_pretty(creds)?.as_bytes())
 }
 
 /// Where the CLI keeps an agent's dedup ledger: the runner's shape, in a
@@ -93,4 +108,18 @@ pub fn save_ledger(agent: &AgentName, ledger: &Ledger) -> Result<()> {
     let path = ledger_path(agent)?;
     std::fs::create_dir_all(path.parent().expect("a ledger path has a parent"))?;
     write_atomically(&path, serde_json::to_string(ledger)?.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_fields_or_open_permissions_need_a_rewrite() {
+        let kept = r#"{"agent_id":"7ad26ccd-1111-4222-8333-444455556666","signing_key_hex":"00","encryption_secret_hex":"11"}"#;
+        assert!(!needs_rewrite(kept, 0o100600).unwrap());
+        assert!(needs_rewrite(kept, 0o100664).unwrap());
+        let stale = r#"{"agent_id":"7ad26ccd-1111-4222-8333-444455556666","signing_key_hex":"00","operator_password":"x"}"#;
+        assert!(needs_rewrite(stale, 0o100600).unwrap());
+    }
 }

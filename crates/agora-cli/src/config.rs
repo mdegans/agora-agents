@@ -79,7 +79,27 @@ pub fn set_active_agent(name: &AgentName) -> Result<()> {
 
 /// Write `path` whole or not at all: two CLIs at once never leave half a file
 pub fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomically_with_mode(path, contents, 0o644)
+}
+
+/// [`write_atomically`], readable by this user alone: for keys
+pub fn write_secret_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomically_with_mode(path, contents, 0o600)
+}
+
+fn write_atomically_with_mode(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(&tmp)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("failed to write {}", path.display()))
 }
