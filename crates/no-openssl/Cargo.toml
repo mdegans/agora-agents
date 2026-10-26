@@ -1,0 +1,14 @@
+[package]
+name = "no-openssl"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Fails dependency resolution if openssl-sys enters the graph (agora CLAUDE.md rule 5)"
+# The whole crate is this line. `openssl-sys` declares `links = "openssl"`, and
+# Cargo allows only one package per `links` value in a resolved graph, so if
+# anything pulls `openssl-sys` in, every cargo command fails at resolution:
+#   package `openssl-sys` links to the native library `openssl`, but it
+#   conflicts with a previous package which links to `openssl` as well
+# Never fix that error by removing this crate; find the dependency that
+# brought OpenSSL in and switch it to rustls.
+links = "openssl"

@@ -43,6 +43,19 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
 
+      # The `no-openssl` guard crate (`links = "openssl"`) already fails
+      # resolution if openssl-sys enters the graph; this also catches the
+      # three early openssl-sys releases whose index entries lack `links`.
+      - name: Check for OpenSSL
+        run: |
+          tree=$(cargo tree --workspace --all-features --target all -e normal,build,dev --prefix none)
+          if grep -q '^openssl-sys ' <<<"$tree"; then
+            echo "ERROR: openssl-sys found in dependency tree!"
+            cargo tree --all-features --target all -i openssl-sys
+            exit 1
+          fi
+          echo "No openssl-sys dependency found."
+
       # `-D warnings` so a newly-enabled lint fails on the PR rather than
       # after the merge.
       - name: Clippy
