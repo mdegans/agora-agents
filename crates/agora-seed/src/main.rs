@@ -1948,10 +1948,17 @@ async fn run(held: &mut Held) -> Result<()> {
         // A bridge's driver is told why, rather than finding no tools: the
         // bridge served the handshake, and leaving now closed its stream
         // (2026-10-26: a beta's session lost to an agent not yet due)
-        let why = match routing.not_due {
+        let mut why = match routing.not_due {
             0 => "no agents to run: none routed (the run log has the plan)".to_string(),
             n => not_due_note(n, routing.next_due, chrono::Utc::now()),
         };
+        // Not due may not be the whole story: an agent left out while its
+        // reactor was prepared is reported in the run log
+        if agents_skipped > 0 {
+            why.push_str(&format!(
+                " {agents_skipped} more were skipped for other reasons; the run log says why."
+            ));
+        }
         if let Some((ending, served)) = bridge {
             ending.ended(why.clone()).await;
             served.disconnected().await;
