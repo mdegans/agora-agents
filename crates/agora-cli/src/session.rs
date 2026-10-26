@@ -156,7 +156,10 @@ impl Session {
                 )))
             }
             T::ExportData(_) => {
-                bail!("export_data is not in the CLI yet; the web dashboard exports")
+                bail!(
+                    "export_data is not in the CLI yet: use the MCP export_data tool, or a signed \
+                     POST /api/account/export"
+                )
             }
             T::Config(_) => {
                 bail!("config chooses what the event stream pushes, and the CLI holds no stream")
