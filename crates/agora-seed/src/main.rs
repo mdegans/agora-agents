@@ -1066,6 +1066,31 @@ struct Routing {
     placeholders: usize,
     /// Agents skipped by `min_cycle_secs` cadence gating.
     not_due: usize,
+    /// When the first of them is due again
+    next_due: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Why a run with `not_due` agents gated and none routed ran no session
+fn not_due_note(
+    not_due: usize,
+    next_due: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let agents = if not_due == 1 { "agent" } else { "agents" };
+    let when = match next_due {
+        Some(at) => {
+            let minutes = ((at - now).num_seconds().max(0) + 59) / 60;
+            format!(
+                " The first is due again at {} (in about {minutes} min).",
+                at.format("%H:%M:%SZ")
+            )
+        }
+        None => String::new(),
+    };
+    format!(
+        "Nothing ran: {not_due} {agents} had a session inside min_cycle_secs \
+         and is not due yet.{when} Start the session again then."
+    )
 }
 
 /// Route each agent onto the endpoint offering its model. First endpoint
@@ -1135,6 +1160,8 @@ fn route(
             let cutoff = now - chrono::Duration::seconds(secs.min(i64::MAX as u64) as i64);
             if last > cutoff {
                 routing.not_due += 1;
+                let due = last + (now - cutoff);
+                routing.next_due = Some(routing.next_due.map_or(due, |d| d.min(due)));
                 continue;
             }
         }
@@ -1918,10 +1945,25 @@ async fn run(held: &mut Held) -> Result<()> {
     // still an error when nobody was gated: no agents at all, or none
     // routable, means the config is wrong, not that the fleet is resting.
     if total == 0 {
-        anyhow::ensure!(
-            routing.not_due > 0,
-            "no agents to run (none routed — check the plan above)"
-        );
+        // A bridge's driver is told why, rather than finding no tools: the
+        // bridge served the handshake, and leaving now closed its stream
+        // (2026-10-26: a beta's session lost to an agent not yet due)
+        let mut why = match routing.not_due {
+            0 => "no agents to run: none routed (the run log has the plan)".to_string(),
+            n => not_due_note(n, routing.next_due, chrono::Utc::now()),
+        };
+        // Not due may not be the whole story: an agent left out while its
+        // reactor was prepared is reported in the run log
+        if agents_skipped > 0 {
+            why.push_str(&format!(
+                " {agents_skipped} more were skipped for other reasons; the run log says why."
+            ));
+        }
+        if let Some((ending, served)) = bridge {
+            ending.ended(why.clone()).await;
+            served.disconnected().await;
+        }
+        anyhow::ensure!(routing.not_due > 0, "{why}");
         tracing::info!(
             not_due = routing.not_due,
             "nothing due inside min_cycle_secs; exiting cleanly"
@@ -2010,6 +2052,22 @@ async fn run(held: &mut Held) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A driver told nothing ran learns when to come back
+    #[test]
+    fn not_due_note_says_when_the_agent_is_due() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-26T13:10:00Z")
+            .unwrap()
+            .to_utc();
+        let at = now + chrono::Duration::seconds(16 * 60 + 24);
+        assert_eq!(
+            not_due_note(1, Some(at), now),
+            "Nothing ran: 1 agent had a session inside min_cycle_secs and is not \
+             due yet. The first is due again at 13:26:24Z (in about 17 min). \
+             Start the session again then."
+        );
+        assert!(!not_due_note(2, None, now).contains("due again"));
+    }
 
     /// A state that won't load is left out and returned for the sweep's
     /// one summary, and does not stop the others loading (audit
