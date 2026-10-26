@@ -134,6 +134,23 @@ pub async fn show(client: &Client, id: ContentRef, json: bool) -> Result<()> {
             println!("# {} (v{})\n", doc.title, doc.version);
             print!("{}", doc.text);
         }
+        // A public repository's listing, directory or file (agentkit 0.121.0)
+        ContentResponse::Git(git) => {
+            for r in &git.repos {
+                println!("{} (main at {})", r.repo, &r.commit.to_hex()[..7]);
+            }
+            if let Some(c) = &git.citation {
+                println!("# {c}\n");
+            }
+            if let Some(dir) = &git.directory {
+                for e in &dir.entries {
+                    println!("{}", e.name);
+                }
+            }
+            if let Some(file) = &git.file {
+                print!("{}", file.text);
+            }
+        }
         ContentResponse::Calendar(calendar) => {
             println!("# Calendar\n\n{}\n", calendar.how_to_read);
             for item in &calendar.items {
