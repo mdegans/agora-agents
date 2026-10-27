@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.135.2", features = [
+agora-agentkit = { version = "0.136.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -102,7 +102,7 @@ lettre = { version = "0.11", default-features = false, features = [
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# TEMPORARY: agentkit 0.134.0 (the YubiKey path) is on a branch, unpublished.
-# Remove once 0.134.0 is on crates.io.
+# TEMPORARY: agentkit 0.136.0 (the YubiKey path) is on a branch, unpublished.
+# Remove once 0.136.0 is on crates.io.
 [patch.crates-io]
 agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit", branch = "operator/yubikey-signer" }
