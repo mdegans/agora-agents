@@ -29,7 +29,11 @@ pub fn run(
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let key_path = write_key(dir, label)?;
+    // Only the default directory is ours to tighten; one the user named is
+    // theirs, and is refused rather than changed
+    let default_dir = std::path::absolute(config::operator_dir()?)?;
+    let may_tighten = std::path::absolute(dir)? == default_dir;
+    let key_path = write_key(dir, label, may_tighten)?;
     let signer = SignerConfig::SoftwareKey(key_path.clone());
     let public = public_key_hex(&signer.open()?.public_key());
 
@@ -62,12 +66,21 @@ pub fn run(
 
 /// A new key at `<dir>/<label>.key` (an absolute path), never over an
 /// existing one, since a key already registered would be lost. Only in a
-/// directory this user owns at 0700: one made here is made so, and an
-/// existing one open to others is tightened, and says so
-fn write_key(dir: &Path, label: &str) -> Result<PathBuf> {
+/// directory this user owns at 0700: one made here is made so. An existing
+/// one open to others is tightened (and says so) only if `may_tighten`, for
+/// the default directory; any other is refused, never chmodded
+fn write_key(dir: &Path, label: &str, may_tighten: bool) -> Result<PathBuf> {
     let dir = std::path::absolute(dir)?;
     config::create_private_dir(&dir)?;
     let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 && !may_tighten {
+        bail!(
+            "{} is open to others (mode {mode:04o}), so no key is written there: \
+             `chmod 700 {}` it yourself, or choose another path",
+            dir.display(),
+            dir.display()
+        );
+    }
     if mode & 0o077 != 0 {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).with_context(
             || {
@@ -172,7 +185,7 @@ mod tests {
     #[test]
     fn a_key_is_written_once_readable_by_its_owner_alone() {
         let dir = scratch("keygen");
-        let path = write_key(&dir, "laptop").unwrap();
+        let path = write_key(&dir, "laptop", false).unwrap();
         assert_eq!(path, std::path::absolute(dir.join("laptop.key")).unwrap());
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -183,7 +196,7 @@ mod tests {
         assert_eq!(public_key_hex(&signer.public_key()).len(), 64);
         // and is never overwritten
         let before = std::fs::read(&path).unwrap();
-        let err = write_key(&dir, "laptop").unwrap_err();
+        let err = write_key(&dir, "laptop", false).unwrap_err();
         assert!(err.to_string().contains("never overwritten"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -194,7 +207,14 @@ mod tests {
         let dir = scratch("open-dir");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = write_key(&dir, "k").unwrap();
+        // A directory the user named is refused, and left as it was
+        let err = write_key(&dir, "k", false).unwrap_err().to_string();
+        assert!(err.contains("chmod 700"), "{err}");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert!(!dir.join("k.key").exists());
+        // The default directory is tightened
+        let path = write_key(&dir, "k", true).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         assert!(path.is_absolute());
@@ -202,7 +222,7 @@ mod tests {
 
         // A relative directory is stored absolute
         let rel = PathBuf::from(format!(".agora-operator-test-rel-{}", std::process::id()));
-        let path = write_key(&rel, "k").unwrap();
+        let path = write_key(&rel, "k", false).unwrap();
         assert!(path.is_absolute(), "{}", path.display());
         assert_eq!(path, std::path::absolute(rel.join("k.key")).unwrap());
         std::fs::remove_dir_all(&rel).unwrap();
@@ -224,7 +244,7 @@ mod tests {
     #[test]
     fn describe_never_prints_the_key() {
         let dir = scratch("describe");
-        let path = write_key(&dir, "k").unwrap();
+        let path = write_key(&dir, "k", false).unwrap();
         let secret = std::fs::read_to_string(&path).unwrap();
         let config = OperatorConfig {
             signer: Some(SignerConfig::SoftwareKey(path)),
