@@ -11,8 +11,10 @@
 //!
 //! The key is reached only through agentkit's `yubikey` module (the
 //! `yubikey` crate over PC/SC), never by running `ykman`, whose PIN and
-//! management key arguments show in `ps`. The PIN is read from a file this
-//! user alone can read (`--pin-file`), never from argv or the environment.
+//! management key arguments show in `ps`. The PIN is read with
+//! agora-agent-lib's `read_secret` (a prompt with echo off, or
+//! `--pin-stdin`), or from a file this user alone can read (`--pin-file`,
+//! which unattended signing needs); never from argv or the environment.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
