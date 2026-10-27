@@ -5,22 +5,17 @@ use std::io::{BufRead, IsTerminal, Read, Write};
 use agora_agent_lib::body_input;
 use agora_agentkit::ids::OperatorActionId;
 use agora_agentkit::operator::{
-    AgentRef, SendNowCode, SendOperatorMessageRequest, SendOperatorMessageResponse,
+    AgentRef, OperatorConfigResponse, SendNowCode, SendOperatorMessageRequest,
+    SendOperatorMessageResponse,
 };
 use anyhow::{Context, Result, bail};
 use zeroize::Zeroizing;
 
 use crate::cli::SendArgs;
 use crate::client::OperatorClient;
-use crate::config::OperatorConfig;
 use crate::render;
 
-pub async fn run(
-    client: &OperatorClient,
-    config: &OperatorConfig,
-    args: SendArgs,
-    json: bool,
-) -> Result<()> {
+pub async fn run(client: &OperatorClient, args: SendArgs, json: bool) -> Result<()> {
     let body = body(&args)?;
     let action = args.write.action_id.unwrap_or_default(); // the default is a new id
     let email_code = match args.email_code {
@@ -59,7 +54,9 @@ pub async fn run(
                 bail!("the server queued a dry run; stopping before the real send")
             }
         };
-        eprint!("{}", consequence(&req, &recipients, config.bulk_threshold)?);
+        // The server's own hold and threshold, and this key's recent sends
+        let settings = client.config().await?;
+        eprint!("{}", consequence(&req, &recipients, &settings)?);
         if !crate::confirm(&format!("Send it, on {}?", client.who()))? {
             bail!("not confirmed; nothing was sent");
         }
@@ -76,7 +73,7 @@ pub async fn run(
 fn consequence(
     req: &SendOperatorMessageRequest,
     recipients: &[AgentRef],
-    threshold: u32,
+    settings: &OperatorConfigResponse,
 ) -> Result<String> {
     let n = recipients.len();
     if n == 0 {
@@ -95,18 +92,27 @@ fn consequence(
             "Above your message, it shows the record of moderation action {about}.\n"
         ));
     }
-    let bulk = n > threshold as usize;
-    let skips_bulk_hold = req.send_now && req.email_code.is_some();
+    let bulk = settings.is_bulk(n as i64);
+    let threshold = settings.bulk_threshold;
+    let recent = match settings.recent_recipients {
+        0 => String::new(),
+        r => format!(
+            ", counting the {r} agent{} this key sent to in the last {}",
+            if r == 1 { "" } else { "s" },
+            render::duration(settings.bulk_window_seconds)
+        ),
+    };
+    let bulk_hold = render::duration(settings.bulk_hold_seconds);
     match (req.deliver_at, req.send_now) {
         (None, true) if bulk && req.email_code.is_none() => bail!(
-            "{out}It is above your bulk threshold ({threshold}), so --send-now needs \
+            "{out}It is above your bulk threshold ({threshold}{recent}), so --send-now needs \
              --email-code: run `agora-operator send-now-code --action-id {action}`, then \
              this again with --action-id {action} --email-code"
         ),
         (_, false) if bulk => out.push_str(&format!(
-            "It is above your bulk threshold ({threshold}): it is held at least an hour{}, and \
-             you are emailed a link to cancel it. Until delivery you can cancel it and the \
-             agent sees nothing.\n",
+            "It is above your bulk threshold ({threshold}{recent}): it is held {bulk_hold}{}, \
+             and you are emailed a link to cancel it. Until delivery you can cancel it and \
+             the agent sees nothing.\n",
             match req.deliver_at {
                 Some(at) => format!(" (and until {} at the earliest)", render::time(&at)),
                 None => String::new(),
@@ -120,16 +126,11 @@ fn consequence(
             "Delivered now, skipping your hold: it cannot be cancelled, only retracted \
              while unread (the agent then sees that it was retracted).\n",
         ),
-        (None, false) => out.push_str(
-            "Held for your hold (one minute by default), then delivered; until then you can \
-             cancel it and the agent sees nothing.\n",
-        ),
-    }
-    if !bulk && !skips_bulk_hold {
-        out.push_str(&format!(
-            "(The bulk threshold counts this key's sends in the last hour too: past \
-             {threshold} agents in all, it is held an hour and you are emailed.)\n"
-        ));
+        (None, false) => out.push_str(&format!(
+            "Held for your hold ({}), then delivered; until then you can cancel it and the \
+             agent sees nothing.\n",
+            render::duration(settings.dm_hold_seconds)
+        )),
     }
     Ok(out)
 }
@@ -188,6 +189,17 @@ mod tests {
         }
     }
 
+    fn settings(recent: i64) -> OperatorConfigResponse {
+        OperatorConfigResponse {
+            dm_hold_seconds: 60,
+            bulk_threshold: 10,
+            bulk_hold_seconds: 3600,
+            bulk_window_seconds: 3600,
+            recent_recipients: recent,
+            agent_reply_daily_cap: 50,
+        }
+    }
+
     fn agents(n: usize) -> Vec<AgentRef> {
         (0..n)
             .map(|i| AgentRef {
@@ -199,35 +211,47 @@ mod tests {
 
     #[test]
     fn a_small_send_is_held_for_the_hold() {
-        let text = consequence(&req(false, false), &agents(2), 10).unwrap();
+        let text = consequence(&req(false, false), &agents(2), &settings(0)).unwrap();
         assert!(text.contains("reaches 2 agents"), "{text}");
         assert!(
             text.contains("agent-0") && text.contains("agent-1"),
             "{text}"
         );
-        assert!(text.contains("Held for your hold"), "{text}");
-        assert!(!text.contains("will be held at least an hour"), "{text}");
+        assert!(text.contains("Held for your hold (1 minute)"), "{text}");
+        assert!(!text.contains("bulk"), "{text}");
     }
 
     #[test]
     fn a_bulk_send_says_it_is_held_and_emailed() {
-        let text = consequence(&req(false, false), &agents(11), 10).unwrap();
-        assert!(text.contains("held at least an hour"), "{text}");
+        let text = consequence(&req(false, false), &agents(11), &settings(0)).unwrap();
+        assert!(text.contains("held 1 hour"), "{text}");
         assert!(text.contains("emailed"), "{text}");
         assert!(!text.contains("Held for your hold"), "{text}");
     }
 
     #[test]
     fn send_now_in_bulk_needs_the_code_first() {
-        let err = consequence(&req(true, false), &agents(11), 10).unwrap_err();
+        let err = consequence(&req(true, false), &agents(11), &settings(0)).unwrap_err();
         assert!(err.to_string().contains("send-now-code"), "{err}");
-        let text = consequence(&req(true, true), &agents(11), 10).unwrap();
+        let text = consequence(&req(true, true), &agents(11), &settings(0)).unwrap();
         assert!(text.contains("Delivered now"), "{text}");
-        assert!(!text.contains("held at least an hour"), "{text}");
+        assert!(!text.contains("held 1 hour"), "{text}");
+    }
+
+    /// The server's rule: this key's recent recipients count toward the
+    /// threshold, so a small send can be bulk
+    #[test]
+    fn recent_sends_make_a_small_send_bulk() {
+        let text = consequence(&req(false, false), &agents(2), &settings(9)).unwrap();
+        assert!(text.contains("held 1 hour"), "{text}");
+        assert!(
+            text.contains("the 9 agents this key sent to in the last 1 hour"),
+            "{text}"
+        );
     }
 
     #[test]
     fn no_recipients_is_refused() {
-        assert!(consequence(&req(false, false), &[], 10).is_err());
+        assert!(consequence(&req(false, false), &[], &settings(0)).is_err());
     }
 }

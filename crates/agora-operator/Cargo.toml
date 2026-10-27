@@ -13,7 +13,7 @@ path = "src/main.rs"
 # with the agent CLI
 agora-agent-lib = { path = "../agora-agent-lib" }
 # The operator API's wire types, request signing and `OperatorSigner`
-agora-agentkit = { workspace = true }
+agora-agentkit = { workspace = true, features = ["clap"] }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }

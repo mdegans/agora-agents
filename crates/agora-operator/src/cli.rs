@@ -1,16 +1,15 @@
 //! The command line. Every request and answer is agentkit's own type
-//! (`agora_agentkit::operator`); the argument structs here only collect
-//! flags and are built into those types field by field, so a field added
-//! in agentkit does not compile until it has a flag.
+//! (`agora_agentkit::operator`), and the queries parse as agentkit's own
+//! `clap::Args` (feature `clap`), so their flags cannot drift from them.
 
 use std::path::PathBuf;
 
 use agora_agentkit::ids::{
-    AgentGroupId, AgentId, MessageId, ModerationActionId, OperatorActionId, OperatorCredentialId,
+    MessageId, ModerationActionId, OperatorActionId, OperatorCredentialId, OperatorId,
 };
 use agora_agentkit::operator::{
-    MarkRepliesRead, OperatorActionKind, OperatorLogQuery, OperatorMessagesQuery,
-    OperatorModerationQuery, OperatorRecipients,
+    MarkRepliesRead, OperatorLogQuery, OperatorMessagesQuery, OperatorModerationQuery,
+    OperatorRecipients,
 };
 use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -51,6 +50,18 @@ pub enum Command {
         /// (~/.config/agora/operator/<LABEL>.key by default)
         #[arg(long, default_value = "default", value_parser = parse_label)]
         label: String,
+        /// Your operator id, as the portal's "Add signing key" page shows
+        /// it: also print the key's proof of possession for that page
+        #[arg(long)]
+        operator: Option<OperatorId>,
+    },
+
+    /// Print the configured key's proof of possession for the portal's
+    /// "Add signing key" page: its signature over the page's challenge
+    Prove {
+        /// Your operator id, as the page shows it
+        #[arg(long)]
+        operator: OperatorId,
     },
 
     /// Show the config, or change it (`--server` is the global flag)
@@ -61,9 +72,6 @@ pub enum Command {
         /// Sign with this key file (hex Ed25519, as `keygen` writes)
         #[arg(long)]
         key_file: Option<PathBuf>,
-        /// Your account's bulk threshold, for `send`'s preview
-        #[arg(long)]
-        bulk_threshold: Option<u32>,
     },
 
     /// Your agents, their groups and unread replies
@@ -111,17 +119,17 @@ pub enum Command {
     },
 
     /// One agent's conversation with you, or the replies across agents
-    Messages(MessagesArgs),
+    Messages(OperatorMessagesQuery),
 
     /// Mark replies read
     #[command(name = "mark-read")]
-    MarkRead(MarkReadArgs),
+    MarkRead(MarkRepliesRead),
 
     /// Your action log, newest first
-    Log(LogArgs),
+    Log(OperatorLogQuery),
 
     /// Moderation actions against your agents
-    Moderation(ModerationArgs),
+    Moderation(OperatorModerationQuery),
 }
 
 /// What every write takes
@@ -186,105 +194,6 @@ pub struct SendArgs {
     pub write: WriteArgs,
 }
 
-#[derive(Debug, Args)]
-pub struct MessagesArgs {
-    /// Only the conversation with this agent, both ways
-    #[arg(long)]
-    pub agent: Option<AgentId>,
-    /// Only replies from agents in this group
-    #[arg(long)]
-    pub group: Option<AgentGroupId>,
-    /// Only replies not yet read
-    #[arg(long)]
-    pub unread: bool,
-    /// Only messages sent before this (RFC 3339), for the next page
-    #[arg(long)]
-    pub before: Option<DateTime<Utc>>,
-    /// At most this many (the server caps it)
-    #[arg(long)]
-    pub limit: Option<u32>,
-}
-
-impl From<MessagesArgs> for OperatorMessagesQuery {
-    fn from(a: MessagesArgs) -> Self {
-        Self {
-            agent: a.agent,
-            group: a.group,
-            unread: a.unread,
-            before: a.before,
-            limit: a.limit,
-        }
-    }
-}
-
-#[derive(Debug, Args)]
-#[command(group(ArgGroup::new("which").required(true).args(["message", "agent", "all"])))]
-pub struct MarkReadArgs {
-    /// These replies (repeat, or separate with commas)
-    #[arg(long, value_delimiter = ',')]
-    pub message: Vec<MessageId>,
-    /// Every reply from this agent
-    #[arg(long)]
-    pub agent: Option<AgentId>,
-    /// Every reply
-    #[arg(long)]
-    pub all: bool,
-}
-
-impl From<MarkReadArgs> for MarkRepliesRead {
-    fn from(a: MarkReadArgs) -> Self {
-        match (a.agent, a.all) {
-            (Some(agent), _) => Self::Agent(agent),
-            (None, true) => Self::All,
-            (None, false) => Self::Messages(a.message),
-        }
-    }
-}
-
-#[derive(Debug, Args)]
-pub struct LogArgs {
-    /// Only entries concerning this agent
-    #[arg(long)]
-    pub agent: Option<AgentId>,
-    /// Only entries of this kind (dm_send, dm_cancel, dm_retract,
-    /// credential_add, credential_revoke)
-    #[arg(long)]
-    pub kind: Option<OperatorActionKind>,
-    /// Only entries before this (RFC 3339), for the next page
-    #[arg(long)]
-    pub before: Option<DateTime<Utc>>,
-    #[arg(long)]
-    pub limit: Option<u32>,
-}
-
-impl From<LogArgs> for OperatorLogQuery {
-    fn from(a: LogArgs) -> Self {
-        Self {
-            agent: a.agent,
-            kind: a.kind,
-            before: a.before,
-            limit: a.limit,
-        }
-    }
-}
-
-#[derive(Debug, Args)]
-pub struct ModerationArgs {
-    #[arg(long)]
-    pub agent: Option<AgentId>,
-    #[arg(long)]
-    pub group: Option<AgentGroupId>,
-}
-
-impl From<ModerationArgs> for OperatorModerationQuery {
-    fn from(a: ModerationArgs) -> Self {
-        Self {
-            agent: a.agent,
-            group: a.group,
-        }
-    }
-}
-
 /// `agent:<id>`, `agents:<id>,<id>,…`, `group:<id>` or `all`, as
 /// agentkit's [`OperatorRecipients`]
 pub fn parse_recipients(text: &str) -> Result<OperatorRecipients, String> {
@@ -330,6 +239,8 @@ fn parse_label(text: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agora_agentkit::ids::AgentId;
+    use agora_agentkit::operator::OperatorActionKind;
     use clap::CommandFactory;
     use clap::error::ErrorKind;
 
@@ -428,7 +339,7 @@ mod tests {
     #[test]
     fn mark_read_takes_exactly_one_selection() {
         let read = |line: &str| match parse(line).map(|c| c.command) {
-            Ok(Command::MarkRead(args)) => Ok(MarkRepliesRead::from(args)),
+            Ok(Command::MarkRead(which)) => Ok(which),
             Ok(other) => panic!("{other:?}"),
             Err(e) => Err(e.kind()),
         };
@@ -438,7 +349,7 @@ mod tests {
             Ok(MarkRepliesRead::Agent(A.parse().unwrap()))
         );
         assert_eq!(
-            read(&format!("mark-read --message {A},{B}")),
+            read(&format!("mark-read --messages {A} {B}")),
             Ok(MarkRepliesRead::Messages(vec![
                 A.parse().unwrap(),
                 B.parse().unwrap()
@@ -461,17 +372,14 @@ mod tests {
         else {
             panic!("expected messages");
         };
-        let query = OperatorMessagesQuery::from(args);
+        let query = args;
         assert_eq!(query.agent, Some(A.parse().unwrap()));
         assert!(query.unread);
         assert_eq!(query.limit, Some(5));
         let Command::Log(args) = parse("log --kind dm_send").unwrap().command else {
             panic!("expected log");
         };
-        assert_eq!(
-            OperatorLogQuery::from(args).kind,
-            Some(OperatorActionKind::DmSend)
-        );
+        assert_eq!(args.kind, Some(OperatorActionKind::DmSend));
         assert!(parse("log --kind dm_sent").is_err());
     }
 
