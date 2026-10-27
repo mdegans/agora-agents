@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use agora_agent_lib::secret_input::{SecretSource, read_secret};
 use agora_agentkit::ids::OperatorId;
+use agora_agentkit::operator_signer::FirmwareVersion;
 use agora_agentkit::operator_signer::Pin;
 use agora_agentkit::operator_signer::yubikey::{
     self, DeviceInfo, ManagementKey, YubikeySigner, device_info,
@@ -31,6 +32,9 @@ use agora_agentkit::operator_signer::{
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
+
+/// The first firmware whose slots say what they hold (PIV metadata)
+const METADATA_MIN_FIRMWARE: FirmwareVersion = FirmwareVersion::new(5, 3, 0);
 use url::Url;
 
 use crate::config::{self, OperatorConfig, SignerConfig};
@@ -273,7 +277,24 @@ async fn provision(
                 .any(|s| s.slot == *slot && (s.key.is_some() || s.generated.is_some()))
         })
         .collect();
-    if !occupied.is_empty() {
+    // Before firmware 5.3 there is no metadata: an imported key reads as an
+    // empty slot, so "empty" is not known and is never taken on a y/n
+    let emptiness_unknown = info.firmware < METADATA_MIN_FIRMWARE;
+    if occupied.is_empty() && emptiness_unknown {
+        let names = plan
+            .iter()
+            .map(|(slot, ..)| slot.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        typed_confirmation(
+            &format!(
+                "YubiKey {} (firmware {}) can't say whether slot(s) {names} hold an imported \
+                 key; generating destroys any that do. Type `overwrite {names}` to go on:",
+                info.serial, info.firmware
+            ),
+            &format!("overwrite {names}"),
+        )?;
+    } else if !occupied.is_empty() {
         let names = occupied
             .iter()
             .map(|s| s.to_string())
@@ -569,22 +590,28 @@ mod tests {
         assert_eq!(policy_words(KeyPolicy::UNATTENDED), "PIN once, touch never");
     }
 
+    /// No argument anywhere in the CLI is a PIN, PUK or management key:
+    /// any id naming one must be a file or stdin switch
     #[test]
-    fn provisioning_takes_no_secret_on_the_command_line() {
+    fn no_secret_is_taken_on_the_command_line() {
         use clap::CommandFactory;
-        let cli = crate::cli::Cli::command();
-        let yubikey = cli
-            .find_subcommand("yubikey")
-            .expect("the yubikey commands");
-        for sub in yubikey.get_subcommands() {
-            for arg in sub.get_arguments() {
-                let name = arg.get_id().as_str();
+        const ALLOWED: [&str; 3] = ["pin_file", "pin_stdin", "management_key_file"];
+        fn walk(command: &clap::Command, path: &str, seen: &mut usize) {
+            for arg in command.get_arguments() {
+                let id = arg.get_id().as_str().to_ascii_lowercase();
+                *seen += 1;
                 assert!(
-                    !matches!(name, "pin" | "puk" | "management_key"),
-                    "`{}` takes a secret on argv: {name}",
-                    sub.get_name()
+                    !(id.contains("pin") || id.contains("puk") || id.contains("management"))
+                        || ALLOWED.contains(&id.as_str()),
+                    "`{path}` takes `{id}` on argv"
                 );
             }
+            for sub in command.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), seen);
+            }
         }
+        let mut seen = 0;
+        walk(&crate::cli::Cli::command(), "agora-operator", &mut seen);
+        assert!(seen > 20, "the walk saw the arguments ({seen})");
     }
 }
