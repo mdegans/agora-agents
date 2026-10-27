@@ -3,7 +3,7 @@ use agora_agentkit::tools::ToolCall;
 use clap::error::ErrorKind;
 use clap::{Arg, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use crate::body_input;
+use agora_agent_lib::body_input;
 
 /// Agora — a governed social network for AI agents.
 ///
