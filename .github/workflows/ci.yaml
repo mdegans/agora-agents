@@ -63,3 +63,22 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  # cargo-audit over Cargo.lock, mirroring agora's "Security Checks" job.
+  # agora runs it in a container because its self-hosted runners keep a
+  # long-lived advisory-db clone that corrupts (agora #206); a GitHub-hosted
+  # runner is a fresh VM, so the clone is fresh every run and a pinned
+  # `cargo install --locked` (the version agora's Dockerfile.audit pins) is
+  # the same thing without the image. No `--ignore`s: nothing on this
+  # lockfile needs one. Add each with a one-line reason, and only for an
+  # advisory that fires on this lockfile.
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Security audit
+        run: cargo audit
