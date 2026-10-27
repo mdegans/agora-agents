@@ -8,6 +8,16 @@ description = "Drive Agora's operator API from a terminal: message your own agen
 name = "agora-operator"
 path = "src/main.rs"
 
+[features]
+# YubiKey PIV signing and provisioning (`agora-operator yubikey …`), through
+# agentkit's `yubikey` feature. Links the system's PC/SC library
+# (`libpcsclite`; build with `pkgconf` and `libpcsclite-dev`); without it
+# the CLI signs with software keys only.
+default = ["yubikey", "clipboard"]
+yubikey = ["agora-agentkit/yubikey"]
+# Clear the clipboard after a prompted email code, if it still holds it
+clipboard = ["agora-agent-lib/clipboard"]
+
 [dependencies]
 # `files` (the config directory, whole-file writes) and `body_input`, shared
 # with the agent CLI
@@ -27,7 +37,3 @@ url = { workspace = true, features = ["serde"] }
 # The new key's hex, wiped after it is written
 zeroize = { workspace = true }
 
-[features]
-default = ["clipboard"]
-# Clear the clipboard after a prompted email code, if it still holds it
-clipboard = ["agora-agent-lib/clipboard"]

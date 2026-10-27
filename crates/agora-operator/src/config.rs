@@ -9,37 +9,79 @@ use std::path::{Path, PathBuf};
 use agora_agent_lib::files::{config_dir, write_atomically};
 use agora_agentkit::ids::OperatorCredentialId;
 use agora_agentkit::operator_signer::{OperatorSigner, SoftwareKeySigner};
+#[cfg(feature = "yubikey")]
+use agora_agentkit::operator_signer::{Pin, PivSerial, PivSlot};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// How the CLI signs: one variant per kind of signer.
-///
-/// A hardware key joins as a variant of its own (its device serial and
-/// PIV slot, say), opened by [`SignerConfig::open`] into the same
-/// `Box<dyn OperatorSigner>`; nothing else in the CLI changes.
+/// How the CLI signs: one variant per kind of signer, each opened by
+/// [`SignerConfig::open`] into the same `Box<dyn OperatorSigner>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SignerConfig {
     /// An Ed25519 key in a file, as hex (`keygen` writes one)
     SoftwareKey(PathBuf),
+    /// A key in a YubiKey's PIV slot (`yubikey provision` sets one up). The
+    /// PIN is read from `pin_file` (this user's alone), never from the
+    /// command line or the environment
+    #[cfg(feature = "yubikey")]
+    Yubikey {
+        /// The slot: `authentication` (9a) for unattended signing
+        slot: PivSlot,
+        /// The file holding the PIV PIN
+        pin_file: PathBuf,
+        /// The device's serial, when more than one may be connected
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        serial: Option<PivSerial>,
+    },
 }
 
 impl SignerConfig {
-    /// The signer, ready to sign
-    pub fn open(&self) -> Result<Box<dyn OperatorSigner>> {
+    /// The signer, ready to sign (a YubiKey's PIN presented)
+    pub async fn open(&self) -> Result<Box<dyn OperatorSigner>> {
         match self {
             Self::SoftwareKey(path) => Ok(Box::new({
                 check_private(path)?;
                 SoftwareKeySigner::from_file(path)
                     .with_context(|| format!("opening the key {}", path.display()))?
             })),
+            #[cfg(feature = "yubikey")]
+            Self::Yubikey {
+                slot,
+                pin_file,
+                serial,
+            } => {
+                let pin = read_pin(pin_file)?;
+                let signer =
+                    agora_agentkit::operator_signer::yubikey::YubikeySigner::open_with_pin(
+                        *serial, *slot, pin,
+                    )
+                    .await
+                    .with_context(|| format!("opening the YubiKey's slot {slot}"))?;
+                Ok(Box::new(signer))
+            }
         }
     }
 }
 
-/// Refuse a key file others can read or write, as ssh does
-fn check_private(path: &Path) -> Result<()> {
+/// A PIV PIN from `path`: a file this user alone can read, as for key
+/// files. Never argv or the environment, where `ps` and logs show them
+#[cfg(feature = "yubikey")]
+pub fn read_pin(path: &Path) -> Result<Pin> {
+    check_private(path)?;
+    let secret = agora_agentkit::secrets::Secret::from_file(path)
+        .with_context(|| format!("reading the PIN file {}", path.display()))?;
+    if secret.expose().trim().is_empty() {
+        bail!("the PIN file {} is empty", path.display());
+    }
+    Ok(Pin::from_secret(agora_agentkit::secrets::Secret::new(
+        secret.expose().trim().to_owned(),
+    )))
+}
+
+/// Refuse a key or PIN file others can read or write, as ssh does
+pub fn check_private(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(path)
         .with_context(|| format!("opening the key {}", path.display()))?
@@ -47,7 +89,7 @@ fn check_private(path: &Path) -> Result<()> {
         .mode();
     if mode & 0o077 != 0 {
         bail!(
-            "the key {} is open to others (mode {:04o}), so it is not used: \
+            "{} is open to others (mode {:04o}), so it is not used: \
              `chmod 600 {}`",
             path.display(),
             mode & 0o7777,
@@ -112,12 +154,13 @@ impl OperatorConfig {
         })
     }
 
-    pub fn signer(&self) -> Result<Box<dyn OperatorSigner>> {
+    pub async fn signer(&self) -> Result<Box<dyn OperatorSigner>> {
         match &self.signer {
-            Some(signer) => signer.open(),
+            Some(signer) => signer.open().await,
             None => bail!(
                 "no signing key: `agora-operator keygen`, or \
-                 `agora-operator config --key-file PATH`"
+                 `agora-operator config --key-file PATH`, or a YubiKey: \
+             `agora-operator yubikey provision`"
             ),
         }
     }
@@ -239,8 +282,45 @@ mod tests {
         assert!(config.server(None).is_err());
     }
 
+    #[cfg(feature = "yubikey")]
     #[test]
-    fn a_key_open_to_others_is_refused() {
+    fn a_yubikey_config_names_its_slot_and_pin_file_only() {
+        let config = OperatorConfig {
+            signer: Some(SignerConfig::Yubikey {
+                slot: PivSlot::Authentication,
+                pin_file: "/k/pin".into(),
+                serial: None,
+            }),
+            ..OperatorConfig::default()
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("slot = \"authentication\""), "{text}");
+        assert!(text.contains("pin_file = \"/k/pin\""), "{text}");
+        assert_eq!(toml::from_str::<OperatorConfig>(&text).unwrap(), config);
+    }
+
+    #[cfg(feature = "yubikey")]
+    #[test]
+    fn a_pin_file_open_to_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("pin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pin");
+        std::fs::write(&path, "123456\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_pin(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("chmod 600")
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_pin(&path).unwrap().expose(), "123456");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_open_to_others_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("mode");
         std::fs::create_dir_all(&dir).unwrap();
@@ -249,11 +329,11 @@ mod tests {
         let signer = SignerConfig::SoftwareKey(path.clone());
         for mode in [0o644, 0o640, 0o604, 0o660] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            let err = signer.open().err().expect("refused");
+            let err = signer.open().await.err().expect("refused");
             assert!(err.to_string().contains("chmod 600"), "{err}");
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(signer.open().is_ok());
+        assert!(signer.open().await.is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -14,7 +14,6 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::config::{self, OperatorConfig, SignerConfig};
-use crate::sign::{public_key_hex, signature_hex};
 
 /// Where the portal adds a key, under the server's URL
 const CREDENTIALS_PAGE: &str = "agora/account/credentials";
@@ -38,8 +37,8 @@ pub async fn run(
     let may_tighten = std::path::absolute(dir)? == default_dir;
     let key_path = write_key(dir, label, may_tighten)?;
     let signer = SignerConfig::SoftwareKey(key_path.clone());
-    let opened = signer.open()?;
-    let public = public_key_hex(&opened.public_key());
+    let opened = signer.open().await?;
+    let public = opened.public_key().to_hex();
 
     println!("Wrote {} (readable by you alone).", key_path.display());
     println!("Public key:\n\n    {public}\n");
@@ -145,11 +144,11 @@ pub async fn proof(signer: &dyn OperatorSigner, operator: OperatorId) -> Result<
     let signature = sign_possession(signer, operator).await?;
     Ok(format!(
         "Proof of possession (for operator {operator}):\n\n    {}",
-        signature_hex(&signature)
+        signature.to_hex()
     ))
 }
 
-fn page_url(server: &Url) -> Result<Url> {
+pub fn page_url(server: &Url) -> Result<Url> {
     let mut base = server.clone();
     if !base.path().ends_with('/') {
         let path = format!("{}/", base.path());
@@ -160,7 +159,7 @@ fn page_url(server: &Url) -> Result<Url> {
 
 /// The config as `config` shows it: never the key, only its file and
 /// public key
-pub fn describe(path: &Path, config: &OperatorConfig) -> String {
+pub async fn describe(path: &Path, config: &OperatorConfig) -> String {
     let mut out = format!("Config: {}\n", path.display());
     let unset = "(not set)";
     let _ = writeln!(
@@ -179,11 +178,28 @@ pub fn describe(path: &Path, config: &OperatorConfig) -> String {
         }
         Some(signer @ SignerConfig::SoftwareKey(file)) => {
             let _ = writeln!(out, "  key:            software key {}", file.display());
-            let public = match signer.open() {
-                Ok(s) => public_key_hex(&s.public_key()),
+            let public = match signer.open().await {
+                Ok(s) => s.public_key().to_hex(),
                 Err(e) => format!("(unreadable: {e:#})"),
             };
             let _ = writeln!(out, "  public key:     {public}");
+        }
+        // The device isn't opened just to describe the config: `yubikey
+        // info` reads it
+        #[cfg(feature = "yubikey")]
+        Some(SignerConfig::Yubikey {
+            slot,
+            pin_file,
+            serial,
+        }) => {
+            let device = serial.map_or("the connected YubiKey".to_owned(), |s| {
+                format!("YubiKey {s}")
+            });
+            let _ = writeln!(
+                out,
+                "  key:            {device}, PIV slot {slot} (PIN from {})",
+                pin_file.display()
+            );
         }
     }
     if config.server.is_none() {
@@ -203,8 +219,8 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn a_key_is_written_once_readable_by_its_owner_alone() {
+    #[tokio::test]
+    async fn a_key_is_written_once_readable_by_its_owner_alone() {
         let dir = scratch("keygen");
         let path = write_key(&dir, "laptop", false).unwrap();
         assert_eq!(path, std::path::absolute(dir.join("laptop.key")).unwrap());
@@ -213,8 +229,11 @@ mod tests {
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(dir_mode & 0o777, 0o700);
         // It opens as the signer the CLI signs with
-        let signer = SignerConfig::SoftwareKey(path.clone()).open().unwrap();
-        assert_eq!(public_key_hex(&signer.public_key()).len(), 64);
+        let signer = SignerConfig::SoftwareKey(path.clone())
+            .open()
+            .await
+            .unwrap();
+        assert_eq!(signer.public_key().to_hex().len(), 64);
         // and is never overwritten
         let before = std::fs::read(&path).unwrap();
         let err = write_key(&dir, "laptop", false).unwrap_err();
@@ -265,7 +284,7 @@ mod tests {
             .sign(&credential_possession_bytes(operator, &signer.public_key()))
             .await
             .unwrap();
-        assert_eq!(hex, signature_hex(&expected));
+        assert_eq!(hex, expected.to_hex());
         let bytes: [u8; 64] = ::hex::decode(hex).unwrap().try_into().unwrap();
         let signature = OperatorSignature::Ed25519(crypto::Signature::from_bytes(&bytes));
         assert!(verify_possession(&signer.public_key(), operator, &signature).is_ok());
@@ -285,8 +304,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn describe_never_prints_the_key() {
+    #[tokio::test]
+    async fn describe_never_prints_the_key() {
         let dir = scratch("describe");
         let path = write_key(&dir, "k", false).unwrap();
         let secret = std::fs::read_to_string(&path).unwrap();
@@ -294,7 +313,7 @@ mod tests {
             signer: Some(SignerConfig::SoftwareKey(path)),
             ..OperatorConfig::default()
         };
-        let text = describe(&dir.join("config.toml"), &config);
+        let text = describe(&dir.join("config.toml"), &config).await;
         assert!(!text.contains(secret.trim()), "{text}");
         assert!(text.contains("public key:"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
