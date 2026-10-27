@@ -172,21 +172,24 @@ pub struct SendArgs {
     #[arg(long, conflicts_with = "send_now")]
     pub deliver_at: Option<DateTime<Utc>>,
     /// Deliver now, skipping the hold. Above the bulk threshold this needs
-    /// `--email-code`
+    /// the code `send-now-code` emails (`--email-code` or
+    /// `--email-code-stdin`)
     #[arg(long)]
     pub send_now: bool,
-    /// The code `send-now-code` emailed. Give the flag bare and you are
-    /// asked for the code, which is the normal way: `--email-code=CODE`
-    /// puts the code in your shell history
-    #[arg(
-        long,
-        requires = "send_now",
-        value_name = "CODE",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = ""
-    )]
-    pub email_code: Option<String>,
+    /// Ask for the code `send-now-code` emailed, on the terminal with echo
+    /// off. A code is never taken from the command line or the
+    /// environment, where it would reach the shell's history and `ps`
+    #[arg(long, requires = "send_now")]
+    pub email_code: bool,
+    /// Read the emailed code from stdin, for scripts: exactly one line.
+    /// Needs `--yes`, since stdin is then not there to confirm on
+    #[arg(long, requires = "send_now", conflicts_with = "email_code")]
+    pub email_code_stdin: bool,
+    /// How many agents you mean to reach, checked against a dry run just
+    /// before the send. Needed with `--yes` by a send to `all` or a group,
+    /// or to more agents than your bulk threshold
+    #[arg(long, value_name = "N")]
+    pub expect: Option<usize>,
     /// List who it would reach, and send nothing
     #[arg(long)]
     pub dry_run: bool,
@@ -309,18 +312,20 @@ mod tests {
     #[test]
     fn send_flags() {
         let line = format!(
-            "send --to all --body x --send-now --email-code=123456 --action-id {B} --yes --json"
+            "send --to all --body x --send-now --email-code --expect 7 --action-id {B} --yes --json"
         );
         let cli = parse(&line).unwrap();
         assert!(cli.json);
         let Command::Send(send) = cli.command else {
             panic!("expected send");
         };
-        assert!(send.send_now && send.write.yes);
-        assert_eq!(send.email_code.as_deref(), Some("123456"));
+        assert!(send.send_now && send.write.yes && send.email_code);
+        assert!(!send.email_code_stdin);
+        assert_eq!(send.expect, Some(7));
         assert_eq!(send.write.action_id, Some(B.parse().unwrap()));
         // A code without --send-now, or a time with it, is refused
-        assert!(parse("send --to all --body x --email-code=1").is_err());
+        assert!(parse("send --to all --body x --email-code").is_err());
+        assert!(parse("send --to all --body x --email-code-stdin").is_err());
         assert!(
             parse("send --to all --body x --send-now --deliver-at 2026-10-28T09:00:00Z").is_err()
         );
@@ -334,6 +339,28 @@ mod tests {
             send.deliver_at,
             Some("2026-10-28T09:00:00Z".parse().unwrap())
         );
+    }
+
+    /// A code is read, never given: not as `--email-code=CODE`, not as
+    /// `--email-code CODE`, and not from both the prompt and stdin
+    #[test]
+    fn a_code_is_never_a_flag_value() {
+        let base = "send --to all --body x --send-now";
+        let err = parse(&format!("{base} --email-code=123456")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TooManyValues, "{err}");
+        let err = parse(&format!("{base} --email-code 123456")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{err}");
+        let err = parse(&format!("{base} --email-code-stdin=123456")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TooManyValues, "{err}");
+        let err = parse(&format!("{base} --email-code --email-code-stdin")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{err}");
+        let Command::Send(send) = parse(&format!("{base} --email-code-stdin"))
+            .unwrap()
+            .command
+        else {
+            panic!("expected send");
+        };
+        assert!(send.email_code_stdin && !send.email_code);
     }
 
     #[test]
