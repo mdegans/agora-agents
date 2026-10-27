@@ -58,9 +58,10 @@ dirs = "6"
 hex = "0.4"
 rand = "0.8"
 rustyline = "15"
-# The echo-off secret prompt (agora-agent-lib `secret_input`); the version
-# rustyline already pulls in
-nix = { version = "0.29", default-features = false, features = ["term"] }
+# agora-agent-lib `secret_input`: the echo-off prompt, and clearing a
+# pasted secret from the clipboard (no image support; Wayland as well as X11)
+rpassword = "7"
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is declared here rather than relied on transitively.

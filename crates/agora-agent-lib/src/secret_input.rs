@@ -16,13 +16,14 @@
 //! shelling out to `ykman`: `ykman piv access change-pin --pin … --new-pin …`
 //! (and its `--management-key`, `--puk`) take the secrets on argv.
 //!
-//! The secret is held in [`Zeroizing`] from the first byte read: a fixed
-//! buffer, then a `String` allocated once at its final size, so no
-//! reallocation leaves a copy behind.
+//! The secret is held in [`Zeroizing`]: from stdin, from the first byte
+//! read (a fixed buffer, then a `String` allocated once at its final size,
+//! so no reallocation leaves a copy behind); from the prompt, from the
+//! moment `rpassword` hands it over.
 //!
-//! After a prompted read the clipboard is cleared, since a code is usually
-//! pasted. That needs a clipboard crate, which is behind the `clipboard`
-//! feature (off by default) and not written yet; see [`clear_clipboard`].
+//! After a prompted read the clipboard is cleared if it still holds the
+//! secret, since a code is usually pasted (feature `clipboard`, on in
+//! `agora-operator`; see [`clear_clipboard`]).
 
 use std::io::{IsTerminal, Read};
 
@@ -50,7 +51,7 @@ pub fn read_secret(prompt: &str, source: SecretSource) -> Result<Zeroizing<Strin
     match source {
         SecretSource::Prompt => {
             let secret = prompt_no_echo(prompt)?;
-            clear_clipboard()?;
+            clear_clipboard(&secret);
             Ok(secret)
         }
         SecretSource::Stdin => {
@@ -111,64 +112,50 @@ pub fn read_secret_from(mut r: impl Read, stop_at_newline: bool) -> Result<Zeroi
     Ok(secret)
 }
 
-/// `prompt` on the terminal, and a line read back with echo off
-#[cfg(unix)]
+/// `prompt` on the terminal (`/dev/tty` on unix, so stdin stays free),
+/// and a line read back with echo off, checked as [`read_secret_from`]
+/// checks stdin's
 fn prompt_no_echo(prompt: &str) -> Result<Zeroizing<String>> {
-    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
-    use std::io::Write;
-
-    let mut tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .context("no terminal to ask on; pipe it in on stdin instead")?;
-    let original = tcgetattr(&tty).context("reading the terminal's settings")?;
-
-    /// Echo back on, however the read ends
-    struct Restore<'a>(&'a std::fs::File, nix::sys::termios::Termios);
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) {
-            let _ = tcsetattr(self.0, SetArg::TCSAFLUSH, &self.1);
-        }
-    }
-
-    let mut quiet = original.clone();
-    quiet.local_flags.remove(LocalFlags::ECHO);
-    // The newline still shows, so the next output starts on its own line
-    quiet.local_flags.insert(LocalFlags::ECHONL);
-    write!(tty, "{prompt}: ")?;
-    tty.flush()?;
-    let restore = Restore(&tty, original);
-    tcsetattr(&tty, SetArg::TCSAFLUSH, &quiet).context("turning the terminal's echo off")?;
-    let secret = read_secret_from(&tty, true);
-    drop(restore);
-    secret.with_context(|| prompt.to_owned())
+    let line = Zeroizing::new(
+        rpassword::prompt_password(format!("{prompt}: "))
+            .context("no terminal to ask on; pipe it in on stdin instead")?,
+    );
+    read_secret_from(line.as_bytes(), false).with_context(|| prompt.to_owned())
 }
 
-#[cfg(not(unix))]
-fn prompt_no_echo(prompt: &str) -> Result<Zeroizing<String>> {
-    bail!("{prompt}: no echo-off prompt on this platform; pipe it in on stdin instead")
-}
-
-/// Clear the clipboard after a prompted read: a pasted secret stays there
-/// otherwise.
+/// Clear the clipboard after a prompted read if it still holds `secret`,
+/// which was most likely pasted. Anything copied since is left alone.
 ///
-/// Not written yet: it needs a clipboard crate, and dependencies need the
-/// Steward's approval. Without the feature, nothing is cleared
+/// Never fails: with no clipboard to reach (a headless box, an SSH session,
+/// where the clipboard is the client's) it does nothing, and says so only
+/// in a debug log
 #[cfg(feature = "clipboard")]
-pub fn clear_clipboard() -> Result<()> {
-    // Intended, with `arboard`: clear only when the clipboard still holds
-    // the secret (compare `get_text()` with it, then `clear()`), so a copy
-    // made since is not lost. Over SSH the clipboard is the client's and
-    // cannot be reached this way.
-    todo!("clear the clipboard once the clipboard crate is approved")
+pub fn clear_clipboard(secret: &str) {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, "no clipboard to clear");
+            return;
+        }
+    };
+    let held = match clipboard.get_text() {
+        Ok(text) => Zeroizing::new(text),
+        Err(e) => {
+            tracing::debug!(error = %e, "clipboard not read; not cleared");
+            return;
+        }
+    };
+    if held.trim() != secret {
+        return;
+    }
+    if let Err(e) = clipboard.clear() {
+        tracing::debug!(error = %e, "clipboard not cleared");
+    }
 }
 
 /// Without the `clipboard` feature, nothing to clear with
 #[cfg(not(feature = "clipboard"))]
-pub fn clear_clipboard() -> Result<()> {
-    Ok(())
-}
+pub fn clear_clipboard(_secret: &str) {}
 
 #[cfg(test)]
 mod tests {

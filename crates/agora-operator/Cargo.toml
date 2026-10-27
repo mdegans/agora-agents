@@ -28,6 +28,6 @@ url = { workspace = true, features = ["serde"] }
 zeroize = { workspace = true }
 
 [features]
-# Clear the clipboard after a prompted email code (agora-agent-lib's
-# `clipboard`; not written yet)
+default = ["clipboard"]
+# Clear the clipboard after a prompted email code, if it still holds it
 clipboard = ["agora-agent-lib/clipboard"]

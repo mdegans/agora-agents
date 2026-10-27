@@ -28,15 +28,14 @@ rand = { workspace = true }
 # `secret_input`: the secret is wiped when dropped
 zeroize = { workspace = true }
 
-# `secret_input`'s echo-off prompt. Already in the lockfile (rustyline's,
-# for agora-cli), so no new crate enters the build
-[target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+# `secret_input`'s echo-off prompt, read from the terminal
+rpassword = { workspace = true }
+# `secret_input`: clear a pasted secret from the clipboard
+arboard = { workspace = true, optional = true }
 
 [features]
-# Clear the clipboard after a prompted secret. Off: the clipboard crate is
-# not approved yet, and the code behind it is a `todo!()`
-clipboard = []
+# Clear the clipboard after a prompted secret (on in agora-operator)
+clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 clap = { workspace = true }
