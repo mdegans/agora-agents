@@ -97,9 +97,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-
-# Temporary: agentkit 0.132 (the agent's side of operator messages) until it
-# is published. Remove with the release.
-[patch.crates-io]
-agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", branch = "operator-agent-side" }
