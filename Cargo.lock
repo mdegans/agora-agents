@@ -20,9 +20,11 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "dirs",
  "eventsource-stream",
  "futures-util",
  "misanthropic",
+ "rand 0.8.6",
  "reqwest",
  "schemars",
  "serde",
@@ -84,7 +86,6 @@ dependencies = [
  "agora-agentkit",
  "anyhow",
  "clap",
- "dirs",
  "ed25519-dalek",
  "hex",
  "misanthropic",
@@ -98,6 +99,25 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "agora-operator"
+version = "0.1.0"
+dependencies = [
+ "agora-agent-lib",
+ "agora-agentkit",
+ "anyhow",
+ "chrono",
+ "clap",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
