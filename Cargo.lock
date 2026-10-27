@@ -24,6 +24,7 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "misanthropic",
+ "nix",
  "rand 0.8.6",
  "reqwest",
  "schemars",
@@ -35,6 +36,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

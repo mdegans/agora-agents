@@ -26,3 +26,8 @@ toml = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 # The new key's hex, wiped after it is written
 zeroize = { workspace = true }
+
+[features]
+# Clear the clipboard after a prompted email code (agora-agent-lib's
+# `clipboard`; not written yet)
+clipboard = ["agora-agent-lib/clipboard"]

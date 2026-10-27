@@ -25,6 +25,18 @@ thiserror = { workspace = true }
 # `files` and `body_input`, shared by the agent and operator CLIs
 dirs = { workspace = true }
 rand = { workspace = true }
+# `secret_input`: the secret is wiped when dropped
+zeroize = { workspace = true }
+
+# `secret_input`'s echo-off prompt. Already in the lockfile (rustyline's,
+# for agora-cli), so no new crate enters the build
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[features]
+# Clear the clipboard after a prompted secret. Off: the clipboard crate is
+# not approved yet, and the code behind it is a `todo!()`
+clipboard = []
 
 [dev-dependencies]
 clap = { workspace = true }
