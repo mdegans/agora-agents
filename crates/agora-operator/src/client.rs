@@ -39,11 +39,21 @@ pub struct ApiError {
     pub path: String,
     pub status: reqwest::StatusCode,
     pub message: String,
+    pub hint: Option<&'static str>,
 }
+
+/// What a 401, or a 404 from no route at all, most often means
+const SIGNING_HINT: &str = "Check that --server is the site's root with no path prefix \
+     (https://host/, not https://host/agora/), that this machine's clock is within five \
+     minutes, and that the credential id is the one the portal shows for this key.";
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}: {}", self.path, self.status, self.message)
+        write!(f, "{}: {}: {}", self.path, self.status, self.message)?;
+        match self.hint {
+            Some(hint) => write!(f, "\n{hint}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -65,6 +75,9 @@ impl OperatorClient {
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .use_rustls_tls()
+            // A redirect would carry a signed request somewhere it was not
+            // signed for; a 3xx is reported, never followed
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("agora-operator/", env!("CARGO_PKG_VERSION")))
             .build()?;
@@ -74,6 +87,15 @@ impl OperatorClient {
             credential,
             signer,
         })
+    }
+
+    /// Where and as what this client signs: for every write's prompt
+    pub fn who(&self) -> String {
+        format!(
+            "{} as credential {}",
+            self.base.host_str().unwrap_or("?"),
+            self.credential
+        )
     }
 
     // -- Reads --
@@ -240,13 +262,23 @@ impl OperatorClient {
         let status = response.status();
         let bytes = response.bytes().await?;
         if !status.is_success() {
-            let message = serde_json::from_slice::<ApiErrorBody>(&bytes)
-                .map(|body| body.message().to_owned())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+            let body = serde_json::from_slice::<ApiErrorBody>(&bytes).ok();
+            // A 404 with no API error body is a route the server does not
+            // have, not a refusal by one it has
+            let hint = match status {
+                reqwest::StatusCode::UNAUTHORIZED => Some(SIGNING_HINT),
+                reqwest::StatusCode::NOT_FOUND if body.is_none() => Some(SIGNING_HINT),
+                _ => None,
+            };
+            let message = match body {
+                Some(body) => body.message().to_owned(),
+                None => String::from_utf8_lossy(&bytes).into_owned(),
+            };
             return Err(ApiError {
                 path: what,
                 status,
                 message,
+                hint,
             }
             .into());
         }
@@ -287,6 +319,62 @@ mod tests {
             Box::new(SoftwareKeySigner::new(SigningKey::from_bytes(&[7; 32]))),
         )
         .unwrap()
+    }
+
+    /// A one-shot server on loopback that answers every connection with
+    /// `response`, counting the connections
+    fn serve(response: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, hits)
+    }
+
+    /// A redirect is reported, never followed: the signed request goes to
+    /// the server named and nowhere else
+    #[tokio::test]
+    async fn a_redirect_is_refused() {
+        let (url, hits) = serve(
+            "HTTP/1.1 302 Found\r\nLocation: https://elsewhere.example/agora/api/operator/agents\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let err = client(&url).agents().await.unwrap_err();
+        let api = err
+            .downcast_ref::<ApiError>()
+            .expect("an answer, not a transport error");
+        assert_eq!(api.status, reqwest::StatusCode::FOUND);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A 401, or a 404 with no API body (no such route), says what to check
+    #[tokio::test]
+    async fn refusals_of_the_signature_say_what_to_check() {
+        let (url, _) = serve(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+             Content-Length: 42\r\nConnection: close\r\n\r\n{\"error\":\"the signature was not accepted\"}",
+        );
+        let err = client(&url).agents().await.unwrap_err().to_string();
+        assert!(
+            err.contains("no path prefix") && err.contains("clock"),
+            "{err}"
+        );
+        let (url, _) = serve(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+             Content-Length: 39\r\nConnection: close\r\n\r\n{\"error\":\"x is not one of your agents\"}",
+        );
+        let err = client(&url).agents().await.unwrap_err().to_string();
+        assert!(!err.contains("clock"), "{err}");
     }
 
     #[test]

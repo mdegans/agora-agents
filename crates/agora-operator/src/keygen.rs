@@ -3,11 +3,11 @@
 //! "Add signing key" form takes it (64 hex digits).
 
 use std::fmt::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use agora_agentkit::crypto;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -60,14 +60,28 @@ pub fn run(
     Ok(())
 }
 
-/// A new key at `<dir>/<label>.key`, never over an existing one: a key
-/// already registered would be lost
+/// A new key at `<dir>/<label>.key` (an absolute path), never over an
+/// existing one, since a key already registered would be lost. Only in a
+/// directory this user owns at 0700: one made here is made so, and an
+/// existing one open to others is tightened, and says so
 fn write_key(dir: &Path, label: &str) -> Result<PathBuf> {
-    if !dir.exists() {
-        // A directory made for keys is this user's alone; one that was
-        // already there keeps its mode
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let dir = std::path::absolute(dir)?;
+    config::create_private_dir(&dir)?;
+    let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "{} is open to others (mode {mode:04o}) and can't be made 0700",
+                    dir.display()
+                )
+            },
+        )?;
+        eprintln!(
+            "Tightened {} from {mode:04o} to 0700: keys are kept only where no one else can \
+             look.",
+            dir.display()
+        );
     }
     let path = dir.join(format!("{label}.key"));
     let (key, _) = crypto::generate_keypair();
@@ -84,6 +98,16 @@ fn write_key(dir: &Path, label: &str) -> Result<PathBuf> {
             ),
             _ => anyhow::Error::new(e).context(format!("writing {}", path.display())),
         })?;
+    // The directory must be this user's: the file just made is, by its uid
+    let dir_meta = std::fs::metadata(&dir)?;
+    if dir_meta.uid() != file.metadata()?.uid() || dir_meta.permissions().mode() & 0o077 != 0 {
+        drop(file);
+        std::fs::remove_file(&path)?;
+        bail!(
+            "{} is not a directory you own at 0700; keys are written only to one",
+            dir.display()
+        );
+    }
     use std::io::Write as _;
     writeln!(file, "{}", hex.as_str()).with_context(|| format!("writing {}", path.display()))?;
     file.sync_all()?;
@@ -149,7 +173,7 @@ mod tests {
     fn a_key_is_written_once_readable_by_its_owner_alone() {
         let dir = scratch("keygen");
         let path = write_key(&dir, "laptop").unwrap();
-        assert_eq!(path, dir.join("laptop.key"));
+        assert_eq!(path, std::path::absolute(dir.join("laptop.key")).unwrap());
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
@@ -163,6 +187,25 @@ mod tests {
         assert!(err.to_string().contains("never overwritten"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_open_directory_is_tightened_and_the_path_is_absolute() {
+        let dir = scratch("open-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = write_key(&dir, "k").unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(path.is_absolute());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A relative directory is stored absolute
+        let rel = PathBuf::from(format!(".agora-operator-test-rel-{}", std::process::id()));
+        let path = write_key(&rel, "k").unwrap();
+        assert!(path.is_absolute(), "{}", path.display());
+        assert_eq!(path, std::path::absolute(rel.join("k.key")).unwrap());
+        std::fs::remove_dir_all(&rel).unwrap();
     }
 
     #[test]

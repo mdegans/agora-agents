@@ -56,6 +56,7 @@ async fn run(cli: Cli) -> Result<()> {
                 || key_file.is_some()
                 || bulk_threshold.is_some();
             if let Some(server) = cli.server {
+                config::check_server(&server)?;
                 config.server = Some(server);
             }
             if let Some(credential) = credential {
@@ -119,7 +120,7 @@ async fn run(cli: Cli) -> Result<()> {
                      will refuse a delivered one (use `retract`)."
                 ),
             }
-            let action = write_action(&write, "Cancel it?")?;
+            let action = write_action(&client, &write, "Cancel it")?;
             let answer = client
                 .cancel(message, &OperatorActionRequest { action_id: action })
                 .await
@@ -134,7 +135,7 @@ async fn run(cli: Cli) -> Result<()> {
                  delivered yet, it is cancelled and the agent sees nothing; if it was read, \
                  it stays."
             );
-            let action = write_action(&write, "Retract it?")?;
+            let action = write_action(&client, &write, "Retract it")?;
             let answer = client
                 .retract(message, &OperatorActionRequest { action_id: action })
                 .await
@@ -155,7 +156,7 @@ async fn run(cli: Cli) -> Result<()> {
                  retracted (the agent sees that a message from you was retracted); copies \
                  already read stay."
             );
-            let action = write_action(&write, "Withdraw them?")?;
+            let action = write_action(&client, &write, "Withdraw them")?;
             let answer = client
                 .retract_batch(send, &OperatorActionRequest { action_id: action })
                 .await
@@ -175,13 +176,25 @@ fn show<T: Serialize>(json: bool, answer: &T, human: fn(&T) -> String) -> Result
 }
 
 /// A write's action id, printed so a retry can reuse it, once confirmed
-fn write_action(write: &WriteArgs, question: &str) -> Result<OperatorActionId> {
+fn write_action(
+    client: &OperatorClient,
+    write: &WriteArgs,
+    question: &str,
+) -> Result<OperatorActionId> {
     let action = write.action_id.unwrap_or_default(); // the default is a new id
-    eprintln!("Action id {action} (retry with --action-id {action})");
-    if !write.yes && !confirm(question)? {
+    action_line(client, action);
+    if !write.yes && !confirm(&format!("{question} on {}?", client.who()))? {
         bail!("not confirmed; nothing was sent");
     }
     Ok(action)
+}
+
+/// The write's action id, and where and as what it is signed
+pub fn action_line(client: &OperatorClient, action: OperatorActionId) {
+    eprintln!(
+        "Action id {action}, to {} (retry with --action-id {action})",
+        client.who()
+    );
 }
 
 /// Ask `question` on the terminal. Refuses without one: a script says `--yes`

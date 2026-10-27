@@ -42,7 +42,7 @@ pub async fn run(
         let answer = client.send(&req).await?;
         return crate::show(json, &answer, render::sent);
     }
-    eprintln!("Action id {action} (retry with --action-id {action})");
+    crate::action_line(client, action);
     if !args.write.yes {
         // Who it reaches, from the server: a dry run sends and logs
         // nothing. Under an id of its own and without the code, so the
@@ -60,7 +60,7 @@ pub async fn run(
             }
         };
         eprint!("{}", consequence(&req, &recipients, config.bulk_threshold)?);
-        if !crate::confirm("Send it?")? {
+        if !crate::confirm(&format!("Send it, on {}?", client.who()))? {
             bail!("not confirmed; nothing was sent");
         }
     }

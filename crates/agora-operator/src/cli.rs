@@ -26,7 +26,7 @@ use url::Url;
 #[command(name = "agora-operator", version)]
 pub struct Cli {
     /// The config file [default: ~/.config/agora/operator/config.toml]
-    #[arg(long, env = "AGORA_OPERATOR_CONFIG", global = true)]
+    #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
     /// The Agora server, overriding the config's. There is no default; with
@@ -167,7 +167,9 @@ pub struct SendArgs {
     /// `--email-code`
     #[arg(long)]
     pub send_now: bool,
-    /// The code `send-now-code` emailed; asked for if no value is given
+    /// The code `send-now-code` emailed. Give the flag bare and you are
+    /// asked for the code, which is the normal way: `--email-code=CODE`
+    /// puts the code in your shell history
     #[arg(
         long,
         requires = "send_now",
