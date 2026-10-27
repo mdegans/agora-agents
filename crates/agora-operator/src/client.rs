@@ -228,6 +228,8 @@ impl OperatorClient {
                 Some(serde_json::to_vec(body)?),
                 RequestKind::Read,
             ),
+            // A send-now code goes into this buffer, and reqwest's, unwiped:
+            // inherent to sending it. Only the parsed `SendNowCode` is wiped
             Signed::Write(body, action) => (
                 Method::POST,
                 Some(serde_json::to_vec(body)?),

@@ -46,7 +46,12 @@ pub enum SecretSource {
 /// Read one secret, `prompt` naming it (`"The code from the email"`).
 ///
 /// Surrounding spaces and tabs are trimmed; an empty secret, more than one
-/// line, a control character or more than [`SECRET_MAX_BYTES`] is refused
+/// line, a control character or more than [`SECRET_MAX_BYTES`] is refused.
+///
+/// What is and isn't wiped: stdin is read unbuffered into a wiped buffer.
+/// The prompt's line comes from `rpassword`, whose `SafeString` grows by
+/// reallocation, so a secret longer than 8 bytes can leave a freed, unwiped
+/// copy of its first part on the heap before it reaches us
 pub fn read_secret(prompt: &str, source: SecretSource) -> Result<Zeroizing<String>> {
     match source {
         SecretSource::Prompt => {
@@ -62,7 +67,12 @@ pub fn read_secret(prompt: &str, source: SecretSource) -> Result<Zeroizing<Strin
                      instead, or pipe it in"
                 );
             }
-            read_secret_from(stdin.lock(), false).with_context(|| format!("{prompt}, on stdin"))
+            // Not through `stdin.lock()`: std's stdin is a global 8 KiB
+            // `BufReader` that would keep the secret, unwiped, for the life
+            // of the process. An unbuffered duplicate of fd 0 reads straight
+            // into our wiped buffer
+            let fd = unbuffered_stdin(&stdin).context("duplicating stdin")?;
+            read_secret_from(fd, false).with_context(|| format!("{prompt}, on stdin"))
         }
     }
 }
@@ -112,6 +122,20 @@ pub fn read_secret_from(mut r: impl Read, stop_at_newline: bool) -> Result<Zeroi
     Ok(secret)
 }
 
+/// Stdin as a `File` of its own (a `dup` of fd 0), read without std's
+/// buffer
+#[cfg(unix)]
+fn unbuffered_stdin(stdin: &std::io::Stdin) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    Ok(std::fs::File::from(stdin.as_fd().try_clone_to_owned()?))
+}
+
+#[cfg(windows)]
+fn unbuffered_stdin(stdin: &std::io::Stdin) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::AsHandle;
+    Ok(std::fs::File::from(stdin.as_handle().try_clone_to_owned()?))
+}
+
 /// `prompt` on the terminal (`/dev/tty` on unix, so stdin stays free),
 /// and a line read back with echo off, checked as [`read_secret_from`]
 /// checks stdin's
@@ -128,7 +152,11 @@ fn prompt_no_echo(prompt: &str) -> Result<Zeroizing<String>> {
 ///
 /// Never fails: with no clipboard to reach (a headless box, an SSH session,
 /// where the clipboard is the client's) it does nothing, and says so only
-/// in a debug log
+/// in a debug log.
+///
+/// Limits: reading the clipboard to compare leaves unwiped copies of
+/// whatever it held inside arboard and wl-clipboard-rs (only our own copy
+/// is wiped), and a clipboard manager's history keeps the code regardless
 #[cfg(feature = "clipboard")]
 pub fn clear_clipboard(secret: &str) {
     let mut clipboard = match arboard::Clipboard::new() {

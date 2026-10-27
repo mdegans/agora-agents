@@ -91,6 +91,11 @@ fn code_source(args: &SendArgs) -> Result<Option<SecretSource>> {
         {
             bail!("--email-code-stdin and --body-file - both want stdin; give the body another way")
         }
+        (_, true) if !args.write.yes => {
+            bail!(
+                "--email-code-stdin needs --yes: with stdin piped, there is no terminal to confirm on"
+            )
+        }
         (_, true) => Ok(Some(SecretSource::Stdin)),
         (true, false) => Ok(Some(SecretSource::Prompt)),
         (false, false) => Ok(None),
@@ -107,7 +112,12 @@ fn needs_expect(to: &OperatorRecipients, n: usize, settings: &OperatorConfigResp
 
 /// `--expect`, checked against the dry run's count of `n` recipients: any
 /// send that names one must reach exactly that many, and one that
-/// [`needs_expect`] cannot go with `--yes` alone
+/// [`needs_expect`] cannot go with `--yes` alone.
+///
+/// Checked here, not by the server: an agent added (to a group, or to the
+/// operator) between the dry run and the send is reached all the same. A
+/// count the server checks (`expect` on agentkit's
+/// `SendOperatorMessageRequest`) is the follow-up that closes it
 fn check_count(
     to: &OperatorRecipients,
     n: usize,
@@ -408,13 +418,16 @@ mod tests {
             };
             send
         };
-        let both = parse("send --to all --body-file - --send-now --email-code-stdin");
+        let both = parse("send --to all --body-file - --send-now --email-code-stdin --yes");
         let err = code_source(&both).unwrap_err().to_string();
         assert!(err.contains("both want stdin"), "{err}");
         let prompt = parse("send --to all --body-file - --send-now --email-code");
         assert_eq!(code_source(&prompt).unwrap(), Some(SecretSource::Prompt));
-        let stdin = parse("send --to all --body x --send-now --email-code-stdin");
+        let stdin = parse("send --to all --body x --send-now --email-code-stdin --yes");
         assert_eq!(code_source(&stdin).unwrap(), Some(SecretSource::Stdin));
+        let unconfirmed = parse("send --to all --body x --send-now --email-code-stdin");
+        let err = code_source(&unconfirmed).unwrap_err().to_string();
+        assert!(err.contains("needs --yes"), "{err}");
         let none = parse("send --to all --body x");
         assert_eq!(code_source(&none).unwrap(), None);
     }

@@ -181,12 +181,13 @@ pub struct SendArgs {
     /// environment, where it would reach the shell's history and `ps`
     #[arg(long, requires = "send_now")]
     pub email_code: bool,
-    /// Read the emailed code from stdin, for scripts: exactly one line
+    /// Read the emailed code from stdin, for scripts: exactly one line.
+    /// Needs `--yes`, since stdin is then not there to confirm on
     #[arg(long, requires = "send_now", conflicts_with = "email_code")]
     pub email_code_stdin: bool,
-    /// How many agents you mean to reach. Needed with `--yes` by a send
-    /// to `all` or a group, or to more agents than your bulk threshold; a
-    /// send reaching any other number is refused
+    /// How many agents you mean to reach, checked against a dry run just
+    /// before the send. Needed with `--yes` by a send to `all` or a group,
+    /// or to more agents than your bulk threshold
     #[arg(long, value_name = "N")]
     pub expect: Option<usize>,
     /// List who it would reach, and send nothing
