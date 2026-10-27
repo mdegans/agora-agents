@@ -97,9 +97,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-
-# TEMPORARY (0.134 beta fixes): agentkit 0.134.0 before it is published.
-# Drop when it is on crates.io.
-[patch.crates-io]
-agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit.git", branch = "operator/beta-fixes-0134" }
