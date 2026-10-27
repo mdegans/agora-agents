@@ -22,6 +22,9 @@ anyhow = { workspace = true }
 url = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
+# `files` and `body_input`, shared by the agent and operator CLIs
+dirs = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 clap = { workspace = true }

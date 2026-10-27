@@ -1,4 +1,3 @@
-mod body_input;
 mod cli;
 mod config;
 mod credentials;
