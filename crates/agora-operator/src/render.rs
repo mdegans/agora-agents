@@ -6,10 +6,11 @@ use agora_agentkit::enums::MessageKind;
 use agora_agentkit::ids::MessageId;
 use agora_agentkit::moderation::ReversalStatus;
 use agora_agentkit::operator::{
-    AgentGroupsResponse, AgentRef, MarkRepliesReadResponse, OperatorActionDetail,
-    OperatorAgentsResponse, OperatorLogResponse, OperatorMessageContent, OperatorMessagesResponse,
-    OperatorModerationResponse, RecordDefect, ScheduledMessagesResponse, SendNowCodeResponse,
-    SendOperatorMessageResponse, WithdrawalResponse,
+    AgentGroupsResponse, AgentRef, CancelReason, CredentialRef, MarkRepliesReadResponse,
+    OperatorActionDetail, OperatorAgentsResponse, OperatorConfigResponse, OperatorLogResponse,
+    OperatorMessageContent, OperatorMessagesResponse, OperatorModerationResponse, RecordDefect,
+    ScheduledMessagesResponse, SendNowCodeResponse, SendOperatorMessageResponse,
+    WithdrawalResponse,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -214,7 +215,7 @@ pub fn log(r: &OperatorLogResponse) -> String {
         .iter()
         .map(|e| {
             let by = match &e.credential {
-                Some(c) => format!("key {} ({})", c.label, c.id),
+                Some(c) => format!("key {}", credential(c)),
                 None => "portal".into(),
             };
             let what = match &e.detail {
@@ -234,8 +235,8 @@ pub fn log(r: &OperatorLogResponse) -> String {
                     }
                     s
                 }
-                OperatorActionDetail::DmCancel { cancelled } => {
-                    format!("cancelled {}", ids(cancelled))
+                OperatorActionDetail::DmCancel { cancelled, reason } => {
+                    format!("cancelled {} ({})", ids(cancelled), cancel_reason(*reason))
                 }
                 OperatorActionDetail::DmRetract {
                     retracted,
@@ -244,18 +245,34 @@ pub fn log(r: &OperatorLogResponse) -> String {
                 OperatorActionDetail::CredentialAdd {
                     credential,
                     credential_kind,
-                } => format!(
-                    "added {credential_kind} {} ({})",
-                    credential.label, credential.id
-                ),
+                } => format!("added {credential_kind} {}", self::credential(credential)),
                 OperatorActionDetail::CredentialRevoke { credential } => {
-                    format!("revoked {} ({})", credential.label, credential.id)
+                    format!("revoked {}", self::credential(credential))
                 }
             };
             format!("{}  {}  {what}  by {by}", e.id, time(&e.created_at))
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A credential by its label, if the log gives one, and id
+fn credential(c: &CredentialRef) -> String {
+    match &c.label {
+        Some(label) => format!("{label} ({})", c.id),
+        None => c.id.to_string(),
+    }
+}
+
+/// Why a cancel happened, as the log reader needs it
+pub fn cancel_reason(reason: CancelReason) -> &'static str {
+    match reason {
+        CancelReason::Operator => "by you",
+        CancelReason::CancelLink => "by the bulk-hold email's cancel link",
+        CancelReason::AgentDeparted => "the agent left before delivery",
+        CancelReason::OperatorBanned => "the account was banned before delivery",
+        CancelReason::CredentialRevoked => "the signing key was revoked before delivery",
+    }
 }
 
 pub fn moderation(r: &OperatorModerationResponse) -> String {
@@ -330,6 +347,30 @@ pub fn moderation(r: &OperatorModerationResponse) -> String {
     out.trim_end().to_owned()
 }
 
+/// `seconds` in the largest whole unit: "1 hour", "90 seconds"
+pub fn duration(seconds: i64) -> String {
+    let (n, unit) = match seconds {
+        s if s != 0 && s % 86_400 == 0 => (s / 86_400, "day"),
+        s if s != 0 && s % 3600 == 0 => (s / 3600, "hour"),
+        s if s != 0 && s % 60 == 0 => (s / 60, "minute"),
+        s => (s, "second"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+pub fn settings(r: &OperatorConfigResponse) -> String {
+    format!(
+        "Server settings:\n  hold:             {}\n  bulk threshold:   {} agents in {} \
+         (this key: {} so far)\n  bulk hold:        {}\n  agent replies:    {} a day each",
+        duration(r.dm_hold_seconds),
+        r.bulk_threshold,
+        duration(r.bulk_window_seconds),
+        r.recent_recipients,
+        duration(r.bulk_hold_seconds),
+        r.agent_reply_daily_cap
+    )
+}
+
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -347,6 +388,38 @@ fn preview(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_says_why_a_cancel_happened() {
+        use agora_agentkit::ids::OperatorActionId;
+        use agora_agentkit::operator::{OperatorLogEntry, OperatorLogResponse};
+        for reason in CancelReason::ALL {
+            let r = OperatorLogResponse {
+                entries: vec![OperatorLogEntry {
+                    id: OperatorActionId::new(),
+                    credential: None,
+                    detail: OperatorActionDetail::DmCancel {
+                        cancelled: vec![MessageId::new()],
+                        reason,
+                    },
+                    created_at: Utc::now(),
+                }],
+            };
+            let text = log(&r);
+            assert!(text.contains(cancel_reason(reason)), "{text}");
+            assert!(text.contains("by portal"), "{text}");
+        }
+    }
+
+    #[test]
+    fn durations_use_the_largest_whole_unit() {
+        assert_eq!(duration(60), "1 minute");
+        assert_eq!(duration(3600), "1 hour");
+        assert_eq!(duration(7200), "2 hours");
+        assert_eq!(duration(90), "90 seconds");
+        assert_eq!(duration(86_400), "1 day");
+        assert_eq!(duration(0), "0 seconds");
+    }
 
     #[test]
     fn previews_cut_long_or_multiline_bodies() {

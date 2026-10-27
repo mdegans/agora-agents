@@ -7,21 +7,24 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use agora_agentkit::crypto;
+use agora_agentkit::ids::OperatorId;
+use agora_agentkit::operator_signer::{OperatorSigner, sign_possession};
 use anyhow::{Context, Result, bail};
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::config::{self, OperatorConfig, SignerConfig};
-use crate::sign::public_key_hex;
+use crate::sign::{public_key_hex, signature_hex};
 
 /// Where the portal adds a key, under the server's URL
 const CREDENTIALS_PAGE: &str = "agora/account/credentials";
 
-pub fn run(
+pub async fn run(
     config_path: &Path,
     config: &mut OperatorConfig,
     label: &str,
     server: Option<&Url>,
+    operator: Option<OperatorId>,
 ) -> Result<()> {
     // Beside the config: `~/.config/agora/operator/` unless `--config`
     // names another file
@@ -35,10 +38,18 @@ pub fn run(
     let may_tighten = std::path::absolute(dir)? == default_dir;
     let key_path = write_key(dir, label, may_tighten)?;
     let signer = SignerConfig::SoftwareKey(key_path.clone());
-    let public = public_key_hex(&signer.open()?.public_key());
+    let opened = signer.open()?;
+    let public = public_key_hex(&opened.public_key());
 
     println!("Wrote {} (readable by you alone).", key_path.display());
     println!("Public key:\n\n    {public}\n");
+    match operator {
+        Some(operator) => println!("{}\n", proof(opened.as_ref(), operator).await?),
+        None => println!(
+            "The page also asks for a proof of possession: \
+             `agora-operator prove --operator <your operator id>`.\n"
+        ),
+    }
     let page = server
         .or(config.server.as_ref())
         .and_then(|s| page_url(s).ok());
@@ -127,6 +138,17 @@ fn write_key(dir: &Path, label: &str, may_tighten: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The proof of possession the portal's "Add signing key" page asks for:
+/// `signer`'s signature over agentkit's `credential_possession_bytes` for
+/// `operator`, in hex
+pub async fn proof(signer: &dyn OperatorSigner, operator: OperatorId) -> Result<String> {
+    let signature = sign_possession(signer, operator).await?;
+    Ok(format!(
+        "Proof of possession (for operator {operator}):\n\n    {}",
+        signature_hex(&signature)
+    ))
+}
+
 fn page_url(server: &Url) -> Result<Url> {
     let mut base = server.clone();
     if !base.path().ends_with('/') {
@@ -164,7 +186,6 @@ pub fn describe(path: &Path, config: &OperatorConfig) -> String {
             let _ = writeln!(out, "  public key:     {public}");
         }
     }
-    let _ = writeln!(out, "  bulk threshold: {}", config.bulk_threshold);
     if config.server.is_none() {
         out.push_str("Set the server with `agora-operator config --server URL`.\n");
     }
@@ -226,6 +247,29 @@ mod tests {
         assert!(path.is_absolute(), "{}", path.display());
         assert_eq!(path, std::path::absolute(rel.join("k.key")).unwrap());
         std::fs::remove_dir_all(&rel).unwrap();
+    }
+
+    /// The proof is the key's signature over agentkit's challenge bytes,
+    /// and verifies for that operator only
+    #[tokio::test]
+    async fn the_proof_signs_the_portals_challenge() {
+        use agora_agentkit::operator_signer::{
+            OperatorSignature, SoftwareKeySigner, verify_possession,
+        };
+        use agora_agentkit::signing::operator_request::credential_possession_bytes;
+        let signer = SoftwareKeySigner::new(crypto::SigningKey::from_bytes(&[7; 32]));
+        let operator: OperatorId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let text = proof(&signer, operator).await.unwrap();
+        let hex = text.split_whitespace().last().unwrap();
+        let expected = signer
+            .sign(&credential_possession_bytes(operator, &signer.public_key()))
+            .await
+            .unwrap();
+        assert_eq!(hex, signature_hex(&expected));
+        let bytes: [u8; 64] = ::hex::decode(hex).unwrap().try_into().unwrap();
+        let signature = OperatorSignature::Ed25519(crypto::Signature::from_bytes(&bytes));
+        assert!(verify_possession(&signer.public_key(), operator, &signature).is_ok());
+        assert!(verify_possession(&signer.public_key(), OperatorId::new(), &signature).is_err());
     }
 
     #[test]

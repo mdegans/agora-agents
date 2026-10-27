@@ -13,9 +13,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// The bulk threshold an account starts with (the server's default)
-pub const DEFAULT_BULK_THRESHOLD: u32 = 10;
-
 /// How the CLI signs: one variant per kind of signer.
 ///
 /// A hardware key joins as a variant of its own (its device serial and
@@ -79,7 +76,7 @@ pub fn check_server(url: &Url) -> Result<()> {
 
 /// The config file. Each field is absent until `config` (or `keygen`)
 /// sets it, and a command that needs one says which is missing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorConfig {
     /// The Agora server. No default, so nothing reaches a server, least of
@@ -91,25 +88,6 @@ pub struct OperatorConfig {
     pub credential: Option<OperatorCredentialId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<SignerConfig>,
-    /// The account's bulk threshold as set in the portal, for `send`'s
-    /// preview only: the server applies its own
-    #[serde(default = "default_bulk_threshold")]
-    pub bulk_threshold: u32,
-}
-
-fn default_bulk_threshold() -> u32 {
-    DEFAULT_BULK_THRESHOLD
-}
-
-impl Default for OperatorConfig {
-    fn default() -> Self {
-        Self {
-            server: None,
-            credential: None,
-            signer: None,
-            bulk_threshold: DEFAULT_BULK_THRESHOLD,
-        }
-    }
 }
 
 impl OperatorConfig {
@@ -213,7 +191,6 @@ mod tests {
             server: Some("http://localhost:8099".parse().unwrap()),
             credential: Some("0b7e2a61-5d3c-4c8e-8f1a-2e9d4b6c7a10".parse().unwrap()),
             signer: Some(SignerConfig::SoftwareKey("/k/laptop.key".into())),
-            bulk_threshold: 25,
         };
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(text.contains("software_key = \"/k/laptop.key\""), "{text}");
@@ -300,7 +277,7 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "bulk_threshold = 3\ncredential = \"s3cr3t-looking\"\n",
+            "server = \"https://example.org\"\ncredential = \"s3cr3t-looking\"\n",
         )
         .unwrap();
         let err = format!("{:#}", load(&path).unwrap_err());
@@ -312,5 +289,7 @@ mod tests {
     #[test]
     fn unknown_fields_are_refused() {
         assert!(toml::from_str::<OperatorConfig>("server_url = \"x\"").is_err());
+        // The server's settings are read from it, not kept here
+        assert!(toml::from_str::<OperatorConfig>("bulk_threshold = 10").is_err());
     }
 }

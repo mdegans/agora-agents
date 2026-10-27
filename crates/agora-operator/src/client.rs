@@ -7,10 +7,10 @@ use agora_agentkit::errors::ApiErrorBody;
 use agora_agentkit::ids::{MessageId, OperatorActionId, OperatorCredentialId};
 use agora_agentkit::operator::{
     AgentGroupsResponse, MarkRepliesRead, MarkRepliesReadResponse, OperatorActionRequest,
-    OperatorAgentsResponse, OperatorLogQuery, OperatorLogResponse, OperatorMessagesQuery,
-    OperatorMessagesResponse, OperatorModerationQuery, OperatorModerationResponse,
-    ScheduledMessagesResponse, SendNowCodeRequest, SendNowCodeResponse, SendOperatorMessageRequest,
-    SendOperatorMessageResponse, WithdrawalResponse,
+    OperatorAgentsResponse, OperatorConfigResponse, OperatorLogQuery, OperatorLogResponse,
+    OperatorMessagesQuery, OperatorMessagesResponse, OperatorModerationQuery,
+    OperatorModerationResponse, ScheduledMessagesResponse, SendNowCodeRequest, SendNowCodeResponse,
+    SendOperatorMessageRequest, SendOperatorMessageResponse, WithdrawalResponse,
 };
 use agora_agentkit::operator_signer::OperatorSigner;
 use agora_agentkit::signing::operator_request::RequestKind;
@@ -107,6 +107,13 @@ impl OperatorClient {
 
     pub async fn groups(&self) -> Result<AgentGroupsResponse> {
         self.call::<(), _>(self.url("groups", &[])?, Signed::Get)
+            .await
+    }
+
+    /// The hold, the bulk rule and this key's recent sends, as the server
+    /// applies them
+    pub async fn config(&self) -> Result<OperatorConfigResponse> {
+        self.call::<(), _>(self.url("config", &[])?, Signed::Get)
             .await
     }
 

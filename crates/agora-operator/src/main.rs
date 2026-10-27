@@ -45,19 +45,22 @@ async fn run(cli: Cli) -> Result<()> {
     };
     let json = cli.json;
     match cli.command {
-        Command::Keygen { label } => keygen::run(&path, &mut config, &label, cli.server.as_ref()),
+        Command::Keygen { label, operator } => {
+            keygen::run(&path, &mut config, &label, cli.server.as_ref(), operator).await
+        }
+        Command::Prove { operator } => {
+            let signer = config.signer()?;
+            println!("{}", keygen::proof(signer.as_ref(), operator).await?);
+            Ok(())
+        }
         Command::Config {
             credential,
             key_file,
-            bulk_threshold,
         } => {
-            let changed = cli.server.is_some()
-                || credential.is_some()
-                || key_file.is_some()
-                || bulk_threshold.is_some();
-            if let Some(server) = cli.server {
-                config::check_server(&server)?;
-                config.server = Some(server);
+            let changed = cli.server.is_some() || credential.is_some() || key_file.is_some();
+            if let Some(server) = &cli.server {
+                config::check_server(server)?;
+                config.server = Some(server.clone());
             }
             if let Some(credential) = credential {
                 config.credential = Some(credential);
@@ -68,14 +71,18 @@ async fn run(cli: Cli) -> Result<()> {
                 SignerConfig::SoftwareKey(key_file.clone()).open()?;
                 config.signer = Some(SignerConfig::SoftwareKey(key_file));
             }
-            if let Some(n) = bulk_threshold {
-                config.bulk_threshold = n;
-            }
             if changed {
                 config::save(&path, &config)?;
                 eprintln!("Saved {}", path.display());
             }
             print!("{}", keygen::describe(&path, &config));
+            // The server's side of it, when there is enough to ask
+            if let Ok(client) = open(&config) {
+                match client.config().await {
+                    Ok(settings) => show(json, &settings, render::settings)?,
+                    Err(e) => eprintln!("(Could not read the server's settings: {e:#})"),
+                }
+            }
             Ok(())
         }
         Command::Agents => show(json, &open(&config)?.agents().await?, render::agents),
@@ -83,21 +90,21 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Scheduled => show(json, &open(&config)?.scheduled().await?, render::scheduled),
         Command::Messages(args) => show(
             json,
-            &open(&config)?.messages(&args.into()).await?,
+            &open(&config)?.messages(&args).await?,
             render::messages,
         ),
         Command::MarkRead(args) => show(
             json,
-            &open(&config)?.mark_read(&args.into()).await?,
+            &open(&config)?.mark_read(&args).await?,
             render::marked,
         ),
-        Command::Log(args) => show(json, &open(&config)?.log(&args.into()).await?, render::log),
+        Command::Log(args) => show(json, &open(&config)?.log(&args).await?, render::log),
         Command::Moderation(args) => show(
             json,
-            &open(&config)?.moderation(&args.into()).await?,
+            &open(&config)?.moderation(&args).await?,
             render::moderation,
         ),
-        Command::Send(args) => send::run(&open(&config)?, &config, args, json).await,
+        Command::Send(args) => send::run(&open(&config)?, args, json).await,
         Command::SendNowCode { action_id } => {
             let client = open(&config)?;
             let answer = client
