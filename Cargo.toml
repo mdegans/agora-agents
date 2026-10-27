@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.131.0", features = [
+agora-agentkit = { version = "0.132.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -97,4 +97,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-
