@@ -1,8 +1,9 @@
 # ~/.config/systemd/user/agora-seed-continuous.service
 # Continuous local-model sweeps: the runner is one-shot (one cycle per
 # agent per invocation); Restart=always + RestartSec is the loop. When the
-# mac (blallama) is unreachable the run fails fast and retries after the
-# cooldown — no in-runner reconnect logic needed.
+# mac (blallama) is unreachable the runner waits for it, at startup and
+# mid-session alike, retrying every `unreachable_hold_secs` without limit,
+# so the unit doesn't fail (and mail) while the mac is rebooting or busy.
 #
 # Type=simple (not oneshot): systemd refuses Restart=always on oneshot
 # units, and simple restarts the whole sweep exactly the same way.

@@ -1543,8 +1543,12 @@ async fn run(held: &mut Held) -> Result<()> {
                 endpoint::Endpoint::Bridge(inference)
             }
         };
-        let models = inference
-            .models()
+        // An unreachable endpoint is waited for, with the session hold's
+        // period, not failed: see `endpoint::hold_unreachable`. Someone at a
+        // terminal (`--list-models`, `--dry-run`) is told at once instead.
+        let hold = (spec.unreachable_hold_secs > 0 && !args.list_models && !args.dry_run)
+            .then(|| std::time::Duration::from_secs(spec.unreachable_hold_secs));
+        let models = endpoint::hold_unreachable(&spec.endpoint, hold, || inference.models())
             .await
             .with_context(|| format!("discovering models on {}", spec.endpoint))?;
         if args.list_models {
