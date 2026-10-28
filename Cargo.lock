@@ -55,7 +55,8 @@ dependencies = [
 [[package]]
 name = "agora-agentkit"
 version = "0.136.0"
-source = "git+https://github.com/mdegans/agora-agentkit?branch=operator%2Fyubikey-signer#23baf3b65bf2461ca422b51c76ada352525c2dd4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f8ef7bb3e0dbac2ac56d90f576f6299af17b6abe6a56c04f38962e5ef7e6a0a"
 dependencies = [
  "anyhow",
  "async-trait",
