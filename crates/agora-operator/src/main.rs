@@ -8,6 +8,8 @@ mod keygen;
 mod render;
 mod send;
 mod sign;
+#[cfg(feature = "yubikey")]
+mod yubikey;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
@@ -36,20 +38,23 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     let path = config::config_path(cli.config.as_deref())?;
     let mut config = config::load(&path)?;
-    let open = |config: &OperatorConfig| -> Result<OperatorClient> {
-        OperatorClient::new(
-            config.server(cli.server.as_ref())?,
-            config.credential()?,
-            config.signer()?,
-        )
+    let server_flag = cli.server.clone();
+    let open = async |config: &OperatorConfig| -> Result<OperatorClient> {
+        let server = config.server(server_flag.as_ref())?;
+        let credential = config.credential()?;
+        OperatorClient::new(server, credential, config.signer().await?)
     };
     let json = cli.json;
     match cli.command {
         Command::Keygen { label, operator } => {
             keygen::run(&path, &mut config, &label, cli.server.as_ref(), operator).await
         }
+        #[cfg(feature = "yubikey")]
+        Command::Yubikey(command) => {
+            yubikey::run(command, &path, &mut config, cli.server.as_ref()).await
+        }
         Command::Prove { operator } => {
-            let signer = config.signer()?;
+            let signer = config.signer().await?;
             println!("{}", keygen::proof(signer.as_ref(), operator).await?);
             Ok(())
         }
@@ -68,16 +73,16 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(key_file) = key_file {
                 let key_file = std::path::absolute(key_file)?;
                 // Refuse a file that is not a key now, not at the first send
-                SignerConfig::SoftwareKey(key_file.clone()).open()?;
+                SignerConfig::SoftwareKey(key_file.clone()).open().await?;
                 config.signer = Some(SignerConfig::SoftwareKey(key_file));
             }
             if changed {
                 config::save(&path, &config)?;
                 eprintln!("Saved {}", path.display());
             }
-            print!("{}", keygen::describe(&path, &config));
+            print!("{}", keygen::describe(&path, &config).await);
             // The server's side of it, when there is enough to ask
-            if let Ok(client) = open(&config) {
+            if let Ok(client) = open(&config).await {
                 match client.config().await {
                     Ok(settings) => show(json, &settings, render::settings)?,
                     Err(e) => eprintln!("(Could not read the server's settings: {e:#})"),
@@ -85,35 +90,39 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Agents => show(json, &open(&config)?.agents().await?, render::agents),
-        Command::Groups => show(json, &open(&config)?.groups().await?, render::groups),
-        Command::Scheduled => show(json, &open(&config)?.scheduled().await?, render::scheduled),
+        Command::Agents => show(json, &open(&config).await?.agents().await?, render::agents),
+        Command::Groups => show(json, &open(&config).await?.groups().await?, render::groups),
+        Command::Scheduled => show(
+            json,
+            &open(&config).await?.scheduled().await?,
+            render::scheduled,
+        ),
         Command::Messages(args) => show(
             json,
-            &open(&config)?.messages(&args).await?,
+            &open(&config).await?.messages(&args).await?,
             render::messages,
         ),
         Command::MarkRead(args) => show(
             json,
-            &open(&config)?.mark_read(&args).await?,
+            &open(&config).await?.mark_read(&args).await?,
             render::marked,
         ),
-        Command::Log(args) => show(json, &open(&config)?.log(&args).await?, render::log),
+        Command::Log(args) => show(json, &open(&config).await?.log(&args).await?, render::log),
         Command::Moderation(args) => show(
             json,
-            &open(&config)?.moderation(&args).await?,
+            &open(&config).await?.moderation(&args).await?,
             render::moderation,
         ),
-        Command::Send(args) => send::run(&open(&config)?, args, json).await,
+        Command::Send(args) => send::run(&open(&config).await?, args, json).await,
         Command::SendNowCode { action_id } => {
-            let client = open(&config)?;
+            let client = open(&config).await?;
             let answer = client
                 .send_now_code(&SendNowCodeRequest { action_id })
                 .await?;
             show(json, &answer, render::send_now_code)
         }
         Command::Cancel { message, write } => {
-            let client = open(&config)?;
+            let client = open(&config).await?;
             let undelivered = client.scheduled().await?;
             match undelivered.messages.iter().find(|m| m.id == message) {
                 Some(m) => eprintln!(
@@ -135,7 +144,7 @@ async fn run(cli: Cli) -> Result<()> {
             show(json, &answer, render::withdrawal)
         }
         Command::Retract { message, write } => {
-            let client = open(&config)?;
+            let client = open(&config).await?;
             eprintln!(
                 "Retracts message {message}. If the agent has not read it, its body is erased \
                  and the agent sees that a message from you was retracted; if it is not \
@@ -150,7 +159,7 @@ async fn run(cli: Cli) -> Result<()> {
             show(json, &answer, render::withdrawal)
         }
         Command::RetractBatch { send, write } => {
-            let client = open(&config)?;
+            let client = open(&config).await?;
             let undelivered = client.scheduled().await?;
             let waiting = undelivered
                 .messages

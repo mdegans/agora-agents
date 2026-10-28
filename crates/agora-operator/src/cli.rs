@@ -64,6 +64,11 @@ pub enum Command {
         operator: OperatorId,
     },
 
+    /// A YubiKey as your signing key: provision, attest, info, reset
+    #[cfg(feature = "yubikey")]
+    #[command(subcommand)]
+    Yubikey(crate::yubikey::YubikeyCommand),
+
     /// Show the config, or change it (`--server` is the global flag)
     Config {
         /// The credential id the portal gave your key

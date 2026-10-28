@@ -40,6 +40,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # agora-operator's default `yubikey` feature links the system's PC/SC
+      # library (pcsc-sys finds it with pkg-config)
+      - name: PC/SC headers
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkgconf
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
@@ -69,9 +74,8 @@ jobs:
   # long-lived advisory-db clone that corrupts (agora #206); a GitHub-hosted
   # runner is a fresh VM, so the clone is fresh every run and a pinned
   # `cargo install --locked` (the version agora's Dockerfile.audit pins) is
-  # the same thing without the image. No `--ignore`s: nothing on this
-  # lockfile needs one. Add each with a one-line reason, and only for an
-  # advisory that fires on this lockfile.
+  # the same thing without the image. Each `--ignore` carries its reason,
+  # and only for an advisory that fires on this lockfile.
   audit:
     name: Security audit
     runs-on: ubuntu-latest
@@ -80,5 +84,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
+      # RUSTSEC-2023-0071 (rsa's timing side channel in decryption and
+      # signing), through rsa 0.10.0-rc.19: yubikey uses rsa in software only
+      # for public keys and key-parameter computation on import; decryption
+      # and signing happen on the device. agentkit's rsa only verifies,
+      # except in its mock test model.
       - name: Security audit
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071

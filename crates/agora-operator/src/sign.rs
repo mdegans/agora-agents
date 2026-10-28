@@ -3,7 +3,7 @@
 //! signed through an [`OperatorSigner`], into the three headers.
 
 use agora_agentkit::ids::OperatorCredentialId;
-use agora_agentkit::operator_signer::{OperatorPublicKey, OperatorSignature, OperatorSigner};
+use agora_agentkit::operator_signer::OperatorSigner;
 use agora_agentkit::signing::operator_request::{
     CREDENTIAL_ID_HEADER, RequestKind, SIGNATURE_HEADER, TIMESTAMP_HEADER, operator_request_bytes,
 };
@@ -54,25 +54,9 @@ pub async fn sign(
     headers.insert(TIMESTAMP_HEADER, HeaderValue::from(timestamp));
     headers.insert(
         SIGNATURE_HEADER,
-        HeaderValue::from_str(&signature_hex(&signature))?,
+        HeaderValue::from_str(&signature.to_hex())?,
     );
     Ok(())
-}
-
-/// A signature as the signature header carries it
-pub fn signature_hex(signature: &OperatorSignature) -> String {
-    match signature {
-        OperatorSignature::Ed25519(s) => hex::encode(s.to_bytes()),
-        OperatorSignature::EcdsaP256(s) => hex::encode(s.to_bytes()),
-    }
-}
-
-/// A public key as the portal's "Add signing key" form takes it: hex
-pub fn public_key_hex(key: &OperatorPublicKey) -> String {
-    match key {
-        OperatorPublicKey::Ed25519(k) => hex::encode(k.as_bytes()),
-        OperatorPublicKey::EcdsaP256(k) => hex::encode(k.as_sec1()),
-    }
 }
 
 #[cfg(test)]
@@ -185,15 +169,5 @@ mod tests {
         let read = request_bytes(&request, credential(), RequestKind::Read).unwrap();
         let write = request_bytes(&request, credential(), RequestKind::Write(action)).unwrap();
         assert_ne!(read, write);
-    }
-
-    #[test]
-    fn the_public_key_is_64_hex_digits() {
-        let text = public_key_hex(&OperatorPublicKey::Ed25519(key().verifying_key()));
-        assert_eq!(text.len(), 64);
-        assert_eq!(
-            hex::decode(&text).unwrap(),
-            key().verifying_key().as_bytes()
-        );
     }
 }
