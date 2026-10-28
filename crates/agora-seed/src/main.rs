@@ -1545,9 +1545,13 @@ async fn run(held: &mut Held) -> Result<()> {
         };
         // An unreachable endpoint is waited for, with the session hold's
         // period, not failed: see `endpoint::hold_unreachable`. Someone at a
-        // terminal (`--list-models`, `--dry-run`) is told at once instead.
-        let hold = (spec.unreachable_hold_secs > 0 && !args.list_models && !args.dry_run)
-            .then(|| std::time::Duration::from_secs(spec.unreachable_hold_secs));
+        // terminal (`--list-models`, `--dry-run`, `--prepare-review-forks`)
+        // is told at once instead. Endpoints are discovered in order, so a
+        // down one also holds back those after it; every config has one.
+        let hold = endpoint::startup_hold(
+            spec.unreachable_hold_secs,
+            args.list_models || args.dry_run || args.prepare_review_forks,
+        );
         let models = endpoint::hold_unreachable(&spec.endpoint, hold, || inference.models())
             .await
             .with_context(|| format!("discovering models on {}", spec.endpoint))?;

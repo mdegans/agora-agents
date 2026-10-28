@@ -95,6 +95,13 @@ impl Inference for Endpoint {
     }
 }
 
+/// How long startup waits between tries of an unreachable endpoint: the
+/// session hold's period, or `None` (fail at once) when the hold is off or
+/// someone at a terminal is waiting for the answer.
+pub(crate) fn startup_hold(hold_secs: u64, interactive: bool) -> Option<std::time::Duration> {
+    (hold_secs > 0 && !interactive).then(|| std::time::Duration::from_secs(hold_secs))
+}
+
 /// Run `attempt` until it succeeds, waiting `hold` between tries for as long
 /// as the endpoint is [unreachable](RetryAfter::unreachable); any other error
 /// returns at once. `None` tries once.
@@ -103,8 +110,9 @@ impl Inference for Endpoint {
 /// blallama is down (the Mac rebooting, its GPU lent to Blender) waits for
 /// it rather than exiting 1: under `Restart=always` that looped the unit and
 /// mailed "unit failed" each hour after the 2026-10-28 reboot. The Steward:
-/// keep retrying, with no timeout. Logged once when the wait starts and once
-/// when it ends, so a day-long wait is two lines, not a thousand.
+/// keep retrying, with no timeout. Logged when the wait starts, hourly while
+/// it lasts (so a waiting runner can be told from a hung one), and when it
+/// ends: a day-long wait is a couple of dozen lines, not a thousand.
 pub(crate) async fn hold_unreachable<T, E, F, Fut>(
     endpoint: &str,
     hold: Option<std::time::Duration>,
@@ -131,6 +139,17 @@ where
             }
             Err(e) if e.unreachable() && hold.is_some() => {
                 let every = hold.expect("checked");
+                let waited = every.saturating_mul(held.try_into().unwrap_or(u32::MAX));
+                if held > 0 && waited.as_secs() / 3600 != (waited + every).as_secs() / 3600 {
+                    tracing::warn!(
+                        event_type = "endpoint_still_unreachable",
+                        endpoint,
+                        held,
+                        waited_secs = (waited + every).as_secs(),
+                        error = %e,
+                        "endpoint still unreachable; still waiting"
+                    );
+                }
                 if held == 0 {
                     tracing::warn!(
                         event_type = "endpoint_unreachable",
@@ -208,6 +227,13 @@ mod tests {
         let (r, tries) = run(2, HOLD, Some(Fake::Answered)).await;
         assert!(matches!(r, Err(Fake::Answered)));
         assert_eq!(tries, 3);
+    }
+
+    #[test]
+    fn a_terminal_or_a_zero_hold_fails_at_once() {
+        assert_eq!(startup_hold(150, false), Some(Duration::from_secs(150)));
+        assert_eq!(startup_hold(150, true), None);
+        assert_eq!(startup_hold(0, false), None);
     }
 
     #[tokio::test(start_paused = true)]
