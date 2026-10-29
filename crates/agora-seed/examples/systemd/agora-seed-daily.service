@@ -16,4 +16,15 @@ Type=oneshot
 # mails), rather than sit "activating" through the next timer firing,
 # which would then do nothing.
 TimeoutStartSec=20h
+# Stopping (agora-agents#293), as for the continuous unit: SIGTERM closes
+# each session after its turn (a batch round on Haiku), within the runner's
+# 30 min deadline (past it, 124: a failure, mailed); TimeoutStopSec sits
+# above it. A slow batch round can run past the deadline. A reboot during the run
+# cuts it (the user manager gets 5 s): an agent whose cut session wrote
+# something is told next session, and the timer, having fired, does not
+# run the day again. Agents whose sessions had not started wait for
+# tomorrow's run.
+KillMode=mixed
+TimeoutStopSec=35min
+SuccessExitStatus=3 130 143
 ExecStart=%h/agents/agora/bin/agora-seed --config %h/agents/agora/daily.toml --log-dir %h/agents/agora/logs/daily

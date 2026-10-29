@@ -63,11 +63,12 @@ mod logging;
 mod models;
 mod provision;
 mod schedule;
+mod signals;
 
 use agora_agentkit::ids::{AgentId, ReactorId};
 use agora_agentkit::reactor::anthropic::{self, EndpointVariant};
 use agora_agentkit::reactor::seed::{FsKeyring, SeedAgent, SeedConfig, SeedContext, SeedState};
-use agora_agentkit::reactor::{FsStorage, Inference, Orchestrator, Reactor, Run, Storage};
+use agora_agentkit::reactor::{FsStorage, Inference, Orchestrator, Reactor, Run, Stop, Storage};
 use misanthropic::model::{Model, ModelInfo};
 use misanthropic::prompt::message::CitationsConfig;
 use misanthropic::tool::{WebFetch, WebSearch};
@@ -188,6 +189,13 @@ struct Args {
     /// A file holding the operator's password, for `--provision`
     #[arg(long)]
     provision_password_file: Option<PathBuf>,
+
+    /// How long a `SIGTERM` stop (end the turn, then close) may take before
+    /// the runner exits at once, cutting the sessions in flight. The
+    /// systemd units' `TimeoutStopSec` must sit above it. See
+    /// [`signals`].
+    #[arg(long, default_value_t = signals::DEFAULT_DEADLINE.as_secs())]
+    stop_deadline_secs: u64,
 
     /// Flags from the pre-cutover scheduler seed, accepted only so we can
     /// explain where each one went. See [`Args::reject_retired`].
@@ -1341,6 +1349,8 @@ const ALERT_FLUSH: Duration = Duration::from_secs(60);
 struct Held {
     alerts: alerts::Alerter,
     log_guards: Option<logging::Guards>,
+    /// A signal stopped the run gracefully: exit [`signals::STOPPED_EXIT`]
+    stopped: bool,
 }
 
 #[tokio::main]
@@ -1350,7 +1360,11 @@ async fn main() -> Result<()> {
     // Before the error (if any) ends the process: an alert raised on the
     // way out — `governance_log_refused` above all — is sent, not dropped.
     held.alerts.flush(ALERT_FLUSH).await;
+    let stopped = held.stopped && result.is_ok();
     drop(held);
+    if stopped {
+        std::process::exit(signals::STOPPED_EXIT);
+    }
     result
 }
 
@@ -1809,6 +1823,8 @@ async fn run(held: &mut Held) -> Result<()> {
     let shares: BTreeMap<Model, f64> = specs.iter().map(|s| (s.id.clone(), s.share)).collect();
     let mut orchestrator = Orchestrator::new();
     let mut labels: BTreeMap<ReactorId, String> = BTreeMap::new();
+    // Raised by `SIGINT` and `SIGTERM` once the run starts (`signals`)
+    let stop = Stop::new();
     let mut total = 0usize;
     for (idx, (spec, (inference, cohort))) in config
         .reactors
@@ -1933,7 +1949,8 @@ async fn run(held: &mut Held) -> Result<()> {
             "reactor ready"
         );
         let mut reactor: Reactor<_, _, SeedRunAgent> =
-            Reactor::new(inference, FsStorage::new(data_dir.join("state")), agents);
+            Reactor::new(inference, FsStorage::new(data_dir.join("state")), agents)
+                .with_stop(stop.clone());
         if spec.unreachable_hold_secs > 0 {
             reactor = reactor
                 .with_unreachable_hold(std::time::Duration::from_secs(spec.unreachable_hold_secs));
@@ -1981,7 +1998,19 @@ async fn run(held: &mut Held) -> Result<()> {
 
     tracing::info!(agents = total, reactors = labels.len(), "starting run");
     let run_started = chrono::Utc::now();
-    let report = orchestrator.run().await;
+    let exit = signals::install(stop.clone(), Duration::from_secs(args.stop_deadline_secs))
+        .context("installing the SIGINT and SIGTERM handlers")?;
+    let report = tokio::select! {
+        report = orchestrator.run() => report,
+        // A second signal, or the stop's deadline: today's kill, but with
+        // the log flushed. No teardown, no save; `interrupted` recovers.
+        code = exit.wait() => {
+            // Alerts already raised go out, briefly; then the log
+            held.alerts.flush(Duration::from_secs(5)).await;
+            drop(held.log_guards.take());
+            std::process::exit(code);
+        }
+    };
     if restore_on {
         // A showing marked completed whose state the reactor then couldn't
         // save lost its memory update: it is shown again.
@@ -2012,6 +2041,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 errors = r.errors.len(),
                 unsaved = r.unsaved.len(),
                 rejected = r.rejected.len(),
+                unstarted = r.unstarted,
                 "reactor finished"
             ),
             Err(e) => tracing::error!(
@@ -2021,18 +2051,23 @@ async fn run(held: &mut Held) -> Result<()> {
             ),
         }
     }
-    let (done, failed) = report
+    let (done, failed, unstarted) = report
         .report
         .values()
         .flatten()
-        .fold((0, 0), |(d, f), r| (d + r.done, f + r.failed));
+        .fold((0, 0, 0), |(d, f, u), r| {
+            (d + r.done, f + r.failed, u + r.unstarted)
+        });
     tracing::info!(
         done,
         failed,
         agents_skipped,
+        unstarted,
+        stop = %stop.level(),
         reactors = report.report.len(),
         "run finished"
     );
+    held.stopped = stop.draining();
     // Rejections mean routing and negotiation disagree — that's a bug.
     let rejected: Vec<_> = report.rejected().collect();
     if !rejected.is_empty() {

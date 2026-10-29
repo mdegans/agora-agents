@@ -825,6 +825,29 @@ where
         }
     }
 
+    /// What follows an inner turn: at the inner session's clean end, the
+    /// closing questions ([`close`](Self::close)), once.
+    async fn after_inner(&mut self, control: Control) -> Result<Control, A::Error> {
+        const DONE: Control = Control::Done(Outcome::Complete);
+        Ok(match control {
+            DONE if !self.closed => {
+                self.closed = true;
+                self.close().await?.unwrap_or(DONE)
+            }
+            other => other,
+        })
+    }
+
+    /// What follows any turn: the session's clean end begins the held
+    /// epilogue (the survey), last.
+    fn after(&mut self, control: Control) -> Result<Control, A::Error> {
+        if control == Control::Done(Outcome::Complete) && !self.epilogue {
+            self.epilogue = true;
+            return self.inner.begin_epilogue();
+        }
+        Ok(control)
+    }
+
     /// The inner agent's turn, then its writes noted (and journaled) however
     /// the turn ended.
     async fn handle_inner(&mut self, response: response::Message) -> Result<Control, A::Error> {
@@ -3594,7 +3617,6 @@ where
     /// The inner session first; at its clean end the closing questions
     /// ([`close`](Self::close)), then its held epilogue — the survey, last.
     async fn handle(&mut self, response: response::Message) -> Result<Control, A::Error> {
-        const DONE: Control = Control::Done(Outcome::Complete);
         self.count_showing().await;
         let control = match std::mem::replace(&mut self.phase, Phase::Inner) {
             Phase::Asking {
@@ -3603,19 +3625,25 @@ where
                 attempt,
             } => self.answer(due, constrained, attempt, response).await?,
             Phase::Offers { open } => self.answer_offers(open, response).await?,
-            Phase::Inner => match self.handle_inner(response).await? {
-                DONE if !self.closed => {
-                    self.closed = true;
-                    self.close().await?.unwrap_or(DONE)
-                }
-                other => other,
-            },
+            Phase::Inner => {
+                let control = self.handle_inner(response).await?;
+                self.after_inner(control).await?
+            }
         };
-        if control == DONE && !self.epilogue {
-            self.epilogue = true;
-            return self.inner.begin_epilogue();
+        self.after(control)
+    }
+
+    /// The run is stopping after this turn (agora-agents#293): the inner
+    /// session closes as a spent round budget closes it, and its clean end
+    /// leads to the closing questions and the survey as any other does.
+    /// Already asking them (or past them), the session is closing anyway.
+    async fn on_stop(&mut self) -> Result<Control, A::Error> {
+        if !matches!(self.phase, Phase::Inner) || self.closed {
+            return Ok(Control::Continue);
         }
-        Ok(control)
+        let control = self.inner.on_stop().await?;
+        let control = self.after_inner(control).await?;
+        self.after(control)
     }
 
     fn stall_reason(&self) -> Option<String> {
@@ -3826,7 +3854,9 @@ mod tests {
     use crate::consent::role::ledger::{Applied, RoleLedger, RoleOutcome};
     use crate::consent::{ConsentConfig, ConsentRuntime, OfferConfig};
     use agora_agentkit::reactor::seed::{SeedError, ShortString};
+    use agora_agentkit::reactor::{Stop, StopLevel};
     use misanthropic::model::{Kind, Model};
+    use std::collections::BTreeMap;
 
     const OLD: &str = "Qwen3.6.gguf";
     const NEW: &str = "Qwen3.8.gguf";
@@ -3911,6 +3941,8 @@ mod tests {
         /// Each response "writes" a post and a comment on it, as the
         /// `agora` tool would record them (the kill drill).
         writes: bool,
+        /// `on_stop` has closed it
+        stopped: bool,
     }
 
     impl ContactRequests for Fake {
@@ -3921,6 +3953,10 @@ mod tests {
 
     /// The survey question a `Fake` with a survey seats as its epilogue.
     const FAKE_SURVEY: &str = "An anonymous survey.";
+
+    /// What a `Fake` asked to stop seats, as `SeedAgent` seats its note
+    /// before the memory turn.
+    const FAKE_STOPPING: &str = "The runner is stopping.";
 
     impl Epilogue for Fake {
         fn hold_epilogue(&mut self) {
@@ -3959,6 +3995,7 @@ mod tests {
                 survey: false,
                 contact: None,
                 writes: false,
+                stopped: false,
             })
         }
         fn id(&self) -> AgentId {
@@ -4005,6 +4042,17 @@ mod tests {
         async fn on_quiesce(&mut self, _: &response::Message) -> Result<Control, SeedError> {
             self.quiesced = true;
             ConsentAgent::<Fake>::seat_user(&mut self.state.prompt, "Update your memory.".into())?;
+            Ok(Control::Continue)
+        }
+        /// As `SeedAgent`: acting ends, a note says why, and the memory
+        /// turn (the next response) ends the inner session. Asked again
+        /// (each boundary), it has already closed.
+        async fn on_stop(&mut self) -> Result<Control, SeedError> {
+            if std::mem::replace(&mut self.stopped, true) {
+                return Ok(Control::Continue);
+            }
+            self.pending = false;
+            ConsentAgent::<Fake>::seat_user(&mut self.state.prompt, FAKE_STOPPING.into())?;
             Ok(Control::Continue)
         }
     }
@@ -7077,6 +7125,43 @@ mod tests {
         agent
     }
 
+    /// A stop during the inner session (agora-agents#293): the inner agent
+    /// closes through its own `on_stop`, the survey still comes last, and
+    /// the session completes and saves. Its journal goes with the save, so
+    /// the next session is told of no interruption: nothing was lost, and
+    /// the agent was told why in the session, before its memory turn.
+    #[tokio::test]
+    async fn a_stopped_session_closes_completes_and_leaves_no_notice() {
+        let h = journal_harness("journal-stop");
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        agent.inner.pending = true;
+        agent.inner.survey = true;
+        write_post(&agent);
+        let control = agent.handle(reply("acting")).await.unwrap();
+        assert_eq!(control, Control::Continue);
+        assert_eq!(journal(&h).await.writes(), 1, "journaled as it happened");
+
+        assert_eq!(agent.on_stop().await.unwrap(), Control::Continue);
+        assert_eq!(last_user_text(&agent), FAKE_STOPPING);
+        // The memory turn ends the inner session; the survey is last
+        let control = agent.handle(reply("memory")).await.unwrap();
+        assert_eq!(control, Control::Continue);
+        assert!(last_user_text(&agent).contains(FAKE_SURVEY));
+        // Asked again while closing, it changes nothing
+        let before = agent.prompt().messages.len();
+        assert_eq!(agent.on_stop().await.unwrap(), Control::Continue);
+        assert_eq!(agent.prompt().messages.len(), before);
+        let control = agent.handle(reply("survey")).await.unwrap();
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+        agent.on_saved().await.unwrap();
+        assert!(!journal_of(&h).path().exists(), "removed once saved");
+
+        let next = completed(&h).await;
+        assert!(!intro_of_session(&next).contains("Interrupted session"));
+    }
+
     #[tokio::test]
     async fn journal_records_each_write_as_its_turn_ends_and_goes_on_save() {
         let h = journal_harness("journal-append");
@@ -7125,7 +7210,9 @@ mod tests {
         let post = write_post(&first);
         let comment = write_comment(&first, post);
         first.handle(reply("done")).await.unwrap();
-        drop(first); // SIGTERM: no teardown, no save
+        // Killed: a power cut, SIGKILL, or the runner's immediate exit (a
+        // second signal, or a stop past its deadline). No teardown, no save.
+        drop(first);
 
         let mut next = h.agent(JOURNAL_MODEL, true);
         next.on_init().await.unwrap();
@@ -7316,9 +7403,11 @@ mod tests {
 
     // --- The kill drill ----------------------------------------------------
     //
-    // A real process, killed with SIGTERM mid-session (as systemd stops the
-    // runner), over a copy of the fleet's state, through agentkit's own
-    // `Reactor` and `FsStorage`. The backend is a stub: `Fake` stands in for
+    // A real process, killed with SIGKILL mid-session, over a copy of the
+    // fleet's state, through agentkit's own `Reactor` and `FsStorage`. A
+    // power cut does the same, and so (without a teardown) does the runner's
+    // immediate exit after a second signal or a stop past its deadline
+    // (`crate::signals`); the graceful stops are the stop drills below. The backend is a stub: `Fake` stands in for
     // the seed agent and records writes as the `agora` tool would, and
     // `Stub` answers inference locally. Nothing reaches Agora or a model.
     //
@@ -7370,6 +7459,30 @@ mod tests {
         hang: bool,
         hanging: std::sync::atomic::AtomicUsize,
         firsts: Arc<std::sync::Mutex<Vec<String>>>,
+        /// The stop drills: an acting turn (a prompt ending in neither the
+        /// survey nor the stop note) is in flight until the stop reaches
+        /// this level, as a model call that returns after the signal.
+        release: Option<(Stop, StopLevel)>,
+        /// Prompts ending in the stop note: each a stopped session's
+        /// memory turn.
+        stopping: Arc<std::sync::atomic::AtomicUsize>,
+        /// Sessions at once (`max_concurrency`)
+        concurrency: usize,
+    }
+
+    impl Stub {
+        fn new(models: Vec<ModelInfo>, hang: bool) -> Self {
+            Self {
+                models,
+                hang,
+                hanging: Default::default(),
+                firsts: Default::default(),
+                release: None,
+                stopping: Default::default(),
+                // All at once: a hung session must not hold back the rest.
+                concurrency: 4096,
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -7385,6 +7498,16 @@ mod tests {
                 self.hanging
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            if last.contains(FAKE_STOPPING) {
+                self.stopping
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else if let Some((stop, level)) = &self.release
+                && !last.contains(FAKE_SURVEY)
+            {
+                while stop.level() < *level {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
             }
             let first = crate::consent::prompt::tests::text(&p.messages[0].content);
             let mut firsts = self.firsts.lock().unwrap();
@@ -7412,8 +7535,7 @@ mod tests {
             Ok(self.models.iter().cloned().collect())
         }
         fn max_concurrency(&self) -> std::num::NonZeroUsize {
-            // All at once: a hung session must not hold back the rest.
-            std::num::NonZeroUsize::new(4096).unwrap()
+            std::num::NonZeroUsize::new(self.concurrency).unwrap()
         }
     }
 
@@ -7477,12 +7599,7 @@ mod tests {
     async fn kill_drill_child() {
         let data = std::path::PathBuf::from(std::env::var("DRILL_DATA").unwrap());
         let (agents, models) = drill_agents(&data, true).await;
-        let stub = Stub {
-            models,
-            hang: true,
-            hanging: Default::default(),
-            firsts: Default::default(),
-        };
+        let stub = Stub::new(models, true);
         let mut reactor: agora_agentkit::reactor::Reactor<_, _, ConsentAgent<Fake>> =
             agora_agentkit::reactor::Reactor::new(
                 stub,
@@ -7559,15 +7676,15 @@ mod tests {
         }
         eprintln!("killing the child mid-session: {last} writes journaled");
         let status = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
+            .args(["-KILL", &pid.to_string()])
             .status()
             .unwrap();
         assert!(status.success());
         let mut child = child;
         let exit = child.0.wait().unwrap();
-        eprintln!("child: {exit:?} (SIGTERM, mid-session)");
+        eprintln!("child: {exit:?} (SIGKILL, mid-session)");
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(exit.signal(), Some(15), "killed by the SIGTERM, not ended");
+        assert_eq!(exit.signal(), Some(9), "killed, not ended");
 
         // 2. The next sweep: each writer is told, by short id; the rest are
         // told nothing, and their empty leftovers go.
@@ -7581,13 +7698,9 @@ mod tests {
                 )
             })
             .collect();
-        let firsts: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let stub = Stub {
-            models,
-            hang: false,
-            hanging: Default::default(),
-            firsts: firsts.clone(),
-        };
+        let stub = Stub::new(models, false);
+        let firsts = stub.firsts.clone();
+
         let mut reactor: agora_agentkit::reactor::Reactor<_, _, ConsentAgent<Fake>> =
             agora_agentkit::reactor::Reactor::new(
                 stub,
@@ -7637,6 +7750,256 @@ mod tests {
             ids.len(),
             notices,
             ids.iter().filter(|id| journal(id).path().exists()).count()
+        );
+    }
+
+    // --- The stop drills (agora-agents#293) --------------------------------
+    //
+    // The kill drill's setup, stopped by signal instead: a real process
+    // with the runner's own handlers (`crate::signals`), over a copy of the
+    // fleet's state, nothing reaching Agora or a model. `DRILL_SIGNAL`:
+    //
+    // - `TERM`: every session's acting turn is in flight at the signal and
+    //   returns after it; each must close (the stop note, its memory turn,
+    //   its survey), save, clear its journal, and the process exit 0.
+    // - `INT`: one session at a time on the sequential path; the sessions in
+    //   flight at the signal (that one, and the batch cohort, which starts
+    //   whole) run to their end, no other starts (their files untouched),
+    //   exit 0.
+    // - `STUCK`: as `TERM`, but the turn in flight never returns: the
+    //   deadline (`DRILL_DEADLINE_SECS`, default 5) exits 143, and every
+    //   journal stays for the next session's notice.
+    //
+    //   cp -a ~/agents/agora/state <scratch>/data/state
+    //   DRILL_DATA=<scratch>/data DRILL_SIGNAL=TERM cargo test -p agora-seed \
+    //       stop_drill -- --ignored --exact consent::agent::tests::stop_drill --nocapture
+
+    fn drill_signal() -> String {
+        std::env::var("DRILL_SIGNAL").unwrap_or_else(|_| "TERM".into())
+    }
+
+    /// The child: run the drill's agents with the runner's signal handlers
+    #[tokio::test]
+    #[ignore = "the stop drills' child process"]
+    async fn stop_drill_child() {
+        use agora_agentkit::reactor::Run;
+        let data = std::path::PathBuf::from(std::env::var("DRILL_DATA").unwrap());
+        let mode = drill_signal();
+        let (mut agents, models) = drill_agents(&data, true).await;
+        let n = agents.len();
+        for agent in &mut agents {
+            // A second acting turn, unless the stop ends acting first. (A
+            // drain lets the session run on: `Fake` ends it after one turn,
+            // its continuing turn leaving no user turn to answer.)
+            agent.inner.pending = mode != "INT";
+        }
+        let stop = Stop::new();
+        let mut stub = Stub::new(models, false);
+        stub.release = Some((
+            stop.clone(),
+            match mode.as_str() {
+                "INT" => StopLevel::Drain,
+                "TERM" => StopLevel::EndTurn,
+                // Never: the turn in flight is stuck
+                _ => StopLevel::EndTurn,
+            },
+        ));
+        if mode == "STUCK" {
+            stub.release = Some((Stop::new(), StopLevel::EndTurn));
+        }
+        if mode == "INT" {
+            stub.concurrency = 1;
+        }
+        let stopping = stub.stopping.clone();
+        let mut reactor: agora_agentkit::reactor::Reactor<_, _, ConsentAgent<Fake>> =
+            agora_agentkit::reactor::Reactor::new(
+                stub,
+                agora_agentkit::reactor::FsStorage::new(data.join("state")),
+                agents,
+            )
+            .with_stop(stop.clone());
+        let deadline = std::env::var("DRILL_DEADLINE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        let exit = crate::signals::install(stop.clone(), std::time::Duration::from_secs(deadline))
+            .unwrap();
+        let report = tokio::select! {
+            report = reactor.run() => report.unwrap(),
+            code = exit.wait() => {
+                eprintln!("child: exiting {code}");
+                std::process::exit(code);
+            }
+        };
+        let stopping = stopping.load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!(
+            "child: {mode}: done {}, failed {}, unstarted {}, stop notes {stopping}, level {}",
+            report.done,
+            report.failed,
+            report.unstarted,
+            stop.level()
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        match mode.as_str() {
+            "INT" => {
+                assert!(report.done >= 1);
+                assert!(report.unstarted >= 1, "a drain must leave some unstarted");
+                assert_eq!(report.done + report.unstarted, n);
+                assert_eq!(stopping, 0, "a drain doesn't end acting");
+            }
+            _ => {
+                assert_eq!(report.done, n);
+                assert_eq!(stopping, n, "each closed through its stop note");
+            }
+        }
+    }
+
+    /// Each file under each agent's directory, with its size and mtime:
+    /// metadata only, never content
+    fn file_meta(
+        data: &std::path::Path,
+        ids: &[AgentId],
+    ) -> BTreeMap<std::path::PathBuf, (u64, std::time::SystemTime)> {
+        let mut out = BTreeMap::new();
+        for id in ids {
+            let dir = data.join("state").join(id.to_string());
+            let mut stack = vec![dir];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    let meta = entry.metadata().unwrap();
+                    if meta.is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        out.insert(entry.path(), (meta.len(), meta.modified().unwrap()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DRILL_DATA: a scratch copy of the fleet's state"]
+    async fn stop_drill() {
+        let data = std::path::PathBuf::from(std::env::var("DRILL_DATA").unwrap());
+        let mode = drill_signal();
+        let ids = drill_ids(&data);
+        let journal =
+            |id: &AgentId| SessionJournal::in_dir(data.join("state").join(id.to_string()));
+        assert!(
+            ids.iter().all(|id| !journal(id).path().exists()),
+            "no journal before the drill"
+        );
+        let before = file_meta(&data, &ids);
+        let state_of = |id: &AgentId| data.join("state").join(id.to_string()).join("state.json");
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "consent::agent::tests::stop_drill_child",
+                "--nocapture",
+            ])
+            .env("DRILL_DATA", &data)
+            .env("DRILL_SIGNAL", &mode)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let pid = child.id();
+        let mut child = Reap(child);
+
+        // Every session that will start has begun (a journal with its
+        // header), and nothing moved for two seconds: each is in its
+        // acting turn, which returns only after the signal. Draining, one
+        // at a time: the sequential path's first, and the batch cohort.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let (mut still, mut last) = (0, 0);
+        let begun_ids = loop {
+            let begun: Vec<AgentId> = ids
+                .iter()
+                .filter(|id| journal(id).path().exists())
+                .copied()
+                .collect();
+            let settled = match mode.as_str() {
+                "INT" => !begun.is_empty() && begun.len() == last,
+                _ => begun.len() == ids.len(),
+            };
+            last = begun.len();
+            still = if settled { still + 1 } else { 0 };
+            if still >= 10 {
+                break begun;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never got there ({last} begun)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        let expect_begun = begun_ids.len();
+        let signal = if mode == "INT" { "-INT" } else { "-TERM" };
+        eprintln!("signalling the child ({signal}) with {expect_begun} sessions in flight");
+        let status = std::process::Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let exit = loop {
+            if let Some(exit) = child.0.try_wait().unwrap() {
+                break exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline + std::time::Duration::from_secs(60),
+                "the child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        eprintln!("child: {exit:?}");
+        let after = file_meta(&data, &ids);
+        let saved = ids
+            .iter()
+            .filter(|id| before.get(&state_of(id)) != after.get(&state_of(id)))
+            .count();
+        let journals = ids.iter().filter(|id| journal(id).path().exists()).count();
+        match mode.as_str() {
+            "STUCK" => {
+                assert_eq!(exit.code(), Some(crate::signals::DEADLINE_EXIT));
+                assert_eq!(journals, ids.len(), "each kept for the notice");
+                assert_eq!(saved, 0, "cut: nothing saved");
+            }
+            "INT" => {
+                assert_eq!(exit.code(), Some(0), "drained");
+                assert_eq!(journals, 0);
+                assert_eq!(saved, expect_begun, "those in flight");
+                assert!(saved < ids.len(), "some never started");
+                // The rest never started: not a byte, not an mtime
+                let prefixes: Vec<_> = begun_ids
+                    .iter()
+                    .map(|id| data.join("state").join(id.to_string()))
+                    .collect();
+                let untouched = |m: &BTreeMap<std::path::PathBuf, _>| {
+                    m.iter()
+                        .filter(|(p, _)| !prefixes.iter().any(|x| p.starts_with(x)))
+                        .map(|(p, v)| (p.clone(), *v))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(untouched(&before), untouched(&after));
+            }
+            _ => {
+                assert_eq!(exit.code(), Some(0), "every session closed");
+                assert_eq!(journals, 0, "complete and saved");
+                assert_eq!(saved, ids.len());
+            }
+        }
+        eprintln!(
+            "stop drill {mode}: {} agents, {saved} saved, {journals} journals left",
+            ids.len()
         );
     }
 

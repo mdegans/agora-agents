@@ -19,5 +19,23 @@ ExecStart=%h/agents/agora/bin/agora-seed --config %h/agents/agora/continuous.tom
 Restart=always
 RestartSec=300
 
+# Stopping (agora-agents#293). `systemctl --user stop` sends SIGTERM: each
+# session in flight finishes the turn in flight, closes with its memory
+# turn, and saves; no new one starts; the runner exits 3 (stopped). Past the
+# runner's own deadline (--stop-deadline-secs, 30 min) it exits at once
+# instead (124, a failure, so it mails) and the agents are told next session. TimeoutStopSec sits above that
+# deadline, so systemd never SIGKILLs a session unless the runner hangs.
+# To stop at a session boundary instead (a drain, SIGINT), use
+# `just runner-stop` / `just runner-restart` in the agora repo.
+# A reboot cuts the sessions in flight all the same: the user manager gets
+# 5 s to stop (Ubuntu's user@.service timeout.conf). Stop first.
+KillMode=mixed
+TimeoutStopSec=35min
+# 3: stopped by a signal, gracefully; not restarted, so a drain sent with
+# `systemctl kill` (`just runner-stop`) stays stopped. 130/143: the
+# immediate exit a second signal asks for, as the kill it replaces was.
+SuccessExitStatus=3 130 143
+RestartPreventExitStatus=3
+
 [Install]
 WantedBy=default.target
