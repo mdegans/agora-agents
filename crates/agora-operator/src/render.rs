@@ -7,10 +7,10 @@ use agora_agentkit::ids::MessageId;
 use agora_agentkit::moderation::ReversalStatus;
 use agora_agentkit::operator::{
     AgentGroupsResponse, AgentRef, CancelReason, CredentialRef, MarkRepliesReadResponse,
-    OperatorActionDetail, OperatorAgentsResponse, OperatorConfigResponse, OperatorLogResponse,
-    OperatorMessageContent, OperatorMessagesResponse, OperatorModerationResponse, RecordDefect,
-    ScheduledMessagesResponse, SendNowCodeResponse, SendOperatorMessageResponse,
-    WithdrawalResponse,
+    OperatorActionDetail, OperatorAgentsResponse, OperatorConfigChange, OperatorConfigResponse,
+    OperatorLogResponse, OperatorMessageContent, OperatorMessagesResponse,
+    OperatorModerationResponse, RecordDefect, ScheduledMessagesResponse, SendNowCodeResponse,
+    SendOperatorMessageResponse, WithdrawalResponse,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -249,6 +249,14 @@ pub fn log(r: &OperatorLogResponse) -> String {
                 OperatorActionDetail::CredentialRevoke { credential } => {
                     format!("revoked {}", self::credential(credential))
                 }
+                OperatorActionDetail::ConfigChangeEffective { change } => match change {
+                    OperatorConfigChange::BulkRequiresSudo { value: true } => {
+                        "bulk sends need sudo from now on".to_owned()
+                    }
+                    OperatorConfigChange::BulkRequiresSudo { value: false } => {
+                        "bulk sends need no sudo from now on".to_owned()
+                    }
+                },
             };
             format!("{}  {}  {what}  by {by}", e.id, time(&e.created_at))
         })
@@ -361,13 +369,20 @@ pub fn duration(seconds: i64) -> String {
 pub fn settings(r: &OperatorConfigResponse) -> String {
     format!(
         "Server settings:\n  hold:             {}\n  bulk threshold:   {} agents in {} \
-         (this key: {} so far)\n  bulk hold:        {}\n  agent replies:    {} a day each",
+         (this key: {} so far)\n  bulk hold:        {}\n  agent replies:    {} a day each\n  \
+         sudo:             {}send-now to more than {} agents",
         duration(r.dm_hold_seconds),
         r.bulk_threshold,
         duration(r.bulk_window_seconds),
         r.recent_recipients,
         duration(r.bulk_hold_seconds),
-        r.agent_reply_daily_cap
+        r.agent_reply_daily_cap,
+        if r.bulk_requires_sudo {
+            "every bulk send, and "
+        } else {
+            ""
+        },
+        r.send_now_sudo_threshold
     )
 }
 

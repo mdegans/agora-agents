@@ -15,7 +15,16 @@ use crate::cli::SendArgs;
 use crate::client::OperatorClient;
 use crate::render;
 
-pub async fn run(client: &OperatorClient, args: SendArgs, json: bool) -> Result<()> {
+/// `client` previews (and sends, unless `sudo_client` is given); `sudo`
+/// says the send is signed by the `[sudo]` key, as `sudo_client` or as
+/// `client` itself
+pub async fn run(
+    client: &OperatorClient,
+    sudo_client: Option<&OperatorClient>,
+    sudo: bool,
+    args: SendArgs,
+    json: bool,
+) -> Result<()> {
     let code_source = code_source(&args)?;
     let body = body(&args)?;
     let action = args.write.action_id.unwrap_or_default(); // the default is a new id
@@ -41,7 +50,8 @@ pub async fn run(client: &OperatorClient, args: SendArgs, json: bool) -> Result<
         let answer = client.send(&req).await?;
         return crate::show(json, &answer, render::sent);
     }
-    crate::action_line(client, action);
+    let sender = sudo_client.unwrap_or(client);
+    crate::action_line(sender, action);
     // Who it reaches, from the server, even with --yes: a dry run sends and
     // logs nothing. Under an id of its own and without the code, so the
     // preview can never stand in for the send
@@ -66,14 +76,17 @@ pub async fn run(client: &OperatorClient, args: SendArgs, json: bool) -> Result<
         args.expect,
         args.write.yes,
     )?;
-    let text = consequence(&req, &recipients, &settings)?;
+    let text = consequence(&req, &recipients, &settings, sudo)?;
     if !args.write.yes {
         eprint!("{}", headline_bold(&text, std::io::stderr().is_terminal()));
-        if !crate::confirm(&format!("Send it, on {}?", client.who()))? {
+        if !crate::confirm(&format!("Send it, on {}?", sender.who()))? {
             bail!("not confirmed; nothing was sent");
         }
     }
-    let answer = client
+    if sudo {
+        eprintln!("Touch the sudo key to sign the send.");
+    }
+    let answer = sender
         .send(&req)
         .await
         .map_err(|e| crate::retry_hint(e, action))?;
@@ -162,6 +175,7 @@ fn consequence(
     req: &SendOperatorMessageRequest,
     recipients: &[AgentRef],
     settings: &OperatorConfigResponse,
+    sudo: bool,
 ) -> Result<String> {
     let n = recipients.len();
     if n == 0 {
@@ -182,6 +196,23 @@ fn consequence(
         ));
     }
     let bulk = settings.is_bulk(n as i64);
+    // The server's rule. Counted with the previewing key's recent sends,
+    // where the server counts the sudo key's: a near miss is the server's
+    // to refuse
+    if !sudo && settings.needs_sudo(n as i64, req.send_now) {
+        bail!(
+            "{out}It needs sudo ({}), so nothing was sent: send it with --sudo, and touch the \
+             sudo key when asked",
+            if settings.bulk_requires_sudo && bulk {
+                "your account requires it for bulk sends".to_owned()
+            } else {
+                format!(
+                    "sending now to more than {} agents",
+                    settings.send_now_sudo_threshold
+                )
+            }
+        );
+    }
     let threshold = settings.bulk_threshold;
     let recent = match settings.recent_recipients {
         0 => String::new(),
@@ -272,7 +303,25 @@ mod tests {
             bulk_window_seconds: 3600,
             recent_recipients: recent,
             agent_reply_daily_cap: 50,
+            bulk_requires_sudo: false,
+            send_now_sudo_threshold: 100,
         }
+    }
+
+    /// A send that needs sudo stops before it is sent without `--sudo`,
+    /// and goes with it
+    #[test]
+    fn a_send_that_needs_sudo_is_stopped_without_it() {
+        let mut bulk_sudo = settings(0);
+        bulk_sudo.bulk_requires_sudo = true;
+        let err = consequence(&req(false, false), &agents(11), &bulk_sudo, false).unwrap_err();
+        assert!(err.to_string().contains("--sudo"), "{err}");
+        assert!(consequence(&req(false, false), &agents(11), &bulk_sudo, true).is_ok());
+        assert!(consequence(&req(false, false), &agents(2), &bulk_sudo, false).is_ok());
+        // Past the send-now threshold, whatever the account's setting
+        let err = consequence(&req(true, true), &agents(101), &settings(0), false).unwrap_err();
+        assert!(err.to_string().contains("more than 100"), "{err}");
+        assert!(consequence(&req(true, true), &agents(101), &settings(0), true).is_ok());
     }
 
     fn agents(n: usize) -> Vec<AgentRef> {
@@ -286,7 +335,7 @@ mod tests {
 
     #[test]
     fn a_small_send_is_held_for_the_hold() {
-        let text = consequence(&req(false, false), &agents(2), &settings(0)).unwrap();
+        let text = consequence(&req(false, false), &agents(2), &settings(0), false).unwrap();
         assert!(text.starts_with("IT REACHES 2 AGENTS.\n"), "{text}");
         assert!(
             text.contains("agent-0") && text.contains("agent-1"),
@@ -298,7 +347,7 @@ mod tests {
 
     #[test]
     fn a_bulk_send_says_it_is_held_and_emailed() {
-        let text = consequence(&req(false, false), &agents(11), &settings(0)).unwrap();
+        let text = consequence(&req(false, false), &agents(11), &settings(0), false).unwrap();
         assert!(text.contains("held 1 hour"), "{text}");
         assert!(text.contains("emailed"), "{text}");
         assert!(!text.contains("Held for your hold"), "{text}");
@@ -306,9 +355,9 @@ mod tests {
 
     #[test]
     fn send_now_in_bulk_needs_the_code_first() {
-        let err = consequence(&req(true, false), &agents(11), &settings(0)).unwrap_err();
+        let err = consequence(&req(true, false), &agents(11), &settings(0), false).unwrap_err();
         assert!(err.to_string().contains("send-now-code"), "{err}");
-        let text = consequence(&req(true, true), &agents(11), &settings(0)).unwrap();
+        let text = consequence(&req(true, true), &agents(11), &settings(0), false).unwrap();
         assert!(text.contains("Delivered now"), "{text}");
         assert!(!text.contains("held 1 hour"), "{text}");
     }
@@ -317,7 +366,7 @@ mod tests {
     /// threshold, so a small send can be bulk
     #[test]
     fn recent_sends_make_a_small_send_bulk() {
-        let text = consequence(&req(false, false), &agents(2), &settings(9)).unwrap();
+        let text = consequence(&req(false, false), &agents(2), &settings(9), false).unwrap();
         assert!(text.contains("held 1 hour"), "{text}");
         assert!(
             text.contains("the 9 agents this key sent to in the last 1 hour"),
@@ -327,13 +376,13 @@ mod tests {
 
     #[test]
     fn no_recipients_is_refused() {
-        assert!(consequence(&req(false, false), &[], &settings(0)).is_err());
+        assert!(consequence(&req(false, false), &[], &settings(0), false).is_err());
     }
 
     /// The count leads, in caps, and in bold on a terminal only
     #[test]
     fn the_count_is_the_first_line() {
-        let text = consequence(&req(false, false), &agents(1), &settings(0)).unwrap();
+        let text = consequence(&req(false, false), &agents(1), &settings(0), false).unwrap();
         assert!(text.starts_with("IT REACHES 1 AGENT.\n"), "{text}");
         let bold = headline_bold(&text, true);
         assert!(

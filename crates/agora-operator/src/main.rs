@@ -39,7 +39,16 @@ async fn run(cli: Cli) -> Result<()> {
     let path = config::config_path(cli.config.as_deref())?;
     let mut config = config::load(&path)?;
     let server_flag = cli.server.clone();
+    let sudo = cli.sudo;
+    let open_sudo = async |config: &OperatorConfig| -> Result<OperatorClient> {
+        let server = config.server(server_flag.as_ref())?;
+        let (credential, signer) = config.sudo().await?;
+        OperatorClient::new(server, credential, signer)
+    };
     let open = async |config: &OperatorConfig| -> Result<OperatorClient> {
+        if sudo {
+            return open_sudo(config).await;
+        }
         let server = config.server(server_flag.as_ref())?;
         let credential = config.credential()?;
         OperatorClient::new(server, credential, config.signer().await?)
@@ -113,7 +122,29 @@ async fn run(cli: Cli) -> Result<()> {
             &open(&config).await?.moderation(&args).await?,
             render::moderation,
         ),
-        Command::Send(args) => send::run(&open(&config).await?, args, json).await,
+        Command::Send(args) => {
+            // A sudo send previews with the ordinary key, if there is one,
+            // so only the send itself waits for a tap
+            let (preview, sudo_client) = match sudo {
+                false => (open(&config).await?, None),
+                true => {
+                    let sudo_client = open_sudo(&config).await?;
+                    let ordinary = match (config.credential(), config.signer().await) {
+                        (Ok(credential), Ok(signer)) => Some(OperatorClient::new(
+                            config.server(server_flag.as_ref())?,
+                            credential,
+                            signer,
+                        )?),
+                        _ => None,
+                    };
+                    match ordinary {
+                        Some(ordinary) => (ordinary, Some(sudo_client)),
+                        None => (sudo_client, None),
+                    }
+                }
+            };
+            send::run(&preview, sudo_client.as_ref(), sudo, args, json).await
+        }
         Command::SendNowCode { action_id } => {
             let client = open(&config).await?;
             let answer = client
