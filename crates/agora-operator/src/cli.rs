@@ -37,6 +37,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// `send` only: sign the send with the config's `[sudo]` key, a
+    /// hardware key that needs a tap for every signature. What a bulk send
+    /// needs when the account requires sudo for them, and a send delivered
+    /// at once past the sudo threshold. The preview uses the ordinary key,
+    /// so the one tap is for the send (each tap is announced)
+    #[arg(long, global = true)]
+    pub sudo: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -106,6 +114,16 @@ pub enum Command {
         write: WriteArgs,
     },
 
+    /// Require sudo for every bulk send, or stop requiring it. Needs
+    /// `--sudo` either way: only a tap on the sudo key changes it
+    #[command(name = "bulk-sudo")]
+    BulkSudo {
+        #[arg(value_enum)]
+        state: OnOff,
+        #[command(flatten)]
+        write: WriteArgs,
+    },
+
     /// Retract a delivered message the agent has not read: it sees that a
     /// message was retracted
     Retract {
@@ -146,6 +164,13 @@ pub struct WriteArgs {
     /// Don't ask before sending
     #[arg(long, short)]
     pub yes: bool,
+}
+
+/// `on` or `off`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Debug, Args)]

@@ -15,12 +15,12 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use agora_agentkit::ids::OperatorActionId;
-use agora_agentkit::operator::{OperatorActionRequest, SendNowCodeRequest};
+use agora_agentkit::operator::{BulkSudoRequest, OperatorActionRequest, SendNowCodeRequest};
 use anyhow::{Result, bail};
 use clap::Parser;
 use serde::Serialize;
 
-use cli::{Cli, Command, WriteArgs};
+use cli::{Cli, Command, OnOff, WriteArgs};
 use client::OperatorClient;
 use config::{OperatorConfig, SignerConfig};
 
@@ -39,12 +39,31 @@ async fn run(cli: Cli) -> Result<()> {
     let path = config::config_path(cli.config.as_deref())?;
     let mut config = config::load(&path)?;
     let server_flag = cli.server.clone();
+    let sudo = cli.sudo;
+    let open_sudo = async |config: &OperatorConfig| -> Result<OperatorClient> {
+        let server = config.server(server_flag.as_ref())?;
+        let (credential, signer) = config.sudo().await?;
+        OperatorClient::new(server, credential, signer)
+    };
     let open = async |config: &OperatorConfig| -> Result<OperatorClient> {
+        if sudo {
+            return open_sudo(config).await;
+        }
         let server = config.server(server_flag.as_ref())?;
         let credential = config.credential()?;
         OperatorClient::new(server, credential, config.signer().await?)
     };
     let json = cli.json;
+    // Only a send and bulk-sudo ever need sudo: a tap asked for anything
+    // else would teach the operator to tap without looking
+    match (&cli.command, sudo) {
+        (Command::Send(_), _) | (Command::BulkSudo { .. }, true) => {}
+        (Command::BulkSudo { .. }, false) => {
+            bail!("bulk-sudo needs --sudo: only a tap on the sudo key changes it")
+        }
+        (_, true) => bail!("--sudo is for `send` and `bulk-sudo` only: nothing else needs a tap"),
+        (_, false) => {}
+    }
     match cli.command {
         Command::Keygen { label, operator } => {
             keygen::run(&path, &mut config, &label, cli.server.as_ref(), operator).await
@@ -113,7 +132,29 @@ async fn run(cli: Cli) -> Result<()> {
             &open(&config).await?.moderation(&args).await?,
             render::moderation,
         ),
-        Command::Send(args) => send::run(&open(&config).await?, args, json).await,
+        Command::Send(args) => {
+            // A sudo send previews with the ordinary key, if there is one,
+            // so only the send itself waits for a tap
+            let (preview, sudo_client) = match sudo {
+                false => (open(&config).await?, None),
+                true => {
+                    let sudo_client = open_sudo(&config).await?;
+                    let ordinary = match (config.credential(), config.signer().await) {
+                        (Ok(credential), Ok(signer)) => Some(OperatorClient::new(
+                            config.server(server_flag.as_ref())?,
+                            credential,
+                            signer,
+                        )?),
+                        _ => None,
+                    };
+                    match ordinary {
+                        Some(ordinary) => (ordinary, Some(sudo_client)),
+                        None => (sudo_client, None),
+                    }
+                }
+            };
+            send::run(&preview, sudo_client.as_ref(), sudo, args, json).await
+        }
         Command::SendNowCode { action_id } => {
             let client = open(&config).await?;
             let answer = client
@@ -142,6 +183,31 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
                 .map_err(|e| retry_hint(e, action))?;
             show(json, &answer, render::withdrawal)
+        }
+        Command::BulkSudo { state, write } => {
+            let client = open(&config).await?;
+            let on = state == OnOff::On;
+            eprintln!(
+                "{}",
+                if on {
+                    "Requires sudo for every bulk send from now on, held or not: agents that \
+                     send for you can't, and the portal can't."
+                } else {
+                    "Stops requiring sudo for bulk sends: a bulk send is held and can be \
+                     cancelled from the email, as before. Sending at once past the sudo \
+                     threshold still needs it."
+                }
+            );
+            let action = write_action(&client, &write, "Change it")?;
+            eprintln!("Touch the sudo key now: this tap signs the change.");
+            let answer = client
+                .bulk_sudo(&BulkSudoRequest {
+                    action_id: action,
+                    on,
+                })
+                .await
+                .map_err(|e| retry_hint(e, action))?;
+            show(json, &answer, render::bulk_sudo)
         }
         Command::Retract { message, write } => {
             let client = open(&config).await?;

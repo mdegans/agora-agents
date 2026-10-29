@@ -130,6 +130,26 @@ pub struct OperatorConfig {
     pub credential: Option<OperatorCredentialId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<SignerConfig>,
+    /// The key `--sudo` signs with: a hardware key attested with touch
+    /// policy `always` (a YubiKey's 9c slot, `slot = "signature"`), added in
+    /// the portal as a credential of its own. Set by hand:
+    ///
+    /// ```toml
+    /// [sudo]
+    /// credential = "<its id from the portal>"
+    /// [sudo.signer.yubikey]
+    /// slot = "signature"
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sudo: Option<SudoConfig>,
+}
+
+/// The `[sudo]` table: a credential and its signer, like the top level's
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SudoConfig {
+    pub credential: OperatorCredentialId,
+    pub signer: SignerConfig,
 }
 
 impl OperatorConfig {
@@ -152,6 +172,16 @@ impl OperatorConfig {
             "no credential: add your key's public key in the portal (Account, Signing keys), \
              then `agora-operator config --credential <id>`"
         })
+    }
+
+    /// The `[sudo]` credential and its signer, opened
+    pub async fn sudo(&self) -> Result<(OperatorCredentialId, Box<dyn OperatorSigner>)> {
+        let sudo = self.sudo.as_ref().with_context(|| {
+            "no sudo key: add a hardware key with touch policy `always` in the portal (Account, \
+             Signing keys), then give it a `[sudo]` table in the config (see `agora-operator \
+             config --help`)"
+        })?;
+        Ok((sudo.credential, sudo.signer.open().await?))
     }
 
     pub async fn signer(&self) -> Result<Box<dyn OperatorSigner>> {
@@ -234,6 +264,7 @@ mod tests {
             server: Some("http://localhost:8099".parse().unwrap()),
             credential: Some("0b7e2a61-5d3c-4c8e-8f1a-2e9d4b6c7a10".parse().unwrap()),
             signer: Some(SignerConfig::SoftwareKey("/k/laptop.key".into())),
+            sudo: None,
         };
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(text.contains("software_key = \"/k/laptop.key\""), "{text}");
@@ -280,6 +311,40 @@ mod tests {
             ..OperatorConfig::default()
         };
         assert!(config.server(None).is_err());
+    }
+
+    /// The `[sudo]` table as its doc writes it
+    #[cfg(feature = "yubikey")]
+    #[test]
+    fn a_sudo_table_names_its_credential_and_slot() {
+        let config: OperatorConfig = toml::from_str(
+            r#"
+            credential = "0b7e2a61-5d3c-4c8e-8f1a-2e9d4b6c7a10"
+            [signer.yubikey]
+            slot = "authentication"
+            pin_file = "/k/pin"
+            [sudo]
+            credential = "1c8f3b72-6e4d-4d9f-9a2b-3f0e5c7d8b21"
+            [sudo.signer.yubikey]
+            slot = "signature"
+            pin_file = "/k/pin"
+            "#,
+        )
+        .unwrap();
+        let sudo = config.sudo.as_ref().expect("a sudo table");
+        assert_eq!(
+            sudo.credential.to_string(),
+            "1c8f3b72-6e4d-4d9f-9a2b-3f0e5c7d8b21"
+        );
+        assert!(matches!(
+            sudo.signer,
+            SignerConfig::Yubikey {
+                slot: PivSlot::Signature,
+                ..
+            }
+        ));
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(toml::from_str::<OperatorConfig>(&text).unwrap(), config);
     }
 
     #[cfg(feature = "yubikey")]
