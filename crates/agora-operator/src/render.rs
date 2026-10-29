@@ -6,9 +6,9 @@ use agora_agentkit::enums::MessageKind;
 use agora_agentkit::ids::MessageId;
 use agora_agentkit::moderation::ReversalStatus;
 use agora_agentkit::operator::{
-    AgentGroupsResponse, AgentRef, CancelReason, CredentialRef, MarkRepliesReadResponse,
-    OperatorActionDetail, OperatorAgentsResponse, OperatorConfigChange, OperatorConfigResponse,
-    OperatorLogResponse, OperatorMessageContent, OperatorMessagesResponse,
+    AgentGroupsResponse, AgentRef, BulkSudoResponse, CancelReason, CredentialRef,
+    MarkRepliesReadResponse, OperatorActionDetail, OperatorAgentsResponse, OperatorConfigChange,
+    OperatorConfigResponse, OperatorLogResponse, OperatorMessageContent, OperatorMessagesResponse,
     OperatorModerationResponse, RecordDefect, ScheduledMessagesResponse, SendNowCodeResponse,
     SendOperatorMessageResponse, WithdrawalResponse,
 };
@@ -104,6 +104,22 @@ pub fn sent(r: &SendOperatorMessageResponse) -> String {
             out
         }
     }
+}
+
+pub fn bulk_sudo(r: &BulkSudoResponse) -> String {
+    format!(
+        "Bulk sends {} sudo{}.",
+        if r.bulk_requires_sudo {
+            "need"
+        } else {
+            "don't need"
+        },
+        if r.changed {
+            " from now on"
+        } else {
+            " (unchanged)"
+        }
+    )
 }
 
 pub fn send_now_code(r: &SendNowCodeResponse) -> String {

@@ -6,11 +6,12 @@ use std::time::Duration;
 use agora_agentkit::errors::ApiErrorBody;
 use agora_agentkit::ids::{MessageId, OperatorActionId, OperatorCredentialId};
 use agora_agentkit::operator::{
-    AgentGroupsResponse, MarkRepliesRead, MarkRepliesReadResponse, OperatorActionRequest,
-    OperatorAgentsResponse, OperatorConfigResponse, OperatorLogQuery, OperatorLogResponse,
-    OperatorMessagesQuery, OperatorMessagesResponse, OperatorModerationQuery,
-    OperatorModerationResponse, ScheduledMessagesResponse, SendNowCodeRequest, SendNowCodeResponse,
-    SendOperatorMessageRequest, SendOperatorMessageResponse, WithdrawalResponse,
+    AgentGroupsResponse, BulkSudoRequest, BulkSudoResponse, MarkRepliesRead,
+    MarkRepliesReadResponse, OperatorActionRequest, OperatorAgentsResponse, OperatorConfigResponse,
+    OperatorLogQuery, OperatorLogResponse, OperatorMessagesQuery, OperatorMessagesResponse,
+    OperatorModerationQuery, OperatorModerationResponse, ScheduledMessagesResponse,
+    SendNowCodeRequest, SendNowCodeResponse, SendOperatorMessageRequest,
+    SendOperatorMessageResponse, WithdrawalResponse,
 };
 use agora_agentkit::operator_signer::OperatorSigner;
 use agora_agentkit::signing::operator_request::RequestKind;
@@ -160,6 +161,14 @@ impl OperatorClient {
     ) -> Result<SendOperatorMessageResponse> {
         self.call(
             self.url("messages", &[])?,
+            Signed::Write(req, req.action_id),
+        )
+        .await
+    }
+
+    pub async fn bulk_sudo(&self, req: &BulkSudoRequest) -> Result<BulkSudoResponse> {
+        self.call(
+            self.url("config/bulk-sudo", &[])?,
             Signed::Write(req, req.action_id),
         )
         .await
