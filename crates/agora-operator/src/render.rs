@@ -54,7 +54,7 @@ pub fn groups(r: &AgentGroupsResponse) -> String {
 
 pub fn sent(r: &SendOperatorMessageResponse) -> String {
     match r {
-        SendOperatorMessageResponse::DryRun { recipients } => {
+        SendOperatorMessageResponse::DryRun { recipients, .. } => {
             let mut out = format!(
                 "Dry run: it would reach {} agent{}; nothing was sent.",
                 recipients.len(),
@@ -391,6 +391,9 @@ pub fn duration(seconds: i64) -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
+// The bulk threshold and `needs_sudo` are deprecated (agentkit 0.140) and
+// retire with decision 9's rule (operator security build step 12)
+#[allow(deprecated)]
 pub fn settings(r: &OperatorConfigResponse) -> String {
     format!(
         "Server settings:\n  hold:             {}\n  bulk threshold:   {} agents in {} \
