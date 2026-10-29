@@ -101,7 +101,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-# Temporary, until agentkit 0.137.0 publishes (operator sudo)
-[patch.crates-io]
-agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit", branch = "operator/sudo" }
