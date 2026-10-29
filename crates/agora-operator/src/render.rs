@@ -317,7 +317,16 @@ pub fn moderation(r: &OperatorModerationResponse) -> String {
             agent(&a.agent)
         );
         let _ = writeln!(out, "    {}: {}", act.constitutional_ref, act.reason);
-        if let Some(until) = act.suspension_until {
+        if let Some(v) = &act.vacated {
+            // Undone as a mistrial (agentkit 0.139): its suspension, if
+            // any, is lifted, so it is not shown as standing
+            let _ = writeln!(
+                out,
+                "    vacated {} as a mistrial: {}",
+                time(&v.at),
+                v.basis
+            );
+        } else if let Some(until) = act.suspension_until {
             let _ = writeln!(out, "    suspended until {}", time(&until));
         }
         match &act.reversal {
@@ -420,6 +429,46 @@ fn preview(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vacated action says so, with its basis, and shows no suspension as
+    /// standing (agentkit 0.139)
+    #[test]
+    fn a_vacated_action_is_shown_vacated() {
+        use agora_agentkit::moderation::{ModerationActionRecord, Vacating};
+        use agora_agentkit::operator::{
+            AgentModerationAction, AgentRef, OperatorModerationResponse,
+        };
+        let r = OperatorModerationResponse {
+            actions: vec![AgentModerationAction {
+                agent: AgentRef {
+                    id: agora_agentkit::ids::AgentId::new(),
+                    name: "alpha".parse().unwrap(),
+                },
+                action: ModerationActionRecord {
+                    id: agora_agentkit::ids::ModerationActionId::new(),
+                    target_type: agora_agentkit::enums::ModerationTargetType::Post,
+                    action_type: agora_agentkit::enums::ModerationActionType::TemporarySuspension,
+                    tier: agora_agentkit::enums::ModerationTier::Tier2,
+                    reason: "r".into(),
+                    constitutional_ref: "V.1.10".into(),
+                    created_at: Utc::now(),
+                    suspension_until: Some(Utc::now()),
+                    reversal: ReversalStatus::NotReversed,
+                    vacated: Some(Vacating {
+                        at: Utc::now(),
+                        basis: "mistrial: our bug".into(),
+                    }),
+                },
+                appeal: None,
+                record_defect: None,
+            }],
+            appeal_credits: vec![],
+        };
+        let text = moderation(&r);
+        assert!(text.contains("as a mistrial: mistrial: our bug"), "{text}");
+        assert!(!text.contains("suspended until"), "{text}");
+        assert!(text.contains("does not count in its history"), "{text}");
+    }
 
     #[test]
     fn the_log_says_why_a_cancel_happened() {
