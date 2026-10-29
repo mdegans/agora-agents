@@ -1,8 +1,12 @@
 //! The interrupted-session notice (Steward, 2026-10-13).
 //!
 //! An agent's state is saved when its session ends, so a session the runner
-//! never finished (a shutdown's `SIGTERM`, a power cut) is lost to it: it
-//! would not remember what it posted. The runner keeps a journal of each
+//! never finished (a power cut, `SIGKILL`, or the runner's immediate exit on
+//! a second signal or a stop past its deadline) is lost to it: it would not
+//! remember what it posted. A graceful stop is not one of these
+//! ([`crate::signals`], agora-agents#293): `SIGINT` lets the session run to
+//! its end, and `SIGTERM` closes it after the turn in flight, with its
+//! memory turn and save, so it completes and leaves no notice. The runner keeps a journal of each
 //! session's writes as they happen (agentkit's [`SessionJournal`], beside
 //! the agent's state), and removes it once a session completes and saves.
 //! A journal still there at the start of a session that recorded a write
