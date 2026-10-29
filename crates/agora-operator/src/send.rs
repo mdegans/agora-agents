@@ -67,7 +67,7 @@ pub async fn run(
         eprintln!("Touch the sudo key now: this tap signs the preview (a dry run, sends nothing).");
     }
     let recipients = match client.send(&preview).await? {
-        SendOperatorMessageResponse::DryRun { recipients } => recipients,
+        SendOperatorMessageResponse::DryRun { recipients, .. } => recipients,
         SendOperatorMessageResponse::Queued { .. } => {
             bail!("the server queued a dry run; stopping before the real send")
         }
@@ -126,6 +126,9 @@ fn code_source(args: &SendArgs) -> Result<Option<SecretSource>> {
 /// Whether to whom it goes needs `--expect`: a send to everyone or a group,
 /// or to more agents than the bulk threshold. An `all` meant as "my few
 /// test agents" reached 1,707 agents on 2026-10-27
+// The bulk threshold and `needs_sudo` are deprecated (agentkit 0.140) and
+// retire with decision 9's rule (operator security build step 12)
+#[allow(deprecated)]
 fn needs_expect(to: &OperatorRecipients, n: usize, settings: &OperatorConfigResponse) -> bool {
     matches!(to, OperatorRecipients::All | OperatorRecipients::Group(_))
         || i64::try_from(n).map_or(true, |n| n > settings.bulk_threshold)
@@ -139,6 +142,9 @@ fn needs_expect(to: &OperatorRecipients, n: usize, settings: &OperatorConfigResp
 /// operator) between the dry run and the send is reached all the same. A
 /// count the server checks (`expect` on agentkit's
 /// `SendOperatorMessageRequest`) is the follow-up that closes it
+// The bulk threshold and `needs_sudo` are deprecated (agentkit 0.140) and
+// retire with decision 9's rule (operator security build step 12)
+#[allow(deprecated)]
 fn check_count(
     to: &OperatorRecipients,
     n: usize,
@@ -179,6 +185,9 @@ fn headline_bold(text: &str, terminal: bool) -> String {
 
 /// What the send does, agent by agent and in time, for the operator to
 /// confirm. An error where the server would refuse it anyway
+// The bulk threshold and `needs_sudo` are deprecated (agentkit 0.140) and
+// retire with decision 9's rule (operator security build step 12)
+#[allow(deprecated)]
 fn consequence(
     req: &SendOperatorMessageRequest,
     recipients: &[AgentRef],
@@ -306,6 +315,9 @@ mod tests {
         }
     }
 
+    // The bulk threshold is deprecated (agentkit 0.140); its tests retire
+    // with decision 9's rule (operator security build step 12)
+    #[allow(deprecated)]
     fn settings(recent: i64) -> OperatorConfigResponse {
         OperatorConfigResponse {
             dm_hold_seconds: 60,
