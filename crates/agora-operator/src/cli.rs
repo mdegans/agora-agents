@@ -37,10 +37,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Sign with the config's `[sudo]` key, a hardware key that needs a
-    /// tap for every signature. What a bulk send needs when the account
-    /// requires sudo for them, and a send-now past the sudo threshold.
-    /// `send` previews with the ordinary key and taps once, for the send
+    /// `send` only: sign the send with the config's `[sudo]` key, a
+    /// hardware key that needs a tap for every signature. What a bulk send
+    /// needs when the account requires sudo for them, and a send delivered
+    /// at once past the sudo threshold. The preview uses the ordinary key,
+    /// so the one tap is for the send (each tap is announced)
     #[arg(long, global = true)]
     pub sudo: bool,
 

@@ -54,6 +54,11 @@ async fn run(cli: Cli) -> Result<()> {
         OperatorClient::new(server, credential, config.signer().await?)
     };
     let json = cli.json;
+    // Only a send ever needs sudo: a tap asked for anything else would
+    // teach the operator to tap without looking
+    if sudo && !matches!(cli.command, Command::Send(_)) {
+        anyhow::bail!("--sudo is for `send` only: nothing else needs a tap");
+    }
     match cli.command {
         Command::Keygen { label, operator } => {
             keygen::run(&path, &mut config, &label, cli.server.as_ref(), operator).await

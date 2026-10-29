@@ -61,6 +61,11 @@ pub async fn run(
         dry_run: true,
         ..req.clone()
     };
+    // Each tap is announced, so one asked for out of turn stands out
+    let tapped = sudo && sudo_client.is_none();
+    if tapped {
+        eprintln!("Touch the sudo key now: this tap signs the preview (a dry run, sends nothing).");
+    }
     let recipients = match client.send(&preview).await? {
         SendOperatorMessageResponse::DryRun { recipients } => recipients,
         SendOperatorMessageResponse::Queued { .. } => {
@@ -68,6 +73,9 @@ pub async fn run(
         }
     };
     // The server's own hold and threshold, and this key's recent sends
+    if tapped {
+        eprintln!("Touch the sudo key now: this tap reads your settings.");
+    }
     let settings = client.config().await?;
     check_count(
         &req.to,
@@ -84,7 +92,7 @@ pub async fn run(
         }
     }
     if sudo {
-        eprintln!("Touch the sudo key to sign the send.");
+        eprintln!("Touch the sudo key now: this tap signs the send.");
     }
     let answer = sender
         .send(&req)
@@ -199,17 +207,20 @@ fn consequence(
     // The server's rule. Counted with the previewing key's recent sends,
     // where the server counts the sudo key's: a near miss is the server's
     // to refuse
-    if !sudo && settings.needs_sudo(n as i64, req.send_now) {
+    // Delivered at once: sent now, or a `deliver_at` sooner than the hold
+    let immediate = req.send_now
+        || req.deliver_at.is_some_and(|at| {
+            at < chrono::Utc::now() + chrono::Duration::seconds(settings.dm_hold_seconds)
+        });
+    if !sudo && settings.needs_sudo(n as i64, immediate) {
         bail!(
             "{out}It needs sudo ({}), so nothing was sent: send it with --sudo, and touch the \
              sudo key when asked",
-            if settings.bulk_requires_sudo && bulk {
-                "your account requires it for bulk sends".to_owned()
-            } else {
-                format!(
-                    "sending now to more than {} agents",
-                    settings.send_now_sudo_threshold
-                )
+            match settings.send_now_sudo_threshold {
+                Some(m) if !(settings.bulk_requires_sudo && bulk) => {
+                    format!("delivering at once to more than {m} agents")
+                }
+                _ => "your account requires it for bulk sends".to_owned(),
             }
         );
     }
@@ -304,7 +315,7 @@ mod tests {
             recent_recipients: recent,
             agent_reply_daily_cap: 50,
             bulk_requires_sudo: false,
-            send_now_sudo_threshold: 100,
+            send_now_sudo_threshold: Some(100),
         }
     }
 

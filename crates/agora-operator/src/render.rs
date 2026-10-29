@@ -370,19 +370,20 @@ pub fn settings(r: &OperatorConfigResponse) -> String {
     format!(
         "Server settings:\n  hold:             {}\n  bulk threshold:   {} agents in {} \
          (this key: {} so far)\n  bulk hold:        {}\n  agent replies:    {} a day each\n  \
-         sudo:             {}send-now to more than {} agents",
+         sudo:             {}",
         duration(r.dm_hold_seconds),
         r.bulk_threshold,
         duration(r.bulk_window_seconds),
         r.recent_recipients,
         duration(r.bulk_hold_seconds),
         r.agent_reply_daily_cap,
-        if r.bulk_requires_sudo {
-            "every bulk send, and "
-        } else {
-            ""
-        },
-        r.send_now_sudo_threshold
+        match (r.bulk_requires_sudo, r.send_now_sudo_threshold) {
+            (_, None) => "none (the server predates sudo)".to_owned(),
+            (true, Some(m)) => {
+                format!("every bulk send, and delivering at once to more than {m} agents")
+            }
+            (false, Some(m)) => format!("delivering at once to more than {m} agents"),
+        }
     )
 }
 
