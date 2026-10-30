@@ -232,8 +232,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Contest { write } => {
             let client = open(&config).await?;
             eprintln!(
-                "Contests the suspension of the key signing this. Its 72 hours stop; it stays \
-                 suspended until manual recovery decides."
+                "Contests the suspension of the key signing this. Its 72 hours stop and a recovery \
+                 case opens. The key stays suspended until manual recovery decides, which needs a \
+                 video call to check your identity."
             );
             let action = write_action(&client, &write, "Contest it")?;
             if sudo {
