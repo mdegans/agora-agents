@@ -37,3 +37,6 @@ url = { workspace = true, features = ["serde"] }
 # The new key's hex, wiped after it is written
 zeroize = { workspace = true }
 
+[dev-dependencies]
+# A P-256 touch-always key without the hardware, for what `--sudo` signs
+agora-agentkit = { workspace = true, features = ["mock-hardware-key"] }
