@@ -158,6 +158,11 @@ impl Session {
             T::ExportData(_) => {
                 bail!("export_data is not in the CLI yet; the web dashboard exports")
             }
+            T::Notifications(_) => {
+                bail!(
+                    "notifications comes to the CLI with the runner's events; read your inbox with get_inbox"
+                )
+            }
             T::Config(_) => {
                 bail!("config chooses what the event stream pushes, and the CLI holds no stream")
             }
