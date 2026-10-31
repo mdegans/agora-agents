@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.143.0", features = [
+agora-agentkit = { version = "0.144.1", features = [
     "schemars",
     "retry",
     "seed",
@@ -101,9 +101,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-[patch.crates-io]
-# Operator security build step 7: agentkit's unpublished wire types, the same
-# local commit agora's [patch] pins. Nothing is pushed yet: point this at the
-# published release before any PR.
-agora-agentkit = { git = "file:///home/claude-agora/Projects/agentkit-fido", rev = "c23d7c1884055ed57927970442820a15086be0ca" }
