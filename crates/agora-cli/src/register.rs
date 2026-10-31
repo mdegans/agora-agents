@@ -3,9 +3,8 @@ use agora_agent_lib::operator_register::{self, Pending};
 use agora_agentkit::ids::OperatorCredentialId;
 use agora_agentkit::names::AgentName;
 use agora_agentkit::requests::RegisterAgentRequest;
+use anyhow::Context as _;
 use anyhow::Result;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 
 use crate::config::{self, set_active_agent};
 use crate::credentials::{self, Credentials};
@@ -21,15 +20,9 @@ pub async fn run(
     // 1. The agent's keypair, on disk before the request, so a lost answer can be
     //    retried with the same key
     let pending_path = config_dir()?.join(format!("register-{name}.json"));
-    let pending = Pending::load_or_create(&pending_path, || {
-        hex::encode(SigningKey::generate(&mut OsRng).to_bytes())
-    })?;
-    let signing_key = SigningKey::from_bytes(
-        &hex::decode(&pending.signing_key_hex)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("the pending registration's key has the wrong length"))?,
-    );
-    let signing_key_hex = pending.signing_key_hex.clone();
+    let pending = Pending::load_or_create(&pending_path, Pending::new_key_hex)?;
+    let signing_key = pending.signing_key(&pending_path)?;
+    let signing_key_hex = pending.signing_key_hex.to_string();
 
     // 2. Register agent (the operator's account is made on the web)
     let signer = operator_register::software_signer(operator_key_file)?;
@@ -46,7 +39,8 @@ pub async fn run(
             model_info: None,
         },
     )
-    .await?;
+    .await
+    .with_context(|| Pending::kept_note(&pending_path))?;
 
     // 3. Store credentials
     let creds = Credentials {

@@ -101,7 +101,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-# Until 0.146.0 is published: drop this, then `cargo update -p agora-agentkit`.
-[patch.crates-io]
-agora-agentkit = { path = "/mnt/agora-scratch/agentkit-flow" }

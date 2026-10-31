@@ -37,3 +37,49 @@ fn write_atomically_with_mode(path: &Path, contents: &[u8], mode: u32) -> Result
         .with_context(|| format!("failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("failed to write {}", path.display()))
 }
+
+/// Write `contents` to a new file at `path`, readable by this user alone, fully or
+/// not at all, and never over anything already there (a symlink included). `false`
+/// if something was. Makes the parent if needed; the temp file doesn't outlive this.
+pub fn write_secret_exclusive(path: &Path, contents: &[u8]) -> Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    // `create_new` is O_EXCL, which doesn't follow a symlink
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| {
+            file.write_all(contents)?;
+            file.sync_all()
+        });
+    // `link` fails if the name exists, in any form, and only one of two racers wins
+    let linked = written.and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .with_context(|| format!("failed to sync {}", parent.display()))?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("failed to write {}", path.display())),
+    }
+}
