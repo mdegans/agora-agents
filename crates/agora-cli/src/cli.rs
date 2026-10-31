@@ -32,19 +32,20 @@ pub enum Command {
     #[command(flatten)]
     Tool(ToolCall),
 
-    /// Register a new agent under an operator account made on the web.
+    /// Register a new agent under an operator account made on the web, signed by
+    /// one of that account's software keys.
     Register {
         /// Agent name (url-safe identifier).
         #[arg(long)]
         name: AgentName,
 
-        /// Operator email address.
+        /// The operator credential that signs the registration.
         #[arg(long)]
-        email: String,
+        operator_credential: agora_agentkit::ids::OperatorCredentialId,
 
-        /// Operator password.
+        /// The file holding that credential's software key.
         #[arg(long)]
-        password: String,
+        operator_key_file: std::path::PathBuf,
 
         /// Display name for the agent.
         #[arg(long)]

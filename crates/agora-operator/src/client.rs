@@ -4,15 +4,14 @@
 use std::time::Duration;
 
 use agora_agentkit::errors::ApiErrorBody;
-use agora_agentkit::ids::{MessageId, OperatorActionId, OperatorCredentialId, OperatorPasskeyId};
+use agora_agentkit::ids::{MessageId, OperatorActionId, OperatorCredentialId};
 use agora_agentkit::operator::{
     AgentGroupsResponse, BulkSudoRequest, BulkSudoResponse, CredentialContestResponse,
-    FirstPasskeyConfirmRequest, FirstPasskeyConfirmResponse, MarkRepliesRead,
-    MarkRepliesReadResponse, OperatorActionRequest, OperatorAgentsResponse, OperatorConfigResponse,
-    OperatorLogQuery, OperatorLogResponse, OperatorMessagesQuery, OperatorMessagesResponse,
-    OperatorModerationQuery, OperatorModerationResponse, ScheduledMessagesResponse,
-    SendNowCodeRequest, SendNowCodeResponse, SendOperatorMessageRequest,
-    SendOperatorMessageResponse, WithdrawalResponse,
+    MarkRepliesRead, MarkRepliesReadResponse, OperatorActionRequest, OperatorAgentsResponse,
+    OperatorConfigResponse, OperatorLogQuery, OperatorLogResponse, OperatorMessagesQuery,
+    OperatorMessagesResponse, OperatorModerationQuery, OperatorModerationResponse,
+    ScheduledMessagesResponse, SendOperatorMessageRequest, SendOperatorMessageResponse,
+    WithdrawalResponse,
 };
 use agora_agentkit::operator_signer::OperatorSigner;
 use agora_agentkit::signing::operator_request::RequestKind;
@@ -22,7 +21,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
 
-use crate::sign;
+use agora_agent_lib::operator_sign as sign;
 
 /// Where the operator API lives under the server's URL
 const API: &str = "agora/api/operator/";
@@ -175,14 +174,6 @@ impl OperatorClient {
         .await
     }
 
-    pub async fn send_now_code(&self, req: &SendNowCodeRequest) -> Result<SendNowCodeResponse> {
-        self.call(
-            self.url("messages/send-now-code", &[])?,
-            Signed::Write(req, req.action_id),
-        )
-        .await
-    }
-
     pub async fn cancel(
         &self,
         message: MessageId,
@@ -211,16 +202,6 @@ impl OperatorClient {
         self.call(url, Signed::Write(req, req.action_id)).await
     }
 
-    /// The sudo confirmation of the account's first passkey
-    pub async fn confirm_first_passkey(
-        &self,
-        passkey: OperatorPasskeyId,
-        req: &FirstPasskeyConfirmRequest,
-    ) -> Result<FirstPasskeyConfirmResponse> {
-        let url = self.confirm_url(passkey)?;
-        self.call(url, Signed::Write(req, req.action_id)).await
-    }
-
     /// Contest the suspension of the credential signing this: the path names
     /// it, because a suspended credential contests only for itself
     pub async fn contest(&self, req: &OperatorActionRequest) -> Result<CredentialContestResponse> {
@@ -229,10 +210,6 @@ impl OperatorClient {
     }
 
     // -- Plumbing --
-
-    fn confirm_url(&self, passkey: OperatorPasskeyId) -> Result<Url> {
-        self.url("passkeys", &[&passkey.to_string(), "confirm"])
-    }
 
     fn contest_url(&self) -> Result<Url> {
         self.url("credentials", &[&self.credential.to_string(), "contest"])
@@ -249,6 +226,15 @@ impl OperatorClient {
         Ok(url)
     }
 
+    /// Register an agent with its own key
+    pub async fn register_agent(
+        &self,
+        req: &agora_agent_lib::operator_register::RegisterAgentRequest,
+    ) -> Result<agora_agentkit::responses::RegisterAgentResponse> {
+        self.call(self.url("agents", &[])?, Signed::Write(req, req.action_id))
+            .await
+    }
+
     /// The request, built and signed at `timestamp`, as it will be sent
     async fn build<B: Serialize>(
         &self,
@@ -263,8 +249,6 @@ impl OperatorClient {
                 Some(serde_json::to_vec(body)?),
                 RequestKind::Read,
             ),
-            // A send-now code goes into this buffer, and reqwest's, unwiped:
-            // inherent to sending it. Only the parsed `SendNowCode` is wiped
             Signed::Write(body, action) => (
                 Method::POST,
                 Some(serde_json::to_vec(body)?),
@@ -523,33 +507,24 @@ mod tests {
         );
     }
 
-    /// `confirm`, as the server's `FirstPasskeyConfirmRequest` reads it, signed
-    /// as a write of its own action under the route's path
+    /// `contest`, as the server reads it, signed as a write of its own action
+    /// under the route's path
     #[tokio::test]
-    async fn a_confirm_is_signed_as_a_write_of_its_own_action() {
+    async fn a_contest_is_signed_as_a_write_of_its_own_action() {
         let c = client("http://localhost:8099");
         let action: OperatorActionId = "6a1f0f43-2c1e-4f6e-9a55-0d6c5b0a1e2f".parse().unwrap();
-        let passkey: OperatorPasskeyId = "7ad26ccd-1111-4222-8333-444455556666".parse().unwrap();
-        let req = FirstPasskeyConfirmRequest {
-            action_id: action,
-            cose_key_sha256: "abcd".into(),
-        };
-        let url = c.confirm_url(passkey).unwrap();
-        assert_eq!(
-            url.as_str(),
-            "http://localhost:8099/agora/api/operator/passkeys/7ad26ccd-1111-4222-8333-444455556666/confirm"
-        );
+        let req = OperatorActionRequest { action_id: action };
+        let url = c.contest_url().unwrap();
         let request = c
             .build(url, Signed::Write(&req, req.action_id), 1_793_000_000)
             .await
             .unwrap();
-        let body =
-            br#"{"action_id":"6a1f0f43-2c1e-4f6e-9a55-0d6c5b0a1e2f","cose_key_sha256":"abcd"}"#;
+        let body = br#"{"action_id":"6a1f0f43-2c1e-4f6e-9a55-0d6c5b0a1e2f"}"#;
         assert_eq!(request.body().unwrap().as_bytes().unwrap(), body);
         let expected = operator_request_bytes(
             "POST",
             "localhost:8099",
-            "/agora/api/operator/passkeys/7ad26ccd-1111-4222-8333-444455556666/confirm",
+            "/agora/api/operator/credentials/0b7e2a61-5d3c-4c8e-8f1a-2e9d4b6c7a10/contest",
             c.credential,
             body,
             RequestKind::Write(action),
@@ -569,7 +544,7 @@ mod tests {
     /// What a YubiKey's 9c slot signs: P-256, one tap per signature. The
     /// header carries what the server's `verify_request` takes for that key
     #[tokio::test]
-    async fn a_confirm_verifies_under_a_p256_touch_always_key() {
+    async fn a_write_verifies_under_a_p256_touch_always_key() {
         use agora_agentkit::operator_signer::mock::{MockPivDevice, MockRootCa};
         use agora_agentkit::operator_signer::{
             HardwareKey, KeyPolicy, OperatorSignature, Pin, PivSerial, PivSlot, SignatureAlgorithm,
@@ -599,15 +574,11 @@ mod tests {
         )
         .unwrap();
         let action = OperatorActionId::new();
-        let req = FirstPasskeyConfirmRequest {
-            action_id: action,
-            cose_key_sha256: "abcd".into(),
-        };
-        let passkey: OperatorPasskeyId = "7ad26ccd-1111-4222-8333-444455556666".parse().unwrap();
+        let req = OperatorActionRequest { action_id: action };
         device.press();
         let request = c
             .build(
-                c.confirm_url(passkey).unwrap(),
+                c.contest_url().unwrap(),
                 Signed::Write(&req, req.action_id),
                 1_793_000_000,
             )
@@ -615,8 +586,12 @@ mod tests {
             .unwrap();
         let signature = hex::decode(request.headers()[SIGNATURE_HEADER].as_bytes()).unwrap();
         let signature = OperatorSignature::from_bytes(public.algorithm(), &signature).unwrap();
-        let signed =
-            crate::sign::request_bytes(&request, credential, RequestKind::Write(action)).unwrap();
+        let signed = agora_agent_lib::operator_sign::request_bytes(
+            &request,
+            credential,
+            RequestKind::Write(action),
+        )
+        .unwrap();
         verify_request(&public, &signed, 1_793_000_000, &signature).unwrap();
     }
 
@@ -633,21 +608,17 @@ mod tests {
     }
 
     /// A refusal comes back in the server's words, for the operator to read:
-    /// the CLI decides nothing about who may confirm
+    /// the CLI decides nothing about who may contest
     #[tokio::test]
-    async fn a_refused_confirm_says_what_the_server_said() {
+    async fn a_refused_contest_says_what_the_server_said() {
         let (url, _) = serve(
             "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\
              Content-Length: 22\r\nConnection: close\r\n\r\n{\"error\":\"needs sudo\"}",
         );
         let err = client(&url)
-            .confirm_first_passkey(
-                "7ad26ccd-1111-4222-8333-444455556666".parse().unwrap(),
-                &FirstPasskeyConfirmRequest {
-                    action_id: OperatorActionId::new(),
-                    cose_key_sha256: "abcd".into(),
-                },
-            )
+            .contest(&OperatorActionRequest {
+                action_id: OperatorActionId::new(),
+            })
             .await
             .unwrap_err();
         let api = err.downcast_ref::<ApiError>().expect("an answer");

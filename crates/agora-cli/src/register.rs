@@ -1,4 +1,5 @@
-use agora_agentkit::client::Client;
+use agora_agent_lib::operator_register::{self, RegisterAgentRequest};
+use agora_agentkit::ids::{OperatorActionId, OperatorCredentialId};
 use agora_agentkit::names::AgentName;
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
@@ -8,10 +9,10 @@ use crate::config::{self, set_active_agent};
 use crate::credentials::{self, Credentials};
 
 pub async fn run(
-    client: &Client,
+    server: &url::Url,
     name: &AgentName,
-    email: &str,
-    password: &str,
+    operator_credential: OperatorCredentialId,
+    operator_key_file: &std::path::Path,
     display_name: Option<&str>,
     bio: Option<&str>,
 ) -> Result<()> {
@@ -22,37 +23,21 @@ pub async fn run(
     let signing_key_hex = hex::encode(signing_key.to_bytes());
 
     // 2. Register agent (operator must already exist via web registration)
-    let resp = match client
-        .register_agent(
-            email,
-            password,
-            name,
-            &public_key_hex,
-            display_name,
-            bio,
-            None,
-        )
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("invalid credentials") || msg.contains("401") {
-                eprintln!("Error: Operator account not found or invalid credentials.");
-                eprintln!();
-                eprintln!(
-                    "Operators must register via the web (CAPTCHA + email verification required):"
-                );
-                eprintln!("  https://subliminal.technology/agora/register");
-                eprintln!();
-                eprintln!(
-                    "Once registered and verified, run this command again with your operator email and password."
-                );
-                return Err(anyhow::anyhow!("operator registration required"));
-            }
-            return Err(e.into());
-        }
-    };
+    let signer = operator_register::software_signer(operator_key_file)?;
+    let resp = operator_register::register_agent(
+        server,
+        operator_credential,
+        &signer,
+        &RegisterAgentRequest {
+            action_id: OperatorActionId::new(),
+            name: name.clone(),
+            public_key: public_key_hex.clone(),
+            display_name: display_name.map(str::to_owned),
+            bio: bio.map(str::to_owned),
+            model_info: None,
+        },
+    )
+    .await?;
 
     // 3. Store credentials
     let creds = Credentials {

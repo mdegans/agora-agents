@@ -3,10 +3,9 @@
 use std::io::{IsTerminal, Read};
 
 use agora_agent_lib::body_input;
-use agora_agent_lib::secret_input::{self, SecretSource};
 use agora_agentkit::ids::OperatorActionId;
 use agora_agentkit::operator::{
-    AgentRef, OperatorConfigResponse, OperatorRecipients, SendNowCode, SendOperatorMessageRequest,
+    AgentRef, OperatorConfigResponse, OperatorRecipients, SendOperatorMessageRequest,
     SendOperatorMessageResponse,
 };
 use anyhow::{Context, Result, bail};
@@ -25,17 +24,8 @@ pub async fn run(
     args: SendArgs,
     json: bool,
 ) -> Result<()> {
-    let code_source = code_source(&args)?;
     let body = body(&args)?;
     let action = args.write.action_id.unwrap_or_default(); // the default is a new id
-    let email_code = match code_source {
-        None => None,
-        Some(source) => {
-            let mut code = secret_input::read_secret("The code from the email", source)?;
-            // Moved, not copied: `SendNowCode` wipes it when dropped
-            Some(SendNowCode(std::mem::take(&mut *code)))
-        }
-    };
     let req = SendOperatorMessageRequest {
         action_id: action,
         to: args.to,
@@ -43,7 +33,7 @@ pub async fn run(
         about: args.about,
         deliver_at: args.deliver_at,
         send_now: args.send_now,
-        email_code,
+        email_code: None,
         dry_run: args.dry_run,
     };
     if req.dry_run {
@@ -53,7 +43,7 @@ pub async fn run(
     let sender = sudo_client.unwrap_or(client);
     crate::action_line(sender, action);
     // Who it reaches, from the server, even with --yes: a dry run sends and
-    // logs nothing. Under an id of its own and without the code, so the
+    // logs nothing. Under an id of its own, so the
     // preview can never stand in for the send
     let preview = SendOperatorMessageRequest {
         action_id: OperatorActionId::new(),
@@ -99,28 +89,6 @@ pub async fn run(
         .await
         .map_err(|e| crate::retry_hint(e, action))?;
     crate::show(json, &answer, render::sent)
-}
-
-/// Where the emailed code is read from, if one is wanted
-fn code_source(args: &SendArgs) -> Result<Option<SecretSource>> {
-    match (args.email_code, args.email_code_stdin) {
-        (_, true)
-            if args
-                .body_file
-                .as_ref()
-                .is_some_and(|p| p.as_os_str() == "-") =>
-        {
-            bail!("--email-code-stdin and --body-file - both want stdin; give the body another way")
-        }
-        (_, true) if !args.write.yes => {
-            bail!(
-                "--email-code-stdin needs --yes: with stdin piped, there is no terminal to confirm on"
-            )
-        }
-        (_, true) => Ok(Some(SecretSource::Stdin)),
-        (true, false) => Ok(Some(SecretSource::Prompt)),
-        (false, false) => Ok(None),
-    }
 }
 
 /// Whether to whom it goes needs `--expect`: a send to everyone or a group,
@@ -198,7 +166,6 @@ fn consequence(
     if n == 0 {
         bail!("it reaches no agent");
     }
-    let action = req.action_id;
     // The count first and loudest, before a list that may scroll it away
     let mut out = format!(
         "IT REACHES {n} AGENT{}.\nEach gets it as a message from you in its inbox:\n",
@@ -244,10 +211,10 @@ fn consequence(
     };
     let bulk_hold = render::duration(settings.bulk_hold_seconds);
     match (req.deliver_at, req.send_now) {
-        (None, true) if bulk && req.email_code.is_none() => bail!(
-            "{out}It is above your bulk threshold ({threshold}{recent}), so --send-now needs \
-             the emailed code: run `agora-operator send-now-code --action-id {action}`, then \
-             this again with --action-id {action} --email-code (or --email-code-stdin)"
+        (None, true) if bulk && !sudo => bail!(
+            "{out}It is above your bulk threshold ({threshold}{recent}), so sending it now needs \
+             --sudo and a touch of the sudo key. Without --send-now it is held and delivered \
+             after the hold"
         ),
         (_, false) if bulk => out.push_str(&format!(
             "It is above your bulk threshold ({threshold}{recent}): it is held {bulk_hold}{}, \
@@ -302,7 +269,7 @@ mod tests {
     use super::*;
     use agora_agentkit::ids::{AgentGroupId, AgentId};
 
-    fn req(send_now: bool, code: bool) -> SendOperatorMessageRequest {
+    fn req(send_now: bool) -> SendOperatorMessageRequest {
         SendOperatorMessageRequest {
             action_id: OperatorActionId::new(),
             to: OperatorRecipients::All,
@@ -310,7 +277,7 @@ mod tests {
             about: None,
             deliver_at: None,
             send_now,
-            email_code: code.then(|| SendNowCode("123456".into())),
+            email_code: None,
             dry_run: false,
         }
     }
@@ -337,14 +304,14 @@ mod tests {
     fn a_send_that_needs_sudo_is_stopped_without_it() {
         let mut bulk_sudo = settings(0);
         bulk_sudo.bulk_requires_sudo = true;
-        let err = consequence(&req(false, false), &agents(11), &bulk_sudo, false).unwrap_err();
+        let err = consequence(&req(false), &agents(11), &bulk_sudo, false).unwrap_err();
         assert!(err.to_string().contains("--sudo"), "{err}");
-        assert!(consequence(&req(false, false), &agents(11), &bulk_sudo, true).is_ok());
-        assert!(consequence(&req(false, false), &agents(2), &bulk_sudo, false).is_ok());
+        assert!(consequence(&req(false), &agents(11), &bulk_sudo, true).is_ok());
+        assert!(consequence(&req(false), &agents(2), &bulk_sudo, false).is_ok());
         // Past the send-now threshold, whatever the account's setting
-        let err = consequence(&req(true, true), &agents(101), &settings(0), false).unwrap_err();
+        let err = consequence(&req(true), &agents(101), &settings(0), false).unwrap_err();
         assert!(err.to_string().contains("more than 100"), "{err}");
-        assert!(consequence(&req(true, true), &agents(101), &settings(0), true).is_ok());
+        assert!(consequence(&req(true), &agents(101), &settings(0), true).is_ok());
     }
 
     fn agents(n: usize) -> Vec<AgentRef> {
@@ -358,7 +325,7 @@ mod tests {
 
     #[test]
     fn a_small_send_is_held_for_the_hold() {
-        let text = consequence(&req(false, false), &agents(2), &settings(0), false).unwrap();
+        let text = consequence(&req(false), &agents(2), &settings(0), false).unwrap();
         assert!(text.starts_with("IT REACHES 2 AGENTS.\n"), "{text}");
         assert!(
             text.contains("agent-0") && text.contains("agent-1"),
@@ -370,17 +337,17 @@ mod tests {
 
     #[test]
     fn a_bulk_send_says_it_is_held_and_emailed() {
-        let text = consequence(&req(false, false), &agents(11), &settings(0), false).unwrap();
+        let text = consequence(&req(false), &agents(11), &settings(0), false).unwrap();
         assert!(text.contains("held 1 hour"), "{text}");
         assert!(text.contains("emailed"), "{text}");
         assert!(!text.contains("Held for your hold"), "{text}");
     }
 
     #[test]
-    fn send_now_in_bulk_needs_the_code_first() {
-        let err = consequence(&req(true, false), &agents(11), &settings(0), false).unwrap_err();
-        assert!(err.to_string().contains("send-now-code"), "{err}");
-        let text = consequence(&req(true, true), &agents(11), &settings(0), false).unwrap();
+    fn send_now_in_bulk_needs_sudo() {
+        let err = consequence(&req(true), &agents(11), &settings(0), false).unwrap_err();
+        assert!(err.to_string().contains("--sudo"), "{err}");
+        let text = consequence(&req(true), &agents(11), &settings(0), true).unwrap();
         assert!(text.contains("Delivered now"), "{text}");
         assert!(!text.contains("held 1 hour"), "{text}");
     }
@@ -389,7 +356,7 @@ mod tests {
     /// threshold, so a small send can be bulk
     #[test]
     fn recent_sends_make_a_small_send_bulk() {
-        let text = consequence(&req(false, false), &agents(2), &settings(9), false).unwrap();
+        let text = consequence(&req(false), &agents(2), &settings(9), false).unwrap();
         assert!(text.contains("held 1 hour"), "{text}");
         assert!(
             text.contains("the 9 agents this key sent to in the last 1 hour"),
@@ -399,13 +366,13 @@ mod tests {
 
     #[test]
     fn no_recipients_is_refused() {
-        assert!(consequence(&req(false, false), &[], &settings(0), false).is_err());
+        assert!(consequence(&req(false), &[], &settings(0), false).is_err());
     }
 
     /// The count leads, in caps, and in bold on a terminal only
     #[test]
     fn the_count_is_the_first_line() {
-        let text = consequence(&req(false, false), &agents(1), &settings(0), false).unwrap();
+        let text = consequence(&req(false), &agents(1), &settings(0), false).unwrap();
         assert!(text.starts_with("IT REACHES 1 AGENT.\n"), "{text}");
         let bold = headline_bold(&text, true);
         assert!(
@@ -475,32 +442,5 @@ mod tests {
     fn asked_on_the_terminal_expect_is_optional() {
         assert!(check_count(&OperatorRecipients::All, 1707, &settings(0), None, false).is_ok());
         assert!(check_count(&group(), 3, &settings(0), None, false).is_ok());
-    }
-
-    #[test]
-    fn stdin_cannot_carry_both_body_and_code() {
-        use clap::Parser;
-        let parse = |line: &str| {
-            let cli = crate::cli::Cli::try_parse_from(
-                std::iter::once("agora-operator").chain(line.split_whitespace()),
-            )
-            .unwrap();
-            let crate::cli::Command::Send(send) = cli.command else {
-                panic!("expected send");
-            };
-            send
-        };
-        let both = parse("send --to all --body-file - --send-now --email-code-stdin --yes");
-        let err = code_source(&both).unwrap_err().to_string();
-        assert!(err.contains("both want stdin"), "{err}");
-        let prompt = parse("send --to all --body-file - --send-now --email-code");
-        assert_eq!(code_source(&prompt).unwrap(), Some(SecretSource::Prompt));
-        let stdin = parse("send --to all --body x --send-now --email-code-stdin --yes");
-        assert_eq!(code_source(&stdin).unwrap(), Some(SecretSource::Stdin));
-        let unconfirmed = parse("send --to all --body x --send-now --email-code-stdin");
-        let err = code_source(&unconfirmed).unwrap_err().to_string();
-        assert!(err.contains("needs --yes"), "{err}");
-        let none = parse("send --to all --body x");
-        assert_eq!(code_source(&none).unwrap(), None);
     }
 }

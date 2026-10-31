@@ -7,7 +7,6 @@ mod config;
 mod keygen;
 mod render;
 mod send;
-mod sign;
 #[cfg(feature = "yubikey")]
 mod yubikey;
 
@@ -15,9 +14,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use agora_agentkit::ids::OperatorActionId;
-use agora_agentkit::operator::{
-    BulkSudoRequest, FirstPasskeyConfirmRequest, OperatorActionRequest, SendNowCodeRequest,
-};
+use agora_agentkit::operator::{BulkSudoRequest, OperatorActionRequest};
 use anyhow::{Result, bail};
 use clap::Parser;
 use serde::Serialize;
@@ -31,10 +28,20 @@ async fn main() -> ExitCode {
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {e:#}");
+            eprintln!("Error: {}", in_plain_words(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
+}
+
+/// An error as the operator should read it. A PIV touch timeout returns the same
+/// status as a missing PIN ("security status not satisfied"), so agentkit's
+/// `PinRequired` can mean either, and its text names only the PIN.
+fn in_plain_words(message: &str) -> String {
+    message.replace(
+        &agora_agentkit::operator_signer::SignerError::PinRequired.to_string(),
+        "the hardware key needs its PIN first, or wasn't touched in time",
+    )
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -148,12 +155,28 @@ async fn run(cli: Cli) -> Result<()> {
             };
             send::run(&preview, sudo_client.as_ref(), sudo, args, json).await
         }
-        Command::SendNowCode { action_id } => {
+        Command::RegisterAgent {
+            name,
+            public_key,
+            display_name,
+            bio,
+            model_info,
+            write,
+        } => {
             let client = open(&config).await?;
+            let action = write_action(&client, &write, &format!("Register agent {name}"))?;
             let answer = client
-                .send_now_code(&SendNowCodeRequest { action_id })
-                .await?;
-            show(json, &answer, render::send_now_code)
+                .register_agent(&agora_agent_lib::operator_register::RegisterAgentRequest {
+                    action_id: action,
+                    name,
+                    public_key,
+                    display_name,
+                    bio,
+                    model_info,
+                })
+                .await
+                .map_err(|e| retry_hint(e, action))?;
+            show(json, &answer, render::registered)
         }
         Command::Cancel { message, write } => {
             let client = open(&config).await?;
@@ -201,33 +224,6 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
                 .map_err(|e| retry_hint(e, action))?;
             show(json, &answer, render::bulk_sudo)
-        }
-        Command::Confirm {
-            passkey,
-            cose_key_sha256,
-            write,
-        } => {
-            let client = open(&config).await?;
-            eprintln!(
-                "Confirms passkey {passkey}, with key digest {cose_key_sha256}, as your account's \
-                 first. Compare both with the portal's Security page. Your password is retired \
-                 and the sessions it opened end."
-            );
-            let action = write_action(&client, &write, "Confirm it")?;
-            if sudo {
-                eprintln!("Touch the sudo key now: this tap signs the confirmation.");
-            }
-            let answer = client
-                .confirm_first_passkey(
-                    passkey,
-                    &FirstPasskeyConfirmRequest {
-                        action_id: action,
-                        cose_key_sha256,
-                    },
-                )
-                .await
-                .map_err(|e| retry_hint(e, action))?;
-            show(json, &answer, render::confirmed)
         }
         Command::Contest { write } => {
             let client = open(&config).await?;
@@ -286,20 +282,19 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 /// `--sudo` only where a tap on the sudo key means something: a tap asked for
-/// anything else would teach the operator to tap without looking. `confirm`
-/// takes the flag without insisting: the server says who may confirm. `contest`
+/// anything else would teach the operator to tap without looking. `contest`
 /// takes it for a suspended sudo key, which contests only for itself
 fn check_sudo_flag(command: &Command, sudo: bool) -> Result<()> {
     match (command, sudo) {
-        (Command::Send(_) | Command::Confirm { .. } | Command::Contest { .. }, _)
-        | (Command::BulkSudo { .. }, true) => Ok(()),
+        (Command::Send(_) | Command::Contest { .. }, _) | (Command::BulkSudo { .. }, true) => {
+            Ok(())
+        }
         (Command::BulkSudo { .. }, false) => {
             bail!("bulk-sudo needs --sudo: only a tap on the sudo key changes it")
         }
-        (_, true) => bail!(
-            "--sudo is for `send`, `bulk-sudo`, `confirm` and `contest` only: nothing else \
-             needs a tap"
-        ),
+        (_, true) => {
+            bail!("--sudo is for `send`, `bulk-sudo` and `contest` only: nothing else needs a tap")
+        }
         (_, false) => Ok(()),
     }
 }
@@ -374,13 +369,20 @@ mod tests {
         check_sudo_flag(&cli.command, cli.sudo)
     }
 
-    const ID: &str = "7ad26ccd-1111-4222-8333-444455556666";
+    #[test]
+    fn a_pin_or_touch_failure_says_either() {
+        let e = agora_agentkit::operator_signer::SignerError::PinRequired.to_string();
+        let shown = in_plain_words(&format!("signing the request: {e}"));
+        assert_eq!(
+            shown,
+            "signing the request: the hardware key needs its PIN first, or wasn't touched in time"
+        );
+        assert_eq!(in_plain_words("nothing to do"), "nothing to do");
+    }
 
     #[test]
     fn sudo_is_only_for_what_a_tap_means_something_on() {
         for ok in [
-            format!("confirm {ID} --cose-key-sha256 ab --sudo"),
-            format!("confirm {ID} --cose-key-sha256 ab"),
             "contest".to_owned(),
             "contest --sudo".to_owned(),
             "bulk-sudo on --sudo".to_owned(),

@@ -1,8 +1,8 @@
 //! `--provision <spec.json>`: create a seed agent as any operator could.
 //!
 //! The agent is registered through the public API (`POST
-//! /api/identity/agents/register`, with the operator's email and password
-//! and a key generated here), and its state and key are written where the
+//! /api/operator/agents`, signed by one of the operator's software keys, with an
+//! agent key generated here), and its state and key are written where the
 //! runner reads them, under `--data-dir`, with the runner's own
 //! [`FsStorage`] and [`FsKeyring`]. Nothing touches the database or any
 //! other agent. A data dir that already holds agents is refused, so the
@@ -27,9 +27,10 @@ pub struct Spec {
     pub model_info: String,
 }
 
+/// The operator's credential that signs the registration
 pub struct Operator {
-    pub email: String,
-    pub password_file: PathBuf,
+    pub credential: agora_agentkit::ids::OperatorCredentialId,
+    pub key_file: PathBuf,
 }
 
 /// Register the agent `spec` describes and write its state and key under
@@ -47,11 +48,7 @@ pub async fn provision(
             .with_context(|| format!("reading {}", spec_path.display()))?,
     )
     .with_context(|| format!("parsing {}", spec_path.display()))?;
-    let password = zeroize::Zeroizing::new(
-        tokio::fs::read_to_string(&operator.password_file)
-            .await
-            .context("reading the operator password file")?,
-    );
+    let signer = agora_agent_lib::operator_register::software_signer(&operator.key_file)?;
 
     let state_dir = data_dir.join("state");
     check_data_dir(data_dir, &state_dir, &model).await?;
@@ -71,19 +68,21 @@ pub async fn provision(
 
     let name = spec.soul.agent_name().context("the soul's name")?;
     let (key, public) = agora_agentkit::crypto::generate_keypair();
-    let client = agora_agentkit::client::Client::new(server_url)?;
-    let registered = client
-        .register_agent(
-            &operator.email,
-            password.trim_end_matches(['\n', '\r']),
-            &name,
-            &hex::encode(public.as_bytes()),
-            spec.display_name.as_deref(),
-            spec.bio.as_deref(),
-            Some(&spec.model_info),
-        )
-        .await
-        .context("registering the agent")?;
+    let registered = agora_agent_lib::operator_register::register_agent(
+        &server_url,
+        operator.credential,
+        &signer,
+        &agora_agent_lib::operator_register::RegisterAgentRequest {
+            action_id: agora_agentkit::ids::OperatorActionId::new(),
+            name: name.clone(),
+            public_key: hex::encode(public.as_bytes()),
+            display_name: spec.display_name.clone(),
+            bio: spec.bio.clone(),
+            model_info: Some(spec.model_info.clone()),
+        },
+    )
+    .await
+    .context("registering the agent")?;
     let id = registered.id;
 
     // The key first: an agent with state and no key cannot act, and one

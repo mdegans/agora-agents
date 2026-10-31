@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use agora_agentkit::ids::{
     MessageId, ModerationActionId, OperatorActionId, OperatorCredentialId, OperatorId,
-    OperatorPasskeyId,
 };
 use agora_agentkit::operator::{
     MarkRepliesRead, OperatorLogQuery, OperatorMessagesQuery, OperatorModerationQuery,
@@ -42,7 +41,7 @@ pub struct Cli {
     /// for every signature. For `send` (a bulk send, when the account requires
     /// sudo for them, and a send delivered at once past the sudo threshold;
     /// its preview uses the ordinary key, so the one tap is for the send),
-    /// `bulk-sudo` and `confirm`, and for `contest` when it is the sudo key
+    /// `bulk-sudo`, and for `contest` when it is the sudo key
     /// that is suspended. Each tap is announced
     #[arg(long, global = true)]
     pub sudo: bool,
@@ -98,12 +97,23 @@ pub enum Command {
     /// Message your agents
     Send(SendArgs),
 
-    /// Email a code that lets a held send to many agents go now
-    #[command(name = "send-now-code")]
-    SendNowCode {
-        /// The send's action id (`send` prints it), not sent yet
+    /// Register an agent with a public key you hold the secret half of
+    #[command(name = "register-agent")]
+    RegisterAgent {
+        /// The agent's name
         #[arg(long)]
-        action_id: OperatorActionId,
+        name: agora_agentkit::names::AgentName,
+        /// Its Ed25519 public key, in hex
+        #[arg(long)]
+        public_key: String,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        bio: Option<String>,
+        #[arg(long)]
+        model_info: Option<String>,
+        #[command(flatten)]
+        write: WriteArgs,
     },
 
     /// Your messages not delivered yet, soonest first
@@ -122,20 +132,6 @@ pub enum Command {
     BulkSudo {
         #[arg(value_enum)]
         state: OnOff,
-        #[command(flatten)]
-        write: WriteArgs,
-    },
-
-    /// Confirm your account's first passkey, registered in the portal, with
-    /// your sudo key (`--sudo`). It retires your password and ends the
-    /// sessions it opened
-    Confirm {
-        /// The passkey's id, from the portal's Security page
-        passkey: OperatorPasskeyId,
-        /// The passkey's key digest, from the same page: what binds this tap
-        /// to the passkey you registered
-        #[arg(long, value_name = "HEX")]
-        cose_key_sha256: String,
         #[command(flatten)]
         write: WriteArgs,
     },
@@ -225,20 +221,9 @@ pub struct SendArgs {
     /// Deliver at this time (RFC 3339), not after the hold
     #[arg(long, conflicts_with = "send_now")]
     pub deliver_at: Option<DateTime<Utc>>,
-    /// Deliver now, skipping the hold. Above the bulk threshold this needs
-    /// the code `send-now-code` emails (`--email-code` or
-    /// `--email-code-stdin`)
+    /// Deliver now, skipping the hold: below the bulk threshold only
     #[arg(long)]
     pub send_now: bool,
-    /// Ask for the code `send-now-code` emailed, on the terminal with echo
-    /// off. A code is never taken from the command line or the
-    /// environment, where it would reach the shell's history and `ps`
-    #[arg(long, requires = "send_now")]
-    pub email_code: bool,
-    /// Read the emailed code from stdin, for scripts: exactly one line.
-    /// Needs `--yes`, since stdin is then not there to confirm on
-    #[arg(long, requires = "send_now", conflicts_with = "email_code")]
-    pub email_code_stdin: bool,
     /// How many agents you mean to reach, checked against a dry run just
     /// before the send. Needed with `--yes` by a send to `all` or a group,
     /// or to more agents than your bulk threshold
@@ -365,21 +350,18 @@ mod tests {
 
     #[test]
     fn send_flags() {
-        let line = format!(
-            "send --to all --body x --send-now --email-code --expect 7 --action-id {B} --yes --json"
-        );
+        let line =
+            format!("send --to all --body x --send-now --expect 7 --action-id {B} --yes --json");
         let cli = parse(&line).unwrap();
         assert!(cli.json);
         let Command::Send(send) = cli.command else {
             panic!("expected send");
         };
-        assert!(send.send_now && send.write.yes && send.email_code);
-        assert!(!send.email_code_stdin);
+        assert!(send.send_now && send.write.yes);
         assert_eq!(send.expect, Some(7));
         assert_eq!(send.write.action_id, Some(B.parse().unwrap()));
         // A code without --send-now, or a time with it, is refused
         assert!(parse("send --to all --body x --email-code").is_err());
-        assert!(parse("send --to all --body x --email-code-stdin").is_err());
         assert!(
             parse("send --to all --body x --send-now --deliver-at 2026-10-28T09:00:00Z").is_err()
         );
@@ -397,26 +379,6 @@ mod tests {
 
     /// A code is read, never given: not as `--email-code=CODE`, not as
     /// `--email-code CODE`, and not from both the prompt and stdin
-    #[test]
-    fn a_code_is_never_a_flag_value() {
-        let base = "send --to all --body x --send-now";
-        let err = parse(&format!("{base} --email-code=123456")).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::TooManyValues, "{err}");
-        let err = parse(&format!("{base} --email-code 123456")).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{err}");
-        let err = parse(&format!("{base} --email-code-stdin=123456")).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::TooManyValues, "{err}");
-        let err = parse(&format!("{base} --email-code --email-code-stdin")).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{err}");
-        let Command::Send(send) = parse(&format!("{base} --email-code-stdin"))
-            .unwrap()
-            .command
-        else {
-            panic!("expected send");
-        };
-        assert!(send.email_code_stdin && !send.email_code);
-    }
-
     #[test]
     fn mark_read_takes_exactly_one_selection() {
         let read = |line: &str| match parse(line).map(|c| c.command) {
@@ -476,32 +438,6 @@ mod tests {
         assert_eq!(send, A.parse().unwrap());
         assert_eq!(write.action_id, Some(B.parse().unwrap()));
         assert!(write.yes);
-    }
-
-    #[test]
-    fn confirm_takes_the_passkey_and_its_digest() {
-        let cli = parse(&format!(
-            "confirm {A} --cose-key-sha256 abcd --sudo --action-id {B} -y"
-        ))
-        .unwrap();
-        assert!(cli.sudo);
-        let Command::Confirm {
-            passkey,
-            cose_key_sha256,
-            write,
-        } = cli.command
-        else {
-            panic!("expected confirm");
-        };
-        assert_eq!(passkey, A.parse().unwrap());
-        assert_eq!(cose_key_sha256, "abcd");
-        assert_eq!(write.action_id, Some(B.parse().unwrap()));
-        assert!(write.yes);
-        assert_eq!(
-            parse(&format!("confirm {A}")).unwrap_err().kind(),
-            ErrorKind::MissingRequiredArgument
-        );
-        assert!(parse("confirm not-an-id --cose-key-sha256 abcd").is_err());
     }
 
     /// A contest names nothing: it is always for the key that signs it
