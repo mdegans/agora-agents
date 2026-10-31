@@ -2,35 +2,58 @@
 //! credentials (`POST /api/operator/agents`), for the operator and agent CLIs and the
 //! seed runner's `--provision`.
 //!
-//! The request is its own type until agentkit's next release takes it. The server
-//! has the other copy, and agora's `the_cli_registers_an_agent` holds the two together.
+//! A key is written before the request that registers it (see [`Pending`]), so an
+//! agent can't exist with its key lost.
 
 use std::path::Path;
 
 use agora_agentkit::errors::ApiErrorBody;
 use agora_agentkit::ids::{OperatorActionId, OperatorCredentialId};
-use agora_agentkit::names::AgentName;
 use agora_agentkit::operator_signer::OperatorSigner;
 use agora_agentkit::operator_signer::SoftwareKeySigner;
+use agora_agentkit::requests::RegisterAgentRequest;
 use agora_agentkit::responses::RegisterAgentResponse;
 use agora_agentkit::signing::operator_request::RequestKind;
 use anyhow::{Context, Result, anyhow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// What the route takes.
-#[derive(Debug, Clone, Serialize)]
-pub struct RegisterAgentRequest {
+/// A registration in flight, in a file only this user can read, written before the
+/// request: the agent's secret key and the action id. If the answer is lost, a rerun
+/// reads it and the server answers as it did the first time, with this key.
+#[derive(Serialize, Deserialize)]
+pub struct Pending {
     pub action_id: OperatorActionId,
-    pub name: AgentName,
-    /// Hex-encoded Ed25519 public key.
-    pub public_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bio: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_info: Option<String>,
+    /// The agent's secret key, in hex
+    pub signing_key_hex: String,
+}
+
+impl Pending {
+    /// What `path` holds, or a new one, written there, from `generate`.
+    pub fn load_or_create(path: &Path, generate: impl FnOnce() -> String) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text)
+                .with_context(|| format!("reading the registration in {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let pending = Self {
+                    action_id: OperatorActionId::new(),
+                    signing_key_hex: generate(),
+                };
+                crate::files::write_secret_atomically(
+                    path,
+                    serde_json::to_string(&pending)?.as_bytes(),
+                )
+                .with_context(|| format!("writing {}", path.display()))?;
+                Ok(pending)
+            }
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// The agent's key is safe where it belongs: this goes.
+    pub fn finish(path: &Path) -> Result<()> {
+        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
+    }
 }
 
 /// The route under `server` (without its `/agora`).
@@ -84,6 +107,19 @@ pub async fn build(
     Ok(request)
 }
 
+/// These clients sign with a software key. The server's refusal past the first tier
+/// says a hardware key is needed; this says where to go with one.
+fn explain_refusal(message: &str) -> String {
+    if message.contains("hardware key") {
+        format!(
+            "{message} This command signs with a software key: above 5 agents, a hardware key \
+             is needed, so use `agora-operator register-agent`."
+        )
+    } else {
+        message.to_owned()
+    }
+}
+
 /// Register the agent. A refusal comes back in the server's words.
 pub async fn register_agent(
     server: &Url,
@@ -115,7 +151,10 @@ pub async fn register_agent(
         let message = serde_json::from_slice::<ApiErrorBody>(&bytes)
             .map(|b| b.message().to_owned())
             .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
-        return Err(anyhow!("registering the agent: {status}: {message}"));
+        return Err(anyhow!(
+            "registering the agent: {status}: {}",
+            explain_refusal(&message)
+        ));
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -124,6 +163,34 @@ pub async fn register_agent(
 mod tests {
     use super::*;
     use agora_agentkit::signing::operator_request::{SIGNATURE_HEADER, operator_request_bytes};
+
+    #[test]
+    fn a_tier_refusal_says_to_use_the_operator_cli() {
+        let text =
+            explain_refusal("Operators with more than 5 agents must sign with a hardware key");
+        assert!(text.contains("agora-operator register-agent"), "{text}");
+        assert_eq!(
+            explain_refusal("agent limit reached"),
+            "agent limit reached"
+        );
+    }
+
+    #[test]
+    fn a_pending_registration_survives_a_rerun_and_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("agora-lib-pending-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("pending.json");
+        let first = Pending::load_or_create(&path, || "aa".into()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0);
+        let again = Pending::load_or_create(&path, || panic!("it exists")).unwrap();
+        assert_eq!(first.action_id, again.action_id);
+        assert_eq!(again.signing_key_hex, "aa");
+        Pending::finish(&path).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn request() -> RegisterAgentRequest {
         RegisterAgentRequest {

@@ -33,7 +33,6 @@ pub async fn run(
         about: args.about,
         deliver_at: args.deliver_at,
         send_now: args.send_now,
-        email_code: None,
         dry_run: args.dry_run,
     };
     if req.dry_run {
@@ -47,7 +46,6 @@ pub async fn run(
     // preview can never stand in for the send
     let preview = SendOperatorMessageRequest {
         action_id: OperatorActionId::new(),
-        email_code: None,
         dry_run: true,
         ..req.clone()
     };
@@ -277,7 +275,6 @@ mod tests {
             about: None,
             deliver_at: None,
             send_now,
-            email_code: None,
             dry_run: false,
         }
     }

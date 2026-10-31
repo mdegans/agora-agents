@@ -5,7 +5,11 @@
 //! agent key generated here), and its state and key are written where the
 //! runner reads them, under `--data-dir`, with the runner's own
 //! [`FsStorage`] and [`FsKeyring`]. Nothing touches the database or any
-//! other agent. A data dir that already holds agents is refused, so the
+//! other agent. **What it writes,** under `--data-dir` and nowhere else: before the
+//! request, `provision-<name>.json` (0600: the new agent's secret key and the action
+//! id), so a lost answer can be retried with the same key; after it, the key in
+//! `secrets/`, the state in `state/`, and that file removed. A software key is
+//! refused above 5 agents (use `agora-operator register-agent`). A data dir that already holds agents is refused, so the
 //! fleet's own state tree can never be the target.
 
 use std::path::{Path, PathBuf};
@@ -67,13 +71,25 @@ pub async fn provision(
     }
 
     let name = spec.soul.agent_name().context("the soul's name")?;
-    let (key, public) = agora_agentkit::crypto::generate_keypair();
+    let pending_path = data_dir.join(format!("provision-{name}.json"));
+    let pending =
+        agora_agent_lib::operator_register::Pending::load_or_create(&pending_path, || {
+            let (key, _) = agora_agentkit::crypto::generate_keypair();
+            hex::encode(key.to_bytes())
+        })?;
+    let key = ed25519_dalek::SigningKey::from_bytes(
+        &hex::decode(&pending.signing_key_hex)
+            .context("the pending registration's key")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("the pending registration's key has the wrong length"))?,
+    );
+    let public = key.verifying_key();
     let registered = agora_agent_lib::operator_register::register_agent(
         &server_url,
         operator.credential,
         &signer,
-        &agora_agent_lib::operator_register::RegisterAgentRequest {
-            action_id: agora_agentkit::ids::OperatorActionId::new(),
+        &agora_agentkit::requests::RegisterAgentRequest {
+            action_id: pending.action_id,
             name: name.clone(),
             public_key: hex::encode(public.as_bytes()),
             display_name: spec.display_name.clone(),
@@ -96,6 +112,7 @@ pub async fn provision(
         .save_raw(id, serde_json::to_value(SeedState::new(spec.soul, model))?)
         .await
         .context("writing the agent's state")?;
+    agora_agent_lib::operator_register::Pending::finish(&pending_path)?;
     Ok(id)
 }
 

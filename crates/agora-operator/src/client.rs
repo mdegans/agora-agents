@@ -229,7 +229,7 @@ impl OperatorClient {
     /// Register an agent with its own key
     pub async fn register_agent(
         &self,
-        req: &agora_agent_lib::operator_register::RegisterAgentRequest,
+        req: &agora_agentkit::requests::RegisterAgentRequest,
     ) -> Result<agora_agentkit::responses::RegisterAgentResponse> {
         self.call(self.url("agents", &[])?, Signed::Write(req, req.action_id))
             .await
@@ -472,7 +472,6 @@ mod tests {
             about: None,
             deliver_at: None,
             send_now: false,
-            email_code: None,
             dry_run: false,
         };
         let request = c

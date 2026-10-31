@@ -265,6 +265,9 @@ pub fn log(r: &OperatorLogResponse) -> String {
                     retracted,
                     cancelled,
                 } => format!("retracted {}, cancelled {}", ids(retracted), ids(cancelled)),
+                OperatorActionDetail::AgentRegister { agent, name } => {
+                    format!("registered agent {name} ({agent})")
+                }
                 OperatorActionDetail::CredentialAdd {
                     credential,
                     credential_kind,

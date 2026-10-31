@@ -28,20 +28,10 @@ async fn main() -> ExitCode {
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Error: {}", in_plain_words(&format!("{e:#}")));
+            eprintln!("Error: {e:#}");
             ExitCode::FAILURE
         }
     }
-}
-
-/// An error as the operator should read it. A PIV touch timeout returns the same
-/// status as a missing PIN ("security status not satisfied"), so agentkit's
-/// `PinRequired` can mean either, and its text names only the PIN.
-fn in_plain_words(message: &str) -> String {
-    message.replace(
-        &agora_agentkit::operator_signer::SignerError::PinRequired.to_string(),
-        "the hardware key needs its PIN first, or wasn't touched in time",
-    )
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -166,7 +156,7 @@ async fn run(cli: Cli) -> Result<()> {
             let client = open(&config).await?;
             let action = write_action(&client, &write, &format!("Register agent {name}"))?;
             let answer = client
-                .register_agent(&agora_agent_lib::operator_register::RegisterAgentRequest {
+                .register_agent(&agora_agentkit::requests::RegisterAgentRequest {
                     action_id: action,
                     name,
                     public_key,
@@ -367,17 +357,6 @@ mod tests {
             Cli::try_parse_from(std::iter::once("agora-operator").chain(line.split_whitespace()))
                 .unwrap();
         check_sudo_flag(&cli.command, cli.sudo)
-    }
-
-    #[test]
-    fn a_pin_or_touch_failure_says_either() {
-        let e = agora_agentkit::operator_signer::SignerError::PinRequired.to_string();
-        let shown = in_plain_words(&format!("signing the request: {e}"));
-        assert_eq!(
-            shown,
-            "signing the request: the hardware key needs its PIN first, or wasn't touched in time"
-        );
-        assert_eq!(in_plain_words("nothing to do"), "nothing to do");
     }
 
     #[test]
