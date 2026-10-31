@@ -175,20 +175,20 @@ struct Args {
     test_alert: bool,
 
     /// Create a test agent for the bridge endpoint, then exit: register
-    /// it through the public API under `--provision-operator` (as any
+    /// it through the public API with `--provision-credential` (as any
     /// operator could), from this spec (`soul`, `display_name`, `bio`,
     /// `model_info`), and write its state and key under `--data-dir`, on
     /// the bridge's model. Refuses a data dir that holds a fleet.
-    #[arg(long, requires_all = ["provision_operator", "provision_password_file", "data_dir"])]
+    #[arg(long, requires_all = ["provision_credential", "provision_key_file", "data_dir"])]
     provision: Option<PathBuf>,
 
-    /// The operator's email, for `--provision`
+    /// The operator credential that signs the registration, for `--provision`
     #[arg(long)]
-    provision_operator: Option<String>,
+    provision_credential: Option<agora_agentkit::ids::OperatorCredentialId>,
 
-    /// A file holding the operator's password, for `--provision`
+    /// The file holding that credential's software key, for `--provision`
     #[arg(long)]
-    provision_password_file: Option<PathBuf>,
+    provision_key_file: Option<PathBuf>,
 
     /// How long a `SIGTERM` stop (end the turn, then close) may take before
     /// the runner exits at once, cutting the sessions in flight. The
@@ -1374,15 +1374,15 @@ async fn run(held: &mut Held) -> Result<()> {
     if args.consent_queue {
         return print_consent_queue(&args);
     }
-    if let (Some(spec), Some(email), Some(password_file), Some(data_dir)) = (
+    if let (Some(spec), Some(credential), Some(key_file), Some(data_dir)) = (
         &args.provision,
-        &args.provision_operator,
-        &args.provision_password_file,
+        args.provision_credential,
+        &args.provision_key_file,
         &args.data_dir,
     ) {
         let operator = provision::Operator {
-            email: email.clone(),
-            password_file: password_file.clone(),
+            credential,
+            key_file: key_file.clone(),
         };
         let id = provision::provision(
             spec,

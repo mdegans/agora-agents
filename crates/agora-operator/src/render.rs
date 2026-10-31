@@ -7,11 +7,11 @@ use agora_agentkit::ids::MessageId;
 use agora_agentkit::moderation::ReversalStatus;
 use agora_agentkit::operator::{
     AgentGroupsResponse, AgentRef, BulkSudoResponse, CancelReason, CredentialContestResponse,
-    CredentialRef, FactorRef, FirstPasskeyConfirmResponse, MarkRepliesReadResponse,
-    OperatorActionDetail, OperatorAgentsResponse, OperatorConfigChange, OperatorConfigResponse,
-    OperatorLogResponse, OperatorMessageContent, OperatorMessagesResponse,
-    OperatorModerationResponse, RecordDefect, ScheduledMessagesResponse, SendNowCodeResponse,
-    SendOperatorMessageResponse, SuspensionCauseRecord, WithdrawalResponse,
+    CredentialRef, FactorRef, MarkRepliesReadResponse, OperatorActionDetail,
+    OperatorAgentsResponse, OperatorConfigChange, OperatorConfigResponse, OperatorLogResponse,
+    OperatorMessageContent, OperatorMessagesResponse, OperatorModerationResponse, RecordDefect,
+    ScheduledMessagesResponse, SendOperatorMessageResponse, SuspensionCauseRecord,
+    WithdrawalResponse,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -123,28 +123,11 @@ pub fn bulk_sudo(r: &BulkSudoResponse) -> String {
     )
 }
 
-pub fn confirmed(r: &FirstPasskeyConfirmResponse) -> String {
-    format!(
-        "Passkey {} is confirmed and your password is retired; {} session{} it opened ended.",
-        r.passkey,
-        r.password_sessions_ended,
-        plural(r.password_sessions_ended as usize)
-    )
-}
-
 pub fn contested(r: &CredentialContestResponse) -> String {
     format!(
         "Contested: recovery case {}. The key stays suspended until manual recovery decides, \
          which needs a video call to check your identity.",
         r.case
-    )
-}
-
-pub fn send_now_code(r: &SendNowCodeResponse) -> String {
-    format!(
-        "A code was emailed to you; it expires at {}. Send with \
-         `--send-now --email-code` and the same --action-id.",
-        time(&r.expires_at)
     )
 }
 
@@ -282,6 +265,9 @@ pub fn log(r: &OperatorLogResponse) -> String {
                     retracted,
                     cancelled,
                 } => format!("retracted {}, cancelled {}", ids(retracted), ids(cancelled)),
+                OperatorActionDetail::AgentRegister { agent, name } => {
+                    format!("registered agent {name} ({agent})")
+                }
                 OperatorActionDetail::CredentialAdd {
                     credential,
                     credential_kind,
@@ -291,6 +277,7 @@ pub fn log(r: &OperatorLogResponse) -> String {
                     nickname,
                     yubikey,
                     synced,
+                    key_sha256: _,
                     approved_by,
                     replaced,
                 } => {
@@ -525,6 +512,10 @@ fn preview(body: &str) -> String {
     }
 }
 
+pub fn registered(r: &agora_agentkit::responses::RegisterAgentResponse) -> String {
+    format!("Agent {} is registered: {}.", r.name, r.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +606,7 @@ mod tests {
                     nickname: "Bio".into(),
                     yubikey,
                     synced,
+                    key_sha256: None,
                     approved_by,
                     replaced,
                 },
@@ -643,6 +635,7 @@ mod tests {
                 yubikey: true,
                 synced: false,
                 approved_by: None,
+                key_sha256: None,
                 replaced: None,
             },
         );
@@ -744,21 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_and_contest_answers_read() {
-        let passkey = agora_agentkit::ids::OperatorPasskeyId::new();
-        let one = confirmed(&FirstPasskeyConfirmResponse {
-            passkey,
-            password_sessions_ended: 1,
-        });
-        assert!(
-            one.contains(&passkey.to_string()) && one.contains("1 session it"),
-            "{one}"
-        );
-        let two = confirmed(&FirstPasskeyConfirmResponse {
-            passkey,
-            password_sessions_ended: 2,
-        });
-        assert!(two.contains("2 sessions it"), "{two}");
+    fn a_contest_answer_reads() {
         let case = agora_agentkit::ids::OperatorRecoveryCaseId::new();
         assert!(contested(&CredentialContestResponse { case }).contains(&case.to_string()));
     }

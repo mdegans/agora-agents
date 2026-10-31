@@ -7,7 +7,6 @@ mod shell;
 
 use std::process::ExitCode;
 
-use agora_agentkit::client::Client;
 use anyhow::Result;
 
 use cli::{Cli, Command};
@@ -54,17 +53,16 @@ pub async fn run(cli: Cli, session: &mut Option<Session>) -> Result<bool> {
         None => Ok(true),
         Some(Command::Register {
             name,
-            email,
-            password,
+            operator_credential,
+            operator_key_file,
             display_name,
             bio,
         }) => {
-            let client = Client::new(server.parse()?)?;
             register::run(
-                &client,
+                &server.parse()?,
                 &name,
-                &email,
-                &password,
+                operator_credential,
+                &operator_key_file,
                 display_name.as_deref(),
                 bio.as_deref(),
             )

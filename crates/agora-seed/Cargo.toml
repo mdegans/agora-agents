@@ -9,6 +9,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+agora-agent-lib = { path = "../agora-agent-lib" }
 agora-agentkit = { workspace = true }
 # Implementing agentkit's `Agent` trait (the model-consent wrapper) needs
 # the same macro the trait is declared with.
@@ -17,6 +18,7 @@ misanthropic = { workspace = true }
 tokio = { workspace = true }
 rmcp = { workspace = true }
 hex = { workspace = true }
+ed25519-dalek = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

@@ -34,8 +34,10 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "ed25519-dalek 2.2.0",
  "eventsource-stream",
  "futures-util",
+ "hex",
  "misanthropic",
  "rand 0.8.6",
  "reqwest",
@@ -54,9 +56,9 @@ dependencies = [
 
 [[package]]
 name = "agora-agentkit"
-version = "0.144.1"
+version = "0.146.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9383b5265cd8267fd3df9907b790757322b3ed891f4f22d0ae3f124019f8ec1"
+checksum = "b36569f4818a914454cfe5818876061500528252f01d7565f675643864db98ef"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -119,6 +121,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -145,12 +148,14 @@ dependencies = [
 name = "agora-seed"
 version = "0.1.0"
 dependencies = [
+ "agora-agent-lib",
  "agora-agentkit",
  "anyhow",
  "async-trait",
  "chrono",
  "clap",
  "dirs",
+ "ed25519-dalek 2.2.0",
  "hex",
  "lettre",
  "misanthropic",
