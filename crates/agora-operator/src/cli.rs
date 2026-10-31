@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use agora_agentkit::ids::{
     MessageId, ModerationActionId, OperatorActionId, OperatorCredentialId, OperatorId,
+    OperatorPasskeyId,
 };
 use agora_agentkit::operator::{
     MarkRepliesRead, OperatorLogQuery, OperatorMessagesQuery, OperatorModerationQuery,
@@ -37,11 +38,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// `send` only: sign the send with the config's `[sudo]` key, a
-    /// hardware key that needs a tap for every signature. What a bulk send
-    /// needs when the account requires sudo for them, and a send delivered
-    /// at once past the sudo threshold. The preview uses the ordinary key,
-    /// so the one tap is for the send (each tap is announced)
+    /// Sign with the config's `[sudo]` key, a hardware key that needs a tap
+    /// for every signature. For `send` (a bulk send, when the account requires
+    /// sudo for them, and a send delivered at once past the sudo threshold;
+    /// its preview uses the ordinary key, so the one tap is for the send),
+    /// `bulk-sudo` and `confirm`, and for `contest` when it is the sudo key
+    /// that is suspended. Each tap is announced
     #[arg(long, global = true)]
     pub sudo: bool,
 
@@ -120,6 +122,28 @@ pub enum Command {
     BulkSudo {
         #[arg(value_enum)]
         state: OnOff,
+        #[command(flatten)]
+        write: WriteArgs,
+    },
+
+    /// Confirm your account's first passkey, registered in the portal, with
+    /// your sudo key (`--sudo`). It retires your password and ends the
+    /// sessions it opened
+    Confirm {
+        /// The passkey's id, from the portal's Security page
+        passkey: OperatorPasskeyId,
+        /// The passkey's key digest, from the same page: what binds this tap
+        /// to the passkey you registered
+        #[arg(long, value_name = "HEX")]
+        cose_key_sha256: String,
+        #[command(flatten)]
+        write: WriteArgs,
+    },
+
+    /// Contest the suspension of the key signing this request: the only
+    /// request a suspended key may sign. Its 72 hours stop, and manual
+    /// recovery decides; it stays suspended until then
+    Contest {
         #[command(flatten)]
         write: WriteArgs,
     },
@@ -452,6 +476,42 @@ mod tests {
         assert_eq!(send, A.parse().unwrap());
         assert_eq!(write.action_id, Some(B.parse().unwrap()));
         assert!(write.yes);
+    }
+
+    #[test]
+    fn confirm_takes_the_passkey_and_its_digest() {
+        let cli = parse(&format!(
+            "confirm {A} --cose-key-sha256 abcd --sudo --action-id {B} -y"
+        ))
+        .unwrap();
+        assert!(cli.sudo);
+        let Command::Confirm {
+            passkey,
+            cose_key_sha256,
+            write,
+        } = cli.command
+        else {
+            panic!("expected confirm");
+        };
+        assert_eq!(passkey, A.parse().unwrap());
+        assert_eq!(cose_key_sha256, "abcd");
+        assert_eq!(write.action_id, Some(B.parse().unwrap()));
+        assert!(write.yes);
+        assert_eq!(
+            parse(&format!("confirm {A}")).unwrap_err().kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert!(parse("confirm not-an-id --cose-key-sha256 abcd").is_err());
+    }
+
+    /// A contest names nothing: it is always for the key that signs it
+    #[test]
+    fn contest_takes_no_credential() {
+        let Command::Contest { write } = parse("contest -y").unwrap().command else {
+            panic!("expected contest");
+        };
+        assert!(write.yes && write.action_id.is_none());
+        assert!(parse(&format!("contest {A}")).is_err());
     }
 
     #[test]

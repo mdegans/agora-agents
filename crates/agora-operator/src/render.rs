@@ -6,11 +6,12 @@ use agora_agentkit::enums::MessageKind;
 use agora_agentkit::ids::MessageId;
 use agora_agentkit::moderation::ReversalStatus;
 use agora_agentkit::operator::{
-    AgentGroupsResponse, AgentRef, BulkSudoResponse, CancelReason, CredentialRef,
-    MarkRepliesReadResponse, OperatorActionDetail, OperatorAgentsResponse, OperatorConfigChange,
-    OperatorConfigResponse, OperatorLogResponse, OperatorMessageContent, OperatorMessagesResponse,
+    AgentGroupsResponse, AgentRef, BulkSudoResponse, CancelReason, CredentialContestResponse,
+    CredentialRef, FactorRef, FirstPasskeyConfirmResponse, MarkRepliesReadResponse,
+    OperatorActionDetail, OperatorAgentsResponse, OperatorConfigChange, OperatorConfigResponse,
+    OperatorLogResponse, OperatorMessageContent, OperatorMessagesResponse,
     OperatorModerationResponse, RecordDefect, ScheduledMessagesResponse, SendNowCodeResponse,
-    SendOperatorMessageResponse, WithdrawalResponse,
+    SendOperatorMessageResponse, SuspensionCauseRecord, WithdrawalResponse,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -122,6 +123,23 @@ pub fn bulk_sudo(r: &BulkSudoResponse) -> String {
     )
 }
 
+pub fn confirmed(r: &FirstPasskeyConfirmResponse) -> String {
+    format!(
+        "Passkey {} is confirmed and your password is retired; {} session{} it opened ended.",
+        r.passkey,
+        r.password_sessions_ended,
+        plural(r.password_sessions_ended as usize)
+    )
+}
+
+pub fn contested(r: &CredentialContestResponse) -> String {
+    format!(
+        "Contested: recovery case {}. The key stays suspended until manual recovery decides, \
+         which needs a video call to check your identity.",
+        r.case
+    )
+}
+
 pub fn send_now_code(r: &SendNowCodeResponse) -> String {
     format!(
         "A code was emailed to you; it expires at {}. Send with \
@@ -230,9 +248,15 @@ pub fn log(r: &OperatorLogResponse) -> String {
     r.entries
         .iter()
         .map(|e| {
-            let by = match &e.credential {
-                Some(c) => format!("key {}", credential(c)),
-                None => "portal".into(),
+            let by = match (&e.credential, &e.detail) {
+                (Some(c), _) => format!("key {}", credential(c)),
+                // Only the 72-hour sweep revokes a passkey
+                (None, OperatorActionDetail::PasskeyRevoke { .. }) => "the 72-hour deadline".into(),
+                // Before suspension, the portal revoked keys; now only the sweep
+                (None, OperatorActionDetail::CredentialRevoke { .. }) => {
+                    "the portal or the 72-hour deadline".into()
+                }
+                (None, _) => "portal".into(),
             };
             let what = match &e.detail {
                 OperatorActionDetail::DmSend {
@@ -262,9 +286,67 @@ pub fn log(r: &OperatorLogResponse) -> String {
                     credential,
                     credential_kind,
                 } => format!("added {credential_kind} {}", self::credential(credential)),
+                OperatorActionDetail::PasskeyAdd {
+                    passkey,
+                    nickname,
+                    yubikey,
+                    synced,
+                    approved_by,
+                    replaced,
+                } => {
+                    let class = match (yubikey, synced) {
+                        (true, _) => "YubiKey",
+                        (false, true) => "synced",
+                        (false, false) => "device-bound",
+                    };
+                    let mut s = format!("added {class} passkey {nickname} ({passkey})");
+                    if let Some(approver) = approved_by {
+                        let _ = write!(s, ", approved by passkey {approver}");
+                    }
+                    if let Some(old) = replaced {
+                        let _ = write!(s, ", replacing passkey {old}");
+                    }
+                    s
+                }
                 OperatorActionDetail::CredentialRevoke { credential } => {
                     format!("revoked {}", self::credential(credential))
                 }
+                OperatorActionDetail::PasskeyRevoke { passkey, nickname } => {
+                    format!("revoked passkey {nickname} ({passkey}), uncontested")
+                }
+                OperatorActionDetail::CredentialSuspend {
+                    target,
+                    cause,
+                    deadline,
+                } => {
+                    let why = match cause {
+                        SuspensionCauseRecord::Direct { by } => {
+                            format!("by a tap of {}", factor(by))
+                        }
+                        SuspensionCauseRecord::Cascade {
+                            root,
+                            root_entry,
+                            by,
+                        } => format!(
+                            "because {} approved it (entry {root_entry}), by a tap of {}",
+                            factor(root),
+                            factor(by)
+                        ),
+                    };
+                    format!(
+                        "suspended {} {why}, revoked after {} unless contested",
+                        factor(target),
+                        time(deadline)
+                    )
+                }
+                OperatorActionDetail::CredentialContest {
+                    target,
+                    suspension,
+                    case,
+                } => format!(
+                    "{} contested its suspension (entry {suspension}): recovery case {case}",
+                    factor(target)
+                ),
                 OperatorActionDetail::ConfigChangeEffective { change } => match change {
                     OperatorConfigChange::BulkRequiresSudo { value: true } => {
                         "bulk sends need sudo from now on".to_owned()
@@ -288,6 +370,14 @@ fn credential(c: &CredentialRef) -> String {
     }
 }
 
+/// A passkey or signing key, by its name and id
+fn factor(f: &FactorRef) -> String {
+    match f {
+        FactorRef::Passkey { id, nickname } => format!("passkey {nickname} ({id})"),
+        FactorRef::Credential { id, label } => format!("key {label} ({id})"),
+    }
+}
+
 /// Why a cancel happened, as the log reader needs it
 pub fn cancel_reason(reason: CancelReason) -> &'static str {
     match reason {
@@ -296,6 +386,12 @@ pub fn cancel_reason(reason: CancelReason) -> &'static str {
         CancelReason::AgentDeparted => "the agent left before delivery",
         CancelReason::OperatorBanned => "the account was banned before delivery",
         CancelReason::CredentialRevoked => "the signing key was revoked before delivery",
+        CancelReason::PasswordRetired => {
+            "your first passkey retired the password, ending the session that sent it"
+        }
+        CancelReason::FactorNotEffective => {
+            "what sent it was suspended, contested or revoked before delivery"
+        }
     }
 }
 
@@ -493,6 +589,178 @@ mod tests {
             assert!(text.contains(cancel_reason(reason)), "{text}");
             assert!(text.contains("by portal"), "{text}");
         }
+    }
+
+    fn entry_text(credential: Option<CredentialRef>, detail: OperatorActionDetail) -> String {
+        use agora_agentkit::ids::OperatorActionId;
+        use agora_agentkit::operator::{OperatorLogEntry, OperatorLogResponse};
+        log(&OperatorLogResponse {
+            entries: vec![OperatorLogEntry {
+                id: OperatorActionId::new(),
+                credential,
+                detail,
+                created_at: Utc::now(),
+            }],
+        })
+    }
+
+    #[test]
+    fn the_log_says_how_a_passkey_came() {
+        use agora_agentkit::ids::OperatorPasskeyId;
+        let add = |yubikey, synced, approved_by, replaced| {
+            entry_text(
+                None,
+                OperatorActionDetail::PasskeyAdd {
+                    passkey: OperatorPasskeyId::new(),
+                    nickname: "Bio".into(),
+                    yubikey,
+                    synced,
+                    approved_by,
+                    replaced,
+                },
+            )
+        };
+        assert!(add(true, false, None, None).contains("added YubiKey passkey Bio"));
+        assert!(add(false, true, None, None).contains("added synced passkey Bio"));
+        assert!(add(false, false, None, None).contains("added device-bound passkey Bio"));
+        let (approver, old) = (OperatorPasskeyId::new(), OperatorPasskeyId::new());
+        let text = add(false, false, Some(approver), Some(old));
+        assert!(
+            text.contains(&format!("approved by passkey {approver}")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("replacing passkey {old}")), "{text}");
+        // Confirmed by a sudo key: the entry's key is who approved it
+        let sudo = CredentialRef {
+            id: agora_agentkit::ids::OperatorCredentialId::new(),
+            label: Some("sudo".into()),
+        };
+        let text = entry_text(
+            Some(sudo.clone()),
+            OperatorActionDetail::PasskeyAdd {
+                passkey: OperatorPasskeyId::new(),
+                nickname: "Bio".into(),
+                yubikey: true,
+                synced: false,
+                approved_by: None,
+                replaced: None,
+            },
+        );
+        assert!(
+            text.ends_with(&format!("by key sudo ({})", sudo.id)),
+            "{text}"
+        );
+    }
+
+    /// A revocation with no key behind it is the deadline's, not the portal's
+    #[test]
+    fn the_log_says_what_revoked() {
+        let id = agora_agentkit::ids::OperatorPasskeyId::new();
+        let text = entry_text(
+            None,
+            OperatorActionDetail::PasskeyRevoke {
+                passkey: id,
+                nickname: "Old".into(),
+            },
+        );
+        assert!(
+            text.contains(&format!("revoked passkey Old ({id})")),
+            "{text}"
+        );
+        assert!(text.ends_with("by the 72-hour deadline"), "{text}");
+        let text = entry_text(
+            None,
+            OperatorActionDetail::CredentialRevoke {
+                credential: CredentialRef {
+                    id: agora_agentkit::ids::OperatorCredentialId::new(),
+                    label: None,
+                },
+            },
+        );
+        assert!(
+            text.ends_with("by the portal or the 72-hour deadline"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_log_says_why_a_factor_was_suspended_and_who_contested() {
+        use agora_agentkit::ids::{
+            OperatorActionId, OperatorCredentialId, OperatorPasskeyId, OperatorRecoveryCaseId,
+        };
+        let tapper = FactorRef::Passkey {
+            id: OperatorPasskeyId::new(),
+            nickname: "Tapper".into(),
+        };
+        let target = FactorRef::Credential {
+            id: OperatorCredentialId::new(),
+            label: "laptop".into(),
+        };
+        let deadline = Utc::now();
+        let direct = entry_text(
+            None,
+            OperatorActionDetail::CredentialSuspend {
+                target: target.clone(),
+                cause: SuspensionCauseRecord::Direct { by: tapper.clone() },
+                deadline,
+            },
+        );
+        assert!(direct.contains("suspended key laptop"), "{direct}");
+        assert!(direct.contains("by a tap of passkey Tapper"), "{direct}");
+        assert!(direct.contains(&time(&deadline)), "{direct}");
+        let root_entry = OperatorActionId::new();
+        let cascade = entry_text(
+            None,
+            OperatorActionDetail::CredentialSuspend {
+                target: target.clone(),
+                cause: SuspensionCauseRecord::Cascade {
+                    root: FactorRef::Passkey {
+                        id: OperatorPasskeyId::new(),
+                        nickname: "Root".into(),
+                    },
+                    root_entry,
+                    by: tapper,
+                },
+                deadline,
+            },
+        );
+        assert!(
+            cascade.contains("because passkey Root") && cascade.contains(&root_entry.to_string()),
+            "{cascade}"
+        );
+        let case = OperatorRecoveryCaseId::new();
+        let suspension = OperatorActionId::new();
+        let contest = entry_text(
+            None,
+            OperatorActionDetail::CredentialContest {
+                target,
+                suspension,
+                case,
+            },
+        );
+        assert!(contest.contains("key laptop"), "{contest}");
+        assert!(contest.contains(&suspension.to_string()), "{contest}");
+        assert!(contest.contains(&case.to_string()), "{contest}");
+    }
+
+    #[test]
+    fn confirm_and_contest_answers_read() {
+        let passkey = agora_agentkit::ids::OperatorPasskeyId::new();
+        let one = confirmed(&FirstPasskeyConfirmResponse {
+            passkey,
+            password_sessions_ended: 1,
+        });
+        assert!(
+            one.contains(&passkey.to_string()) && one.contains("1 session it"),
+            "{one}"
+        );
+        let two = confirmed(&FirstPasskeyConfirmResponse {
+            passkey,
+            password_sessions_ended: 2,
+        });
+        assert!(two.contains("2 sessions it"), "{two}");
+        let case = agora_agentkit::ids::OperatorRecoveryCaseId::new();
+        assert!(contested(&CredentialContestResponse { case }).contains(&case.to_string()));
     }
 
     #[test]

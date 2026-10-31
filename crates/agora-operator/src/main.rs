@@ -15,7 +15,9 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use agora_agentkit::ids::OperatorActionId;
-use agora_agentkit::operator::{BulkSudoRequest, OperatorActionRequest, SendNowCodeRequest};
+use agora_agentkit::operator::{
+    BulkSudoRequest, FirstPasskeyConfirmRequest, OperatorActionRequest, SendNowCodeRequest,
+};
 use anyhow::{Result, bail};
 use clap::Parser;
 use serde::Serialize;
@@ -54,16 +56,7 @@ async fn run(cli: Cli) -> Result<()> {
         OperatorClient::new(server, credential, config.signer().await?)
     };
     let json = cli.json;
-    // Only a send and bulk-sudo ever need sudo: a tap asked for anything
-    // else would teach the operator to tap without looking
-    match (&cli.command, sudo) {
-        (Command::Send(_), _) | (Command::BulkSudo { .. }, true) => {}
-        (Command::BulkSudo { .. }, false) => {
-            bail!("bulk-sudo needs --sudo: only a tap on the sudo key changes it")
-        }
-        (_, true) => bail!("--sudo is for `send` and `bulk-sudo` only: nothing else needs a tap"),
-        (_, false) => {}
-    }
+    check_sudo_flag(&cli.command, sudo)?;
     match cli.command {
         Command::Keygen { label, operator } => {
             keygen::run(&path, &mut config, &label, cli.server.as_ref(), operator).await
@@ -209,6 +202,50 @@ async fn run(cli: Cli) -> Result<()> {
                 .map_err(|e| retry_hint(e, action))?;
             show(json, &answer, render::bulk_sudo)
         }
+        Command::Confirm {
+            passkey,
+            cose_key_sha256,
+            write,
+        } => {
+            let client = open(&config).await?;
+            eprintln!(
+                "Confirms passkey {passkey}, with key digest {cose_key_sha256}, as your account's \
+                 first. Compare both with the portal's Security page. Your password is retired \
+                 and the sessions it opened end."
+            );
+            let action = write_action(&client, &write, "Confirm it")?;
+            if sudo {
+                eprintln!("Touch the sudo key now: this tap signs the confirmation.");
+            }
+            let answer = client
+                .confirm_first_passkey(
+                    passkey,
+                    &FirstPasskeyConfirmRequest {
+                        action_id: action,
+                        cose_key_sha256,
+                    },
+                )
+                .await
+                .map_err(|e| retry_hint(e, action))?;
+            show(json, &answer, render::confirmed)
+        }
+        Command::Contest { write } => {
+            let client = open(&config).await?;
+            eprintln!(
+                "Contests the suspension of the key signing this. Its 72 hours stop and a recovery \
+                 case opens. The key stays suspended until manual recovery decides, which needs a \
+                 video call to check your identity."
+            );
+            let action = write_action(&client, &write, "Contest it")?;
+            if sudo {
+                eprintln!("Touch the sudo key now: this tap signs the contest.");
+            }
+            let answer = client
+                .contest(&OperatorActionRequest { action_id: action })
+                .await
+                .map_err(|e| retry_hint(e, action))?;
+            show(json, &answer, render::contested)
+        }
         Command::Retract { message, write } => {
             let client = open(&config).await?;
             eprintln!(
@@ -245,6 +282,25 @@ async fn run(cli: Cli) -> Result<()> {
                 .map_err(|e| retry_hint(e, action))?;
             show(json, &answer, render::withdrawal)
         }
+    }
+}
+
+/// `--sudo` only where a tap on the sudo key means something: a tap asked for
+/// anything else would teach the operator to tap without looking. `confirm`
+/// takes the flag without insisting: the server says who may confirm. `contest`
+/// takes it for a suspended sudo key, which contests only for itself
+fn check_sudo_flag(command: &Command, sudo: bool) -> Result<()> {
+    match (command, sudo) {
+        (Command::Send(_) | Command::Confirm { .. } | Command::Contest { .. }, _)
+        | (Command::BulkSudo { .. }, true) => Ok(()),
+        (Command::BulkSudo { .. }, false) => {
+            bail!("bulk-sudo needs --sudo: only a tap on the sudo key changes it")
+        }
+        (_, true) => bail!(
+            "--sudo is for `send`, `bulk-sudo`, `confirm` and `contest` only: nothing else \
+             needs a tap"
+        ),
+        (_, false) => Ok(()),
     }
 }
 
@@ -304,5 +360,37 @@ pub fn retry_hint(e: anyhow::Error, action: OperatorActionId) -> anyhow::Error {
             "{e:#}\nIf it may have reached the server, retry with --action-id {action}: the \
              same id and request answer as the first did."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checked(line: &str) -> Result<()> {
+        let cli =
+            Cli::try_parse_from(std::iter::once("agora-operator").chain(line.split_whitespace()))
+                .unwrap();
+        check_sudo_flag(&cli.command, cli.sudo)
+    }
+
+    const ID: &str = "7ad26ccd-1111-4222-8333-444455556666";
+
+    #[test]
+    fn sudo_is_only_for_what_a_tap_means_something_on() {
+        for ok in [
+            format!("confirm {ID} --cose-key-sha256 ab --sudo"),
+            format!("confirm {ID} --cose-key-sha256 ab"),
+            "contest".to_owned(),
+            "contest --sudo".to_owned(),
+            "bulk-sudo on --sudo".to_owned(),
+            "send --to all --body x --sudo".to_owned(),
+            "agents".to_owned(),
+        ] {
+            assert!(checked(&ok).is_ok(), "{ok}");
+        }
+        for bad in ["bulk-sudo on", "agents --sudo", "log --sudo"] {
+            assert!(checked(bad).is_err(), "{bad}");
+        }
     }
 }
