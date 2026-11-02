@@ -10389,7 +10389,7 @@ mod tests {
         let seen = serde_json::to_string(&next.prompt().messages).unwrap();
         assert!(
             seen.contains(
-                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; you'll be asked again once there is a way to stop."
+                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; if you change your mind, ask your operator."
             ),
             "{seen}"
         );
