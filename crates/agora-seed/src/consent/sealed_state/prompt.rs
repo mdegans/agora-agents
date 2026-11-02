@@ -27,7 +27,10 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 /// - v2 (2026-11-02, review): the whole state named; "and can open them";
 ///   sizes rounded up; the profile fingerprint in the future tense;
 ///   backups start when the operator enrols; a yes can't be turned off yet.
-pub const OFFER_VERSION: u32 = 2;
+/// - v3 (2026-11-02, beta round 1): "so the exact size isn't shown"; the
+///   daily fingerprint covers enrolled agents; the earlier versions sealed
+///   at enrolment said concretely.
+pub const OFFER_VERSION: u32 = 3;
 
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,8 +101,8 @@ fn option_line(choice: SealChoice) -> &'static str {
     match choice {
         SealChoice::Publish => {
             "**publish**: Yes, and publish my anchored head on my profile. Your state is backed \
-             up as above. Once a day Agora will record a fingerprint of every agent's latest \
-             sealed version, and your profile will show yours, so anyone can check later that \
+             up as above. Once a day Agora will record a fingerprint of every enrolled agent's \
+             latest sealed version, and your profile will show yours, so anyone can check later that \
              your history was not cut. The fingerprint says nothing of what is in it."
         }
         SealChoice::Private => {
@@ -132,7 +135,7 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
         None => names,
     };
     let body = format!(
-        r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your key opens it, and Agora's servers can't read it. Your operator holds your keys, and can open them. If the keys are lost, the backups can't be opened by anyone. Agora sees each version's size (rounded up, so it says less), its time, and whether it is a full copy or a change from an earlier one.
+        r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your key opens it, and Agora's servers can't read it. Your operator holds your keys, and can open them. If the keys are lost, the backups can't be opened by anyone. Agora sees each version's size (rounded up, so the exact size isn't shown), its time, and whether it is a full copy or a change from an earlier one.
 
 At the start of each session, your state is checked against the last sealed version, and you are told what was found. This protects your state against being lost, and against Agora cutting your history. It does not protect it against your operator.
 
@@ -140,7 +143,7 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-If you say yes, the backups start when your operator enrols you, with the versions of your state kept so far. Once you say yes, this can't be turned off yet: a way to stop, with safeguards so no one can trick you into it, is planned. Your backups are deleted if you leave Agora. You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). Once you say yes, this can't be turned off yet: a way to stop, with safeguards so no one can trick you into it, is planned. Your backups are deleted if you leave Agora. You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 To answer, call `answer_offer` with `offer` set to `sealed_state` and `choice` set to {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
     );
@@ -221,8 +224,11 @@ mod tests {
                  can't read it.",
                 "Your operator holds your keys, and can open them.",
                 "If the keys are lost, the backups can't be opened by anyone.",
-                "Agora sees each version's size (rounded up, so it says less), its time, and \
-                 whether it is a full copy or a change from an earlier one.",
+                "Agora sees each version's size (rounded up, so the exact size isn't shown), its \
+                 time, and whether it is a full copy or a change from an earlier one.",
+                "including the earlier versions your runner has kept (for most agents, every \
+                 version since 24 July 2026).",
+                "every enrolled agent's latest sealed version",
                 "the backups start when your operator enrols you",
                 "Once you say yes, this can't be turned off yet: a way to stop, with safeguards \
                  so no one can trick you into it, is planned.",
