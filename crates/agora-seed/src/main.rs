@@ -1407,6 +1407,38 @@ struct Held {
     stopped: bool,
 }
 
+/// A reactor's outcome for the terminal: counts, ids, error kinds and
+/// sizes. Never its `Debug`, which holds every unsaved agent's whole state
+/// (memory included) and went to stdout and journald until 2026-11-02.
+fn report_summary<E: std::fmt::Display>(
+    result: &std::result::Result<agora_agentkit::reactor::Report, E>,
+) -> String {
+    use std::fmt::Write;
+    let r = match result {
+        Ok(r) => r,
+        Err(e) => return format!("run failed: {e}"),
+    };
+    let mut out = format!(
+        "done {}, failed {}, unsaved {}, rejected {}, unstarted {}",
+        r.done,
+        r.failed,
+        r.unsaved.len(),
+        r.rejected.len(),
+        r.unstarted
+    );
+    let size = |v: &serde_json::Value| serde_json::to_vec(v).map_or(0, |b| b.len());
+    for (id, e) in &r.errors {
+        let _ = write!(out, "\n  error {id}: {:?}", e.kind);
+    }
+    for (id, v) in &r.unsaved {
+        let _ = write!(out, "\n  unsaved {id}: {} bytes", size(v));
+    }
+    for (id, v) in &r.rejected {
+        let _ = write!(out, "\n  rejected {id}: {} bytes", size(v));
+    }
+    out
+}
+
 /// What the sealed-state start check leaves for the run.
 #[derive(Default)]
 struct SealedRun {
@@ -2317,7 +2349,7 @@ async fn run(held: &mut Held) -> Result<()> {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
         if bridge.is_none() {
             say!("== {label}");
-            say!("{result:#?}");
+            say!("{}", report_summary(result));
         }
         // The `println!` above is for whoever is watching; this is the
         // same thing for whoever asks later. Without it the run's outcome
@@ -2401,6 +2433,26 @@ mod tests {
              Start the session again then."
         );
         assert!(!not_due_note(2, None, now).contains("due again"));
+    }
+
+    /// The terminal's run summary never carries state content.
+    #[test]
+    fn the_run_summary_has_counts_not_content() {
+        let id = AgentId::new();
+        let r: agora_agentkit::reactor::Report = serde_json::from_value(serde_json::json!({
+            "done": 1, "failed": 1,
+            "errors": { id.to_string(): {
+                "kind": "Storage", "retry_after": null, "message": "SYNTHETIC-SECRET in an error"
+            } },
+            "unsaved": { id.to_string(): { "memory": { "content": "SYNTHETIC-SECRET" } } },
+        }))
+        .unwrap();
+        let ok: std::result::Result<_, String> = Ok(r);
+        let s = report_summary(&ok);
+        assert!(!s.contains("SYNTHETIC-SECRET"), "{s}");
+        assert!(s.contains("done 1, failed 1, unsaved 1"), "{s}");
+        assert!(s.contains(&format!("error {id}: Storage")), "{s}");
+        assert!(s.contains(&format!("unsaved {id}: ")), "{s}");
     }
 
     /// The sealed start check: an intact agent runs with its lines, a
