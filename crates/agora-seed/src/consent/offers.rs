@@ -54,6 +54,7 @@ use super::ledger::SWITCH_COOLDOWN_SESSIONS;
 use super::memory_restore::prompt::RestoreChoice;
 use super::prompt::OfferChoice;
 use super::role::prompt::RoleChoice;
+use super::sealed_state::prompt::SealChoice;
 
 /// The tool's name on the wire.
 pub const TOOL_NAME: &str = "answer_offer";
@@ -66,16 +67,18 @@ pub enum OfferKind {
     Role,
     Cadence,
     MemoryRestore,
+    SealedState,
 }
 
 impl OfferKind {
     /// Canonical order: the order offers are seated in, and the schema's.
     #[cfg(test)]
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ModelSwap,
         Self::Role,
         Self::Cadence,
         Self::MemoryRestore,
+        Self::SealedState,
     ];
 
     /// The wire name.
@@ -85,6 +88,7 @@ impl OfferKind {
             Self::Role => "role",
             Self::Cadence => "cadence",
             Self::MemoryRestore => "memory_restore",
+            Self::SealedState => "sealed_state",
         }
     }
 }
@@ -110,12 +114,14 @@ pub enum AnyChoice {
     NoPreference,
     Show,
     Decline,
+    Publish,
+    Private,
 }
 
 impl AnyChoice {
     /// Canonical order, as in the schema's `enum`.
     #[cfg(test)]
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::NoSwap,
         Self::Trial,
         Self::Permanent,
@@ -128,6 +134,8 @@ impl AnyChoice {
         Self::NoPreference,
         Self::Show,
         Self::Decline,
+        Self::Publish,
+        Self::Private,
     ];
 
     /// The wire name.
@@ -145,6 +153,8 @@ impl AnyChoice {
             Self::NoPreference => "no_preference",
             Self::Show => "show",
             Self::Decline => "decline",
+            Self::Publish => "publish",
+            Self::Private => "private",
         }
     }
 
@@ -175,6 +185,17 @@ impl AnyChoice {
             Self::KeepDaily => Some(CadenceChoice::KeepDaily),
             Self::Switch => Some(CadenceChoice::Switch),
             Self::NoPreference => Some(CadenceChoice::NoPreference),
+            _ => None,
+        }
+    }
+
+    /// As a sealed-state answer, if it is one. `decline` is shared with
+    /// the memory-restore offer: each reads it as its own.
+    pub fn sealed_state(self) -> Option<SealChoice> {
+        match self {
+            Self::Publish => Some(SealChoice::Publish),
+            Self::Private => Some(SealChoice::Private),
+            Self::Decline => Some(SealChoice::Decline),
             _ => None,
         }
     }
@@ -266,7 +287,7 @@ pub fn unsaved(args: &Args) -> Option<&'static str> {
                  saved.",
             )
         }
-        OfferKind::Cadence | OfferKind::MemoryRestore if text => {
+        OfferKind::Cadence | OfferKind::MemoryRestore | OfferKind::SealedState if text => {
             Some(" This offer takes no `text`; what you wrote there was not saved.")
         }
         _ => None,
@@ -343,7 +364,15 @@ pub fn nothing_pending(offer: Option<OfferKind>, set_model: bool) -> Content {
                 .to_string()
         }
         (None, true) => format!("If you meant to change your model, {switch}"),
-        (Some(OfferKind::Role | OfferKind::Cadence | OfferKind::MemoryRestore), _)
+        (
+            Some(
+                OfferKind::Role
+                | OfferKind::Cadence
+                | OfferKind::MemoryRestore
+                | OfferKind::SealedState,
+            ),
+            _,
+        )
         | (None, false) => "Carry on with your session.".to_string(),
     };
     Content::from(format!("{NOTHING_PENDING} {pointer}"))
@@ -545,7 +574,13 @@ mod tests {
         let s = schema();
         assert_eq!(
             strings(&s["properties"]["offer"]["enum"]),
-            ["model_swap", "role", "cadence", "memory_restore"]
+            [
+                "model_swap",
+                "role",
+                "cadence",
+                "memory_restore",
+                "sealed_state"
+            ]
         );
         for k in OfferKind::ALL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
@@ -563,10 +598,17 @@ mod tests {
         for c in RestoreChoice::ALL {
             union.push(serde_json::to_value(c).unwrap().as_str().unwrap().into());
         }
+        // `decline` is the memory-restore offer's already
+        for c in SealChoice::ALL {
+            let name: String = serde_json::to_value(c).unwrap().as_str().unwrap().into();
+            if !union.contains(&name) {
+                union.push(name);
+            }
+        }
         assert_eq!(strings(&s["properties"]["choice"]["enum"]), union);
         assert_eq!(MODEL_SWAP_CHOICES.map(String::from).to_vec(), union[..3]);
-        // Each `AnyChoice` maps back onto exactly one offer's own choice,
-        // under the same wire name.
+        // Each `AnyChoice` maps back onto its offers' own choices, under
+        // the same wire name (`decline` onto two).
         for c in AnyChoice::ALL {
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
             let mapped: Vec<serde_json::Value> = [
@@ -574,11 +616,14 @@ mod tests {
                 c.role().map(|x| serde_json::to_value(x).unwrap()),
                 c.cadence().map(|x| serde_json::to_value(x).unwrap()),
                 c.memory_restore().map(|x| serde_json::to_value(x).unwrap()),
+                c.sealed_state().map(|x| serde_json::to_value(x).unwrap()),
             ]
             .into_iter()
             .flatten()
             .collect();
-            assert_eq!(mapped, [serde_json::Value::from(c.as_str())], "{c:?}");
+            let shared = if c == AnyChoice::Decline { 2 } else { 1 };
+            assert_eq!(mapped.len(), shared, "{c:?}");
+            assert!(mapped.iter().all(|m| m == c.as_str()), "{c:?}");
         }
     }
 
@@ -645,7 +690,7 @@ mod tests {
                 format!("{NOTHING_PENDING} Carry on with your session.")
             );
         }
-        for kind in ["role", "cadence", "memory_restore"] {
+        for kind in ["role", "cadence", "memory_restore", "sealed_state"] {
             for set_model in [true, false] {
                 assert_eq!(
                     refusal(kind.into(), set_model).await,
@@ -745,7 +790,7 @@ mod tests {
         assert!(two.find("## Offer `role`").unwrap() < two.find("## Offer `cadence`").unwrap());
         assert_eq!(
             key_list(&OfferKind::ALL),
-            "`model_swap`, `role`, `cadence` and `memory_restore`"
+            "`model_swap`, `role`, `cadence`, `memory_restore` and `sealed_state`"
         );
         assert!(reminder(&[OfferKind::Role]).contains("`role` offer above is still open"));
         assert!(reminder(&[OfferKind::Role, OfferKind::Cadence]).contains("`role` and `cadence`"));

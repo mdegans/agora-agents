@@ -359,6 +359,11 @@ impl RestoreOffer {
         }
     }
 
+    /// The post about the loss and the restore, if configured.
+    pub fn thread(&self) -> Option<PostId> {
+        self.thread
+    }
+
     /// Where `agent`'s recovered memory is.
     pub fn path_for(&self, agent: &ShortString<64>) -> PathBuf {
         self.dir.join(agent.as_str()).join(MEMORY_FILE)

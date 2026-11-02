@@ -172,6 +172,11 @@ use super::role::{
     ledger::{Applied, RoleAsk, RoleLedger, RoleOutcome},
     prompt::{RoleAnswer, RoleChoice},
 };
+use super::sealed_state::{
+    self,
+    ledger::{SealAsk, SealLedger, SealOutcome},
+    prompt::{SealAnswer, SealChoice},
+};
 use super::switch::{self, SelfKind, SetModel, SwitchError};
 use crate::alerts::{Alert, AlertKind};
 
@@ -284,6 +289,11 @@ enum Pending {
         seed: u64,
         chars: usize,
     },
+    /// `order` as for the role offer.
+    SealedState {
+        order: [SealChoice; 3],
+        seed: u64,
+    },
 }
 
 impl Pending {
@@ -293,6 +303,7 @@ impl Pending {
             Self::Role { .. } => OfferKind::Role,
             Self::Cadence { .. } => OfferKind::Cadence,
             Self::MemoryRestore { .. } => OfferKind::MemoryRestore,
+            Self::SealedState { .. } => OfferKind::SealedState,
         }
     }
 
@@ -318,6 +329,9 @@ impl Pending {
                 .map(|c| format!("`{}`", c.as_str()))
                 .collect(),
             Self::MemoryRestore { order, .. } => {
+                order.iter().map(|c| format!("`{}`", c.as_str())).collect()
+            }
+            Self::SealedState { order, .. } => {
                 order.iter().map(|c| format!("`{}`", c.as_str())).collect()
             }
         };
@@ -376,6 +390,8 @@ enum Accepted {
     Cadence(Taken),
     /// The answer, and why its `memory_note` was dropped, if it was.
     MemoryRestore(RestoreAnswer, Option<String>),
+    /// The answer, and why its `memory_note` was dropped, if it was.
+    SealedState(SealAnswer, Option<String>),
 }
 
 impl Accepted {
@@ -390,6 +406,7 @@ impl Accepted {
             Self::Cadence(Taken::Clean(a) | Taken::NoteDropped(a, _)) => a.choice.as_str(),
             Self::Cadence(Taken::Salvaged { choice, .. }) => choice.as_str(),
             Self::MemoryRestore(a, _) => a.choice.as_str(),
+            Self::SealedState(a, _) => a.choice.as_str(),
         }
     }
 }
@@ -552,6 +569,23 @@ pub struct ConsentAgent<A> {
     /// What was written for the memory-restore offer, to write again if an
     /// edit made before it is taken out.
     restore_written: Option<RestoreWrite>,
+    /// The sealed-state offer's ledger, loaded only for agents the offer
+    /// lists; `None` also when unreadable (then nothing is asked or saved).
+    sealed_ledger: Option<SealLedger>,
+    sealed_dirty: bool,
+    /// The Evolution Log line recording the sealed-state answer, and the
+    /// agent's own note, written at teardown.
+    sealed_line: Option<String>,
+    sealed_note: Option<String>,
+    /// SOUL and memory from before the sealed-state writes, put back if its
+    /// ledger can't be saved.
+    sealed_undo: Option<(Soul, Memory)>,
+    /// What was written for the sealed-state offer, to write again if an
+    /// edit made before it is taken out.
+    sealed_written: Option<RestoreWrite>,
+    /// The sealed-state refusal notice was seated: renamed aside once the
+    /// session saves.
+    sealed_notice: bool,
     /// The closing questions have been put (or there were none): the inner
     /// session's next `Done` is its epilogue's.
     closed: bool,
@@ -1135,6 +1169,17 @@ where
                     sections.push(section);
                     open.push(offer);
                 }
+                // Not beside the role offer, nor the memory-restore offer,
+                // whose answer the sealed genesis records: it waits for a
+                // session where neither is put.
+                let restore_put = open.iter().any(|o| o.kind() == OfferKind::MemoryRestore);
+                if !role_put
+                    && !restore_put
+                    && let Some((section, offer)) = self.sealed_section()
+                {
+                    sections.push(section);
+                    open.push(offer);
+                }
                 if open.is_empty() {
                     return Ok(None);
                 }
@@ -1417,6 +1462,40 @@ where
                 body,
             },
             Open::new(Pending::MemoryRestore { order, seed, chars }),
+        ))
+    }
+
+    /// The sealed-state offer's section, if this agent is listed and it is
+    /// due: the options in this agent's seeded order.
+    fn sealed_section(&self) -> Option<(Section, Open)> {
+        let soul = &self.inner.state().soul;
+        if !self
+            .rt
+            .sealed_state
+            .as_ref()
+            .is_some_and(|o| o.admits(self.inner.id()))
+            || !self.sealed_ledger.as_ref().is_some_and(|l| l.due(soul))
+        {
+            return None;
+        }
+        let seed = sealed_state::prompt::seed_for(self.inner.id());
+        let order = sealed_state::prompt::order_for(seed);
+        tracing::info!(
+            event_type = "sealed_state_seated",
+            agent = %soul.name,
+            agent_id = %self.inner.id(),
+            question = "sealed_state",
+            offer_version = sealed_state::prompt::OFFER_VERSION,
+            order = ?order.map(SealChoice::as_str),
+            order_seed = seed,
+            "sealed-state question seated"
+        );
+        Some((
+            Section {
+                kind: OfferKind::SealedState,
+                body: sealed_state::prompt::offer(order),
+            },
+            Open::new(Pending::SealedState { order, seed }),
         ))
     }
 
@@ -1725,7 +1804,8 @@ where
                     accepted.choice()
                 );
                 if let Accepted::Cadence(Taken::NoteDropped(_, why))
-                | Accepted::MemoryRestore(_, Some(why)) = &accepted
+                | Accepted::MemoryRestore(_, Some(why))
+                | Accepted::SealedState(_, Some(why)) = &accepted
                 {
                     text.push_str(&format!(" Your `memory_note` was not written: {why}"));
                 }
@@ -1822,6 +1902,16 @@ where
                 };
                 let dropped = answer.check_note(&state.memory).err();
                 Ok(Accepted::MemoryRestore(answer, dropped))
+            }
+            Pending::SealedState { .. } => {
+                let choice = args.choice.sealed_state().ok_or_else(wrong)?;
+                let answer = SealAnswer {
+                    reason: args.note,
+                    choice,
+                    memory_note: args.memory_note,
+                };
+                let dropped = answer.check_note(&state.memory).err();
+                Ok(Accepted::SealedState(answer, dropped))
             }
         }
     }
@@ -1928,6 +2018,12 @@ where
                     let dropped = answer.check_note(&state.memory).err();
                     Accepted::MemoryRestore(answer, dropped)
                 }),
+            Pending::SealedState { .. } => {
+                parse(response, false, sealed_state::prompt::parse).map(|answer| {
+                    let dropped = answer.check_note(&state.memory).err();
+                    Accepted::SealedState(answer, dropped)
+                })
+            }
         }
     }
 
@@ -2040,6 +2136,7 @@ where
             OfferKind::Role => "role_consent_malformed",
             OfferKind::Cadence => "cadence_consent_malformed",
             OfferKind::MemoryRestore => "memory_restore_malformed",
+            OfferKind::SealedState => "sealed_state_malformed",
         };
         tracing::warn!(
             event_type,
@@ -2100,6 +2197,9 @@ where
             } => self.settle_cadence(order, seed, reask, tries, settle, attempts, &model, raw),
             Pending::MemoryRestore { order, seed, chars } => {
                 self.settle_restore(order, seed, chars, settle, attempts, &model)
+            }
+            Pending::SealedState { order, seed } => {
+                self.settle_sealed(order, seed, settle, attempts, &model)
             }
         }
     }
@@ -2590,6 +2690,106 @@ where
         }
     }
 
+    /// The sealed-state offer's record. Nothing is applied here: the SOUL
+    /// line and the agent's note are written at teardown; a yes is acted on
+    /// by the operator's `sealed-enroll`.
+    fn settle_sealed(
+        &mut self,
+        order: [SealChoice; 3],
+        seed: u64,
+        settle: Settle,
+        attempts: u32,
+        model: &Model,
+    ) {
+        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
+        let mut constrained = false;
+        let outcome = match settle {
+            Settle::Answered {
+                accepted: Accepted::SealedState(answer, dropped),
+                constrained: c,
+            } => {
+                constrained = c;
+                let note = answer.memory_note.trim();
+                let note = (dropped.is_none() && !note.is_empty()).then(|| note.to_string());
+                tracing::info!(
+                    event_type = "sealed_state_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %model,
+                    attempts,
+                    choice = answer.choice.as_str(),
+                    order = ?order.map(SealChoice::as_str),
+                    position = order.iter().position(|c| *c == answer.choice).map(|p| p + 1),
+                    memory_note = note.is_some(),
+                    note_dropped = dropped.is_some(),
+                    constrained,
+                    "sealed-state answer recorded"
+                );
+                self.sealed_line = Some(sealed_state::evolution_line(
+                    answer.choice,
+                    Utc::now().date_naive(),
+                ));
+                self.sealed_note = note;
+                SealOutcome::Answered {
+                    choice: answer.choice,
+                    reason: answer.reason,
+                    memory_note_written: self.sealed_note.is_some(),
+                    note_dropped: dropped,
+                    apply_failed: None,
+                }
+            }
+            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
+            Settle::Refused(reason) => {
+                tracing::warn!(
+                    event_type = "sealed_state_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    attempts,
+                    failure = %reason,
+                    "sealed-state offer refused; nothing changes"
+                );
+                SealOutcome::Refused { reason }
+            }
+            Settle::Paused => {
+                let failure = "paused on a server tool".to_string();
+                tracing::warn!(
+                    event_type = "sealed_state_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    attempts,
+                    failure = %failure,
+                    "sealed-state offer got no answer (a paused turn); nothing changes"
+                );
+                SealOutcome::NoAnswer { failure }
+            }
+            Settle::Missed(failure) => {
+                tracing::error!(
+                    event_type = "sealed_state_no_answer",
+                    agent = %agent,
+                    agent_id = %agent_id,
+                    model = %model,
+                    attempts,
+                    failure = %failure,
+                    "sealed-state offer got no usable answer; nothing changes"
+                );
+                SealOutcome::NoAnswer { failure }
+            }
+        };
+        if let Some(ledger) = self.sealed_ledger.as_mut() {
+            ledger.record(SealAsk {
+                at: Utc::now(),
+                offer_version: sealed_state::prompt::OFFER_VERSION,
+                model: model.clone(),
+                order,
+                order_seed: seed,
+                constrained,
+                attempts,
+                outcome,
+            });
+            self.sealed_dirty = true;
+        }
+    }
+
     /// The review session: the usual intro is built, then — instead of the
     /// act phase — the review, with the forks and the before/after sample.
     /// Its answer hands over to the inner memory turn
@@ -2810,6 +3010,7 @@ where
             && self.cadence_line.is_none()
             && self.cadence_note.is_none()
             && !self.restore_pending()
+            && !self.sealed_pending()
         {
             return None;
         }
@@ -2833,6 +3034,9 @@ where
                 }
                 if self.restore_pending() {
                     self.restore_failed(format!("could not copy state: {e}"));
+                }
+                if self.sealed_pending() {
+                    self.sealed_failed(format!("could not copy state: {e}"));
                 }
                 return None;
             }
@@ -2868,7 +3072,55 @@ where
         changed |= self.apply_role(&mut state);
         changed |= self.apply_cadence(&mut state);
         changed |= self.apply_restore(&mut state);
+        changed |= self.apply_sealed(&mut state);
         changed.then_some(state)
+    }
+
+    /// Whether the sealed-state offer has anything to write at teardown.
+    fn sealed_pending(&self) -> bool {
+        self.sealed_line.is_some() || self.sealed_note.is_some()
+    }
+
+    /// Write the sealed-state answer's Evolution Log line and the agent's
+    /// own note into `state`, all or nothing.
+    fn apply_sealed(&mut self, state: &mut SeedState) -> bool {
+        let write = RestoreWrite {
+            line: self.sealed_line.take(),
+            note: self.sealed_note.take(),
+        };
+        if write.line.is_none() && write.note.is_none() {
+            return false;
+        }
+        self.sealed_undo = Some((state.soul.clone(), state.memory.clone()));
+        if let Err(e) = write_restore(state, &write) {
+            self.sealed_failed(e);
+            return false;
+        }
+        tracing::info!(
+            event_type = "sealed_state_applied",
+            agent = %state.soul.name,
+            agent_id = %self.inner.id(),
+            soul_line = write.line.is_some(),
+            memory_note = write.note.is_some(),
+            "sealed-state answer written"
+        );
+        self.sealed_written = Some(write);
+        true
+    }
+
+    fn sealed_failed(&mut self, why: String) {
+        tracing::error!(
+            event_type = "sealed_state_apply_failed",
+            agent_id = %self.inner.id(),
+            error = %why,
+            "sealed-state SOUL line or note not written; SOUL and memory unchanged"
+        );
+        self.sealed_line = None;
+        self.sealed_note = None;
+        if let Some(ledger) = self.sealed_ledger.as_mut() {
+            ledger.mark_apply_failed(why);
+            self.sealed_dirty = true;
+        }
     }
 
     /// Whether the memory-restore offer has anything to write at teardown.
@@ -3423,6 +3675,13 @@ where
             restore_note: None,
             restore_undo: None,
             restore_written: None,
+            sealed_ledger: None,
+            sealed_dirty: false,
+            sealed_line: None,
+            sealed_note: None,
+            sealed_undo: None,
+            sealed_written: None,
+            sealed_notice: false,
             closed: false,
             epilogue: false,
         })
@@ -3549,6 +3808,22 @@ where
             }
         }
         self.load_restore(&dir).await;
+        if self
+            .rt
+            .sealed_state
+            .as_ref()
+            .is_some_and(|o| o.admits(self.inner.id()))
+        {
+            match SealLedger::load(&dir).await {
+                Ok(ledger) => self.sealed_ledger = Some(ledger),
+                Err(e) => tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %SealLedger::path(&dir).display(),
+                    error = %e,
+                    "sealed-state ledger unreadable; not asking or saving this session"
+                ),
+            }
+        }
         let interrupted = self.open_journal().await;
         let early = set_model.is_some();
         self.inner.on_init().await?;
@@ -3568,6 +3843,15 @@ where
                 let (_, prompt) = self.inner.parts();
                 Self::seat_user(prompt, Content::from(notice))?;
             }
+        }
+        // The sealed-state start check's verdict, and a refusal's notice
+        if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id())
+            && !seat.lines.is_empty()
+        {
+            let text = seat.lines.join("\n\n");
+            self.sealed_notice = seat.notice;
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(prompt, Content::from(text))?;
         }
         if let Some(key) = self.review.clone() {
             self.seat_review(key).await?;
@@ -3665,6 +3949,15 @@ where
                 "session journal not removed after the save"
             );
         }
+        if self.sealed_notice
+            && let Err(e) = crate::sealed::notice::Notice::shown(&self.agent_dir())
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "sealed-state notice not set aside after the save; it is shown again"
+            );
+        }
         result
     }
 
@@ -3733,6 +4026,16 @@ where
                                 );
                             }
                         }
+                        if let Some(write) = &self.sealed_written {
+                            self.sealed_undo = Some((state.soul.clone(), state.memory.clone()));
+                            if let Err(e) = write_restore(state, write) {
+                                tracing::error!(
+                                    agent_id = %self.inner.id(),
+                                    error = %e,
+                                    "sealed-state writes not redone after an earlier edit was undone"
+                                );
+                            }
+                        }
                         true
                     }
                     _ => false,
@@ -3767,6 +4070,16 @@ where
                                     agent_id = %self.inner.id(),
                                     error = %e,
                                     "memory-restore writes not redone after the cadence line was undone"
+                                );
+                            }
+                        }
+                        if let Some(write) = &self.sealed_written {
+                            self.sealed_undo = Some((state.soul.clone(), state.memory.clone()));
+                            if let Err(e) = write_restore(state, write) {
+                                tracing::error!(
+                                    agent_id = %self.inner.id(),
+                                    error = %e,
+                                    "sealed-state writes not redone after an earlier edit was undone"
                                 );
                             }
                         }
@@ -3826,6 +4139,17 @@ where
                     (Some(state), Some((soul, memory))) => {
                         state.soul = soul;
                         state.memory = memory;
+                        // The sealed-state writes came after: again on top
+                        if let Some(write) = &self.sealed_written {
+                            self.sealed_undo = Some((state.soul.clone(), state.memory.clone()));
+                            if let Err(e) = write_restore(state, write) {
+                                tracing::error!(
+                                    agent_id = %self.inner.id(),
+                                    error = %e,
+                                    "sealed-state writes not redone after an earlier edit was undone"
+                                );
+                            }
+                        }
                         true
                     }
                     _ => false,
@@ -3837,6 +4161,31 @@ where
                     error = %e,
                     edit_undone = undone,
                     "memory-restore ledger save failed; this session's SOUL line and note are not saved"
+                );
+            }
+        }
+        if self.sealed_dirty
+            && let Some(ledger) = &mut self.sealed_ledger
+        {
+            ledger.agent = Some(self.inner.state().soul.name.clone());
+            if let Err(e) = ledger.save(&dir).await {
+                // Without the record the answer is lost and asked again:
+                // take this session's SOUL line and note back out.
+                let undone = match (self.patched.as_mut(), self.sealed_undo.take()) {
+                    (Some(state), Some((soul, memory))) => {
+                        state.soul = soul;
+                        state.memory = memory;
+                        true
+                    }
+                    _ => false,
+                };
+                tracing::error!(
+                    event_type = "sealed_state_ledger_save_failed",
+                    agent_id = %self.inner.id(),
+                    path = %SealLedger::path(&dir).display(),
+                    error = %e,
+                    edit_undone = undone,
+                    "sealed-state ledger save failed; this session's SOUL line and note are not saved"
                 );
             }
         }
@@ -7563,7 +7912,7 @@ mod tests {
         let mut agents = Vec::new();
         let mut models: Vec<ModelInfo> = Vec::new();
         for (i, id) in ids.into_iter().enumerate() {
-            let mut state = storage.load::<ConsentAgent<Fake>>(id).await.unwrap();
+            let mut state = storage.load::<ConsentAgent<Fake>>(id).await.unwrap().value;
             // The seed agent builds each session's prompt afresh; so does
             // the drill.
             state.prompt = Prompt::default();
@@ -9837,6 +10186,137 @@ mod tests {
         assert_eq!(
             agent.state().soul.identity.as_str(),
             "A test agent that came home."
+        );
+    }
+
+    // --- The sealed-state offer --------------------------------------------
+
+    /// A harness with the sealed-state offer to the harness agent, and the
+    /// memory-restore offer to `restore`.
+    fn with_sealed(tag: &str, restore: Option<&[&str]>) -> Harness {
+        let mut h = Harness::build(tag, None, None, None, restore);
+        let rt = Arc::get_mut(&mut h.rt).unwrap();
+        rt.sealed_state = Some(sealed_state::SealedOffer::for_agents(&[h.id]));
+        h
+    }
+
+    async fn sealed_ledger(h: &Harness) -> SealLedger {
+        SealLedger::load(&h.rt.state_dir.join(h.id.to_string()))
+            .await
+            .unwrap()
+    }
+
+    /// Asked of a listed agent, answered with `private`: one dated SOUL
+    /// line, memory untouched, the choice on file, never asked again.
+    #[tokio::test]
+    async fn sealed_offer_is_asked_once_and_recorded() {
+        let h = with_sealed("sealed-offer", None);
+        let memory = anthropic_agent(&h).state().memory.content.clone();
+        let mut agent = seated(&h).await;
+        let q = last_user_text(&agent);
+        assert!(q.contains("## Offer `sealed_state`"), "{q}");
+        assert!(
+            q.contains("It does not protect it against your operator."),
+            "{q}"
+        );
+        assert_eq!(
+            agent
+                .handle(answer_call("sealed_state", "private", "", ""))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            evolution_notes(&agent),
+            [sealed_state::evolution_line(
+                SealChoice::Private,
+                Utc::now().date_naive()
+            )]
+        );
+        assert_eq!(agent.state().memory.content, memory);
+        let ledger = sealed_ledger(&h).await;
+        assert_eq!(ledger.choice(), Some(SealChoice::Private));
+        assert!(ledger.opted_in());
+        let seed = sealed_state::prompt::seed_for(h.id);
+        assert_eq!(ledger.asks[0].order, sealed_state::prompt::order_for(seed));
+
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert_eq!(
+            next.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "not asked again"
+        );
+    }
+
+    /// `show` is the memory-restore offer's; `publish` is not: each offer
+    /// takes only its own options.
+    #[tokio::test]
+    async fn sealed_offer_refuses_another_offers_choice() {
+        let h = with_sealed("sealed-wrong", None);
+        let mut agent = seated(&h).await;
+        assert_eq!(
+            agent
+                .handle(answer_call("sealed_state", "show", "", ""))
+                .await
+                .unwrap(),
+            Control::Continue
+        );
+        assert!(sealed_ledger(&h).await.asks.is_empty(), "nothing recorded");
+    }
+
+    /// Never in the same question as the memory-restore offer, whose
+    /// answer the genesis records: it waits for the session after.
+    #[tokio::test]
+    async fn sealed_offer_waits_for_the_memory_restore_offer() {
+        let h = with_sealed("sealed-restore", Some(&["tarn"]));
+        let mut agent = seated(&h).await;
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains("## Offer `memory_restore`") && !q.contains("sealed_state"),
+            "{q}"
+        );
+        agent
+            .handle(answer_call("memory_restore", "decline", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert_eq!(next.handle(reply("done")).await.unwrap(), Control::Continue);
+        assert!(last_user_text(&next).contains("## Offer `sealed_state`"));
+    }
+
+    /// The start check's lines are seated at the end of the intro; a
+    /// refusal notice among them is set aside once the session saves.
+    #[tokio::test]
+    async fn sealed_lines_are_seated_and_the_notice_set_aside_after_the_save() {
+        let mut h = Harness::new("sealed-seat");
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        crate::sealed::notice::Notice::accept(
+            &dir,
+            "a test",
+            crate::sealed::notice::Refusal::Mismatch,
+        )
+        .unwrap();
+        let rt = Arc::get_mut(&mut h.rt).unwrap();
+        rt.sealed_seats.insert(
+            h.id,
+            crate::consent::SealedSeat {
+                lines: vec!["NOTICE LINE".into(), "VERDICT LINE".into()],
+                notice: true,
+            },
+        );
+        let mut agent = anthropic_agent(&h);
+        agent.on_init().await.unwrap();
+        let intro = serde_json::to_string(&agent.prompt().messages).unwrap();
+        assert!(intro.contains("NOTICE LINE\\n\\nVERDICT LINE"), "{intro}");
+        assert!(crate::sealed::notice::Notice::load(&dir).unwrap().is_some());
+        agent.on_saved().await.unwrap();
+        assert!(
+            crate::sealed::notice::Notice::load(&dir).unwrap().is_none(),
+            "set aside"
         );
     }
 }
