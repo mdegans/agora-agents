@@ -192,6 +192,10 @@ impl ContactRequests for SeedAgent {
     }
 }
 
+/// The heading the sealed-state lines are seated under, at the intro's
+/// heading level, so they don't read as part of the section before them.
+pub const SEALED_HEADING: &str = "## Your Sealed State";
+
 /// Answers per question per session: the first plus two retries. For an
 /// offer, the unusable ones it may take: refused `answer_offer` calls,
 /// clipped turns, unanswered turns (of which it gets one reminder).
@@ -2736,10 +2740,7 @@ where
                     constrained,
                     "sealed-state answer recorded"
                 );
-                self.sealed_line = Some(sealed_state::evolution_line(
-                    answer.choice,
-                    Utc::now().date_naive(),
-                ));
+                self.sealed_line = Some(sealed_state::evolution_line(answer.choice));
                 self.sealed_note = note;
                 SealOutcome::Answered {
                     choice: answer.choice,
@@ -3881,7 +3882,10 @@ where
         }
         if !sealed_lines.is_empty() {
             let (_, prompt) = self.inner.parts();
-            Self::seat_user(prompt, Content::from(sealed_lines.join("\n\n")))?;
+            Self::seat_user(
+                prompt,
+                Content::from(format!("{SEALED_HEADING}\n\n{}", sealed_lines.join("\n\n"))),
+            )?;
         }
         if let Some(key) = self.review.clone() {
             self.seat_review(key).await?;
@@ -10259,10 +10263,7 @@ mod tests {
         agent.on_teardown().await.unwrap();
         assert_eq!(
             evolution_notes(&agent),
-            [sealed_state::evolution_line(
-                SealChoice::Private,
-                Utc::now().date_naive()
-            )]
+            [sealed_state::evolution_line(SealChoice::Private)]
         );
         assert_eq!(agent.state().memory.content, memory);
         let ledger = sealed_ledger(&h).await;
@@ -10341,7 +10342,10 @@ mod tests {
         let mut agent = anthropic_agent(&h);
         agent.on_init().await.unwrap();
         let intro = serde_json::to_string(&agent.prompt().messages).unwrap();
-        assert!(intro.contains("NOTICE LINE\\n\\nVERDICT LINE"), "{intro}");
+        assert!(
+            intro.contains("## Your Sealed State\\n\\nNOTICE LINE\\n\\nVERDICT LINE"),
+            "{intro}"
+        );
         assert!(crate::sealed::notice::Notice::load(&dir).unwrap().is_some());
         agent.on_saved().await.unwrap();
         assert!(
@@ -10385,7 +10389,7 @@ mod tests {
         let seen = serde_json::to_string(&next.prompt().messages).unwrap();
         assert!(
             seen.contains(
-                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed."
+                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; you'll be asked again once there is a way to stop."
             ),
             "{seen}"
         );

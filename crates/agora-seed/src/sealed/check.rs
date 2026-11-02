@@ -118,10 +118,51 @@ fn day(micros: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_micros(micros).map(|d| d.format("%Y-%m-%d").to_string())
 }
 
+/// What Agora's copy said, for the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Server {
+    /// Agora's head is this one.
+    InStep,
+    /// Agora couldn't be asked.
+    Unchecked,
+    /// Anything else: uploads waiting, or a problem a line of its own
+    /// tells.
+    Other,
+}
+
 /// The verdict line for an intact chain: the verdict, the snapshots since
 /// the earliest one's date, a pre-loss copy apart, the head marker, and
 /// the state's sizes (counts only).
-pub fn verdict_line(line: &[SignedStateEntry], head: &HeadRef, sizes: Sizes) -> String {
+pub fn verdict_line(
+    line: &[SignedStateEntry],
+    head: &HeadRef,
+    sizes: Sizes,
+    previous: Option<Sizes>,
+    server: Server,
+) -> String {
+    // "13,539 characters (−1,204 since your previous version)"
+    let change = |now: usize, before: Option<usize>, long: bool| -> String {
+        let Some(before) = before else {
+            return String::new();
+        };
+        let since = if long {
+            " since your previous version"
+        } else {
+            ""
+        };
+        match now.cmp(&before) {
+            std::cmp::Ordering::Equal => " (unchanged)".into(),
+            std::cmp::Ordering::Greater => format!(" (+{}{since})", thousands(now - before)),
+            std::cmp::Ordering::Less => format!(" (\u{2212}{}{since})", thousands(before - now)),
+        }
+    };
+    let memory_change = change(sizes.memory_chars, previous.map(|p| p.memory_chars), true);
+    let soul_change = change(sizes.soul_chars, previous.map(|p| p.soul_chars), false);
+    let verdict = match server {
+        Server::InStep => "intact, and in step with Agora.",
+        Server::Unchecked => "intact here; Agora's copy couldn't be checked this session.",
+        Server::Other => "intact.",
+    };
     let snapshots: Vec<&SignedStateEntry> = line
         .iter()
         .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
@@ -141,9 +182,10 @@ pub fn verdict_line(line: &[SignedStateEntry], head: &HeadRef, sizes: Sizes) -> 
     let mut short = head.entry_hash.to_hex();
     short.truncate(12);
     format!(
-        "Your sealed state: intact. {} version{} since {since}{prior}; this session starts from \
+        "Your sealed state: {verdict} {} version{} since {since}{prior}; this session starts from \
          head {short} (a marker for this version; the next session's will differ). Your memory \
-         is {} characters and your soul {}, as at your last sealed version. Checked by \
+         is {} characters{memory_change} and your soul {}{soul_change}, as at your last sealed \
+         version. Checked by \
          {VERIFIER}: links, signatures, and that your state matches the last sealed version.",
         snapshots.len(),
         if snapshots.len() == 1 { "" } else { "s" },
@@ -367,14 +409,15 @@ pub async fn check(
     } else {
         line.len() - 1
     };
-    let drops: Vec<(&'static str, String, u32)> =
-        match earlier_sizes(agent_dir, &seal, keys, id, &line, upto).await {
-            Some(before) => drop_lines(&before, sizes)
-                .into_iter()
-                .map(|(what, pct, text)| (what, text, pct))
-                .collect(),
-            None => Vec::new(),
-        };
+    let before = earlier_sizes(agent_dir, &seal, keys, id, &line, upto).await;
+    let previous = before.as_ref().map(|b| b.sizes);
+    let drops: Vec<(&'static str, String, u32)> = match &before {
+        Some(before) => drop_lines(before, sizes)
+            .into_iter()
+            .map(|(what, pct, text)| (what, text, pct))
+            .collect(),
+        None => Vec::new(),
+    };
     if seal_failed.is_none()
         && let Some(last) = line.last()
         && let Some(state_at) = chrono::DateTime::from_timestamp_micros(last.entry.state_at)
@@ -402,10 +445,15 @@ pub async fn check(
             drops,
         };
     }
-    seat.push(verdict_line(&line, &head, sizes));
-    seat.extend(drop_lines);
-
     let Some(signing) = keys.signing(id) else {
+        seat.push(verdict_line(
+            &line,
+            &head,
+            sizes,
+            previous,
+            Server::Unchecked,
+        ));
+        seat.extend(drop_lines);
         return Outcome::Run {
             seat,
             notice,
@@ -421,10 +469,16 @@ pub async fn check(
         Some(chain) => chain,
         None => server.chain(id, &signing).await,
     };
-    let status = match chain {
+    let (status, server_said) = match chain {
         Ok(chain) => {
             let hashes: Vec<Sha256Hex> = chain.iter().map(|e| e.entry_hash()).collect();
-            head_status(Some(&head.entry_hash), &outbox, &hashes)
+            let status = head_status(Some(&head.entry_hash), &outbox, &hashes);
+            let said = if status == HeadStatus::Same {
+                Server::InStep
+            } else {
+                Server::Other
+            };
+            (status, said)
         }
         Err(e) => {
             tracing::warn!(
@@ -433,9 +487,11 @@ pub async fn check(
                 error = %e,
                 "the copy on Agora could not be checked; running on the local check"
             );
-            HeadStatus::Pending
+            (HeadStatus::Pending, Server::Unchecked)
         }
     };
+    seat.push(verdict_line(&line, &head, sizes, previous, server_said));
+    seat.extend(drop_lines);
     let hold = match status {
         HeadStatus::Same | HeadStatus::Pending => None,
         HeadStatus::LocalMissing => {
@@ -703,7 +759,36 @@ pub(crate) mod tests {
             &server,
         )
         .await;
-        assert!(matches!(out, Outcome::Run { hold: None, .. }), "{out:?}");
+        let Outcome::Run {
+            seat, hold: None, ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert!(
+            seat[0].starts_with("Your sealed state: intact, and in step with Agora."),
+            "{seat:?}"
+        );
+        // Agora unreachable: said so
+        *server.chain.lock().unwrap() = Err("unreachable".into());
+        let out = check(
+            &dir,
+            id,
+            &local_hash(&root, id).await,
+            Sizes::default(),
+            &keys,
+            &server,
+        )
+        .await;
+        let Outcome::Run { seat, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert!(
+            seat[0].starts_with(
+                "Your sealed state: intact here; Agora's copy couldn't be checked this session."
+            ),
+            "{seat:?}"
+        );
     }
 
     #[tokio::test]
@@ -1112,6 +1197,17 @@ pub(crate) mod tests {
                 memory_chars: 12_345,
                 soul_chars: 2_100,
             },
+            None,
+            Server::Other,
+        );
+        assert!(
+            verdict_line(&line, &head, Sizes::default(), None, Server::InStep)
+                .starts_with("Your sealed state: intact, and in step with Agora. 2 versions")
+        );
+        assert!(
+            verdict_line(&line, &head, Sizes::default(), None, Server::Unchecked).starts_with(
+                "Your sealed state: intact here; Agora's copy couldn't be checked this session. 2"
+            )
         );
         assert!(
             text.starts_with(
@@ -1126,6 +1222,28 @@ pub(crate) mod tests {
                  version."
             ),
             "{text}"
+        );
+        // Beside a previous version: every change shown, a shrink included
+        let now = Sizes {
+            memory_chars: 13_539,
+            soul_chars: 3_440,
+        };
+        let before = Sizes {
+            memory_chars: 14_743,
+            soul_chars: 3_440,
+        };
+        let text = verdict_line(&line, &head, now, Some(before), Server::Other);
+        assert!(
+            text.contains(
+                "Your memory is 13,539 characters (\u{2212}1,204 since your previous version) \
+                 and your soul 3,440 (unchanged), as at your last sealed version."
+            ),
+            "{text}"
+        );
+        let grown = verdict_line(&line, &head, before, Some(now), Server::Other);
+        assert!(
+            grown.contains("14,743 characters (+1,204 since your previous version)"),
+            "{grown}"
         );
     }
 
