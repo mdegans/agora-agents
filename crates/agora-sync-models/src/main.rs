@@ -18,6 +18,12 @@
 //! Persistence goes through [`FsStorage::save_raw`], which archives the
 //! previous `state.json` to a timestamped sibling before overwriting —
 //! so every pre-sync state is recoverable.
+//!
+//! **Agents enrolled in sealed state are skipped** (`sealed/enrolled` in
+//! their directory), each with a `sync_models_skipped_sealed` line: a write
+//! from here would bypass the seal, and the runner would refuse the agent's
+//! next session as a state that matches no sealed version. This tool is
+//! frozen for operator-hat use anyway (CLAUDE.md, "The Operator Hat").
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -73,8 +79,13 @@ enum Fetched {
 
 /// Per-agent outcome after comparing server model to local state.
 enum Outcome {
-    Changed { old: String, new: String },
+    Changed {
+        old: String,
+        new: String,
+    },
     Unchanged,
+    /// Enrolled in sealed state: never written here.
+    Sealed,
     NotFound,
     Empty,
     Error,
@@ -137,15 +148,26 @@ async fn main() -> Result<()> {
         let outcome = match fetched {
             Fetched::Model(server_model) => {
                 let local = state.model.id.name().to_owned();
+                // Held until this agent's write is done
+                let guard = (local != server_model).then(|| seal_guard(&storage, *id));
                 if local == server_model {
                     Outcome::Unchanged
+                } else if let Some(skip) = guard.as_ref().and_then(Guard::skip) {
+                    tracing::warn!(
+                        event_type = "sync_models_skipped_sealed",
+                        agent = %name,
+                        agent_id = %id,
+                        why = skip,
+                        "sealed state: its model is not written here"
+                    );
+                    Outcome::Sealed
                 } else {
                     if !args.dry_run {
                         set_model(state, &server_model);
                         let value = serde_json::to_value(&*state)
                             .with_context(|| format!("serializing {name}"))?;
                         storage
-                            .save_raw(*id, value)
+                            .save_raw(*id, value, None)
                             .await
                             .with_context(|| format!("saving {name}"))?;
                     }
@@ -193,6 +215,10 @@ async fn main() -> Result<()> {
         .iter()
         .filter(|o| matches!(o, Outcome::Empty))
         .count();
+    let sealed = outcomes
+        .iter()
+        .filter(|o| matches!(o, Outcome::Sealed))
+        .count();
 
     let verb = if args.dry_run {
         "would change"
@@ -208,7 +234,8 @@ async fn main() -> Result<()> {
     }
     println!(
         "{verb}: {changed}  unchanged: {unchanged}  \
-         not found: {not_found}  no server model: {empty}  errors: {errors}",
+         not found: {not_found}  no server model: {empty}  \
+         skipped (sealed state): {sealed}  errors: {errors}",
     );
     if errors > 0 {
         anyhow::bail!("{errors} agents failed to sync");
@@ -244,6 +271,61 @@ fn group_transitions<'a>(
     grouped
 }
 
+/// Whether this tool may write an agent: not when it is enrolled in
+/// sealed state, nor while its `sealed/lock` is held (an enrolment under
+/// way), nor when that can't be told. Reads only markers, nothing of the
+/// state.
+enum Guard {
+    /// Free to write; the lock, when there is a `sealed/`, held until
+    /// dropped.
+    Free(#[allow(dead_code)] Option<std::fs::File>),
+    Sealed,
+    Busy,
+    Unreadable,
+}
+
+impl Guard {
+    /// Why it is skipped, if it is.
+    fn skip(&self) -> Option<&'static str> {
+        match self {
+            Self::Free(_) => None,
+            Self::Sealed => Some("enrolled"),
+            Self::Busy => Some("its sealed lock is held"),
+            Self::Unreadable => Some("its sealed state can't be read"),
+        }
+    }
+}
+
+fn seal_guard(storage: &FsStorage, id: AgentId) -> Guard {
+    let sealed = storage
+        .agent_dir(id)
+        .join(agora_agentkit::state::storage::SEALED_DIR);
+    match std::fs::exists(&sealed) {
+        Ok(false) => return Guard::Free(None),
+        Ok(true) => {}
+        Err(_) => return Guard::Unreadable,
+    }
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(sealed.join("lock"))
+    else {
+        return Guard::Unreadable;
+    };
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Guard::Busy,
+        Err(std::fs::TryLockError::Error(_)) => return Guard::Unreadable,
+    }
+    match std::fs::exists(sealed.join("enrolled")) {
+        Ok(false) => Guard::Free(Some(lock)),
+        Ok(true) => Guard::Sealed,
+        Err(_) => Guard::Unreadable,
+    }
+}
+
 /// Load every `state.json` under `state_dir` (same pattern as the runner).
 async fn load_states(
     storage: &FsStorage,
@@ -265,7 +347,7 @@ async fn load_states(
     let mut states: Vec<(AgentId, SeedState)> = Vec::new();
     for (id, result) in loaded {
         match result {
-            Ok(state) => states.push((id, state)),
+            Ok(loaded) => states.push((id, loaded.value)),
             Err(e) => tracing::warn!(agent_id = %id, error = %e, "unloadable state, skipping"),
         }
     }
@@ -298,6 +380,29 @@ mod tests {
                 ("old-model", "new-model", 1),
             ]
         );
+    }
+
+    /// An enrolled agent is reported as sealed; any other is not.
+    #[tokio::test]
+    async fn an_enrolled_agent_is_sealed() {
+        let dir = std::env::temp_dir().join(format!("sync-models-sealed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = FsStorage::new(&dir);
+        let (a, b) = (AgentId::new(), AgentId::new());
+        agora_agentkit::state::storage::AgentSeal::new(&storage.agent_dir(a), a)
+            .enroll()
+            .await
+            .unwrap();
+        assert!(matches!(seal_guard(&storage, a), Guard::Sealed));
+        assert!(matches!(seal_guard(&storage, b), Guard::Free(None)));
+        // An enrolment under way holds the lock: skipped, never waited on
+        let c = AgentId::new();
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&storage.agent_dir(c), c);
+        let held = seal.lock().await.unwrap();
+        assert!(matches!(seal_guard(&storage, c), Guard::Busy));
+        drop(held);
+        assert!(matches!(seal_guard(&storage, c), Guard::Free(Some(_))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

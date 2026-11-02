@@ -37,7 +37,11 @@
 //! - [`memory_restore`] — another sibling (`[memory_restore]`): an agent
 //!   whose memory was deleted on 2026-05-05 is offered the copy recovered
 //!   from 2026-05-03, to see it (`show`) or not (`decline`).
-//! - [`offers`] — `answer_offer`, the strict tool all four are answered
+//! - [`sealed_state`] — another sibling (`[sealed_state]`): whether the
+//!   agent's state is backed up to Agora, sealed under its own key
+//!   (`publish`, `private`, `decline`); the runner's side is
+//!   [`crate::sealed`].
+//! - [`offers`] — `answer_offer`, the strict tool all five are answered
 //!   with: every offer due at a session's close is seated in one question
 //!   turn, each under a heading naming its key.
 //!
@@ -71,6 +75,7 @@ pub mod offers;
 pub mod prompt;
 pub mod queue;
 pub mod role;
+pub mod sealed_state;
 pub mod switch;
 
 use std::path::PathBuf;
@@ -193,6 +198,20 @@ pub struct ConsentRuntime {
     /// The memory-restore offer (`[memory_restore]`); off unless
     /// [`Self::with_memory_restore_offer`].
     pub memory_restore: Option<memory_restore::RestoreOffer>,
+    /// The sealed-state offer (`[sealed_state]`); off unless
+    /// [`Self::with_sealed_state`].
+    pub sealed_state: Option<sealed_state::SealedOffer>,
+    /// What the sealed-state start check seats in each enrolled agent's
+    /// intro ([`crate::sealed::check`]).
+    pub sealed_seats: std::collections::BTreeMap<agora_agentkit::ids::AgentId, SealedSeat>,
+}
+
+/// Lines the sealed-state start check left for an agent's intro.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SealedSeat {
+    pub lines: Vec<String>,
+    /// One is the refusal notice: renamed aside once the session saves.
+    pub notice: bool,
 }
 
 impl ConsentRuntime {
@@ -220,6 +239,8 @@ impl ConsentRuntime {
             role: None,
             cadence: None,
             memory_restore: None,
+            sealed_state: None,
+            sealed_seats: Default::default(),
         })
     }
 
@@ -248,6 +269,18 @@ impl ConsentRuntime {
         offer: Option<memory_restore::RestoreOffer>,
     ) -> Self {
         self.memory_restore = offer;
+        self
+    }
+
+    /// Put the sealed-state offer ([`sealed_state`]) to the agents it
+    /// lists, and seat the start check's lines.
+    pub fn with_sealed_state(
+        mut self,
+        offer: Option<sealed_state::SealedOffer>,
+        seats: std::collections::BTreeMap<agora_agentkit::ids::AgentId, SealedSeat>,
+    ) -> Self {
+        self.sealed_state = offer;
+        self.sealed_seats = seats;
         self
     }
 }
