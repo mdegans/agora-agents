@@ -44,6 +44,49 @@ pub fn no_session(state_dir: &Path, id: AgentId, refused_ok: bool) -> anyhow::Re
     )
 }
 
+/// `<data_dir>/runner.lock`: the runner holds it shared for its whole
+/// life; `rotate-keys` needs it exclusive, so it runs only while no runner
+/// does.
+pub const RUNNER_LOCK: &str = "runner.lock";
+
+fn runner_lock_file(data_dir: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(data_dir)?;
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join(RUNNER_LOCK))?)
+}
+
+/// The runner's shared hold, for as long as the returned file lives.
+pub fn runner_shared(data_dir: &Path) -> anyhow::Result<std::fs::File> {
+    let file = runner_lock_file(data_dir)?;
+    match file.try_lock_shared() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "{} is held exclusively: `agora-seed rotate-keys` is running; start the runner \
+             when it has finished",
+            data_dir.join(RUNNER_LOCK).display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// `rotate-keys`'s exclusive hold: refused while any runner holds it.
+pub fn runner_exclusive(data_dir: &Path) -> anyhow::Result<std::fs::File> {
+    let file = runner_lock_file(data_dir)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "a runner holds {}: stop the runner (`just runner-stop`) before rotating keys; a \
+             session signing with a key retired under it would be refused at the next start",
+            data_dir.join(RUNNER_LOCK).display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 /// [`no_session`], then the agent's `sealed/lock`, held until dropped.
 pub async fn take(state_dir: &Path, id: AgentId, refused_ok: bool) -> anyhow::Result<SealLock> {
     no_session(state_dir, id, refused_ok)?;
@@ -135,5 +178,23 @@ mod tests {
         assert!(no_session(&root, id, false).is_err());
         assert!(take(&root, id, false).await.is_err());
         let _lock = take(&root, id, true).await.unwrap();
+    }
+
+    #[test]
+    fn rotate_keys_needs_the_runner_stopped() {
+        let root = crate::sealed::TestDir::new("runner-lock");
+        let runner = runner_shared(&root).unwrap();
+        let second = runner_shared(&root).unwrap();
+        let e = runner_exclusive(&root).unwrap_err().to_string();
+        assert!(e.contains("stop the runner"), "{e}");
+        drop((runner, second));
+        let rotating = runner_exclusive(&root).unwrap();
+        assert!(
+            runner_shared(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("rotate-keys` is running")
+        );
+        drop(rotating);
     }
 }

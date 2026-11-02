@@ -118,6 +118,8 @@ pub enum AlertKind {
     /// The server lists a rotation of an agent's signing key that the
     /// runner never made. Advisory: never trusted.
     SealedStateRotationUnknown,
+    /// An agent's `rotate-keys` didn't finish; it is left out until it does.
+    SealedStateRotationUnfinished,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -126,7 +128,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -146,6 +148,7 @@ impl AlertKind {
         Self::SealedStateDrop,
         Self::SealedStateUnreadable,
         Self::SealedStateRotationUnknown,
+        Self::SealedStateRotationUnfinished,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -170,6 +173,7 @@ impl AlertKind {
             Self::SealedStateDrop => "sealed_state_drop",
             Self::SealedStateUnreadable => "sealed_state_unreadable",
             Self::SealedStateRotationUnknown => "sealed_state_rotation_unknown",
+            Self::SealedStateRotationUnfinished => "sealed_state_rotation_unfinished",
             Self::Test => "test_alert",
         }
     }
@@ -290,10 +294,11 @@ impl AlertKind {
                  next wake. Nothing is lost while the disk holds."
             }
             Self::SealedStateDisabled => {
-                "The run config's [sealed_state] table could not be used (the \
-                 error below says why). Nobody is asked the sealed-state \
-                 question until it is fixed. Agents already enrolled stay \
-                 sealed and checked."
+                "The run config's [sealed_state] table could not be used, or \
+                 some of its `agents` entries are not agent ids and were \
+                 skipped (the summary below says which). Whoever it can't \
+                 name is not asked the sealed-state question until it is \
+                 fixed. Agents already enrolled stay sealed and checked."
             }
             Self::SealedStateDrop => {
                 "An enrolled agent's memory or soul is less than half the \
@@ -317,6 +322,14 @@ impl AlertKind {
                  The runner doesn't trust it: chain checks follow only its own \
                  records. Find out who rotated the key; an operator \
                  replacement or a server fault are the likely causes."
+            }
+            Self::SealedStateRotationUnfinished => {
+                "An agent's key rotation didn't finish (secrets.next.json is \
+                 still in its secrets directory), so its keys and the \
+                 server's may disagree. The runner leaves it out, without a \
+                 refusal or a notice to the agent, until it does. Stop the \
+                 runner and run the rotate-keys command below again: it \
+                 resumes where it stopped."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

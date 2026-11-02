@@ -201,6 +201,11 @@ pub fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let dir = path.parent().expect("a file in a directory");
     std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let tmp = path.with_extension("json.tmp");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -511,6 +516,14 @@ mod tests {
         store.write_state_key(id, &file).unwrap();
         let back = store.state_key_file(id).unwrap().unwrap();
         assert_eq!(back.state_key().unwrap().expose(), key.expose());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&store.agent_dir(id)), 0o700);
+            assert_eq!(mode(&store.agent_dir(id).join(STATE_KEY_FILE)), 0o600);
+        }
         assert!(store.seal_keys(id).is_none(), "no signing key yet");
         store
             .ring()

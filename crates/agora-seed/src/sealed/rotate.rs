@@ -27,6 +27,45 @@ use super::KeyStore;
 use super::api::SealedApi;
 use super::keys::{SecretsFile, StateKeyFile};
 
+/// The head the old key's trust ends at: an enrolled agent's local head,
+/// which must be Agora's head with nothing waiting to upload (the server
+/// takes a rotation only at its current head). `None` for an agent not
+/// enrolled.
+async fn confirmed_head(
+    agent_dir: &std::path::Path,
+    api: &dyn SealedApi,
+    id: AgentId,
+    signing: &agora_agentkit::crypto::SigningKey,
+) -> anyhow::Result<Option<agora_agentkit::state::verify::HeadRef>> {
+    if !super::is_enrolled(agent_dir) {
+        return Ok(None);
+    }
+    let seal = agora_agentkit::state::storage::AgentSeal::new(agent_dir, id);
+    let waiting = seal.outbox().await?.len();
+    anyhow::ensure!(
+        waiting == 0,
+        "pending uploads: {waiting} sealed version(s) wait in sealed/outbox. Let the runner \
+         upload them, or run this with the runner stopped after a drain"
+    );
+    let local = seal.head().await?.map(|h| h.head);
+    let server = api
+        .chain(id, signing)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("reading the agent's chain on Agora")?;
+    let server_head = server
+        .last()
+        .map(|e| agora_agentkit::state::verify::HeadRef {
+            entry_hash: e.entry_hash(),
+            seq: e.entry.seq,
+        });
+    anyhow::ensure!(
+        local == server_head,
+        "the sealed head here and Agora's differ: resolve that first (the start check says how)"
+    );
+    Ok(server_head)
+}
+
 /// What changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rotated {
@@ -106,27 +145,27 @@ pub async fn rotate_keys(
     .context("recording the old keys in past_keys.json")?;
 
     // 2. The server
-    if done.signing {
-        let seq = keys
-            .rotations(id)?
+    let new_public = agora_agentkit::govlog::PublicKeyHex::from(&new_signing.verifying_key());
+    let recorded = keys.rotations(id)?;
+    // An earlier attempt got the signing rotation taken and recorded, and
+    // stopped after it: never a second rotation to the same key
+    let signing_done = done.signing
+        && recorded
             .iter()
-            .map(|r| r.seq + 1)
-            .max()
-            .unwrap_or(0);
-        let new_public = agora_agentkit::govlog::PublicKeyHex::from(&new_signing.verifying_key());
+            .max_by_key(|r| r.seq)
+            .is_some_and(|r| r.new_public_key == new_public);
+    if signing_done && keys.pending_rotation(id)?.is_some() {
+        let seq = recorded.iter().map(|r| r.seq).max().unwrap_or(0);
+        keys.settle_pending_rotation(id, seq)?;
+    }
+    if done.signing && !signing_done {
+        let seq = recorded.iter().map(|r| r.seq + 1).max().unwrap_or(0);
         // The rotation an earlier attempt signed and sent, if it was this one
         let rotation = match keys.pending_rotation(id)? {
             Some(r) if r.new_public_key == new_public && r.seq == seq => r,
             _ => {
-                // The old key signs nothing past the current head
-                let last = if super::is_enrolled(&agent_dir) {
-                    agora_agentkit::state::storage::AgentSeal::new(&agent_dir, id)
-                        .head()
-                        .await?
-                        .map(|h| h.head)
-                } else {
-                    None
-                };
+                // The old key signs nothing past the head Agora confirms
+                let last = confirmed_head(&agent_dir, api, id, &old_signing).await?;
                 let r = KeyRotation::agent_signed(
                     id,
                     seq,
@@ -156,12 +195,18 @@ pub async fn rotate_keys(
                 "the server already holds the new signing key: an earlier attempt's answer was lost"
             );
         } else {
-            api.rotate_key(id, &old_signing, &rotation)
-                .await
-                .map_err(anyhow::Error::msg)
-                .context(
+            if let Err(e) = api.rotate_key(id, &old_signing, &rotation).await {
+                if e.starts_with(super::api::CONFLICT) {
+                    anyhow::bail!(
+                        "Agora's sealed head moved on from the one this rotation names ({e}): \
+                         secrets.json is unchanged. Let the runner upload what waits, stop it, \
+                         and run this again"
+                    );
+                }
+                return Err(anyhow::Error::msg(e).context(
                     "the server refused the signing-key rotation; secrets.json is unchanged",
-                )?;
+                ));
+            }
         }
         // Ours to verify the chain by, never the server's
         keys.record_rotation(id, &rotation)
@@ -226,6 +271,16 @@ mod tests {
     use agora_agentkit::state::crypto::StateKey;
     use agora_agentkit::state::storage::plaintext_hash;
 
+    /// Everything sealed is on the fake Agora: nothing waits to upload.
+    async fn uploaded(dir: &std::path::Path, id: AgentId, api: &FakeApi) {
+        let seal = agora_agentkit::state::storage::AgentSeal::new(dir, id);
+        let chain = check::local_entries(&seal).await.unwrap();
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        *api.chain.lock().unwrap() = Ok(chain);
+    }
+
     #[tokio::test]
     async fn new_keys_are_written_first_and_secrets_replaced_only_after_the_server() {
         let root = crate::sealed::TestDir::new("rotate");
@@ -235,6 +290,7 @@ mod tests {
         let old_enc = keys.encryption(id).unwrap();
         let api = FakeApi::new();
         *api.public_key.lock().unwrap() = Some(old_signing.verifying_key());
+        uploaded(&dir, id, &api).await;
 
         let state_dir = root.join("state");
         assert!(
@@ -318,7 +374,7 @@ mod tests {
                 .unwrap()
                 .value,
         );
-        let out = check::check(&dir, id, &local, Default::default(), &keys, &FakeApi::new()).await;
+        let out = check::check(&dir, id, &local, Default::default(), &keys, &api).await;
         assert!(matches!(out, Outcome::Run { hold: None, .. }), "{out:?}");
     }
 
@@ -328,10 +384,11 @@ mod tests {
     #[tokio::test]
     async fn a_rotation_whose_answer_was_lost_is_recorded_on_retry() {
         let root = crate::sealed::TestDir::new("rotate-lost");
-        let (id, keys, _) = enrolled(&root).await;
+        let (id, keys, dir) = enrolled(&root).await;
         let state_dir = root.join("state");
         let api = FakeApi::new();
         *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
+        uploaded(&dir, id, &api).await;
         *api.fail.lock().unwrap() = Some("rotate_key_reply");
         assert!(
             rotate_keys(&state_dir, &keys, &api, id, true, false)
@@ -382,5 +439,83 @@ mod tests {
             .to_string();
         assert!(e.contains("session in progress"), "{e}");
         assert!(keys.next_secrets(id).unwrap().is_none(), "nothing written");
+    }
+
+    /// The signing rotation taken and recorded, the encryption key
+    /// refused: the retry finishes the encryption step and never signs a
+    /// second rotation.
+    #[tokio::test]
+    async fn a_half_done_rotation_resumes_after_the_signing_step() {
+        let root = crate::sealed::TestDir::new("rotate-half");
+        let (id, keys, dir) = enrolled(&root).await;
+        keys.ring().ensure_encryption_key(id).unwrap();
+        let state_dir = root.join("state");
+        let api = FakeApi::new();
+        *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
+        uploaded(&dir, id, &api).await;
+        *api.fail.lock().unwrap() = Some("register_encryption_key");
+        assert!(
+            rotate_keys(&state_dir, &keys, &api, id, true, true)
+                .await
+                .is_err()
+        );
+        assert_eq!(keys.rotations(id).unwrap().len(), 1);
+
+        *api.fail.lock().unwrap() = None;
+        api.calls.lock().unwrap().clear();
+        let done = rotate_keys(&state_dir, &keys, &api, id, true, true)
+            .await
+            .unwrap();
+        assert!(done.signing && done.encryption && done.rewrapped);
+        assert_eq!(
+            *api.calls.lock().unwrap(),
+            ["register_encryption_key", "post_state_key"],
+            "no second rotation"
+        );
+        let rotations = keys.rotations(id).unwrap();
+        assert_eq!(rotations.len(), 1);
+        assert!(keys.pending_rotation(id).unwrap().is_none());
+        assert!(
+            keys.trusted(id).unwrap().is_some(),
+            "ends at the current key"
+        );
+    }
+
+    /// An enrolled agent rotates only at the head Agora confirms: versions
+    /// waiting to upload stop it, and a moved head is a clear refusal.
+    #[tokio::test]
+    async fn a_rotation_names_the_head_agora_confirms() {
+        let root = crate::sealed::TestDir::new("rotate-head");
+        let (id, keys, dir) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        let api = FakeApi::new();
+        *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
+        let e = rotate_keys(&state_dir, &keys, &api, id, true, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pending uploads"), "{e}");
+        assert!(keys.rotations(id).unwrap().is_empty());
+        let chain = crate::sealed::check::local_entries(&seal).await.unwrap();
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        *api.chain.lock().unwrap() = Ok(chain.clone());
+        *api.fail.lock().unwrap() = Some("rotate_key_conflict");
+        let e = rotate_keys(&state_dir, &keys, &api, id, true, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("head moved on"), "{e}");
+        *api.fail.lock().unwrap() = None;
+        rotate_keys(&state_dir, &keys, &api, id, true, false)
+            .await
+            .unwrap();
+        let r = &keys.rotations(id).unwrap()[0];
+        assert_eq!(
+            r.old_key_last.map(|h| h.entry_hash),
+            Some(chain.last().unwrap().entry_hash())
+        );
     }
 }

@@ -787,7 +787,8 @@ struct Skipped {
     id: AgentId,
     /// Unknown when the state would not load.
     name: Option<String>,
-    /// `load`, `construct` or `sealed` (refused by the sealed-state check).
+    /// `load`, `construct`, `sealed` (refused by the sealed-state check) or
+    /// `rotation` (a key rotation unfinished).
     stage: &'static str,
     error: String,
 }
@@ -900,12 +901,14 @@ fn report_skipped(skipped: &[Skipped], alerts: &alerts::Alerter) {
     }
     let count = |stage| skipped.iter().filter(|s| s.stage == stage).count();
     let (load, construct, sealed) = (count("load"), count("construct"), count("sealed"));
+    let rotation = count("rotation");
     tracing::error!(
         event_type = "agents_skipped",
         agents_skipped = skipped.len(),
         load,
         construct,
         sealed,
+        rotation,
         "agents left out of this sweep; see the agent_skipped events"
     );
     if let Some(alert) = skipped_alert(skipped) {
@@ -1486,6 +1489,44 @@ fn report_summary<E: std::fmt::Display>(
     out
 }
 
+/// Leave out every agent whose `rotate-keys` didn't finish
+/// (`secrets.next.json` is there): stage `rotation`, no refusal marker, no
+/// notice to the agent, and an alert to finish the command.
+fn mid_rotation(
+    pool: &mut Vec<(AgentId, SeedState)>,
+    secrets_dir: &std::path::Path,
+    alerts: &alerts::Alerter,
+    skipped: &mut Vec<Skipped>,
+) {
+    pool.retain(|(id, state)| {
+        let staged = secrets_dir
+            .join(id.to_string())
+            .join(sealed::keys::NEXT_SECRETS_FILE);
+        if !std::fs::exists(&staged).unwrap_or(true) {
+            return true;
+        }
+        let name = state.soul.name.to_string();
+        skipped.push(Skipped::new(
+            *id,
+            Some(name.clone()),
+            "rotation",
+            "a key rotation is unfinished".into(),
+        ));
+        alerts.notify(
+            alerts::Alert::new(
+                alerts::AlertKind::SealedStateRotationUnfinished,
+                format!("{name}: a key rotation is unfinished; the agent is left out"),
+            )
+            .agent(&name, *id)
+            .detail(
+                "finish",
+                format!("agora-seed rotate-keys --agent {id} (with the runner stopped)"),
+            ),
+        );
+        false
+    });
+}
+
 /// What the sealed-state start check leaves for the run.
 #[derive(Default)]
 struct SealedRun {
@@ -1758,6 +1799,11 @@ async fn run(held: &mut Held) -> Result<()> {
             .context("no home directory")?
             .join("agents/agora"),
     };
+    // Shared with any other runner on this data dir; `rotate-keys` takes it
+    // exclusive. A dry run or a listing reads only
+    if !args.dry_run && !args.list_models {
+        held.runner_lock = Some(sealed::session::runner_shared(&data_dir)?);
+    }
     if args.test_alert {
         let alerts = config
             .alerts
@@ -1979,6 +2025,14 @@ async fn run(held: &mut Held) -> Result<()> {
         sealed: enrolled,
         mut skipped,
     } = loaded;
+    // An agent mid-rotation (`secrets.next.json`) is left out, unrefused:
+    // its keys and the server's may disagree until `rotate-keys` finishes
+    mid_rotation(
+        &mut pool,
+        &data_dir.join("secrets"),
+        &held.alerts,
+        &mut skipped,
+    );
     // The sealed-state start check, for enrolled agents: before anyone is
     // built, so a refused agent is never run, saved or sealed.
     let sealed_run = sealed_start_check(

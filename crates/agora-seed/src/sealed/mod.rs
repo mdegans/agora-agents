@@ -69,6 +69,14 @@ impl SealedEnrolment {
         }
     }
 
+    /// Over a [`KeyStore`] already open.
+    pub fn with_keys(state_dir: impl Into<PathBuf>, keys: KeyStore) -> Self {
+        Self {
+            state_dir: state_dir.into(),
+            keys,
+        }
+    }
+
     pub fn keys_store(&self) -> &KeyStore {
         &self.keys
     }

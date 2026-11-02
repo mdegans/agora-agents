@@ -7,6 +7,10 @@ use agora_agentkit::envelope::EncryptionPublicKey;
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::state::{KeyRotation, SignedStateEntry, StateKeyRecord};
 
+/// How an error string from [`SealedApi::rotate_key`] begins when the
+/// server's head moved on (a 409).
+pub const CONFLICT: &str = "conflict: ";
+
 /// What sealed state asks of Agora, each signed as the agent.
 // async_trait marks each boxed future `#[must_use]`, which it already is
 #[allow(clippy::double_must_use)]
@@ -97,7 +101,10 @@ impl SealedApi for Client {
         Client::rotate_key(self, auth(id, old), rotation)
             .await
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| match agora_agentkit::client::state_conflict(&e) {
+                Some(head) => format!("{CONFLICT}{head:?}"),
+                None => e.to_string(),
+            })
     }
 
     async fn register_encryption_key(
@@ -231,6 +238,9 @@ pub mod fake {
         ) -> Result<(), String> {
             self.call("rotate_key")?;
             self.signed_by(old)?;
+            if *self.fail.lock().unwrap() == Some("rotate_key_conflict") {
+                return Err(format!("{CONFLICT}another head"));
+            }
             rotation.verify_agent_signed().map_err(|e| e.to_string())?;
             *self.public_key.lock().unwrap() = Some(
                 rotation

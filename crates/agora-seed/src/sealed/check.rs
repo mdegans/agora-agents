@@ -51,6 +51,10 @@ pub enum Hold {
     /// `sealed/` couldn't be read: the agent runs, its saves go unsealed
     /// (no base) and are recorded as such.
     Unreadable,
+    /// The chain couldn't be checked (Agora unreachable for a main line
+    /// that runs through it): the agent runs, uploads held. No refusal
+    /// without evidence.
+    Unchecked,
 }
 
 /// The check's answer for one agent.
@@ -113,8 +117,9 @@ pub fn verdict_line(line: &[SignedStateEntry], head: &HeadRef) -> String {
     short.truncate(12);
     format!(
         "Your sealed state: {} version{} since {since}; this session starts from head {short} \
-         (the next session's will differ). Checked by {VERIFIER}: links, signatures, and that \
-         your state matches the last sealed version.",
+         (a marker for this version, which the history tools will use; the next session's will \
+         differ). Checked by {VERIFIER}: links, signatures, and that your state matches the \
+         last sealed version.",
         versions.len(),
         if versions.len() == 1 { "" } else { "s" },
     )
@@ -134,6 +139,10 @@ pub const HEAD_MISSING_LINE: &str = "Your latest sealed version is not on Agora:
 pub const UNREADABLE_LINE: &str = "Your sealed history couldn't be read here at the start of \
      this session, so it couldn't be checked. This session runs on your state as it is; its \
      save is kept here but not sealed, and your operator has been told.";
+
+pub const UNCHECKED_LINE: &str = "Your sealed history couldn't be checked at the start of this \
+     session: part of it is on Agora, which couldn't be reached. This session runs on your \
+     state as it is, and your operator has been told.";
 
 pub const SEAL_FAILED_LINE: &str = "Your last save was written here but could not be sealed, so \
      your sealed history does not include it yet. This session starts from that save; new \
@@ -192,6 +201,12 @@ pub async fn check(
         hold: Some(Hold::Unreadable),
         drops: Vec::new(),
     };
+    let unchecked = || Outcome::Run {
+        seat: vec![UNCHECKED_LINE.to_string()],
+        notice: false,
+        hold: Some(Hold::Unchecked),
+        drops: Vec::new(),
+    };
     match seal.is_refused().await {
         Ok(false) => {}
         Ok(true) => {
@@ -247,7 +262,10 @@ pub async fn check(
     };
     let entries = match local_entries(&seal).await {
         Ok(entries) => entries,
-        Err(e) => return refuse(Refusal::ChainBroken, format!("local chain unreadable: {e}")),
+        Err(e) => {
+            tracing::warn!(agent_id = %id, error = %e, "local sealed chain unreadable");
+            return unreadable();
+        }
     };
     // After a rebase the main line runs through Agora's entries, which
     // aren't kept here: they are read from Agora and verified below with
@@ -265,19 +283,36 @@ pub async fn check(
         }
         fetched = Some(chain);
     }
-    let Some(line) = line else {
-        return refuse(
-            Refusal::ChainBroken,
-            format!(
-                "the main line to head {} has a missing link",
-                head.entry_hash
-            ),
-        );
+    let line = match (line, &fetched) {
+        (Some(line), _) => line,
+        // Agora couldn't be asked, or there is no key to ask with: no
+        // evidence either way, so the agent runs, unchecked
+        (None, Some(Err(e))) => {
+            tracing::warn!(agent_id = %id, error = %e, "the main line runs through Agora's chain, which couldn't be read");
+            return unchecked();
+        }
+        (None, None) => return unchecked(),
+        (None, Some(Ok(_))) => {
+            return refuse(
+                Refusal::ChainBroken,
+                format!(
+                    "the main line to head {} has a missing link",
+                    head.entry_hash
+                ),
+            );
+        }
     };
+    // Keys that can't be read are no evidence against the chain
     let trusted = match keys.trusted(id) {
         Ok(Some(t)) => t,
-        Ok(None) => return refuse(Refusal::ChainBroken, "no signing key to verify with".into()),
-        Err(e) => return refuse(Refusal::ChainBroken, format!("past keys unreadable: {e}")),
+        Ok(None) => {
+            tracing::warn!(agent_id = %id, "no signing key to verify the sealed chain with");
+            return unreadable();
+        }
+        Err(e) => {
+            tracing::warn!(agent_id = %id, error = %e, "the agent's key records are unreadable");
+            return unreadable();
+        }
     };
     let report = verify_chain(id, &line, &trusted);
     for notice in &report.notices {
@@ -496,7 +531,11 @@ pub fn hold_alert(
         ),
         Hold::Unreadable => (
             AlertKind::SealedStateUnreadable,
-            "sealed/ could not be read; the agent runs unsealed, uploads held",
+            "sealed/ or its keys could not be read; the agent runs, uploads held",
+        ),
+        Hold::Unchecked => (
+            AlertKind::SealedStateUnreadable,
+            "the sealed chain could not be checked (Agora unreachable); the agent runs, uploads held",
         ),
     };
     let mut alert = Alert::new(kind, format!("{name}: {summary}")).agent(name, id);
@@ -620,7 +659,13 @@ pub(crate) mod tests {
             "{}",
             seat[0]
         );
-        assert!(seat[0].contains(VERIFIER) && seat[0].contains("(the next session's will differ)"));
+        assert!(
+            seat[0].contains(VERIFIER)
+                && seat[0].contains(
+                    "(a marker for this version, which the history tools will use; the next \
+                     session's will differ)"
+                )
+        );
 
         // Agora has all of it: the same
         *server.chain.lock().unwrap() = Ok(sealed_chain(&dir, id).await);
@@ -930,6 +975,74 @@ pub(crate) mod tests {
         assert_eq!(unknown_rotations(&keys, &api, id).await, Some(0));
     }
 
+    /// No refusal without evidence: unreadable key records, or a chain
+    /// that runs through an unreachable Agora, run held.
+    #[tokio::test]
+    async fn transient_failures_run_held_and_are_never_refused() {
+        let root = crate::sealed::TestDir::new("check-transient");
+        let (id, keys, dir) = enrolled(&root).await;
+        std::fs::write(keys.agent_dir(id).join("rotations.json"), b"{ not json").unwrap();
+        let out = check(
+            &dir,
+            id,
+            &local_hash(&root, id).await,
+            Sizes::default(),
+            &keys,
+            &server(Vec::new()),
+        )
+        .await;
+        assert!(
+            matches!(
+                out,
+                Outcome::Run {
+                    hold: Some(Hold::Unreadable),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert!(!AgentSeal::new(&dir, id).is_refused().await.unwrap());
+
+        // A main line through Agora's entries, Agora unreachable
+        std::fs::rename(
+            keys.agent_dir(id).join("rotations.json"),
+            keys.agent_dir(id).join("rotations.broken"),
+        )
+        .unwrap();
+        let seal = AgentSeal::new(&dir, id);
+        let mine = local_entries(&seal).await.unwrap();
+        let mut sibling = mine[1].entry.clone();
+        sibling.state_at += 1;
+        let api = server(vec![
+            mine[0].clone(),
+            sibling.sign(&keys.signing(id).unwrap()),
+        ]);
+        crate::sealed::accept::rebase(&root.join("state"), &keys, &api, id, "a test")
+            .await
+            .unwrap();
+        *api.chain.lock().unwrap() = Err("unreachable".into());
+        let out = check(
+            &dir,
+            id,
+            &local_hash(&root, id).await,
+            Sizes::default(),
+            &keys,
+            &api,
+        )
+        .await;
+        assert!(
+            matches!(
+                out,
+                Outcome::Run {
+                    hold: Some(Hold::Unchecked),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert!(!seal.is_refused().await.unwrap());
+    }
+
     #[test]
     fn the_verifier_is_the_locked_agentkit() {
         let lock = include_str!("../../../../Cargo.lock");
@@ -952,6 +1065,7 @@ pub(crate) mod tests {
             HEAD_MISSING_LINE,
             SEAL_FAILED_LINE,
             UNREADABLE_LINE,
+            UNCHECKED_LINE,
         ] {
             let l = line.to_lowercase();
             for banned in ["claude", "haiku", "qwen", "model"] {

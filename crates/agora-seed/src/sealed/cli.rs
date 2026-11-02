@@ -173,6 +173,20 @@ pub async fn run(
             signing,
             encryption,
         } => {
+            // Only while no runner runs: held until the command ends
+            let _runner = super::session::runner_exclusive(data_dir)?;
+            // The server takes a rotation only at its current head: upload
+            // what waits first (rotate_keys refuses if anything still does)
+            if super::is_enrolled(&state_dir.join(agent.to_string())) {
+                let outbox = AgoraOutbox::new(
+                    client.clone(),
+                    &state_dir,
+                    Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
+                );
+                if let Err(e) = outbox.drain(agent).await {
+                    tracing::warn!(agent_id = %agent, error = %e, "upload before the rotation failed");
+                }
+            }
             let done =
                 super::rotate::rotate_keys(&state_dir, &keys, &client, agent, signing, encryption)
                     .await?;

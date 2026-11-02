@@ -70,10 +70,27 @@ pub struct SealedStateConfig {
     #[serde(default = "yes")]
     pub ask: bool,
     /// Who is asked, by agent id. There is no `all` in v1: the beta
-    /// allowlist. Strings, so a bad entry is skipped rather than failing the
+    /// allowlist. A bad entry is skipped and alerted, never failing the
     /// whole config.
     #[serde(default)]
-    pub agents: Vec<String>,
+    pub agents: Vec<ListedId>,
+}
+
+/// An `agents` entry: an [`AgentId`], or what didn't parse as one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListedId {
+    Id(AgentId),
+    Bad(String),
+}
+
+impl<'de> Deserialize<'de> for ListedId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Ok(match raw.trim().parse::<AgentId>() {
+            Ok(id) => Self::Id(id),
+            Err(_) => Self::Bad(raw),
+        })
+    }
 }
 
 impl SealedStateConfig {
@@ -85,14 +102,13 @@ impl SealedStateConfig {
         }
         let mut agents = BTreeSet::new();
         for (n, entry) in self.agents.iter().enumerate() {
-            match entry.trim().parse::<AgentId>() {
-                Ok(id) => {
-                    agents.insert(id);
+            match entry {
+                ListedId::Id(id) => {
+                    agents.insert(*id);
                 }
-                Err(e) => tracing::warn!(
+                ListedId::Bad(_) => tracing::warn!(
                     event_type = "sealed_state_bad_agent",
                     entry = n + 1,
-                    error = ?e,
                     "`[sealed_state].agents` entry is not an agent id; skipped"
                 ),
             }
@@ -112,6 +128,20 @@ pub fn resolve_or_disable(
     config: &SealedStateConfig,
     alerts: &crate::alerts::Alerter,
 ) -> Option<SealedOffer> {
+    let bad = config
+        .agents
+        .iter()
+        .filter(|e| matches!(e, ListedId::Bad(_)))
+        .count();
+    if config.enabled && bad > 0 {
+        alerts.notify(
+            crate::alerts::Alert::new(
+                crate::alerts::AlertKind::SealedStateDisabled,
+                format!("{bad} `[sealed_state].agents` entries are not agent ids; skipped"),
+            )
+            .detail("skipped", bad),
+        );
+    }
     match config.resolve() {
         Ok(offer) => offer,
         Err(e) => {

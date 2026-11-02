@@ -502,14 +502,30 @@ impl Enroller {
             .context("sealing the current state")?;
             record_sizes(&agent_dir, head, at, &current);
         }
-        seal.enroll()
+        // The last step is agentkit's, which takes the lock itself: the
+        // state rewritten as format 2 (a runner older than 0.147 then
+        // refuses it rather than overwriting it), resealed if the rewrite
+        // changed its hash, then `enrolled`
+        drop(lock);
+        let mut mirrored = agora_agentkit::state::storage::Mirrored::new(
+            FsStorage::new(&self.state_dir),
+            (),
+            std::sync::Arc::new(super::SealedEnrolment::with_keys(
+                &self.state_dir,
+                self.keys.clone(),
+            )),
+        );
+        let head = mirrored
+            .enroll(id)
             .await
-            .context("writing the enrolment marker")?;
+            .context("marking the state and writing the enrolment marker")?;
+        if let Ok(marked) = FsStorage::new(&self.state_dir).load_raw(id).await {
+            record_sizes(&agent_dir, head, Utc::now(), &marked.value);
+        }
         report.entries = super::check::local_entries(&seal)
             .await
             .map_err(anyhow::Error::msg)?
             .len();
-        drop(lock);
         tracing::info!(
             event_type = "sealed_enrolled",
             agent_id = %id,
@@ -620,6 +636,13 @@ mod tests {
         let seal = AgentSeal::new(&dir, id);
         assert!(seal.is_enrolled().await.unwrap());
         assert!(keys.state_key_file(id).unwrap().is_some());
+        // Marked: a pre-0.147 runner refuses it rather than overwrite it
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            raw["format"],
+            agora_agentkit::reactor::storage::SEALED_FORMAT
+        );
         let entries = super::super::check::local_entries(&seal).await.unwrap();
         let trusted = keys.trusted(id).unwrap().unwrap();
         assert!(verify_chain(id, &entries, &trusted).intact);
