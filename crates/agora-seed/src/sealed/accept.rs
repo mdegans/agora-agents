@@ -27,7 +27,7 @@ use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::{FsStorage, Storage};
 use agora_agentkit::state::codec::KeyframePolicy;
 use agora_agentkit::state::storage::{Adopted, AgentSeal};
-use agora_agentkit::state::verify::HeadRef;
+use agora_agentkit::state::verify::{HeadRef, HeadStatus, head_status, verify_chain};
 use anyhow::Context;
 use chrono::Utc;
 
@@ -179,6 +179,107 @@ pub async fn accept(
         reason,
         head,
         adopted: adopted.is_some(),
+    })
+}
+
+/// What `sealed-accept --rebase` did: hashes and counts only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebased {
+    /// The server head it was sealed on top of.
+    pub onto: HeadRef,
+    /// The new head.
+    pub head: HeadRef,
+    /// Outbox items set aside (kept, with their blobs).
+    pub set_aside: usize,
+}
+
+/// Resolve a held fork (v1 has no merges): the current state is sealed as
+/// a keyframe child of Agora's head, which is first verified with the
+/// runner's own trust; the versions that went the other way are kept
+/// locally as `.displaced`. A refusal is cleared first. The agent's next
+/// session is told its two histories were joined, with `note`.
+pub async fn rebase(
+    state_dir: &Path,
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    id: AgentId,
+    note: &str,
+) -> anyhow::Result<Rebased> {
+    let note = note.trim();
+    anyhow::ensure!(!note.is_empty(), "--note is required: the agent reads it");
+    let agent_dir = state_dir.join(id.to_string());
+    let seal = AgentSeal::new(&agent_dir, id);
+    let lock = super::session::take(state_dir, id, true).await?;
+    anyhow::ensure!(
+        seal.is_enrolled().await?,
+        "agent {id} is not enrolled in sealed state"
+    );
+    let signing = keys.signing(id).context("no signing key for the agent")?;
+    let chain = api
+        .chain(id, &signing)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("reading the agent's chain on Agora")?;
+    let trusted = keys
+        .trusted(id)?
+        .context("no signing key to verify Agora's chain with")?;
+    let report = verify_chain(id, &chain, &trusted);
+    anyhow::ensure!(
+        report.intact,
+        "Agora's chain does not verify ({:?}): not rebasing onto it",
+        report.problems
+    );
+    let server_head = chain
+        .last()
+        .context("Agora holds no chain: nothing to rebase onto")?;
+    let local_head = seal.head().await?.map(|h| h.head);
+    let outbox: Vec<_> = seal
+        .outbox()
+        .await?
+        .into_iter()
+        .map(|i| i.entry.entry)
+        .collect();
+    let hashes: Vec<_> = chain.iter().map(|e| e.entry_hash()).collect();
+    let status = head_status(local_head.as_ref().map(|h| &h.entry_hash), &outbox, &hashes);
+    anyhow::ensure!(
+        matches!(status, HeadStatus::ServerAhead | HeadStatus::Diverged),
+        "no fork to resolve: the local head stands {status:?} to Agora's"
+    );
+    let current = FsStorage::new(state_dir)
+        .load_raw(id)
+        .await
+        .context("the agent's state won't load")?
+        .value;
+    let k = keys
+        .seal_keys(id)
+        .context("no sealing keys for the agent")?;
+    if seal.is_refused().await? {
+        seal.clear_refusal().await.context("clearing the refusal")?;
+    }
+    let set_aside = outbox.len();
+    let head = seal
+        .rebase_onto(&lock, &k, &server_head.entry, &current)
+        .await
+        .context("sealing the current state on top of Agora's head")?;
+    super::enroll::record_sizes(&agent_dir, head, Utc::now(), &current);
+    Notice::joined(&agent_dir, note).context("writing the notice")?;
+    drop(lock);
+    let onto = HeadRef {
+        entry_hash: server_head.entry_hash(),
+        seq: server_head.entry.seq,
+    };
+    tracing::warn!(
+        event_type = "sealed_state_rebased",
+        agent_id = %id,
+        onto = %onto.entry_hash,
+        head = %head.entry_hash,
+        set_aside,
+        "the operator joined a held fork onto Agora's head"
+    );
+    Ok(Rebased {
+        onto,
+        head,
+        set_aside,
     })
 }
 
@@ -419,5 +520,88 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("session in progress"), "{e}");
+    }
+
+    /// A held fork: Agora moved on from the local head. `--rebase` seals
+    /// the current state on Agora's head, keeps the other branch locally,
+    /// and the next start is clean and tells the agent.
+    #[tokio::test]
+    async fn a_held_fork_is_rebased_onto_agoras_head() {
+        let root = crate::sealed::TestDir::new("accept-rebase");
+        let (id, keys, dir) = enrolled(&root).await;
+        let seal = AgentSeal::new(&dir, id);
+        let mine = check::local_entries(&seal).await.unwrap();
+        // Agora took genesis and a sibling of our state
+        let mut sibling = mine[1].entry.clone();
+        sibling.state_at += 1;
+        let server_chain = vec![mine[0].clone(), sibling.sign(&keys.signing(id).unwrap())];
+        let api = FakeApi::new();
+        *api.chain.lock().unwrap() = Ok(server_chain.clone());
+        let out = check::check(
+            &dir,
+            id,
+            &local(&root, id).await,
+            Default::default(),
+            &keys,
+            &api,
+        )
+        .await;
+        assert!(
+            matches!(
+                out,
+                Outcome::Run {
+                    hold: Some(check::Hold::Fork),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        let held = seal.held().await.unwrap();
+        assert!(held.outbox_items > 0);
+
+        assert!(
+            rebase(&root.join("state"), &keys, &api, id, " ")
+                .await
+                .is_err(),
+            "a note"
+        );
+        let done = rebase(&root.join("state"), &keys, &api, id, "joined in a test")
+            .await
+            .unwrap();
+        assert_eq!(done.onto.entry_hash, server_chain[1].entry_hash());
+        assert_eq!(done.head.seq, 2);
+        assert_eq!(done.set_aside, held.outbox_items);
+        // Agora at its head, the rebased version waiting on it: clean
+        let out = check::check(
+            &dir,
+            id,
+            &local(&root, id).await,
+            Default::default(),
+            &keys,
+            &api,
+        )
+        .await;
+        let Outcome::Run {
+            seat, hold, notice, ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert_eq!(hold, None);
+        assert!(notice);
+        assert!(
+            seat[0].contains("your operator joined your two sealed histories"),
+            "{seat:?}"
+        );
+        assert!(
+            seat[0].ends_with("Your operator's note: joined in a test"),
+            "{seat:?}"
+        );
+        // Nothing left to rebase
+        assert!(
+            rebase(&root.join("state"), &keys, &api, id, "again")
+                .await
+                .is_err()
+        );
     }
 }

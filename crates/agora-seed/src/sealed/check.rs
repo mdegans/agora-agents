@@ -249,7 +249,23 @@ pub async fn check(
         Ok(entries) => entries,
         Err(e) => return refuse(Refusal::ChainBroken, format!("local chain unreadable: {e}")),
     };
-    let Some(line) = main_line(&entries, &head.entry_hash) else {
+    // After a rebase the main line runs through Agora's entries, which
+    // aren't kept here: they are read from Agora and verified below with
+    // the runner's own trust, never taken on its word
+    let mut fetched: Option<Result<Vec<SignedStateEntry>, String>> = None;
+    let mut line = main_line(&entries, &head.entry_hash);
+    if line.is_none()
+        && let Some(signing) = keys.signing(id)
+    {
+        let chain = server.chain(id, &signing).await;
+        if let Ok(chain) = &chain {
+            let mut all = entries.clone();
+            all.extend(chain.iter().cloned());
+            line = main_line(&all, &head.entry_hash);
+        }
+        fetched = Some(chain);
+    }
+    let Some(line) = line else {
         return refuse(
             Refusal::ChainBroken,
             format!(
@@ -339,7 +355,11 @@ pub async fn check(
         Ok(items) => items.into_iter().map(|i| i.entry.entry).collect(),
         Err(_) => Vec::new(),
     };
-    let status = match server.chain(id, &signing).await {
+    let chain = match fetched {
+        Some(chain) => chain,
+        None => server.chain(id, &signing).await,
+    };
+    let status = match chain {
         Ok(chain) => {
             let hashes: Vec<Sha256Hex> = chain.iter().map(|e| e.entry_hash()).collect();
             head_status(Some(&head.entry_hash), &outbox, &hashes)
@@ -455,7 +475,12 @@ pub fn drop_alert(id: AgentId, name: &str, drops: &[(&'static str, u32)]) -> Ale
 }
 
 /// The alert for a run that goes on held.
-pub fn hold_alert(hold: Hold, id: AgentId, name: &str) -> Alert {
+pub fn hold_alert(
+    hold: Hold,
+    id: AgentId,
+    name: &str,
+    held: Option<&agora_agentkit::state::storage::Held>,
+) -> Alert {
     let (kind, summary) = match hold {
         Hold::SealFailed => (
             AlertKind::SealedStateSealFailed,
@@ -474,7 +499,21 @@ pub fn hold_alert(hold: Hold, id: AgentId, name: &str) -> Alert {
             "sealed/ could not be read; the agent runs unsealed, uploads held",
         ),
     };
-    Alert::new(kind, format!("{name}: {summary}")).agent(name, id)
+    let mut alert = Alert::new(kind, format!("{name}: {summary}")).agent(name, id);
+    if let Some(held) = held {
+        alert = alert
+            .detail("held", held.outbox_items)
+            .detail("blobs", held.blobs)
+            .detail("blob_bytes", held.blob_bytes)
+            .detail("forks", held.displaced);
+    }
+    if hold == Hold::Fork {
+        alert = alert.detail(
+            "resolve",
+            format!("agora-seed sealed-accept --agent {id} --rebase --note \"…\""),
+        );
+    }
+    alert
 }
 
 #[cfg(test)]

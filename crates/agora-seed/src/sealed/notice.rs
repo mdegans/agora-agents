@@ -60,6 +60,10 @@ pub struct Notice {
     pub reason: Refusal,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted: Option<Accepted>,
+    /// Not a refusal: the operator joined two histories (`sealed-accept
+    /// --rebase`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub joined: bool,
 }
 
 fn path(agent_dir: &Path) -> PathBuf {
@@ -108,6 +112,33 @@ impl Notice {
                 refused_at: Utc::now(),
                 reason,
                 accepted: None,
+                joined: false,
+            },
+        )
+    }
+
+    /// Two histories joined by the operator, with its note. An earlier
+    /// notice not yet shown is kept aside.
+    pub fn joined(agent_dir: &Path, note: &str) -> std::io::Result<()> {
+        let from = path(agent_dir);
+        if std::fs::exists(&from)? {
+            let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+            std::fs::rename(
+                &from,
+                from.with_file_name(format!("notice.superseded.{at}.json")),
+            )?;
+        }
+        let now = Utc::now();
+        write(
+            agent_dir,
+            &Notice {
+                refused_at: now,
+                reason: Refusal::Mismatch,
+                accepted: Some(Accepted {
+                    at: now,
+                    note: note.trim().to_string(),
+                }),
+                joined: true,
             },
         )
     }
@@ -118,6 +149,7 @@ impl Notice {
             refused_at: Utc::now(),
             reason: fallback,
             accepted: None,
+            joined: false,
         });
         n.accepted = Some(Accepted {
             at: Utc::now(),
@@ -129,6 +161,15 @@ impl Notice {
     /// What the agent is shown; only once the operator accepted.
     pub fn line(&self) -> Option<String> {
         let accepted = self.accepted.as_ref()?;
+        if self.joined {
+            return Some(format!(
+                "On {}, your operator joined your two sealed histories, which had gone separate \
+                 ways: your state here is now sealed on top of the copy on Agora, and the \
+                 versions that went the other way are kept. Your operator's note: {}",
+                accepted.at.format("%-d %B %Y"),
+                accepted.note
+            ));
+        }
         Some(format!(
             "Your session on {} did not run: {}. Your operator accepted the current state with \
              this note: {}",

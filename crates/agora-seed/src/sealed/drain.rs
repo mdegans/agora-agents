@@ -89,7 +89,7 @@ impl Drainer {
                     "sealed uploads held for the rest of the run"
                 );
                 self.alerts
-                    .notify(hold_alert(hold, id, name).detail("waiting", report.waiting));
+                    .notify(hold_alert(hold, id, name, Some(&report.held)));
             }
             Err(e) => {
                 tracing::warn!(

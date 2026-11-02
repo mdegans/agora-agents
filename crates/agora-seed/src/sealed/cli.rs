@@ -43,6 +43,10 @@ pub enum Command {
         /// lost head.json rebuilt from Agora that the state matches.
         #[arg(long)]
         note: Option<String>,
+        /// Resolve a held fork: seal the current state on top of Agora's
+        /// verified head, keep the other branch locally, resume uploads.
+        #[arg(long, requires = "note")]
+        rebase: bool,
     },
     /// Rotate an agent's keys: new ones written first, the server told,
     /// the state key re-wrapped, `secrets.json` replaced last. Old keys are
@@ -126,7 +130,30 @@ pub async fn run(
             }
             anyhow::ensure!(failed == 0, "{failed} enrolment(s) failed");
         }
-        Command::SealedAccept { agent, note } => {
+        Command::SealedAccept {
+            agent,
+            note,
+            rebase: true,
+        } => {
+            let done = super::accept::rebase(
+                &state_dir,
+                &keys,
+                &client,
+                agent,
+                note.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            println!(
+                "{agent}: rebased onto Agora's head {} (seq {}); new head {} at seq {}; {} \
+                 version(s) set aside locally",
+                done.onto.entry_hash,
+                done.onto.seq,
+                done.head.entry_hash,
+                done.head.seq,
+                done.set_aside
+            );
+        }
+        Command::SealedAccept { agent, note, .. } => {
             let done =
                 super::accept::accept(&state_dir, &keys, &client, agent, note.as_deref()).await?;
             println!(

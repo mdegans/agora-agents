@@ -1480,7 +1480,15 @@ async fn sealed_start_check(
                     alerts.notify(sealed::check::drop_alert(*id, &name, &drops));
                 }
                 if let Some(hold) = hold {
-                    alerts.notify(sealed::check::hold_alert(hold, *id, &name));
+                    // Every start while held, rate-limited by the alerter
+                    let held = agora_agentkit::state::storage::AgentSeal::new(
+                        &state_dir.join(id.to_string()),
+                        *id,
+                    )
+                    .held()
+                    .await
+                    .ok();
+                    alerts.notify(sealed::check::hold_alert(hold, *id, &name, held.as_ref()));
                     run.held.push(*id);
                 }
                 if let Some(n @ 1..) = sealed::check::unknown_rotations(keys, api, *id).await {
