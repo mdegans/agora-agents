@@ -373,7 +373,7 @@ mod tests {
             "{seat:?}"
         );
         assert!(
-            seat[1].starts_with("Your sealed state: 2 versions since "),
+            seat[1].starts_with("Your sealed state: intact. 2 versions since "),
             "{seat:?}"
         );
         // Shown in a session that saved: not again

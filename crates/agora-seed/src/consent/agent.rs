@@ -3865,14 +3865,23 @@ where
                 Self::seat_user(prompt, Content::from(notice))?;
             }
         }
-        // The sealed-state start check's verdict, and a refusal's notice
-        if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id())
-            && !seat.lines.is_empty()
+        // The sealed-state answer told back once, then the start check's
+        // verdict and a refusal's notice
+        let mut sealed_lines = Vec::new();
+        if let Some(ledger) = self.sealed_ledger.as_mut()
+            && let Some(line) = ledger.ack_line()
         {
-            let text = seat.lines.join("\n\n");
+            ledger.acknowledge();
+            self.sealed_dirty = true;
+            sealed_lines.push(line);
+        }
+        if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id()) {
             self.sealed_notice = seat.notice;
+            sealed_lines.extend(seat.lines.iter().cloned());
+        }
+        if !sealed_lines.is_empty() {
             let (_, prompt) = self.inner.parts();
-            Self::seat_user(prompt, Content::from(text))?;
+            Self::seat_user(prompt, Content::from(sealed_lines.join("\n\n")))?;
         }
         if let Some(key) = self.review.clone() {
             self.seat_review(key).await?;
@@ -10359,5 +10368,33 @@ mod tests {
             "the sealed-state question is seated"
         );
         assert!(last_user_text(&agent).contains("## Offer `sealed_state`"));
+    }
+
+    /// The session after an answer is told it is on file, once.
+    #[tokio::test]
+    async fn the_sealed_answer_is_told_back_once_at_the_next_session() {
+        let h = with_sealed("sealed-ack", None);
+        let mut agent = seated(&h).await;
+        agent
+            .handle(answer_call("sealed_state", "decline", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        let seen = serde_json::to_string(&next.prompt().messages).unwrap();
+        assert!(
+            seen.contains(
+                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed."
+            ),
+            "{seen}"
+        );
+        next.handle(reply("done")).await.unwrap();
+        next.on_teardown().await.unwrap();
+        assert!(sealed_ledger(&h).await.acknowledged);
+        let mut third = next_session(&h, &next);
+        third.on_init().await.unwrap();
+        let seen = serde_json::to_string(&third.prompt().messages).unwrap();
+        assert!(!seen.contains("is recorded: decline"), "once");
     }
 }

@@ -36,6 +36,10 @@ pub struct SealLedger {
     /// Every time the offer was put, oldest first.
     #[serde(default)]
     pub asks: Vec<SealAsk>,
+    /// The answer on file was told back to the agent, once, at the session
+    /// after it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub acknowledged: bool,
 }
 
 impl Default for SealLedger {
@@ -44,6 +48,7 @@ impl Default for SealLedger {
             format: FORMAT,
             agent: None,
             asks: Vec::new(),
+            acknowledged: false,
         }
     }
 }
@@ -183,6 +188,29 @@ impl SealLedger {
         )
     }
 
+    /// The line telling the agent its answer is on file, at the first
+    /// session after it; `None` once told, or with no answer.
+    pub fn ack_line(&self) -> Option<String> {
+        if self.acknowledged {
+            return None;
+        }
+        Some(match self.choice()? {
+            SealChoice::Decline => {
+                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed."
+                    .to_string()
+            }
+            choice => format!(
+                "Your answer to the sealed-backups offer is recorded: {}.",
+                choice.as_str()
+            ),
+        })
+    }
+
+    /// The answer was told back.
+    pub fn acknowledge(&mut self) {
+        self.acknowledged = true;
+    }
+
     pub fn record(&mut self, ask: SealAsk) {
         self.asks.push(ask);
     }
@@ -269,6 +297,30 @@ mod tests {
             }));
         }
         assert!(!l.due(&soul()), "misses capped");
+    }
+
+    /// The answer is told back once, at the session after it.
+    #[test]
+    fn the_answer_is_acknowledged_once() {
+        let mut l = SealLedger::default();
+        assert_eq!(l.ack_line(), None, "nothing answered");
+        l.record(ask(SealOutcome::NoAnswer {
+            failure: "x".into(),
+        }));
+        assert_eq!(l.ack_line(), None, "no answer, nothing to tell");
+        l.record(ask(answered(SealChoice::Publish)));
+        assert_eq!(
+            l.ack_line().unwrap(),
+            "Your answer to the sealed-backups offer is recorded: publish."
+        );
+        l.acknowledge();
+        assert_eq!(l.ack_line(), None, "once");
+        let mut no = SealLedger::default();
+        no.record(ask(answered(SealChoice::Decline)));
+        assert_eq!(
+            no.ack_line().unwrap(),
+            "Your answer to the sealed-backups offer is recorded: decline. Nothing changed."
+        );
     }
 
     #[tokio::test]
