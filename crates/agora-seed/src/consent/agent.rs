@@ -1476,6 +1476,17 @@ where
             .is_some_and(|o| o.admits(self.inner.id()))
             || !self.sealed_ledger.as_ref().is_some_and(|l| l.due(soul))
         {
+            if let Some(ledger) = &self.sealed_ledger {
+                tracing::info!(
+                    event_type = "sealed_state_not_due",
+                    agent = %soul.name,
+                    agent_id = %self.inner.id(),
+                    asks = ledger.asks.len(),
+                    choice = ledger.choice().map(SealChoice::as_str),
+                    in_soul = sealed_state::applied_in(soul),
+                    "sealed-state offer not due this session"
+                );
+            }
             return None;
         }
         let seed = sealed_state::prompt::seed_for(self.inner.id());
@@ -3808,6 +3819,16 @@ where
             }
         }
         self.load_restore(&dir).await;
+        if let Some(offer) = &self.rt.sealed_state
+            && !offer.admits(self.inner.id())
+        {
+            tracing::info!(
+                event_type = "sealed_state_not_listed",
+                agent = %self.inner.state().soul.name,
+                agent_id = %self.inner.id(),
+                "not on the sealed-state list (or ask = false); not asked"
+            );
+        }
         if self
             .rt
             .sealed_state
@@ -10318,5 +10339,25 @@ mod tests {
             crate::sealed::notice::Notice::load(&dir).unwrap().is_none(),
             "set aside"
         );
+    }
+
+    /// Beta round 1: an agent listed only in `[sealed_state]`, no other
+    /// offer configured, no ledger files at all, is still asked.
+    #[tokio::test]
+    async fn sealed_offer_is_asked_with_no_other_offer_and_no_ledgers() {
+        let h = Harness::new("sealed-alone");
+        let mut rt = h.runtime_advertising(&[OLD, NEW, OTHER]);
+        Arc::get_mut(&mut rt).unwrap().sealed_state =
+            Some(sealed_state::SealedOffer::for_agents(&[h.id]));
+        let dir = rt.state_dir.join(h.id.to_string());
+        assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none());
+        let mut agent = h.agent_on(&rt, OTHER);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "the sealed-state question is seated"
+        );
+        assert!(last_user_text(&agent).contains("## Offer `sealed_state`"));
     }
 }

@@ -114,6 +114,14 @@ impl SealedStateConfig {
             }
         }
         anyhow::ensure!(!agents.is_empty(), "`agents` lists nobody usable");
+        // Who is asked, as resolved: ids, never anything of their state
+        tracing::info!(
+            event_type = "sealed_state_offer",
+            ask = self.ask,
+            agents = ?agents.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            skipped = self.agents.len() - agents.len(),
+            "sealed-state offer resolved"
+        );
         Ok(Some(SealedOffer {
             agents,
             ask: self.ask,
