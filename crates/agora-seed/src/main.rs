@@ -1402,9 +1402,56 @@ const ALERT_FLUSH: Duration = Duration::from_secs(60);
 #[derive(Default)]
 struct Held {
     alerts: alerts::Alerter,
+    /// `<data_dir>/runner.lock`, held shared for the run: `rotate-keys`
+    /// refuses while it is
+    runner_lock: Option<std::fs::File>,
     log_guards: Option<logging::Guards>,
     /// A signal stopped the run gracefully: exit [`signals::STOPPED_EXIT`]
     stopped: bool,
+}
+
+/// Write each unsaved agent's state to
+/// `<state_dir>/<id>/unsaved.<utc>.json` (0600; tmp, fsync, rename,
+/// directory fsync; `FsStorage`'s `{format: 1, state}` envelope). Not
+/// `state.json` nor an archive: nothing loads it, and the sealed start
+/// check never sees it. Content is never logged.
+fn rescue_unsaved(
+    state_dir: &std::path::Path,
+    report: &agora_agentkit::reactor::Report,
+) -> Vec<(AgentId, std::io::Result<PathBuf>)> {
+    use std::io::Write;
+    let at = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
+    report
+        .unsaved
+        .iter()
+        .map(|(id, value)| {
+            let write = || -> std::io::Result<PathBuf> {
+                let dir = state_dir.join(id.to_string());
+                std::fs::create_dir_all(&dir)?;
+                let path = dir.join(format!("unsaved.{at}.json"));
+                let tmp = dir.join(format!("unsaved.{at}.json.tmp"));
+                let bytes = zeroize::Zeroizing::new(serde_json::to_vec_pretty(
+                    &serde_json::json!({ "format": 1, "state": value }),
+                )?);
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                {
+                    let mut file = options.open(&tmp)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                }
+                std::fs::rename(&tmp, &path)?;
+                std::fs::File::open(&dir)?.sync_all()?;
+                Ok(path)
+            };
+            (*id, write())
+        })
+        .collect()
 }
 
 /// A reactor's outcome for the terminal: counts, ids, error kinds and
@@ -2347,6 +2394,37 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     for (id, result) in &report.report {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
+        // A session whose save failed lives only in the report: kept in a
+        // rescue file beside its state, never loaded by anything
+        if let Ok(r) = result {
+            for (agent, rescued) in rescue_unsaved(&state_dir, r) {
+                match rescued {
+                    Ok(path) => tracing::error!(
+                        event_type = "unsaved_rescued",
+                        agent_id = %agent,
+                        path = %path.display(),
+                        "an unsaved session's state was kept in a rescue file"
+                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            event_type = "unsaved_rescue_failed",
+                            agent_id = %agent,
+                            error_kind = ?e.kind(),
+                            "an unsaved session's state could not be written to a rescue file"
+                        );
+                        // The last resort, for this agent only: without it
+                        // the session is lost, so its state goes to stdout
+                        // as it always did before rescue files
+                        if let Some(value) = r.unsaved.get(&agent) {
+                            say!(
+                                "unsaved {agent} (rescue file failed): {}",
+                                serde_json::to_string_pretty(value).unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if bridge.is_none() {
             say!("== {label}");
             say!("{}", report_summary(result));
@@ -2433,6 +2511,60 @@ mod tests {
              Start the session again then."
         );
         assert!(!not_due_note(2, None, now).contains("due again"));
+    }
+
+    /// An unfinished rotation leaves the agent out, unrefused.
+    #[test]
+    fn an_unfinished_rotation_leaves_the_agent_out() {
+        let root = sealed::TestDir::new("main-midrotation");
+        let (a, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let (b, wren) = crate::agent_selection_tests::pooled("wren");
+        std::fs::create_dir_all(root.join(a.to_string())).unwrap();
+        std::fs::write(root.join(a.to_string()).join("secrets.next.json"), b"{}").unwrap();
+        let mut pool = vec![(a, tarn), (b, wren)];
+        let mut skipped = Vec::new();
+        mid_rotation(&mut pool, &root, &alerts::Alerter::off(), &mut skipped);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].0, b);
+        assert_eq!((skipped[0].id, skipped[0].stage), (a, "rotation"));
+    }
+
+    /// An unsaved session is kept in a rescue file, 0600, in FsStorage's
+    /// envelope, beside (never as) its state.
+    #[test]
+    fn unsaved_sessions_are_rescued_to_files() {
+        let root = sealed::TestDir::new("main-rescue");
+        let id = AgentId::new();
+        let state = serde_json::json!({ "memory": { "content": "synthetic unsaved" } });
+        let r: agora_agentkit::reactor::Report =
+            serde_json::from_value(serde_json::json!({ "done": 0, "failed": 1, "errors": {}, "unsaved": { id.to_string(): state } }))
+                .unwrap();
+        let rescued = rescue_unsaved(&root, &r);
+        assert_eq!(rescued.len(), 1);
+        let path = rescued[0].1.as_ref().unwrap();
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("unsaved.")
+        );
+        let back: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(back, serde_json::json!({ "format": 1, "state": state }));
+        assert!(!root.join(id.to_string()).join("state.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // A directory that can't be written: the error comes back
+        let blocked = sealed::TestDir::new("main-rescue-blocked");
+        std::fs::write(blocked.join(id.to_string()), b"a file").unwrap();
+        assert!(rescue_unsaved(&blocked, &r)[0].1.is_err());
     }
 
     /// The terminal's run summary never carries state content.
