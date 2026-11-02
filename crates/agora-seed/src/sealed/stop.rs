@@ -7,7 +7,7 @@
 //! `sealed/stopped` (`{at, note, shown}`, local; the note is shown to the
 //! agent, not uploaded in v1). `enrolled`, `head.json`, the outbox and the
 //! whole history stay. From then on nothing is sealed for the agent and no
-//! failed seal is recorded ([`super::RunnerStorage`] saves it plainly, as
+//! failed seal is recorded ([`super::SealedStorage`] saves it plainly, as
 //! FsStorage format 1), and the start check leaves it alone but for a line
 //! under "## Your Sealed State".
 //!
@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use agora_agentkit::ids::AgentId;
+use agora_agentkit::reactor::Storage as _;
 use agora_agentkit::state::storage::{AgentSeal, SEALED_DIR};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -75,12 +76,13 @@ impl Stopped {
         if self.shown {
             format!(
                 "Your sealed backups are stopped (since {date}); your earlier versions stay on \
-                 Agora."
+                 Agora; your state isn't checked while stopped."
             )
         } else {
             format!(
                 "Your sealed backups were stopped by your operator on {date}: {}. Your earlier \
-                 versions stay on Agora.",
+                 versions stay on Agora. While stopped, your state isn't checked at the start of \
+                 sessions.",
                 self.note.trim_end_matches('.')
             )
         }
@@ -132,6 +134,30 @@ pub async fn stop(
         "agent {id}'s backups are already stopped"
     );
     super::session::no_session(state_dir, id, false)?;
+    // Never a way around sealed-accept: a refused agent, a save that went
+    // unsealed, or a state that isn't its head's is resolved first
+    anyhow::ensure!(
+        !seal.is_refused().await?,
+        "agent {id} is refused; resolve that with sealed-accept first"
+    );
+    anyhow::ensure!(
+        seal.seal_failed().await?.is_none(),
+        "agent {id}'s last save went unsealed; resolve that with sealed-accept first"
+    );
+    let current = agora_agentkit::reactor::FsStorage::new(state_dir)
+        .load_raw(id)
+        .await
+        .context("the agent's state won't load")?
+        .value;
+    let local = agora_agentkit::state::storage::plaintext_hash(&current);
+    match seal.recover(Some(&local)).await? {
+        agora_agentkit::state::storage::Recovery::Intact(_)
+        | agora_agentkit::state::storage::Recovery::Committed(_) => {}
+        other => anyhow::bail!(
+            "agent {id}'s state doesn't match its sealed head ({other:?}); resolve that with \
+             sealed-accept first"
+        ),
+    }
     if let Err(e) = drain.await {
         anyhow::bail!(
             "the versions waiting to upload could not be uploaded ({e}); nothing was stopped. \
@@ -205,7 +231,7 @@ mod tests {
         assert!(!seal.sent().await.unwrap().is_empty());
         assert!(
             s.line()
-                .contains(": It asked me to. Your earlier versions stay on Agora."),
+                .contains(": It asked me to. Your earlier versions stay on Agora. While stopped, your state isn't checked at the start of sessions."),
             "{}",
             s.line()
         );
@@ -217,8 +243,61 @@ mod tests {
         let later = Stopped::load(&dir).unwrap().unwrap().line();
         assert!(
             later.starts_with("Your sealed backups are stopped (since ")
-                && later.ends_with("); your earlier versions stay on Agora."),
+                && later.ends_with(
+                    "); your earlier versions stay on Agora; your state isn't checked while \
+                     stopped."
+                ),
             "{later}"
         );
+    }
+
+    /// Stop is no way around sealed-accept.
+    #[tokio::test]
+    async fn stopping_refuses_a_refused_unsealed_or_changed_agent() {
+        let root = crate::sealed::TestDir::new("stop-refused");
+        let (id, _keys, dir) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        // Changed outside the seal
+        let mut fs = agora_agentkit::reactor::FsStorage::new(&state_dir);
+        agora_agentkit::reactor::Storage::save_raw(
+            &mut fs,
+            id,
+            serde_json::json!({ "memory": "edited" }),
+            None,
+        )
+        .await
+        .unwrap();
+        let e = stop(&state_dir, id, "n", drained())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("doesn't match its sealed head"), "{e}");
+        // Unsealed save on record
+        let local = agora_agentkit::state::storage::plaintext_hash(
+            &agora_agentkit::reactor::Storage::load_raw(&fs, id)
+                .await
+                .unwrap()
+                .value,
+        );
+        seal.record_seal_failed(local, agora_agentkit::state::storage::SealFailureKind::Io)
+            .await
+            .unwrap();
+        let e = stop(&state_dir, id, "n", drained())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("went unsealed"), "{e}");
+        // Refused
+        seal.refuse("mismatch").await.unwrap();
+        let e = stop(&state_dir, id, "n", drained())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is refused"), "{e}");
+        assert!(!is_stopped(&dir));
     }
 }

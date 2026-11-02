@@ -276,7 +276,18 @@ impl Enroller {
     /// Resume a stopped agent's backups on its existing chain: the
     /// current state sealed as the next snapshot on the head, `stopped`
     /// set aside, the state marked format 2 again. Never a new genesis.
-    pub async fn resume(&self, id: AgentId) -> anyhow::Result<Report> {
+    ///
+    /// Only while no runner runs (`runner.lock` held exclusive until the
+    /// end), so no sweep saves this agent mid-resume. A state that changed
+    /// while stopped needs `note`, which the agent is shown, as after
+    /// `sealed-accept`.
+    pub async fn resume(&self, id: AgentId, note: Option<&str>) -> anyhow::Result<Report> {
+        let note = note.map(str::trim).filter(|n| !n.is_empty());
+        let data_dir = self
+            .state_dir
+            .parent()
+            .context("the state directory has no parent data directory")?;
+        let _runner = super::session::runner_exclusive(data_dir)?;
         let agent_dir = self.state_dir.join(id.to_string());
         let seal = AgentSeal::new(&agent_dir, id);
         let lock = super::session::take(&self.state_dir, id, false).await?;
@@ -293,6 +304,13 @@ impl Enroller {
             .await
             .context("the agent's state won't load")?
             .value;
+        let changed =
+            seal.head().await?.and_then(|h| h.plaintext_sha256) != Some(plaintext_hash(&current));
+        anyhow::ensure!(
+            !changed || note.is_some(),
+            "agent {id}'s state changed while its backups were stopped: pass --note \"<why>\" \
+             to resume over it (the agent is shown the note)"
+        );
         let now = Utc::now();
         let head = super::session::append(
             &seal,
@@ -321,7 +339,11 @@ impl Enroller {
             .enroll(id)
             .await
             .context("marking the state as sealed again")?;
+        if changed && let Some(note) = note {
+            super::notice::Notice::resumed(&agent_dir, note).context("writing the notice")?;
+        }
         super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
+        // `_runner` held through here
         tracing::warn!(
             event_type = "sealed_state_resumed",
             agent_id = %id,
@@ -340,7 +362,19 @@ impl Enroller {
     }
 
     /// Enrol `id`, or with `dry_run` say what would be done.
+    #[cfg(test)]
     pub async fn enroll(&self, id: AgentId, dry_run: bool) -> Result<Report, Skip> {
+        self.enroll_with(id, dry_run, None).await
+    }
+
+    /// [`Self::enroll`], with the operator's note for resuming a stopped
+    /// agent whose state changed while stopped.
+    pub async fn enroll_with(
+        &self,
+        id: AgentId,
+        dry_run: bool,
+        note: Option<&str>,
+    ) -> Result<Report, Skip> {
         let agent_dir = self.state_dir.join(id.to_string());
         let seal = AgentSeal::new(&agent_dir, id);
         if seal
@@ -348,8 +382,14 @@ impl Enroller {
             .await
             .context("reading the enrolment marker")?
         {
-            if super::stop::is_stopped(&agent_dir) && !dry_run {
-                return self.resume(id).await.map_err(Skip::Failed);
+            if super::stop::is_stopped(&agent_dir) {
+                if dry_run {
+                    return Ok(Report {
+                        resumed: true,
+                        ..Report::default()
+                    });
+                }
+                return self.resume(id, note).await.map_err(Skip::Failed);
             }
             return Err(Skip::Enrolled);
         }
@@ -962,8 +1002,35 @@ mod tests {
             api: std::sync::Arc::new(FakeApi::new()),
             restore: None,
         };
-        let report = enroller.enroll(id, false).await.unwrap();
+        // A dry run says it would resume
+        assert!(enroller.enroll(id, true).await.unwrap().resumed);
+        // Changed while stopped: refused without a note
+        let e = enroller.enroll(id, false).await.unwrap_err().to_string();
+        assert!(e.contains("changed while its backups were stopped"), "{e}");
+        assert!(crate::sealed::stop::is_stopped(&dir));
+        // ...and refused while a runner runs
+        let runner = crate::sealed::session::runner_shared(&root).unwrap();
+        let e = enroller
+            .enroll_with(id, false, Some("checked"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("stop the runner"), "{e}");
+        drop(runner);
+        let report = enroller
+            .enroll_with(id, false, Some("I checked the edit."))
+            .await
+            .unwrap();
         assert!(report.resumed);
+        assert_eq!(
+            crate::sealed::notice::Notice::load(&dir)
+                .unwrap()
+                .unwrap()
+                .line()
+                .unwrap(),
+            "While your backups were stopped, your state changed; your operator resumed them \
+             with this note: I checked the edit."
+        );
         let after = super::super::check::local_entries(&seal).await.unwrap();
         assert_eq!(after.len(), before.len() + 1);
         assert_eq!(&after[..before.len()], &before[..], "the chain kept");

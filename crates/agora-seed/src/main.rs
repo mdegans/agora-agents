@@ -2694,7 +2694,10 @@ mod tests {
         assert!(seat.stop_note);
         assert!(
             seat.lines[0].starts_with("Your sealed backups were stopped by your operator on ")
-                && seat.lines[0].ends_with(": It asked. Your earlier versions stay on Agora."),
+                && seat.lines[0].ends_with(
+                    ": It asked. Your earlier versions stay on Agora. While stopped, your state \
+                     isn't checked at the start of sessions."
+                ),
             "{:?}",
             seat.lines
         );

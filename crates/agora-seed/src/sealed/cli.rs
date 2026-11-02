@@ -32,6 +32,10 @@ pub enum Command {
         /// network.
         #[arg(long)]
         dry_run: bool,
+        /// Resuming a stopped agent whose state changed while stopped:
+        /// why, for the agent (shown at its next session).
+        #[arg(long)]
+        note: Option<String>,
     },
     /// Let a refused agent run again: seal its current state as accepted
     /// (or, for a lost head.json, rebuild it from Agora's verified chain),
@@ -89,6 +93,7 @@ pub async fn run(
             agent,
             opted_in,
             dry_run,
+            note,
         } => {
             let enroller = super::enroll::Enroller {
                 state_dir: state_dir.clone(),
@@ -111,7 +116,10 @@ pub async fn run(
             );
             let mut failed = 0;
             for id in ids {
-                match enroller.enroll(id, dry_run).await {
+                match enroller.enroll_with(id, dry_run, note.as_deref()).await {
+                    Ok(report) if dry_run && report.resumed => {
+                        println!("{id}: would resume its stopped backups on its existing chain")
+                    }
                     Ok(report) if dry_run => println!("{id}: would seal: {report}"),
                     Ok(report) => {
                         let uploaded = match outbox.drain(id).await {

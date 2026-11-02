@@ -64,6 +64,10 @@ pub struct Notice {
     /// --rebase`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub joined: bool,
+    /// Not a refusal: the operator resumed stopped backups over a state
+    /// that changed while they were stopped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed: bool,
 }
 
 fn path(agent_dir: &Path) -> PathBuf {
@@ -113,13 +117,29 @@ impl Notice {
                 reason,
                 accepted: None,
                 joined: false,
+                resumed: false,
             },
         )
+    }
+
+    /// Stopped backups resumed over a changed state, with the operator's
+    /// note. An earlier notice not yet shown is kept aside.
+    pub fn resumed(agent_dir: &Path, note: &str) -> std::io::Result<()> {
+        Self::operator_note(agent_dir, note, false, true)
     }
 
     /// Two histories joined by the operator, with its note. An earlier
     /// notice not yet shown is kept aside.
     pub fn joined(agent_dir: &Path, note: &str) -> std::io::Result<()> {
+        Self::operator_note(agent_dir, note, true, false)
+    }
+
+    fn operator_note(
+        agent_dir: &Path,
+        note: &str,
+        joined: bool,
+        resumed: bool,
+    ) -> std::io::Result<()> {
         let from = path(agent_dir);
         if std::fs::exists(&from)? {
             let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
@@ -138,7 +158,8 @@ impl Notice {
                     at: now,
                     note: note.trim().to_string(),
                 }),
-                joined: true,
+                joined,
+                resumed,
             },
         )
     }
@@ -150,6 +171,7 @@ impl Notice {
             reason: fallback,
             accepted: None,
             joined: false,
+            resumed: false,
         });
         n.accepted = Some(Accepted {
             at: Utc::now(),
@@ -161,6 +183,13 @@ impl Notice {
     /// What the agent is shown; only once the operator accepted.
     pub fn line(&self) -> Option<String> {
         let accepted = self.accepted.as_ref()?;
+        if self.resumed {
+            return Some(format!(
+                "While your backups were stopped, your state changed; your operator resumed them \
+                 with this note: {}",
+                accepted.note
+            ));
+        }
         if self.joined {
             return Some(format!(
                 "On {}, your operator joined your two sealed histories, which had gone separate \

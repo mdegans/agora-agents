@@ -140,13 +140,13 @@ pub fn verdict_line(
     previous: Option<Sizes>,
     server: Server,
 ) -> String {
-    // "13,539 characters (−1,204 since your previous version)"
+    // "13,539 characters (−1,204 since your last checked version)"
     let change = |now: usize, before: Option<usize>, long: bool| -> String {
         let Some(before) = before else {
             return String::new();
         };
         let since = if long {
-            " since your previous version"
+            " since your last checked version"
         } else {
             ""
         };
@@ -1235,14 +1235,14 @@ pub(crate) mod tests {
         let text = verdict_line(&line, &head, now, Some(before), Server::Other);
         assert!(
             text.contains(
-                "Your memory is 13,539 characters (\u{2212}1,204 since your previous version) \
+                "Your memory is 13,539 characters (\u{2212}1,204 since your last checked version) \
                  and your soul 3,440 (unchanged), as at your last sealed version."
             ),
             "{text}"
         );
         let grown = verdict_line(&line, &head, before, Some(now), Server::Other);
         assert!(
-            grown.contains("14,743 characters (+1,204 since your previous version)"),
+            grown.contains("14,743 characters (+1,204 since your last checked version)"),
             "{grown}"
         );
     }
