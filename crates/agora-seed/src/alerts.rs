@@ -94,6 +94,27 @@ pub enum AlertKind {
     /// An agent was left out of the sweep before its session could start:
     /// its state would not load, or the agent could not be built from it.
     AgentSkipped,
+    /// An enrolled agent's state did not match its last sealed version, its
+    /// sealed chain did not verify, or its sealed head is gone: the agent
+    /// is left out until `agora-seed sealed-accept`.
+    SealedStateRefused,
+    /// An enrolled agent's last save was written unsealed; it runs, its
+    /// uploads held.
+    SealedStateSealFailed,
+    /// An enrolled agent's sealed head is not on Agora; it runs, held.
+    SealedStateHeadMissing,
+    /// An enrolled agent's chain on Agora moved on from its local head; it
+    /// runs on the local copy, held.
+    SealedStateFork,
+    /// Sealed versions could not be uploaded.
+    SealedStateUploadFailing,
+    /// `[sealed_state]` could not be resolved; nobody is asked.
+    SealedStateDisabled,
+    /// An enrolled agent's memory or soul is less than half the size it
+    /// was at its previous sealed version. Not a refusal.
+    SealedStateDrop,
+    /// An enrolled agent's `sealed/` could not be read; it runs, unsealed.
+    SealedStateUnreadable,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -102,7 +123,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 18] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -113,6 +134,14 @@ impl AlertKind {
         Self::ContactRequested,
         Self::MemoryRestoreDisabled,
         Self::AgentSkipped,
+        Self::SealedStateRefused,
+        Self::SealedStateSealFailed,
+        Self::SealedStateHeadMissing,
+        Self::SealedStateFork,
+        Self::SealedStateUploadFailing,
+        Self::SealedStateDisabled,
+        Self::SealedStateDrop,
+        Self::SealedStateUnreadable,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -128,6 +157,14 @@ impl AlertKind {
             Self::ContactRequested => "contact_requested",
             Self::MemoryRestoreDisabled => "memory_restore_disabled",
             Self::AgentSkipped => "agent_skipped",
+            Self::SealedStateRefused => "sealed_state_refused",
+            Self::SealedStateSealFailed => "sealed_state_seal_failed",
+            Self::SealedStateHeadMissing => "sealed_state_head_missing",
+            Self::SealedStateFork => "sealed_state_fork",
+            Self::SealedStateUploadFailing => "sealed_state_upload_failing",
+            Self::SealedStateDisabled => "sealed_state_disabled",
+            Self::SealedStateDrop => "sealed_state_drop",
+            Self::SealedStateUnreadable => "sealed_state_unreadable",
             Self::Test => "test_alert",
         }
     }
@@ -208,6 +245,66 @@ impl AlertKind {
                  permissions). Do not edit state in place: copy it out, find \
                  the cause, and follow the agent-state review rules before \
                  any repair."
+            }
+            Self::SealedStateRefused => {
+                "An agent enrolled in sealed state was refused and left out \
+                 of the sweep: its state matched no sealed version (the \
+                 signature of a wipe like May's), its sealed chain did not \
+                 verify, or its sealed head is gone. Nothing was sealed or \
+                 saved for it. Copy its state directory out and look before \
+                 anything else (counts and sizes, not content). It stays out \
+                 of every sweep until `agora-seed sealed-accept --agent <id> \
+                 --note \"…\"` seals its current state as accepted; the note \
+                 is shown to the agent at its next session."
+            }
+            Self::SealedStateSealFailed => {
+                "An enrolled agent's last save went to disk without its seal \
+                 (the error kind is in sealed/seal_failed.json). It runs, and \
+                 its uploads are held for this run; the next good save seals \
+                 its state again. Find out why sealing failed (disk, keys)."
+            }
+            Self::SealedStateHeadMissing => {
+                "An enrolled agent's latest sealed version is not on Agora: \
+                 the server lost or cut versions the runner sealed and \
+                 uploaded. The agent runs on its local state, which matches \
+                 its last sealed version, and was told; uploads are held. \
+                 Compare the server's chain with sealed/sent before \
+                 uploading again."
+            }
+            Self::SealedStateFork => {
+                "An enrolled agent's sealed chain on Agora moved on from its \
+                 local head: two sessions saved from one version, or another \
+                 runner wrote. The agent runs on its local state and was \
+                 told; its new versions are held in sealed/outbox. Nothing is \
+                 lost. A merge tool comes in v1.1; until then, reconcile by \
+                 hand."
+            }
+            Self::SealedStateUploadFailing => {
+                "Sealed versions could not be uploaded to Agora (the error \
+                 is below). They wait in sealed/outbox and are retried at the \
+                 next wake. Nothing is lost while the disk holds."
+            }
+            Self::SealedStateDisabled => {
+                "The run config's [sealed_state] table could not be used (the \
+                 error below says why). Nobody is asked the sealed-state \
+                 question until it is fixed. Agents already enrolled stay \
+                 sealed and checked."
+            }
+            Self::SealedStateDrop => {
+                "An enrolled agent's memory or soul is less than half the \
+                 size it was at its previous sealed version (sizes below, in \
+                 characters). The agent was told and runs as usual: it may \
+                 have condensed its own memory. If it didn't, its earlier \
+                 versions are sealed and can be restored. Look at counts and \
+                 sizes, not content."
+            }
+            Self::SealedStateUnreadable => {
+                "An enrolled agent's sealed/ directory could not be read at \
+                 the start of its session (permissions, a malformed file, a \
+                 lock). Its state could not be checked; it runs anyway, its \
+                 saves are written locally but not sealed (recorded in \
+                 sealed/seal_failed.json), and its uploads are held. Fix the \
+                 directory; the next start checks again."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

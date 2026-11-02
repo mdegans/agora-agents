@@ -1,0 +1,252 @@
+//! `agora-seed rotate-keys --agent <id> [--signing] [--encryption]`.
+//!
+//! In this order, so no step can lose a key:
+//!
+//! 1. the new secrets are written to `secrets.next.json` (or, on a retry,
+//!    the ones already there are reused), and the old keys are appended to
+//!    `past_keys.json`;
+//! 2. the server takes the change: an agent-signed rotation of the Ed25519
+//!    key (signed by the old key, with the new key's proof; its `seq` the
+//!    next after `rotations.json`'s), recorded in `rotations.json` once
+//!    taken, then the new X25519 key, registered under the current signing
+//!    key;
+//! 3. an enrolled agent's state key is re-wrapped to the new X25519 key
+//!    with the next `wrap_seq`, and posted;
+//! 4. only then `secrets.next.json` becomes `secrets.json`; the replaced
+//!    file is kept as `secrets.<utc>.json`.
+//!
+//! A failure at 2 or 3 leaves `secrets.json` as it was, and a rerun picks
+//! up `secrets.next.json`. Old keys are never deleted.
+
+use agora_agentkit::ids::AgentId;
+use agora_agentkit::state::KeyRotation;
+use anyhow::Context;
+use chrono::Utc;
+
+use super::KeyStore;
+use super::api::SealedApi;
+use super::keys::{SecretsFile, StateKeyFile};
+
+/// What changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rotated {
+    pub signing: bool,
+    pub encryption: bool,
+    /// The state key was re-wrapped to the new X25519 key.
+    pub rewrapped: bool,
+    /// `secrets.next.json` from an earlier attempt was used.
+    pub resumed: bool,
+}
+
+pub async fn rotate_keys(
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    id: AgentId,
+    signing: bool,
+    encryption: bool,
+) -> anyhow::Result<Rotated> {
+    anyhow::ensure!(
+        signing || encryption,
+        "name what to rotate: --signing, --encryption, or both"
+    );
+    let current = keys
+        .secrets(id)?
+        .with_context(|| format!("agent {id} has no secrets.json"))?;
+    let old_signing = current.signing()?;
+    let old_encryption = current.encryption()?;
+
+    // 1. The new keys, on disk before anything else
+    let (next, resumed) = match keys.next_secrets(id)? {
+        Some(next) => (next, true),
+        None => {
+            let new_signing = if signing {
+                agora_agentkit::crypto::generate_keypair().0
+            } else {
+                old_signing.clone()
+            };
+            let new_encryption = if encryption {
+                Some(agora_agentkit::envelope::generate_encryption_keypair().0)
+            } else {
+                old_encryption.clone()
+            };
+            let next = SecretsFile::new(&new_signing, new_encryption.as_ref());
+            keys.write_next_secrets(id, &next)
+                .context("writing secrets.next.json")?;
+            (next, false)
+        }
+    };
+    let new_signing = next.signing()?;
+    let new_encryption = next.encryption()?;
+    let mut done = Rotated {
+        signing: new_signing.to_bytes() != old_signing.to_bytes(),
+        encryption: new_encryption.as_ref().map(|k| k.to_bytes())
+            != old_encryption.as_ref().map(|k| k.to_bytes()),
+        rewrapped: false,
+        resumed,
+    };
+    keys.retire(
+        id,
+        done.signing.then_some(&old_signing),
+        if done.encryption {
+            old_encryption.as_ref()
+        } else {
+            None
+        },
+    )
+    .context("recording the old keys in past_keys.json")?;
+
+    // 2. The server
+    if done.signing {
+        let seq = keys
+            .rotations(id)?
+            .iter()
+            .map(|r| r.seq + 1)
+            .max()
+            .unwrap_or(0);
+        let rotation = KeyRotation::agent_signed(id, seq, &old_signing, &new_signing, Utc::now());
+        api.rotate_key(id, &old_signing, &rotation)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("the server refused the signing-key rotation; secrets.json is unchanged")?;
+        // Ours to verify the chain by, never the server's
+        keys.record_rotation(id, &rotation)
+            .context("recording the rotation in rotations.json")?;
+    }
+    if done.encryption
+        && let Some(secret) = &new_encryption
+    {
+        let public = agora_agentkit::envelope::EncryptionPublicKey::from(secret);
+        api.register_encryption_key(id, &new_signing, &public)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("the server refused the new encryption key; secrets.json is unchanged")?;
+    }
+
+    // 3. The state key, re-wrapped
+    if done.encryption
+        && let Some(secret) = &new_encryption
+        && let Some(file) = keys.state_key_file(id)?
+    {
+        let state_key = file.state_key()?;
+        let wrap_seq = file.wrap_seq + 1;
+        let record = state_key
+            .wrap(
+                id,
+                file.key_gen,
+                wrap_seq,
+                &agora_agentkit::envelope::EncryptionPublicKey::from(secret),
+                &new_signing,
+            )
+            .context("re-wrapping the state key")?;
+        api.post_state_key(id, &new_signing, &record)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("the server refused the re-wrapped state key; secrets.json is unchanged")?;
+        keys.write_state_key(id, &StateKeyFile::new(&state_key, file.key_gen, wrap_seq))?;
+        done.rewrapped = true;
+    }
+
+    // 4. Only now
+    keys.promote_next_secrets(id)
+        .context("replacing secrets.json")?;
+    tracing::warn!(
+        event_type = "sealed_keys_rotated",
+        agent_id = %id,
+        signing = done.signing,
+        encryption = done.encryption,
+        rewrapped = done.rewrapped,
+        resumed = done.resumed,
+        "agent keys rotated; the old ones are in past_keys.json"
+    );
+    Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sealed::api::fake::FakeApi;
+    use crate::sealed::check::{self, Outcome, tests::enrolled};
+    use agora_agentkit::reactor::{FsStorage, Storage};
+    use agora_agentkit::state::crypto::StateKey;
+    use agora_agentkit::state::storage::plaintext_hash;
+
+    #[tokio::test]
+    async fn new_keys_are_written_first_and_secrets_replaced_only_after_the_server() {
+        let root = crate::sealed::TestDir::new("rotate");
+        let (id, keys, dir) = enrolled(&root).await;
+        keys.ring().ensure_encryption_key(id).unwrap();
+        let old_signing = keys.signing(id).unwrap();
+        let old_enc = keys.encryption(id).unwrap();
+        let api = FakeApi::new();
+        *api.public_key.lock().unwrap() = Some(old_signing.verifying_key());
+
+        assert!(rotate_keys(&keys, &api, id, false, false).await.is_err());
+
+        // The server refuses: nothing replaced, the new keys kept
+        *api.fail.lock().unwrap() = Some("rotate_key");
+        assert!(rotate_keys(&keys, &api, id, true, true).await.is_err());
+        assert_eq!(keys.signing(id).unwrap().to_bytes(), old_signing.to_bytes());
+        let staged = keys.next_secrets(id).unwrap().unwrap().signing().unwrap();
+        let past = keys.past_keys(id).unwrap();
+        assert_eq!(past.signing_public(), vec![old_signing.verifying_key()]);
+        assert_eq!(past.encryption.len(), 1);
+
+        // A retry resumes with the same new keys
+        *api.fail.lock().unwrap() = None;
+        api.calls.lock().unwrap().clear();
+        let done = rotate_keys(&keys, &api, id, true, true).await.unwrap();
+        assert_eq!(
+            done,
+            Rotated {
+                signing: true,
+                encryption: true,
+                rewrapped: true,
+                resumed: true
+            }
+        );
+        assert_eq!(
+            *api.calls.lock().unwrap(),
+            ["rotate_key", "register_encryption_key", "post_state_key"],
+            "rotation, then the X25519 key under the new signer, then the re-wrap"
+        );
+        assert_eq!(keys.signing(id).unwrap().to_bytes(), staged.to_bytes());
+        assert!(keys.next_secrets(id).unwrap().is_none());
+        let new_enc = keys.encryption(id).unwrap();
+        assert_ne!(new_enc.to_bytes(), old_enc.to_bytes());
+        // The re-wrap opens with the new X25519 key to the same state key
+        let record = api.keys.lock().unwrap().last().unwrap().clone();
+        assert_eq!(record.wrap_seq, 1);
+        let file = keys.state_key_file(id).unwrap().unwrap();
+        assert_eq!(file.wrap_seq, 1);
+        assert_eq!(
+            StateKey::unwrap(&record, &new_enc).unwrap().expose(),
+            file.state_key().unwrap().expose()
+        );
+        // Old keys are still on disk, never deleted; the rotation is ours
+        assert_eq!(keys.past_keys(id).unwrap().signing.len(), 1);
+        let rotations = keys.rotations(id).unwrap();
+        assert_eq!(rotations.len(), 1);
+        assert_eq!(rotations[0].seq, 0);
+        assert!(rotations[0].verify_agent_signed().is_ok());
+        let backups = std::fs::read_dir(keys.agent_dir(id))
+            .unwrap()
+            .filter(|e| {
+                let n = e.as_ref().unwrap().file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("secrets.2") && n.ends_with(".json")
+            })
+            .count();
+        assert_eq!(backups, 1);
+
+        // The chain signed by the old key still verifies at the next start
+        let local = plaintext_hash(
+            &FsStorage::new(root.join("state"))
+                .load_raw(id)
+                .await
+                .unwrap()
+                .value,
+        );
+        let out = check::check(&dir, id, &local, Default::default(), &keys, &FakeApi::new()).await;
+        assert!(matches!(out, Outcome::Run { hold: None, .. }), "{out:?}");
+    }
+}
