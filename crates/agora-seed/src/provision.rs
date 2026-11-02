@@ -141,9 +141,11 @@ async fn install(
         Ok(_) => Ok(()),
         Err(FsStorageError::NotFound(_)) => {
             // As `load_states` reads it
+            // A new agent: no sealed chain, so no base
             storage
-                .save_raw(id, state()?)
+                .save_raw(id, state()?, None)
                 .await
+                .map(|_| ())
                 .context("writing the agent's state")
         }
         Err(e) => Err(e).with_context(|| format!("agent {id}'s state can't be read")),
@@ -223,7 +225,8 @@ async fn check_data_dir(data_dir: &Path, state_dir: &Path, model: &ModelInfo) ->
             storage
                 .load_raw(id)
                 .await
-                .with_context(|| format!("reading agent {id}"))?,
+                .with_context(|| format!("reading agent {id}"))?
+                .value,
         )
         .with_context(|| format!("reading agent {id}"))?;
         anyhow::ensure!(
@@ -257,6 +260,7 @@ mod tests {
             .load_raw(id)
             .await
             .unwrap()
+            .value
     }
 
     /// The whole retry: a lost answer's replay, after the first run got its files in, or
@@ -274,7 +278,7 @@ mod tests {
         // Same key, state already there and since changed by a run: untouched
         let run = serde_json::json!({"memory": "after a run"});
         FsStorage::new(&state)
-            .save_raw(id, run.clone())
+            .save_raw(id, run.clone(), None)
             .await
             .unwrap();
         install(&secrets, state.clone(), id, &k, || {
