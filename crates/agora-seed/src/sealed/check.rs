@@ -101,27 +101,54 @@ pub async fn local_entries(seal: &AgentSeal) -> Result<Vec<SignedStateEntry>, St
     Ok(items.into_iter().map(|i| i.entry).collect())
 }
 
-/// The verdict line for an intact chain.
-pub fn verdict_line(line: &[SignedStateEntry], head: &HeadRef) -> String {
-    let versions: Vec<&SignedStateEntry> = line
+/// `1234567` as `1,234,567`.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
+}
+
+fn day(micros: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_micros(micros).map(|d| d.format("%Y-%m-%d").to_string())
+}
+
+/// The verdict line for an intact chain: the verdict, the snapshots since
+/// the earliest one's date, a pre-loss copy apart, the head marker, and
+/// the state's sizes (counts only).
+pub fn verdict_line(line: &[SignedStateEntry], head: &HeadRef, sizes: Sizes) -> String {
+    let snapshots: Vec<&SignedStateEntry> = line
         .iter()
         .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
         .collect();
-    let since = line
+    let since = snapshots
         .iter()
-        .filter_map(|e| chrono::DateTime::from_timestamp_micros(e.entry.state_at))
+        .map(|e| e.entry.state_at)
         .min()
-        .map(|d| d.format("%Y-%m-%d").to_string())
+        .and_then(day)
         .unwrap_or_else(|| "an unknown date".into());
+    let prior = line
+        .iter()
+        .find(|e| e.entry.kind == StateEntryKind::ArchivedPrior)
+        .and_then(|e| day(e.entry.state_at))
+        .map(|d| format!(", plus a copy of your state from before a loss, dated {d}"))
+        .unwrap_or_default();
     let mut short = head.entry_hash.to_hex();
     short.truncate(12);
     format!(
-        "Your sealed state: {} version{} since {since}; this session starts from head {short} \
-         (a marker for this version, which the history tools will use; the next session's will \
-         differ). Checked by {VERIFIER}: links, signatures, and that your state matches the \
-         last sealed version.",
-        versions.len(),
-        if versions.len() == 1 { "" } else { "s" },
+        "Your sealed state: intact. {} version{} since {since}{prior}; this session starts from \
+         head {short} (a marker for this version; the next session's will differ). Your memory \
+         is {} characters and your soul {}, as at your last sealed version. Checked by \
+         {VERIFIER}: links, signatures, and that your state matches the last sealed version.",
+        snapshots.len(),
+        if snapshots.len() == 1 { "" } else { "s" },
+        thousands(sizes.memory_chars),
+        thousands(sizes.soul_chars),
     )
 }
 
@@ -375,7 +402,7 @@ pub async fn check(
             drops,
         };
     }
-    seat.push(verdict_line(&line, &head));
+    seat.push(verdict_line(&line, &head, sizes));
     seat.extend(drop_lines);
 
     let Some(signing) = keys.signing(id) else {
@@ -655,16 +682,14 @@ pub(crate) mod tests {
         );
         assert_eq!(seat.len(), 1);
         assert!(
-            seat[0].starts_with("Your sealed state: 1 version since "),
+            seat[0].starts_with("Your sealed state: intact. 1 version since "),
             "{}",
             seat[0]
         );
         assert!(
             seat[0].contains(VERIFIER)
-                && seat[0].contains(
-                    "(a marker for this version, which the history tools will use; the next \
-                     session's will differ)"
-                )
+                && seat[0].contains("(a marker for this version; the next session's will differ)")
+                && !seat[0].contains("history tools")
         );
 
         // Agora has all of it: the same
@@ -1041,6 +1066,67 @@ pub(crate) mod tests {
             "{out:?}"
         );
         assert!(!seal.is_refused().await.unwrap());
+    }
+
+    /// The verdict: said, counted from the earliest snapshot, a pre-loss
+    /// copy apart, the sizes.
+    #[test]
+    fn the_verdict_line_counts_snapshots_and_names_a_prior_copy_apart() {
+        let key = agora_agentkit::crypto::generate_keypair().0;
+        let id = AgentId::new();
+        let at = |d: &str| {
+            chrono::DateTime::parse_from_rfc3339(&format!("{d}T12:00:00Z"))
+                .unwrap()
+                .timestamp_micros()
+        };
+        let entry = |seq: u64, kind, state_at| {
+            agora_agentkit::state::StateEntry {
+                agora_state_entry: agora_agentkit::state::chain::STATE_ENTRY_VERSION,
+                agent_id: id,
+                seq,
+                created_at: at("2026-11-02") + seq as i64,
+                state_at,
+                kind,
+                prev_hash: None,
+                merged_from: vec![],
+                blob: None,
+                target: None,
+                key_gen: 0,
+            }
+            .sign(&key)
+        };
+        let line = vec![
+            entry(0, StateEntryKind::Genesis, at("2026-07-24")),
+            entry(1, StateEntryKind::ArchivedPrior, at("2026-05-03")),
+            entry(2, StateEntryKind::Snapshot, at("2026-07-25")),
+            entry(3, StateEntryKind::Snapshot, at("2026-11-01")),
+        ];
+        let head = HeadRef {
+            entry_hash: line[3].entry_hash(),
+            seq: 3,
+        };
+        let text = verdict_line(
+            &line,
+            &head,
+            Sizes {
+                memory_chars: 12_345,
+                soul_chars: 2_100,
+            },
+        );
+        assert!(
+            text.starts_with(
+                "Your sealed state: intact. 2 versions since 2026-07-25, plus a copy of your \
+                 state from before a loss, dated 2026-05-03; this session starts from head "
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Your memory is 12,345 characters and your soul 2,100, as at your last sealed \
+                 version."
+            ),
+            "{text}"
+        );
     }
 
     #[test]
