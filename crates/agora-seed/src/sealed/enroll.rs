@@ -273,6 +273,72 @@ impl Enroller {
         Ok(out)
     }
 
+    /// Resume a stopped agent's backups on its existing chain: the
+    /// current state sealed as the next snapshot on the head, `stopped`
+    /// set aside, the state marked format 2 again. Never a new genesis.
+    pub async fn resume(&self, id: AgentId) -> anyhow::Result<Report> {
+        let agent_dir = self.state_dir.join(id.to_string());
+        let seal = AgentSeal::new(&agent_dir, id);
+        let lock = super::session::take(&self.state_dir, id, false).await?;
+        anyhow::ensure!(
+            seal.head().await?.is_some(),
+            "agent {id} is stopped but its sealed/head.json is missing: nothing to resume onto"
+        );
+        let keys = self
+            .keys
+            .seal_keys(id)
+            .context("sealing keys for the agent")?;
+        let current = FsStorage::new(&self.state_dir)
+            .load_raw(id)
+            .await
+            .context("the agent's state won't load")?
+            .value;
+        let now = Utc::now();
+        let head = super::session::append(
+            &seal,
+            &lock,
+            &keys,
+            &KeyframePolicy::default(),
+            StateEntryKind::Snapshot,
+            &current,
+            now,
+        )
+        .await
+        .context("sealing the current state on the existing chain")?;
+        record_sizes(&agent_dir, head, now, &current);
+        drop(lock);
+        // Marked format 2 again (agentkit takes the lock itself), then the
+        // stop set aside
+        let mut mirrored = agora_agentkit::state::storage::Mirrored::new(
+            FsStorage::new(&self.state_dir),
+            (),
+            std::sync::Arc::new(super::SealedEnrolment::with_keys(
+                &self.state_dir,
+                self.keys.clone(),
+            )),
+        );
+        mirrored
+            .enroll(id)
+            .await
+            .context("marking the state as sealed again")?;
+        super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
+        tracing::warn!(
+            event_type = "sealed_state_resumed",
+            agent_id = %id,
+            head = %head.entry_hash,
+            seq = head.seq,
+            "a stopped agent's sealed backups resumed on its chain"
+        );
+        Ok(Report {
+            resumed: true,
+            entries: super::check::local_entries(&seal)
+                .await
+                .map_err(anyhow::Error::msg)?
+                .len(),
+            ..Report::default()
+        })
+    }
+
     /// Enrol `id`, or with `dry_run` say what would be done.
     pub async fn enroll(&self, id: AgentId, dry_run: bool) -> Result<Report, Skip> {
         let agent_dir = self.state_dir.join(id.to_string());
@@ -282,6 +348,9 @@ impl Enroller {
             .await
             .context("reading the enrolment marker")?
         {
+            if super::stop::is_stopped(&agent_dir) && !dry_run {
+                return self.resume(id).await.map_err(Skip::Failed);
+            }
             return Err(Skip::Enrolled);
         }
         let ledger = SealLedger::load(&agent_dir)
@@ -836,5 +905,90 @@ mod tests {
         assert!(e.contains("never start a second genesis"), "{e}");
         assert_eq!(*api.calls.lock().unwrap(), ["chain"], "no key posted");
         assert!(keys.state_key_file(id).unwrap().is_none());
+    }
+
+    /// A stopped agent: saved plainly, nothing sealed, no failed seal; then
+    /// resumed on the same chain, with no second genesis.
+    #[tokio::test]
+    async fn a_stopped_agent_is_saved_plainly_then_resumed_on_its_chain() {
+        let root = crate::sealed::TestDir::new("stop-resume");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        let before = super::super::check::local_entries(&seal).await.unwrap();
+        crate::sealed::stop::stop(&state_dir, id, "asked to", Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        // The run's storage: a plain save, format 1, nothing sealed
+        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::with_keys(
+            &state_dir,
+            keys.clone(),
+        ));
+        let outbox = agora_agentkit::state::outbox::AgoraOutbox::new(
+            agora_agentkit::client::Client::new(url::Url::parse("http://127.0.0.1:9").unwrap())
+                .unwrap(),
+            &state_dir,
+            enrolment.clone(),
+        );
+        let mut storage = crate::sealed::SealedStorage::new(&state_dir, outbox, enrolment);
+        let loaded = storage.load_raw(id).await.unwrap();
+        assert_eq!(loaded.base, None);
+        assert_eq!(
+            storage
+                .save_raw(id, state("tarn", "while stopped"), None)
+                .await
+                .unwrap(),
+            None
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(raw["format"], 1);
+        assert_eq!(
+            super::super::check::local_entries(&seal).await.unwrap(),
+            before
+        );
+        assert!(
+            seal.seal_failed().await.unwrap().is_none(),
+            "no failed seal recorded"
+        );
+
+        // Resumed: the next snapshot on the same chain, marked again
+        let enroller = Enroller {
+            state_dir: state_dir.clone(),
+            keys: keys.clone(),
+            api: std::sync::Arc::new(FakeApi::new()),
+            restore: None,
+        };
+        let report = enroller.enroll(id, false).await.unwrap();
+        assert!(report.resumed);
+        let after = super::super::check::local_entries(&seal).await.unwrap();
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(&after[..before.len()], &before[..], "the chain kept");
+        assert_eq!(
+            after.last().unwrap().entry.prev_hash,
+            Some(before.last().unwrap().entry_hash())
+        );
+        assert!(
+            after
+                .iter()
+                .filter(|e| e.entry.kind == StateEntryKind::Genesis)
+                .count()
+                == 1
+        );
+        assert!(!crate::sealed::stop::is_stopped(&dir));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            raw["format"],
+            agora_agentkit::reactor::storage::SEALED_FORMAT
+        );
+        let local = plaintext_hash(&FsStorage::new(&state_dir).load_raw(id).await.unwrap().value);
+        assert!(matches!(
+            seal.recover(Some(&local)).await.unwrap(),
+            agora_agentkit::state::storage::Recovery::Intact(_)
+        ));
     }
 }

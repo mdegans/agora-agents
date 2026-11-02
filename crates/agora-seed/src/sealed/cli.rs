@@ -48,6 +48,16 @@ pub enum Command {
         #[arg(long, requires = "note")]
         rebase: bool,
     },
+    /// Stop an agent's sealed backups, at its request: what waits is
+    /// uploaded first, the history stays, and the agent is shown the note.
+    /// `sealed-enroll --agent` resumes them.
+    SealedStop {
+        #[arg(long)]
+        agent: AgentId,
+        /// Why, for the agent: shown at its next session.
+        #[arg(long)]
+        note: String,
+    },
     /// Rotate an agent's keys: new ones written first, the server told,
     /// the state key re-wrapped, `secrets.json` replaced last. Old keys are
     /// kept in `past_keys.json`.
@@ -166,6 +176,26 @@ pub async fn run(
                 } else {
                     ""
                 },
+            );
+        }
+        Command::SealedStop { agent, note } => {
+            let outbox = AgoraOutbox::new(
+                client.clone(),
+                &state_dir,
+                Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
+            );
+            let drain: super::stop::Drain = Box::pin(async move {
+                outbox
+                    .drain(agent)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            });
+            let stopped = super::stop::stop(&state_dir, agent, &note, drain).await?;
+            println!(
+                "{agent}: sealed backups stopped at {}; its history stays. `sealed-enroll \
+                 --agent {agent}` resumes them",
+                stopped.at
             );
         }
         Command::RotateKeys {

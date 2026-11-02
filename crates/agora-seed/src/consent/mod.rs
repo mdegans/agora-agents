@@ -212,6 +212,8 @@ pub struct SealedSeat {
     pub lines: Vec<String>,
     /// One is the refusal notice: renamed aside once the session saves.
     pub notice: bool,
+    /// One is the stop's first note: marked shown once the session saves.
+    pub stop_note: bool,
 }
 
 impl ConsentRuntime {

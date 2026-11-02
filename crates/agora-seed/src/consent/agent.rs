@@ -590,6 +590,9 @@ pub struct ConsentAgent<A> {
     /// The sealed-state refusal notice was seated: renamed aside once the
     /// session saves.
     sealed_notice: bool,
+    /// The stop's first note was seated: marked shown once the session
+    /// saves.
+    sealed_stop_note: bool,
     /// The closing questions have been put (or there were none): the inner
     /// session's next `Done` is its epilogue's.
     closed: bool,
@@ -3694,6 +3697,7 @@ where
             sealed_undo: None,
             sealed_written: None,
             sealed_notice: false,
+            sealed_stop_note: false,
             closed: false,
             epilogue: false,
         })
@@ -3878,6 +3882,7 @@ where
         }
         if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id()) {
             self.sealed_notice = seat.notice;
+            self.sealed_stop_note = seat.stop_note;
             sealed_lines.extend(seat.lines.iter().cloned());
         }
         if !sealed_lines.is_empty() {
@@ -3990,6 +3995,15 @@ where
                 agent_id = %self.inner.id(),
                 error = %e,
                 "sealed-state notice not set aside after the save; it is shown again"
+            );
+        }
+        if self.sealed_stop_note
+            && let Err(e) = crate::sealed::stop::Stopped::mark_shown(&self.agent_dir())
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "the stop's note not marked shown after the save; it is shown again"
             );
         }
         result
@@ -10337,6 +10351,7 @@ mod tests {
             crate::consent::SealedSeat {
                 lines: vec!["NOTICE LINE".into(), "VERDICT LINE".into()],
                 notice: true,
+                stop_note: false,
             },
         );
         let mut agent = anthropic_agent(&h);
