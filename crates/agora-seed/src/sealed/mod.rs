@@ -35,6 +35,7 @@ pub mod enroll;
 pub mod keys;
 pub mod notice;
 pub mod rotate;
+pub mod session;
 pub mod sizes;
 
 use std::path::{Path, PathBuf};

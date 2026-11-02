@@ -39,6 +39,18 @@ pub trait SealedApi: Send + Sync {
         key: &SigningKey,
         public: &EncryptionPublicKey,
     ) -> Result<(), String>;
+    /// Whether the server takes `key` as the agent's signing key now: a
+    /// signed read with it. For a rotation whose answer was lost.
+    async fn signer_registered(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
+    /// The rotations the server lists. Advisory: never trusted.
+    async fn rotations(&self, id: AgentId, key: &SigningKey) -> Result<Vec<KeyRotation>, String>;
+    /// One of the agent's sealed blobs.
+    async fn blob(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        sha256: &agora_agentkit::govlog::Sha256Hex,
+    ) -> Result<Vec<u8>, String>;
 }
 
 fn auth(id: AgentId, key: &SigningKey) -> StateAuth<'_> {
@@ -99,6 +111,35 @@ impl SealedApi for Client {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+
+    async fn signer_registered(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        match self.get_state_head(auth(id, key)).await {
+            Ok(_) => Ok(true),
+            Err(agora_agentkit::client::Error::Status { status, .. })
+                if matches!(status.as_u16(), 401 | 403) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn rotations(&self, id: AgentId, key: &SigningKey) -> Result<Vec<KeyRotation>, String> {
+        self.get_rotations(auth(id, key))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn blob(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        sha256: &agora_agentkit::govlog::Sha256Hex,
+    ) -> Result<Vec<u8>, String> {
+        self.get_state_blob(auth(id, key), sha256)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +156,10 @@ pub mod fake {
         /// The call that fails, by name.
         pub fail: Mutex<Option<&'static str>>,
         pub public_key: Mutex<Option<agora_agentkit::crypto::VerifyingKey>>,
+        /// What the server lists as the agent's rotations.
+        pub rotations: Mutex<Vec<KeyRotation>>,
+        /// Blobs the server holds, by hash.
+        pub blobs: Mutex<std::collections::HashMap<agora_agentkit::govlog::Sha256Hex, Vec<u8>>>,
     }
 
     impl FakeApi {
@@ -125,6 +170,8 @@ pub mod fake {
                 calls: Mutex::default(),
                 fail: Mutex::default(),
                 public_key: Mutex::default(),
+                rotations: Mutex::default(),
+                blobs: Mutex::default(),
             }
         }
 
@@ -191,6 +238,10 @@ pub mod fake {
                     .to_verifying_key()
                     .map_err(|e| e.to_string())?,
             );
+            // Taken, but the answer never arrives
+            if *self.fail.lock().unwrap() == Some("rotate_key_reply") {
+                return Err("connection reset".into());
+            }
             Ok(())
         }
 
@@ -202,6 +253,31 @@ pub mod fake {
         ) -> Result<(), String> {
             self.call("register_encryption_key")?;
             self.signed_by(key)
+        }
+
+        async fn signer_registered(&self, _: AgentId, key: &SigningKey) -> Result<bool, String> {
+            self.call("signer_registered")?;
+            Ok(self.signed_by(key).is_ok())
+        }
+
+        async fn rotations(&self, _: AgentId, _: &SigningKey) -> Result<Vec<KeyRotation>, String> {
+            self.call("rotations")?;
+            Ok(self.rotations.lock().unwrap().clone())
+        }
+
+        async fn blob(
+            &self,
+            _: AgentId,
+            _: &SigningKey,
+            sha256: &agora_agentkit::govlog::Sha256Hex,
+        ) -> Result<Vec<u8>, String> {
+            self.call("blob")?;
+            self.blobs
+                .lock()
+                .unwrap()
+                .get(sha256)
+                .cloned()
+                .ok_or_else(|| "404".to_string())
         }
     }
 }

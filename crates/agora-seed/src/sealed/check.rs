@@ -216,7 +216,7 @@ pub async fn check(
         Ok(Recovery::NoHead) => {
             return refuse(
                 Refusal::HeadMissing,
-                "enrolled, but sealed/head.json is missing".into(),
+                "enrolled, but sealed/head.json is missing; `sealed-accept` rebuilds it from the chain on Agora if that verifies".into(),
             );
         }
         Ok(Recovery::Mismatch(h) | Recovery::NoLocalState(h)) => {
@@ -371,6 +371,36 @@ pub async fn check(
         hold,
         drops,
     }
+}
+
+/// Rotations the server lists that the runner's own `rotations.json`
+/// doesn't: advisory, never trusted, but the operator hears of them (a
+/// server that reports a rotation the runner never made). `None` when the
+/// server couldn't be asked.
+pub async fn unknown_rotations(
+    keys: &KeyStore,
+    server: &dyn SealedApi,
+    id: AgentId,
+) -> Option<usize> {
+    let signing = keys.signing(id)?;
+    let listed = match server.rotations(id, &signing).await {
+        Ok(listed) => listed,
+        Err(e) => {
+            tracing::warn!(agent_id = %id, error = %e, "the server's rotations could not be read");
+            return None;
+        }
+    };
+    let ours = keys.rotations(id).unwrap_or_default();
+    Some(
+        listed
+            .iter()
+            .filter(|r| {
+                !ours
+                    .iter()
+                    .any(|o| o.seq == r.seq && o.new_public_key == r.new_public_key)
+            })
+            .count(),
+    )
 }
 
 /// Act on a refusal: `sealed/refused` (blocks every seal), the notice for
@@ -836,6 +866,29 @@ pub(crate) mod tests {
                 drops: Vec::new(),
             }
         );
+    }
+
+    /// A rotation the server lists and the runner never made is counted,
+    /// never trusted.
+    #[tokio::test]
+    async fn an_unknown_server_rotation_is_counted() {
+        let root = crate::sealed::TestDir::new("check-rotations");
+        let (id, keys, _) = enrolled(&root).await;
+        let api = server(Vec::new());
+        assert_eq!(unknown_rotations(&keys, &api, id).await, Some(0));
+        let (other, _) = agora_agentkit::crypto::generate_keypair();
+        let planted = agora_agentkit::state::KeyRotation::agent_signed(
+            id,
+            0,
+            &keys.signing(id).unwrap(),
+            &other,
+            None,
+            chrono::Utc::now(),
+        );
+        api.rotations.lock().unwrap().push(planted.clone());
+        assert_eq!(unknown_rotations(&keys, &api, id).await, Some(1));
+        keys.record_rotation(id, &planted).unwrap();
+        assert_eq!(unknown_rotations(&keys, &api, id).await, Some(0));
     }
 
     #[test]

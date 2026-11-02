@@ -115,6 +115,9 @@ pub enum AlertKind {
     SealedStateDrop,
     /// An enrolled agent's `sealed/` could not be read; it runs, unsealed.
     SealedStateUnreadable,
+    /// The server lists a rotation of an agent's signing key that the
+    /// runner never made. Advisory: never trusted.
+    SealedStateRotationUnknown,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -123,7 +126,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -142,6 +145,7 @@ impl AlertKind {
         Self::SealedStateDisabled,
         Self::SealedStateDrop,
         Self::SealedStateUnreadable,
+        Self::SealedStateRotationUnknown,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -165,6 +169,7 @@ impl AlertKind {
             Self::SealedStateDisabled => "sealed_state_disabled",
             Self::SealedStateDrop => "sealed_state_drop",
             Self::SealedStateUnreadable => "sealed_state_unreadable",
+            Self::SealedStateRotationUnknown => "sealed_state_rotation_unknown",
             Self::Test => "test_alert",
         }
     }
@@ -305,6 +310,13 @@ impl AlertKind {
                  saves are written locally but not sealed (recorded in \
                  sealed/seal_failed.json), and its uploads are held. Fix the \
                  directory; the next start checks again."
+            }
+            Self::SealedStateRotationUnknown => {
+                "Agora lists a rotation of this agent's signing key that the \
+                 runner never made (it isn't in <secrets>/<id>/rotations.json). \
+                 The runner doesn't trust it: chain checks follow only its own \
+                 records. Find out who rotated the key; an operator \
+                 replacement or a server fault are the likely causes."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

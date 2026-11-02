@@ -1,4 +1,4 @@
-//! `agora-seed sealed-accept --agent <id> --note "…"`: the only way out of
+//! `agora-seed sealed-accept --agent <id> [--note "…"]`: the only way out of
 //! a refusal, and an operator's act.
 //!
 //! It seals the agent's current state as a new snapshot on its chain (so
@@ -10,9 +10,15 @@
 //! The note is kept in `sealed/notice.json`, beside the chain. It is not
 //! uploaded: no v1 entry kind carries it (the history-tools PR adds one).
 //!
-//! A refusal for a missing `head.json` can't be accepted here: there is no
-//! head to seal onto, and only agentkit's `AgentSeal` writes `sealed/`.
-//! Restore `head.json` from a backup of the agent's directory first.
+//! A refusal for a missing `head.json` is accepted by rebuilding it from
+//! the agent's chain on Agora, verified with the runner's own trust
+//! (agentkit's `adopt_server_head`): when the state here is that head's,
+//! the refusal is simply cleared (`--note` optional); when it isn't, the
+//! agent stays refused unless `--note` seals its current state on top.
+//! Never a second genesis. With no chain on Agora either, `head.json` must
+//! come back from a backup. Like every operator command it refuses while
+//! the agent has a session, and holds the agent's `sealed/lock`
+//! throughout.
 
 use std::path::Path;
 
@@ -20,12 +26,13 @@ use agora_agentkit::enums::StateEntryKind;
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::{FsStorage, Storage};
 use agora_agentkit::state::codec::KeyframePolicy;
-use agora_agentkit::state::storage::AgentSeal;
+use agora_agentkit::state::storage::{Adopted, AgentSeal};
 use agora_agentkit::state::verify::HeadRef;
 use anyhow::Context;
 use chrono::Utc;
 
 use super::KeyStore;
+use super::api::SealedApi;
 use super::notice::{Notice, Refusal};
 
 /// What the refusal marker says, as a [`Refusal`].
@@ -42,21 +49,33 @@ fn refusal_of(text: &str) -> Refusal {
 pub struct Accepted {
     pub reason: Refusal,
     pub head: HeadRef,
+    /// A lost `head.json` was rebuilt from Agora's verified chain.
+    pub adopted: bool,
 }
 
-/// Accept `id`'s current state with `note`.
+/// The note when the rebuilt head matched and the operator gave none.
+pub const REBUILT_NOTE: &str = "the record of your last sealed version was missing here and \
+     was rebuilt from your chain on Agora, after checking it; your state matched it, so \
+     nothing about your state changed.";
+
+/// Accept `id`'s current state. A lost `head.json` is first rebuilt from
+/// Agora's chain ([`AgentSeal::adopt_server_head`]): if the state matches
+/// its head the refusal is cleared with no new version; if not, it stays
+/// refused unless `note` is given, which seals the current state on top
+/// of the adopted head. Never a second genesis.
 pub async fn accept(
     state_dir: &Path,
     keys: &KeyStore,
+    api: &dyn SealedApi,
     id: AgentId,
-    note: &str,
+    note: Option<&str>,
 ) -> anyhow::Result<Accepted> {
-    anyhow::ensure!(
-        !note.trim().is_empty(),
-        "--note is required: the agent reads it"
-    );
+    let note = note.map(str::trim).filter(|n| !n.is_empty());
     let agent_dir = state_dir.join(id.to_string());
     let seal = AgentSeal::new(&agent_dir, id);
+    // No session in progress (a journal older than the refusal is one the
+    // refused agent can't clear), and the lock for the whole command
+    let lock = super::session::take(state_dir, id, true).await?;
     anyhow::ensure!(
         seal.is_enrolled().await?,
         "agent {id} is not enrolled in sealed state"
@@ -76,34 +95,91 @@ pub async fn accept(
         .seal_keys(id)
         .context("no sealing keys for the agent")?;
 
-    anyhow::ensure!(
-        seal.head().await?.is_some(),
-        "agent {id}'s sealed/head.json is missing: restore it from a backup of its directory \
-         first; there is no head to seal onto"
-    );
-    seal.clear_refusal().await.context("clearing the refusal")?;
+    let mut adopted = None;
+    if seal.head().await?.is_none() {
+        let signing = keys.signing(id).context("no signing key for the agent")?;
+        let chain = api
+            .chain(id, &signing)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("reading the agent's chain on Agora")?;
+        anyhow::ensure!(
+            !chain.is_empty(),
+            "agent {id}'s sealed/head.json is missing and Agora holds no chain: restore \
+             head.json from a backup of its directory"
+        );
+        let trusted = keys
+            .trusted(id)?
+            .context("no signing key to verify Agora's chain with")?;
+        let signing = &signing;
+        let fetch = move |sha: agora_agentkit::govlog::Sha256Hex| async move {
+            api.blob(id, signing, &sha)
+                .await
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+        };
+        let result = seal
+            .adopt_server_head(&lock, &chain, &trusted, &k, Some(&current), fetch)
+            .await
+            .context("rebuilding head.json from Agora's chain")?;
+        tracing::warn!(
+            event_type = "sealed_state_head_adopted",
+            agent_id = %id,
+            matched = matches!(result, Adopted::Intact(_)),
+            "head.json rebuilt from the verified chain on Agora"
+        );
+        adopted = Some(result);
+    }
+
     let now = Utc::now();
-    let head = seal
-        .append_state(
-            &k,
-            &KeyframePolicy::default(),
-            StateEntryKind::Snapshot,
-            &current,
-            now,
-        )
-        .await
-        .context("sealing the accepted state (the refusal is cleared; the next start checks it)")?;
-    super::enroll::record_sizes(&agent_dir, head, now, &current);
-    Notice::accept(&agent_dir, note, reason).context("writing the notice")?;
+    let head = match (adopted, note) {
+        (Some(Adopted::Intact(head)), note) => {
+            seal.clear_refusal().await.context("clearing the refusal")?;
+            Notice::accept(&agent_dir, note.unwrap_or(REBUILT_NOTE), reason)
+                .context("writing the notice")?;
+            head
+        }
+        (Some(Adopted::Mismatch(head)), None) => anyhow::bail!(
+            "head.json was rebuilt from Agora (head {} at seq {}), but the state here doesn't \
+             match it: the agent stays refused. Pass --note to seal its current state on top",
+            head.entry_hash,
+            head.seq
+        ),
+        (None, None) => anyhow::bail!("--note is required: the agent reads it"),
+        (_, Some(note)) => {
+            seal.clear_refusal().await.context("clearing the refusal")?;
+            let head = super::session::append(
+                &seal,
+                &lock,
+                &k,
+                &KeyframePolicy::default(),
+                StateEntryKind::Snapshot,
+                &current,
+                now,
+            )
+            .await
+            .context(
+                "sealing the accepted state (the refusal is cleared; the next start checks it)",
+            )?;
+            super::enroll::record_sizes(&agent_dir, head, now, &current);
+            Notice::accept(&agent_dir, note, reason).context("writing the notice")?;
+            head
+        }
+    };
+    drop(lock);
     tracing::warn!(
         event_type = "sealed_state_accepted",
         agent_id = %id,
         reason = reason.as_str(),
         head = %head.entry_hash,
         seq = head.seq,
+        adopted = adopted.is_some(),
         "the operator accepted a refused agent's current state"
     );
-    Ok(Accepted { reason, head })
+    Ok(Accepted {
+        reason,
+        head,
+        adopted: adopted.is_some(),
+    })
 }
 
 #[cfg(test)]
@@ -131,7 +207,11 @@ mod tests {
         let api = FakeApi::new();
         let state_dir = root.join("state");
         // Not refused: nothing to accept
-        assert!(accept(&state_dir, &keys, id, "n").await.is_err());
+        assert!(
+            accept(&state_dir, &keys, &api, id, Some("n"))
+                .await
+                .is_err()
+        );
 
         // A wipe, refused
         FsStorage::new(&state_dir)
@@ -152,13 +232,21 @@ mod tests {
         };
         check::refuse(&dir, id, "tarn", reason, &detail, &Alerter::off()).await;
         assert!(
-            accept(&state_dir, &keys, id, "  ").await.is_err(),
+            accept(&state_dir, &keys, &api, id, Some("  "))
+                .await
+                .is_err(),
             "a note is required"
         );
 
-        let done = accept(&state_dir, &keys, id, "A test wipe; I restored nothing.")
-            .await
-            .unwrap();
+        let done = accept(
+            &state_dir,
+            &keys,
+            &api,
+            id,
+            Some("A test wipe; I restored nothing."),
+        )
+        .await
+        .unwrap();
         assert_eq!(done.reason, Refusal::Mismatch);
         let out = check::check(
             &dir,
@@ -201,14 +289,63 @@ mod tests {
         assert!(matches!(out, Outcome::Run { notice: false, .. }), "{out:?}");
     }
 
-    #[tokio::test]
-    async fn a_lost_head_file_is_not_accepted_over() {
-        let root = crate::sealed::TestDir::new("accept-head");
-        let (id, keys, dir) = enrolled(&root).await;
-        let api = FakeApi::new();
+    /// Every blob and entry the agent holds, on a fake Agora.
+    fn uploaded(api: &FakeApi, dir: &Path, chain: Vec<agora_agentkit::state::SignedStateEntry>) {
+        *api.chain.lock().unwrap() = Ok(chain);
+        for f in std::fs::read_dir(dir.join("sealed/blobs")).unwrap() {
+            let f = f.unwrap();
+            let sha = f.file_name().to_str().unwrap().parse().unwrap();
+            api.blobs
+                .lock()
+                .unwrap()
+                .insert(sha, std::fs::read(f.path()).unwrap());
+        }
+    }
+
+    async fn lose_head_and_refuse(root: &Path, id: AgentId, keys: &KeyStore, dir: &Path) {
         let sealed = dir.join("sealed");
         std::fs::rename(sealed.join("head.json"), sealed.join("head.json.lost")).unwrap();
+        let api = FakeApi::new();
         let Outcome::Refuse { reason, detail } = check::check(
+            dir,
+            id,
+            &local(root, id).await,
+            Default::default(),
+            keys,
+            &api,
+        )
+        .await
+        else {
+            panic!()
+        };
+        assert_eq!(reason, Refusal::HeadMissing);
+        check::refuse(dir, id, "tarn", reason, &detail, &Alerter::off()).await;
+    }
+
+    /// A lost head.json, the state still the head's: rebuilt from Agora's
+    /// verified chain and the refusal cleared, with no new version.
+    #[tokio::test]
+    async fn a_lost_head_is_adopted_from_agora_when_the_state_matches() {
+        let root = crate::sealed::TestDir::new("accept-adopt");
+        let (id, keys, dir) = enrolled(&root).await;
+        let chain = check::local_entries(&AgentSeal::new(&dir, id))
+            .await
+            .unwrap();
+        lose_head_and_refuse(&root, id, &keys, &dir).await;
+        let api = FakeApi::new();
+        // Nothing on Agora: nothing to adopt, still refused
+        assert!(
+            accept(&root.join("state"), &keys, &api, id, None)
+                .await
+                .is_err()
+        );
+        uploaded(&api, &dir, chain.clone());
+        let done = accept(&root.join("state"), &keys, &api, id, None)
+            .await
+            .unwrap();
+        assert!(done.adopted);
+        assert_eq!(done.head.entry_hash, chain.last().unwrap().entry_hash());
+        let out = check::check(
             &dir,
             id,
             &local(&root, id).await,
@@ -216,20 +353,71 @@ mod tests {
             &keys,
             &api,
         )
-        .await
-        else {
-            panic!()
+        .await;
+        let Outcome::Run { seat, hold, .. } = out else {
+            panic!("{out:?}")
         };
-        check::refuse(&dir, id, "tarn", reason, &detail, &Alerter::off()).await;
-        assert!(accept(&root.join("state"), &keys, id, "n").await.is_err());
-        assert!(
-            AgentSeal::new(&dir, id).is_refused().await.unwrap(),
-            "still refused"
-        );
-        // The head restored by hand: accepted
-        std::fs::rename(sealed.join("head.json.lost"), sealed.join("head.json")).unwrap();
-        accept(&root.join("state"), &keys, id, "head file restored")
+        assert_eq!(hold, None);
+        assert!(seat[0].contains(REBUILT_NOTE), "{seat:?}");
+    }
+
+    /// A lost head.json and a state that isn't its head: refused until the
+    /// operator writes a note, then sealed on top of the adopted head.
+    #[tokio::test]
+    async fn a_lost_head_with_a_changed_state_stays_refused_without_a_note() {
+        let root = crate::sealed::TestDir::new("accept-adopt-mismatch");
+        let (id, keys, dir) = enrolled(&root).await;
+        let chain = check::local_entries(&AgentSeal::new(&dir, id))
             .await
             .unwrap();
+        FsStorage::new(root.join("state"))
+            .save_raw(id, serde_json::json!({ "memory": "" }), None)
+            .await
+            .unwrap();
+        lose_head_and_refuse(&root, id, &keys, &dir).await;
+        let api = FakeApi::new();
+        uploaded(&api, &dir, chain.clone());
+        let e = accept(&root.join("state"), &keys, &api, id, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("stays refused"), "{e}");
+        assert!(AgentSeal::new(&dir, id).is_refused().await.unwrap());
+        let done = accept(
+            &root.join("state"),
+            &keys,
+            &api,
+            id,
+            Some("wiped in a test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.head.seq, chain.len() as u64, "on top of Agora's head");
+        let out = check::check(
+            &dir,
+            id,
+            &local(&root, id).await,
+            Default::default(),
+            &keys,
+            &api,
+        )
+        .await;
+        assert!(matches!(out, Outcome::Run { hold: None, .. }), "{out:?}");
+    }
+
+    /// Never while the agent has a session journal newer than its refusal.
+    #[tokio::test]
+    async fn accept_refuses_while_a_session_is_in_progress() {
+        let root = crate::sealed::TestDir::new("accept-session");
+        let (id, keys, dir) = enrolled(&root).await;
+        AgentSeal::new(&dir, id).refuse("mismatch").await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let journal = FsStorage::new(root.join("state")).journal(id);
+        std::fs::write(journal.path(), b"{}\n").unwrap();
+        let e = accept(&root.join("state"), &keys, &FakeApi::new(), id, Some("n"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("session in progress"), "{e}");
     }
 }

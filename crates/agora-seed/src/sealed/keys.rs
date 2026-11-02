@@ -35,6 +35,8 @@ pub const SECRETS_FILE: &str = "secrets.json";
 pub const NEXT_SECRETS_FILE: &str = "secrets.next.json";
 /// The signing key's rotations.
 pub const ROTATIONS_FILE: &str = "rotations.json";
+/// A rotation sent, its answer not yet in hand.
+pub const PENDING_ROTATION_FILE: &str = "rotation.pending.json";
 
 /// `state_key.json`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -353,6 +355,37 @@ impl KeyStore {
             all.push(rotation.clone());
         }
         write_secret(&self.agent_dir(id).join(ROTATIONS_FILE), &to_json(&all)?)
+    }
+
+    /// The rotation sent but not yet recorded, if any.
+    pub fn pending_rotation(
+        &self,
+        id: AgentId,
+    ) -> std::io::Result<Option<agora_agentkit::state::KeyRotation>> {
+        read_json(&self.agent_dir(id).join(PENDING_ROTATION_FILE))
+    }
+
+    /// Keep the signed rotation before it is sent, so a retry sends (or
+    /// records) the same one.
+    pub fn write_pending_rotation(
+        &self,
+        id: AgentId,
+        rotation: &agora_agentkit::state::KeyRotation,
+    ) -> std::io::Result<()> {
+        write_secret(
+            &self.agent_dir(id).join(PENDING_ROTATION_FILE),
+            &to_json(rotation)?,
+        )
+    }
+
+    /// The pending rotation is recorded: kept as
+    /// `rotation.<seq>.taken.json`, never deleted.
+    pub fn settle_pending_rotation(&self, id: AgentId, seq: u32) -> std::io::Result<()> {
+        let dir = self.agent_dir(id);
+        std::fs::rename(
+            dir.join(PENDING_ROTATION_FILE),
+            dir.join(format!("rotation.{seq}.taken.json")),
+        )
     }
 
     /// What an enrolled agent's entries are signed and sealed with.

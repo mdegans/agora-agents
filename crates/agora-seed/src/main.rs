@@ -1483,6 +1483,22 @@ async fn sealed_start_check(
                     alerts.notify(sealed::check::hold_alert(hold, *id, &name));
                     run.held.push(*id);
                 }
+                if let Some(n @ 1..) = sealed::check::unknown_rotations(keys, api, *id).await {
+                    tracing::warn!(
+                        event_type = "sealed_state_rotation_unknown",
+                        agent_id = %id,
+                        rotations = n,
+                        "the server lists key rotations this runner never made; not trusted"
+                    );
+                    alerts.notify(
+                        alerts::Alert::new(
+                            alerts::AlertKind::SealedStateRotationUnknown,
+                            format!("{name}: the server lists {n} key rotation(s) this runner never made"),
+                        )
+                        .agent(&name, *id)
+                        .detail("rotations", n),
+                    );
+                }
                 run.seats.insert(
                     *id,
                     consent::SealedSeat {

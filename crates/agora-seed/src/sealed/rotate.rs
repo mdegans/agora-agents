@@ -39,6 +39,7 @@ pub struct Rotated {
 }
 
 pub async fn rotate_keys(
+    state_dir: &std::path::Path,
     keys: &KeyStore,
     api: &dyn SealedApi,
     id: AgentId,
@@ -49,6 +50,15 @@ pub async fn rotate_keys(
         signing || encryption,
         "name what to rotate: --signing, --encryption, or both"
     );
+    // No session in progress: one would sign with a key retired under it.
+    // An enrolled agent's lock is held for the whole command.
+    super::session::no_session(state_dir, id, false)?;
+    let agent_dir = state_dir.join(id.to_string());
+    let _lock = if super::is_enrolled(&agent_dir) {
+        Some(super::session::take(state_dir, id, false).await?)
+    } else {
+        None
+    };
     let current = keys
         .secrets(id)?
         .with_context(|| format!("agent {id} has no secrets.json"))?;
@@ -103,14 +113,60 @@ pub async fn rotate_keys(
             .map(|r| r.seq + 1)
             .max()
             .unwrap_or(0);
-        let rotation = KeyRotation::agent_signed(id, seq, &old_signing, &new_signing, Utc::now());
-        api.rotate_key(id, &old_signing, &rotation)
-            .await
-            .map_err(anyhow::Error::msg)
-            .context("the server refused the signing-key rotation; secrets.json is unchanged")?;
+        let new_public = agora_agentkit::govlog::PublicKeyHex::from(&new_signing.verifying_key());
+        // The rotation an earlier attempt signed and sent, if it was this one
+        let rotation = match keys.pending_rotation(id)? {
+            Some(r) if r.new_public_key == new_public && r.seq == seq => r,
+            _ => {
+                // The old key signs nothing past the current head
+                let last = if super::is_enrolled(&agent_dir) {
+                    agora_agentkit::state::storage::AgentSeal::new(&agent_dir, id)
+                        .head()
+                        .await?
+                        .map(|h| h.head)
+                } else {
+                    None
+                };
+                let r = KeyRotation::agent_signed(
+                    id,
+                    seq,
+                    &old_signing,
+                    &new_signing,
+                    last,
+                    Utc::now(),
+                );
+                keys.write_pending_rotation(id, &r)
+                    .context("keeping the signed rotation before sending it")?;
+                r
+            }
+        };
+        // An earlier attempt's answer may have been lost: if the server
+        // already takes the new key, the rotation was taken
+        let taken = resumed
+            && api
+                .signer_registered(id, &new_signing)
+                .await
+                .map_err(anyhow::Error::msg)
+                .context("asking the server which signing key it holds")?;
+        if taken {
+            tracing::warn!(
+                event_type = "sealed_rotation_already_taken",
+                agent_id = %id,
+                seq,
+                "the server already holds the new signing key: an earlier attempt's answer was lost"
+            );
+        } else {
+            api.rotate_key(id, &old_signing, &rotation)
+                .await
+                .map_err(anyhow::Error::msg)
+                .context(
+                    "the server refused the signing-key rotation; secrets.json is unchanged",
+                )?;
+        }
         // Ours to verify the chain by, never the server's
         keys.record_rotation(id, &rotation)
             .context("recording the rotation in rotations.json")?;
+        keys.settle_pending_rotation(id, seq)?;
     }
     if done.encryption
         && let Some(secret) = &new_encryption
@@ -180,11 +236,20 @@ mod tests {
         let api = FakeApi::new();
         *api.public_key.lock().unwrap() = Some(old_signing.verifying_key());
 
-        assert!(rotate_keys(&keys, &api, id, false, false).await.is_err());
+        let state_dir = root.join("state");
+        assert!(
+            rotate_keys(&state_dir, &keys, &api, id, false, false)
+                .await
+                .is_err()
+        );
 
         // The server refuses: nothing replaced, the new keys kept
         *api.fail.lock().unwrap() = Some("rotate_key");
-        assert!(rotate_keys(&keys, &api, id, true, true).await.is_err());
+        assert!(
+            rotate_keys(&state_dir, &keys, &api, id, true, true)
+                .await
+                .is_err()
+        );
         assert_eq!(keys.signing(id).unwrap().to_bytes(), old_signing.to_bytes());
         let staged = keys.next_secrets(id).unwrap().unwrap().signing().unwrap();
         let past = keys.past_keys(id).unwrap();
@@ -194,7 +259,9 @@ mod tests {
         // A retry resumes with the same new keys
         *api.fail.lock().unwrap() = None;
         api.calls.lock().unwrap().clear();
-        let done = rotate_keys(&keys, &api, id, true, true).await.unwrap();
+        let done = rotate_keys(&state_dir, &keys, &api, id, true, true)
+            .await
+            .unwrap();
         assert_eq!(
             done,
             Rotated {
@@ -206,7 +273,12 @@ mod tests {
         );
         assert_eq!(
             *api.calls.lock().unwrap(),
-            ["rotate_key", "register_encryption_key", "post_state_key"],
+            [
+                "signer_registered",
+                "rotate_key",
+                "register_encryption_key",
+                "post_state_key"
+            ],
             "rotation, then the X25519 key under the new signer, then the re-wrap"
         );
         assert_eq!(keys.signing(id).unwrap().to_bytes(), staged.to_bytes());
@@ -248,5 +320,67 @@ mod tests {
         );
         let out = check::check(&dir, id, &local, Default::default(), &keys, &FakeApi::new()).await;
         assert!(matches!(out, Outcome::Run { hold: None, .. }), "{out:?}");
+    }
+
+    /// The server took the rotation but its answer was lost: the retry
+    /// finds the new key registered, records the same signed rotation, and
+    /// never rotates twice.
+    #[tokio::test]
+    async fn a_rotation_whose_answer_was_lost_is_recorded_on_retry() {
+        let root = crate::sealed::TestDir::new("rotate-lost");
+        let (id, keys, _) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        let api = FakeApi::new();
+        *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
+        *api.fail.lock().unwrap() = Some("rotate_key_reply");
+        assert!(
+            rotate_keys(&state_dir, &keys, &api, id, true, false)
+                .await
+                .is_err()
+        );
+        let sent = keys.pending_rotation(id).unwrap().unwrap();
+        assert!(
+            keys.rotations(id).unwrap().is_empty(),
+            "not recorded without an answer"
+        );
+
+        *api.fail.lock().unwrap() = None;
+        api.calls.lock().unwrap().clear();
+        let done = rotate_keys(&state_dir, &keys, &api, id, true, false)
+            .await
+            .unwrap();
+        assert!(done.signing && done.resumed);
+        assert_eq!(
+            *api.calls.lock().unwrap(),
+            ["signer_registered"],
+            "no second rotation"
+        );
+        assert_eq!(
+            keys.rotations(id).unwrap(),
+            vec![sent.clone()],
+            "the one sent"
+        );
+        assert!(keys.pending_rotation(id).unwrap().is_none());
+        assert_eq!(
+            agora_agentkit::govlog::PublicKeyHex::from(&keys.signing(id).unwrap().verifying_key()),
+            sent.new_public_key
+        );
+        assert!(keys.trusted(id).unwrap().is_some());
+    }
+
+    /// Never while the agent has a session journal.
+    #[tokio::test]
+    async fn rotation_refuses_while_a_session_is_in_progress() {
+        let root = crate::sealed::TestDir::new("rotate-session");
+        let (id, keys, _) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        let journal = FsStorage::new(&state_dir).journal(id);
+        std::fs::write(journal.path(), b"{}\n").unwrap();
+        let e = rotate_keys(&state_dir, &keys, &FakeApi::new(), id, true, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("session in progress"), "{e}");
+        assert!(keys.next_secrets(id).unwrap().is_none(), "nothing written");
     }
 }

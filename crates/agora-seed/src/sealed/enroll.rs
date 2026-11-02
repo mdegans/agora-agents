@@ -14,11 +14,13 @@
 //! 5. the current state;
 //! 6. `sealed/enrolled`: from here every save is sealed; then one upload.
 //!
-//! Only agents whose sealed-state ledger says yes. A partial enrolment (a
-//! chain but no `enrolled`) is renamed aside to `sealed.partial.<utc>`, and
-//! begun again with the same key. `--dry-run` reads sizes and markers and
-//! prints counts and sizes only: no writes, no network. Run it while the
-//! agent is not in a session.
+//! Only agents whose sealed-state ledger says yes, with no session in
+//! progress, under the agent's `sealed/lock` for the whole run. A partial
+//! enrolment (a chain but no `enrolled`) is resumed: the archives after the
+//! newest state it sealed, then the current state, then `enrolled`, with
+//! the same key. With no chain here, an agent Agora holds a chain of is
+//! never given a second genesis. `--dry-run` reads sizes and markers and
+//! prints counts and sizes only: no writes, no network.
 //!
 //! [`StateKeyRecord`]: agora_agentkit::state::StateKeyRecord
 
@@ -159,6 +161,10 @@ pub struct Report {
     pub prior: bool,
     pub origin: String,
     pub current_bytes: u64,
+    /// A partial enrolment was continued.
+    pub resumed: bool,
+    /// Archives a partial enrolment had already sealed.
+    pub resumed_past: usize,
     /// Entries in the chain at the end (genesis included).
     pub entries: usize,
 }
@@ -308,27 +314,36 @@ impl Enroller {
             ..Report::default()
         };
         if dry_run {
+            super::session::no_session(&self.state_dir, id, false)?;
             return Ok(report);
         }
-
-        // A chain begun before but never enrolled: left for the operator
-        if seal
-            .head()
-            .await
-            .context("reading the sealed head")?
-            .is_some()
-        {
-            return Err(Skip::Failed(anyhow::anyhow!(
-                "a partial enrolment is in {} (a chain, no `enrolled`): move that directory \
-                 aside (never delete it) and run this again; the state key is reused",
-                seal.dir().display()
-            )));
-        }
+        // No session in progress, and the agent's lock for the whole
+        // enrolment: every write below goes through it
+        let lock = super::session::take(&self.state_dir, id, false).await?;
+        // A chain begun before but never enrolled is resumed
+        let partial = seal.head().await.context("reading the sealed head")?;
 
         let signing = self
             .keys
             .signing(id)
             .context("the agent has no signing key")?;
+        // Never a second genesis for an agent Agora holds a chain of, and
+        // no key posted for one either
+        if partial.is_none() {
+            let server = self
+                .api
+                .chain(id, &signing)
+                .await
+                .map_err(anyhow::Error::msg)
+                .context("reading the agent's chain on Agora")?;
+            if !server.is_empty() {
+                return Err(Skip::Failed(anyhow::anyhow!(
+                    "Agora holds a chain of {} entries for this agent and there is none here: \
+                     adopt it (sealed-accept), never start a second genesis",
+                    server.len()
+                )));
+            }
+        }
         let encryption = self
             .keys
             .ring()
@@ -388,21 +403,53 @@ impl Enroller {
             .context("sealing keys for the agent")?;
         let policy = KeyframePolicy::default();
 
-        let first_at = archives
-            .first()
-            .map(|a| a.mtime)
-            .or_else(|| mtime(&current_path).ok())
-            .unwrap_or_else(Utc::now);
-        seal.genesis(&keys, &origin.origin, first_at)
-            .await
-            .context("sealing the genesis")?;
-        if let Some(prior) = &origin.prior {
+        // Where a partial enrolment stopped: the newest state it sealed,
+        // and whether the pre-loss copy is in
+        let mut done_until: Option<i64> = None;
+        let mut prior_done = false;
+        let mut last = None;
+        match &partial {
+            Some(head) => {
+                let entries = super::check::local_entries(&seal)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                done_until = entries
+                    .iter()
+                    .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
+                    .map(|e| e.entry.state_at)
+                    .max();
+                prior_done = entries
+                    .iter()
+                    .any(|e| e.entry.kind == StateEntryKind::ArchivedPrior);
+                last = head.plaintext_sha256;
+                report.resumed = true;
+                tracing::warn!(
+                    event_type = "sealed_enroll_resumed",
+                    agent_id = %id,
+                    entries = entries.len(),
+                    "resuming a partial enrolment"
+                );
+            }
+            None => {
+                let first_at = archives
+                    .first()
+                    .map(|a| a.mtime)
+                    .or_else(|| mtime(&current_path).ok())
+                    .unwrap_or_else(Utc::now);
+                super::session::genesis(&seal, &lock, &keys, &origin.origin, first_at)
+                    .await
+                    .context("sealing the genesis")?;
+            }
+        }
+        if let Some(prior) = origin.prior.as_ref().filter(|_| !prior_done) {
             let value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(prior).context("reading the pre-loss copy")?)
                     .map_err(|e| {
                         anyhow::anyhow!("the pre-loss copy isn't JSON ({:?})", e.classify())
                     })?;
-            seal.append_state(
+            super::session::append(
+                &seal,
+                &lock,
                 &keys,
                 &policy,
                 StateEntryKind::ArchivedPrior,
@@ -412,8 +459,11 @@ impl Enroller {
             .await
             .context("sealing the pre-loss copy")?;
         }
-        let mut last = None;
         for archive in &archives {
+            if done_until.is_some_and(|t| archive.mtime.timestamp_micros() <= t) {
+                report.resumed_past += 1;
+                continue;
+            }
             let Some(state) = archived_state(&archive.path) else {
                 report.skipped += 1;
                 continue;
@@ -423,25 +473,33 @@ impl Enroller {
                 report.skipped += 1;
                 continue;
             }
-            let head = seal
-                .append_state(
-                    &keys,
-                    &policy,
-                    StateEntryKind::Snapshot,
-                    &state,
-                    archive.mtime,
-                )
-                .await
-                .with_context(|| format!("sealing archive {}", archive.path.display()))?;
+            let head = super::session::append(
+                &seal,
+                &lock,
+                &keys,
+                &policy,
+                StateEntryKind::Snapshot,
+                &state,
+                archive.mtime,
+            )
+            .await
+            .with_context(|| format!("sealing archive {}", archive.path.display()))?;
             record_sizes(&agent_dir, head, archive.mtime, &state);
             last = Some(hash);
         }
         if last != Some(plaintext_hash(&current)) {
             let at = mtime(&current_path).unwrap_or_else(|_| Utc::now());
-            let head = seal
-                .append_state(&keys, &policy, StateEntryKind::Snapshot, &current, at)
-                .await
-                .context("sealing the current state")?;
+            let head = super::session::append(
+                &seal,
+                &lock,
+                &keys,
+                &policy,
+                StateEntryKind::Snapshot,
+                &current,
+                at,
+            )
+            .await
+            .context("sealing the current state")?;
             record_sizes(&agent_dir, head, at, &current);
         }
         seal.enroll()
@@ -451,6 +509,7 @@ impl Enroller {
             .await
             .map_err(anyhow::Error::msg)?
             .len();
+        drop(lock);
         tracing::info!(
             event_type = "sealed_enrolled",
             agent_id = %id,
@@ -538,7 +597,10 @@ mod tests {
         assert!(keys.state_key_file(id).unwrap().is_none());
 
         let report = enroller.enroll(id, false).await.unwrap();
-        assert_eq!(*api.calls.lock().unwrap(), ["state_keys", "post_state_key"]);
+        assert_eq!(
+            *api.calls.lock().unwrap(),
+            ["chain", "state_keys", "post_state_key"]
+        );
         let record = api.keys.lock().unwrap()[0].clone();
         let enc = keys.encryption(id).unwrap();
         assert_eq!(
@@ -630,5 +692,126 @@ mod tests {
             Some("2026-10-13T09:00:00Z".parse().unwrap())
         );
         assert_eq!(shown.prior, Some(recovered.join("tarn/MEMORY.json")));
+    }
+
+    /// An enrolment interrupted after `k` archives resumes where it
+    /// stopped: every state once, in order, no gap, one genesis.
+    #[tokio::test]
+    async fn an_interrupted_enrolment_resumes_without_duplicates_or_gaps() {
+        for k in 0..=4 {
+            let root = crate::sealed::TestDir::new("enroll-resume");
+            let state_dir = root.join("state");
+            let keys = KeyStore::new(root.join("secrets"));
+            let id = AgentId::new();
+            keys.ring()
+                .insert(id, &agora_agentkit::crypto::generate_keypair().0)
+                .unwrap();
+            let mut fs = FsStorage::new(&state_dir);
+            let memories = ["a", "b", "c", "d", "e"];
+            for m in memories {
+                fs.save_raw(id, state("tarn", m), None).await.unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let dir = state_dir.join(id.to_string());
+            yes(&dir);
+            // The first run: key, genesis, k archives, then it died
+            keys.write_state_key(id, &StateKeyFile::new(&StateKey::generate(), 0, 0))
+                .unwrap();
+            let seal = AgentSeal::new(&dir, id);
+            let k_keys = keys.seal_keys(id).unwrap();
+            let all = archives(&dir).unwrap();
+            {
+                let lock = seal.lock().await.unwrap();
+                let origin = GenesisOrigin {
+                    class: GenesisClass::Unknown,
+                    incident: None,
+                    prior_copy_held: false,
+                    verified_at: None,
+                };
+                crate::sealed::session::genesis(&seal, &lock, &k_keys, &origin, all[0].mtime)
+                    .await
+                    .unwrap();
+                for a in &all[..k] {
+                    crate::sealed::session::append(
+                        &seal,
+                        &lock,
+                        &k_keys,
+                        &KeyframePolicy::default(),
+                        StateEntryKind::Snapshot,
+                        &archived_state(&a.path).unwrap(),
+                        a.mtime,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            let api = std::sync::Arc::new(FakeApi::new());
+            let enroller = Enroller {
+                state_dir: state_dir.clone(),
+                keys: keys.clone(),
+                api: api.clone(),
+                restore: None,
+            };
+            let report = enroller.enroll(id, false).await.unwrap();
+            assert!(report.resumed, "k={k}");
+            assert_eq!(report.resumed_past, k, "k={k}");
+            assert!(!api.calls.lock().unwrap().contains(&"chain".to_string()));
+            let entries = super::super::check::local_entries(&seal).await.unwrap();
+            assert_eq!(
+                entries.len(),
+                1 + memories.len(),
+                "k={k}: genesis and each state once"
+            );
+            assert!(verify_chain(id, &entries, &keys.trusted(id).unwrap().unwrap()).intact);
+            let mut opened = Vec::new();
+            for e in &entries[1..] {
+                let base = match e.entry.blob.as_ref().unwrap().encoding {
+                    agora_agentkit::state::BlobEncoding::Delta { base } => entries
+                        .iter()
+                        .map(|x| &x.entry)
+                        .find(|x| x.entry_hash() == base),
+                    _ => None,
+                };
+                let v = seal.open_state(&k_keys, &e.entry, base).await.unwrap();
+                opened.push(v["memory"]["content"].as_str().unwrap().to_string());
+            }
+            assert_eq!(
+                opened, memories,
+                "k={k}: in order, none twice, none missing"
+            );
+        }
+    }
+
+    /// No chain here, but one on Agora: never a second genesis.
+    #[tokio::test]
+    async fn no_second_genesis_for_a_chain_on_agora() {
+        let root = crate::sealed::TestDir::new("enroll-server-chain");
+        let (other, _, other_dir) = crate::sealed::check::tests::enrolled(&root).await;
+        let chain = super::super::check::local_entries(&AgentSeal::new(&other_dir, other))
+            .await
+            .unwrap();
+        let state_dir = root.join("state");
+        let keys = KeyStore::new(root.join("secrets"));
+        let id = AgentId::new();
+        keys.ring()
+            .insert(id, &agora_agentkit::crypto::generate_keypair().0)
+            .unwrap();
+        FsStorage::new(&state_dir)
+            .save_raw(id, state("tarn", "m"), None)
+            .await
+            .unwrap();
+        yes(&state_dir.join(id.to_string()));
+        let api = std::sync::Arc::new(FakeApi::new());
+        *api.chain.lock().unwrap() = Ok(chain);
+        let enroller = Enroller {
+            state_dir,
+            keys: keys.clone(),
+            api: api.clone(),
+            restore: None,
+        };
+        let e = enroller.enroll(id, false).await.unwrap_err().to_string();
+        assert!(e.contains("never start a second genesis"), "{e}");
+        assert_eq!(*api.calls.lock().unwrap(), ["chain"], "no key posted");
+        assert!(keys.state_key_file(id).unwrap().is_none());
     }
 }

@@ -33,14 +33,16 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Let a refused agent run again: seal its current state as accepted,
+    /// Let a refused agent run again: seal its current state as accepted
+    /// (or, for a lost head.json, rebuild it from Agora's verified chain),
     /// clear the refusal, and leave the note for its next session.
     SealedAccept {
         #[arg(long)]
         agent: AgentId,
-        /// What the agent is told, in its next session.
+        /// What the agent is told, in its next session. Required, but for a
+        /// lost head.json rebuilt from Agora that the state matches.
         #[arg(long)]
-        note: String,
+        note: Option<String>,
     },
     /// Rotate an agent's keys: new ones written first, the server told,
     /// the state key re-wrapped, `secrets.json` replaced last. Old keys are
@@ -125,12 +127,18 @@ pub async fn run(
             anyhow::ensure!(failed == 0, "{failed} enrolment(s) failed");
         }
         Command::SealedAccept { agent, note } => {
-            let done = super::accept::accept(&state_dir, &keys, agent, &note).await?;
+            let done =
+                super::accept::accept(&state_dir, &keys, &client, agent, note.as_deref()).await?;
             println!(
-                "{agent}: accepted ({}); new head {} at seq {}",
+                "{agent}: accepted ({}); head {} at seq {}{}",
                 done.reason.as_str(),
                 done.head.entry_hash,
                 done.head.seq,
+                if done.adopted {
+                    "; head.json rebuilt from Agora's verified chain"
+                } else {
+                    ""
+                },
             );
         }
         Command::RotateKeys {
@@ -139,7 +147,8 @@ pub async fn run(
             encryption,
         } => {
             let done =
-                super::rotate::rotate_keys(&keys, &client, agent, signing, encryption).await?;
+                super::rotate::rotate_keys(&state_dir, &keys, &client, agent, signing, encryption)
+                    .await?;
             println!(
                 "{agent}: rotated signing {}, encryption {}, state key re-wrapped {}{}",
                 done.signing,
