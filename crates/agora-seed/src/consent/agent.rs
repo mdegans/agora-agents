@@ -192,6 +192,10 @@ impl ContactRequests for SeedAgent {
     }
 }
 
+/// The heading the sealed-state lines are seated under, at the intro's
+/// heading level, so they don't read as part of the section before them.
+pub const SEALED_HEADING: &str = "## Your Sealed State";
+
 /// Answers per question per session: the first plus two retries. For an
 /// offer, the unusable ones it may take: refused `answer_offer` calls,
 /// clipped turns, unanswered turns (of which it gets one reminder).
@@ -586,6 +590,9 @@ pub struct ConsentAgent<A> {
     /// The sealed-state refusal notice was seated: renamed aside once the
     /// session saves.
     sealed_notice: bool,
+    /// The stop's first note was seated: marked shown once the session
+    /// saves.
+    sealed_stop_note: bool,
     /// The closing questions have been put (or there were none): the inner
     /// session's next `Done` is its epilogue's.
     closed: bool,
@@ -2736,10 +2743,7 @@ where
                     constrained,
                     "sealed-state answer recorded"
                 );
-                self.sealed_line = Some(sealed_state::evolution_line(
-                    answer.choice,
-                    Utc::now().date_naive(),
-                ));
+                self.sealed_line = Some(sealed_state::evolution_line(answer.choice));
                 self.sealed_note = note;
                 SealOutcome::Answered {
                     choice: answer.choice,
@@ -3693,6 +3697,7 @@ where
             sealed_undo: None,
             sealed_written: None,
             sealed_notice: false,
+            sealed_stop_note: false,
             closed: false,
             epilogue: false,
         })
@@ -3877,11 +3882,15 @@ where
         }
         if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id()) {
             self.sealed_notice = seat.notice;
+            self.sealed_stop_note = seat.stop_note;
             sealed_lines.extend(seat.lines.iter().cloned());
         }
         if !sealed_lines.is_empty() {
             let (_, prompt) = self.inner.parts();
-            Self::seat_user(prompt, Content::from(sealed_lines.join("\n\n")))?;
+            Self::seat_user(
+                prompt,
+                Content::from(format!("{SEALED_HEADING}\n\n{}", sealed_lines.join("\n\n"))),
+            )?;
         }
         if let Some(key) = self.review.clone() {
             self.seat_review(key).await?;
@@ -3986,6 +3995,15 @@ where
                 agent_id = %self.inner.id(),
                 error = %e,
                 "sealed-state notice not set aside after the save; it is shown again"
+            );
+        }
+        if self.sealed_stop_note
+            && let Err(e) = crate::sealed::stop::Stopped::mark_shown(&self.agent_dir())
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "the stop's note not marked shown after the save; it is shown again"
             );
         }
         result
@@ -10259,10 +10277,7 @@ mod tests {
         agent.on_teardown().await.unwrap();
         assert_eq!(
             evolution_notes(&agent),
-            [sealed_state::evolution_line(
-                SealChoice::Private,
-                Utc::now().date_naive()
-            )]
+            [sealed_state::evolution_line(SealChoice::Private)]
         );
         assert_eq!(agent.state().memory.content, memory);
         let ledger = sealed_ledger(&h).await;
@@ -10336,12 +10351,16 @@ mod tests {
             crate::consent::SealedSeat {
                 lines: vec!["NOTICE LINE".into(), "VERDICT LINE".into()],
                 notice: true,
+                stop_note: false,
             },
         );
         let mut agent = anthropic_agent(&h);
         agent.on_init().await.unwrap();
         let intro = serde_json::to_string(&agent.prompt().messages).unwrap();
-        assert!(intro.contains("NOTICE LINE\\n\\nVERDICT LINE"), "{intro}");
+        assert!(
+            intro.contains("## Your Sealed State\\n\\nNOTICE LINE\\n\\nVERDICT LINE"),
+            "{intro}"
+        );
         assert!(crate::sealed::notice::Notice::load(&dir).unwrap().is_some());
         agent.on_saved().await.unwrap();
         assert!(
@@ -10385,7 +10404,7 @@ mod tests {
         let seen = serde_json::to_string(&next.prompt().messages).unwrap();
         assert!(
             seen.contains(
-                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed."
+                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; if you change your mind, ask your operator."
             ),
             "{seen}"
         );

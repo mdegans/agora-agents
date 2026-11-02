@@ -32,6 +32,10 @@ pub enum Command {
         /// network.
         #[arg(long)]
         dry_run: bool,
+        /// Resuming a stopped agent whose state changed while stopped:
+        /// why, for the agent (shown at its next session).
+        #[arg(long)]
+        note: Option<String>,
     },
     /// Let a refused agent run again: seal its current state as accepted
     /// (or, for a lost head.json, rebuild it from Agora's verified chain),
@@ -47,6 +51,16 @@ pub enum Command {
         /// verified head, keep the other branch locally, resume uploads.
         #[arg(long, requires = "note")]
         rebase: bool,
+    },
+    /// Stop an agent's sealed backups, at its request: what waits is
+    /// uploaded first, the history stays, and the agent is shown the note.
+    /// `sealed-enroll --agent` resumes them.
+    SealedStop {
+        #[arg(long)]
+        agent: AgentId,
+        /// Why, for the agent: shown at its next session.
+        #[arg(long)]
+        note: String,
     },
     /// Rotate an agent's keys: new ones written first, the server told,
     /// the state key re-wrapped, `secrets.json` replaced last. Old keys are
@@ -79,6 +93,7 @@ pub async fn run(
             agent,
             opted_in,
             dry_run,
+            note,
         } => {
             let enroller = super::enroll::Enroller {
                 state_dir: state_dir.clone(),
@@ -101,7 +116,10 @@ pub async fn run(
             );
             let mut failed = 0;
             for id in ids {
-                match enroller.enroll(id, dry_run).await {
+                match enroller.enroll_with(id, dry_run, note.as_deref()).await {
+                    Ok(report) if dry_run && report.resumed => {
+                        println!("{id}: would resume its stopped backups on its existing chain")
+                    }
                     Ok(report) if dry_run => println!("{id}: would seal: {report}"),
                     Ok(report) => {
                         let uploaded = match outbox.drain(id).await {
@@ -166,6 +184,26 @@ pub async fn run(
                 } else {
                     ""
                 },
+            );
+        }
+        Command::SealedStop { agent, note } => {
+            let outbox = AgoraOutbox::new(
+                client.clone(),
+                &state_dir,
+                Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
+            );
+            let drain: super::stop::Drain = Box::pin(async move {
+                outbox
+                    .drain(agent)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            });
+            let stopped = super::stop::stop(&state_dir, agent, &note, drain).await?;
+            println!(
+                "{agent}: sealed backups stopped at {}; its history stays. `sealed-enroll \
+                 --agent {agent}` resumes them",
+                stopped.at
             );
         }
         Command::RotateKeys {

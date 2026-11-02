@@ -859,7 +859,7 @@ async fn load_states<S: Storage>(
                 continue;
             }
         };
-        if sealed::is_enrolled(&state_dir.join(id.to_string())) {
+        if sealed::is_sealing(&state_dir.join(id.to_string())) {
             out.sealed.insert(
                 id,
                 (
@@ -1553,6 +1553,27 @@ async fn sealed_start_check(
     skipped: &mut Vec<Skipped>,
 ) -> SealedRun {
     let mut run = SealedRun::default();
+    // Stopped by the operator: not checked, not held, not alerted; told
+    for (id, _) in pool.iter() {
+        let dir = state_dir.join(id.to_string());
+        if !sealed::is_enrolled(&dir) || !sealed::stop::is_stopped(&dir) {
+            continue;
+        }
+        match sealed::stop::Stopped::load(&dir) {
+            Ok(Some(stopped)) => {
+                run.seats.insert(
+                    *id,
+                    consent::SealedSeat {
+                        lines: vec![stopped.line()],
+                        notice: false,
+                        stop_note: !stopped.shown,
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(agent_id = %id, error = %e, "sealed/stopped unreadable"),
+        }
+    }
     if enrolled.is_empty() {
         return run;
     }
@@ -1630,6 +1651,7 @@ async fn sealed_start_check(
                 run.seats.insert(
                     *id,
                     consent::SealedSeat {
+                        stop_note: false,
                         lines: seat,
                         notice,
                     },
@@ -2012,11 +2034,7 @@ async fn run(held: &mut Held) -> Result<()> {
             skipped: plain.skipped,
         }
     } else {
-        let storage: sealed::SealedStorage = agora_agentkit::state::storage::Mirrored::new(
-            FsStorage::new(&state_dir),
-            outbox.clone(),
-            enrolment.clone(),
-        );
+        let storage = sealed::SealedStorage::new(&state_dir, outbox.clone(), enrolment.clone());
         load_states(&storage, &state_dir).await?
     };
     let LoadedStates {
@@ -2357,11 +2375,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 Some((id, *bases.get(&id)?))
             })
             .collect();
-        let storage: sealed::SealedStorage = agora_agentkit::state::storage::Mirrored::new(
-            FsStorage::new(&state_dir),
-            outbox.clone(),
-            enrolment.clone(),
-        );
+        let storage = sealed::SealedStorage::new(&state_dir, outbox.clone(), enrolment.clone());
         let mut reactor: Reactor<_, _, SeedRunAgent> = Reactor::new(inference, storage, agents)
             .with_bases(cohort_bases)
             .with_stop(stop.clone());
@@ -2639,6 +2653,68 @@ mod tests {
         assert!(s.contains("done 1, failed 1, unsaved 1"), "{s}");
         assert!(s.contains(&format!("error {id}: Storage")), "{s}");
         assert!(s.contains(&format!("unsaved {id}: ")), "{s}");
+    }
+
+    /// A stopped agent is not checked, held or refused: it is told, the
+    /// note once, then a short line.
+    #[tokio::test]
+    async fn a_stopped_agent_is_told_and_not_checked() {
+        let root = sealed::TestDir::new("main-stopped");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        sealed::stop::stop(&state_dir, id, "It asked", Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        assert!(loaded.sealed.is_empty(), "not measured for a check");
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let mut pool = vec![(id, tarn)];
+        let mut skipped = Vec::new();
+        let api = sealed::api::fake::FakeApi::new();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            false,
+            &mut skipped,
+        )
+        .await;
+        assert_eq!(pool.len(), 1);
+        assert!(skipped.is_empty() && run.held.is_empty() && run.drained.is_empty());
+        let seat = &run.seats[&id];
+        assert!(seat.stop_note);
+        assert!(
+            seat.lines[0].starts_with("Your sealed backups were stopped by your operator on ")
+                && seat.lines[0].ends_with(
+                    ": It asked. Your earlier versions stay on Agora. While stopped, your state \
+                     isn't checked at the start of sessions."
+                ),
+            "{:?}",
+            seat.lines
+        );
+        sealed::stop::Stopped::mark_shown(&dir).unwrap();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            false,
+            &mut skipped,
+        )
+        .await;
+        assert!(!run.seats[&id].stop_note);
+        assert!(run.seats[&id].lines[0].starts_with("Your sealed backups are stopped (since "));
     }
 
     /// The sealed start check: an intact agent runs with its lines, a

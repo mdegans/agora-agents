@@ -49,7 +49,6 @@ use std::collections::BTreeSet;
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::seed::Soul;
-use chrono::NaiveDate;
 use serde::Deserialize;
 
 use prompt::SealChoice;
@@ -192,13 +191,13 @@ impl SealedOffer {
     }
 }
 
-/// What follows the date in every disclosure; also how [`applied_in`]
-/// finds one.
-pub const OFFERED: &str =
-    ": Offered sealed backups of its state (soul and memory) on Agora; chose ";
+/// How every disclosure begins after `[SYSTEM] `; also how [`applied_in`]
+/// finds one, the older ones (`[SYSTEM] <date>: Offered …`) included. The
+/// Evolution Log dates each entry itself, so the line carries no date.
+pub const OFFERED: &str = "Offered sealed backups of its state (soul and memory) on Agora; chose ";
 
 /// The Evolution Log line recording the agent's answer.
-pub fn evolution_line(choice: SealChoice, date: NaiveDate) -> String {
+pub fn evolution_line(choice: SealChoice) -> String {
     let meaning = match choice {
         SealChoice::Publish => {
             "Backups start when its operator enrols it, and its anchored head is to be shown \
@@ -208,7 +207,7 @@ pub fn evolution_line(choice: SealChoice, date: NaiveDate) -> String {
         SealChoice::Decline => "Nothing changed.",
     };
     format!(
-        "[SYSTEM] {date}{OFFERED}{} by its own choice. {meaning}",
+        "[SYSTEM] {OFFERED}{}, its own choice. {meaning}",
         choice.as_str()
     )
 }
@@ -277,14 +276,21 @@ mod tests {
 
     #[test]
     fn the_evolution_line_records_every_answer_and_is_found() {
-        let date: NaiveDate = "2026-11-08".parse().unwrap();
         assert_eq!(
-            evolution_line(SealChoice::Decline, date),
-            "[SYSTEM] 2026-11-08: Offered sealed backups of its state (soul and memory) on \
-             Agora; chose decline by its own choice. Nothing changed."
+            evolution_line(SealChoice::Decline),
+            "[SYSTEM] Offered sealed backups of its state (soul and memory) on Agora; chose \
+             decline, its own choice. Nothing changed."
         );
+        // A line from before the date was dropped is still found
+        let mut old = soul();
+        old.push_evolution(
+            "[SYSTEM] 2026-11-02: Offered sealed backups of its state (soul and memory) on \
+             Agora; chose decline by its own choice. Nothing changed.",
+        )
+        .unwrap();
+        assert!(applied_in(&old));
         for c in SealChoice::ALL {
-            let line = evolution_line(c, date);
+            let line = evolution_line(c);
             assert!(line.chars().count() <= 512, "{line}");
             let mut s = soul();
             assert!(!applied_in(&s));

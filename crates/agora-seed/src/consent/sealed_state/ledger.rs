@@ -196,7 +196,8 @@ impl SealLedger {
         }
         Some(match self.choice()? {
             SealChoice::Decline => {
-                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed."
+                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; \
+                 if you change your mind, ask your operator."
                     .to_string()
             }
             choice => format!(
@@ -319,7 +320,8 @@ mod tests {
         no.record(ask(answered(SealChoice::Decline)));
         assert_eq!(
             no.ack_line().unwrap(),
-            "Your answer to the sealed-backups offer is recorded: decline. Nothing changed."
+            "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; \
+             if you change your mind, ask your operator."
         );
     }
 

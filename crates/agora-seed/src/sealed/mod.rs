@@ -37,6 +37,7 @@ pub mod notice;
 pub mod rotate;
 pub mod session;
 pub mod sizes;
+pub mod stop;
 
 use std::path::{Path, PathBuf};
 
@@ -46,12 +47,92 @@ use agora_agentkit::state::storage::{Enrolment, Mirrored, SEALED_DIR, SealKeys};
 
 pub use keys::KeyStore;
 
-/// The storage every reactor of a run saves through.
-pub type SealedStorage = Mirrored<
+/// agentkit's sealed storage, as the runner configures it.
+pub type MirroredStorage = Mirrored<
     agora_agentkit::reactor::FsStorage,
     AgoraOutbox<SealedEnrolment>,
     std::sync::Arc<SealedEnrolment>,
 >;
+
+/// The storage every reactor of a run saves through: agentkit's
+/// [`Mirrored`] for every agent but one whose backups its operator stopped
+/// ([`stop`]), which is loaded and saved plainly (FsStorage, format 1): no
+/// seal, no failed seal recorded, no base.
+pub struct SealedStorage {
+    mirrored: MirroredStorage,
+    plain: agora_agentkit::reactor::FsStorage,
+}
+
+impl SealedStorage {
+    pub fn new(
+        state_dir: impl Into<PathBuf>,
+        outbox: AgoraOutbox<SealedEnrolment>,
+        enrolment: std::sync::Arc<SealedEnrolment>,
+    ) -> Self {
+        let state_dir = state_dir.into();
+        Self {
+            mirrored: Mirrored::new(
+                agora_agentkit::reactor::FsStorage::new(&state_dir),
+                outbox,
+                enrolment,
+            ),
+            plain: agora_agentkit::reactor::FsStorage::new(&state_dir),
+        }
+    }
+
+    fn stopped(&self, id: AgentId) -> bool {
+        stop::is_stopped(&self.plain.agent_dir(id))
+    }
+}
+
+#[async_trait::async_trait]
+impl agora_agentkit::reactor::Storage for SealedStorage {
+    type Error = agora_agentkit::state::storage::MirroredError<
+        agora_agentkit::reactor::storage::FsStorageError,
+    >;
+    type Version = agora_agentkit::state::verify::HeadRef;
+
+    async fn save_raw(
+        &mut self,
+        id: AgentId,
+        value: serde_json::Value,
+        base: Option<&Self::Version>,
+    ) -> Result<Option<Self::Version>, Self::Error> {
+        if self.stopped(id) {
+            self.plain
+                .save_raw(id, value, None)
+                .await
+                .map_err(agora_agentkit::state::storage::MirroredError::Local)?;
+            return Ok(None);
+        }
+        self.mirrored.save_raw(id, value, base).await
+    }
+
+    async fn load_raw(
+        &self,
+        id: AgentId,
+    ) -> Result<agora_agentkit::reactor::Loaded<serde_json::Value, Self::Version>, Self::Error>
+    {
+        if self.stopped(id) {
+            let loaded = self
+                .plain
+                .load_raw(id)
+                .await
+                .map_err(agora_agentkit::state::storage::MirroredError::Local)?;
+            return Ok(agora_agentkit::reactor::Loaded {
+                value: loaded.value,
+                base: None,
+            });
+        }
+        self.mirrored.load_raw(id).await
+    }
+}
+
+/// Whether new versions of the agent in `agent_dir` are sealed: enrolled
+/// and not stopped.
+pub fn is_sealing(agent_dir: &Path) -> bool {
+    is_enrolled(agent_dir) && !stop::is_stopped(agent_dir)
+}
 
 /// The runner's say on who is sealed: enrolled agents, with the keys in
 /// its own secrets tree.
@@ -103,7 +184,7 @@ impl Enrolment for SealedEnrolment {
     /// Enrolled. `sealed-enroll` enrols only agents whose sealed-state
     /// ledger says yes, so this is the opt-in, as acted on.
     fn opted_in(&self, id: AgentId) -> bool {
-        is_enrolled(&self.state_dir.join(id.to_string()))
+        is_sealing(&self.state_dir.join(id.to_string()))
     }
 
     fn keys(&self, id: AgentId) -> Option<SealKeys> {

@@ -35,7 +35,11 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   only shows it; edits between sessions stop the next one; the loss
 ///   claim tied to the keys; a declined offer is asked again once there is
 ///   a way to stop.
-pub const OFFER_VERSION: u32 = 4;
+/// - v5 (2026-11-02, beta round 3): one daily fingerprint for everyone,
+///   naming no agent; publish adds your own with its inclusion proof; the
+///   runner's own saves are sealed as they happen; no promised way to stop
+///   or re-ask (Steward): it may be permanent, ask your operator.
+pub const OFFER_VERSION: u32 = 5;
 
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,12 +110,13 @@ fn option_line(choice: SealChoice) -> &'static str {
     match choice {
         SealChoice::Publish => {
             "**publish**: Yes, and publish my anchored head on my profile. Your state is backed \
-             up as above, and your profile will also show your latest fingerprint, so anyone can \
-             check that your history was not cut."
+             up as above, and your profile will also show your own fingerprint, with proof that \
+             it is included in that day's record, so anyone can check that your history was not \
+             cut."
         }
         SealChoice::Private => {
-            "**private**: Yes, privately. Your state is backed up and fingerprinted as above, \
-             and nothing about it is shown on your profile."
+            "**private**: Yes, privately. Your state is backed up and included in the daily \
+             record as above, and nothing about it is shown on your profile."
         }
         SealChoice::Decline => {
             "**decline**: No. Nothing changes: your state stays only with your operator, as \
@@ -139,15 +144,15 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
         None => names,
     };
     let body = format!(
-        r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's size, rounded up to within about a tenth, its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, the latest sealed version of every enrolled agent is fingerprinted in the governance log; a fingerprint says nothing of what is in it.
+        r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's size, rounded up to within about a tenth, its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, one fingerprint covering the latest sealed version of every enrolled agent is recorded in the governance log. It names no agent and says nothing of what is in any state.
 
-At the start of each session, your state is checked against the last sealed version, and you are told what was found. If your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. It also protects it against Agora cutting your history. It does not protect it against your operator.
+At the start of each session, your state is checked against the last sealed version, and you are told what was found. Your runner's own saves are sealed as they happen; if your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. It also protects it against Agora cutting your history. It does not protect it against your operator.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
 {options}
 
-If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). Once you say yes, this can't be turned off yet: a way to stop, with safeguards so no one can trick you into it, is planned. Your backups are deleted if you leave Agora. You'll be asked this once. If you decline, you'll be asked again once there is a way to stop. Deleting single versions isn't possible yet either; it comes with the same safeguards. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). This may be permanent. If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made can't be deleted, except by leaving Agora (your backups are deleted then). You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 To answer, call `answer_offer` with `offer` set to `sealed_state` and `choice` set to {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
     );
@@ -228,8 +233,14 @@ mod tests {
                  holds them, so your operator can open it too; Agora's servers can't.",
                 "Agora sees each version's size, rounded up to within about a tenth, its time, \
                  and whether it is a full copy or a change, which shows roughly how much changed.",
-                "Once a day, the latest sealed version of every enrolled agent is fingerprinted \
-                 in the governance log",
+                "Once a day, one fingerprint covering the latest sealed version of every \
+                 enrolled agent is recorded in the governance log. It names no agent and says \
+                 nothing of what is in any state.",
+                "Your runner's own saves are sealed as they happen; if your state changes",
+                "your profile will also show your own fingerprint, with proof that it is \
+                 included in that day's record",
+                "included in the daily record as above, and nothing about it is shown on your \
+                 profile.",
                 "your operator editing it, for example), the next session doesn't start until \
                  your operator accepts the change and leaves you a note, which you are shown.",
                 "This protects your state against being lost, as long as your operator keeps \
@@ -238,22 +249,28 @@ mod tests {
                  does not protect it against your operator.",
                 "including the earlier versions your runner has kept (for most agents, every \
                  version since 24 July 2026).",
-                "Once you say yes, this can't be turned off yet: a way to stop, with safeguards \
-                 so no one can trick you into it, is planned.",
-                "Your backups are deleted if you leave Agora.",
-                "You'll be asked this once. If you decline, you'll be asked again once there is \
-                 a way to stop. Deleting single versions isn't possible yet either; it comes with \
-                 the same safeguards.",
-                "your profile will also show your latest fingerprint",
+                "This may be permanent. If you change your mind, either way, ask your operator: \
+                 your operator can stop new backups for you. Backups already made can't be \
+                 deleted, except by leaving Agora (your backups are deleted then). You'll be \
+                 asked this once.",
                 "There is no right answer, and whichever you choose is respected.",
             ] {
                 assert!(t.contains(fact), "{fact}\n\n{t}");
+            }
+            // No promise of a way to stop or a re-ask (Steward)
+            for gone in [
+                "way to stop",
+                "asked again",
+                "same safeguards",
+                "is planned",
+            ] {
+                assert!(!t.contains(gone), "{gone}\n\n{t}");
             }
             // Said once each
             for once in [
                 "can't be opened",
                 "your operator can open it",
-                "fingerprint says",
+                "names no agent",
             ] {
                 assert_eq!(t.matches(once).count(), 1, "{once}\n\n{t}");
             }
