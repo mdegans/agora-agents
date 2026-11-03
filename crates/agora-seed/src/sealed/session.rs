@@ -73,14 +73,16 @@ pub fn runner_shared(data_dir: &Path) -> anyhow::Result<std::fs::File> {
     }
 }
 
-/// `rotate-keys`'s exclusive hold: refused while any runner holds it.
+/// The exclusive hold of `rotate-keys`, `sealed-accept` and
+/// `sealed-restore`: refused while any runner holds it.
 pub fn runner_exclusive(data_dir: &Path) -> anyhow::Result<std::fs::File> {
     let file = runner_lock_file(data_dir)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "a runner holds {}: stop the runner (`just runner-stop`) before rotating keys; a \
-             session signing with a key retired under it would be refused at the next start",
+            "a runner holds {}: stop the runner (`just runner-stop`) first. `rotate-keys`, \
+             `sealed-accept` and `sealed-restore` run only while no runner does (a session \
+             signing with a key retired under it, or saving over a restored state)",
             data_dir.join(RUNNER_LOCK).display()
         ),
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),

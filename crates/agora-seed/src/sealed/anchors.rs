@@ -147,12 +147,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub enum ProofError {
     #[error("the proofs could not be fetched: {0}")]
     Fetch(String),
-    #[error("{anc_id} names entry {entry_hash} at seq {seq}, which is not one of the agent's own")]
-    NotOwn {
-        anc_id: GovernanceLogId,
-        entry_hash: Sha256Hex,
-        seq: u64,
-    },
     #[error("{anc_id}'s date, root and count don't hash to the governance log's entry")]
     NotTheLogs { anc_id: GovernanceLogId },
     #[error("{anc_id}'s inclusion proof does not reach the governance log's root")]
@@ -165,7 +159,6 @@ impl ProofError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Fetch(_) => "fetch",
-            Self::NotOwn { .. } => "not_own",
             Self::NotTheLogs { .. } => "not_the_logs",
             Self::DidNotCheck { .. } => "did_not_check",
             Self::Local(_) => "local",
@@ -180,6 +173,7 @@ impl ProofError {
 pub async fn fetch_proofs(
     agent_dir: &Path,
     id: AgentId,
+    keys: &super::KeyStore,
     signing: &SigningKey,
     api: &dyn SealedApi,
     verified: &VerifiedAnchors,
@@ -193,26 +187,53 @@ pub async fn fetch_proofs(
     if proofs.is_empty() {
         return Ok(0);
     }
-    let own: std::collections::HashMap<Sha256Hex, u64> = AgentSeal::new(agent_dir, id)
+    // The agent's own entries: uploaded here, and (asked once, only when
+    // a proof names one not here) its verified main line, which runs
+    // through Agora's entries after a rebase or a restore
+    let seal = AgentSeal::new(agent_dir, id);
+    let mut own: std::collections::HashMap<Sha256Hex, u64> = seal
         .sent()
         .await
         .map_err(|e| ProofError::Local(e.to_string()))?
         .into_iter()
         .map(|i| (i.entry.entry_hash(), i.entry.entry.seq))
         .collect();
+    let mut line_read = false;
     let mut kept = 0;
     let mut failed = None;
     for proof in proofs {
         if file.proofs.iter().any(|p| p.anc_id == proof.anc_id) {
             continue;
         }
+        if own.get(&proof.entry_hash) != Some(&proof.seq) && !line_read {
+            line_read = true;
+            let head = seal
+                .head()
+                .await
+                .map_err(|e| ProofError::Local(e.to_string()))?;
+            if let Some(head) = head {
+                match super::version::verified_line(&seal, keys, api, id, &head).await {
+                    Ok(line) => own.extend(line.iter().map(|e| (e.entry_hash(), e.entry.seq))),
+                    Err(e) => tracing::warn!(
+                        agent_id = %id,
+                        error = %e,
+                        "the main line couldn't be read to place a proof"
+                    ),
+                }
+            }
+        }
+        // Not the agent's: skipped and never stored, but no reason to stop
+        // the ones after it
         if own.get(&proof.entry_hash) != Some(&proof.seq) {
-            failed = Some(ProofError::NotOwn {
-                anc_id: proof.anc_id,
-                entry_hash: proof.entry_hash,
-                seq: proof.seq,
-            });
-            break;
+            tracing::warn!(
+                event_type = "sealed_state_proof_not_own",
+                agent_id = %id,
+                anc_id = %proof.anc_id,
+                entry = %proof.entry_hash,
+                seq = proof.seq,
+                "a proof names an entry that isn't on the agent's verified line; skipped"
+            );
+            continue;
         }
         let data = match verified.data(&proof) {
             None => {
@@ -392,42 +413,43 @@ pub(crate) mod tests {
 
         // Not in the verified log yet: waits, nothing stored
         let none = VerifiedAnchors::default();
-        assert_eq!(fetch_proofs(&dir, id, &signing, &api, &none).await, Ok(0));
+        assert_eq!(
+            fetch_proofs(&dir, id, &keys, &signing, &api, &none).await,
+            Ok(0)
+        );
         assert!(AnchorsFile::newest(&dir).is_none());
 
         let verified = VerifiedAnchors::new([(anc.clone(), attested)]);
         assert_eq!(
-            fetch_proofs(&dir, id, &signing, &api, &verified).await,
+            fetch_proofs(&dir, id, &keys, &signing, &api, &verified).await,
             Ok(1)
         );
         assert_eq!(AnchorsFile::newest(&dir), Some(good.clone()));
         // Asked after the newest kept: nothing new
         assert_eq!(
-            fetch_proofs(&dir, id, &signing, &api, &verified).await,
+            fetch_proofs(&dir, id, &keys, &signing, &api, &verified).await,
             Ok(0)
         );
 
-        // Someone else's head, at our seq: never stored
+        // Someone else's head at our seq, then ours at a wrong seq: each
+        // skipped, never stored, and the next good proof still kept
         let (theirs, anc3, attested3) = anchor(3, id, Sha256Hex::from([9; 32]), seq);
-        api.proofs.lock().unwrap().push(theirs);
-        let verified = VerifiedAnchors::new([(anc.clone(), attested), (anc3, attested3)]);
-        let e = fetch_proofs(&dir, id, &signing, &api, &verified)
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind(), "not_own", "{e}");
-        // Our head at the wrong seq
         let mut wrong_seq = good.clone();
-        wrong_seq.anc_id = "ANC-2026-0003".parse().unwrap();
+        wrong_seq.anc_id = "ANC-2026-0004".parse().unwrap();
         wrong_seq.seq += 1;
-        *api.proofs.lock().unwrap() = vec![good.clone(), wrong_seq];
+        let (later, anc5, attested5) = anchor(5, id, hash, seq);
+        *api.proofs.lock().unwrap() = vec![good.clone(), theirs, wrong_seq, later.clone()];
+        let verified = VerifiedAnchors::new([
+            (anc.clone(), attested),
+            (anc3, attested3),
+            (anc5, attested5),
+        ]);
         assert_eq!(
-            fetch_proofs(&dir, id, &signing, &api, &verified)
-                .await
-                .unwrap_err()
-                .kind(),
-            "not_own"
+            fetch_proofs(&dir, id, &keys, &signing, &api, &verified).await,
+            Ok(1),
+            "the loop goes on past what isn't ours"
         );
-        assert_eq!(AnchorsFile::load(&dir).unwrap().proofs, vec![good]);
+        assert_eq!(AnchorsFile::load(&dir).unwrap().proofs, vec![good, later]);
     }
 
     /// ANC-2026-0001 as Agora serves it (data and attested data_hash, read
@@ -480,7 +502,7 @@ pub(crate) mod tests {
         let mut other_root = good.clone();
         other_root.root = Sha256Hex::from([7; 32]);
         *api.proofs.lock().unwrap() = vec![other_root];
-        let e = fetch_proofs(&dir, id, &signing, &api, &verified)
+        let e = fetch_proofs(&dir, id, &keys, &signing, &api, &verified)
             .await
             .unwrap_err();
         assert_eq!(e.kind(), "not_the_logs", "{e}");
@@ -489,7 +511,7 @@ pub(crate) mod tests {
         let mut bad_path = good.clone();
         bad_path.proof[0].sibling = Sha256Hex::from([8; 32]);
         *api.proofs.lock().unwrap() = vec![bad_path];
-        let e = fetch_proofs(&dir, id, &signing, &api, &verified)
+        let e = fetch_proofs(&dir, id, &keys, &signing, &api, &verified)
             .await
             .unwrap_err();
         assert_eq!(e.kind(), "did_not_check", "{e}");
@@ -498,13 +520,48 @@ pub(crate) mod tests {
         // Fetch fails: an error, nothing stored
         *api.fail.lock().unwrap() = Some("proofs");
         assert_eq!(
-            fetch_proofs(&dir, id, &signing, &api, &verified)
+            fetch_proofs(&dir, id, &keys, &signing, &api, &verified)
                 .await
                 .unwrap_err()
                 .kind(),
             "fetch"
         );
         assert!(!dir.join("sealed").join(ANCHORS).exists());
+    }
+
+    /// After a lost-directory restore sent/ is empty: a proof for the
+    /// restored head is placed on the verified line through Agora and kept.
+    #[tokio::test]
+    async fn a_proof_is_kept_after_a_lost_directory_restore() {
+        let root = crate::sealed::TestDir::new("anchors-restored");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        let seal = AgentSeal::new(&dir, id);
+        *api.chain.lock().unwrap() = Ok(crate::sealed::check::local_entries(&seal).await.unwrap());
+        all_sent(&dir, id).await;
+        for f in std::fs::read_dir(dir.join("sealed/blobs")).unwrap() {
+            let f = f.unwrap();
+            let sha = f.file_name().to_str().unwrap().parse().unwrap();
+            api.blobs
+                .lock()
+                .unwrap()
+                .insert(sha, std::fs::read(f.path()).unwrap());
+        }
+        let (hash, seq) = head(&dir, id).await;
+        std::fs::rename(&dir, root.join("gone")).unwrap();
+        crate::sealed::restore::restore(&root.join("state"), &keys, &api, id, None)
+            .await
+            .unwrap();
+        assert!(seal.sent().await.unwrap().is_empty());
+        let (proof, anc, attested) = anchor(2, id, hash, seq);
+        api.proofs.lock().unwrap().push(proof.clone());
+        let signing = keys.signing(id).unwrap();
+        let verified = VerifiedAnchors::new([(anc, attested)]);
+        assert_eq!(
+            fetch_proofs(&dir, id, &keys, &signing, &api, &verified).await,
+            Ok(1)
+        );
+        assert_eq!(AnchorsFile::newest(&dir), Some(proof));
     }
 
     #[tokio::test]

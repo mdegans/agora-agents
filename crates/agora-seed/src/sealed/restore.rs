@@ -29,10 +29,14 @@
 //! Like every operator command it refuses while the agent has a session,
 //! and holds the agent's `sealed/lock` throughout.
 
+use std::collections::HashMap;
 use std::path::Path;
 
+use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::FsStorage;
+use agora_agentkit::state::SignedStateEntry;
+use agora_agentkit::state::storage::OutboxItem;
 use agora_agentkit::state::storage::{AgentSeal, as_reloaded, plaintext_hash};
 use agora_agentkit::state::verify::HeadRef;
 use anyhow::Context;
@@ -51,15 +55,86 @@ pub struct Restored {
     pub from: DateTime<Utc>,
     /// `head.json` was gone and was rebuilt from Agora's verified chain.
     pub rebuilt_head: bool,
+    /// The agent's backups stay stopped (its own request, kept in the
+    /// secrets tree).
+    pub stopped: bool,
 }
 
-/// What the refusal marker says, as a [`Refusal`].
-fn refusal_of(text: &str) -> Refusal {
-    match text.trim() {
-        "chain_broken" => Refusal::ChainBroken,
-        "head_missing" => Refusal::HeadMissing,
-        _ => Refusal::Mismatch,
+/// Every entry `sealed/` holds that `head.json` would name: `sent/`, and
+/// the outbox read directly (agentkit's `outbox()` needs `head.json`),
+/// `.json` and `.tmp`. Unreadable is an error: no evidence, no adoption.
+async fn held_entries(seal: &AgentSeal) -> anyhow::Result<Vec<(Sha256Hex, u64)>> {
+    let mut out: Vec<(Sha256Hex, u64)> = seal
+        .sent()
+        .await
+        .context("reading sealed/sent")?
+        .into_iter()
+        .map(|i| (i.entry.entry_hash(), i.entry.entry.seq))
+        .collect();
+    let dir = seal.dir().join("outbox");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).context("reading sealed/outbox"),
+    };
+    for entry in entries {
+        let path = entry.context("reading sealed/outbox")?.path();
+        if !matches!(
+            path.extension().and_then(|x| x.to_str()),
+            Some("json" | "tmp")
+        ) {
+            continue;
+        }
+        let item: OutboxItem = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{} isn't an outbox item ({:?})",
+                path.display(),
+                e.classify()
+            )
+        })?;
+        out.push((item.entry.entry_hash(), item.entry.entry.seq));
     }
+    Ok(out)
+}
+
+/// Before adopting Agora's chain over a `sealed/` that is still here:
+/// nothing held here (sent, waiting, or anchored) may lie past Agora's
+/// head or off its line. Otherwise Agora serves an older or other history
+/// than this runner sealed, and restoring from it would roll the agent
+/// back.
+async fn no_rollback(
+    seal: &AgentSeal,
+    agent_dir: &Path,
+    id: AgentId,
+    chain: &[SignedStateEntry],
+) -> anyhow::Result<()> {
+    let on_line: HashMap<Sha256Hex, u64> = chain
+        .iter()
+        .map(|e| (e.entry_hash(), e.entry.seq))
+        .collect();
+    let head_seq = chain.last().map_or(0, |e| e.entry.seq);
+    let mut held = held_entries(seal).await?;
+    let anchors =
+        super::anchors::AnchorsFile::load(agent_dir).context("reading sealed/anchors.json")?;
+    held.extend(anchors.proofs.iter().map(|p| (p.entry_hash, p.seq)));
+    let off: Vec<&(Sha256Hex, u64)> = held
+        .iter()
+        .filter(|(hash, seq)| *seq > head_seq || on_line.get(hash) != Some(seq))
+        .collect();
+    if let Some((hash, seq)) = off.first() {
+        anyhow::bail!(
+            "agent {id}'s sealed/ holds {} version(s) past Agora's head (seq {head_seq}) or off \
+             its line, e.g. {hash} at seq {seq}: Agora may be serving an older history than \
+             this runner sealed, and restoring from it would roll the agent back. Nothing was \
+             written. If the state here is right, `sealed-accept --agent {id}` rebuilds \
+             head.json with it",
+            off.len()
+        );
+    }
+    Ok(())
 }
 
 /// Restore `id`'s last sealed version as its state: a refused agent's, or
@@ -82,11 +157,14 @@ pub async fn restore(
              opened or checked without them, so there is nothing this runner can restore"
         );
     };
-    let found = std::fs::exists(agent_dir.join("state.json"))?;
+    let state_path = agent_dir.join("state.json");
+    // A restore cut between FsStorage's archive and its rename leaves the
+    // new state as state.json.tmp and the found one archived: found
+    let found = std::fs::exists(&state_path)? || std::fs::exists(agent_dir.join("state.json.tmp"))?;
     let had_head = seal.head().await?.is_some();
     let refused = seal.is_refused().await?;
     anyhow::ensure!(
-        refused || !found || !had_head,
+        refused || !std::fs::exists(&state_path)? || !had_head,
         "agent {id} is not refused and its state and sealed head are here: the start check \
          finds it intact or holds it, and this won't overwrite it (a deliberate change is \
          `sealed-accept --note`)"
@@ -94,9 +172,11 @@ pub async fn restore(
     // Made if the directory is gone; no session in progress
     let lock = super::session::take(state_dir, id, true).await?;
     let reason = if refused {
-        refusal_of(&std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default())
-    } else if had_head {
-        Refusal::Mismatch
+        Refusal::from_marker(
+            &std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default(),
+        )
+    } else if !found {
+        Refusal::StateMissing
     } else {
         Refusal::HeadMissing
     };
@@ -119,8 +199,9 @@ pub async fn restore(
             "agent {id} has no sealed head here and Agora holds no chain for it: nothing to \
              restore from"
         );
+        no_rollback(&seal, &agent_dir, id, &chain).await?;
         let signing = &k.signing;
-        let fetch = move |sha: agora_agentkit::govlog::Sha256Hex| async move {
+        let fetch = move |sha: Sha256Hex| async move {
             api.blob(id, signing, &sha)
                 .await
                 .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
@@ -155,6 +236,11 @@ pub async fn restore(
     );
     let from = DateTime::from_timestamp_micros(last.snapshot.entry.state_at)
         .context("the version's date is out of range")?;
+    // A stop the agent asked for outlives its sealed/: put back before
+    // anything marks it enrolled, so it stays stopped (nothing sealed)
+    let stopped = super::stop::reconcile(&agent_dir, keys, id)
+        .context("putting back the stop kept in the secrets tree")?
+        || super::stop::is_stopped(&agent_dir);
     // Archives a state.json found here as state.<utc>.json first
     FsStorage::new(state_dir)
         .save_sealed_raw(id, state)
@@ -168,7 +254,8 @@ pub async fn restore(
     if refused {
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
-    Notice::restored(&agent_dir, from, note, reason, found).context("writing the notice")?;
+    Notice::restored(&agent_dir, from, note, reason, found, refused)
+        .context("writing the notice")?;
     drop(lock);
     let head = last.head.head;
     tracing::warn!(
@@ -177,6 +264,7 @@ pub async fn restore(
         reason = reason.as_str(),
         refused,
         found,
+        stopped,
         rebuilt_head = !had_head,
         head = %head.entry_hash,
         seq = head.seq,
@@ -188,6 +276,7 @@ pub async fn restore(
         head,
         from,
         rebuilt_head: !had_head,
+        stopped,
     })
 }
 
@@ -408,6 +497,178 @@ mod tests {
             let entry = seal.outbox().await.unwrap().pop().unwrap().entry.entry;
             assert_eq!(entry.prev_hash, Some(head.head.entry_hash), "{lose}");
         }
+    }
+
+    /// head.json lost while sealed/ holds versions Agora doesn't (Agora
+    /// serving an older prefix): adopting it would roll the agent back,
+    /// so it is refused and nothing is written (review of #337).
+    #[tokio::test]
+    async fn restore_refuses_to_roll_back_to_an_older_agora_prefix() {
+        use agora_agentkit::enums::StateEntryKind;
+        use agora_agentkit::state::codec::KeyframePolicy;
+        let root = crate::sealed::TestDir::new("restore-rollback");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        on_agora(&api, &dir, id).await;
+        let seal = AgentSeal::new(&dir, id);
+        let prefix = check::local_entries(&seal).await.unwrap();
+        let k = keys.seal_keys(id).unwrap();
+        seal.append_state(
+            &k,
+            &KeyframePolicy::default(),
+            StateEntryKind::Snapshot,
+            &check::tests::state(2),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        FsStorage::new(root.join("state"))
+            .save_raw(id, check::tests::state(2), None)
+            .await
+            .unwrap();
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        // Agora's copy is the old prefix only
+        *api.chain.lock().unwrap() = Ok(prefix);
+        std::fs::rename(dir.join("sealed/head.json"), root.join("head.lost")).unwrap();
+        let archived = archives(&dir);
+        let e = format!(
+            "{:#}",
+            restore(&root.join("state"), &keys, &api, id, None)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            e.contains("Agora may be serving an older history") && e.contains("sealed-accept"),
+            "{e}"
+        );
+        assert!(
+            seal.head().await.unwrap().is_none(),
+            "head.json not adopted"
+        );
+        assert_eq!(archives(&dir), archived, "nothing written");
+        assert_eq!(
+            local(&root, id).await,
+            plaintext_hash(&check::tests::state(2))
+        );
+
+        // A stored anchor proof past Agora's head is the same evidence
+        let root = crate::sealed::TestDir::new("restore-rollback-anchor");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        on_agora(&api, &dir, id).await;
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
+        let file = crate::sealed::anchors::AnchorsFile {
+            proofs: vec![agora_agentkit::state::AnchorProof {
+                anc_id: "ANC-2026-0009".parse().unwrap(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 11, 9).unwrap(),
+                root: Sha256Hex::from([1; 32]),
+                entry_hash: Sha256Hex::from([2; 32]),
+                seq: head.seq + 3,
+                leaf_index: 0,
+                leaf_count: 1,
+                proof: Vec::new(),
+            }],
+        };
+        std::fs::write(
+            dir.join("sealed").join(crate::sealed::anchors::ANCHORS),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(dir.join("sealed/head.json"), root.join("head.lost")).unwrap();
+        let e = format!(
+            "{:#}",
+            restore(&root.join("state"), &keys, &api, id, None)
+                .await
+                .unwrap_err()
+        );
+        assert!(e.contains("older history"), "{e}");
+    }
+
+    /// A stopped agent that lost sealed/: restored, and still stopped (the
+    /// stop kept in the secrets tree is put back), with nothing sealed.
+    #[tokio::test]
+    async fn a_stopped_agent_stays_stopped_through_a_restore() {
+        let root = crate::sealed::TestDir::new("restore-stopped");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        on_agora(&api, &dir, id).await;
+        let state_dir = root.join("state");
+        crate::sealed::stop::stop(
+            &state_dir,
+            &keys,
+            id,
+            "It asked",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            keys.agent_dir(id)
+                .join(crate::sealed::stop::DURABLE)
+                .exists()
+        );
+        std::fs::rename(dir.join("sealed"), root.join("sealed.lost")).unwrap();
+        let done = restore(&state_dir, &keys, &api, id, None).await.unwrap();
+        assert!(done.stopped);
+        assert!(crate::sealed::stop::is_stopped(&dir));
+        assert!(!crate::sealed::is_sealing(&dir));
+        let stopped = crate::sealed::stop::Stopped::load(&dir).unwrap().unwrap();
+        assert_eq!(stopped.note, "It asked");
+        // A save goes plainly: nothing sealed, nothing to upload
+        let mut storage = crate::sealed::SealedStorage::new(
+            &state_dir,
+            agora_agentkit::state::outbox::AgoraOutbox::new(
+                agora_agentkit::client::Client::new("http://127.0.0.1:9".parse().unwrap()).unwrap(),
+                &state_dir,
+                std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
+                    &state_dir,
+                    root.join("secrets"),
+                )),
+            ),
+            std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
+                &state_dir,
+                root.join("secrets"),
+            )),
+        );
+        storage
+            .save_raw(id, serde_json::json!({ "memory": "after" }), None)
+            .await
+            .unwrap();
+        let seal = AgentSeal::new(&dir, id);
+        assert!(seal.outbox().await.unwrap().is_empty(), "nothing sealed");
+        assert_eq!(seal.head().await.unwrap().unwrap().head, done.head);
+
+        // The start of a run puts a lost sealed/stopped back too
+        std::fs::rename(dir.join("sealed/stopped"), root.join("stopped.lost")).unwrap();
+        crate::sealed::stop::reconcile_all(&state_dir, &keys);
+        assert!(crate::sealed::stop::is_stopped(&dir));
+    }
+
+    /// A restore cut after FsStorage archived the state found but before
+    /// the new one took its place: the rerun says the state was found and
+    /// kept, not lost.
+    #[tokio::test]
+    async fn a_rerun_after_a_cut_restore_says_the_state_was_kept() {
+        let root = crate::sealed::TestDir::new("restore-cut");
+        let (id, keys, dir) = enrolled(&root).await;
+        wipe_and_refuse(&root, id, &keys, &dir).await;
+        // As FsStorage leaves it: state.json archived, the new one as tmp
+        std::fs::copy(dir.join("state.json"), dir.join("state.json.tmp")).unwrap();
+        std::fs::rename(
+            dir.join("state.json"),
+            dir.join("state.20261103T000000000Z.json"),
+        )
+        .unwrap();
+        restore(&root.join("state"), &keys, &FakeApi::new(), id, None)
+            .await
+            .unwrap();
+        let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+        assert!(
+            line.contains("did not run") && line.contains("The state found here is kept"),
+            "{line}"
+        );
     }
 
     /// Without the keys nothing on Agora can be opened: refused, plainly,

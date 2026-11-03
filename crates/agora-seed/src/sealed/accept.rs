@@ -35,15 +35,6 @@ use super::KeyStore;
 use super::api::SealedApi;
 use super::notice::{Diff, Notice, Refusal};
 
-/// What the refusal marker says, as a [`Refusal`].
-fn refusal_of(text: &str) -> Refusal {
-    match text.trim() {
-        "chain_broken" => Refusal::ChainBroken,
-        "head_missing" => Refusal::HeadMissing,
-        _ => Refusal::Mismatch,
-    }
-}
-
 /// What `sealed-accept` did: hashes only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted {
@@ -84,8 +75,9 @@ pub async fn accept(
         seal.is_refused().await?,
         "agent {id} is not refused; nothing to accept"
     );
-    let reason =
-        refusal_of(&std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default());
+    let reason = Refusal::from_marker(
+        &std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default(),
+    );
     let current = FsStorage::new(state_dir)
         .load_raw(id)
         .await

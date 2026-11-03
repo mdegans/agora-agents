@@ -132,35 +132,30 @@ pub async fn open(
     .context("the parsing task failed")?
 }
 
-/// The main line to `head.json`'s head, verified, and its newest snapshot
-/// opened. `Err` says why not (no head, a link missing, a chain that
-/// doesn't verify, a blob that can't be had), in hashes and counts.
-pub async fn last_sealed(
+/// The main line to `head`, oldest first: from the entries here, and
+/// through Agora's when it runs through them (ours winning), verified
+/// with the runner's own trust.
+pub async fn verified_line(
     seal: &AgentSeal,
     keys: &KeyStore,
     api: &dyn SealedApi,
     id: AgentId,
-) -> anyhow::Result<LastSealed> {
-    let head = seal
-        .head()
-        .await
-        .context("reading sealed/head.json")?
-        .context("sealed/head.json is missing")?;
-    let k = keys
-        .seal_keys(id)
-        .context("no sealing keys for the agent")?;
+    head: &HeadFile,
+) -> anyhow::Result<Vec<SignedStateEntry>> {
     let entries = local_entries(seal).await.map_err(anyhow::Error::msg)?;
     let line = match main_line(&entries, &head.head.entry_hash) {
         Some(line) => line,
-        // Through Agora's entries (after a rebase), verified below
+        // Through Agora's entries (after a rebase or a restore)
         None => {
+            let signing = keys.signing(id).context("no signing key for the agent")?;
             let chain = api
-                .chain(id, &k.signing)
+                .chain(id, &signing)
                 .await
                 .map_err(anyhow::Error::msg)
                 .context("reading the agent's chain on Agora")?;
-            let mut all = entries;
-            all.extend(chain);
+            let all = super::check::merge_server(&entries, &chain).map_err(|hash| {
+                anyhow::anyhow!("Agora's copy of entry {hash} differs from the one held here")
+            })?;
             main_line(&all, &head.head.entry_hash).with_context(|| {
                 format!(
                     "the main line to head {} has a missing link",
@@ -178,6 +173,27 @@ pub async fn last_sealed(
         "the sealed chain did not verify: {:?}",
         report.problems
     );
+    Ok(line)
+}
+
+/// The main line to `head.json`'s head, verified, and its newest snapshot
+/// opened. `Err` says why not (no head, a link missing, a chain that
+/// doesn't verify, a blob that can't be had), in hashes and counts.
+pub async fn last_sealed(
+    seal: &AgentSeal,
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    id: AgentId,
+) -> anyhow::Result<LastSealed> {
+    let head = seal
+        .head()
+        .await
+        .context("reading sealed/head.json")?
+        .context("sealed/head.json is missing")?;
+    let k = keys
+        .seal_keys(id)
+        .context("no sealing keys for the agent")?;
+    let line = verified_line(seal, keys, api, id, &head).await?;
     let snapshot = line
         .iter()
         .rev()

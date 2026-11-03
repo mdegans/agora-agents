@@ -63,6 +63,9 @@ pub trait SealedApi: Send + Sync {
         key: &SigningKey,
         after: Option<GovernanceLogId>,
     ) -> Result<Vec<AnchorProof>, String>;
+    /// Whether Agora holds a sealed head for the agent: `Ok(false)` only on
+    /// a 404 from the signed head read; anything else unanswered is `Err`.
+    async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
     /// Whether the agent's anchored head is shown on its profile.
     async fn post_anchor(&self, id: AgentId, key: &SigningKey, publish: bool)
     -> Result<(), String>;
@@ -157,6 +160,16 @@ impl SealedApi for Client {
         self.get_state_blob(auth(id, key), sha256)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        match self.get_state_head(auth(id, key)).await {
+            Ok(_) => Ok(true),
+            Err(agora_agentkit::client::Error::Status { status, .. }) if status.as_u16() == 404 => {
+                Ok(false)
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     async fn proofs(
@@ -345,6 +358,14 @@ pub mod fake {
                 .filter(|p| after.as_ref().is_none_or(|a| p.anc_id > *a))
                 .cloned()
                 .collect())
+        }
+
+        async fn head_known(&self, _: AgentId, _: &SigningKey) -> Result<bool, String> {
+            self.call("head_known")?;
+            match &*self.chain.lock().unwrap() {
+                Ok(chain) => Ok(!chain.is_empty()),
+                Err(e) => Err(e.clone()),
+            }
         }
 
         async fn post_anchor(

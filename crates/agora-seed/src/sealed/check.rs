@@ -55,6 +55,32 @@ pub enum Hold {
     /// that runs through it): the agent runs, uploads held. No refusal
     /// without evidence.
     Unchecked,
+    /// The local state is the local head's, but the main line runs
+    /// through Agora's entries and those didn't check (a missing link, a
+    /// bad signature, a copy that differs from ours): Agora's evidence
+    /// alone, so a hold, never a refusal.
+    ServerChainBroken,
+}
+
+/// Agora's entries beside ours, ours winning: one Agora holds that is
+/// here too is not taken from Agora. `Err`: Agora's copy of an entry held
+/// here differs from it (the hash names it).
+pub fn merge_server(
+    local: &[SignedStateEntry],
+    server: &[SignedStateEntry],
+) -> Result<Vec<SignedStateEntry>, Sha256Hex> {
+    let ours: HashMap<Sha256Hex, &SignedStateEntry> =
+        local.iter().map(|e| (e.entry_hash(), e)).collect();
+    let mut all = local.to_vec();
+    for e in server {
+        let hash = e.entry_hash();
+        match ours.get(&hash) {
+            Some(mine) if *mine == e => {}
+            Some(_) => return Err(hash),
+            None => all.push(e.clone()),
+        }
+    }
+    Ok(all)
 }
 
 /// The check's answer for one agent.
@@ -226,6 +252,11 @@ pub const UNCHECKED_LINE: &str = "Your sealed history couldn't be checked at the
      session: part of it is on Agora, which couldn't be reached. This session runs on your \
      state as it is, and your operator has been told.";
 
+pub const SERVER_CHAIN_LINE: &str = "Your sealed history couldn't be fully checked at the \
+     start of this session: part of it is read from Agora, and Agora's copy didn't check out. \
+     This session runs on your state here, which matches your last sealed version; new versions \
+     are kept here, not uploaded, and your operator has been told.";
+
 pub const SEAL_FAILED_LINE: &str = "Your last save was written here but could not be sealed, so \
      your sealed history does not include it yet. This session starts from that save; new \
      versions are kept here, not uploaded, until your operator has looked, and your operator \
@@ -287,6 +318,12 @@ pub async fn check(
         seat: vec![UNCHECKED_LINE.to_string()],
         notice: false,
         hold: Some(Hold::Unchecked),
+        drops: Vec::new(),
+    };
+    let server_broken = || Outcome::Run {
+        seat: vec![SERVER_CHAIN_LINE.to_string()],
+        notice: false,
+        hold: Some(Hold::ServerChainBroken),
         drops: Vec::new(),
     };
     match seal.is_refused().await {
@@ -351,17 +388,30 @@ pub async fn check(
     };
     // After a rebase the main line runs through Agora's entries, which
     // aren't kept here: they are read from Agora and verified below with
-    // the runner's own trust, never taken on its word
+    // the runner's own trust, never taken on its word. Local entries win;
+    // what fails only on Agora's data is a hold, never a refusal (no
+    // refusal on the server's evidence alone)
     let mut fetched: Option<Result<Vec<SignedStateEntry>, String>> = None;
     let mut line = main_line(&entries, &head.entry_hash);
+    let mut through_server = false;
     if line.is_none()
         && let Some(signing) = keys.signing(id)
     {
         let chain = server.chain(id, &signing).await;
         if let Ok(chain) = &chain {
-            let mut all = entries.clone();
-            all.extend(chain.iter().cloned());
-            line = main_line(&all, &head.entry_hash);
+            match merge_server(&entries, chain) {
+                Ok(all) => line = main_line(&all, &head.entry_hash),
+                Err(hash) => {
+                    tracing::warn!(
+                        event_type = "sealed_state_server_chain_broken",
+                        agent_id = %id,
+                        entry = %hash,
+                        "Agora's copy of an entry held here differs from it"
+                    );
+                    return server_broken();
+                }
+            }
+            through_server = true;
         }
         fetched = Some(chain);
     }
@@ -374,14 +424,15 @@ pub async fn check(
             return unchecked();
         }
         (None, None) => return unchecked(),
+        // The link is missing from Agora's copy too: its data, not ours
         (None, Some(Ok(_))) => {
-            return refuse(
-                Refusal::ChainBroken,
-                format!(
-                    "the main line to head {} has a missing link",
-                    head.entry_hash
-                ),
+            tracing::warn!(
+                event_type = "sealed_state_server_chain_broken",
+                agent_id = %id,
+                head = %head.entry_hash,
+                "the main line through Agora's chain has a missing link"
             );
+            return server_broken();
         }
     };
     // Keys that can't be read are no evidence against the chain
@@ -401,6 +452,15 @@ pub async fn check(
         tracing::warn!(event_type = "sealed_state_key_notice", agent_id = %id, notice = ?notice, "sealed-state key notice");
     }
     if !report.intact || report.head != Some(head) {
+        if through_server {
+            tracing::warn!(
+                event_type = "sealed_state_server_chain_broken",
+                agent_id = %id,
+                problems = ?report.problems,
+                "the main line through Agora's chain did not verify"
+            );
+            return server_broken();
+        }
         return refuse(
             Refusal::ChainBroken,
             format!("chain did not verify: {:?}", report.problems),
@@ -534,6 +594,62 @@ pub async fn check(
     }
 }
 
+/// Agents enrolled by their keys (a state key in the secrets tree) whose
+/// `state.json` is gone, with the whole directory or alone: refused
+/// ([`Refusal::StateMissing`]), since a deletion is the May loss's other
+/// face. Unless Agora answers that it holds no sealed head for one (a 404:
+/// never enrolled, or departed with its secrets left behind), which is
+/// warned and skipped. Agora unreachable, or no key to ask with: refused
+/// (fail closed).
+pub async fn missing_states(
+    state_dir: &Path,
+    keys: &KeyStore,
+    server: &dyn SealedApi,
+) -> Vec<AgentId> {
+    let ids = match keys.with_state_keys() {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "the secrets tree couldn't be listed for missing states");
+            return Vec::new();
+        }
+    };
+    let mut missing = Vec::new();
+    for id in ids {
+        let state = state_dir.join(id.to_string()).join("state.json");
+        if std::fs::exists(&state).unwrap_or(true) {
+            continue;
+        }
+        let known = match keys.signing(id) {
+            Some(signing) => server.head_known(id, &signing).await,
+            None => Err("no signing key to ask Agora with".into()),
+        };
+        match known {
+            Ok(false) => {
+                tracing::warn!(
+                    event_type = "sealed_state_keys_without_state",
+                    agent_id = %id,
+                    "a state key is here but no state, and Agora holds no sealed head for it; skipped"
+                );
+                continue;
+            }
+            Ok(true) => {}
+            Err(e) => tracing::warn!(
+                agent_id = %id,
+                error = %e,
+                "Agora couldn't say whether it holds the missing state's head; refused"
+            ),
+        }
+        tracing::error!(
+            event_type = "sealed_state_refused",
+            agent_id = %id,
+            reason = Refusal::StateMissing.as_str(),
+            "an enrolled agent's state is missing; `agora-seed sealed-restore` restores it from Agora"
+        );
+        missing.push(id);
+    }
+    missing
+}
+
 /// Rotations the server lists that the runner's own `rotations.json`
 /// doesn't: advisory, never trusted, but the operator hears of them (a
 /// server that reports a rotation the runner never made). `None` when the
@@ -642,6 +758,10 @@ pub fn hold_alert(
         Hold::Unchecked => (
             AlertKind::SealedStateUnreadable,
             "the sealed chain could not be checked (Agora unreachable); the agent runs, uploads held",
+        ),
+        Hold::ServerChainBroken => (
+            AlertKind::SealedStateServerChainBroken,
+            "the main line through Agora's chain did not check (Agora's data only); the agent runs, uploads held",
         ),
     };
     let mut alert = Alert::new(kind, format!("{name}: {summary}")).agent(name, id);
@@ -1239,6 +1359,74 @@ pub(crate) mod tests {
         assert!(!seal.is_refused().await.unwrap());
     }
 
+    /// The main line runs through Agora's entries (after a rebase) and
+    /// Agora's copy doesn't check: a hold on Agora's evidence, never a
+    /// refusal. A local chain that doesn't verify still refuses.
+    #[tokio::test]
+    async fn agoras_broken_copy_holds_and_never_refuses() {
+        let root = crate::sealed::TestDir::new("check-server-broken");
+        let (id, keys, dir) = enrolled(&root).await;
+        let seal = AgentSeal::new(&dir, id);
+        let mine = local_entries(&seal).await.unwrap();
+        let mut sibling = mine[1].entry.clone();
+        sibling.state_at += 1;
+        let signed_sibling = sibling.clone().sign(&keys.signing(id).unwrap());
+        let api = server(vec![mine[0].clone(), signed_sibling.clone()]);
+        crate::sealed::accept::rebase(&root.join("state"), &keys, &api, id, "a test")
+            .await
+            .unwrap();
+        let run = async |api: &FakeApi| {
+            check(
+                &dir,
+                id,
+                &local_hash(&root, id).await,
+                Sizes::default(),
+                &keys,
+                api,
+            )
+            .await
+        };
+        assert!(
+            matches!(run(&api).await, Outcome::Run { hold: None, .. }),
+            "the good copy runs"
+        );
+        // Agora's copy of the rebased-onto entry signed by another key
+        let (forger, _) = agora_agentkit::crypto::generate_keypair();
+        *api.chain.lock().unwrap() = Ok(vec![mine[0].clone(), sibling.sign(&forger)]);
+        let out = run(&api).await;
+        assert_eq!(
+            out,
+            Outcome::Run {
+                seat: vec![SERVER_CHAIN_LINE.to_string()],
+                notice: false,
+                hold: Some(Hold::ServerChainBroken),
+                drops: Vec::new(),
+            }
+        );
+        // A link missing from Agora's copy
+        *api.chain.lock().unwrap() = Ok(vec![mine[0].clone()]);
+        assert!(matches!(
+            run(&api).await,
+            Outcome::Run {
+                hold: Some(Hold::ServerChainBroken),
+                ..
+            }
+        ));
+        // Agora's copy of an entry held here differs from ours: ours wins,
+        // and the disagreement is held
+        let mut other = mine[0].clone();
+        other.signature = signed_sibling.signature;
+        *api.chain.lock().unwrap() = Ok(vec![other, signed_sibling]);
+        assert!(matches!(
+            run(&api).await,
+            Outcome::Run {
+                hold: Some(Hold::ServerChainBroken),
+                ..
+            }
+        ));
+        assert!(!seal.is_refused().await.unwrap());
+    }
+
     /// The verdict: said, counted from the earliest snapshot, a pre-loss
     /// copy apart, the sizes.
     #[test]
@@ -1386,6 +1574,7 @@ pub(crate) mod tests {
             SEAL_FAILED_LINE,
             UNREADABLE_LINE,
             UNCHECKED_LINE,
+            SERVER_CHAIN_LINE,
         ] {
             let l = line.to_lowercase();
             for banned in ["claude", "haiku", "qwen", "model"] {

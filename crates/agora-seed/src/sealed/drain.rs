@@ -119,8 +119,15 @@ impl Drainer {
                 self.alerts
                     .notify(super::anchors::anchor_alert(*id, name, "publish", &e));
             }
-            if let Err(e) =
-                super::anchors::fetch_proofs(&dir, *id, &signing, a.api.as_ref(), &a.verified).await
+            if let Err(e) = super::anchors::fetch_proofs(
+                &dir,
+                *id,
+                &a.keys,
+                &signing,
+                a.api.as_ref(),
+                &a.verified,
+            )
+            .await
             {
                 tracing::warn!(
                     event_type = "sealed_state_anchor_failed",

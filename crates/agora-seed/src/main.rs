@@ -1652,6 +1652,16 @@ async fn sealed_start_check(
             Err(e) => tracing::warn!(agent_id = %id, error = %e, "sealed/stopped unreadable"),
         }
     }
+    // An enrolled agent whose state is gone never loads: found by its keys
+    if !dry_run {
+        for id in sealed::check::missing_states(state_dir, keys, api).await {
+            run.refused.push((
+                id,
+                "(state missing)".into(),
+                sealed::notice::Refusal::StateMissing,
+            ));
+        }
+    }
     if enrolled.is_empty() {
         return run;
     }
@@ -2111,6 +2121,10 @@ async fn run(held: &mut Held) -> Result<()> {
         &state_dir,
         enrolment.clone(),
     );
+    // A stop kept in the secrets tree stands for a lost sealed/stopped
+    if !args.dry_run {
+        sealed::stop::reconcile_all(&state_dir, enrolment.keys_store());
+    }
     let loaded = if args.dry_run {
         let plain = load_states(&FsStorage::new(&state_dir), &state_dir).await?;
         LoadedStates {
@@ -2763,9 +2777,15 @@ mod tests {
         for item in seal.outbox().await.unwrap() {
             seal.mark_sent(item.ord).await.unwrap();
         }
-        sealed::stop::stop(&state_dir, id, "It asked", Box::pin(async { Ok(()) }))
-            .await
-            .unwrap();
+        sealed::stop::stop(
+            &state_dir,
+            &keys,
+            id,
+            "It asked",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
         let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
             .await
             .unwrap();
@@ -2963,6 +2983,72 @@ mod tests {
             .unwrap_err();
             assert!(e.is::<RefusedRun>());
         }
+    }
+
+    /// An enrolled agent whose whole directory is gone never loads, but its
+    /// keys say it was sealed: the run is refused until it is restored.
+    /// Agora saying it holds no head for it (a 404) skips it.
+    #[tokio::test]
+    async fn a_deleted_agent_refuses_the_run_until_restored() {
+        let root = sealed::TestDir::new("main-deleted");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let api = sealed::api::fake::FakeApi::new();
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        *api.chain.lock().unwrap() = Ok(sealed::check::local_entries(&seal).await.unwrap());
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        for f in std::fs::read_dir(dir.join("sealed/blobs")).unwrap() {
+            let f = f.unwrap();
+            let sha = f.file_name().to_str().unwrap().parse().unwrap();
+            api.blobs
+                .lock()
+                .unwrap()
+                .insert(sha, std::fs::read(f.path()).unwrap());
+        }
+        std::fs::rename(&dir, root.join("gone")).unwrap();
+        let check = async |api: &sealed::api::fake::FakeApi| {
+            let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+                .await
+                .unwrap();
+            let mut pool = Vec::new();
+            sealed_start_check(
+                &mut pool,
+                &loaded.sealed,
+                &state_dir,
+                &keys,
+                api,
+                &alerts::Alerter::off(),
+                false,
+                &mut Vec::new(),
+            )
+            .await
+        };
+        let run = check(&api).await;
+        assert_eq!(
+            run.refused.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(),
+            vec![(id, sealed::notice::Refusal::StateMissing)]
+        );
+        assert!(refuse_run(&run.refused, &alerts::Alerter::off()).is_err());
+
+        // Agora unreachable: refused all the same (fail closed)
+        let down = sealed::api::fake::FakeApi::new();
+        *down.chain.lock().unwrap() = Err("unreachable".into());
+        assert_eq!(check(&down).await.refused.len(), 1);
+        // Agora holds no head for it (departed): skipped
+        assert!(
+            check(&sealed::api::fake::FakeApi::new())
+                .await
+                .refused
+                .is_empty()
+        );
+
+        sealed::restore::restore(&state_dir, &keys, &api, id, None)
+            .await
+            .unwrap();
+        let run = check(&api).await;
+        assert!(run.refused.is_empty(), "{:?}", run.refused);
     }
 
     /// A dry run checks nothing, so refuses nothing.

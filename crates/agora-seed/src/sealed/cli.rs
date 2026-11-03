@@ -199,6 +199,8 @@ pub async fn run(
             note,
             rebase: true,
         } => {
+            // Only while no runner runs: held until the command ends
+            let _runner = super::session::runner_exclusive(data_dir)?;
             let done = super::accept::rebase(
                 &state_dir,
                 &keys,
@@ -218,6 +220,7 @@ pub async fn run(
             );
         }
         Command::SealedAccept { agent, note, .. } => {
+            let _runner = super::session::runner_exclusive(data_dir)?;
             let done =
                 super::accept::accept(&state_dir, &keys, &client, agent, note.as_deref()).await?;
             println!(
@@ -233,15 +236,26 @@ pub async fn run(
             );
         }
         Command::SealedRestore { agent, note } => {
+            let _runner = super::session::runner_exclusive(data_dir)?;
             let done =
                 super::restore::restore(&state_dir, &keys, &client, agent, note.as_deref()).await?;
             println!(
-                "{agent}: restored ({}) from its sealed version of {} (head {} at seq {}); the \
-                 state found is archived beside state.json",
+                "{agent}: restored ({}) from its sealed version of {} (head {} at seq {}{}); a \
+                 state found is archived beside state.json{}",
                 done.reason.as_str(),
                 done.from.format("%Y-%m-%d"),
                 done.head.entry_hash,
-                done.head.seq
+                done.head.seq,
+                if done.rebuilt_head {
+                    ", head.json rebuilt from Agora"
+                } else {
+                    ""
+                },
+                if done.stopped {
+                    "; its backups stay stopped, at its request"
+                } else {
+                    ""
+                },
             );
         }
         Command::SealedStop { agent, note } => {
@@ -257,7 +271,7 @@ pub async fn run(
                     .map(drop)
                     .map_err(|e| e.to_string())
             });
-            let stopped = super::stop::stop(&state_dir, agent, &note, drain).await?;
+            let stopped = super::stop::stop(&state_dir, &keys, agent, &note, drain).await?;
             println!(
                 "{agent}: sealed backups stopped at {}; its history stays. `sealed-enroll \
                  --agent {agent}` resumes them",

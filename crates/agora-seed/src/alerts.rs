@@ -126,6 +126,9 @@ pub enum AlertKind {
     /// An anchor proof didn't check, couldn't be fetched, or publishing
     /// the anchor failed. Nothing was stored.
     SealedStateAnchorFailed,
+    /// An enrolled agent's main line runs through Agora's entries and
+    /// those didn't check; it runs, held (no refusal on Agora's data).
+    SealedStateServerChainBroken,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -134,7 +137,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -157,6 +160,7 @@ impl AlertKind {
         Self::SealedStateRotationUnfinished,
         Self::SealedStateRefusedRun,
         Self::SealedStateAnchorFailed,
+        Self::SealedStateServerChainBroken,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -184,6 +188,7 @@ impl AlertKind {
             Self::SealedStateRotationUnfinished => "sealed_state_rotation_unfinished",
             Self::SealedStateRefusedRun => "sealed_state_refused_run",
             Self::SealedStateAnchorFailed => "sealed_state_anchor_failed",
+            Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::Test => "test_alert",
         }
     }
@@ -361,6 +366,15 @@ impl AlertKind {
                  failed. Nothing was stored; the runner tries again later. A \
                  proof that doesn't check is the server's claim failing: \
                  compare it with the ANC entry before anything else."
+            }
+            Self::SealedStateServerChainBroken => {
+                "An enrolled agent's state matches its local sealed head, but \
+                 its main line runs through entries read from Agora (after a \
+                 rebase or a restore) and those didn't check: a missing link, \
+                 a bad signature, or Agora's copy of an entry held here \
+                 differing from it. That is Agora's evidence alone, so the \
+                 agent runs, told, and its uploads are held. Compare Agora's \
+                 chain with sealed/sent before uploading again."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

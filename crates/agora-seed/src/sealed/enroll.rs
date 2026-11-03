@@ -343,6 +343,8 @@ impl Enroller {
             super::notice::Notice::resumed(&agent_dir, note).context("writing the notice")?;
         }
         super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
+        super::stop::clear_durable(&self.keys, id)
+            .context("setting the stop in the secrets tree aside")?;
         // `_runner` held through here
         tracing::warn!(
             event_type = "sealed_state_resumed",
@@ -377,6 +379,11 @@ impl Enroller {
     ) -> Result<Report, Skip> {
         let agent_dir = self.state_dir.join(id.to_string());
         let seal = AgentSeal::new(&agent_dir, id);
+        // A stop kept in the secrets tree stands for a lost sealed/stopped
+        if seal.is_enrolled().await.unwrap_or(false) {
+            super::stop::reconcile(&agent_dir, &self.keys, id)
+                .context("putting back the stop kept in the secrets tree")?;
+        }
         if seal
             .is_enrolled()
             .await
@@ -959,9 +966,15 @@ mod tests {
             seal.mark_sent(item.ord).await.unwrap();
         }
         let before = super::super::check::local_entries(&seal).await.unwrap();
-        crate::sealed::stop::stop(&state_dir, id, "asked to", Box::pin(async { Ok(()) }))
-            .await
-            .unwrap();
+        crate::sealed::stop::stop(
+            &state_dir,
+            &keys,
+            id,
+            "asked to",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
         // The run's storage: a plain save, format 1, nothing sealed
         let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::with_keys(
             &state_dir,

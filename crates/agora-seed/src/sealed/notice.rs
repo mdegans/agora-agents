@@ -26,6 +26,10 @@ pub enum Refusal {
     ChainBroken,
     /// The local record of the last sealed version is gone.
     HeadMissing,
+    /// An enrolled agent's state (or whole directory) is gone: its keys
+    /// are here and Agora holds its sealed head. Refuses the run; no
+    /// marker is written (there may be no directory to write it in).
+    StateMissing,
 }
 
 impl Refusal {
@@ -34,6 +38,7 @@ impl Refusal {
             Self::Mismatch => "mismatch",
             Self::ChainBroken => "chain_broken",
             Self::HeadMissing => "head_missing",
+            Self::StateMissing => "state_missing",
         }
     }
 
@@ -43,6 +48,18 @@ impl Refusal {
             Self::Mismatch => "your state did not match your last sealed version",
             Self::ChainBroken => "your sealed history did not verify",
             Self::HeadMissing => "the record of your last sealed version was missing",
+            Self::StateMissing => "your state was missing here",
+        }
+    }
+
+    /// What `sealed/refused` says, as a [`Refusal`]: the one reading of
+    /// the marker.
+    pub fn from_marker(text: &str) -> Self {
+        match text.trim() {
+            "chain_broken" => Self::ChainBroken,
+            "head_missing" => Self::HeadMissing,
+            "state_missing" => Self::StateMissing,
+            _ => Self::Mismatch,
         }
     }
 }
@@ -66,6 +83,9 @@ pub struct Restored {
     /// was lost.
     #[serde(default = "yes")]
     pub found: bool,
+    /// The agent was refused (`sealed/refused`) when it was restored.
+    #[serde(default = "yes")]
+    pub refused: bool,
 }
 
 fn yes() -> bool {
@@ -316,6 +336,7 @@ impl Notice {
         note: Option<&str>,
         fallback: Refusal,
         found: bool,
+        refused: bool,
     ) -> std::io::Result<()> {
         let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
         n.accepted = None;
@@ -328,6 +349,7 @@ impl Notice {
                 .filter(|n| !n.is_empty())
                 .map(String::from),
             found,
+            refused,
         });
         write(agent_dir, &n)
     }
@@ -348,23 +370,31 @@ impl Notice {
     /// restored.
     pub fn line(&self) -> Option<String> {
         if let Some(r) = &self.restored {
-            let mut line = if r.found {
-                format!(
-                    "Your session on {} did not run: {}. On {}, your operator restored your \
-                     state from your sealed version of {}. The state found here is kept by your \
-                     operator.",
+            let (at, from) = (r.at.format("%-d %B %Y"), r.from.format("%-d %B %Y"));
+            let mut line = match (r.refused, r.found) {
+                (true, true) => format!(
+                    "Your session on {} did not run: {}. On {at}, your operator restored your \
+                     state from your sealed version of {from}. The state found here is kept by \
+                     your operator.",
                     self.refused_at.format("%-d %B %Y"),
                     self.reason.plain(),
-                    r.at.format("%-d %B %Y"),
-                    r.from.format("%-d %B %Y"),
-                )
-            } else {
-                format!(
-                    "Your state was lost here. On {}, your operator restored it from your sealed \
-                     version of {}, the copy on Agora.",
-                    r.at.format("%-d %B %Y"),
-                    r.from.format("%-d %B %Y"),
-                )
+                ),
+                (true, false) => format!(
+                    "Your session on {} did not run: {}. Your state here was then lost, and on \
+                     {at} your operator restored it from your sealed version of {from}, the \
+                     copy on Agora.",
+                    self.refused_at.format("%-d %B %Y"),
+                    self.reason.plain(),
+                ),
+                (false, true) => format!(
+                    "On {at}, your operator restored your state from your sealed version of \
+                     {from}: the record of your last sealed version was missing here. The state \
+                     found here is kept by your operator."
+                ),
+                (false, false) => format!(
+                    "Your state was lost here. On {at}, your operator restored it from your \
+                     sealed version of {from}, the copy on Agora."
+                ),
             };
             if let Some(note) = &r.note {
                 line.push_str(&format!(" Your operator's note: {note}"));
