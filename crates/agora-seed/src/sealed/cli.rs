@@ -52,11 +52,14 @@ pub enum Command {
         #[arg(long, requires = "note")]
         rebase: bool,
     },
-    /// Put a refused agent's last sealed version back as its state: the
-    /// chain verified, missing blobs fetched from Agora and checked, the
-    /// plaintext hash matched to head.json. The state found is archived
-    /// (state.<utc>.json), the refusal cleared, and the agent told at its
-    /// next session. No new version is sealed.
+    /// Put an agent's last sealed version back as its state: a refused
+    /// agent's, or one whose state, sealed/ or whole directory was lost
+    /// (head.json is then rebuilt from Agora's chain, verified with the
+    /// keys in the secrets directory). Missing blobs are fetched from
+    /// Agora and checked, and the plaintext hash matched to head.json. A
+    /// state found is archived (state.<utc>.json), a refusal cleared, and
+    /// the agent told at its next session. No new version is sealed. A
+    /// healthy state (not refused, head.json present) is never overwritten.
     SealedRestore {
         #[arg(long)]
         agent: AgentId,

@@ -72,13 +72,21 @@ impl VerifiedAnchors {
             root: proof.root,
             agents: proof.leaf_count,
         };
-        let value = serde_json::to_value(&data).ok()?;
-        Some(if agora_agentkit::govlog::data_hash(&value) == *attested {
+        Some(if anchor_data_hash(&data) == Some(*attested) {
             Ok(data)
         } else {
             Err(())
         })
     }
+}
+
+/// `data`'s hash as the governance log attests it: the log's own
+/// `govlog::data_hash` (SHA-256 of its canonical JSON) over the value as
+/// the server writes it (`serde_json::to_value`).
+pub fn anchor_data_hash(data: &AnchorData) -> Option<Sha256Hex> {
+    serde_json::to_value(data)
+        .ok()
+        .map(|v| agora_agentkit::govlog::data_hash(&v))
 }
 
 /// `sealed/anchors.json`.
@@ -349,7 +357,7 @@ pub(crate) mod tests {
             root,
             agents: leaves.len() as u32,
         };
-        let attested = agora_agentkit::govlog::data_hash(&serde_json::to_value(&data).unwrap());
+        let attested = anchor_data_hash(&data).unwrap();
         (
             AnchorProof {
                 anc_id: anc_id.clone(),
@@ -420,6 +428,41 @@ pub(crate) mod tests {
             "not_own"
         );
         assert_eq!(AnchorsFile::load(&dir).unwrap().proofs, vec![good]);
+    }
+
+    /// ANC-2026-0001 as Agora serves it (data and attested data_hash, read
+    /// 2026-11-03): the AnchorData rebuilt from a proof's fields hashes to
+    /// the signed data_hash, with the log's own function, as served.
+    #[test]
+    fn a_real_anc_entry_round_trips_to_its_data_hash() {
+        let served = serde_json::json!({
+            "date": "2026-11-02",
+            "root": "a8a1d4d25b88fd3a5b968f885635c90cf85166e75b15d7aa08f8d3753a4970f1",
+            "agents": 3,
+        });
+        let attested: Sha256Hex =
+            "8793c2a680e8d1225c24601f86f810d8d51baf365dbb5be249c6e527ad5d6c5a"
+                .parse()
+                .unwrap();
+        assert_eq!(agora_agentkit::govlog::data_hash(&served), attested);
+        let data: AnchorData = serde_json::from_value(served).unwrap();
+        assert_eq!(anchor_data_hash(&data), Some(attested));
+        let anc_id: GovernanceLogId = "ANC-2026-0001".parse().unwrap();
+        let proof = AnchorProof {
+            anc_id: anc_id.clone(),
+            date: data.date,
+            root: data.root,
+            entry_hash: Sha256Hex::from([0; 32]),
+            seq: 0,
+            leaf_index: 0,
+            leaf_count: data.agents,
+            proof: Vec::new(),
+        };
+        let verified = VerifiedAnchors::new([(anc_id, attested)]);
+        assert_eq!(verified.data(&proof), Some(Ok(data)));
+        let mut off_by_one = proof;
+        off_by_one.leaf_count += 1;
+        assert_eq!(verified.data(&off_by_one), Some(Err(())));
     }
 
     #[tokio::test]

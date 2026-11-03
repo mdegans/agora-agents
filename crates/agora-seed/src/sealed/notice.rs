@@ -62,6 +62,14 @@ pub struct Restored {
     pub from: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// A state was found here (and is kept, archived); `false` when it
+    /// was lost.
+    #[serde(default = "yes")]
+    pub found: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// What `sealed-accept` changed, from the last sealed version to the
@@ -307,6 +315,7 @@ impl Notice {
         from: DateTime<Utc>,
         note: Option<&str>,
         fallback: Refusal,
+        found: bool,
     ) -> std::io::Result<()> {
         let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
         n.accepted = None;
@@ -318,6 +327,7 @@ impl Notice {
                 .map(str::trim)
                 .filter(|n| !n.is_empty())
                 .map(String::from),
+            found,
         });
         write(agent_dir, &n)
     }
@@ -338,14 +348,24 @@ impl Notice {
     /// restored.
     pub fn line(&self) -> Option<String> {
         if let Some(r) = &self.restored {
-            let mut line = format!(
-                "Your session on {} did not run: {}. On {}, your operator restored your state \
-                 from your sealed version of {}. The state found here is kept by your operator.",
-                self.refused_at.format("%-d %B %Y"),
-                self.reason.plain(),
-                r.at.format("%-d %B %Y"),
-                r.from.format("%-d %B %Y"),
-            );
+            let mut line = if r.found {
+                format!(
+                    "Your session on {} did not run: {}. On {}, your operator restored your \
+                     state from your sealed version of {}. The state found here is kept by your \
+                     operator.",
+                    self.refused_at.format("%-d %B %Y"),
+                    self.reason.plain(),
+                    r.at.format("%-d %B %Y"),
+                    r.from.format("%-d %B %Y"),
+                )
+            } else {
+                format!(
+                    "Your state was lost here. On {}, your operator restored it from your sealed \
+                     version of {}, the copy on Agora.",
+                    r.at.format("%-d %B %Y"),
+                    r.from.format("%-d %B %Y"),
+                )
+            };
             if let Some(note) = &r.note {
                 line.push_str(&format!(" Your operator's note: {note}"));
             }
