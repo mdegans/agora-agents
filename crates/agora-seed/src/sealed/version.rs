@@ -148,8 +148,7 @@ pub async fn verified_line(
         // Through Agora's entries (after a rebase or a restore)
         None => {
             let signing = keys.signing(id).context("no signing key for the agent")?;
-            let chain = api
-                .chain(id, &signing)
+            let chain = super::api::chain(api, id, &signing)
                 .await
                 .map_err(anyhow::Error::msg)
                 .context("reading the agent's chain on Agora")?;

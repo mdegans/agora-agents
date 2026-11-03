@@ -339,6 +339,11 @@ impl Notice {
         refused: bool,
     ) -> std::io::Result<()> {
         let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
+        // A rerun of a restore cut short: what the first run found stands
+        let (found, refused) = match &n.restored {
+            Some(r) => (r.found, r.refused || refused),
+            None => (found, refused),
+        };
         n.accepted = None;
         n.diff = None;
         n.restored = Some(Restored {

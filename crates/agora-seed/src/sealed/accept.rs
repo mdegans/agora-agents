@@ -90,8 +90,7 @@ pub async fn accept(
     let mut adopted = None;
     if seal.head().await?.is_none() {
         let signing = keys.signing(id).context("no signing key for the agent")?;
-        let chain = api
-            .chain(id, &signing)
+        let chain = super::api::chain(api, id, &signing)
             .await
             .map_err(anyhow::Error::msg)
             .context("reading the agent's chain on Agora")?;
@@ -161,7 +160,14 @@ pub async fn accept(
                     Diff::unavailable()
                 }
             };
+            super::crash::point("accept:diffed")?;
+            // The note is written before the refusal is cleared: a crash in
+            // between leaves the agent refused, and a rerun rewrites it. A
+            // refusal at the next start sets an unshown acceptance aside
+            Notice::accept(&agent_dir, note, reason, Some(diff)).context("writing the notice")?;
+            super::crash::point("accept:noticed")?;
             seal.clear_refusal().await.context("clearing the refusal")?;
+            super::crash::point("accept:cleared")?;
             let head = super::session::append(
                 &seal,
                 &lock,
@@ -175,8 +181,8 @@ pub async fn accept(
             .context(
                 "sealing the accepted state (the refusal is cleared; the next start checks it)",
             )?;
+            super::crash::point("accept:appended")?;
             super::enroll::record_sizes(&agent_dir, head, now, &current);
-            Notice::accept(&agent_dir, note, reason, Some(diff)).context("writing the notice")?;
             head
         }
     };
@@ -230,8 +236,7 @@ pub async fn rebase(
         "agent {id} is not enrolled in sealed state"
     );
     let signing = keys.signing(id).context("no signing key for the agent")?;
-    let chain = api
-        .chain(id, &signing)
+    let chain = super::api::chain(api, id, &signing)
         .await
         .map_err(anyhow::Error::msg)
         .context("reading the agent's chain on Agora")?;

@@ -1543,7 +1543,7 @@ struct SealedRun {
     /// Those whose history on Agora failed verification while their local
     /// state is intact (name, detail): they refuse the run too, but nothing
     /// is marked against them.
-    server_faults: Vec<(AgentId, String, String)>,
+    server_faults: Vec<(AgentId, String, sealed::check::FaultKind, String)>,
 }
 
 /// The start check refused agents, so the run doesn't start: `main` exits
@@ -1572,14 +1572,20 @@ impl std::error::Error for RefusedRun {}
 /// commands that resolve it; one alert. Holds never come here.
 fn refuse_run(
     refused: &[(AgentId, String, sealed::notice::Refusal)],
-    server_faults: &[(AgentId, String, String)],
+    server_faults: &[(AgentId, String, sealed::check::FaultKind, String)],
     alerts: &alerts::Alerter,
 ) -> Result<()> {
     if refused.is_empty() && server_faults.is_empty() {
         return Ok(());
     }
-    if !server_faults.is_empty() {
-        server_fault_alert(server_faults, alerts);
+    let (keys, chains): (Vec<_>, Vec<_>) = server_faults
+        .iter()
+        .partition(|f| f.2 == sealed::check::FaultKind::UntrustedKey);
+    if !chains.is_empty() {
+        server_fault_alert(&chains, alerts);
+    }
+    if !keys.is_empty() {
+        untrusted_key_alert(&keys, alerts);
     }
     #[derive(serde::Serialize)]
     struct RefusedAgent<'a> {
@@ -1655,16 +1661,57 @@ pub const SERVER_FAULT_TEXT: &str = "Agora's copy of these agents' sealed histor
 /// likely.
 pub const PLATFORM_FAULT_AGENTS: usize = 3;
 
-fn server_fault_alert(faults: &[(AgentId, String, String)], alerts: &alerts::Alerter) {
+type Fault = (AgentId, String, sealed::check::FaultKind, String);
+
+/// What the run says for an agent whose entries are signed by a key the
+/// runner doesn't recognise (not a platform fault).
+pub fn untrusted_key_text(name: &str, id: AgentId) -> String {
+    format!(
+        "Entries on Agora for {name} are signed by a key this runner doesn't recognise: most \
+         likely its record of past signing keys (`<secrets>/{id}/rotations.json`) was lost \
+         after a key rotation; otherwise a forgery. Restore that file from backup, then start \
+         again."
+    )
+}
+
+fn untrusted_key_alert(faults: &[&Fault], alerts: &alerts::Alerter) {
+    let texts: Vec<String> = faults
+        .iter()
+        .map(|(id, name, _, _)| untrusted_key_text(name, *id))
+        .collect();
+    for ((id, name, _, detail), text) in faults.iter().zip(&texts) {
+        tracing::error!(
+            event_type = "sealed_state_untrusted_key",
+            agent_id = %id,
+            agent = %name,
+            detail = %detail,
+            "{text}"
+        );
+    }
+    let mut alert = alerts::Alert::new(
+        alerts::AlertKind::SealedStateUntrustedKey,
+        format!(
+            "REFUSING TO RUN: {} agent(s)' sealed entries are signed by a key this runner \
+             doesn't recognise",
+            faults.len()
+        ),
+    );
+    for text in texts {
+        alert = alert.detail("agent", text);
+    }
+    alerts.notify(alert);
+}
+
+fn server_fault_alert(faults: &[&Fault], alerts: &alerts::Alerter) {
     #[derive(serde::Serialize)]
-    struct Fault<'a> {
+    struct Listed<'a> {
         agent_id: AgentId,
         name: &'a str,
         detail: &'a str,
     }
-    let listed: Vec<Fault> = faults
+    let listed: Vec<Listed> = faults
         .iter()
-        .map(|(id, name, detail)| Fault {
+        .map(|(id, name, _, detail)| Listed {
             agent_id: *id,
             name,
             detail,
@@ -1737,12 +1784,9 @@ async fn sealed_start_check(
     }
     // An enrolled agent whose state is gone never loads: found by its keys
     if !dry_run {
-        for id in sealed::check::missing_states(state_dir, keys, api, alerts).await {
-            run.refused.push((
-                id,
-                "(state missing)".into(),
-                sealed::notice::Refusal::StateMissing,
-            ));
+        for (id, reason) in sealed::check::missing_states(state_dir, keys, api, alerts).await {
+            run.refused
+                .push((id, format!("({})", reason.as_str()), reason));
         }
     }
     if enrolled.is_empty() {
@@ -1763,7 +1807,7 @@ async fn sealed_start_check(
         let name = state.soul.name.to_string();
         let dir = state_dir.join(id.to_string());
         match sealed::check::check(&dir, *id, hash, *sizes, keys, api).await {
-            sealed::check::Outcome::ServerFault { detail } => {
+            sealed::check::Outcome::ServerFault { kind, detail } => {
                 skipped.push(Skipped::new(
                     *id,
                     Some(name.clone()),
@@ -1771,7 +1815,7 @@ async fn sealed_start_check(
                     "Agora's copy of its history failed verification".to_string(),
                 ));
                 refused.insert(*id);
-                run.server_faults.push((*id, name, detail));
+                run.server_faults.push((*id, name, kind, detail));
             }
             sealed::check::Outcome::Refuse { reason, detail } => {
                 sealed::check::refuse(&dir, *id, &name, reason, &detail, alerts).await;

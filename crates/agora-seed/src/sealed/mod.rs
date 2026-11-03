@@ -39,11 +39,16 @@ pub mod anchors;
 pub mod api;
 pub mod check;
 pub mod cli;
+pub mod crash;
+#[cfg(test)]
+mod crash_tests;
 pub mod drain;
 pub mod enroll;
 pub mod forget;
 pub mod keys;
 pub mod notice;
+#[cfg(test)]
+mod props;
 pub mod restore;
 pub mod rotate;
 pub mod session;
@@ -224,6 +229,18 @@ impl TestDir {
 
     pub fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// In `/dev/shm` where there is one: for tests that fsync a lot (the
+    /// property tests), which a disk makes slow.
+    pub fn in_memory(label: &str) -> Self {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            return Self::new(label);
+        }
+        let dir = shm.join(format!("agora-seed-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
     }
 }
 

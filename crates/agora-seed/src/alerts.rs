@@ -135,6 +135,10 @@ pub enum AlertKind {
     /// nothing to restore it from: skipped (`sealed-forget` sets the key
     /// aside).
     SealedStateKeysWithoutState,
+    /// An agent's sealed entries are signed by a key the runner doesn't
+    /// recognise (its record of past keys lost, or a forgery): the run is
+    /// refused, nothing marked. Never rate-limited.
+    SealedStateUntrustedKey,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -143,7 +147,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -168,12 +172,16 @@ impl AlertKind {
         Self::SealedStateAnchorFailed,
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
+        Self::SealedStateUntrustedKey,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
     /// must hear of each time it stops the fleet.
     pub fn unlimited(self) -> bool {
-        matches!(self, Self::SealedStateServerChainBroken)
+        matches!(
+            self,
+            Self::SealedStateServerChainBroken | Self::SealedStateUntrustedKey
+        )
     }
 
     /// The `event_type` the runner logs this under.
@@ -203,6 +211,7 @@ impl AlertKind {
             Self::SealedStateAnchorFailed => "sealed_state_anchor_failed",
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
+            Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::Test => "test_alert",
         }
     }
@@ -394,6 +403,15 @@ impl AlertKind {
                  histories that verify. To run an agent regardless, stop \
                  its backups with `agora-seed sealed-stop --agent <id> \
                  --note \"…\"`. This alert is never rate-limited."
+            }
+            Self::SealedStateUntrustedKey => {
+                "The seed runner refused to run: the sealed entries of the \
+                 agents below are signed by a key this runner doesn't \
+                 recognise. Most likely its record of past signing keys \
+                 (<secrets>/<id>/rotations.json) was lost after a key \
+                 rotation; otherwise a forgery. Restore that file from \
+                 backup, then start again. Nothing was marked against the \
+                 agents. This alert is never rate-limited."
             }
             Self::SealedStateKeysWithoutState => {
                 "An agent has a state key in the secrets tree but no state \

@@ -167,7 +167,7 @@ pub async fn restore(
     let had_head = seal.head().await?.is_some();
     let refused = seal.is_refused().await?;
     anyhow::ensure!(
-        refused || !std::fs::exists(&state_path)? || !had_head,
+        refused || !std::fs::exists(&state_path)? || !had_head || !seal.is_enrolled().await?,
         "agent {id} is not refused and its state and sealed head are here: the start check \
          finds it intact or holds it, and this won't overwrite it (a deliberate change is \
          `sealed-accept --note`)"
@@ -184,16 +184,25 @@ pub async fn restore(
         Refusal::HeadMissing
     };
     if had_head {
-        anyhow::ensure!(
-            seal.is_enrolled().await?,
-            "agent {id} is not enrolled in sealed state"
-        );
+        // A head.json without the marker: a restore cut after it adopted
+        // Agora's head. Enrolled, if Agora's chain holds that head (the
+        // line to it is verified below)
+        if !seal.is_enrolled().await? {
+            let head = seal.head().await?.context("head.json vanished")?;
+            let chain = super::api::chain(api, id, &k.signing)
+                .await
+                .map_err(anyhow::Error::msg)
+                .context("reading the agent's chain on Agora")?;
+            anyhow::ensure!(
+                chain.iter().any(|e| e.entry_hash() == head.head.entry_hash),
+                "agent {id} is not enrolled in sealed state"
+            );
+        }
     } else {
         // head.json is gone (with sealed/, or the whole directory): it is
         // rebuilt from Agora's chain, verified with the runner's own keys,
         // the way `sealed-accept` adopts it. Never a genesis
-        let chain = api
-            .chain(id, &k.signing)
+        let chain = super::api::chain(api, id, &k.signing)
             .await
             .map_err(anyhow::Error::msg)
             .context("reading the agent's chain on Agora")?;
@@ -218,6 +227,7 @@ pub async fn restore(
             entries = chain.len(),
             "head.json rebuilt from the verified chain on Agora, for a restore"
         );
+        super::crash::point("restore:adopted")?;
     }
     let last = super::version::last_sealed(&seal, keys, api, id)
         .await
@@ -244,6 +254,12 @@ pub async fn restore(
     let stopped = super::stop::reconcile(&agent_dir, keys, id)
         .context("putting back the stop kept in the secrets tree")?
         || super::stop::is_stopped(&agent_dir);
+    // The notice first: what was found here is known now, and a rerun of
+    // a restore cut short keeps it. The marker and the refusal last, so a
+    // cut anywhere leaves a rerun to do (refused, or not enrolled)
+    Notice::restored(&agent_dir, from, note, reason, found, refused)
+        .context("writing the notice")?;
+    super::crash::point("restore:noticed")?;
     // A stray tmp (a save or restore cut short) is kept, never truncated
     // by the write below
     let tmp = agent_dir.join("state.json.tmp");
@@ -252,21 +268,22 @@ pub async fn restore(
         std::fs::rename(&tmp, agent_dir.join(format!("state.{at}.tmp.json")))
             .context("setting a stray state.json.tmp aside")?;
     }
+    super::crash::point("restore:before_write")?;
     // Archives a state.json found here as state.<utc>.json first
     FsStorage::new(state_dir)
         .save_sealed_raw(id, state)
         .await
         .context("writing the restored state")?;
+    super::crash::point("restore:written")?;
     if !seal.is_enrolled().await? {
         seal.enroll()
             .await
             .context("writing the enrolment marker")?;
     }
+    super::crash::point("restore:enrolled")?;
     if refused {
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
-    Notice::restored(&agent_dir, from, note, reason, found, refused)
-        .context("writing the notice")?;
     drop(lock);
     let head = last.head.head;
     tracing::warn!(

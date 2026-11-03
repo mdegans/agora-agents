@@ -94,24 +94,139 @@ pub enum Outcome {
     /// Leave it out, refused. `detail` is for the operator, hashes and
     /// counts only.
     Refuse { reason: Refusal, detail: String },
-    /// The local state is the local head's, and the main line runs through
-    /// Agora's entries, which didn't verify: Agora's evidence alone. The
-    /// whole run is refused (Steward, 2026-11-03), but nothing is marked
-    /// against the agent: the next start checks again, and runs once Agora
-    /// serves a history that verifies. Decided in one place,
-    /// [`on_server_fault`].
-    ServerFault { detail: String },
+    /// The local state is the local head's, and the history on Agora (or
+    /// the keys it is checked with) fails while nothing here shows a loss.
+    /// The whole run is refused (Steward, 2026-11-03), but nothing is
+    /// marked against the agent: the next start checks again, and runs once
+    /// the cause is fixed. Decided in one place, [`judge_failure`].
+    ServerFault { kind: FaultKind, detail: String },
 }
 
-/// What a failure on Agora's data alone does: the one place it is decided.
-fn on_server_fault(id: AgentId, detail: String) -> Outcome {
+/// What a failure that isn't the local state's own is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    /// Agora's copy fails: a missing link, a chain problem on entries
+    /// only Agora holds, a copy that differs from ours. Likely a
+    /// server-side fault.
+    ServerChainBroken,
+    /// Entries are signed by a key this runner doesn't recognise: most
+    /// likely its record of past signing keys was lost after a rotation;
+    /// otherwise a forgery. Not reported as a platform fault.
+    UntrustedKey,
+}
+
+impl FaultKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerChainBroken => "server_chain_broken",
+            Self::UntrustedKey => "untrusted_key",
+        }
+    }
+}
+
+/// The class of one `verify_chain` problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProblemClass {
+    /// No key this runner knows made the signature, or a known one it
+    /// doesn't trust.
+    Key,
+    /// Anything else: the chain's shape, links, kinds, blobs, times, a
+    /// retired key's use.
+    Chain,
+}
+
+/// Exhaustive, no wildcard: a variant agentkit adds fails to compile here
+/// until it is classified.
+pub fn class_of(p: &agora_agentkit::state::verify::ChainProblem) -> ProblemClass {
+    use agora_agentkit::state::verify::ChainProblem as P;
+    match p {
+        P::BadSignature { .. } | P::UntrustedKey { .. } => ProblemClass::Key,
+        P::MissingGenesis
+        | P::GenesisNotFirst { .. }
+        | P::WrongAgent { .. }
+        | P::UnknownVersion { .. }
+        | P::SeqGap { .. }
+        | P::Fork { .. }
+        | P::BrokenLink { .. }
+        | P::RetiredKey { .. }
+        | P::UnknownKind { .. }
+        | P::DeltaWithoutBase { .. }
+        | P::MissingBlob { .. }
+        | P::MergeNotAllowed { .. }
+        | P::TimeWentBack { .. } => ProblemClass::Chain,
+    }
+}
+
+/// The one place a chain that didn't verify is judged. `server_seqs`: the
+/// seqs of the line's entries only Agora holds.
+///
+/// - every problem a key problem: [`FaultKind::UntrustedKey`], unmarked;
+/// - every problem on entries only Agora holds:
+///   [`FaultKind::ServerChainBroken`], unmarked;
+/// - otherwise local evidence: refused, [`Refusal::ChainBroken`].
+pub fn judge_failure(
+    id: AgentId,
+    problems: &[agora_agentkit::state::verify::ChainProblem],
+    server_seqs: &std::collections::HashSet<u64>,
+) -> Outcome {
+    if !problems.is_empty() && problems.iter().all(|p| class_of(p) == ProblemClass::Key) {
+        return on_fault(
+            id,
+            FaultKind::UntrustedKey,
+            format!("entries signed by a key this runner doesn't recognise: {problems:?}"),
+        );
+    }
+    if !problems.is_empty()
+        && problems
+            .iter()
+            .all(|p| problem_seq(p).is_some_and(|s| server_seqs.contains(&s)))
+    {
+        return on_fault(
+            id,
+            FaultKind::ServerChainBroken,
+            format!("Agora's entries did not verify: {problems:?}"),
+        );
+    }
+    Outcome::Refuse {
+        reason: Refusal::ChainBroken,
+        detail: format!("chain did not verify: {problems:?}"),
+    }
+}
+
+fn on_fault(id: AgentId, kind: FaultKind, detail: String) -> Outcome {
     tracing::error!(
         event_type = "sealed_state_server_chain_broken",
         agent_id = %id,
+        kind = kind.as_str(),
         detail = %detail,
-        "Agora's copy of the agent's sealed history failed verification; its local state is intact"
+        "the agent's sealed history failed verification; its local state is intact"
     );
-    Outcome::ServerFault { detail }
+    Outcome::ServerFault { kind, detail }
+}
+
+/// Whether `sealed/` shows a local loss: an outbox number below
+/// `head.json`'s `next_ord` that no file here carries (`sent/`, or the
+/// outbox's waiting, writing, set-aside or abandoned items). Each item
+/// keeps its number for good, so a gap is a file deleted here.
+pub fn local_gap(seal: &AgentSeal, next_ord: u64) -> std::io::Result<bool> {
+    let mut seen = std::collections::BTreeSet::new();
+    for sub in ["sent", "outbox"] {
+        let dir = seal.dir().join(sub);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(ord) = digits.parse::<u64>() {
+                seen.insert(ord);
+            }
+        }
+    }
+    Ok((0..next_ord).any(|o| !seen.contains(&o)))
 }
 
 /// Where a walk to the head stopped: the hash held nowhere, and the seq it
@@ -443,16 +558,41 @@ pub async fn check(
     // reaches: what is Agora's evidence, and what isn't
     let mut server_only: HashMap<Sha256Hex, u64> = HashMap::new();
     let mut walked = walk_line(&entries, &head.entry_hash, Some(head.seq));
+    // A file deleted here is local evidence, whatever Agora says
+    let next_ord = match seal.head().await {
+        Ok(Some(h)) => h.next_ord,
+        _ => 0,
+    };
+    let gap = match local_gap(&seal, next_ord) {
+        Ok(gap) => gap,
+        Err(e) => {
+            tracing::warn!(agent_id = %id, error = %e, "sealed/ unreadable for its numbering");
+            return unreadable();
+        }
+    };
+    if let Err(missing) = &walked
+        && gap
+    {
+        return refuse(
+            Refusal::ChainBroken,
+            format!(
+                "the main line to head {} lacks {} (seq {:?}), and sealed/ is missing an item it \
+                 numbered",
+                head.entry_hash, missing.hash, missing.seq
+            ),
+        );
+    }
     if walked.is_err()
         && let Some(signing) = keys.signing(id)
     {
-        let chain = server.chain(id, &signing).await;
+        let chain = super::api::chain(server, id, &signing).await;
         if let Ok(chain) = &chain {
             let all = match merge_server(&entries, chain) {
                 Ok(all) => all,
                 Err(hash) => {
-                    return on_server_fault(
+                    return on_fault(
                         id,
+                        FaultKind::ServerChainBroken,
                         format!("Agora's copy of entry {hash} differs from the one held here"),
                     );
                 }
@@ -465,20 +605,16 @@ pub async fn check(
                 .map(|e| (e.entry_hash(), e.entry.seq))
                 .collect();
             walked = walk_line(&all, &head.entry_hash, Some(head.seq));
+            // Nothing here was lost (no gap): what is missing is Agora's
             if let Err(missing) = &walked {
-                // Agora's chain reaches past the missing seq: Agora lost it.
-                // Else Agora never had it, and the loss is ours
-                let reach = chain.iter().map(|e| e.entry.seq).max();
-                if missing.seq.is_some_and(|s| reach.is_some_and(|r| r >= s)) {
-                    return on_server_fault(
-                        id,
-                        format!(
-                            "the main line through Agora's chain lacks {} (seq {:?}), which \
-                             Agora's chain reaches past",
-                            missing.hash, missing.seq
-                        ),
-                    );
-                }
+                return on_fault(
+                    id,
+                    FaultKind::ServerChainBroken,
+                    format!(
+                        "the main line through Agora's chain lacks {} (seq {:?})",
+                        missing.hash, missing.seq
+                    ),
+                );
             }
         }
         fetched = Some(chain);
@@ -491,16 +627,7 @@ pub async fn check(
             tracing::warn!(agent_id = %id, error = %e, "the main line runs through Agora's chain, which couldn't be read");
             return unchecked();
         }
-        (Err(_), None) => return unchecked(),
-        (Err(missing), Some(Ok(_))) => {
-            return refuse(
-                Refusal::ChainBroken,
-                format!(
-                    "the main line to head {} lacks {} (seq {:?}), held neither here nor on Agora",
-                    head.entry_hash, missing.hash, missing.seq
-                ),
-            );
-        }
+        (Err(_), _) => return unchecked(),
     };
     // Keys that can't be read are no evidence against the chain
     let trusted = match keys.trusted(id) {
@@ -519,28 +646,12 @@ pub async fn check(
         tracing::warn!(event_type = "sealed_state_key_notice", agent_id = %id, notice = ?notice, "sealed-state key notice");
     }
     if !report.intact || report.head != Some(head) {
-        // Agora's alone only when every problem lies on an entry only
-        // Agora holds; anything touching ours is local evidence
         let server_seqs: std::collections::HashSet<u64> = line
             .iter()
             .filter(|e| server_only.contains_key(&e.entry_hash()))
             .map(|e| e.entry.seq)
             .collect();
-        let agoras = !report.problems.is_empty()
-            && report
-                .problems
-                .iter()
-                .all(|p| problem_seq(p).is_some_and(|s| server_seqs.contains(&s)));
-        if agoras {
-            return on_server_fault(
-                id,
-                format!("Agora's entries did not verify: {:?}", report.problems),
-            );
-        }
-        return refuse(
-            Refusal::ChainBroken,
-            format!("chain did not verify: {:?}", report.problems),
-        );
+        return judge_failure(id, &report.problems, &server_seqs);
     }
 
     let mut seat = Vec::new();
@@ -619,12 +730,41 @@ pub async fn check(
     };
     let chain = match fetched {
         Some(chain) => chain,
-        None => server.chain(id, &signing).await,
+        None => super::api::chain(server, id, &signing).await,
     };
     let (status, server_said) = match chain {
         Ok(chain) => {
+            // Agora's copy of an entry held here must be ours
+            if let Err(hash) = merge_server(&entries, &chain) {
+                return on_fault(
+                    id,
+                    FaultKind::ServerChainBroken,
+                    format!("Agora's copy of entry {hash} differs from the one held here"),
+                );
+            }
             let hashes: Vec<Sha256Hex> = chain.iter().map(|e| e.entry_hash()).collect();
-            let status = head_status(Some(&head.entry_hash), &outbox, &hashes);
+            let mut status = head_status(Some(&head.entry_hash), &outbox, &hashes);
+            // And every version uploaded from here must still be there, not
+            // just the head
+            if matches!(status, HeadStatus::Same | HeadStatus::Pending) {
+                let on_agora: std::collections::HashSet<&Sha256Hex> = hashes.iter().collect();
+                let lost = match seal.sent().await {
+                    Ok(sent) => sent
+                        .iter()
+                        .filter(|i| !on_agora.contains(&i.entry.entry_hash()))
+                        .count(),
+                    Err(_) => 0,
+                };
+                if lost > 0 {
+                    tracing::warn!(
+                        event_type = "sealed_state_uploaded_missing",
+                        agent_id = %id,
+                        lost,
+                        "versions uploaded from here are missing from Agora's chain"
+                    );
+                    status = HeadStatus::LocalMissing;
+                }
+            }
             let said = if status == HeadStatus::Same {
                 Server::InStep
             } else {
@@ -682,7 +822,7 @@ pub async fn missing_states(
     keys: &KeyStore,
     server: &dyn SealedApi,
     alerts: &Alerter,
-) -> Vec<AgentId> {
+) -> Vec<(AgentId, Refusal)> {
     let ids = match keys.with_state_keys() {
         Ok(ids) => ids,
         Err(e) => {
@@ -692,10 +832,17 @@ pub async fn missing_states(
     };
     let mut missing = Vec::new();
     for id in ids {
-        let state = state_dir.join(id.to_string()).join("state.json");
-        if std::fs::exists(&state).unwrap_or(true) {
+        let dir = state_dir.join(id.to_string());
+        let state_here = std::fs::exists(dir.join("state.json")).unwrap_or(true);
+        // A state whose sealed/ (its enrolment marker) is gone would run
+        // unsealed and never be checked again: as missing as a lost state
+        let reason = if !state_here {
+            Refusal::StateMissing
+        } else if !super::is_enrolled(&dir) {
+            Refusal::HeadMissing
+        } else {
             continue;
-        }
+        };
         let known = match keys.signing(id) {
             Some(signing) => server.head_known(id, &signing).await,
             None => Err("no signing key to ask Agora with".into()),
@@ -710,7 +857,7 @@ pub async fn missing_states(
                 alerts.notify(
                     Alert::new(
                         AlertKind::SealedStateKeysWithoutState,
-                        format!("{id}: a state key but no state, and nothing on Agora to restore"),
+                        format!("{id}: a state key but no sealed state here, and nothing on Agora to restore"),
                     )
                     .agent(id.to_string(), id)
                     .detail(
@@ -730,10 +877,10 @@ pub async fn missing_states(
         tracing::error!(
             event_type = "sealed_state_refused",
             agent_id = %id,
-            reason = Refusal::StateMissing.as_str(),
-            "an enrolled agent's state is missing; `agora-seed sealed-restore` restores it from Agora"
+            reason = reason.as_str(),
+            "an enrolled agent's state or sealed/ is missing; `agora-seed sealed-restore` restores it from Agora"
         );
-        missing.push(id);
+        missing.push((id, reason));
     }
     missing
 }
@@ -1150,6 +1297,9 @@ pub(crate) mod tests {
         );
     }
 
+    /// A chain signed by a key this runner doesn't recognise refuses the
+    /// run as an untrusted key, unmarked (its rotation record lost, or a
+    /// forgery): not the agent's fault, not a platform fault.
     #[tokio::test]
     async fn a_chain_signed_by_an_untrusted_key_is_refused() {
         let root = crate::sealed::TestDir::new("check-key");
@@ -1173,8 +1323,8 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 out,
-                Outcome::Refuse {
-                    reason: Refusal::ChainBroken,
+                Outcome::ServerFault {
+                    kind: FaultKind::UntrustedKey,
                     ..
                 }
             ),

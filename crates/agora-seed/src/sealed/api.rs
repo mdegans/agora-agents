@@ -72,6 +72,21 @@ pub trait SealedApi: Send + Sync {
     -> Result<(), String>;
 }
 
+/// [`SealedApi::chain`], in seq order with duplicates dropped: the order
+/// or repetition of Agora's answer is never evidence, only its entries.
+/// Every caller reads the chain through this.
+pub async fn chain(
+    api: &dyn SealedApi,
+    id: AgentId,
+    key: &SigningKey,
+) -> Result<Vec<SignedStateEntry>, String> {
+    let mut chain = api.chain(id, key).await?;
+    let mut seen = std::collections::HashSet::new();
+    chain.retain(|e| seen.insert((e.entry_hash(), e.signature)));
+    chain.sort_by_key(|e| e.entry.seq);
+    Ok(chain)
+}
+
 fn auth(id: AgentId, key: &SigningKey) -> StateAuth<'_> {
     StateAuth { agent_id: id, key }
 }

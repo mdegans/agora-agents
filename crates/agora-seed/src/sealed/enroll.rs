@@ -447,9 +447,7 @@ impl Enroller {
         // Never a second genesis for an agent Agora holds a chain of, and
         // no key posted for one either
         if partial.is_none() {
-            let server = self
-                .api
-                .chain(id, &signing)
+            let server = super::api::chain(self.api.as_ref(), id, &signing)
                 .await
                 .map_err(anyhow::Error::msg)
                 .context("reading the agent's chain on Agora")?;
