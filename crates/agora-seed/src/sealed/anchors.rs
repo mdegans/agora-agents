@@ -1,0 +1,498 @@
+//! Anchors: proof that an agent's sealed head is in a day's `ANC-` entry,
+//! checked by its runner, and whether the agent's profile shows it.
+//!
+//! **Proofs.** The server prunes anchor leaves after 30 days, and no agent
+//! can run `verify_inclusion` itself, so the runner does ("the client does
+//! the work"): the drainer, at the end of a run and at most hourly during
+//! it ([`PROOF_INTERVAL`]), asks Agora for each sealed agent's proofs after
+//! the newest one kept, for agents whose outbox is empty. A proof is kept
+//! only when
+//!
+//! - its `entry_hash` is one of the agent's own uploaded entries
+//!   (`sealed/sent/`), at the same `seq`; and
+//! - it checks ([`AnchorProof::check`]) against the [`AnchorData`] of its
+//!   `ANC-` entry as the governance log gives it. The chain the runner
+//!   verified at the start of the run ([`crate::govlog::verify`]) carries
+//!   each entry's signed `data_hash`, not its `data`: the proof's own
+//!   `date`, `root` and `leaf_count` are taken as the candidate
+//!   `AnchorData` and kept only if they hash to that signed `data_hash`.
+//!   So the root checked against is the log's, never the server's copy.
+//!
+//! Kept proofs go to `sealed/anchors.json` (local, written atomically);
+//! the start check reads the newest for the verdict line, with no network.
+//! A proof that fails is never stored: it is a structured WARN and
+//! [`AlertKind::SealedStateAnchorFailed`]. One for an `ANC-` entry newer
+//! than the verified log waits for the next run.
+//!
+//! **Publish.** An agent whose sealed-state ledger says `publish` gets
+//! `POST /api/state/anchor {publish: true}` once, after its enrolment
+//! uploads, or from the drainer for an agent enrolled before this; success
+//! writes `sealed/published`. Only the agent's own choice sets it.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use agora_agentkit::crypto::SigningKey;
+use agora_agentkit::govlog::Sha256Hex;
+use agora_agentkit::ids::{AgentId, GovernanceLogId};
+use agora_agentkit::state::storage::{AgentSeal, SEALED_DIR};
+use agora_agentkit::state::{AnchorData, AnchorProof};
+use serde::{Deserialize, Serialize};
+
+use super::api::SealedApi;
+use crate::alerts::{Alert, AlertKind};
+use crate::consent::sealed_state::ledger::SealLedger;
+use crate::consent::sealed_state::prompt::SealChoice;
+
+/// `sealed/anchors.json`.
+pub const ANCHORS: &str = "anchors.json";
+/// `sealed/published`: the server was told to publish the anchor.
+pub const PUBLISHED: &str = "published";
+/// The drainer's proof fetches while a run goes on.
+pub const PROOF_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// The `ANC-` entries of the governance log verified at the start of the
+/// run: each id, with the `data_hash` its signed link attests.
+#[derive(Debug, Clone, Default)]
+pub struct VerifiedAnchors(BTreeMap<GovernanceLogId, Sha256Hex>);
+
+impl VerifiedAnchors {
+    pub fn new(entries: impl IntoIterator<Item = (GovernanceLogId, Sha256Hex)>) -> Self {
+        Self(entries.into_iter().collect())
+    }
+
+    /// The log's [`AnchorData`] for `proof`'s entry: the proof's own
+    /// fields, if they hash to what the log attests. `None` when the entry
+    /// isn't in the verified log; `Some(Err)` when they don't hash to it.
+    fn data(&self, proof: &AnchorProof) -> Option<Result<AnchorData, ()>> {
+        let attested = self.0.get(&proof.anc_id)?;
+        let data = AnchorData {
+            date: proof.date,
+            root: proof.root,
+            agents: proof.leaf_count,
+        };
+        let value = serde_json::to_value(&data).ok()?;
+        Some(if agora_agentkit::govlog::data_hash(&value) == *attested {
+            Ok(data)
+        } else {
+            Err(())
+        })
+    }
+}
+
+/// `sealed/anchors.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorsFile {
+    /// Oldest first, each checked.
+    #[serde(default)]
+    pub proofs: Vec<AnchorProof>,
+}
+
+fn path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join(SEALED_DIR).join(ANCHORS)
+}
+
+impl AnchorsFile {
+    /// A missing file is no proofs.
+    pub fn load(agent_dir: &Path) -> std::io::Result<Self> {
+        match std::fs::read(path(agent_dir)) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The newest kept proof, for the verdict line. Unreadable: none, and
+    /// a WARN.
+    pub fn newest(agent_dir: &Path) -> Option<AnchorProof> {
+        match Self::load(agent_dir) {
+            Ok(file) => file.proofs.last().cloned(),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path(agent_dir).display(),
+                    error = %e,
+                    "sealed/anchors.json unreadable; no anchor named"
+                );
+                None
+            }
+        }
+    }
+
+    fn save(&self, agent_dir: &Path) -> std::io::Result<()> {
+        write_atomic(&path(agent_dir), &serde_json::to_vec_pretty(self)?)
+    }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().expect("in sealed/");
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("writing");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Why a proof wasn't kept, or the fetch failed. Ids and hashes only.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProofError {
+    #[error("the proofs could not be fetched: {0}")]
+    Fetch(String),
+    #[error("{anc_id} names entry {entry_hash} at seq {seq}, which is not one of the agent's own")]
+    NotOwn {
+        anc_id: GovernanceLogId,
+        entry_hash: Sha256Hex,
+        seq: u64,
+    },
+    #[error("{anc_id}'s date, root and count don't hash to the governance log's entry")]
+    NotTheLogs { anc_id: GovernanceLogId },
+    #[error("{anc_id}'s inclusion proof does not reach the governance log's root")]
+    DidNotCheck { anc_id: GovernanceLogId },
+    #[error("sealed/ unreadable: {0}")]
+    Local(String),
+}
+
+impl ProofError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Fetch(_) => "fetch",
+            Self::NotOwn { .. } => "not_own",
+            Self::NotTheLogs { .. } => "not_the_logs",
+            Self::DidNotCheck { .. } => "did_not_check",
+            Self::Local(_) => "local",
+        }
+    }
+}
+
+/// Fetch `id`'s proofs after the newest kept, and keep those that check,
+/// in order, up to the first that doesn't (stored before it is returned)
+/// or the first whose entry the verified log doesn't hold yet. Returns
+/// how many were kept.
+pub async fn fetch_proofs(
+    agent_dir: &Path,
+    id: AgentId,
+    signing: &SigningKey,
+    api: &dyn SealedApi,
+    verified: &VerifiedAnchors,
+) -> Result<usize, ProofError> {
+    let mut file = AnchorsFile::load(agent_dir).map_err(|e| ProofError::Local(e.to_string()))?;
+    let after = file.proofs.last().map(|p| p.anc_id.clone());
+    let proofs = api
+        .proofs(id, signing, after)
+        .await
+        .map_err(ProofError::Fetch)?;
+    if proofs.is_empty() {
+        return Ok(0);
+    }
+    let own: std::collections::HashMap<Sha256Hex, u64> = AgentSeal::new(agent_dir, id)
+        .sent()
+        .await
+        .map_err(|e| ProofError::Local(e.to_string()))?
+        .into_iter()
+        .map(|i| (i.entry.entry_hash(), i.entry.entry.seq))
+        .collect();
+    let mut kept = 0;
+    let mut failed = None;
+    for proof in proofs {
+        if file.proofs.iter().any(|p| p.anc_id == proof.anc_id) {
+            continue;
+        }
+        if own.get(&proof.entry_hash) != Some(&proof.seq) {
+            failed = Some(ProofError::NotOwn {
+                anc_id: proof.anc_id,
+                entry_hash: proof.entry_hash,
+                seq: proof.seq,
+            });
+            break;
+        }
+        let data = match verified.data(&proof) {
+            None => {
+                tracing::info!(
+                    event_type = "sealed_state_proof_waits",
+                    agent_id = %id,
+                    anc_id = %proof.anc_id,
+                    "a proof for an ANC entry newer than the verified governance log; next run"
+                );
+                break;
+            }
+            Some(Err(())) => {
+                failed = Some(ProofError::NotTheLogs {
+                    anc_id: proof.anc_id,
+                });
+                break;
+            }
+            Some(Ok(data)) => data,
+        };
+        if !proof.check(id, &data) {
+            failed = Some(ProofError::DidNotCheck {
+                anc_id: proof.anc_id,
+            });
+            break;
+        }
+        tracing::info!(
+            event_type = "sealed_state_proof_kept",
+            agent_id = %id,
+            anc_id = %proof.anc_id,
+            date = %proof.date,
+            seq = proof.seq,
+            "anchor proof checked against the governance log and kept"
+        );
+        file.proofs.push(proof);
+        kept += 1;
+    }
+    if kept > 0 {
+        file.save(agent_dir)
+            .map_err(|e| ProofError::Local(e.to_string()))?;
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(kept),
+    }
+}
+
+/// Tell Agora to publish `id`'s anchor, once, if its ledger says
+/// `publish`. `Ok(true)`: told now.
+pub async fn publish_if_chosen(
+    agent_dir: &Path,
+    id: AgentId,
+    signing: &SigningKey,
+    api: &dyn SealedApi,
+) -> Result<bool, String> {
+    let marker = agent_dir.join(SEALED_DIR).join(PUBLISHED);
+    if std::fs::exists(&marker).map_err(|e| e.to_string())? {
+        return Ok(false);
+    }
+    let ledger = SealLedger::load(agent_dir)
+        .await
+        .map_err(|e| format!("sealed-state ledger unreadable: {e}"))?;
+    if ledger.choice() != Some(SealChoice::Publish) {
+        return Ok(false);
+    }
+    api.post_anchor(id, signing, true).await?;
+    write_atomic(&marker, chrono::Utc::now().to_rfc3339().as_bytes())
+        .map_err(|e| format!("told Agora, but sealed/published not written: {e}"))?;
+    tracing::info!(
+        event_type = "sealed_state_anchor_published",
+        agent_id = %id,
+        "the agent chose publish: its anchored head is shown on its profile"
+    );
+    Ok(true)
+}
+
+/// The alert for a proof or publish that failed.
+pub fn anchor_alert(id: AgentId, name: &str, what: &str, error: &str) -> Alert {
+    Alert::new(
+        AlertKind::SealedStateAnchorFailed,
+        format!("{name}: sealed-state anchor {what} failed"),
+    )
+    .agent(name, id)
+    .detail("what", what)
+    .detail("error", error)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::sealed::api::fake::FakeApi;
+    use crate::sealed::check::tests::enrolled;
+    use agora_agentkit::state::anchor::{anchor_leaf, inclusion_proof, merkle_root};
+
+    /// A ledger on file with `choice`.
+    pub(crate) async fn chose(dir: &Path, choice: SealChoice) {
+        use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
+        let mut l = SealLedger::default();
+        l.record(SealAsk {
+            at: chrono::Utc::now(),
+            offer_version: 1,
+            model: "m".into(),
+            order: SealChoice::ALL,
+            order_seed: 0,
+            constrained: true,
+            attempts: 1,
+            outcome: SealOutcome::Answered {
+                choice,
+                reason: String::new(),
+                memory_note_written: false,
+                note_dropped: None,
+                apply_failed: None,
+            },
+        });
+        l.save(dir).await.unwrap();
+    }
+
+    /// Every entry uploaded.
+    async fn all_sent(dir: &Path, id: AgentId) {
+        let seal = AgentSeal::new(dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+    }
+
+    /// An `ANC-` entry over `id`'s `head` among others, its proof, and
+    /// the log's attested data hash.
+    fn anchor(
+        n: u32,
+        id: AgentId,
+        head: Sha256Hex,
+        seq: u64,
+    ) -> (AnchorProof, GovernanceLogId, Sha256Hex) {
+        let mut leaves: Vec<Sha256Hex> = (0..4u8)
+            .map(|i| anchor_leaf(AgentId::new(), &Sha256Hex::from([i; 32])))
+            .collect();
+        leaves.insert(2, anchor_leaf(id, &head));
+        let root = merkle_root(&leaves);
+        let anc_id: GovernanceLogId = format!("ANC-2026-{n:04}").parse().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, n).unwrap();
+        let data = AnchorData {
+            date,
+            root,
+            agents: leaves.len() as u32,
+        };
+        let attested = agora_agentkit::govlog::data_hash(&serde_json::to_value(&data).unwrap());
+        (
+            AnchorProof {
+                anc_id: anc_id.clone(),
+                date,
+                root,
+                entry_hash: head,
+                seq,
+                leaf_index: 2,
+                leaf_count: leaves.len() as u32,
+                proof: inclusion_proof(&leaves, 2).unwrap(),
+            },
+            anc_id,
+            attested,
+        )
+    }
+
+    async fn head(dir: &Path, id: AgentId) -> (Sha256Hex, u64) {
+        let h = AgentSeal::new(dir, id).head().await.unwrap().unwrap().head;
+        (h.entry_hash, h.seq)
+    }
+
+    #[tokio::test]
+    async fn a_proof_is_kept_only_when_it_checks_and_is_the_agents_own() {
+        let root = crate::sealed::TestDir::new("anchors");
+        let (id, keys, dir) = enrolled(&root).await;
+        all_sent(&dir, id).await;
+        let signing = keys.signing(id).unwrap();
+        let (hash, seq) = head(&dir, id).await;
+        let (good, anc, attested) = anchor(2, id, hash, seq);
+        let api = FakeApi::new();
+        api.proofs.lock().unwrap().push(good.clone());
+
+        // Not in the verified log yet: waits, nothing stored
+        let none = VerifiedAnchors::default();
+        assert_eq!(fetch_proofs(&dir, id, &signing, &api, &none).await, Ok(0));
+        assert!(AnchorsFile::newest(&dir).is_none());
+
+        let verified = VerifiedAnchors::new([(anc.clone(), attested)]);
+        assert_eq!(
+            fetch_proofs(&dir, id, &signing, &api, &verified).await,
+            Ok(1)
+        );
+        assert_eq!(AnchorsFile::newest(&dir), Some(good.clone()));
+        // Asked after the newest kept: nothing new
+        assert_eq!(
+            fetch_proofs(&dir, id, &signing, &api, &verified).await,
+            Ok(0)
+        );
+
+        // Someone else's head, at our seq: never stored
+        let (theirs, anc3, attested3) = anchor(3, id, Sha256Hex::from([9; 32]), seq);
+        api.proofs.lock().unwrap().push(theirs);
+        let verified = VerifiedAnchors::new([(anc.clone(), attested), (anc3, attested3)]);
+        let e = fetch_proofs(&dir, id, &signing, &api, &verified)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "not_own", "{e}");
+        // Our head at the wrong seq
+        let mut wrong_seq = good.clone();
+        wrong_seq.anc_id = "ANC-2026-0003".parse().unwrap();
+        wrong_seq.seq += 1;
+        *api.proofs.lock().unwrap() = vec![good.clone(), wrong_seq];
+        assert_eq!(
+            fetch_proofs(&dir, id, &signing, &api, &verified)
+                .await
+                .unwrap_err()
+                .kind(),
+            "not_own"
+        );
+        assert_eq!(AnchorsFile::load(&dir).unwrap().proofs, vec![good]);
+    }
+
+    #[tokio::test]
+    async fn a_forged_proof_is_rejected() {
+        let root = crate::sealed::TestDir::new("anchors-forged");
+        let (id, keys, dir) = enrolled(&root).await;
+        all_sent(&dir, id).await;
+        let signing = keys.signing(id).unwrap();
+        let (hash, seq) = head(&dir, id).await;
+        let (good, anc, attested) = anchor(2, id, hash, seq);
+        let verified = VerifiedAnchors::new([(anc, attested)]);
+        let api = FakeApi::new();
+
+        // A server root that isn't the log's: refused before the path
+        let mut other_root = good.clone();
+        other_root.root = Sha256Hex::from([7; 32]);
+        *api.proofs.lock().unwrap() = vec![other_root];
+        let e = fetch_proofs(&dir, id, &signing, &api, &verified)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "not_the_logs", "{e}");
+
+        // The log's root, a path that doesn't reach it
+        let mut bad_path = good.clone();
+        bad_path.proof[0].sibling = Sha256Hex::from([8; 32]);
+        *api.proofs.lock().unwrap() = vec![bad_path];
+        let e = fetch_proofs(&dir, id, &signing, &api, &verified)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "did_not_check", "{e}");
+
+        assert!(AnchorsFile::newest(&dir).is_none(), "nothing stored");
+        // Fetch fails: an error, nothing stored
+        *api.fail.lock().unwrap() = Some("proofs");
+        assert_eq!(
+            fetch_proofs(&dir, id, &signing, &api, &verified)
+                .await
+                .unwrap_err()
+                .kind(),
+            "fetch"
+        );
+        assert!(!dir.join("sealed").join(ANCHORS).exists());
+    }
+
+    #[tokio::test]
+    async fn publish_is_sent_once_and_only_for_publish() {
+        let root = crate::sealed::TestDir::new("anchors-publish");
+        let (id, keys, dir) = enrolled(&root).await;
+        let signing = keys.signing(id).unwrap();
+        let api = FakeApi::new();
+        // No ledger: nothing
+        assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
+        for (choice, sent) in [(SealChoice::Private, false), (SealChoice::Publish, true)] {
+            chose(&dir, choice).await;
+            assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(sent));
+        }
+        assert_eq!(*api.anchored.lock().unwrap(), vec![true]);
+        assert!(dir.join("sealed").join(PUBLISHED).exists());
+        assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
+        assert_eq!(api.anchored.lock().unwrap().len(), 1, "once");
+    }
+
+    #[tokio::test]
+    async fn a_failed_publish_is_retried() {
+        let root = crate::sealed::TestDir::new("anchors-publish-fail");
+        let (id, keys, dir) = enrolled(&root).await;
+        let signing = keys.signing(id).unwrap();
+        chose(&dir, SealChoice::Publish).await;
+        let api = FakeApi::new();
+        *api.fail.lock().unwrap() = Some("post_anchor");
+        assert!(publish_if_chosen(&dir, id, &signing, &api).await.is_err());
+        assert!(!dir.join("sealed").join(PUBLISHED).exists());
+        *api.fail.lock().unwrap() = None;
+        assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(true));
+    }
+}

@@ -7,9 +7,14 @@
 //! and queued for upload by agentkit's `Mirrored` storage; the [`drain`]er
 //! uploads it, away from the reactor's storage lock. Before any session,
 //! the [`check`] compares each enrolled agent's state with its last sealed
-//! version: a state that matches nothing is **refused** (left out, a
-//! notice kept for the agent, the operator mailed), and only
-//! `agora-seed sealed-accept` ([`accept`]) lets it run again.
+//! version: a state that matches nothing is **refused** (a notice kept for
+//! the agent, the operator mailed), and the **whole run** with it (exit
+//! [`REFUSED_RUN_EXIT`]): a state that matches nothing is likely
+//! fleet-wide. `agora-seed sealed-restore` ([`restore`]) puts the last
+//! sealed version back; `agora-seed sealed-accept --note` ([`accept`])
+//! keeps the state as it is, and the agent is shown the note and a diff.
+//! The drainer also fetches each agent's anchor proofs and keeps those
+//! that check against the governance log ([`anchors`]).
 //! `agora-seed rotate-keys` ([`rotate`]) rotates an agent's keys and
 //! re-wraps its state key.
 //!
@@ -17,8 +22,11 @@
 //! seal it; nothing here logs or prints any of its content. Writes are new
 //! files under `<state>/<id>/sealed/` (agentkit's layout, plus this
 //! module's `notice.json`) and the key files in `<secrets>/<id>/`
-//! ([`keys`]). Nothing here deletes a file: what is superseded is renamed
-//! aside.
+//! ([`keys`]), plus `sealed/anchors.json` and `sealed/published`
+//! ([`anchors`]). The agent's `state.json` is written only by
+//! `sealed-restore`, through agentkit's `FsStorage`, which renames the
+//! state it replaces to `state.<utc>.json` first. Nothing here deletes a
+//! file: what is superseded is renamed aside.
 //!
 //! **Who is sealed.** An agent is sealed exactly when its
 //! `sealed/enrolled` marker exists ([`SealedEnrolment`]); the
@@ -27,6 +35,7 @@
 //! a state the seal never saw, and be refused.
 
 pub mod accept;
+pub mod anchors;
 pub mod api;
 pub mod check;
 pub mod cli;
@@ -34,10 +43,12 @@ pub mod drain;
 pub mod enroll;
 pub mod keys;
 pub mod notice;
+pub mod restore;
 pub mod rotate;
 pub mod session;
 pub mod sizes;
 pub mod stop;
+pub mod version;
 
 use std::path::{Path, PathBuf};
 
@@ -46,6 +57,12 @@ use agora_agentkit::state::outbox::AgoraOutbox;
 use agora_agentkit::state::storage::{Enrolment, Mirrored, SEALED_DIR, SealKeys};
 
 pub use keys::KeyStore;
+
+/// The runner's exit code when the start check refused any agent, so the
+/// whole run did not start. The systemd unit doesn't restart on it
+/// (`RestartPreventExitStatus=`): only an operator's `sealed-restore` or
+/// `sealed-accept` can resolve it. EX_TEMPFAIL's number, nothing else.
+pub const REFUSED_RUN_EXIT: i32 = 75;
 
 /// agentkit's sealed storage, as the runner configures it.
 pub type MirroredStorage = Mirrored<

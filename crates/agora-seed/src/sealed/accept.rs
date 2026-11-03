@@ -33,7 +33,7 @@ use chrono::Utc;
 
 use super::KeyStore;
 use super::api::SealedApi;
-use super::notice::{Notice, Refusal};
+use super::notice::{Diff, Notice, Refusal};
 
 /// What the refusal marker says, as a [`Refusal`].
 fn refusal_of(text: &str) -> Refusal {
@@ -134,7 +134,7 @@ pub async fn accept(
     let head = match (adopted, note) {
         (Some(Adopted::Intact(head)), note) => {
             seal.clear_refusal().await.context("clearing the refusal")?;
-            Notice::accept(&agent_dir, note.unwrap_or(REBUILT_NOTE), reason)
+            Notice::accept(&agent_dir, note.unwrap_or(REBUILT_NOTE), reason, None)
                 .context("writing the notice")?;
             head
         }
@@ -146,6 +146,29 @@ pub async fn accept(
         ),
         (None, None) => anyhow::bail!("--note is required: the agent reads it"),
         (_, Some(note)) => {
+            // What the agent will be shown beside the note: the last sealed
+            // version against the state accepted. Local only, never logged
+            let diff = match super::version::last_sealed(&seal, keys, api, id).await {
+                // line_diff can take seconds by design: off the runtime
+                Ok(last) => {
+                    let after = current.clone();
+                    tokio::task::spawn_blocking(move || Diff::between(&last.state, &after))
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(agent_id = %id, error = %e, "the diff task failed");
+                            Diff::unavailable()
+                        })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event_type = "sealed_accept_no_diff",
+                        agent_id = %id,
+                        error = %e,
+                        "the last sealed version couldn't be opened; accepted without a diff"
+                    );
+                    Diff::unavailable()
+                }
+            };
             seal.clear_refusal().await.context("clearing the refusal")?;
             let head = super::session::append(
                 &seal,
@@ -161,7 +184,7 @@ pub async fn accept(
                 "sealing the accepted state (the refusal is cleared; the next start checks it)",
             )?;
             super::enroll::record_sizes(&agent_dir, head, now, &current);
-            Notice::accept(&agent_dir, note, reason).context("writing the notice")?;
+            Notice::accept(&agent_dir, note, reason, Some(diff)).context("writing the notice")?;
             head
         }
     };
@@ -388,6 +411,99 @@ mod tests {
         )
         .await;
         assert!(matches!(out, Outcome::Run { notice: false, .. }), "{out:?}");
+    }
+
+    /// A deliberate edit, accepted: the agent reads the note, then what
+    /// changed, counted; with the last version unopenable, it is told no
+    /// diff could be made.
+    #[tokio::test]
+    async fn an_accepted_edit_shows_the_note_then_the_diff() {
+        let root = crate::sealed::TestDir::new("accept-diff");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        let state_dir = root.join("state");
+        let edited = serde_json::json!({
+            "memory": { "content": "first line\nan edited line\nthird line\nfourth\n" },
+            "soul": { "name": "tarn" },
+        });
+        FsStorage::new(&state_dir)
+            .save_raw(id, edited, None)
+            .await
+            .unwrap();
+        let Outcome::Refuse { reason, detail } = check::check(
+            &dir,
+            id,
+            &local(&root, id).await,
+            Default::default(),
+            &keys,
+            &api,
+        )
+        .await
+        else {
+            panic!()
+        };
+        check::refuse(&dir, id, "tarn", reason, &detail, &Alerter::off()).await;
+        accept(&state_dir, &keys, &api, id, Some("I edited it by hand."))
+            .await
+            .unwrap();
+        let notice = Notice::load(&dir).unwrap().unwrap();
+        let diff = notice.diff.clone().unwrap();
+        assert!(diff.text.is_some() && !diff.cut);
+        let line = notice.line().unwrap();
+        let (note, shown) = line.split_once("\n\n").unwrap();
+        assert!(
+            note.ends_with("with this note: I edited it by hand."),
+            "{line}"
+        );
+        assert!(
+            shown.starts_with(&format!(
+                "What changed from your last sealed version to the state your operator \
+                 accepted (+{} / \u{2212}{} lines):\nMemory:\n",
+                diff.added, diff.removed
+            )),
+            "{shown}"
+        );
+        assert!(diff.added >= 4, "{diff:?}");
+        assert!(
+            shown.contains("  + an edited line") && shown.contains("Soul:\n"),
+            "{shown}"
+        );
+
+        // Again, with the sealed blobs gone and Agora unreachable
+        let root = crate::sealed::TestDir::new("accept-nodiff");
+        let (id, keys, dir) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        FsStorage::new(&state_dir)
+            .save_raw(id, serde_json::json!({ "memory": "changed" }), None)
+            .await
+            .unwrap();
+        let Outcome::Refuse { reason, detail } = check::check(
+            &dir,
+            id,
+            &local(&root, id).await,
+            Default::default(),
+            &keys,
+            &api,
+        )
+        .await
+        else {
+            panic!()
+        };
+        check::refuse(&dir, id, "tarn", reason, &detail, &Alerter::off()).await;
+        std::fs::rename(dir.join("sealed/blobs"), root.join("blobs.moved")).unwrap();
+        std::fs::create_dir_all(dir.join("sealed/blobs")).unwrap();
+        *api.fail.lock().unwrap() = Some("blob");
+        accept(&state_dir, &keys, &api, id, Some("offline"))
+            .await
+            .unwrap();
+        let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+        assert!(
+            line.ends_with(&format!(
+                "with this note: offline\n\n{}",
+                super::super::notice::NO_DIFF
+            )),
+            "{line}"
+        );
     }
 
     /// Every blob and entry the agent holds, on a fake Agora.

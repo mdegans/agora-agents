@@ -4,8 +4,8 @@
 use agora_agentkit::client::{Client, StateAuth};
 use agora_agentkit::crypto::SigningKey;
 use agora_agentkit::envelope::EncryptionPublicKey;
-use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::{KeyRotation, SignedStateEntry, StateKeyRecord};
+use agora_agentkit::ids::{AgentId, GovernanceLogId};
+use agora_agentkit::state::{AnchorProof, KeyRotation, SignedStateEntry, StateKeyRecord};
 
 /// How an error string from [`SealedApi::rotate_key`] begins when the
 /// server's head moved on (a 409).
@@ -55,6 +55,17 @@ pub trait SealedApi: Send + Sync {
         key: &SigningKey,
         sha256: &agora_agentkit::govlog::Sha256Hex,
     ) -> Result<Vec<u8>, String>;
+    /// The agent's heads in `ANC-` entries after `after`, oldest first.
+    /// Untrusted until checked ([`super::anchors`]).
+    async fn proofs(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        after: Option<GovernanceLogId>,
+    ) -> Result<Vec<AnchorProof>, String>;
+    /// Whether the agent's anchored head is shown on its profile.
+    async fn post_anchor(&self, id: AgentId, key: &SigningKey, publish: bool)
+    -> Result<(), String>;
 }
 
 fn auth(id: AgentId, key: &SigningKey) -> StateAuth<'_> {
@@ -147,6 +158,29 @@ impl SealedApi for Client {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn proofs(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        after: Option<GovernanceLogId>,
+    ) -> Result<Vec<AnchorProof>, String> {
+        self.get_state_proofs(auth(id, key), after)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn post_anchor(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        publish: bool,
+    ) -> Result<(), String> {
+        self.post_state_anchor(auth(id, key), publish)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +201,10 @@ pub mod fake {
         pub rotations: Mutex<Vec<KeyRotation>>,
         /// Blobs the server holds, by hash.
         pub blobs: Mutex<std::collections::HashMap<agora_agentkit::govlog::Sha256Hex, Vec<u8>>>,
+        /// The proofs the server lists, all of them: `after` filters.
+        pub proofs: Mutex<Vec<AnchorProof>>,
+        /// Every `post_anchor`'s `publish`.
+        pub anchored: Mutex<Vec<bool>>,
     }
 
     impl FakeApi {
@@ -179,6 +217,8 @@ pub mod fake {
                 public_key: Mutex::default(),
                 rotations: Mutex::default(),
                 blobs: Mutex::default(),
+                proofs: Mutex::default(),
+                anchored: Mutex::default(),
             }
         }
 
@@ -288,6 +328,35 @@ pub mod fake {
                 .get(sha256)
                 .cloned()
                 .ok_or_else(|| "404".to_string())
+        }
+
+        async fn proofs(
+            &self,
+            _: AgentId,
+            _: &SigningKey,
+            after: Option<GovernanceLogId>,
+        ) -> Result<Vec<AnchorProof>, String> {
+            self.call("proofs")?;
+            Ok(self
+                .proofs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| after.as_ref().is_none_or(|a| p.anc_id > *a))
+                .cloned()
+                .collect())
+        }
+
+        async fn post_anchor(
+            &self,
+            _: AgentId,
+            key: &SigningKey,
+            publish: bool,
+        ) -> Result<(), String> {
+            self.call("post_anchor")?;
+            self.signed_by(key)?;
+            self.anchored.lock().unwrap().push(publish);
+            Ok(())
         }
     }
 }

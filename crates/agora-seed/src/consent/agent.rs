@@ -10343,6 +10343,7 @@ mod tests {
             &dir,
             "a test",
             crate::sealed::notice::Refusal::Mismatch,
+            None,
         )
         .unwrap();
         let rt = Arc::get_mut(&mut h.rt).unwrap();

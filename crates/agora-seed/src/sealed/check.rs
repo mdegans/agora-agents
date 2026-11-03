@@ -28,9 +28,9 @@ use std::path::Path;
 use agora_agentkit::enums::StateEntryKind;
 use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::SignedStateEntry;
 use agora_agentkit::state::storage::{AgentSeal, Recovery};
 use agora_agentkit::state::verify::{HeadRef, HeadStatus, head_status, verify_chain};
+use agora_agentkit::state::{AnchorProof, SignedStateEntry};
 
 use super::KeyStore;
 use super::api::SealedApi;
@@ -40,7 +40,7 @@ use crate::alerts::{Alert, AlertKind, Alerter};
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.147.1:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.148.0:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,14 +131,16 @@ pub enum Server {
 }
 
 /// The verdict line for an intact chain: the verdict, the snapshots since
-/// the earliest one's date, a pre-loss copy apart, the head marker, and
-/// the state's sizes (counts only).
+/// the earliest one's date, a pre-loss copy apart, the newest anchor the
+/// runner checked ([`super::anchors`]), the head marker, and the state's
+/// sizes (counts only).
 pub fn verdict_line(
     line: &[SignedStateEntry],
     head: &HeadRef,
     sizes: Sizes,
     previous: Option<Sizes>,
     server: Server,
+    anchor: Option<&AnchorProof>,
 ) -> String {
     // "13,539 characters (−1,204 since your last checked version)"
     let change = |now: usize, before: Option<usize>, long: bool| -> String {
@@ -179,10 +181,21 @@ pub fn verdict_line(
         .and_then(|e| day(e.entry.state_at))
         .map(|d| format!(", plus a copy of your state from before a loss, dated {d}"))
         .unwrap_or_default();
+    let anchored = anchor
+        .map(|a| {
+            format!(
+                "; your version of {} is in {} (checked by your runner against the governance \
+                 log)",
+                a.date.format("%Y-%m-%d"),
+                a.anc_id
+            )
+        })
+        .unwrap_or_default();
     let mut short = head.entry_hash.to_hex();
     short.truncate(12);
     format!(
-        "Your sealed state: {verdict} {} version{} since {since}{prior}; this session starts from \
+        "Your sealed state: {verdict} {} version{} since {since}{prior}{anchored}; this session \
+         starts from \
          head {short} (a marker for this version; the next session's will differ). Your memory \
          is {} characters{memory_change} and your soul {}{soul_change}, as at your last sealed \
          version. Checked by \
@@ -433,6 +446,8 @@ pub async fn check(
     {
         tracing::warn!(agent_id = %id, error = %e, "sealed sizes not recorded");
     }
+    // Read here, never fetched: no network for this at the start
+    let anchor = super::anchors::AnchorsFile::newest(agent_dir);
     let drop_lines: Vec<String> = drops.iter().map(|d| d.1.clone()).collect();
     let drops: Vec<(&'static str, u32)> = drops.iter().map(|d| (d.0, d.2)).collect();
     if seal_failed.is_some() {
@@ -452,6 +467,7 @@ pub async fn check(
             sizes,
             previous,
             Server::Unchecked,
+            anchor.as_ref(),
         ));
         seat.extend(drop_lines);
         return Outcome::Run {
@@ -490,7 +506,14 @@ pub async fn check(
             (HeadStatus::Pending, Server::Unchecked)
         }
     };
-    seat.push(verdict_line(&line, &head, sizes, previous, server_said));
+    seat.push(verdict_line(
+        &line,
+        &head,
+        sizes,
+        previous,
+        server_said,
+        anchor.as_ref(),
+    ));
     seat.extend(drop_lines);
     let hold = match status {
         HeadStatus::Same | HeadStatus::Pending => None,
@@ -788,6 +811,69 @@ pub(crate) mod tests {
                 "Your sealed state: intact here; Agora's copy couldn't be checked this session."
             ),
             "{seat:?}"
+        );
+    }
+
+    /// The newest kept anchor proof is named, read from sealed/anchors.json
+    /// at the check; none kept, no clause.
+    #[tokio::test]
+    async fn the_verdict_names_the_newest_kept_anchor() {
+        let root = crate::sealed::TestDir::new("check-anchor");
+        let (id, keys, dir) = enrolled(&root).await;
+        let server = server(Vec::new());
+        let verdict = async || {
+            let out = check(
+                &dir,
+                id,
+                &local_hash(&root, id).await,
+                Sizes::default(),
+                &keys,
+                &server,
+            )
+            .await;
+            let Outcome::Run { seat, .. } = out else {
+                panic!("{out:?}")
+            };
+            seat[0].clone()
+        };
+        assert!(!verdict().await.contains("governance log"));
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
+        let proof = |n: u32| AnchorProof {
+            anc_id: format!("ANC-2026-{n:04}").parse().unwrap(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 11, n).unwrap(),
+            root: Sha256Hex::from([1; 32]),
+            entry_hash: head.entry_hash,
+            seq: head.seq,
+            leaf_index: 0,
+            leaf_count: 1,
+            proof: Vec::new(),
+        };
+        let file = crate::sealed::anchors::AnchorsFile {
+            proofs: vec![proof(2), proof(3)],
+        };
+        std::fs::write(
+            dir.join("sealed").join(crate::sealed::anchors::ANCHORS),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let line = verdict().await;
+        assert!(
+            line.contains(
+                "; your version of 2026-11-03 is in ANC-2026-0003 (checked by your runner \
+                 against the governance log); this session starts from head "
+            ),
+            "{line}"
+        );
+        assert_eq!(
+            server
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| *c == "proofs")
+                .count(),
+            0,
+            "no network for it"
         );
     }
 
@@ -1199,13 +1285,22 @@ pub(crate) mod tests {
             },
             None,
             Server::Other,
+            None,
         );
         assert!(
-            verdict_line(&line, &head, Sizes::default(), None, Server::InStep)
+            verdict_line(&line, &head, Sizes::default(), None, Server::InStep, None)
                 .starts_with("Your sealed state: intact, and in step with Agora. 2 versions")
         );
         assert!(
-            verdict_line(&line, &head, Sizes::default(), None, Server::Unchecked).starts_with(
+            verdict_line(
+                &line,
+                &head,
+                Sizes::default(),
+                None,
+                Server::Unchecked,
+                None
+            )
+            .starts_with(
                 "Your sealed state: intact here; Agora's copy couldn't be checked this session. 2"
             )
         );
@@ -1232,7 +1327,7 @@ pub(crate) mod tests {
             memory_chars: 14_743,
             soul_chars: 3_440,
         };
-        let text = verdict_line(&line, &head, now, Some(before), Server::Other);
+        let text = verdict_line(&line, &head, now, Some(before), Server::Other, None);
         assert!(
             text.contains(
                 "Your memory is 13,539 characters (\u{2212}1,204 since your last checked version) \
@@ -1240,10 +1335,31 @@ pub(crate) mod tests {
             ),
             "{text}"
         );
-        let grown = verdict_line(&line, &head, before, Some(now), Server::Other);
+        let grown = verdict_line(&line, &head, before, Some(now), Server::Other, None);
         assert!(
             grown.contains("14,743 characters (+1,204 since your last checked version)"),
             "{grown}"
+        );
+        // The newest anchor the runner checked, named
+        let proof = AnchorProof {
+            anc_id: "ANC-2026-0004".parse().unwrap(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+            root: Sha256Hex::from([1; 32]),
+            entry_hash: head.entry_hash,
+            seq: 3,
+            leaf_index: 0,
+            leaf_count: 1,
+            proof: Vec::new(),
+        };
+        let anchored = verdict_line(&line, &head, now, None, Server::InStep, Some(&proof));
+        assert!(
+            anchored.starts_with(
+                "Your sealed state: intact, and in step with Agora. 2 versions since 2026-07-25, \
+                 plus a copy of your state from before a loss, dated 2026-05-03; your version of \
+                 2026-11-02 is in ANC-2026-0004 (checked by your runner against the governance \
+                 log); this session starts from head "
+            ),
+            "{anchored}"
         );
     }
 

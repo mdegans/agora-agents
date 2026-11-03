@@ -35,7 +35,11 @@ TimeoutStopSec=35min
 # `systemctl kill` (`just runner-stop`) stays stopped. 130/143: the
 # immediate exit a second signal asks for, as the kill it replaces was.
 SuccessExitStatus=3 130 143
-RestartPreventExitStatus=3
+# 75: the sealed-state start check refused agents, so the whole run did not
+# start (a failure, so it mails). Restarting can't fix it: only the
+# operator's `agora-seed sealed-restore` or `sealed-accept --note` can, then
+# `systemctl --user start` (or `just runner-restart`).
+RestartPreventExitStatus=3 75
 
 [Install]
 WantedBy=default.target

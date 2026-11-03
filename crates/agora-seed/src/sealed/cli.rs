@@ -52,6 +52,18 @@ pub enum Command {
         #[arg(long, requires = "note")]
         rebase: bool,
     },
+    /// Put a refused agent's last sealed version back as its state: the
+    /// chain verified, missing blobs fetched from Agora and checked, the
+    /// plaintext hash matched to head.json. The state found is archived
+    /// (state.<utc>.json), the refusal cleared, and the agent told at its
+    /// next session. No new version is sealed.
+    SealedRestore {
+        #[arg(long)]
+        agent: AgentId,
+        /// Added to what the agent is told.
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Stop an agent's sealed backups, at its request: what waits is
     /// uploaded first, the history stays, and the agent is shown the note.
     /// `sealed-enroll --agent` resumes them.
@@ -97,7 +109,7 @@ pub async fn run(
         } => {
             let enroller = super::enroll::Enroller {
                 state_dir: state_dir.clone(),
-                keys,
+                keys: keys.clone(),
                 api: Arc::new(client.clone()),
                 restore,
             };
@@ -110,7 +122,7 @@ pub async fn run(
                 println!("nobody to enrol");
             }
             let outbox = AgoraOutbox::new(
-                client,
+                client.clone(),
                 &state_dir,
                 Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
             );
@@ -123,7 +135,38 @@ pub async fn run(
                     Ok(report) if dry_run => println!("{id}: would seal: {report}"),
                     Ok(report) => {
                         let uploaded = match outbox.drain(id).await {
-                            Ok(d) => format!("uploaded {}, {:?}", d.uploaded, d.status),
+                            Ok(d) => {
+                                // Its own choice: the anchor on its profile,
+                                // once its head is on Agora (else the
+                                // runner's drainer does it)
+                                let published = match keys.signing(id) {
+                                    Some(signing) if d.waiting == 0 => {
+                                        match super::anchors::publish_if_chosen(
+                                            &state_dir.join(id.to_string()),
+                                            id,
+                                            &signing,
+                                            &client,
+                                        )
+                                        .await
+                                        {
+                                            Ok(true) => "; anchor published (its choice)",
+                                            Ok(false) => "",
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    event_type = "sealed_state_anchor_failed",
+                                                    agent_id = %id,
+                                                    what = "publish",
+                                                    error = %e,
+                                                    "publishing the anchor failed; the runner retries"
+                                                );
+                                                "; publishing the anchor failed (the runner retries)"
+                                            }
+                                        }
+                                    }
+                                    _ => "",
+                                };
+                                format!("uploaded {}, {:?}{published}", d.uploaded, d.status)
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     event_type = "sealed_enroll_upload_failed",
@@ -184,6 +227,18 @@ pub async fn run(
                 } else {
                     ""
                 },
+            );
+        }
+        Command::SealedRestore { agent, note } => {
+            let done =
+                super::restore::restore(&state_dir, &keys, &client, agent, note.as_deref()).await?;
+            println!(
+                "{agent}: restored ({}) from its sealed version of {} (head {} at seq {}); the \
+                 state found is archived beside state.json",
+                done.reason.as_str(),
+                done.from.format("%Y-%m-%d"),
+                done.head.entry_hash,
+                done.head.seq
             );
         }
         Command::SealedStop { agent, note } => {

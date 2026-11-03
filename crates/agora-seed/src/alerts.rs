@@ -120,6 +120,12 @@ pub enum AlertKind {
     SealedStateRotationUnknown,
     /// An agent's `rotate-keys` didn't finish; it is left out until it does.
     SealedStateRotationUnfinished,
+    /// The start check refused one or more agents, so the whole run did
+    /// not start (exit [`crate::sealed::REFUSED_RUN_EXIT`]).
+    SealedStateRefusedRun,
+    /// An anchor proof didn't check, couldn't be fetched, or publishing
+    /// the anchor failed. Nothing was stored.
+    SealedStateAnchorFailed,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -128,7 +134,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -149,6 +155,8 @@ impl AlertKind {
         Self::SealedStateUnreadable,
         Self::SealedStateRotationUnknown,
         Self::SealedStateRotationUnfinished,
+        Self::SealedStateRefusedRun,
+        Self::SealedStateAnchorFailed,
     ];
 
     /// The `event_type` the runner logs this under.
@@ -174,6 +182,8 @@ impl AlertKind {
             Self::SealedStateUnreadable => "sealed_state_unreadable",
             Self::SealedStateRotationUnknown => "sealed_state_rotation_unknown",
             Self::SealedStateRotationUnfinished => "sealed_state_rotation_unfinished",
+            Self::SealedStateRefusedRun => "sealed_state_refused_run",
+            Self::SealedStateAnchorFailed => "sealed_state_anchor_failed",
             Self::Test => "test_alert",
         }
     }
@@ -330,6 +340,27 @@ impl AlertKind {
                  refusal or a notice to the agent, until it does. Stop the \
                  runner and run the rotate-keys command below again: it \
                  resumes where it stopped."
+            }
+            Self::SealedStateRefusedRun => {
+                "The seed runner refused to run: the sealed-state start check \
+                 refused the agents listed below (a state that matches no \
+                 sealed version, a chain that doesn't verify, or a lost \
+                 head), and a state that matches nothing is likely \
+                 fleet-wide, so no agent runs. The unit does not restart on \
+                 this exit (75). For each agent: `agora-seed sealed-restore \
+                 --agent <id>` puts its last sealed version back (damage), or \
+                 `agora-seed sealed-accept --agent <id> --note \"…\"` keeps \
+                 its state (a deliberate change); then start the runner. Look \
+                 at counts and sizes, not content."
+            }
+            Self::SealedStateAnchorFailed => {
+                "An agent's sealed-state anchor proof could not be fetched or \
+                 did not check against the governance log (it names an entry \
+                 that isn't the agent's, or its root or path isn't the \
+                 log's), or telling Agora to publish the agent's anchor \
+                 failed. Nothing was stored; the runner tries again later. A \
+                 proof that doesn't check is the server's claim failing: \
+                 compare it with the ANC entry before anything else."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

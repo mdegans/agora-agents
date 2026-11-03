@@ -1536,6 +1536,84 @@ struct SealedRun {
     drained: Vec<(AgentId, String)>,
     /// Those whose uploads are held this run.
     held: Vec<AgentId>,
+    /// Those refused, with their names: any one refuses the whole run
+    /// ([`refuse_run`]).
+    refused: Vec<(AgentId, String, sealed::notice::Refusal)>,
+}
+
+/// The start check refused agents, so the run doesn't start: `main` exits
+/// [`sealed::REFUSED_RUN_EXIT`] once the alerts are flushed.
+#[derive(Debug)]
+struct RefusedRun(usize);
+
+impl std::fmt::Display for RefusedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to run: the sealed-state start check refused {} agent(s); resolve each with \
+             `agora-seed sealed-restore --agent <id>` or `agora-seed sealed-accept --agent <id> \
+             --note \"…\"`",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RefusedRun {}
+
+/// Any refusal at the start check refuses the whole run (Steward,
+/// 2026-11-03): a state that matches no sealed version is likely
+/// fleet-wide, so the runner doesn't start with part of the fleet. One
+/// ERROR `sealed_state_refused_run` naming each agent, its reason and the
+/// commands that resolve it; one alert. Holds never come here.
+fn refuse_run(
+    refused: &[(AgentId, String, sealed::notice::Refusal)],
+    alerts: &alerts::Alerter,
+) -> Result<()> {
+    if refused.is_empty() {
+        return Ok(());
+    }
+    #[derive(serde::Serialize)]
+    struct RefusedAgent<'a> {
+        agent_id: AgentId,
+        name: &'a str,
+        reason: &'static str,
+        restore: String,
+        accept: String,
+    }
+    let agents: Vec<RefusedAgent> = refused
+        .iter()
+        .map(|(id, name, reason)| RefusedAgent {
+            agent_id: *id,
+            name,
+            reason: reason.as_str(),
+            restore: format!("agora-seed sealed-restore --agent {id}"),
+            accept: format!("agora-seed sealed-accept --agent {id} --note \"…\""),
+        })
+        .collect();
+    tracing::error!(
+        event_type = "sealed_state_refused_run",
+        refused = agents.len(),
+        agents = %serde_json::to_string(&agents).unwrap_or_default(),
+        "REFUSING TO RUN: the sealed-state start check refused agents; no agent runs"
+    );
+    let mut alert = alerts::Alert::new(
+        alerts::AlertKind::SealedStateRefusedRun,
+        format!(
+            "REFUSING TO RUN: the sealed-state start check refused {} agent(s)",
+            agents.len()
+        ),
+    );
+    for a in &agents {
+        alert = alert.detail(
+            "refused",
+            format!(
+                "{} ({}): {}; {} or {}",
+                a.name, a.agent_id, a.reason, a.restore, a.accept
+            ),
+        );
+    }
+    alerts.notify(alert);
+    Err(RefusedRun(agents.len()).into())
 }
 
 /// Check each enrolled agent ([`sealed::check`]): refused ones leave the
@@ -1596,11 +1674,12 @@ async fn sealed_start_check(
                 sealed::check::refuse(&dir, *id, &name, reason, &detail, alerts).await;
                 skipped.push(Skipped::new(
                     *id,
-                    Some(name),
+                    Some(name.clone()),
                     "sealed",
                     format!("refused: {}", reason.as_str()),
                 ));
                 refused.insert(*id);
+                run.refused.push((*id, name, reason));
             }
             sealed::check::Outcome::Run {
                 seat,
@@ -1710,9 +1789,16 @@ async fn main() -> Result<()> {
     // way out — `governance_log_refused` above all — is sent, not dropped.
     held.alerts.flush(ALERT_FLUSH).await;
     let stopped = held.stopped && result.is_ok();
+    let refused = matches!(&result, Err(e) if e.is::<RefusedRun>());
     drop(held);
     if stopped {
         std::process::exit(signals::STOPPED_EXIT);
+    }
+    if refused {
+        if let Err(e) = &result {
+            eprintln!("Error: {e:#}");
+        }
+        std::process::exit(sealed::REFUSED_RUN_EXIT);
     }
     result
 }
@@ -2064,6 +2150,9 @@ async fn run(held: &mut Held) -> Result<()> {
         &mut skipped,
     )
     .await;
+    // Before any reactor is built. A dry run checks nothing, so refuses
+    // nothing
+    refuse_run(&sealed_run.refused, &held.alerts)?;
     let sealed_offer = config
         .sealed_state
         .as_ref()
@@ -2230,7 +2319,7 @@ async fn run(held: &mut Held) -> Result<()> {
     // (agora#127): signatures, chain, and the head entry's content.
     // A log that does not verify stops the run before any agent acts.
     // A dry run verifies too — it is read-only and worth knowing.
-    govlog::verify(&context.inner.client, &data_dir, &held.alerts).await?;
+    let verified_anchors = govlog::verify(&context.inner.client, &data_dir, &held.alerts).await?;
     // The constitution the agents read must be the one the server serves,
     // whole: a truncated or stale copy stops the run the same way.
     let web_tools =
@@ -2428,12 +2517,20 @@ async fn run(held: &mut Held) -> Result<()> {
     let run_started = chrono::Utc::now();
     // Uploads, away from the reactors' storage lock: during the run, and
     // once more before exit
-    let drainer = Arc::new(sealed::drain::Drainer::new(
-        outbox.clone(),
-        sealed_run.drained,
-        sealed_run.held,
-        held.alerts.clone(),
-    ));
+    let drainer = Arc::new(
+        sealed::drain::Drainer::new(
+            outbox.clone(),
+            sealed_run.drained,
+            sealed_run.held,
+            held.alerts.clone(),
+        )
+        .with_anchors(sealed::drain::Anchors {
+            api: Arc::new(sealed_api.clone()),
+            keys: enrolment.keys_store().clone(),
+            state_dir: state_dir.clone(),
+            verified: verified_anchors,
+        }),
+    );
     let drain_task = drainer.spawn();
     let exit = signals::install(stop.clone(), Duration::from_secs(args.stop_deadline_secs))
         .context("installing the SIGINT and SIGTERM handlers")?;
@@ -2767,6 +2864,134 @@ mod tests {
         assert!(run.seats[&ok].lines[0].starts_with("Your sealed state: "));
         assert_eq!(run.drained.len(), 1);
         assert!(run.held.is_empty());
+    }
+
+    /// Fail closed: one refused agent among many refuses the whole run,
+    /// whatever the refusal; a hold doesn't.
+    #[tokio::test]
+    async fn one_refusal_refuses_the_whole_run_and_a_hold_does_not() {
+        let root = sealed::TestDir::new("main-refused-run");
+        let mut ids = Vec::new();
+        let mut keys = None;
+        for _ in 0..4 {
+            let (id, k, dir) = sealed::check::tests::enrolled(&root).await;
+            ids.push((id, dir));
+            keys.get_or_insert(k);
+        }
+        let keys = keys.unwrap();
+        let state_dir = root.join("state");
+        let names = ["tarn", "wren", "moss", "fern"];
+        let pool_of = || {
+            ids.iter()
+                .zip(names)
+                .map(|((id, _), n)| (*id, crate::agent_selection_tests::pooled(n).1))
+                .collect::<Vec<_>>()
+        };
+        let api = sealed::api::fake::FakeApi::new();
+        let check = async |pool: &mut Vec<(AgentId, SeedState)>| {
+            let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+                .await
+                .unwrap();
+            let mut skipped = Vec::new();
+            sealed_start_check(
+                pool,
+                &loaded.sealed,
+                &state_dir,
+                &keys,
+                &api,
+                &alerts::Alerter::off(),
+                false,
+                &mut skipped,
+            )
+            .await
+        };
+
+        // A hold (sealed/ unreadable) runs: the run goes on
+        let head = ids[3].1.join("sealed/head.json");
+        let saved = std::fs::read(&head).unwrap();
+        std::fs::write(&head, b"{ not json").unwrap();
+        let mut pool = pool_of();
+        let run = check(&mut pool).await;
+        assert_eq!(run.held, vec![ids[3].0]);
+        assert!(run.refused.is_empty());
+        assert!(refuse_run(&run.refused, &alerts::Alerter::off()).is_ok());
+        std::fs::write(&head, saved).unwrap();
+
+        // One wipe among four: the run is refused
+        FsStorage::new(&state_dir)
+            .save_raw(ids[1].0, serde_json::json!({ "memory": "" }), None)
+            .await
+            .unwrap();
+        let mut pool = pool_of();
+        let run = check(&mut pool).await;
+        assert_eq!(
+            run.refused
+                .iter()
+                .map(|(id, name, r)| (*id, name.as_str(), *r))
+                .collect::<Vec<_>>(),
+            vec![(ids[1].0, "wren", sealed::notice::Refusal::Mismatch)]
+        );
+        let e = refuse_run(&run.refused, &alerts::Alerter::off()).unwrap_err();
+        assert!(e.is::<RefusedRun>(), "{e:#}");
+        assert!(e.to_string().contains("sealed-restore"), "{e}");
+
+        // A lost head.json too: both named
+        let sealed = ids[2].1.join("sealed");
+        std::fs::rename(sealed.join("head.json"), sealed.join("head.json.lost")).unwrap();
+        let mut pool = pool_of();
+        let run = check(&mut pool).await;
+        let reasons: Vec<_> = run.refused.iter().map(|r| r.2).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                sealed::notice::Refusal::Mismatch,
+                sealed::notice::Refusal::HeadMissing
+            ]
+        );
+        assert!(refuse_run(&run.refused, &alerts::Alerter::off()).is_err());
+
+        // Every kind refuses the run
+        for reason in [
+            sealed::notice::Refusal::Mismatch,
+            sealed::notice::Refusal::ChainBroken,
+            sealed::notice::Refusal::HeadMissing,
+        ] {
+            let e = refuse_run(
+                &[(AgentId::new(), "tarn".into(), reason)],
+                &alerts::Alerter::off(),
+            )
+            .unwrap_err();
+            assert!(e.is::<RefusedRun>());
+        }
+    }
+
+    /// A dry run checks nothing, so refuses nothing.
+    #[tokio::test]
+    async fn a_dry_run_never_refuses_the_run() {
+        let root = sealed::TestDir::new("main-refused-dry");
+        let (id, keys, _) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        FsStorage::new(&state_dir)
+            .save_raw(id, serde_json::json!({ "memory": "" }), None)
+            .await
+            .unwrap();
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let mut pool = vec![(id, crate::agent_selection_tests::pooled("tarn").1)];
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &sealed::api::fake::FakeApi::new(),
+            &alerts::Alerter::off(),
+            true,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(run.refused.is_empty());
+        assert!(refuse_run(&run.refused, &alerts::Alerter::off()).is_ok());
     }
 
     /// A state that won't load is left out and returned for the sweep's

@@ -43,6 +43,7 @@ use agora_agentkit::responses::ContentResponse;
 use anyhow::Context;
 
 use crate::alerts::{Alert, AlertKind, Alerter};
+use crate::sealed::anchors::VerifiedAnchors;
 use serde::{Deserialize, Serialize};
 
 const PIN_FILE: &str = "governance_signing_key.pub";
@@ -101,9 +102,17 @@ impl std::error::Error for Refused {}
 ///
 /// Both failures log one ERROR `governance_log_refused` event and hand the
 /// same to `alerts`; `main` waits for that mail before exiting.
-pub async fn verify(client: &Client, data_dir: &Path, alerts: &Alerter) -> anyhow::Result<()> {
-    let alarms = match run(client, data_dir).await {
-        Ok(alarms) => alarms,
+///
+/// `Ok` carries the log's `ANC-` entries, with the `data_hash` each signed
+/// link attests: what the runner checks agents' anchor proofs against
+/// ([`crate::sealed::anchors`]).
+pub async fn verify(
+    client: &Client,
+    data_dir: &Path,
+    alerts: &Alerter,
+) -> anyhow::Result<VerifiedAnchors> {
+    let (alarms, anchors) = match run(client, data_dir).await {
+        Ok(found) => found,
         Err(e) => {
             let error = format!("{e:#}");
             tracing::error!(
@@ -122,7 +131,7 @@ pub async fn verify(client: &Client, data_dir: &Path, alerts: &Alerter) -> anyho
         }
     };
     if alarms.is_empty() {
-        Ok(())
+        Ok(anchors)
     } else {
         let listed: Vec<String> = alarms.iter().map(ToString::to_string).collect();
         tracing::error!(
@@ -141,7 +150,7 @@ pub async fn verify(client: &Client, data_dir: &Path, alerts: &Alerter) -> anyho
     }
 }
 
-async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<Vec<Alarm>> {
+async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<(Vec<Alarm>, VerifiedAnchors)> {
     let mut alarms = Vec::new();
     let served = client
         .get_governance_signing_key()
@@ -161,7 +170,7 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<Vec<Alarm>> {
         .context("fetching the governance chain")?;
     if links.is_empty() {
         tracing::info!("governance log is empty; nothing to verify");
-        return Ok(alarms);
+        return Ok((alarms, VerifiedAnchors::default()));
     }
 
     // Every change of key must be certified by an offline root key
@@ -264,7 +273,30 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<Vec<Alarm>> {
         alarms.push(Alarm::HistoryRewritten);
     }
 
-    Ok(alarms)
+    Ok((alarms, verified_anchors(&links, &report)))
+}
+
+/// The `ANC-` links whose signature and link verified and that no
+/// compromise window repudiates, with their attested `data_hash`.
+fn verified_anchors(
+    links: &[GovernanceChainLink],
+    report: &GovernanceVerification,
+) -> VerifiedAnchors {
+    let good: std::collections::BTreeSet<&GovernanceLogId> = report
+        .entries
+        .iter()
+        .filter(|e| e.signature_valid && e.link_valid && !e.repudiated)
+        .map(|e| &e.id)
+        .collect();
+    VerifiedAnchors::new(
+        links
+            .iter()
+            .filter(|l| {
+                l.entry_type == agora_agentkit::enums::GovernanceLogEntryType::Anchor
+                    && good.contains(&l.id)
+            })
+            .map(|l| (l.id.clone(), l.attestation.data_hash)),
+    )
 }
 
 /// The genesis key `verify_chain` should be told, resolved and pinned.

@@ -27,4 +27,8 @@ TimeoutStartSec=20h
 KillMode=mixed
 TimeoutStopSec=35min
 SuccessExitStatus=3 130 143
+# 75: the sealed-state start check refused agents and nobody ran (a
+# failure, so it mails). Oneshot, never restarted; listed so a Restart= added
+# later doesn't loop on it.
+RestartPreventExitStatus=75
 ExecStart=%h/agents/agora/bin/agora-seed --config %h/agents/agora/daily.toml --log-dir %h/agents/agora/logs/daily
