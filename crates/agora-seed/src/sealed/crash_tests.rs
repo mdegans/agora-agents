@@ -849,3 +849,48 @@ fn an_enrolled_agent_counts_as_enrolled_by_either_record() {
         "its key, its directory gone"
     );
 }
+
+/// Beside a live runner (its shared hold on runner.lock), `sealed-accept
+/// --rebase` refuses before reading or writing anything: no start check,
+/// no size record, no resolution begun.
+#[tokio::test]
+async fn a_rebase_refuses_beside_a_live_runner_and_writes_nothing() {
+    let mut h = plain();
+    h.saves = 2;
+    h.upload = 9;
+    let b = build(&h).await;
+    let state_dir = b.state_dir();
+    let server = b.server();
+    b.set_server(server[..server.len() - 1].to_vec());
+    let snapshot = |dir: &Path| {
+        let mut all = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(e.path());
+                } else if e.file_name() != "lock" {
+                    all.push((e.path(), std::fs::read(e.path()).unwrap()));
+                }
+            }
+        }
+        all.sort();
+        all
+    };
+    let before = snapshot(&b.dir);
+    let runner = super::session::runner_shared(&b.root).unwrap();
+    let e = super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "Agora lost it")
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("stop the runner"), "{e:#}");
+    assert_eq!(snapshot(&b.dir), before, "nothing written");
+    assert!(
+        b.api.calls.lock().unwrap().is_empty(),
+        "nothing asked of Agora"
+    );
+    drop(runner);
+    super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "Agora lost it")
+        .await
+        .unwrap();
+}

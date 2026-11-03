@@ -214,8 +214,7 @@ pub async fn run(
             note,
             rebase: true,
         } => {
-            // Only while no runner runs: held until the command ends
-            let _runner = super::session::runner_exclusive(data_dir)?;
+            // `rebase` takes the runner lock itself, before it reads anything
             let done = super::accept::rebase(
                 &state_dir,
                 &keys,

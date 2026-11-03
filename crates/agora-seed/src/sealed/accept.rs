@@ -256,6 +256,15 @@ pub async fn rebase(
 ) -> anyhow::Result<Rebased> {
     let note = note.trim();
     anyhow::ensure!(!note.is_empty(), "--note is required: the agent reads it");
+    // Before anything is read or written: no runner on this data dir (it
+    // could be saving), held to the end, and no session in progress. The
+    // start check below takes the agent's sealed/lock itself, so that lock
+    // is taken after it
+    let data_dir = state_dir
+        .parent()
+        .context("the state directory has no parent data directory")?;
+    let _runner = super::session::runner_exclusive(data_dir)?;
+    super::session::no_session(state_dir, id, true)?;
     let agent_dir = state_dir.join(id.to_string());
     let seal = AgentSeal::new(&agent_dir, id);
     anyhow::ensure!(
