@@ -1482,6 +1482,14 @@ where
             .as_ref()
             .is_some_and(|o| o.admits(self.inner.id()))
             || !self.sealed_ledger.as_ref().is_some_and(|l| l.due(soul))
+            // Enrolled (its marker, or a state key in the secrets tree) is
+            // never asked again, whatever the ledger: one lost with its
+            // directory doesn't undo the answer
+            || crate::sealed::enrolled_by_keys_or_marker(
+                &self.rt.state_dir.join(self.inner.id().to_string()),
+                &self.rt.secrets_dir,
+                self.inner.id(),
+            )
         {
             if let Some(ledger) = &self.sealed_ledger {
                 tracing::info!(
@@ -10343,6 +10351,7 @@ mod tests {
             &dir,
             "a test",
             crate::sealed::notice::Refusal::Mismatch,
+            None,
         )
         .unwrap();
         let rt = Arc::get_mut(&mut h.rt).unwrap();
@@ -10387,6 +10396,28 @@ mod tests {
             "the sealed-state question is seated"
         );
         assert!(last_user_text(&agent).contains("## Offer `sealed_state`"));
+    }
+
+    /// An enrolled agent whose ledger was lost with its directory (only its
+    /// state key in the secrets tree says it was enrolled) is never asked
+    /// again.
+    #[tokio::test]
+    async fn an_enrolled_agent_is_never_offered_again() {
+        let h = Harness::new("sealed-enrolled");
+        let mut rt = h.runtime_advertising(&[OLD, NEW, OTHER]);
+        Arc::get_mut(&mut rt).unwrap().sealed_state =
+            Some(sealed_state::SealedOffer::for_agents(&[h.id]));
+        let key_dir = rt.secrets_dir.join(h.id.to_string());
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join(crate::sealed::keys::STATE_KEY_FILE), b"{}").unwrap();
+        let mut agent = h.agent_on(&rt, OTHER);
+        agent.on_init().await.unwrap();
+        // Nothing is seated: the session ends at its closing phase
+        assert_ne!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "no sealed-state question"
+        );
     }
 
     /// The session after an answer is told it is on file, once.

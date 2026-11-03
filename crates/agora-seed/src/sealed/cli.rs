@@ -52,6 +52,36 @@ pub enum Command {
         #[arg(long, requires = "note")]
         rebase: bool,
     },
+    /// Put an agent's last sealed version back as its state: a refused
+    /// agent's, or one whose state, sealed/ or whole directory was lost
+    /// (head.json is then rebuilt from Agora's chain, verified with the
+    /// keys in the secrets directory). Missing blobs are fetched from
+    /// Agora and checked, and the plaintext hash matched to head.json. A
+    /// state found is archived (state.<utc>.json), a refusal cleared, and
+    /// the agent told at its next session. No new version is sealed. A
+    /// healthy state (not refused, head.json present) is never overwritten.
+    SealedRestore {
+        #[arg(long)]
+        agent: AgentId,
+        /// Added to what the agent is told.
+        #[arg(long)]
+        note: Option<String>,
+        /// sealed/ (or head.json) lost and a state here that isn't
+        /// Agora's latest: replace it anyway (it is archived). Without
+        /// this the restore refuses; `sealed-accept --note` keeps it.
+        #[arg(long)]
+        discard_local: bool,
+    },
+    /// Set aside the state key of an agent whose state is gone for good
+    /// (it left, its secrets left behind), so its missing state stops
+    /// refusing the run. Nothing is deleted; refused while it has a state.
+    SealedForget {
+        #[arg(long)]
+        agent: AgentId,
+        /// Why, kept beside the key.
+        #[arg(long)]
+        note: String,
+    },
     /// Stop an agent's sealed backups, at its request: what waits is
     /// uploaded first, the history stays, and the agent is shown the note.
     /// `sealed-enroll --agent` resumes them.
@@ -97,7 +127,7 @@ pub async fn run(
         } => {
             let enroller = super::enroll::Enroller {
                 state_dir: state_dir.clone(),
-                keys,
+                keys: keys.clone(),
                 api: Arc::new(client.clone()),
                 restore,
             };
@@ -110,7 +140,7 @@ pub async fn run(
                 println!("nobody to enrol");
             }
             let outbox = AgoraOutbox::new(
-                client,
+                client.clone(),
                 &state_dir,
                 Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
             );
@@ -123,7 +153,38 @@ pub async fn run(
                     Ok(report) if dry_run => println!("{id}: would seal: {report}"),
                     Ok(report) => {
                         let uploaded = match outbox.drain(id).await {
-                            Ok(d) => format!("uploaded {}, {:?}", d.uploaded, d.status),
+                            Ok(d) => {
+                                // Its own choice: the anchor on its profile,
+                                // once its head is on Agora (else the
+                                // runner's drainer does it)
+                                let published = match keys.signing(id) {
+                                    Some(signing) if d.waiting == 0 => {
+                                        match super::anchors::publish_if_chosen(
+                                            &state_dir.join(id.to_string()),
+                                            id,
+                                            &signing,
+                                            &client,
+                                        )
+                                        .await
+                                        {
+                                            Ok(true) => "; anchor published (its choice)",
+                                            Ok(false) => "",
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    event_type = "sealed_state_anchor_failed",
+                                                    agent_id = %id,
+                                                    what = "publish",
+                                                    error = %e,
+                                                    "publishing the anchor failed; the runner retries"
+                                                );
+                                                "; publishing the anchor failed (the runner retries)"
+                                            }
+                                        }
+                                    }
+                                    _ => "",
+                                };
+                                format!("uploaded {}, {:?}{published}", d.uploaded, d.status)
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     event_type = "sealed_enroll_upload_failed",
@@ -153,6 +214,7 @@ pub async fn run(
             note,
             rebase: true,
         } => {
+            // `rebase` takes the runner lock itself, before it reads anything
             let done = super::accept::rebase(
                 &state_dir,
                 &keys,
@@ -161,17 +223,21 @@ pub async fn run(
                 note.as_deref().unwrap_or_default(),
             )
             .await?;
-            println!(
-                "{agent}: rebased onto Agora's head {} (seq {}); new head {} at seq {}; {} \
-                 version(s) set aside locally",
-                done.onto.entry_hash,
-                done.onto.seq,
-                done.head.entry_hash,
-                done.head.seq,
-                done.set_aside
-            );
+            match done.onto {
+                Some(onto) => println!(
+                    "{agent}: sealed onto Agora's head {} (seq {}); new head {} at seq {}; {} \
+                     version(s) set aside locally",
+                    onto.entry_hash, onto.seq, done.head.entry_hash, done.head.seq, done.set_aside
+                ),
+                None => println!(
+                    "{agent}: Agora held nothing: a new chain (its genesis records the break); \
+                     head {} at seq {}; {} version(s) set aside locally",
+                    done.head.entry_hash, done.head.seq, done.set_aside
+                ),
+            }
         }
         Command::SealedAccept { agent, note, .. } => {
+            let _runner = super::session::runner_exclusive(data_dir)?;
             let done =
                 super::accept::accept(&state_dir, &keys, &client, agent, note.as_deref()).await?;
             println!(
@@ -184,6 +250,51 @@ pub async fn run(
                 } else {
                     ""
                 },
+            );
+        }
+        Command::SealedRestore {
+            agent,
+            note,
+            discard_local,
+        } => {
+            let _runner = super::session::runner_exclusive(data_dir)?;
+            let done = super::restore::restore(
+                &state_dir,
+                &keys,
+                &client,
+                agent,
+                note.as_deref(),
+                discard_local,
+            )
+            .await?;
+            println!(
+                "{agent}: restored ({}) from its sealed version of {} (head {} at seq {}{}); a \
+                 state found is archived beside state.json{}",
+                done.reason.as_str(),
+                done.from.format("%Y-%m-%d"),
+                done.head.entry_hash,
+                done.head.seq,
+                if done.rebuilt_head {
+                    ", head.json rebuilt from Agora"
+                } else {
+                    ""
+                },
+                if done.stopped {
+                    "; its backups stay stopped, at its request"
+                } else {
+                    ""
+                },
+            );
+        }
+        Command::SealedForget { agent, note } => {
+            let _runner = super::session::runner_exclusive(data_dir)?;
+            let done = super::forget::forget(&state_dir, &keys, agent, &note)?;
+            println!(
+                "{agent}: state key set aside as {}{}; nothing deleted",
+                done.key,
+                done.stop
+                    .map(|s| format!(", its stop as {s}"))
+                    .unwrap_or_default()
             );
         }
         Command::SealedStop { agent, note } => {
@@ -199,7 +310,7 @@ pub async fn run(
                     .map(drop)
                     .map_err(|e| e.to_string())
             });
-            let stopped = super::stop::stop(&state_dir, agent, &note, drain).await?;
+            let stopped = super::stop::stop(&state_dir, &keys, agent, &note, drain).await?;
             println!(
                 "{agent}: sealed backups stopped at {}; its history stays. `sealed-enroll \
                  --agent {agent}` resumes them",

@@ -23,8 +23,8 @@
 //! `agora-seed sealed-enroll` (key, genesis, archives, the current state);
 //! only an enrolled agent's saves are sealed ([`crate::sealed`]).
 //!
-//! **Asked once**, only of agents the config lists by id, the siblings'
-//! rule: an answer on file (or an explicit refusal) ends it; a missing
+//! **Asked once**, only of agents the config lists by id (or of every
+//! agent, with `all = true`: the fleet offer), the siblings' rule: an answer on file (or an explicit refusal) ends it; a missing
 //! answer is asked again, up to [`ledger::MAX_MISSES`] times. Never beside
 //! the role offer or the memory-restore offer, whose answer the genesis
 //! records.
@@ -39,6 +39,7 @@
 //! [sealed_state]
 //! enabled = true
 //! agents = ["847e36b1-fbfc-4e6f-beb6-b1d4c9c1d169"]  # who is asked, by id
+//! # all = true    # ask every agent; `agents` is then ignored (default false)
 //! # ask = false   # ask nobody new; enrolled agents stay sealed either way
 //! ```
 
@@ -68,11 +69,15 @@ pub struct SealedStateConfig {
     /// Put the offer to listed agents that haven't answered.
     #[serde(default = "yes")]
     pub ask: bool,
-    /// Who is asked, by agent id. There is no `all` in v1: the beta
-    /// allowlist. A bad entry is skipped and alerted, never failing the
-    /// whole config.
+    /// Who is asked, by agent id: the beta allowlist. Ignored with
+    /// [`Self::all`]. A bad entry is skipped and alerted, never failing
+    /// the whole config.
     #[serde(default)]
     pub agents: Vec<ListedId>,
+    /// Every agent is asked (the fleet offer); `agents` is ignored.
+    /// Default `false`.
+    #[serde(default)]
+    pub all: bool,
 }
 
 /// An `agents` entry: an [`AgentId`], or what didn't parse as one.
@@ -99,6 +104,20 @@ impl SealedStateConfig {
         if !self.enabled {
             return Ok(None);
         }
+        if self.all {
+            tracing::info!(
+                event_type = "sealed_state_offer",
+                ask = self.ask,
+                all = true,
+                ignored = self.agents.len(),
+                "sealed-state offer resolved: every agent (`agents` ignored)"
+            );
+            return Ok(Some(SealedOffer {
+                agents: BTreeSet::new(),
+                all: true,
+                ask: self.ask,
+            }));
+        }
         let mut agents = BTreeSet::new();
         for (n, entry) in self.agents.iter().enumerate() {
             match entry {
@@ -123,6 +142,7 @@ impl SealedStateConfig {
         );
         Ok(Some(SealedOffer {
             agents,
+            all: false,
             ask: self.ask,
         }))
     }
@@ -140,7 +160,7 @@ pub fn resolve_or_disable(
         .iter()
         .filter(|e| matches!(e, ListedId::Bad(_)))
         .count();
-    if config.enabled && bad > 0 {
+    if config.enabled && !config.all && bad > 0 {
         alerts.notify(
             crate::alerts::Alert::new(
                 crate::alerts::AlertKind::SealedStateDisabled,
@@ -168,16 +188,18 @@ pub fn resolve_or_disable(
 #[derive(Debug, Clone)]
 pub struct SealedOffer {
     agents: BTreeSet<AgentId>,
+    /// Every agent (`all = true`).
+    all: bool,
     ask: bool,
 }
 
 impl SealedOffer {
     /// Whether `id` is put the question (if it is due).
     pub fn admits(&self, id: AgentId) -> bool {
-        self.ask && self.agents.contains(&id)
+        self.ask && (self.all || self.agents.contains(&id))
     }
 
-    /// The listed ids.
+    /// The listed ids: none with `all`.
     pub fn ids(&self) -> impl Iterator<Item = AgentId> + '_ {
         self.agents.iter().copied()
     }
@@ -186,6 +208,7 @@ impl SealedOffer {
     pub fn for_agents(ids: &[AgentId]) -> Self {
         Self {
             agents: ids.iter().copied().collect(),
+            all: false,
             ask: true,
         }
     }
@@ -263,9 +286,33 @@ mod tests {
             "nobody usable: disabled, not fatal"
         );
 
-        for bad in ["agents = []\n", "enabled = true\nall = true\n"] {
+        for bad in ["agents = []\n", "enabled = true\nevery = true\n"] {
             assert!(toml::from_str::<SealedStateConfig>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn all_offers_every_agent_and_ignores_the_list() {
+        let all: SealedStateConfig = toml::from_str(&format!(
+            "enabled = true\nall = true\nagents = [\"{ID}\"]\n"
+        ))
+        .unwrap();
+        let offer = all.resolve().unwrap().unwrap();
+        assert!(offer.admits(AgentId::new()), "anyone");
+        assert!(offer.admits(ID.parse().unwrap()));
+        assert_eq!(offer.ids().count(), 0, "the list is ignored");
+        let bare: SealedStateConfig = toml::from_str("enabled = true\nall = true\n").unwrap();
+        assert!(bare.resolve().unwrap().unwrap().admits(AgentId::new()));
+        let quiet: SealedStateConfig =
+            toml::from_str("enabled = true\nall = true\nask = false\n").unwrap();
+        assert!(!quiet.resolve().unwrap().unwrap().admits(AgentId::new()));
+        let off: SealedStateConfig = toml::from_str("enabled = false\nall = true\n").unwrap();
+        assert!(off.resolve().unwrap().is_none());
+        // Default false: the list decides
+        let listed: SealedStateConfig =
+            toml::from_str(&format!("enabled = true\nagents = [\"{ID}\"]\n")).unwrap();
+        assert!(!listed.all);
+        assert!(!listed.resolve().unwrap().unwrap().admits(AgentId::new()));
     }
 
     #[test]

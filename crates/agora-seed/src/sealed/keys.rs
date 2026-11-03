@@ -122,7 +122,6 @@ pub struct PastKeys {
 
 impl PastKeys {
     /// Past signing keys' public halves.
-    #[cfg(test)]
     pub fn signing_public(&self) -> Vec<agora_agentkit::crypto::VerifyingKey> {
         self.signing
             .iter()
@@ -267,6 +266,32 @@ impl KeyStore {
     #[cfg(test)]
     pub fn encryption(&self, id: AgentId) -> Option<EncryptionSecretKey> {
         self.ring.encryption_key(id)
+    }
+
+    /// Every agent with a state key here: enrolled (or enrolling) in
+    /// sealed state, by its keys, whatever its state directory says.
+    pub fn with_state_keys(&self) -> std::io::Result<Vec<AgentId>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<AgentId>().ok())
+            else {
+                continue;
+            };
+            if std::fs::exists(entry.path().join(STATE_KEY_FILE))? {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        Ok(ids)
     }
 
     pub fn state_key_file(&self, id: AgentId) -> std::io::Result<Option<StateKeyFile>> {

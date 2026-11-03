@@ -56,9 +56,9 @@ dependencies = [
 
 [[package]]
 name = "agora-agentkit"
-version = "0.147.1"
+version = "0.148.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6c16753fd61d33a6313e48bd9032ca89f4e577336fe97bcaacdef6c5f4f3325"
+checksum = "7a0a2ff80a56f19556161316f25ead590aad56435e15805aa9af14a939a7c3e9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -88,6 +88,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2 0.10.9",
+ "similar",
  "static_assertions",
  "subtle",
  "thiserror 2.0.18",
@@ -3099,6 +3100,12 @@ dependencies = [
  "digest 0.11.3",
  "rand_core 0.10.1",
 ]
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "slab"

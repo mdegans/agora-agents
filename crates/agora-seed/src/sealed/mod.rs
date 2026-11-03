@@ -7,9 +7,14 @@
 //! and queued for upload by agentkit's `Mirrored` storage; the [`drain`]er
 //! uploads it, away from the reactor's storage lock. Before any session,
 //! the [`check`] compares each enrolled agent's state with its last sealed
-//! version: a state that matches nothing is **refused** (left out, a
-//! notice kept for the agent, the operator mailed), and only
-//! `agora-seed sealed-accept` ([`accept`]) lets it run again.
+//! version: a state that matches nothing is **refused** (a notice kept for
+//! the agent, the operator mailed), and the **whole run** with it (exit
+//! [`REFUSED_RUN_EXIT`]): a state that matches nothing is likely
+//! fleet-wide. `agora-seed sealed-restore` ([`restore`]) puts the last
+//! sealed version back; `agora-seed sealed-accept --note` ([`accept`])
+//! keeps the state as it is, and the agent is shown the note and a diff.
+//! The drainer also fetches each agent's anchor proofs and keeps those
+//! that check against the governance log ([`anchors`]).
 //! `agora-seed rotate-keys` ([`rotate`]) rotates an agent's keys and
 //! re-wraps its state key.
 //!
@@ -17,8 +22,11 @@
 //! seal it; nothing here logs or prints any of its content. Writes are new
 //! files under `<state>/<id>/sealed/` (agentkit's layout, plus this
 //! module's `notice.json`) and the key files in `<secrets>/<id>/`
-//! ([`keys`]). Nothing here deletes a file: what is superseded is renamed
-//! aside.
+//! ([`keys`]), plus `sealed/anchors.json` and `sealed/published`
+//! ([`anchors`]). The agent's `state.json` is written only by
+//! `sealed-restore`, through agentkit's `FsStorage`, which renames the
+//! state it replaces to `state.<utc>.json` first. Nothing here deletes a
+//! file: what is superseded is renamed aside.
 //!
 //! **Who is sealed.** An agent is sealed exactly when its
 //! `sealed/enrolled` marker exists ([`SealedEnrolment`]); the
@@ -27,17 +35,27 @@
 //! a state the seal never saw, and be refused.
 
 pub mod accept;
+pub mod anchors;
 pub mod api;
 pub mod check;
 pub mod cli;
+pub mod crash;
+#[cfg(test)]
+mod crash_tests;
 pub mod drain;
 pub mod enroll;
+pub mod forget;
 pub mod keys;
+pub mod lost;
 pub mod notice;
+#[cfg(test)]
+mod props;
+pub mod restore;
 pub mod rotate;
 pub mod session;
 pub mod sizes;
 pub mod stop;
+pub mod version;
 
 use std::path::{Path, PathBuf};
 
@@ -46,6 +64,12 @@ use agora_agentkit::state::outbox::AgoraOutbox;
 use agora_agentkit::state::storage::{Enrolment, Mirrored, SEALED_DIR, SealKeys};
 
 pub use keys::KeyStore;
+
+/// The runner's exit code when the start check refused any agent, so the
+/// whole run did not start. The systemd unit doesn't restart on it
+/// (`RestartPreventExitStatus=`): only an operator's `sealed-restore` or
+/// `sealed-accept` can resolve it. EX_TEMPFAIL's number, nothing else.
+pub const REFUSED_RUN_EXIT: i32 = 75;
 
 /// agentkit's sealed storage, as the runner configures it.
 pub type MirroredStorage = Mirrored<
@@ -180,6 +204,14 @@ pub fn is_enrolled(agent_dir: &Path) -> bool {
     }
 }
 
+/// Enrolled by either record: `sealed/enrolled`, or a state key in
+/// `<secrets>/<id>/` (which survives a lost state directory).
+pub fn enrolled_by_keys_or_marker(agent_dir: &Path, secrets_dir: &Path, id: AgentId) -> bool {
+    is_enrolled(agent_dir)
+        || std::fs::exists(secrets_dir.join(id.to_string()).join(keys::STATE_KEY_FILE))
+            .unwrap_or(true)
+}
+
 impl Enrolment for SealedEnrolment {
     /// Enrolled. `sealed-enroll` enrols only agents whose sealed-state
     /// ledger says yes, so this is the opt-in, as acted on.
@@ -206,6 +238,18 @@ impl TestDir {
 
     pub fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// In `/dev/shm` where there is one: for tests that fsync a lot (the
+    /// property tests), which a disk makes slow.
+    pub fn in_memory(label: &str) -> Self {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            return Self::new(label);
+        }
+        let dir = shm.join(format!("agora-seed-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
     }
 }
 

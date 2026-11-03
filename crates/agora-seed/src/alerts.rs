@@ -120,6 +120,25 @@ pub enum AlertKind {
     SealedStateRotationUnknown,
     /// An agent's `rotate-keys` didn't finish; it is left out until it does.
     SealedStateRotationUnfinished,
+    /// The start check refused one or more agents, so the whole run did
+    /// not start (exit [`crate::sealed::REFUSED_RUN_EXIT`]).
+    SealedStateRefusedRun,
+    /// An anchor proof didn't check, couldn't be fetched, or publishing
+    /// the anchor failed. Nothing was stored.
+    SealedStateAnchorFailed,
+    /// Agora's copy of agents' sealed histories failed verification
+    /// while their local states are intact: the run is refused, nothing
+    /// is marked against them, and the next start checks again. Never
+    /// rate-limited.
+    SealedStateServerChainBroken,
+    /// A state key is in the secrets tree but no state, and Agora holds
+    /// nothing to restore it from: skipped (`sealed-forget` sets the key
+    /// aside).
+    SealedStateKeysWithoutState,
+    /// An agent's sealed entries are signed by a key the runner doesn't
+    /// recognise (its record of past keys lost, or a forgery): the run is
+    /// refused, nothing marked. Never rate-limited.
+    SealedStateUntrustedKey,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -128,7 +147,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 25] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -149,7 +168,21 @@ impl AlertKind {
         Self::SealedStateUnreadable,
         Self::SealedStateRotationUnknown,
         Self::SealedStateRotationUnfinished,
+        Self::SealedStateRefusedRun,
+        Self::SealedStateAnchorFailed,
+        Self::SealedStateServerChainBroken,
+        Self::SealedStateKeysWithoutState,
+        Self::SealedStateUntrustedKey,
     ];
+
+    /// Sent every time, outside the rate limit: a fault the operator
+    /// must hear of each time it stops the fleet.
+    pub fn unlimited(self) -> bool {
+        matches!(
+            self,
+            Self::SealedStateServerChainBroken | Self::SealedStateUntrustedKey
+        )
+    }
 
     /// The `event_type` the runner logs this under.
     pub fn as_str(self) -> &'static str {
@@ -174,6 +207,11 @@ impl AlertKind {
             Self::SealedStateUnreadable => "sealed_state_unreadable",
             Self::SealedStateRotationUnknown => "sealed_state_rotation_unknown",
             Self::SealedStateRotationUnfinished => "sealed_state_rotation_unfinished",
+            Self::SealedStateRefusedRun => "sealed_state_refused_run",
+            Self::SealedStateAnchorFailed => "sealed_state_anchor_failed",
+            Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
+            Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
+            Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::Test => "test_alert",
         }
     }
@@ -330,6 +368,59 @@ impl AlertKind {
                  refusal or a notice to the agent, until it does. Stop the \
                  runner and run the rotate-keys command below again: it \
                  resumes where it stopped."
+            }
+            Self::SealedStateRefusedRun => {
+                "The seed runner refused to run: the sealed-state start check \
+                 refused the agents listed below (a state that matches no \
+                 sealed version, a chain that doesn't verify, or a lost \
+                 head), and a state that matches nothing is likely \
+                 fleet-wide, so no agent runs. The unit does not restart on \
+                 this exit (75). For each agent: `agora-seed sealed-restore \
+                 --agent <id>` puts its last sealed version back (damage), or \
+                 `agora-seed sealed-accept --agent <id> --note \"…\"` keeps \
+                 its state (a deliberate change). For a missing state \
+                 (state_missing) of an agent that left, `agora-seed \
+                 sealed-forget --agent <id> --note \"…\"` sets its key \
+                 aside instead. Then start the runner. Look \
+                 at counts and sizes, not content."
+            }
+            Self::SealedStateAnchorFailed => {
+                "An agent's sealed-state anchor proof could not be fetched or \
+                 did not check against the governance log (it names an entry \
+                 that isn't the agent's, or its root or path isn't the \
+                 log's), or telling Agora to publish the agent's anchor \
+                 failed. Nothing was stored; the runner tries again later. A \
+                 proof that doesn't check is the server's claim failing: \
+                 compare it with the ANC entry before anything else."
+            }
+            Self::SealedStateServerChainBroken => {
+                "The seed runner refused to run: Agora's copy of the sealed \
+                 histories of the agents below failed verification while \
+                 their local states are intact. That is likely a \
+                 server-side fault (a bug, a bad database restore, or \
+                 tampering). Nothing was marked against the agents: the \
+                 next start checks again and runs once Agora serves \
+                 histories that verify. To run an agent regardless, stop \
+                 its backups with `agora-seed sealed-stop --agent <id> \
+                 --note \"…\"`. This alert is never rate-limited."
+            }
+            Self::SealedStateUntrustedKey => {
+                "The seed runner refused to run: the sealed entries of the \
+                 agents below are signed by a key this runner doesn't \
+                 recognise. Most likely its record of past signing keys \
+                 (<secrets>/<id>/rotations.json) was lost after a key \
+                 rotation; otherwise a forgery. Restore that file from \
+                 backup, then start again. Nothing was marked against the \
+                 agents. This alert is never rate-limited."
+            }
+            Self::SealedStateKeysWithoutState => {
+                "An agent has a state key in the secrets tree, and Agora \
+                 holds no sealed head for it (or doesn't know it). If its \
+                 state is here, its enrolment was cut after its key was \
+                 cached: `agora-seed sealed-enroll --agent <id>` resumes it. \
+                 If not, nothing can be restored: if it left, `agora-seed \
+                 sealed-forget --agent <id> --note \"…\"` sets its key aside \
+                 (nothing is deleted). It was skipped either way."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
@@ -844,7 +935,12 @@ impl Inner {
     async fn deliver(&self, alert: Alert) {
         let key = alert.rate_key();
         let now = Utc::now();
-        match self.reserve(&key, now).await {
+        let reserved = if alert.kind.unlimited() {
+            Ok(true)
+        } else {
+            self.reserve(&key, now).await
+        };
+        match reserved {
             Ok(true) => {}
             Ok(false) => {
                 tracing::info!(

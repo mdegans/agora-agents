@@ -26,6 +26,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 const STOPPED: &str = "stopped";
+/// `<secrets>/<id>/sealed_stopped`: the stop, kept beside the keys too,
+/// so it survives a lost `sealed/` (or state directory) and a restore
+/// leaves the agent stopped. Authoritative when `sealed/stopped` is gone.
+pub const DURABLE: &str = "sealed_stopped";
 
 /// `sealed/stopped`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,14 +54,79 @@ pub fn is_stopped(agent_dir: &Path) -> bool {
 }
 
 fn write(agent_dir: &Path, stopped: &Stopped) -> std::io::Result<()> {
-    let path = path(agent_dir);
-    let dir = path.parent().expect("in sealed/");
+    write_at(&path(agent_dir), stopped)
+}
+
+fn write_at(path: &Path, stopped: &Stopped) -> std::io::Result<()> {
+    let dir = path.parent().expect("in a directory");
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(stopped)?)?;
     std::fs::File::open(&tmp)?.sync_all()?;
-    std::fs::rename(&tmp, &path)?;
+    std::fs::rename(&tmp, path)?;
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// The stop as kept in the secrets tree, if any.
+pub fn durable(keys: &super::KeyStore, id: AgentId) -> std::io::Result<Option<Stopped>> {
+    match std::fs::read(keys.agent_dir(id).join(DURABLE)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `sealed/stopped` put back from the secrets tree when it is gone: the
+/// stop is the agent's request and outlives its `sealed/`. `Ok(true)`: put
+/// back.
+pub fn reconcile(agent_dir: &Path, keys: &super::KeyStore, id: AgentId) -> std::io::Result<bool> {
+    if std::fs::exists(path(agent_dir))? {
+        return Ok(false);
+    }
+    let Some(stopped) = durable(keys, id)? else {
+        return Ok(false);
+    };
+    write(agent_dir, &stopped)?;
+    tracing::warn!(
+        event_type = "sealed_state_stop_reconciled",
+        agent_id = %id,
+        "sealed/stopped was missing; put back from the secrets tree (the agent stays stopped)"
+    );
+    Ok(true)
+}
+
+/// [`reconcile`] for every agent with a stop in the secrets tree and a
+/// state directory here: at the start of a run, before states load.
+pub fn reconcile_all(state_dir: &Path, keys: &super::KeyStore) {
+    let ids = match keys.with_state_keys() {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "the secrets tree couldn't be listed for stops");
+            return;
+        }
+    };
+    for id in ids {
+        let dir = state_dir.join(id.to_string());
+        if !std::fs::exists(&dir).unwrap_or(false) {
+            continue;
+        }
+        if let Err(e) = reconcile(&dir, keys, id) {
+            tracing::error!(agent_id = %id, error = %e, "the durable stop couldn't be put back");
+        }
+    }
+}
+
+/// Resumed: the durable copy set aside too, as `sealed_stopped.cleared.<utc>`.
+pub fn clear_durable(keys: &super::KeyStore, id: AgentId) -> std::io::Result<()> {
+    let from = keys.agent_dir(id).join(DURABLE);
+    if !std::fs::exists(&from)? {
+        return Ok(());
+    }
+    let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+    std::fs::rename(
+        &from,
+        from.with_file_name(format!("{DURABLE}.cleared.{at}")),
+    )
 }
 
 impl Stopped {
@@ -117,6 +186,7 @@ pub type Drain = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), S
 /// Stop `id`'s sealed backups. `drain` uploads what waits first.
 pub async fn stop(
     state_dir: &Path,
+    keys: &super::KeyStore,
     id: AgentId,
     note: &str,
     drain: Drain,
@@ -176,6 +246,9 @@ pub async fn stop(
         note: note.to_string(),
         shown: false,
     };
+    // The durable copy first: a stop must never be lost with sealed/
+    write_at(&keys.agent_dir(id).join(DURABLE), &stopped)
+        .context("writing the stop into the secrets tree")?;
     write(&agent_dir, &stopped).context("writing sealed/stopped")?;
     drop(lock);
     tracing::warn!(
@@ -198,23 +271,23 @@ mod tests {
     #[tokio::test]
     async fn stopping_drains_first_and_keeps_everything() {
         let root = crate::sealed::TestDir::new("stop");
-        let (id, _keys, dir) = enrolled(&root).await;
+        let (id, keys, dir) = enrolled(&root).await;
         let state_dir = root.join("state");
         let seal = AgentSeal::new(&dir, id);
         assert!(
-            stop(&state_dir, id, " ", drained()).await.is_err(),
+            stop(&state_dir, &keys, id, " ", drained()).await.is_err(),
             "a note"
         );
         // The drain fails: nothing stopped
         let failing: Drain = Box::pin(async { Err("unreachable".to_string()) });
-        let e = stop(&state_dir, id, "asked to", failing)
+        let e = stop(&state_dir, &keys, id, "asked to", failing)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("could not be uploaded"), "{e}");
         assert!(!is_stopped(&dir));
         // Drained, but something still waits: refused
-        let e = stop(&state_dir, id, "asked to", drained())
+        let e = stop(&state_dir, &keys, id, "asked to", drained())
             .await
             .unwrap_err()
             .to_string();
@@ -223,7 +296,7 @@ mod tests {
         for item in seal.outbox().await.unwrap() {
             seal.mark_sent(item.ord).await.unwrap();
         }
-        let s = stop(&state_dir, id, "It asked me to.", drained())
+        let s = stop(&state_dir, &keys, id, "It asked me to.", drained())
             .await
             .unwrap();
         assert!(is_stopped(&dir));
@@ -236,7 +309,9 @@ mod tests {
             s.line()
         );
         assert!(
-            stop(&state_dir, id, "again", drained()).await.is_err(),
+            stop(&state_dir, &keys, id, "again", drained())
+                .await
+                .is_err(),
             "already"
         );
         Stopped::mark_shown(&dir).unwrap();
@@ -255,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_refuses_a_refused_unsealed_or_changed_agent() {
         let root = crate::sealed::TestDir::new("stop-refused");
-        let (id, _keys, dir) = enrolled(&root).await;
+        let (id, keys, dir) = enrolled(&root).await;
         let state_dir = root.join("state");
         let seal = AgentSeal::new(&dir, id);
         for item in seal.outbox().await.unwrap() {
@@ -271,7 +346,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let e = stop(&state_dir, id, "n", drained())
+        let e = stop(&state_dir, &keys, id, "n", drained())
             .await
             .unwrap_err()
             .to_string();
@@ -286,14 +361,14 @@ mod tests {
         seal.record_seal_failed(local, agora_agentkit::state::storage::SealFailureKind::Io)
             .await
             .unwrap();
-        let e = stop(&state_dir, id, "n", drained())
+        let e = stop(&state_dir, &keys, id, "n", drained())
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("went unsealed"), "{e}");
         // Refused
         seal.refuse("mismatch").await.unwrap();
-        let e = stop(&state_dir, id, "n", drained())
+        let e = stop(&state_dir, &keys, id, "n", drained())
             .await
             .unwrap_err()
             .to_string();

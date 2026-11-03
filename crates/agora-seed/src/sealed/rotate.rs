@@ -48,8 +48,7 @@ async fn confirmed_head(
          upload them, or run this with the runner stopped after a drain"
     );
     let local = seal.head().await?.map(|h| h.head);
-    let server = api
-        .chain(id, signing)
+    let server = super::api::chain(api, id, signing)
         .await
         .map_err(anyhow::Error::msg)
         .context("reading the agent's chain on Agora")?;

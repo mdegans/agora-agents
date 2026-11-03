@@ -176,6 +176,9 @@ pub struct ConsentRuntime {
     pub offer: Option<OfferConfig>,
     /// `<data_dir>/state` — each agent's ledger sits in its own directory.
     pub state_dir: PathBuf,
+    /// `<data_dir>/secrets`: an agent with a state key there is enrolled
+    /// in sealed state, whatever its ledger says.
+    pub secrets_dir: PathBuf,
     /// See [`queue::queue_path`].
     pub queue_path: PathBuf,
     /// For the trial review's before/after sample, and to report a model
@@ -232,6 +235,7 @@ impl ConsentRuntime {
         Ok(Self {
             offer: config.offer,
             state_dir: data_dir.join("state"),
+            secrets_dir: data_dir.join("secrets"),
             queue_path: queue::queue_path(data_dir),
             client,
             keys,

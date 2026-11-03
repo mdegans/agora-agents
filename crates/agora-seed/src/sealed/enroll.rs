@@ -342,6 +342,9 @@ impl Enroller {
         if changed && let Some(note) = note {
             super::notice::Notice::resumed(&agent_dir, note).context("writing the notice")?;
         }
+        // The durable copy first: left behind, it would put the stop back
+        super::stop::clear_durable(&self.keys, id)
+            .context("setting the stop in the secrets tree aside")?;
         super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
         // `_runner` held through here
         tracing::warn!(
@@ -377,6 +380,11 @@ impl Enroller {
     ) -> Result<Report, Skip> {
         let agent_dir = self.state_dir.join(id.to_string());
         let seal = AgentSeal::new(&agent_dir, id);
+        // A stop kept in the secrets tree stands for a lost sealed/stopped
+        if seal.is_enrolled().await.unwrap_or(false) {
+            super::stop::reconcile(&agent_dir, &self.keys, id)
+                .context("putting back the stop kept in the secrets tree")?;
+        }
         if seal
             .is_enrolled()
             .await
@@ -439,9 +447,7 @@ impl Enroller {
         // Never a second genesis for an agent Agora holds a chain of, and
         // no key posted for one either
         if partial.is_none() {
-            let server = self
-                .api
-                .chain(id, &signing)
+            let server = super::api::chain(self.api.as_ref(), id, &signing)
                 .await
                 .map_err(anyhow::Error::msg)
                 .context("reading the agent's chain on Agora")?;
@@ -959,9 +965,15 @@ mod tests {
             seal.mark_sent(item.ord).await.unwrap();
         }
         let before = super::super::check::local_entries(&seal).await.unwrap();
-        crate::sealed::stop::stop(&state_dir, id, "asked to", Box::pin(async { Ok(()) }))
-            .await
-            .unwrap();
+        crate::sealed::stop::stop(
+            &state_dir,
+            &keys,
+            id,
+            "asked to",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
         // The run's storage: a plain save, format 1, nothing sealed
         let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::with_keys(
             &state_dir,
@@ -1046,6 +1058,13 @@ mod tests {
                 == 1
         );
         assert!(!crate::sealed::stop::is_stopped(&dir));
+        assert!(
+            !keys
+                .agent_dir(id)
+                .join(crate::sealed::stop::DURABLE)
+                .exists(),
+            "the durable stop set aside too"
+        );
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
         assert_eq!(

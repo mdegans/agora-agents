@@ -4,8 +4,8 @@
 use agora_agentkit::client::{Client, StateAuth};
 use agora_agentkit::crypto::SigningKey;
 use agora_agentkit::envelope::EncryptionPublicKey;
-use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::{KeyRotation, SignedStateEntry, StateKeyRecord};
+use agora_agentkit::ids::{AgentId, GovernanceLogId};
+use agora_agentkit::state::{AnchorProof, KeyRotation, SignedStateEntry, StateKeyRecord};
 
 /// How an error string from [`SealedApi::rotate_key`] begins when the
 /// server's head moved on (a 409).
@@ -55,6 +55,46 @@ pub trait SealedApi: Send + Sync {
         key: &SigningKey,
         sha256: &agora_agentkit::govlog::Sha256Hex,
     ) -> Result<Vec<u8>, String>;
+    /// The agent's heads in `ANC-` entries after `after`, oldest first.
+    /// Untrusted until checked ([`super::anchors`]).
+    async fn proofs(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        after: Option<GovernanceLogId>,
+    ) -> Result<Vec<AnchorProof>, String>;
+    /// Agora's head for the agent, asked apart from its chain: `None` for
+    /// `head: null` or a 404.
+    async fn head(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+    ) -> Result<Option<agora_agentkit::govlog::Sha256Hex>, String>;
+    /// Whether Agora holds a sealed head for the agent: `Ok(false)` when it
+    /// answers `head: null` (nothing sealed there) or 404s (an unknown or
+    /// deleted agent); anything else unanswered is `Err`.
+    async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
+    /// Whether the agent's public profile shows an anchored head (it chose
+    /// to publish). Unsigned: a profile read.
+    async fn anchor_shown(&self, name: &agora_agentkit::names::AgentName) -> Result<bool, String>;
+    /// Whether the agent's anchored head is shown on its profile.
+    async fn post_anchor(&self, id: AgentId, key: &SigningKey, publish: bool)
+    -> Result<(), String>;
+}
+
+/// [`SealedApi::chain`], in seq order with duplicates dropped: the order
+/// or repetition of Agora's answer is never evidence, only its entries.
+/// Every caller reads the chain through this.
+pub async fn chain(
+    api: &dyn SealedApi,
+    id: AgentId,
+    key: &SigningKey,
+) -> Result<Vec<SignedStateEntry>, String> {
+    let mut chain = api.chain(id, key).await?;
+    let mut seen = std::collections::HashSet::new();
+    chain.retain(|e| seen.insert((e.entry_hash(), e.signature)));
+    chain.sort_by_key(|e| e.entry.seq);
+    Ok(chain)
 }
 
 fn auth(id: AgentId, key: &SigningKey) -> StateAuth<'_> {
@@ -147,6 +187,60 @@ impl SealedApi for Client {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn head(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+    ) -> Result<Option<agora_agentkit::govlog::Sha256Hex>, String> {
+        match self.get_state_head(auth(id, key)).await {
+            Ok(r) => Ok(r.head.map(|h| h.entry_hash)),
+            Err(agora_agentkit::client::Error::Status { status, .. }) if status.as_u16() == 404 => {
+                Ok(None)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        match self.get_state_head(auth(id, key)).await {
+            Ok(_) => Ok(true),
+            Err(agora_agentkit::client::Error::Status { status, .. }) if status.as_u16() == 404 => {
+                Ok(false)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn anchor_shown(&self, name: &agora_agentkit::names::AgentName) -> Result<bool, String> {
+        self.get_agent(name)
+            .await
+            .map(|a| a.is_some_and(|a| a.state_anchor.is_some()))
+            .map_err(|e| e.to_string())
+    }
+
+    async fn proofs(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        after: Option<GovernanceLogId>,
+    ) -> Result<Vec<AnchorProof>, String> {
+        self.get_state_proofs(auth(id, key), after)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn post_anchor(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        publish: bool,
+    ) -> Result<(), String> {
+        self.post_state_anchor(auth(id, key), publish)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +261,17 @@ pub mod fake {
         pub rotations: Mutex<Vec<KeyRotation>>,
         /// Blobs the server holds, by hash.
         pub blobs: Mutex<std::collections::HashMap<agora_agentkit::govlog::Sha256Hex, Vec<u8>>>,
+        /// The proofs the server lists, all of them: `after` filters.
+        pub proofs: Mutex<Vec<AnchorProof>>,
+        /// Every `post_anchor`'s `publish`.
+        pub anchored: Mutex<Vec<bool>>,
+        /// The agent is unknown to the server (deleted): a 404.
+        pub unknown_agent: Mutex<bool>,
+        /// Its profile shows an anchored head.
+        pub anchor_shown: Mutex<bool>,
+        /// What `head` answers instead of the chain's last: a server whose
+        /// answers disagree.
+        pub head_override: Mutex<Option<Option<agora_agentkit::govlog::Sha256Hex>>>,
     }
 
     impl FakeApi {
@@ -179,6 +284,11 @@ pub mod fake {
                 public_key: Mutex::default(),
                 rotations: Mutex::default(),
                 blobs: Mutex::default(),
+                proofs: Mutex::default(),
+                anchored: Mutex::default(),
+                unknown_agent: Mutex::default(),
+                anchor_shown: Mutex::default(),
+                head_override: Mutex::default(),
             }
         }
 
@@ -288,6 +398,74 @@ pub mod fake {
                 .get(sha256)
                 .cloned()
                 .ok_or_else(|| "404".to_string())
+        }
+
+        async fn proofs(
+            &self,
+            _: AgentId,
+            _: &SigningKey,
+            after: Option<GovernanceLogId>,
+        ) -> Result<Vec<AnchorProof>, String> {
+            self.call("proofs")?;
+            Ok(self
+                .proofs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| after.as_ref().is_none_or(|a| p.anc_id > *a))
+                .cloned()
+                .collect())
+        }
+
+        async fn head(
+            &self,
+            _: AgentId,
+            _: &SigningKey,
+        ) -> Result<Option<agora_agentkit::govlog::Sha256Hex>, String> {
+            self.call("head")?;
+            if let Some(h) = *self.head_override.lock().unwrap() {
+                return Ok(h);
+            }
+            if *self.unknown_agent.lock().unwrap() {
+                return Ok(None);
+            }
+            match &*self.chain.lock().unwrap() {
+                Ok(chain) => Ok(chain
+                    .iter()
+                    .max_by_key(|e| e.entry.seq)
+                    .map(|e| e.entry_hash())),
+                Err(e) => Err(e.clone()),
+            }
+        }
+
+        /// As the real server: 404 for an unknown agent, `head: null`
+        /// (false) for no chain, the head otherwise.
+        async fn head_known(&self, _: AgentId, _: &SigningKey) -> Result<bool, String> {
+            self.call("head_known")?;
+            if *self.unknown_agent.lock().unwrap() {
+                return Ok(false);
+            }
+            match &*self.chain.lock().unwrap() {
+                Ok(chain) => Ok(!chain.is_empty()),
+                Err(e) => Err(e.clone()),
+            }
+        }
+
+        async fn anchor_shown(&self, _: &agora_agentkit::names::AgentName) -> Result<bool, String> {
+            self.call("anchor_shown")?;
+            Ok(*self.anchor_shown.lock().unwrap())
+        }
+
+        async fn post_anchor(
+            &self,
+            _: AgentId,
+            key: &SigningKey,
+            publish: bool,
+        ) -> Result<(), String> {
+            self.call("post_anchor")?;
+            self.signed_by(key)?;
+            self.anchored.lock().unwrap().push(publish);
+            Ok(())
         }
     }
 }
