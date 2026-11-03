@@ -111,11 +111,14 @@ async fn no_rollback(
     id: AgentId,
     chain: &[SignedStateEntry],
 ) -> anyhow::Result<()> {
-    let on_line: HashMap<Sha256Hex, u64> = chain
-        .iter()
-        .map(|e| (e.entry_hash(), e.entry.seq))
-        .collect();
-    let head_seq = chain.last().map_or(0, |e| e.entry.seq);
+    // Agora's main line: from its head back by prev_hash, not every entry
+    // it returned
+    let head = chain.last().context("Agora holds no chain")?;
+    let line = super::check::main_line(chain, &head.entry_hash())
+        .context("Agora's chain has a missing link back from its head: not restoring from it")?;
+    let on_line: HashMap<Sha256Hex, u64> =
+        line.iter().map(|e| (e.entry_hash(), e.entry.seq)).collect();
+    let head_seq = head.entry.seq;
     let mut held = held_entries(seal).await?;
     let anchors =
         super::anchors::AnchorsFile::load(agent_dir).context("reading sealed/anchors.json")?;
@@ -241,6 +244,14 @@ pub async fn restore(
     let stopped = super::stop::reconcile(&agent_dir, keys, id)
         .context("putting back the stop kept in the secrets tree")?
         || super::stop::is_stopped(&agent_dir);
+    // A stray tmp (a save or restore cut short) is kept, never truncated
+    // by the write below
+    let tmp = agent_dir.join("state.json.tmp");
+    if std::fs::exists(&tmp)? {
+        let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        std::fs::rename(&tmp, agent_dir.join(format!("state.{at}.tmp.json")))
+            .context("setting a stray state.json.tmp aside")?;
+    }
     // Archives a state.json found here as state.<utc>.json first
     FsStorage::new(state_dir)
         .save_sealed_raw(id, state)
@@ -656,6 +667,7 @@ mod tests {
         wipe_and_refuse(&root, id, &keys, &dir).await;
         // As FsStorage leaves it: state.json archived, the new one as tmp
         std::fs::copy(dir.join("state.json"), dir.join("state.json.tmp")).unwrap();
+        let stray = std::fs::read(dir.join("state.json.tmp")).unwrap();
         std::fs::rename(
             dir.join("state.json"),
             dir.join("state.20261103T000000000Z.json"),
@@ -669,6 +681,14 @@ mod tests {
             line.contains("did not run") && line.contains("The state found here is kept"),
             "{line}"
         );
+        // The stray tmp was kept whole, set aside
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".tmp.json"))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), stray);
     }
 
     /// Without the keys nothing on Agora can be opened: refused, plainly,

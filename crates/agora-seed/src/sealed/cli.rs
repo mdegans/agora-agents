@@ -67,6 +67,16 @@ pub enum Command {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Set aside the state key of an agent whose state is gone for good
+    /// (it left, its secrets left behind), so its missing state stops
+    /// refusing the run. Nothing is deleted; refused while it has a state.
+    SealedForget {
+        #[arg(long)]
+        agent: AgentId,
+        /// Why, kept beside the key.
+        #[arg(long)]
+        note: String,
+    },
     /// Stop an agent's sealed backups, at its request: what waits is
     /// uploaded first, the history stays, and the agent is shown the note.
     /// `sealed-enroll --agent` resumes them.
@@ -256,6 +266,17 @@ pub async fn run(
                 } else {
                     ""
                 },
+            );
+        }
+        Command::SealedForget { agent, note } => {
+            let _runner = super::session::runner_exclusive(data_dir)?;
+            let done = super::forget::forget(&state_dir, &keys, agent, &note)?;
+            println!(
+                "{agent}: state key set aside as {}{}; nothing deleted",
+                done.key,
+                done.stop
+                    .map(|s| format!(", its stop as {s}"))
+                    .unwrap_or_default()
             );
         }
         Command::SealedStop { agent, note } => {

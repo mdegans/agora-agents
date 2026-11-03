@@ -153,6 +153,8 @@ pub enum ProofError {
     DidNotCheck { anc_id: GovernanceLogId },
     #[error("sealed/ unreadable: {0}")]
     Local(String),
+    #[error("the agent's main line couldn't be read to place a proof: {0}")]
+    Line(String),
 }
 
 impl ProofError {
@@ -162,14 +164,16 @@ impl ProofError {
             Self::NotTheLogs { .. } => "not_the_logs",
             Self::DidNotCheck { .. } => "did_not_check",
             Self::Local(_) => "local",
+            Self::Line(_) => "line",
         }
     }
 }
 
 /// Fetch `id`'s proofs after the newest kept, and keep those that check,
-/// in order, up to the first that doesn't (stored before it is returned)
-/// or the first whose entry the verified log doesn't hold yet. Returns
-/// how many were kept.
+/// in order, up to the first that doesn't (stored before it is returned),
+/// the first whose entry the verified log doesn't hold yet, or a main line
+/// that can't be read. A proof for an entry not the agent's is skipped and
+/// counted.
 pub async fn fetch_proofs(
     agent_dir: &Path,
     id: AgentId,
@@ -177,7 +181,7 @@ pub async fn fetch_proofs(
     signing: &SigningKey,
     api: &dyn SealedApi,
     verified: &VerifiedAnchors,
-) -> Result<usize, ProofError> {
+) -> Result<Fetched, ProofError> {
     let mut file = AnchorsFile::load(agent_dir).map_err(|e| ProofError::Local(e.to_string()))?;
     let after = file.proofs.last().map(|p| p.anc_id.clone());
     let proofs = api
@@ -185,7 +189,7 @@ pub async fn fetch_proofs(
         .await
         .map_err(ProofError::Fetch)?;
     if proofs.is_empty() {
-        return Ok(0);
+        return Ok(Fetched::default());
     }
     // The agent's own entries: uploaded here, and (asked once, only when
     // a proof names one not here) its verified main line, which runs
@@ -199,6 +203,7 @@ pub async fn fetch_proofs(
         .map(|i| (i.entry.entry_hash(), i.entry.entry.seq))
         .collect();
     let mut line_read = false;
+    let mut not_own = 0;
     let mut kept = 0;
     let mut failed = None;
     for proof in proofs {
@@ -211,14 +216,18 @@ pub async fn fetch_proofs(
                 .head()
                 .await
                 .map_err(|e| ProofError::Local(e.to_string()))?;
-            if let Some(head) = head {
-                match super::version::verified_line(&seal, keys, api, id, &head).await {
-                    Ok(line) => own.extend(line.iter().map(|e| (e.entry_hash(), e.entry.seq))),
-                    Err(e) => tracing::warn!(
-                        agent_id = %id,
-                        error = %e,
-                        "the main line couldn't be read to place a proof"
-                    ),
+            let line = match head {
+                Some(head) => super::version::verified_line(&seal, keys, api, id, &head)
+                    .await
+                    .map_err(|e| format!("{e:#}")),
+                None => Err("sealed/head.json is missing".into()),
+            };
+            match line {
+                Ok(line) => own.extend(line.iter().map(|e| (e.entry_hash(), e.entry.seq))),
+                // Can't place it: stop here, the cursor where it was
+                Err(e) => {
+                    failed = Some(ProofError::Line(e));
+                    break;
                 }
             }
         }
@@ -233,6 +242,7 @@ pub async fn fetch_proofs(
                 seq = proof.seq,
                 "a proof names an entry that isn't on the agent's verified line; skipped"
             );
+            not_own += 1;
             continue;
         }
         let data = match verified.data(&proof) {
@@ -276,8 +286,18 @@ pub async fn fetch_proofs(
     }
     match failed {
         Some(e) => Err(e),
-        None => Ok(kept),
+        None => Ok(Fetched { kept, not_own }),
     }
+}
+
+/// What one [`fetch_proofs`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Fetched {
+    /// Checked and stored.
+    pub kept: usize,
+    /// Proofs Agora attributes to the agent for entries that aren't on its
+    /// verified line: skipped, never stored, alerted.
+    pub not_own: usize,
 }
 
 /// Tell Agora to publish `id`'s anchor, once, if its ledger says
@@ -415,20 +435,29 @@ pub(crate) mod tests {
         let none = VerifiedAnchors::default();
         assert_eq!(
             fetch_proofs(&dir, id, &keys, &signing, &api, &none).await,
-            Ok(0)
+            Ok(Fetched {
+                kept: 0,
+                not_own: 0
+            })
         );
         assert!(AnchorsFile::newest(&dir).is_none());
 
         let verified = VerifiedAnchors::new([(anc.clone(), attested)]);
         assert_eq!(
             fetch_proofs(&dir, id, &keys, &signing, &api, &verified).await,
-            Ok(1)
+            Ok(Fetched {
+                kept: 1,
+                not_own: 0
+            })
         );
         assert_eq!(AnchorsFile::newest(&dir), Some(good.clone()));
         // Asked after the newest kept: nothing new
         assert_eq!(
             fetch_proofs(&dir, id, &keys, &signing, &api, &verified).await,
-            Ok(0)
+            Ok(Fetched {
+                kept: 0,
+                not_own: 0
+            })
         );
 
         // Someone else's head at our seq, then ours at a wrong seq: each
@@ -446,7 +475,10 @@ pub(crate) mod tests {
         ]);
         assert_eq!(
             fetch_proofs(&dir, id, &keys, &signing, &api, &verified).await,
-            Ok(1),
+            Ok(Fetched {
+                kept: 1,
+                not_own: 2
+            }),
             "the loop goes on past what isn't ours"
         );
         assert_eq!(AnchorsFile::load(&dir).unwrap().proofs, vec![good, later]);
@@ -557,9 +589,25 @@ pub(crate) mod tests {
         api.proofs.lock().unwrap().push(proof.clone());
         let signing = keys.signing(id).unwrap();
         let verified = VerifiedAnchors::new([(anc, attested)]);
+        // The line can't be read (Agora's chain unreachable): the pass
+        // stops there, nothing skipped or stored
+        let chain = api.chain.lock().unwrap().clone();
+        *api.chain.lock().unwrap() = Err("unreachable".into());
+        assert_eq!(
+            fetch_proofs(&dir, id, &keys, &signing, &api, &verified)
+                .await
+                .unwrap_err()
+                .kind(),
+            "line"
+        );
+        assert!(AnchorsFile::newest(&dir).is_none());
+        *api.chain.lock().unwrap() = chain;
         assert_eq!(
             fetch_proofs(&dir, id, &keys, &signing, &api, &verified).await,
-            Ok(1)
+            Ok(Fetched {
+                kept: 1,
+                not_own: 0
+            })
         );
         assert_eq!(AnchorsFile::newest(&dir), Some(proof));
     }

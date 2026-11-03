@@ -63,8 +63,9 @@ pub trait SealedApi: Send + Sync {
         key: &SigningKey,
         after: Option<GovernanceLogId>,
     ) -> Result<Vec<AnchorProof>, String>;
-    /// Whether Agora holds a sealed head for the agent: `Ok(false)` only on
-    /// a 404 from the signed head read; anything else unanswered is `Err`.
+    /// Whether Agora holds a sealed head for the agent: `Ok(false)` when it
+    /// answers `head: null` (nothing sealed there) or 404s (an unknown or
+    /// deleted agent); anything else unanswered is `Err`.
     async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
     /// Whether the agent's anchored head is shown on its profile.
     async fn post_anchor(&self, id: AgentId, key: &SigningKey, publish: bool)
@@ -218,6 +219,8 @@ pub mod fake {
         pub proofs: Mutex<Vec<AnchorProof>>,
         /// Every `post_anchor`'s `publish`.
         pub anchored: Mutex<Vec<bool>>,
+        /// The agent is unknown to the server (deleted): a 404.
+        pub unknown_agent: Mutex<bool>,
     }
 
     impl FakeApi {
@@ -232,6 +235,7 @@ pub mod fake {
                 blobs: Mutex::default(),
                 proofs: Mutex::default(),
                 anchored: Mutex::default(),
+                unknown_agent: Mutex::default(),
             }
         }
 
@@ -360,8 +364,13 @@ pub mod fake {
                 .collect())
         }
 
+        /// As the real server: 404 for an unknown agent, `head: null`
+        /// (false) for no chain, the head otherwise.
         async fn head_known(&self, _: AgentId, _: &SigningKey) -> Result<bool, String> {
             self.call("head_known")?;
+            if *self.unknown_agent.lock().unwrap() {
+                return Ok(false);
+            }
             match &*self.chain.lock().unwrap() {
                 Ok(chain) => Ok(!chain.is_empty()),
                 Err(e) => Err(e.clone()),

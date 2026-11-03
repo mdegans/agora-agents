@@ -119,7 +119,7 @@ impl Drainer {
                 self.alerts
                     .notify(super::anchors::anchor_alert(*id, name, "publish", &e));
             }
-            if let Err(e) = super::anchors::fetch_proofs(
+            match super::anchors::fetch_proofs(
                 &dir,
                 *id,
                 &a.keys,
@@ -129,20 +129,36 @@ impl Drainer {
             )
             .await
             {
-                tracing::warn!(
-                    event_type = "sealed_state_anchor_failed",
-                    agent_id = %id,
-                    what = "proof",
-                    kind = e.kind(),
-                    error = %e,
-                    "an anchor proof was not kept"
-                );
-                self.alerts.notify(super::anchors::anchor_alert(
-                    *id,
-                    name,
-                    "proof",
-                    &e.to_string(),
-                ));
+                Ok(f) if f.not_own > 0 => {
+                    // Agora attributing entries to the agent that aren't
+                    // its own is Agora's claim failing: the operator hears
+                    self.alerts.notify(super::anchors::anchor_alert(
+                        *id,
+                        name,
+                        "proof",
+                        &format!(
+                            "{} proof(s) name entries that aren't on the agent's verified line",
+                            f.not_own
+                        ),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        event_type = "sealed_state_anchor_failed",
+                        agent_id = %id,
+                        what = "proof",
+                        kind = e.kind(),
+                        error = %e,
+                        "an anchor proof was not kept"
+                    );
+                    self.alerts.notify(super::anchors::anchor_alert(
+                        *id,
+                        name,
+                        "proof",
+                        &e.to_string(),
+                    ));
+                }
             }
         }
     }

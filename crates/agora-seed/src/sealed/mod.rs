@@ -41,6 +41,7 @@ pub mod check;
 pub mod cli;
 pub mod drain;
 pub mod enroll;
+pub mod forget;
 pub mod keys;
 pub mod notice;
 pub mod restore;

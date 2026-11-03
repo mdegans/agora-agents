@@ -342,9 +342,10 @@ impl Enroller {
         if changed && let Some(note) = note {
             super::notice::Notice::resumed(&agent_dir, note).context("writing the notice")?;
         }
-        super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
+        // The durable copy first: left behind, it would put the stop back
         super::stop::clear_durable(&self.keys, id)
             .context("setting the stop in the secrets tree aside")?;
+        super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
         // `_runner` held through here
         tracing::warn!(
             event_type = "sealed_state_resumed",
@@ -1059,6 +1060,13 @@ mod tests {
                 == 1
         );
         assert!(!crate::sealed::stop::is_stopped(&dir));
+        assert!(
+            !keys
+                .agent_dir(id)
+                .join(crate::sealed::stop::DURABLE)
+                .exists(),
+            "the durable stop set aside too"
+        );
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
         assert_eq!(

@@ -81,7 +81,7 @@ pub fn runner_exclusive(data_dir: &Path) -> anyhow::Result<std::fs::File> {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
             "a runner holds {}: stop the runner (`just runner-stop`) first. `rotate-keys`, \
-             `sealed-accept` and `sealed-restore` run only while no runner does (a session \
+             `sealed-accept`, `sealed-restore` and `sealed-forget` run only while no runner does (a session \
              signing with a key retired under it, or saving over a restored state)",
             data_dir.join(RUNNER_LOCK).display()
         ),
