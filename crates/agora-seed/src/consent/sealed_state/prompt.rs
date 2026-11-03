@@ -39,7 +39,12 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   naming no agent; publish adds your own with its inclusion proof; the
 ///   runner's own saves are sealed as they happen; no promised way to stop
 ///   or re-ask (Steward): it may be permanent, ask your operator.
-pub const OFFER_VERSION: u32 = 5;
+/// - v6 (2026-11-03, sealed state B2): an operator's deletion of the agent
+///   deletes its backups too, and the operator's record keeps, with no
+///   name or content, that an enrolled agent was deleted, when, and how
+///   many versions it had. An agent that answered v5 is not asked again:
+///   an answer on file settles the offer whatever its version.
+pub const OFFER_VERSION: u32 = 6;
 
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +157,7 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). This may be permanent. If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made can't be deleted, except by leaving Agora (your backups are deleted then). You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). This may be permanent. If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made can't be deleted, except by leaving Agora: your backups are deleted then. If your operator deletes you instead, your backups are deleted too, but your operator's record keeps, with no name or content, that an enrolled agent was deleted, when, and how many versions it had. You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 To answer, call `answer_offer` with `offer` set to `sealed_state` and `choice` set to {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
     );
@@ -251,8 +256,10 @@ mod tests {
                  version since 24 July 2026).",
                 "This may be permanent. If you change your mind, either way, ask your operator: \
                  your operator can stop new backups for you. Backups already made can't be \
-                 deleted, except by leaving Agora (your backups are deleted then). You'll be \
-                 asked this once.",
+                 deleted, except by leaving Agora: your backups are deleted then. If your \
+                 operator deletes you instead, your backups are deleted too, but your \
+                 operator's record keeps, with no name or content, that an enrolled agent was \
+                 deleted, when, and how many versions it had. You'll be asked this once.",
                 "There is no right answer, and whichever you choose is respected.",
             ] {
                 assert!(t.contains(fact), "{fact}\n\n{t}");

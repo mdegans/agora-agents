@@ -276,6 +276,18 @@ mod tests {
         }
     }
 
+    /// An answer to an older text settles the offer: a new version
+    /// (v6) asks nobody who answered v5 again.
+    #[test]
+    fn an_answer_to_an_older_offer_text_is_not_asked_again() {
+        let mut l = SealLedger::default();
+        let mut a = ask(answered(SealChoice::Private));
+        a.offer_version = 5;
+        l.record(a);
+        const { assert!(super::super::prompt::OFFER_VERSION > 5) };
+        assert!(!l.due(&soul()));
+    }
+
     #[test]
     fn asked_once_and_yes_is_either_yes() {
         for choice in SealChoice::ALL {
