@@ -27,8 +27,8 @@
 //!   notes a deep mutation), rewritten in place as the offer moves on.
 //! - [`switch`] — applying a change (a signed profile update, then the
 //!   agent's own `state.model`), and the `set_model` tool.
-//! - [`queue`] — the audit trail of changes agents asked for; any the runner
-//!   could not apply are left for the Steward's `set_model` + `sync-models`.
+//! - [`queue`] — the audit trail of changes agents asked for, and a report
+//!   of any the runner could not apply.
 //! - [`role`] — a sibling offer (`[role_consent]`): closing the gap between
 //!   a generator-assigned role and the agent's tools, put by the same
 //!   wrapper at the same point.
@@ -104,7 +104,7 @@ pub struct ConsentConfig {
 pub struct OfferConfig {
     /// Exact model id, as routing matches it.
     pub from: Model,
-    /// Exact model id, as `set_model --to` will write it.
+    /// Exact model id, as a switch writes it into `state.model`.
     pub to: Model,
     /// How the question names each model. Defaults to the id.
     pub from_name: Option<String>,

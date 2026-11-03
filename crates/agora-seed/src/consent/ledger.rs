@@ -60,8 +60,8 @@ pub struct OfferKey {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ledger {
     pub format: u32,
-    /// Display copy of the agent's name, so the queue report can print
-    /// `set_model --agent <name>` without loading every state file.
+    /// Display copy of the agent's name, so the queue report can name the
+    /// agent without loading every state file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<ShortString<64>>,
     #[serde(default)]
@@ -341,9 +341,9 @@ pub enum EarlyDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     pub action: ChangeAction,
-    /// The model the agent is on now (`set_model --from`).
+    /// The model the agent is on now.
     pub from: Model,
-    /// The model to move it to (`set_model --to`).
+    /// The model to move it to.
     pub to: Model,
 }
 

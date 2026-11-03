@@ -2,9 +2,9 @@
 //! for one.
 //!
 //! A change has two halves. [`report_model`] is the remote half: a signed
-//! `update_profile(model_info = to)` as the agent, so the server — which
-//! `sync-models` treats as the source of truth — says the same as the
-//! runner. The local half is the wrapper's
+//! `update_profile(model_info = to)` as the agent, so the server's
+//! `model_info` mirrors the runner. The runner's `state.model` is the
+//! truth; the server only reflects it. The local half is the wrapper's
 //! [`ConsentAgent::apply_change`](super::agent::ConsentAgent::apply_change):
 //! the ledger's [`Switch`] and the agent's `state.model` from its next
 //! session. The remote half goes first, and a failure there changes nothing

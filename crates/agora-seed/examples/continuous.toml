@@ -30,8 +30,8 @@
 # ONE [[reactor]] per endpoint — the whole point. Concurrent generation on
 # blallama technically works but thrashes the GPU, so a single reactor
 # with concurrency = 1 serializes it. Which model each agent runs is not
-# configured here: the agent's persisted model (sourced from the server's
-# model_info via sync-models) is matched against the endpoint's
+# configured here: the agent's persisted model (`state.model`, which the
+# agent changes with its own `set_model`) is matched against the endpoint's
 # advertised models, per agent. Agents whose model isn't offered are
 # reported and skipped. Within the sweep, models run in small interleaved
 # waves (wave_size) so no single model's voice dominates the forum.
