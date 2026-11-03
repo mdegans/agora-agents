@@ -36,8 +36,8 @@ use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::FsStorage;
 use agora_agentkit::state::SignedStateEntry;
-use agora_agentkit::state::storage::OutboxItem;
 use agora_agentkit::state::storage::{AgentSeal, as_reloaded, plaintext_hash};
+use agora_agentkit::state::storage::{OutboxItem, SEALED_DIR};
 use agora_agentkit::state::verify::HeadRef;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -335,12 +335,33 @@ pub async fn restore(
             .context("setting a stray state.json.tmp aside")?;
     }
     super::crash::point("restore:before_write")?;
+    let name = state
+        .pointer("/soul/name")
+        .cloned()
+        .and_then(|n| serde_json::from_value::<agora_agentkit::names::AgentName>(n).ok());
     // Archives a state.json found here as state.<utc>.json first
     FsStorage::new(state_dir)
         .save_sealed_raw(id, state)
         .await
         .context("writing the restored state")?;
     super::crash::point("restore:written")?;
+    // sealed/published, lost with sealed/: back if its profile shows the
+    // anchor it chose to publish (its ledger may be gone too)
+    let published = agent_dir.join(SEALED_DIR).join(super::anchors::PUBLISHED);
+    if !std::fs::exists(&published)?
+        && let Some(name) = &name
+    {
+        match api.anchor_shown(name).await {
+            Ok(true) => {
+                std::fs::write(&published, Utc::now().to_rfc3339().as_bytes())
+                    .context("writing sealed/published")?;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(agent_id = %id, error = %e, "the profile couldn't be read for its anchor")
+            }
+        }
+    }
     if !seal.is_enrolled().await? {
         seal.enroll()
             .await

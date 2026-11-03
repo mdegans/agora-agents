@@ -203,6 +203,14 @@ pub fn is_enrolled(agent_dir: &Path) -> bool {
     }
 }
 
+/// Enrolled by either record: `sealed/enrolled`, or a state key in
+/// `<secrets>/<id>/` (which survives a lost state directory).
+pub fn enrolled_by_keys_or_marker(agent_dir: &Path, secrets_dir: &Path, id: AgentId) -> bool {
+    is_enrolled(agent_dir)
+        || std::fs::exists(secrets_dir.join(id.to_string()).join(keys::STATE_KEY_FILE))
+            .unwrap_or(true)
+}
+
 impl Enrolment for SealedEnrolment {
     /// Enrolled. `sealed-enroll` enrols only agents whose sealed-state
     /// ledger says yes, so this is the opt-in, as acted on.

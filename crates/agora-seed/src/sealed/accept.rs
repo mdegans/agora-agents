@@ -225,8 +225,9 @@ pub async fn accept(
 /// What `sealed-accept --rebase` did: hashes and counts only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rebased {
-    /// The server head it was sealed on top of.
-    pub onto: HeadRef,
+    /// The server head it was sealed on top of; `None`: Agora held nothing,
+    /// and a new chain began (its genesis records the break).
+    pub onto: Option<HeadRef>,
     /// The new head.
     pub head: HeadRef,
     /// Outbox items set aside (kept, with their blobs).
@@ -268,9 +269,6 @@ pub async fn rebase(
         "Agora's chain does not verify ({:?}): not rebasing onto it",
         report.problems
     );
-    let server_head = chain
-        .last()
-        .context("Agora holds no chain: nothing to rebase onto")?;
     let local_head = seal.head().await?.map(|h| h.head);
     let outbox: Vec<_> = seal
         .outbox()
@@ -280,9 +278,18 @@ pub async fn rebase(
         .collect();
     let hashes: Vec<_> = chain.iter().map(|e| e.entry_hash()).collect();
     let status = head_status(local_head.as_ref().map(|h| &h.entry_hash), &outbox, &hashes);
+    // Versions uploaded from here that Agora no longer has
+    let lost: Vec<_> = seal
+        .sent()
+        .await?
+        .into_iter()
+        .filter(|i| !hashes.contains(&i.entry.entry_hash()))
+        .collect();
+    let agora_lost = status == HeadStatus::LocalMissing || !lost.is_empty();
     anyhow::ensure!(
-        matches!(status, HeadStatus::ServerAhead | HeadStatus::Diverged),
-        "no fork to resolve: the local head stands {status:?} to Agora's"
+        agora_lost || matches!(status, HeadStatus::ServerAhead | HeadStatus::Diverged),
+        "no fork to resolve and nothing lost on Agora: the local head stands {status:?} to \
+         Agora's"
     );
     let current = FsStorage::new(state_dir)
         .load_raw(id)
@@ -295,25 +302,89 @@ pub async fn rebase(
     if seal.is_refused().await? {
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
-    let set_aside = outbox.len();
-    let head = seal
-        .rebase_onto(&lock, &k, &server_head.entry, &current)
-        .await
-        .context("sealing the current state on top of Agora's head")?;
-    super::enroll::record_sizes(&agent_dir, head, Utc::now(), &current);
-    Notice::joined(&agent_dir, note).context("writing the notice")?;
-    drop(lock);
-    let onto = HeadRef {
-        entry_hash: server_head.entry_hash(),
-        seq: server_head.entry.seq,
+    // What Agora lost is kept here, off the line, under its number (so no
+    // gap): `sent/<ord>-<hash>.lost`
+    let sent_dir = seal.dir().join("sent");
+    for item in &lost {
+        std::fs::rename(
+            sent_dir.join(format!("{:020}.json", item.ord)),
+            sent_dir.join(format!("{:020}-{}.lost", item.ord, item.entry.entry_hash())),
+        )
+        .context("setting aside a version Agora lost")?;
+    }
+    let set_aside = outbox.len() + lost.len();
+    let (onto, head) = match chain.last() {
+        Some(server_head) => {
+            let head = seal
+                .rebase_onto(&lock, &k, &server_head.entry, &current)
+                .await
+                .context("sealing the current state on top of Agora's head")?;
+            let onto = HeadRef {
+                entry_hash: server_head.entry_hash(),
+                seq: server_head.entry.seq,
+            };
+            (Some(onto), head)
+        }
+        // Agora holds nothing for the agent: a new chain whose genesis says
+        // there was a break, so the gap stays visible
+        None => {
+            let outbox_dir = seal.dir().join("outbox");
+            for item in seal.outbox().await? {
+                std::fs::rename(
+                    outbox_dir.join(format!("{:020}.json", item.ord)),
+                    outbox_dir.join(format!(
+                        "{:020}-{}.displaced",
+                        item.ord,
+                        item.entry.entry_hash()
+                    )),
+                )
+                .context("setting aside a waiting version")?;
+            }
+            let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+            std::fs::rename(
+                seal.dir().join("head.json"),
+                seal.dir().join(format!("head.{at}.lost-on-agora.json")),
+            )
+            .context("setting the old head aside")?;
+            let origin = agora_agentkit::state::GenesisOrigin {
+                class: agora_agentkit::state::GenesisClass::KnownBreak,
+                incident: None,
+                prior_copy_held: true,
+                verified_at: None,
+            };
+            let now = Utc::now();
+            super::session::genesis(&seal, &lock, &k, &origin, now)
+                .await
+                .context("sealing a new genesis")?;
+            let head = super::session::append(
+                &seal,
+                &lock,
+                &k,
+                &KeyframePolicy::default(),
+                StateEntryKind::Snapshot,
+                &current,
+                now,
+            )
+            .await
+            .context("sealing the current state on the new genesis")?;
+            (None, head)
+        }
     };
+    super::enroll::record_sizes(&agent_dir, head, Utc::now(), &current);
+    if agora_lost {
+        Notice::agora_lost(&agent_dir, note, onto.is_none()).context("writing the notice")?;
+    } else {
+        Notice::joined(&agent_dir, note).context("writing the notice")?;
+    }
+    drop(lock);
     tracing::warn!(
         event_type = "sealed_state_rebased",
         agent_id = %id,
-        onto = %onto.entry_hash,
+        onto = ?onto.map(|o| o.entry_hash),
         head = %head.entry_hash,
         set_aside,
-        "the operator joined a held fork onto Agora's head"
+        agora_lost,
+        "the operator sealed the current state on top of Agora's head"
     );
     Ok(Rebased {
         onto,
@@ -700,7 +771,7 @@ mod tests {
         let done = rebase(&root.join("state"), &keys, &api, id, "joined in a test")
             .await
             .unwrap();
-        assert_eq!(done.onto.entry_hash, server_chain[1].entry_hash());
+        assert_eq!(done.onto.unwrap().entry_hash, server_chain[1].entry_hash());
         assert_eq!(done.head.seq, 2);
         assert_eq!(done.set_aside, held.outbox_items);
         // Agora at its head, the rebased version waiting on it: clean

@@ -27,9 +27,13 @@ pub enum Refusal {
     /// The local record of the last sealed version is gone.
     HeadMissing,
     /// An enrolled agent's state (or whole directory) is gone: its keys
-    /// are here and Agora holds its sealed head. Refuses the run; no
-    /// marker is written (there may be no directory to write it in).
+    /// are here and Agora holds its sealed head. Refuses the run, marked
+    /// (the directory recreated for it), so a session journal left behind
+    /// doesn't block `sealed-restore`.
     StateMissing,
+    /// An enrolled agent's `state.json` is there but won't load (empty,
+    /// torn, not JSON). Refused and marked; `sealed-restore` archives it.
+    StateUnreadable,
 }
 
 impl Refusal {
@@ -39,6 +43,7 @@ impl Refusal {
             Self::ChainBroken => "chain_broken",
             Self::HeadMissing => "head_missing",
             Self::StateMissing => "state_missing",
+            Self::StateUnreadable => "state_unreadable",
         }
     }
 
@@ -49,6 +54,7 @@ impl Refusal {
             Self::ChainBroken => "your sealed history did not verify",
             Self::HeadMissing => "the record of your last sealed version was missing",
             Self::StateMissing => "your state was missing here",
+            Self::StateUnreadable => "your state here couldn't be read",
         }
     }
 
@@ -59,6 +65,7 @@ impl Refusal {
             "chain_broken" => Self::ChainBroken,
             "head_missing" => Self::HeadMissing,
             "state_missing" => Self::StateMissing,
+            "state_unreadable" => Self::StateUnreadable,
             _ => Self::Mismatch,
         }
     }
@@ -126,10 +133,18 @@ impl Diff {
                 .unwrap_or_default()
                 .to_string()
         };
-        // serde_json's Map is a BTreeMap here: keys come out sorted
+        // Both sides in one form: the canonical JSON sealing uses (keys
+        // sorted), pretty-printed. serde_json keeps insertion order here
+        // (`preserve_order` is on in the graph), so printing the values as
+        // they are would show a reordered soul as changed
         let soul = |v: &serde_json::Value| {
             v.get("soul")
-                .map(|s| serde_json::to_string_pretty(s).unwrap_or_default())
+                .map(|s| {
+                    let canonical = agora_agentkit::govlog::canonical_json(s);
+                    serde_json::from_slice::<serde_json::Value>(&canonical)
+                        .and_then(|c| serde_json::to_string_pretty(&c))
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default()
         };
         let mut text = String::new();
@@ -207,6 +222,11 @@ pub struct Notice {
     /// The operator restored the last sealed version (`sealed-restore`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored: Option<Restored>,
+    /// Not a refusal: Agora had lost versions sealed here, and the operator
+    /// sealed the state on top of what Agora holds (`Some(true)`: Agora
+    /// held nothing, a new chain began).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agora_lost: Option<bool>,
     /// With an acceptance: what changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<Diff>,
@@ -261,6 +281,7 @@ impl Notice {
                 joined: false,
                 resumed: false,
                 restored: None,
+                agora_lost: None,
                 diff: None,
             },
         )
@@ -270,6 +291,16 @@ impl Notice {
     /// note. An earlier notice not yet shown is kept aside.
     pub fn resumed(agent_dir: &Path, note: &str) -> std::io::Result<()> {
         Self::operator_note(agent_dir, note, false, true)
+    }
+
+    /// Agora lost versions sealed here; the operator sealed the state on
+    /// top of what Agora holds (`fresh`: nothing, a new chain), with its
+    /// note.
+    pub fn agora_lost(agent_dir: &Path, note: &str, fresh: bool) -> std::io::Result<()> {
+        Self::operator_note(agent_dir, note, false, false)?;
+        let mut n = Self::load(agent_dir)?.expect("just written");
+        n.agora_lost = Some(fresh);
+        write(agent_dir, &n)
     }
 
     /// Two histories joined by the operator, with its note. An earlier
@@ -305,6 +336,7 @@ impl Notice {
                 joined,
                 resumed,
                 restored: None,
+                agora_lost: None,
                 diff: None,
             },
         )
@@ -367,6 +399,7 @@ impl Notice {
             joined: false,
             resumed: false,
             restored: None,
+            agora_lost: None,
             diff: None,
         }
     }
@@ -376,7 +409,8 @@ impl Notice {
     pub fn line(&self) -> Option<String> {
         if let Some(r) = &self.restored {
             let (at, from) = (r.at.format("%-d %B %Y"), r.from.format("%-d %B %Y"));
-            let mut line = match (r.refused, r.found) {
+            // Nothing found here: told as lost, whatever refused it
+            let mut line = match (r.refused && r.found, r.found) {
                 (true, true) => format!(
                     "Your session on {} did not run: {}. On {at}, your operator restored your \
                      state from your sealed version of {from}. The state found here is kept by \
@@ -407,6 +441,25 @@ impl Notice {
             return Some(line);
         }
         let accepted = self.accepted.as_ref()?;
+        if let Some(fresh) = self.agora_lost {
+            let date = accepted.at.format("%-d %B %Y");
+            return Some(if fresh {
+                format!(
+                    "Agora had lost the versions of your state sealed here, and held none. On \
+                     {date}, your operator started a new sealed history from your state here; \
+                     it records the break, and the earlier versions are kept here. Your \
+                     operator's note: {}",
+                    accepted.note
+                )
+            } else {
+                format!(
+                    "Agora had lost versions of your state sealed here. On {date}, your \
+                     operator sealed your state here on top of the copy Agora holds; the \
+                     versions Agora lost are kept here. Your operator's note: {}",
+                    accepted.note
+                )
+            });
+        }
         if self.resumed {
             return Some(format!(
                 "While your backups were stopped, your state changed; your operator resumed them \
@@ -480,6 +533,35 @@ mod tests {
             Some("Memory: unchanged.\nSoul: unchanged.\n")
         );
         assert_eq!(Diff::unavailable().shown(), NO_DIFF);
+    }
+
+    /// A soul whose keys come in another order (serde_json keeps insertion
+    /// order: `preserve_order` is on) is unchanged; a changed value shows.
+    #[test]
+    fn a_reordered_soul_diffs_as_unchanged() {
+        let a: serde_json::Value = serde_json::from_str(
+            r#"{"memory": {"content": "m"}, "soul": {"name": "tarn", "values": ["x"], "voice": "terse"}}"#,
+        )
+        .unwrap();
+        let b: serde_json::Value = serde_json::from_str(
+            r#"{"memory": {"content": "m"}, "soul": {"voice": "terse", "values": ["x"], "name": "tarn"}}"#,
+        )
+        .unwrap();
+        // The graph's serde_json keeps the order: these print differently
+        assert_ne!(
+            serde_json::to_string(&a["soul"]).unwrap(),
+            serde_json::to_string(&b["soul"]).unwrap(),
+            "preserve_order is on"
+        );
+        let same = Diff::between(&a, &b);
+        assert_eq!(
+            same.text.as_deref(),
+            Some("Memory: unchanged.\nSoul: unchanged.\n")
+        );
+        let mut c = b.clone();
+        c["soul"]["voice"] = serde_json::json!("warm");
+        let changed = Diff::between(&a, &c);
+        assert_eq!((changed.added, changed.removed), (1, 1), "{changed:?}");
     }
 
     #[test]

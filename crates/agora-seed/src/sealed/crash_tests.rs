@@ -587,3 +587,158 @@ async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
     );
     assert!(report.intact, "{:?}", report.problems);
 }
+
+/// Agora lost our head (LocalMissing, held every start): `sealed-accept
+/// --rebase --note` seals the state here on top of what Agora holds, the
+/// lost versions kept aside, and the next start is intact. With nothing on
+/// Agora, a new chain whose genesis records the break.
+#[tokio::test]
+async fn agoras_lost_versions_are_resolved_by_a_rebase() {
+    for nothing_left in [false, true] {
+        let mut h = plain();
+        h.saves = 2;
+        h.upload = 9;
+        let b = build(&h).await;
+        let state_dir = b.state_dir();
+        let server = b.server();
+        b.set_server(if nothing_left {
+            Vec::new()
+        } else {
+            server[..server.len() - 1].to_vec()
+        });
+        let out = check_at(&state_dir, &b).await;
+        assert!(
+            matches!(
+                out,
+                Outcome::Run {
+                    hold: Some(super::check::Hold::HeadMissing),
+                    ..
+                }
+            ),
+            "{nothing_left}: {out:?}"
+        );
+        let done = super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "Agora lost it")
+            .await
+            .unwrap();
+        assert_eq!(done.onto.is_none(), nothing_left);
+        let out = check_at(&state_dir, &b).await;
+        let Outcome::Run { seat, hold, .. } = &out else {
+            panic!("{nothing_left}: {out:?}")
+        };
+        assert!(hold.is_none(), "{nothing_left}: {out:?}");
+        assert!(seat[0].contains("Agora had lost"), "{seat:?}");
+        // The lost versions are kept here, not deleted
+        let kept = std::fs::read_dir(b.dir.join("sealed/sent"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".lost")
+            })
+            .count();
+        assert!(kept >= 1, "{nothing_left}");
+        if nothing_left {
+            let line = check::local_entries(&b.seal()).await.unwrap();
+            assert_eq!(
+                line[0].entry.kind,
+                agora_agentkit::enums::StateEntryKind::Genesis
+            );
+        }
+    }
+}
+
+/// An enrolled agent's state.json emptied: refused with the marker (and
+/// the run with it), restored with the empty file archived, intact after.
+/// A session journal left behind doesn't block the restore, for a missing
+/// state either.
+#[tokio::test]
+async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
+    for missing in [false, true] {
+        let mut h = plain();
+        h.upload = 9;
+        let b = build(&h).await;
+        let state_dir = b.state_dir();
+        let head = b.seal().head().await.unwrap().unwrap();
+        // A stalled session's journal
+        let journal = FsStorage::new(&state_dir).journal(b.id);
+        std::fs::write(journal.path(), b"{}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if missing {
+            std::fs::rename(b.dir.join("state.json"), b.root.join("state.lost")).unwrap();
+        } else {
+            std::fs::write(b.dir.join("state.json"), b"").unwrap();
+        }
+        let refused =
+            check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off())
+                .await;
+        let reason = if missing {
+            Refusal::StateMissing
+        } else {
+            Refusal::StateUnreadable
+        };
+        assert_eq!(refused, vec![(b.id, reason)]);
+        assert!(b.seal().is_refused().await.unwrap(), "marked");
+        b.api.anchor_shown.lock().unwrap().clone_from(&true);
+        super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
+            .await
+            .unwrap_or_else(|e| panic!("{missing}: {e:#}"));
+        assert_eq!(
+            hash_of(&state_dir, b.id).await,
+            Some(head.plaintext_sha256.unwrap())
+        );
+        if !missing {
+            let empty = std::fs::read_dir(&b.dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("state.2")
+                })
+                .any(|p| std::fs::metadata(p).unwrap().len() == 0);
+            assert!(empty, "the unreadable file is archived, not deleted");
+        }
+        assert!(
+            b.dir
+                .join("sealed")
+                .join(super::anchors::PUBLISHED)
+                .exists(),
+            "published, as its profile shows"
+        );
+        assert!(
+            check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off())
+                .await
+                .is_empty()
+        );
+        assert!(matches!(
+            check_at(&state_dir, &b).await,
+            Outcome::Run { hold: None, .. }
+        ));
+    }
+}
+
+#[test]
+fn an_enrolled_agent_counts_as_enrolled_by_either_record() {
+    let root = super::TestDir::new("enrolled-either");
+    let id = AgentId::new();
+    let (agent_dir, secrets) = (
+        root.join("state").join(id.to_string()),
+        root.join("secrets"),
+    );
+    assert!(!super::enrolled_by_keys_or_marker(&agent_dir, &secrets, id));
+    std::fs::create_dir_all(secrets.join(id.to_string())).unwrap();
+    std::fs::write(
+        secrets
+            .join(id.to_string())
+            .join(super::keys::STATE_KEY_FILE),
+        b"{}",
+    )
+    .unwrap();
+    assert!(
+        super::enrolled_by_keys_or_marker(&agent_dir, &secrets, id),
+        "its key, its directory gone"
+    );
+}

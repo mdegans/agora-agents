@@ -224,15 +224,18 @@ pub async fn run(
                 note.as_deref().unwrap_or_default(),
             )
             .await?;
-            println!(
-                "{agent}: rebased onto Agora's head {} (seq {}); new head {} at seq {}; {} \
-                 version(s) set aside locally",
-                done.onto.entry_hash,
-                done.onto.seq,
-                done.head.entry_hash,
-                done.head.seq,
-                done.set_aside
-            );
+            match done.onto {
+                Some(onto) => println!(
+                    "{agent}: sealed onto Agora's head {} (seq {}); new head {} at seq {}; {} \
+                     version(s) set aside locally",
+                    onto.entry_hash, onto.seq, done.head.entry_hash, done.head.seq, done.set_aside
+                ),
+                None => println!(
+                    "{agent}: Agora held nothing: a new chain (its genesis records the break); \
+                     head {} at seq {}; {} version(s) set aside locally",
+                    done.head.entry_hash, done.head.seq, done.set_aside
+                ),
+            }
         }
         Command::SealedAccept { agent, note, .. } => {
             let _runner = super::session::runner_exclusive(data_dir)?;

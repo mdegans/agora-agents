@@ -1603,6 +1603,9 @@ fn refuse_run(
             name,
             reason: reason.as_str(),
             options: match reason {
+                R::StateUnreadable => vec![format!(
+                    "agora-seed sealed-restore --agent {id} (the unreadable file is archived)"
+                )],
                 R::StateMissing => vec![
                     format!("agora-seed sealed-restore --agent {id} (from Agora)"),
                     format!("agora-seed sealed-forget --agent {id} --note \"…\" (if it left)"),

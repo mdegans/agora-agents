@@ -929,6 +929,27 @@ pub async fn missing_states(
         } else if !super::is_enrolled(&dir) {
             Refusal::HeadMissing
         } else {
+            // There and enrolled: it must load, or it is never checked
+            use agora_agentkit::reactor::Storage as _;
+            match agora_agentkit::reactor::FsStorage::new(state_dir)
+                .load_raw(id)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    let reason = Refusal::StateUnreadable;
+                    refuse(
+                        &dir,
+                        id,
+                        &format!("({})", reason.as_str()),
+                        reason,
+                        &e.to_string(),
+                        alerts,
+                    )
+                    .await;
+                    missing.push((id, reason));
+                }
+            }
             continue;
         };
         let known = match keys.signing(id) {
@@ -975,12 +996,17 @@ pub async fn missing_states(
                 "Agora couldn't say whether it holds the missing state's head; refused"
             ),
         }
-        tracing::error!(
-            event_type = "sealed_state_refused",
-            agent_id = %id,
-            reason = reason.as_str(),
-            "an enrolled agent's state or sealed/ is missing; `agora-seed sealed-restore` restores it from Agora"
-        );
+        // Marked (the directory recreated if it is gone), so a session
+        // journal left behind doesn't block the restore
+        refuse(
+            &dir,
+            id,
+            &format!("({})", reason.as_str()),
+            reason,
+            "an enrolled agent's state or sealed/ is missing; `agora-seed sealed-restore` restores it from Agora",
+            alerts,
+        )
+        .await;
         missing.push((id, reason));
     }
     missing
