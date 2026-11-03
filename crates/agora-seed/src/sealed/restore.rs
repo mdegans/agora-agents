@@ -140,6 +140,67 @@ async fn no_rollback(
     Ok(())
 }
 
+/// How many of Agora's newest versions a local state is compared with.
+const COMPARED: usize = 50;
+
+/// Before replacing a state still here with Agora's head (its sealed/ or
+/// head.json lost): it must be that head already. Otherwise sessions not
+/// yet uploaded would be reverted, so the operator chooses: `sealed-accept`
+/// keeps it, `sealed-restore --discard-local` replaces it. Says how far
+/// behind it is when it is an older version on Agora's line.
+async fn local_is_agoras(
+    seal: &AgentSeal,
+    api: &dyn SealedApi,
+    k: &agora_agentkit::state::storage::SealKeys,
+    id: AgentId,
+    state_dir: &std::path::PathBuf,
+    chain: &[SignedStateEntry],
+) -> anyhow::Result<()> {
+    use agora_agentkit::enums::StateEntryKind;
+    use agora_agentkit::reactor::Storage as _;
+    let local = match FsStorage::new(state_dir).load_raw(id).await {
+        Ok(l) => Some(plaintext_hash(&as_reloaded(&l.value)?)),
+        Err(_) => None,
+    };
+    let head = chain.last().context("Agora holds no chain")?;
+    let line = super::check::main_line(chain, &head.entry_hash())
+        .context("Agora's chain has a missing link back from its head")?;
+    let mut behind = None;
+    if let Some(local) = local {
+        for (n, entry) in line
+            .iter()
+            .rev()
+            .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
+            .take(COMPARED)
+            .enumerate()
+        {
+            let Ok(state) = super::version::open(seal, api, k, &line, &entry.entry).await else {
+                continue;
+            };
+            if as_reloaded(&state).is_ok_and(|s| plaintext_hash(&s) == local) {
+                behind = Some(n);
+                break;
+            }
+        }
+    }
+    let found = match behind {
+        Some(0) => return Ok(()),
+        Some(n) => {
+            format!("the state here is Agora's version from {n} version(s) before its latest")
+        }
+        None => format!(
+            "the state here matches none of Agora's latest {COMPARED} versions (sessions not yet \
+             uploaded when sealed/ was lost?)"
+        ),
+    };
+    anyhow::bail!(
+        "agent {id}: {found}. Restoring would replace it with Agora's latest. Choose: \
+         `agora-seed sealed-accept --agent {id} --note \"…\"` keeps the state here, sealed on top \
+         of Agora's history; `agora-seed sealed-restore --agent {id} --discard-local` replaces it \
+         with Agora's latest (the one here is archived)"
+    )
+}
+
 /// Restore `id`'s last sealed version as its state: a refused agent's, or
 /// one whose state or `sealed/` (or whole directory) is gone. A state
 /// here that isn't refused and has its `head.json` is never overwritten.
@@ -149,6 +210,7 @@ pub async fn restore(
     api: &dyn SealedApi,
     id: AgentId,
     note: Option<&str>,
+    discard_local: bool,
 ) -> anyhow::Result<Restored> {
     let agent_dir = state_dir.join(id.to_string());
     let seal = AgentSeal::new(&agent_dir, id);
@@ -212,6 +274,9 @@ pub async fn restore(
              restore from"
         );
         no_rollback(&seal, &agent_dir, id, &chain).await?;
+        if std::fs::exists(&state_path)? && !discard_local {
+            local_is_agoras(&seal, api, &k, id, &state_dir.to_path_buf(), &chain).await?;
+        }
         let signing = &k.signing;
         let fetch = move |sha: Sha256Hex| async move {
             api.blob(id, signing, &sha)
@@ -265,7 +330,8 @@ pub async fn restore(
     let tmp = agent_dir.join("state.json.tmp");
     if std::fs::exists(&tmp)? {
         let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
-        std::fs::rename(&tmp, agent_dir.join(format!("state.{at}.tmp.json")))
+        // Not `*.json`: the enrolment's archive listing would take it
+        std::fs::rename(&tmp, agent_dir.join(format!("state.json.tmp.{at}.aside")))
             .context("setting a stray state.json.tmp aside")?;
     }
     super::crash::point("restore:before_write")?;
@@ -375,9 +441,16 @@ mod tests {
         let archived = archives(&dir);
         let api = FakeApi::new();
         // With a note, which the agent is shown
-        let done = restore(&root.join("state"), &keys, &api, id, Some("a test wipe"))
-            .await
-            .unwrap();
+        let done = restore(
+            &root.join("state"),
+            &keys,
+            &api,
+            id,
+            Some("a test wipe"),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(done.head, head);
         assert_eq!(archives(&dir), archived + 1, "the wiped state is archived");
         assert!(!seal.is_refused().await.unwrap());
@@ -423,7 +496,7 @@ mod tests {
             before,
             "no new version"
         );
-        let e = restore(&root.join("state"), &keys, &api, id, None)
+        let e = restore(&root.join("state"), &keys, &api, id, None, false)
             .await
             .unwrap_err()
             .to_string();
@@ -465,7 +538,9 @@ mod tests {
                 _ => std::fs::rename(dir.join("sealed"), &gone).unwrap(),
             }
             let state_dir = root.join("state");
-            let done = restore(&state_dir, &keys, &api, id, None).await.unwrap();
+            let done = restore(&state_dir, &keys, &api, id, None, false)
+                .await
+                .unwrap();
             assert!(done.rebuilt_head, "{lose}");
             assert_eq!(done.head, head.head, "{lose}");
             let seal = AgentSeal::new(&dir, id);
@@ -563,7 +638,7 @@ mod tests {
         let archived = archives(&dir);
         let e = format!(
             "{:#}",
-            restore(&root.join("state"), &keys, &api, id, None)
+            restore(&root.join("state"), &keys, &api, id, None, false)
                 .await
                 .unwrap_err()
         );
@@ -607,7 +682,7 @@ mod tests {
         std::fs::rename(dir.join("sealed/head.json"), root.join("head.lost")).unwrap();
         let e = format!(
             "{:#}",
-            restore(&root.join("state"), &keys, &api, id, None)
+            restore(&root.join("state"), &keys, &api, id, None, false)
                 .await
                 .unwrap_err()
         );
@@ -638,7 +713,9 @@ mod tests {
                 .exists()
         );
         std::fs::rename(dir.join("sealed"), root.join("sealed.lost")).unwrap();
-        let done = restore(&state_dir, &keys, &api, id, None).await.unwrap();
+        let done = restore(&state_dir, &keys, &api, id, None, false)
+            .await
+            .unwrap();
         assert!(done.stopped);
         assert!(crate::sealed::stop::is_stopped(&dir));
         assert!(!crate::sealed::is_sealing(&dir));
@@ -690,7 +767,7 @@ mod tests {
             dir.join("state.20261103T000000000Z.json"),
         )
         .unwrap();
-        restore(&root.join("state"), &keys, &FakeApi::new(), id, None)
+        restore(&root.join("state"), &keys, &FakeApi::new(), id, None, false)
             .await
             .unwrap();
         let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
@@ -702,10 +779,79 @@ mod tests {
         let kept: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().path())
-            .filter(|p| p.to_string_lossy().ends_with(".tmp.json"))
+            .filter(|p| p.to_string_lossy().ends_with(".aside"))
             .collect();
         assert_eq!(kept.len(), 1);
         assert_eq!(std::fs::read(&kept[0]).unwrap(), stray);
+    }
+
+    /// sealed/ lost while a session's version was still waiting: the state
+    /// here is newer than Agora's latest. Restore refuses to revert it
+    /// unless told to; `sealed-accept --note` keeps it, sealed on top.
+    #[tokio::test]
+    async fn a_newer_local_state_is_never_reverted_silently() {
+        let root = crate::sealed::TestDir::new("restore-newer");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        on_agora(&api, &dir, id).await;
+        let agora_head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap();
+        // A session's save, sealed here, never uploaded
+        let state_dir = root.join("state");
+        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
+            &state_dir,
+            root.join("secrets"),
+        ));
+        let mut store = agora_agentkit::state::storage::Mirrored::new(
+            FsStorage::new(&state_dir),
+            (),
+            enrolment,
+        );
+        let base = store.load_raw(id).await.unwrap().base;
+        store
+            .save_raw(id, check::tests::state(7), base.as_ref())
+            .await
+            .unwrap();
+        let newer = local(&root, id).await;
+        std::fs::rename(dir.join("sealed"), root.join("sealed.lost")).unwrap();
+        let e = format!(
+            "{:#}",
+            restore(&state_dir, &keys, &api, id, None, false)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            e.contains("matches none of Agora's latest")
+                && e.contains("sealed-accept")
+                && e.contains("--discard-local"),
+            "{e}"
+        );
+        assert_eq!(local(&root, id).await, newer, "untouched");
+        // Kept: sealed on top of Agora's history
+        let done = crate::sealed::accept::accept(&state_dir, &keys, &api, id, Some("kept"))
+            .await
+            .unwrap();
+        assert_eq!(done.head.seq, agora_head.head.seq + 1);
+        assert_eq!(local(&root, id).await, newer);
+        let out = check::check(&dir, id, &newer, Default::default(), &keys, &api).await;
+        assert!(matches!(out, Outcome::Run { hold: None, .. }), "{out:?}");
+
+        // The other choice, on a second agent: replaced, archived
+        let root = crate::sealed::TestDir::new("restore-newer-discard");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        on_agora(&api, &dir, id).await;
+        let agora_head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap();
+        FsStorage::new(root.join("state"))
+            .save_sealed_raw(id, check::tests::state(8))
+            .await
+            .unwrap();
+        std::fs::rename(dir.join("sealed"), root.join("sealed.lost")).unwrap();
+        let archived = archives(&dir);
+        restore(&root.join("state"), &keys, &api, id, None, true)
+            .await
+            .unwrap();
+        assert_eq!(archives(&dir), archived + 1);
+        assert_eq!(local(&root, id).await, agora_head.plaintext_sha256.unwrap());
     }
 
     /// Without the keys nothing on Agora can be opened: refused, plainly,
@@ -723,6 +869,7 @@ mod tests {
             &api,
             id,
             None,
+            false,
         )
         .await
         .unwrap_err()
@@ -745,7 +892,7 @@ mod tests {
         // Agora doesn't have them either: refused, nothing written
         let archived = archives(&dir);
         assert!(
-            restore(&root.join("state"), &keys, &api, id, None)
+            restore(&root.join("state"), &keys, &api, id, None, false)
                 .await
                 .is_err()
         );
@@ -757,7 +904,7 @@ mod tests {
             api.blobs.lock().unwrap().insert(sha, b"forged".to_vec());
         }
         assert!(
-            restore(&root.join("state"), &keys, &api, id, None)
+            restore(&root.join("state"), &keys, &api, id, None, false)
                 .await
                 .is_err()
         );
@@ -770,7 +917,7 @@ mod tests {
                 .unwrap()
                 .insert(sha, std::fs::read(f.path()).unwrap());
         }
-        restore(&root.join("state"), &keys, &api, id, None)
+        restore(&root.join("state"), &keys, &api, id, None, false)
             .await
             .unwrap();
         assert!(api.calls.lock().unwrap().iter().any(|c| c == "blob"));
@@ -805,7 +952,7 @@ mod tests {
         other
             .write_state_key(id, &keys.state_key_file(id).unwrap().unwrap())
             .unwrap();
-        let e = restore(&root.join("state"), &other, &api, id, None)
+        let e = restore(&root.join("state"), &other, &api, id, None, false)
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("did not verify"), "{e:#}");
@@ -817,7 +964,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         head["plaintext_sha256"] = serde_json::json!("00".repeat(32));
         std::fs::write(&path, serde_json::to_vec(&head).unwrap()).unwrap();
-        let e = restore(&root.join("state"), &keys, &api, id, None)
+        let e = restore(&root.join("state"), &keys, &api, id, None, false)
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("not restoring it"), "{e:#}");

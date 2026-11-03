@@ -33,6 +33,17 @@ use super::check::{Hold, hold_alert};
 use super::{KeyStore, SealedEnrolment};
 use crate::alerts::{Alert, AlertKind, Alerter};
 
+/// A drain Agora refused as unprocessable (422): the entry itself is
+/// wrong, so a retry can only fail the same way.
+pub fn rejected(e: &agora_agentkit::state::outbox::DrainError) -> bool {
+    matches!(
+        e,
+        agora_agentkit::state::outbox::DrainError::Client(
+            agora_agentkit::client::Error::Status { status, .. }
+        ) if status.as_u16() == 422
+    )
+}
+
 /// Between drains when nothing wakes it.
 pub const INTERVAL: Duration = Duration::from_secs(60);
 
@@ -209,6 +220,28 @@ impl Drainer {
                 self.alerts
                     .notify(hold_alert(hold, id, name, Some(&report.held)));
             }
+            // Agora refused the entry itself (e.g. `time_went_back`): a
+            // bug, never fixed by retrying. Held for the run, told
+            Err(e) if rejected(&e) => {
+                self.held.lock().expect("held lock").insert(id);
+                tracing::error!(
+                    event_type = "sealed_state_upload_rejected",
+                    agent_id = %id,
+                    error = %e,
+                    "Agora rejected a sealed version (422); uploads held for the rest of the run"
+                );
+                self.alerts.notify(
+                    Alert::new(
+                        AlertKind::SealedStateUploadFailing,
+                        format!(
+                            "{name}: Agora rejected a sealed version as malformed (422): a bug; \
+                             uploads held for this run"
+                        ),
+                    )
+                    .agent(name, id)
+                    .detail("error", e),
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     event_type = "sealed_state_upload_failing",
@@ -256,5 +289,61 @@ impl Drainer {
         }
         self.drain_all().await;
         self.anchor_all().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An Agora that answers every request 422 `time_went_back`, counting.
+    async fn rejecting() -> (url::Url, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = sock.read(&mut buf).await;
+                    let body = "{\"error\":\"time_went_back\"}";
+                    let resp = format!(
+                        "HTTP/1.1 422 Unprocessable Entity\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/").parse().unwrap(), hits)
+    }
+
+    /// A 422 holds the agent for the run, alerted: no retry loop.
+    #[tokio::test]
+    async fn a_rejected_upload_is_held_not_retried() {
+        let root = crate::sealed::TestDir::new("drain-422");
+        let (id, _keys, _) = crate::sealed::check::tests::enrolled(&root).await;
+        let (url, hits) = rejecting().await;
+        let outbox = AgoraOutbox::new(
+            agora_agentkit::client::Client::new(url).unwrap(),
+            root.join("state"),
+            Arc::new(SealedEnrolment::new(
+                root.join("state"),
+                root.join("secrets"),
+            )),
+        );
+        let drainer = Drainer::new(outbox, vec![(id, "tarn".into())], [], Alerter::off());
+        drainer.drain_all().await;
+        assert!(drainer.held(id), "held after the 422");
+        let after = hits.load(Ordering::SeqCst);
+        assert!(after > 0);
+        drainer.drain_all().await;
+        drainer.drain_all().await;
+        assert_eq!(hits.load(Ordering::SeqCst), after, "not retried this run");
     }
 }

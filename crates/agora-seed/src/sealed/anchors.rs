@@ -581,7 +581,7 @@ pub(crate) mod tests {
         }
         let (hash, seq) = head(&dir, id).await;
         std::fs::rename(&dir, root.join("gone")).unwrap();
-        crate::sealed::restore::restore(&root.join("state"), &keys, &api, id, None)
+        crate::sealed::restore::restore(&root.join("state"), &keys, &api, id, None, false)
             .await
             .unwrap();
         assert!(seal.sent().await.unwrap().is_empty());

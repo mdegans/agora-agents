@@ -66,6 +66,11 @@ pub enum Command {
         /// Added to what the agent is told.
         #[arg(long)]
         note: Option<String>,
+        /// sealed/ (or head.json) lost and a state here that isn't
+        /// Agora's latest: replace it anyway (it is archived). Without
+        /// this the restore refuses; `sealed-accept --note` keeps it.
+        #[arg(long)]
+        discard_local: bool,
     },
     /// Set aside the state key of an agent whose state is gone for good
     /// (it left, its secrets left behind), so its missing state stops
@@ -245,10 +250,21 @@ pub async fn run(
                 },
             );
         }
-        Command::SealedRestore { agent, note } => {
+        Command::SealedRestore {
+            agent,
+            note,
+            discard_local,
+        } => {
             let _runner = super::session::runner_exclusive(data_dir)?;
-            let done =
-                super::restore::restore(&state_dir, &keys, &client, agent, note.as_deref()).await?;
+            let done = super::restore::restore(
+                &state_dir,
+                &keys,
+                &client,
+                agent,
+                note.as_deref(),
+                discard_local,
+            )
+            .await?;
             println!(
                 "{agent}: restored ({}) from its sealed version of {} (head {} at seq {}{}); a \
                  state found is archived beside state.json{}",

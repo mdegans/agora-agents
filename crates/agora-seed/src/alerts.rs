@@ -414,11 +414,13 @@ impl AlertKind {
                  agents. This alert is never rate-limited."
             }
             Self::SealedStateKeysWithoutState => {
-                "An agent has a state key in the secrets tree but no state \
-                 here, and Agora holds no sealed head for it (or doesn't \
-                 know it): nothing to restore. It was skipped. If it left, \
-                 `agora-seed sealed-forget --agent <id> --note \"…\"` sets \
-                 its key aside (nothing is deleted)."
+                "An agent has a state key in the secrets tree, and Agora \
+                 holds no sealed head for it (or doesn't know it). If its \
+                 state is here, its enrolment was cut after its key was \
+                 cached: `agora-seed sealed-enroll --agent <id>` resumes it. \
+                 If not, nothing can be restored: if it left, `agora-seed \
+                 sealed-forget --agent <id> --note \"…\"` sets its key aside \
+                 (nothing is deleted). It was skipped either way."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

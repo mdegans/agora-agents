@@ -67,17 +67,27 @@ pub async fn accept(
     // No session in progress (a journal older than the refusal is one the
     // refused agent can't clear), and the lock for the whole command
     let lock = super::session::take(state_dir, id, true).await?;
+    // sealed/ lost (its enrolment marker and head.json with it), the state
+    // here: enrolled by its keys, and accepted on top of Agora's chain.
+    // The start check refuses the run for it without a marker
+    let lost_seal = !seal.is_enrolled().await?
+        && seal.head().await?.is_none()
+        && keys.state_key_file(id)?.is_some();
     anyhow::ensure!(
-        seal.is_enrolled().await?,
+        lost_seal || seal.is_enrolled().await?,
         "agent {id} is not enrolled in sealed state"
     );
     anyhow::ensure!(
-        seal.is_refused().await?,
+        lost_seal || seal.is_refused().await?,
         "agent {id} is not refused; nothing to accept"
     );
-    let reason = Refusal::from_marker(
-        &std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default(),
-    );
+    let reason = if lost_seal && !seal.is_refused().await? {
+        Refusal::HeadMissing
+    } else {
+        Refusal::from_marker(
+            &std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default(),
+        )
+    };
     let current = FsStorage::new(state_dir)
         .load_raw(id)
         .await
@@ -124,7 +134,9 @@ pub async fn accept(
     let now = Utc::now();
     let head = match (adopted, note) {
         (Some(Adopted::Intact(head)), note) => {
-            seal.clear_refusal().await.context("clearing the refusal")?;
+            if seal.is_refused().await? {
+                seal.clear_refusal().await.context("clearing the refusal")?;
+            }
             Notice::accept(&agent_dir, note.unwrap_or(REBUILT_NOTE), reason, None)
                 .context("writing the notice")?;
             head
@@ -166,7 +178,9 @@ pub async fn accept(
             // refusal at the next start sets an unshown acceptance aside
             Notice::accept(&agent_dir, note, reason, Some(diff)).context("writing the notice")?;
             super::crash::point("accept:noticed")?;
-            seal.clear_refusal().await.context("clearing the refusal")?;
+            if seal.is_refused().await? {
+                seal.clear_refusal().await.context("clearing the refusal")?;
+            }
             super::crash::point("accept:cleared")?;
             let head = super::session::append(
                 &seal,
@@ -186,6 +200,11 @@ pub async fn accept(
             head
         }
     };
+    if lost_seal {
+        seal.enroll()
+            .await
+            .context("writing the enrolment marker")?;
+    }
     drop(lock);
     tracing::warn!(
         event_type = "sealed_state_accepted",

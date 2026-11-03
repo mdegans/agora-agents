@@ -250,7 +250,7 @@ pub async fn build(h: &History) -> Built {
         Mode::Restore => {
             upload(&b, usize::MAX).await;
             std::fs::rename(&b.dir, b.root.join("lost")).unwrap();
-            super::restore::restore(&b.state_dir(), &b.keys, &b.api, id, None)
+            super::restore::restore(&b.state_dir(), &b.keys, &b.api, id, None, false)
                 .await
                 .unwrap();
             super::notice::Notice::shown(&b.dir).unwrap();
@@ -276,6 +276,14 @@ pub enum Fault {
     ServerResigned(usize),
     /// Agora serves only its first `len - 1 - k` entries
     ServerPrefix(usize),
+    /// A signature changed in an entry held here (the newest)
+    LocalSignatureCorrupted,
+    /// Another byte of an entry held here (the newest)
+    LocalBytesCorrupted,
+    /// state.json gone
+    StateMissing,
+    /// sealed/ gone
+    SealedLost,
 }
 
 pub fn fault() -> impl Strategy<Value = Fault> {
@@ -292,6 +300,10 @@ pub fn fault() -> impl Strategy<Value = Fault> {
         (0usize..8).prop_map(Fault::ServerFlipped),
         (0usize..8).prop_map(Fault::ServerResigned),
         (0usize..8).prop_map(Fault::ServerPrefix),
+        Just(Fault::LocalSignatureCorrupted),
+        Just(Fault::LocalBytesCorrupted),
+        Just(Fault::StateMissing),
+        Just(Fault::SealedLost),
     ]
 }
 
@@ -309,6 +321,10 @@ pub enum Expect {
     Refused(Refusal),
     /// Refused the run, unmarked.
     Fault(FaultKind),
+    /// Never checked (no state, or no sealed/): the run's missing-state
+    /// pass refuses it with this reason, or skips it (`None`: nothing on
+    /// Agora).
+    Missing(Option<Refusal>),
 }
 
 /// Apply `fault`, and say what the check must then give.
@@ -431,6 +447,43 @@ pub async fn apply(b: &Built, fault: Fault) -> Expect {
             b.set_server(s);
             expect
         }
+        Fault::LocalSignatureCorrupted | Fault::LocalBytesCorrupted => {
+            // The newest item held here: waiting, else uploaded
+            let seal = b.seal();
+            let newest = match seal.outbox().await.unwrap().pop() {
+                Some(i) => Some(("outbox", i.ord)),
+                None => seal.sent().await.unwrap().pop().map(|i| ("sent", i.ord)),
+            };
+            let Some((sub, ord)) = newest else {
+                return Expect::Intact;
+            };
+            let path = b
+                .dir
+                .join("sealed")
+                .join(sub)
+                .join(format!("{ord:020}.json"));
+            let mut item: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if fault == Fault::LocalSignatureCorrupted {
+                let sig = item["entry"]["signature"].as_str().unwrap().to_string();
+                let flipped = if sig.starts_with('0') { "1" } else { "0" };
+                item["entry"]["signature"] = serde_json::json!(format!("{flipped}{}", &sig[1..]));
+            } else {
+                let at = item["entry"]["entry"]["state_at"].as_i64().unwrap();
+                item["entry"]["entry"]["state_at"] = serde_json::json!(at ^ 1);
+            }
+            std::fs::write(&path, serde_json::to_vec(&item).unwrap()).unwrap();
+            Expect::Refused(Refusal::ChainBroken)
+        }
+        Fault::StateMissing | Fault::SealedLost => {
+            let (from, reason) = if fault == Fault::StateMissing {
+                (b.dir.join("state.json"), Refusal::StateMissing)
+            } else {
+                (b.dir.join("sealed"), Refusal::HeadMissing)
+            };
+            std::fs::rename(from, b.root.join("fault.lost")).unwrap();
+            Expect::Missing((!server.is_empty()).then_some(reason))
+        }
         Fault::ServerPrefix(k) => {
             if server.is_empty() {
                 return Expect::Intact;
@@ -488,6 +541,18 @@ proptest! {
         rt().block_on(async {
             let b = build(&h).await;
             let expect = apply(&b, f).await;
+            if let Expect::Missing(reason) = expect {
+                let missing = check::missing_states(
+                    &b.state_dir(),
+                    &b.keys,
+                    &b.api,
+                    &crate::alerts::Alerter::off(),
+                )
+                .await;
+                let want: Vec<_> = reason.map(|r| (b.id, r)).into_iter().collect();
+                prop_assert_eq!(missing, want, "{:?} {:?}", h, f);
+                return Ok(());
+            }
             let out = b.check().await;
             prop_assert!(meets(&out, &expect), "{h:?} {f:?}: expected {expect:?}, got {out:?}");
             // Never marked against the agent unless the evidence is local
@@ -569,8 +634,18 @@ proptest! {
                 Loss::DirDeleted => std::fs::rename(&b.dir, b.root.join("dir.lost")).unwrap(),
             }
             let before = archives(&b.dir);
-            let done = super::restore::restore(&b.state_dir(), &b.keys, &b.api, b.id, None).await;
+            let local_hash = if had_state { Some(b.local_hash().await) } else { None };
+            let mut done = super::restore::restore(&b.state_dir(), &b.keys, &b.api, b.id, None, false).await;
             let adopts = matches!(l, Loss::SealedDeleted | Loss::HeadDeleted | Loss::DirDeleted);
+            // A state here that isn't Agora's latest, its sealed/ lost: never
+            // replaced silently; with --discard-local it is
+            if let Err(e) = &done
+                && format!("{e:#}").contains("--discard-local")
+            {
+                prop_assert!(adopts && had_state, "{h:?} {l:?}: {e:#}");
+                prop_assert!(local_hash.is_some() && agora_head.is_some());
+                done = super::restore::restore(&b.state_dir(), &b.keys, &b.api, b.id, None, true).await;
+            }
             match done {
                 Err(e) => {
                     let e = format!("{e:#}");
@@ -642,38 +717,73 @@ fn every_chain_problem_has_exactly_one_class() {
     for (p, class) in &all {
         assert_eq!(check::class_of(p), *class, "{p:?}");
     }
-    // judge_failure: keys only → untrusted key; on Agora's entries only →
-    // server fault; anything on ours → refused
+    // judge_failure places each problem by its entry
+    let (key, _) = agora_agentkit::crypto::generate_keypair();
+    let (stranger, _) = agora_agentkit::crypto::generate_keypair();
+    let (retired, _) = agora_agentkit::crypto::generate_keypair();
     let id = AgentId::new();
-    let on: std::collections::HashSet<u64> = [1].into();
+    let entry = |seq: u64, by: &agora_agentkit::crypto::SigningKey| {
+        agora_agentkit::state::StateEntry {
+            agora_state_entry: agora_agentkit::state::chain::STATE_ENTRY_VERSION,
+            agent_id: id,
+            seq,
+            created_at: 1_000 + seq as i64,
+            state_at: 1_000,
+            kind: if seq == 0 {
+                StateEntryKind::Genesis
+            } else {
+                StateEntryKind::Snapshot
+            },
+            prev_hash: None,
+            merged_from: vec![],
+            blob: None,
+            target: None,
+            key_gen: 0,
+        }
+        .sign(by)
+    };
+    let line = vec![entry(0, &key), entry(1, &stranger), entry(2, &retired)];
+    let agoras: std::collections::HashSet<Sha256Hex> = [line[1].entry_hash()].into();
     let none = std::collections::HashSet::new();
-    assert!(matches!(
-        check::judge_failure(id, &[P::BadSignature { seq: 3 }], &none),
-        Outcome::ServerFault {
-            kind: FaultKind::UntrustedKey,
-            ..
-        }
-    ));
-    assert!(matches!(
-        check::judge_failure(id, &[P::BrokenLink { seq: 1 }], &on),
-        Outcome::ServerFault {
-            kind: FaultKind::ServerChainBroken,
-            ..
-        }
-    ));
-    assert!(matches!(
-        check::judge_failure(
-            id,
-            &[P::BrokenLink { seq: 1 }, P::BrokenLink { seq: 2 }],
-            &on
-        ),
-        Outcome::Refuse {
-            reason: Refusal::ChainBroken,
-            ..
-        }
-    ));
-    assert!(matches!(
-        check::judge_failure(id, &[], &on),
-        Outcome::Refuse { .. }
-    ));
+    let known = vec![key.verifying_key(), retired.verifying_key()];
+    let judge = |problems: &[P], agoras: &std::collections::HashSet<Sha256Hex>| {
+        check::judge_failure(id, problems, &line, agoras, &known)
+    };
+    let fault = |o: Outcome| match o {
+        Outcome::ServerFault { kind, .. } => Some(kind),
+        _ => None,
+    };
+    let refused = |o: Outcome| {
+        matches!(
+            o,
+            Outcome::Refuse {
+                reason: Refusal::ChainBroken,
+                ..
+            }
+        )
+    };
+    // A key problem on Agora's entry: untrusted key, unmarked
+    assert_eq!(
+        fault(judge(&[P::BadSignature { seq: 1 }], &agoras)),
+        Some(FaultKind::UntrustedKey)
+    );
+    // On an entry held here, signed by none of our keys: corrupted here
+    assert!(refused(judge(&[P::BadSignature { seq: 1 }], &none)));
+    // On an entry held here that a retired key of ours signed: the
+    // rotation record was lost
+    assert_eq!(
+        fault(judge(&[P::BadSignature { seq: 2 }], &none)),
+        Some(FaultKind::UntrustedKey)
+    );
+    // A chain problem on Agora's entry: a server fault
+    assert_eq!(
+        fault(judge(&[P::BrokenLink { seq: 1 }], &agoras)),
+        Some(FaultKind::ServerChainBroken)
+    );
+    // Anything on ours refuses, whatever else
+    assert!(refused(judge(
+        &[P::BrokenLink { seq: 1 }, P::BrokenLink { seq: 2 }],
+        &agoras
+    )));
+    assert!(refused(judge(&[], &agoras)));
 }

@@ -18,6 +18,19 @@ use super::notice::Refusal;
 use super::props::{History, Mode, build, version};
 use super::sizes::Sizes;
 
+/// An archive named now, as FsStorage names one.
+fn archive_name() -> String {
+    format!(
+        "state.{}.json",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
+    )
+}
+
+/// The restart, once a cut save's tmp has settled.
+fn later() -> std::time::SystemTime {
+    std::time::SystemTime::now() + crate::promote::SETTLED + std::time::Duration::from_secs(1)
+}
+
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
@@ -138,11 +151,7 @@ async fn a_save_cut_at_any_step_loses_nothing() {
             3 => {
                 prepare(&b.dir);
                 std::fs::write(b.dir.join("state.json.tmp"), &new_state).unwrap();
-                std::fs::rename(
-                    b.dir.join("state.json"),
-                    b.dir.join("state.20261103T000000000Z.json"),
-                )
-                .unwrap();
+                std::fs::rename(b.dir.join("state.json"), b.dir.join(archive_name())).unwrap();
             }
             // Written, not committed
             4 => {
@@ -155,7 +164,7 @@ async fn a_save_cut_at_any_step_loses_nothing() {
                 copy_dir(&after, &b.dir);
             }
         }
-        crate::promote::promote_tmp_states(&state_dir);
+        crate::promote::promote_tmp_states(&state_dir, later());
         let now = hash_of(&state_dir, b.id).await;
         let expect = if stage <= 2 { old } else { new };
         assert_eq!(now, Some(expect), "stage {stage}");
@@ -178,16 +187,12 @@ async fn a_torn_tmp_is_never_promoted_and_restore_recovers() {
     let state_dir = b.state_dir();
     let head = b.seal().head().await.unwrap().unwrap();
     std::fs::write(b.dir.join("state.json.tmp"), b"{\"format\": 2, \"st").unwrap();
-    std::fs::rename(
-        b.dir.join("state.json"),
-        b.dir.join("state.20261103T000000000Z.json"),
-    )
-    .unwrap();
-    assert_eq!(crate::promote::promote_tmp_states(&state_dir), 0);
+    std::fs::rename(b.dir.join("state.json"), b.dir.join(archive_name())).unwrap();
+    assert_eq!(crate::promote::promote_tmp_states(&state_dir, later()), 0);
     let missing =
         check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off()).await;
     assert_eq!(missing, vec![(b.id, Refusal::StateMissing)]);
-    super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None)
+    super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
         .await
         .unwrap();
     assert_eq!(
@@ -249,7 +254,7 @@ async fn a_restore_cut_at_any_step_finishes_on_a_rerun() {
                 .await;
             }
             super::crash::at(point);
-            let e = super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None)
+            let e = super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
                 .await
                 .unwrap_err();
             assert!(
@@ -257,7 +262,7 @@ async fn a_restore_cut_at_any_step_finishes_on_a_rerun() {
                 "{point}: {e:#}"
             );
             // The restart
-            crate::promote::promote_tmp_states(&state_dir);
+            crate::promote::promote_tmp_states(&state_dir, later());
             if !lost_dir {
                 // Still refused until the restore finishes
                 assert!(b.seal().is_refused().await.unwrap(), "{point}");
@@ -273,7 +278,8 @@ async fn a_restore_cut_at_any_step_finishes_on_a_rerun() {
                     .count();
                 assert!(wiped >= 1, "{point}: the state found is kept");
             }
-            let rerun = super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None).await;
+            let rerun =
+                super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false).await;
             // Cut after its last step for an agent that wasn't refused: done,
             // and a rerun won't overwrite the state it restored
             if lost_dir && *point == "restore:enrolled" {
@@ -512,4 +518,68 @@ proptest! {
             Ok(())
         })?;
     }
+}
+
+/// A clock stepped back between saves: the runner's saves and an accept
+/// (each through agentkit's `prepare`, which floors `created_at` at the
+/// parent's + 1 µs) still make a chain that verifies, with no time going
+/// back (the server refuses that with 422 `time_went_back`).
+#[tokio::test]
+async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
+    let b = build(&plain()).await;
+    let state_dir = b.state_dir();
+    // The head an hour in the future: as if the clock then stepped back
+    let path = b.dir.join("sealed/head.json");
+    let mut head: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let future = chrono::Utc::now().timestamp_micros() + 3_600_000_000;
+    head["created_at"] = serde_json::json!(future);
+    std::fs::write(&path, serde_json::to_vec(&head).unwrap()).unwrap();
+    let enrolment = std::sync::Arc::new(super::SealedEnrolment::new(
+        &state_dir,
+        b.root.join("secrets"),
+    ));
+    let mut store =
+        agora_agentkit::state::storage::Mirrored::new(FsStorage::new(&state_dir), (), enrolment);
+    let base = store.load_raw(b.id).await.unwrap().base;
+    store
+        .save_raw(b.id, version(50), base.as_ref())
+        .await
+        .unwrap();
+    // And an accept on top
+    FsStorage::new(&state_dir)
+        .save_sealed_raw(b.id, serde_json::json!({ "memory": "edited" }))
+        .await
+        .unwrap();
+    let Outcome::Refuse { reason, detail } = check_at(&state_dir, &b).await else {
+        panic!("not refused")
+    };
+    check::refuse(
+        &b.dir,
+        b.id,
+        "tarn",
+        reason,
+        &detail,
+        &crate::alerts::Alerter::off(),
+    )
+    .await;
+    super::accept::accept(&state_dir, &b.keys, &FakeApi::new(), b.id, Some("by hand"))
+        .await
+        .unwrap();
+    let entries = check::local_entries(&b.seal()).await.unwrap();
+    let mut line = entries.clone();
+    line.sort_by_key(|e| e.entry.seq);
+    for pair in line.windows(2) {
+        assert!(
+            pair[1].entry.created_at > pair[0].entry.created_at,
+            "time went back"
+        );
+    }
+    assert!(line.last().unwrap().entry.created_at > future);
+    let report = agora_agentkit::state::verify::verify_chain(
+        b.id,
+        &line,
+        &b.keys.trusted(b.id).unwrap().unwrap(),
+    );
+    assert!(report.intact, "{:?}", report.problems);
 }

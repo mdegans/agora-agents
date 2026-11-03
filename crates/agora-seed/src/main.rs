@@ -1592,27 +1592,39 @@ fn refuse_run(
         agent_id: AgentId,
         name: &'a str,
         reason: &'static str,
-        restore: String,
-        /// For a missing state: an agent that left, its keys left behind
-        #[serde(skip_serializing_if = "Option::is_none")]
-        forget: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        accept: Option<String>,
+        /// What resolves it, in the order to consider them
+        options: Vec<String>,
     }
+    use sealed::notice::Refusal as R;
     let agents: Vec<RefusedAgent> = refused
         .iter()
-        .map(|(id, name, reason)| {
-            let missing = *reason == sealed::notice::Refusal::StateMissing;
-            RefusedAgent {
-                agent_id: *id,
-                name,
-                reason: reason.as_str(),
-                restore: format!("agora-seed sealed-restore --agent {id}"),
-                forget: missing
-                    .then(|| format!("agora-seed sealed-forget --agent {id} --note \"…\"")),
-                accept: (!missing)
-                    .then(|| format!("agora-seed sealed-accept --agent {id} --note \"…\"")),
-            }
+        .map(|(id, name, reason)| RefusedAgent {
+            agent_id: *id,
+            name,
+            reason: reason.as_str(),
+            options: match reason {
+                R::StateMissing => vec![
+                    format!("agora-seed sealed-restore --agent {id} (from Agora)"),
+                    format!("agora-seed sealed-forget --agent {id} --note \"…\" (if it left)"),
+                ],
+                // sealed/ or head.json lost, the state here
+                R::HeadMissing => vec![
+                    format!(
+                        "agora-seed sealed-accept --agent {id} --note \"…\" (keeps the state \
+                         here, sealed on top of Agora's history)"
+                    ),
+                    format!(
+                        "agora-seed sealed-restore --agent {id} --discard-local (replaces it with \
+                         Agora's latest; the one here is archived)"
+                    ),
+                ],
+                R::Mismatch | R::ChainBroken => vec![
+                    format!("agora-seed sealed-restore --agent {id} (damage)"),
+                    format!(
+                        "agora-seed sealed-accept --agent {id} --note \"…\" (a deliberate change)"
+                    ),
+                ],
+            },
         })
         .collect();
     if !agents.is_empty() {
@@ -1630,16 +1642,14 @@ fn refuse_run(
             ),
         );
         for a in &agents {
-            let other = a
-                .accept
-                .as_deref()
-                .or(a.forget.as_deref())
-                .unwrap_or_default();
             alert = alert.detail(
                 "refused",
                 format!(
-                    "{} ({}): {}; {} or {}",
-                    a.name, a.agent_id, a.reason, a.restore, other
+                    "{} ({}): {}; {}",
+                    a.name,
+                    a.agent_id,
+                    a.reason,
+                    a.options.join(", or ")
                 ),
             );
         }
@@ -2057,6 +2067,10 @@ async fn run(held: &mut Held) -> Result<()> {
     // Shared with any other runner on this data dir; `rotate-keys` takes it
     // exclusive. A dry run or a listing reads only
     if !args.dry_run && !args.list_models {
+        // A save cut between its archive and its rename, while no other
+        // runner shares the data dir (exclusive, not waiting): before the
+        // shared hold, and before any state loads
+        promote::promote_if_alone(&data_dir);
         held.runner_lock = Some(sealed::session::runner_shared(&data_dir)?);
     }
     if args.test_alert {
@@ -2258,11 +2272,9 @@ async fn run(held: &mut Held) -> Result<()> {
         &state_dir,
         enrolment.clone(),
     );
-    // A save cut between its archive and its rename; then a stop kept in
-    // the secrets tree stands for a lost sealed/stopped. A dry run writes
-    // nothing
+    // A stop kept in the secrets tree stands for a lost sealed/stopped. A
+    // dry run writes nothing
     if !args.dry_run {
-        promote::promote_tmp_states(&state_dir);
         sealed::stop::reconcile_all(&state_dir, enrolment.keys_store());
     }
     let loaded = if args.dry_run {
@@ -3185,7 +3197,7 @@ mod tests {
                 .is_empty()
         );
 
-        sealed::restore::restore(&state_dir, &keys, &api, id, None)
+        sealed::restore::restore(&state_dir, &keys, &api, id, None, false)
             .await
             .unwrap();
         let run = check(&api).await;

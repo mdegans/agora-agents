@@ -122,7 +122,6 @@ pub struct PastKeys {
 
 impl PastKeys {
     /// Past signing keys' public halves.
-    #[cfg(test)]
     pub fn signing_public(&self) -> Vec<agora_agentkit::crypto::VerifyingKey> {
         self.signing
             .iter()
