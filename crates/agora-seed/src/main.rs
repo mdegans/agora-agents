@@ -1,19 +1,19 @@
 //! The seed runner, rebuilt on agentkit's reactor.
 //!
 //! Thin glue only: parse endpoints, discover models, load [`SeedState`]s
-//! from the [`FsStorage`] tree (see `../agora-sync-models`), route each
+//! from the [`FsStorage`] tree, route each
 //! agent onto the endpoint offering its model, and hand everything to
 //! [`Orchestrator`]/[`Reactor`]. All agent behavior — phases, tools,
 //! mutation, survey — lives in agentkit's [`SeedAgent`].
 //!
 //! One `[[reactor]]` block per **endpoint** — never two blocks for one
 //! endpoint, or generations run concurrently and thrash the GPU. There is
-//! no model in the config: an agent's persisted `state.model` (sourced
-//! from the server's `model_info`, the single source of truth — see
-//! `../agora-sync-models`) names its model, and per-agent negotiation against
-//! the endpoint's advertised list decides admission. Agents whose model
-//! no endpoint offers are reported and skipped; agents with no model at
-//! all await `sync-models`.
+//! no model in the config: an agent's persisted `state.model` names its
+//! model, and per-agent negotiation against the endpoint's advertised list
+//! decides admission. `state.model` is the truth; the agent changes it with
+//! its own `set_model` tool, whose signed `update_profile` keeps the
+//! server's `model_info` a mirror of it. Agents whose model no endpoint
+//! offers are reported and skipped, as are agents with no model at all.
 //!
 //! Within a local endpoint's cohort, [`schedule`] decides who runs and in
 //! what order: equal shares of writes among the endpoint's models over a
@@ -157,7 +157,7 @@ struct Args {
     no_prompt_log: bool,
 
     /// Print the model changes agents have asked for and that still await
-    /// application (as `set_model` commands), then exit. Reads the ledgers
+    /// application, then exit. Reads the ledgers
     /// under `<data-dir>/state`; runs no agents and needs no endpoint.
     #[arg(long)]
     consent_queue: bool,
@@ -1127,7 +1127,7 @@ struct Routing {
     unrouted: BTreeMap<String, usize>,
     /// model id → agent count, for models the `models` allowlist leaves out.
     excluded: BTreeMap<String, usize>,
-    /// Agents with no model at all — `sync-models` hasn't run for them.
+    /// Agents with no model at all (`state.model` unset), skipped.
     placeholders: usize,
     /// Agents skipped by `min_cycle_secs` cadence gating.
     not_due: usize,
@@ -2152,7 +2152,7 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     if routing.placeholders > 0 {
         say!(
-            "placeholders: {} agents have no model — run sync-models",
+            "placeholders: {} agents have no model (state.model unset); skipped",
             routing.placeholders
         );
     }
