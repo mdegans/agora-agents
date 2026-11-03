@@ -570,12 +570,16 @@ async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
     let mut line = entries.clone();
     line.sort_by_key(|e| e.entry.seq);
     for pair in line.windows(2) {
+        // agentkit's one rule (`state::chain::time_went_back`): equal is allowed
         assert!(
-            pair[1].entry.created_at > pair[0].entry.created_at,
+            !agora_agentkit::state::chain::time_went_back(
+                pair[0].entry.created_at,
+                pair[1].entry.created_at
+            ),
             "time went back"
         );
     }
-    assert!(line.last().unwrap().entry.created_at > future);
+    assert!(line.last().unwrap().entry.created_at >= future);
     let report = agora_agentkit::state::verify::verify_chain(
         b.id,
         &line,
