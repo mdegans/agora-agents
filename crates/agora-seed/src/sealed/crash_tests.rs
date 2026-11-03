@@ -8,7 +8,7 @@ use std::path::Path;
 use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::{AgentId, GovernanceLogId};
 use agora_agentkit::reactor::{FsStorage, Storage};
-use agora_agentkit::state::storage::plaintext_hash;
+use agora_agentkit::state::storage::{AgentSeal, plaintext_hash};
 use agora_agentkit::state::{AnchorData, AnchorProof};
 use proptest::prelude::*;
 
@@ -588,65 +588,172 @@ async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
     assert!(report.intact, "{:?}", report.problems);
 }
 
-/// Agora lost our head (LocalMissing, held every start): `sealed-accept
-/// --rebase --note` seals the state here on top of what Agora holds, the
-/// lost versions kept aside, and the next start is intact. With nothing on
-/// Agora, a new chain whose genesis records the break.
+/// Agora lost our versions (LocalMissing, held every start): `sealed-accept
+/// --rebase --note` seals the state here on top of what Agora holds, or on
+/// a new chain whose genesis records the break when Agora holds nothing;
+/// the next start is intact. What was set aside is kept in
+/// `sealed/lost/<utc>/`, past `prune_blobs`: the old head's keyframe still
+/// opens with agentkit's `open_state`. Cut at every step, a rerun finishes.
 #[tokio::test]
-async fn agoras_lost_versions_are_resolved_by_a_rebase() {
+async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
+    let points: [Option<&'static str>; 7] = [
+        None,
+        Some("lost:intent"),
+        Some("lost:copied"),
+        Some("lost:aside"),
+        Some("lost:head_aside"),
+        Some("lost:genesis"),
+        Some("lost:sealed"),
+    ];
     for nothing_left in [false, true] {
-        let mut h = plain();
-        h.saves = 2;
-        h.upload = 9;
-        let b = build(&h).await;
-        let state_dir = b.state_dir();
-        let server = b.server();
-        b.set_server(if nothing_left {
-            Vec::new()
-        } else {
-            server[..server.len() - 1].to_vec()
-        });
-        let out = check_at(&state_dir, &b).await;
-        assert!(
-            matches!(
-                out,
-                Outcome::Run {
-                    hold: Some(super::check::Hold::HeadMissing),
-                    ..
-                }
-            ),
-            "{nothing_left}: {out:?}"
-        );
-        let done = super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "Agora lost it")
-            .await
-            .unwrap();
-        assert_eq!(done.onto.is_none(), nothing_left);
-        let out = check_at(&state_dir, &b).await;
-        let Outcome::Run { seat, hold, .. } = &out else {
-            panic!("{nothing_left}: {out:?}")
-        };
-        assert!(hold.is_none(), "{nothing_left}: {out:?}");
-        assert!(seat[0].contains("Agora had lost"), "{seat:?}");
-        // The lost versions are kept here, not deleted
-        let kept = std::fs::read_dir(b.dir.join("sealed/sent"))
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".lost")
-            })
-            .count();
-        assert!(kept >= 1, "{nothing_left}");
-        if nothing_left {
-            let line = check::local_entries(&b.seal()).await.unwrap();
-            assert_eq!(
-                line[0].entry.kind,
-                agora_agentkit::enums::StateEntryKind::Genesis
+        for point in points {
+            if !nothing_left && matches!(point, Some("lost:head_aside" | "lost:genesis")) {
+                continue;
+            }
+            let mut h = plain();
+            h.saves = 2;
+            h.upload = 9;
+            let b = build(&h).await;
+            let state_dir = b.state_dir();
+            let old_head = b.seal().head().await.unwrap().unwrap();
+            let server = b.server();
+            b.set_server(if nothing_left {
+                Vec::new()
+            } else {
+                server[..server.len() - 1].to_vec()
+            });
+            let out = check_at(&state_dir, &b).await;
+            assert!(
+                matches!(
+                    out,
+                    Outcome::Run {
+                        hold: Some(super::check::Hold::HeadMissing),
+                        ..
+                    }
+                ),
+                "{nothing_left}: {out:?}"
             );
+            if let Some(point) = point {
+                super::crash::at(point);
+                let e = super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "Agora lost it")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    format!("{e:#}").contains("simulated crash"),
+                    "{point}: {e:#}"
+                );
+            }
+            let done = super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "Agora lost it")
+                .await
+                .unwrap_or_else(|e| panic!("{nothing_left} {point:?}: {e:#}"));
+            assert_eq!(done.onto.is_none(), nothing_left);
+            let out = check_at(&state_dir, &b).await;
+            let Outcome::Run { seat, hold, .. } = &out else {
+                panic!("{nothing_left} {point:?}: {out:?}")
+            };
+            assert!(hold.is_none(), "{nothing_left} {point:?}: {out:?}");
+            assert!(
+                seat[0].contains("Agora had lost")
+                    && seat[0].contains("Kept by your runner: the full copy of your state from "),
+                "{seat:?}"
+            );
+            // Kept past a prune: the old keyframe opens
+            b.seal().prune_blobs().await.unwrap();
+            let lost = std::fs::read_dir(b.dir.join("sealed/lost"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect::<Vec<_>>();
+            assert_eq!(lost.len(), 1);
+            assert!(lost[0].join("DONE").exists() && !lost[0].join("INTENT").exists());
+            let kept = AgentSeal::new(&lost[0], b.id);
+            let kept_head = kept.head().await.unwrap().unwrap();
+            assert_eq!(kept_head.head, old_head.head);
+            let keyframe = kept_head.keyframe.unwrap().entry;
+            let opened = kept
+                .open_state(&b.keys.seal_keys(b.id).unwrap(), &keyframe, None)
+                .await
+                .unwrap();
+            assert!(opened.get("memory").is_some());
+            let records = std::fs::read_dir(lost[0].join("items")).unwrap().count();
+            assert!(records >= 1, "the set-aside versions' records");
+            if nothing_left {
+                let line = check::local_entries(&b.seal()).await.unwrap();
+                assert_eq!(
+                    line[0].entry.kind,
+                    agora_agentkit::enums::StateEntryKind::Genesis
+                );
+                assert_eq!(line[0].entry.seq, 0);
+            } else {
+                let lost_here = std::fs::read_dir(b.dir.join("sealed/sent"))
+                    .unwrap()
+                    .filter(|e| {
+                        e.as_ref()
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(".lost")
+                    })
+                    .count();
+                assert!(lost_here >= 1, "numbering kept in sent/");
+            }
         }
     }
+}
+
+/// Agora's chain and its head disagree, or nothing is held: no rebase.
+#[tokio::test]
+async fn a_rebase_needs_agora_to_agree_and_the_agent_held() {
+    let mut h = plain();
+    h.saves = 2;
+    h.upload = 9;
+    let b = build(&h).await;
+    let state_dir = b.state_dir();
+    // Nothing lost, nothing forked
+    let e = super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "n")
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("nothing lost on Agora"), "{e:#}");
+    let server = b.server();
+    b.set_server(server[..server.len() - 1].to_vec());
+    // The head, asked apart, still names our lost head
+    *b.api.head_override.lock().unwrap() = Some(Some(server.last().unwrap().entry_hash()));
+    let e = super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "n")
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("answers disagree"), "{e:#}");
+    // Nothing on Agora by the chain, a head by /head
+    b.set_server(Vec::new());
+    let e = super::accept::rebase(&state_dir, &b.keys, &b.api, b.id, "n")
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("answers disagree"), "{e:#}");
+    assert!(!b.dir.join("sealed/lost").exists(), "nothing begun");
+}
+
+/// A state.json a newer runner wrote: its own refusal, and neither restore
+/// nor accept will touch it.
+#[tokio::test]
+async fn a_state_from_a_newer_runner_is_never_restored_over() {
+    let mut h = plain();
+    h.upload = 9;
+    let b = build(&h).await;
+    let state_dir = b.state_dir();
+    std::fs::write(b.dir.join("state.json"), br#"{"format": 99, "state": {}}"#).unwrap();
+    let refused =
+        check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off()).await;
+    assert_eq!(refused, vec![(b.id, Refusal::StateTooNew)]);
+    let e = super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("newer runner"), "{e:#}");
+    let e = super::accept::accept(&state_dir, &b.keys, &b.api, b.id, Some("n"))
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("newer runner"), "{e:#}");
+    assert_eq!(
+        std::fs::read(b.dir.join("state.json")).unwrap(),
+        br#"{"format": 99, "state": {}}"#
+    );
 }
 
 /// An enrolled agent's state.json emptied: refused with the marker (and

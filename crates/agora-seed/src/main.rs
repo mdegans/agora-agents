@@ -1603,6 +1603,15 @@ fn refuse_run(
             name,
             reason: reason.as_str(),
             options: match reason {
+                R::StateTooNew => vec![
+                    "written by a newer runner than this one: upgrade the runner; don't restore \
+                     or accept"
+                        .to_string(),
+                ],
+                R::StateIo => vec![format!(
+                    "an I/O error reading it: check permissions and the disk first; then, if the \
+                     file is damaged, agora-seed sealed-restore --agent {id}"
+                )],
                 R::StateUnreadable => vec![format!(
                     "agora-seed sealed-restore --agent {id} (the unreadable file is archived)"
                 )],

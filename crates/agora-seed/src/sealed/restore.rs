@@ -226,6 +226,12 @@ pub async fn restore(
     // A restore cut between FsStorage's archive and its rename leaves the
     // new state as state.json.tmp and the found one archived: found
     let found = std::fs::exists(&state_path)? || std::fs::exists(agent_dir.join("state.json.tmp"))?;
+    anyhow::ensure!(
+        !std::fs::read_to_string(seal.dir().join("refused"))
+            .is_ok_and(|r| Refusal::from_marker(&r) == Refusal::StateTooNew),
+        "agent {id}'s state was written by a newer runner than this one: upgrade the runner; \
+         don't restore or accept over it"
+    );
     let had_head = seal.head().await?.is_some();
     let refused = seal.is_refused().await?;
     anyhow::ensure!(

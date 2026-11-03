@@ -34,6 +34,13 @@ pub enum Refusal {
     /// An enrolled agent's `state.json` is there but won't load (empty,
     /// torn, not JSON). Refused and marked; `sealed-restore` archives it.
     StateUnreadable,
+    /// Its `state.json` is in a format newer than this runner reads: a
+    /// newer runner wrote it (this one is a rollback). Upgrade the runner;
+    /// never restore or accept over it.
+    StateTooNew,
+    /// Its `state.json` couldn't be read from the disk (an I/O error):
+    /// check permissions and the disk first.
+    StateIo,
 }
 
 impl Refusal {
@@ -44,6 +51,8 @@ impl Refusal {
             Self::HeadMissing => "head_missing",
             Self::StateMissing => "state_missing",
             Self::StateUnreadable => "state_unreadable",
+            Self::StateTooNew => "state_too_new",
+            Self::StateIo => "state_io",
         }
     }
 
@@ -55,6 +64,8 @@ impl Refusal {
             Self::HeadMissing => "the record of your last sealed version was missing",
             Self::StateMissing => "your state was missing here",
             Self::StateUnreadable => "your state here couldn't be read",
+            Self::StateTooNew => "your state here was written by a newer runner than this one",
+            Self::StateIo => "your state here couldn't be read from the disk",
         }
     }
 
@@ -66,6 +77,8 @@ impl Refusal {
             "head_missing" => Self::HeadMissing,
             "state_missing" => Self::StateMissing,
             "state_unreadable" => Self::StateUnreadable,
+            "state_too_new" => Self::StateTooNew,
+            "state_io" => Self::StateIo,
             _ => Self::Mismatch,
         }
     }
@@ -76,6 +89,17 @@ impl Refusal {
 pub struct Accepted {
     pub at: DateTime<Utc>,
     pub note: String,
+}
+
+/// Agora lost versions sealed here (`sealed-accept --rebase`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgoraLost {
+    /// Agora held nothing: a new chain began.
+    pub fresh: bool,
+    /// Versions set aside.
+    pub versions: usize,
+    /// What the runner keeps, in the agent's words.
+    pub kept: String,
 }
 
 /// The operator's restore (`sealed-restore`).
@@ -223,10 +247,9 @@ pub struct Notice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored: Option<Restored>,
     /// Not a refusal: Agora had lost versions sealed here, and the operator
-    /// sealed the state on top of what Agora holds (`Some(true)`: Agora
-    /// held nothing, a new chain began).
+    /// sealed the state on top of what Agora holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agora_lost: Option<bool>,
+    pub agora_lost: Option<AgoraLost>,
     /// With an acceptance: what changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<Diff>,
@@ -296,10 +319,20 @@ impl Notice {
     /// Agora lost versions sealed here; the operator sealed the state on
     /// top of what Agora holds (`fresh`: nothing, a new chain), with its
     /// note.
-    pub fn agora_lost(agent_dir: &Path, note: &str, fresh: bool) -> std::io::Result<()> {
+    pub fn agora_lost(
+        agent_dir: &Path,
+        note: &str,
+        fresh: bool,
+        versions: usize,
+        kept: &str,
+    ) -> std::io::Result<()> {
         Self::operator_note(agent_dir, note, false, false)?;
         let mut n = Self::load(agent_dir)?.expect("just written");
-        n.agora_lost = Some(fresh);
+        n.agora_lost = Some(AgoraLost {
+            fresh,
+            versions,
+            kept: kept.to_string(),
+        });
         write(agent_dir, &n)
     }
 
@@ -441,22 +474,23 @@ impl Notice {
             return Some(line);
         }
         let accepted = self.accepted.as_ref()?;
-        if let Some(fresh) = self.agora_lost {
+        if let Some(lost) = &self.agora_lost {
             let date = accepted.at.format("%-d %B %Y");
-            return Some(if fresh {
+            let n = lost.versions;
+            let versions = format!("{n} version{}", if n == 1 { "" } else { "s" });
+            return Some(if lost.fresh {
                 format!(
-                    "Agora had lost the versions of your state sealed here, and held none. On \
+                    "Agora had lost the {versions} of your state sealed here, and held none. On \
                      {date}, your operator started a new sealed history from your state here; \
-                     it records the break, and the earlier versions are kept here. Your \
-                     operator's note: {}",
-                    accepted.note
+                     it records the break. Kept by your runner: {}. Your operator's note: {}",
+                    lost.kept, accepted.note
                 )
             } else {
                 format!(
-                    "Agora had lost versions of your state sealed here. On {date}, your \
-                     operator sealed your state here on top of the copy Agora holds; the \
-                     versions Agora lost are kept here. Your operator's note: {}",
-                    accepted.note
+                    "Agora had lost {versions} of your state sealed here. On {date}, your \
+                     operator sealed your state here on top of the copy Agora holds. Kept by \
+                     your runner: {}. Your operator's note: {}",
+                    lost.kept, accepted.note
                 )
             });
         }

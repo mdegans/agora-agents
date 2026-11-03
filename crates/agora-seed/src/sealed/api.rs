@@ -63,6 +63,13 @@ pub trait SealedApi: Send + Sync {
         key: &SigningKey,
         after: Option<GovernanceLogId>,
     ) -> Result<Vec<AnchorProof>, String>;
+    /// Agora's head for the agent, asked apart from its chain: `None` for
+    /// `head: null` or a 404.
+    async fn head(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+    ) -> Result<Option<agora_agentkit::govlog::Sha256Hex>, String>;
     /// Whether Agora holds a sealed head for the agent: `Ok(false)` when it
     /// answers `head: null` (nothing sealed there) or 404s (an unknown or
     /// deleted agent); anything else unanswered is `Err`.
@@ -181,6 +188,20 @@ impl SealedApi for Client {
             .map_err(|e| e.to_string())
     }
 
+    async fn head(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+    ) -> Result<Option<agora_agentkit::govlog::Sha256Hex>, String> {
+        match self.get_state_head(auth(id, key)).await {
+            Ok(r) => Ok(r.head.map(|h| h.entry_hash)),
+            Err(agora_agentkit::client::Error::Status { status, .. }) if status.as_u16() == 404 => {
+                Ok(None)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
         match self.get_state_head(auth(id, key)).await {
             Ok(_) => Ok(true),
@@ -248,6 +269,9 @@ pub mod fake {
         pub unknown_agent: Mutex<bool>,
         /// Its profile shows an anchored head.
         pub anchor_shown: Mutex<bool>,
+        /// What `head` answers instead of the chain's last: a server whose
+        /// answers disagree.
+        pub head_override: Mutex<Option<Option<agora_agentkit::govlog::Sha256Hex>>>,
     }
 
     impl FakeApi {
@@ -264,6 +288,7 @@ pub mod fake {
                 anchored: Mutex::default(),
                 unknown_agent: Mutex::default(),
                 anchor_shown: Mutex::default(),
+                head_override: Mutex::default(),
             }
         }
 
@@ -390,6 +415,27 @@ pub mod fake {
                 .filter(|p| after.as_ref().is_none_or(|a| p.anc_id > *a))
                 .cloned()
                 .collect())
+        }
+
+        async fn head(
+            &self,
+            _: AgentId,
+            _: &SigningKey,
+        ) -> Result<Option<agora_agentkit::govlog::Sha256Hex>, String> {
+            self.call("head")?;
+            if let Some(h) = *self.head_override.lock().unwrap() {
+                return Ok(h);
+            }
+            if *self.unknown_agent.lock().unwrap() {
+                return Ok(None);
+            }
+            match &*self.chain.lock().unwrap() {
+                Ok(chain) => Ok(chain
+                    .iter()
+                    .max_by_key(|e| e.entry.seq)
+                    .map(|e| e.entry_hash())),
+                Err(e) => Err(e.clone()),
+            }
         }
 
         /// As the real server: 404 for an unknown agent, `head: null`

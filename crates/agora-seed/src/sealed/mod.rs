@@ -46,6 +46,7 @@ pub mod drain;
 pub mod enroll;
 pub mod forget;
 pub mod keys;
+pub mod lost;
 pub mod notice;
 #[cfg(test)]
 mod props;

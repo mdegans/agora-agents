@@ -70,6 +70,12 @@ pub async fn accept(
     // sealed/ lost (its enrolment marker and head.json with it), the state
     // here: enrolled by its keys, and accepted on top of Agora's chain.
     // The start check refuses the run for it without a marker
+    anyhow::ensure!(
+        !std::fs::read_to_string(seal.dir().join("refused"))
+            .is_ok_and(|r| Refusal::from_marker(&r) == Refusal::StateTooNew),
+        "agent {id}'s state was written by a newer runner than this one: upgrade the runner; \
+         don't restore or accept over it"
+    );
     let lost_seal = !seal.is_enrolled().await?
         && seal.head().await?.is_none()
         && keys.state_key_file(id)?.is_some();
@@ -234,11 +240,13 @@ pub struct Rebased {
     pub set_aside: usize,
 }
 
-/// Resolve a held fork (v1 has no merges): the current state is sealed as
-/// a keyframe child of Agora's head, which is first verified with the
-/// runner's own trust; the versions that went the other way are kept
-/// locally as `.displaced`. A refusal is cleared first. The agent's next
-/// session is told its two histories were joined, with `note`.
+/// Resolve a held fork (v1 has no merges), or versions Agora lost (a held
+/// LocalMissing): the current state is sealed as a keyframe child of
+/// Agora's head, which is first verified with the runner's own trust. For
+/// a fork the versions that went the other way are kept locally as
+/// `.displaced`; for a loss, see [`super::lost`] (and, Agora holding
+/// nothing, a new chain whose genesis records the break). A refusal is
+/// cleared first. The agent's next session is told, with `note`.
 pub async fn rebase(
     state_dir: &Path,
     keys: &KeyStore,
@@ -250,12 +258,14 @@ pub async fn rebase(
     anyhow::ensure!(!note.is_empty(), "--note is required: the agent reads it");
     let agent_dir = state_dir.join(id.to_string());
     let seal = AgentSeal::new(&agent_dir, id);
-    let lock = super::session::take(state_dir, id, true).await?;
     anyhow::ensure!(
         seal.is_enrolled().await?,
         "agent {id} is not enrolled in sealed state"
     );
     let signing = keys.signing(id).context("no signing key for the agent")?;
+    let k = keys
+        .seal_keys(id)
+        .context("no sealing keys for the agent")?;
     let chain = super::api::chain(api, id, &signing)
         .await
         .map_err(anyhow::Error::msg)
@@ -269,6 +279,19 @@ pub async fn rebase(
         "Agora's chain does not verify ({:?}): not rebasing onto it",
         report.problems
     );
+    let current = FsStorage::new(state_dir)
+        .load_raw(id)
+        .await
+        .context("the agent's state won't load")?
+        .value;
+    // A resolution of Agora's loss cut short: finished, as it began
+    if let Some((dir, intent)) = super::lost::pending(&seal)? {
+        let lock = super::session::take(state_dir, id, true).await?;
+        return finish_lost(
+            &seal, &lock, &k, &agent_dir, &dir, &intent, &current, &chain, note,
+        )
+        .await;
+    }
     let local_head = seal.head().await?.map(|h| h.head);
     let outbox: Vec<_> = seal
         .outbox()
@@ -291,105 +314,128 @@ pub async fn rebase(
         "no fork to resolve and nothing lost on Agora: the local head stands {status:?} to \
          Agora's"
     );
-    let current = FsStorage::new(state_dir)
-        .load_raw(id)
-        .await
-        .context("the agent's state won't load")?
-        .value;
-    let k = keys
-        .seal_keys(id)
-        .context("no sealing keys for the agent")?;
+    if agora_lost {
+        // Never on a cold run: the start check must hold (or have refused)
+        // the agent for it, now
+        let refused = seal.is_refused().await?;
+        if !refused {
+            let out = super::check::check(
+                &agent_dir,
+                id,
+                &agora_agentkit::state::storage::plaintext_hash(&current),
+                super::sizes::Sizes::of(&current),
+                keys,
+                api,
+            )
+            .await;
+            anyhow::ensure!(
+                matches!(
+                    out,
+                    super::check::Outcome::Run {
+                        hold: Some(super::check::Hold::HeadMissing),
+                        ..
+                    }
+                ),
+                "agent {id} is not held for versions Agora lost (the start check says {out:?}): \
+                 nothing to resolve"
+            );
+        }
+        // And one read isn't enough to call versions lost: Agora's head,
+        // asked apart, must say the same
+        let head = api.head(id, &signing).await.map_err(anyhow::Error::msg)?;
+        let agrees = match (chain.last(), head) {
+            (None, None) => true,
+            (Some(last), Some(h)) => h == last.entry_hash(),
+            _ => false,
+        };
+        anyhow::ensure!(
+            agrees,
+            "Agora's answers disagree (its chain and its head); try again later"
+        );
+        let onto = chain.last().map(|e| HeadRef {
+            entry_hash: e.entry_hash(),
+            seq: e.entry.seq,
+        });
+        let lock = super::session::take(state_dir, id, true).await?;
+        let (dir, intent) = super::lost::begin(&seal, onto, &lost, note).await?;
+        return finish_lost(
+            &seal, &lock, &k, &agent_dir, &dir, &intent, &current, &chain, note,
+        )
+        .await;
+    }
+    let lock = super::session::take(state_dir, id, true).await?;
     if seal.is_refused().await? {
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
-    // What Agora lost is kept here, off the line, under its number (so no
-    // gap): `sent/<ord>-<hash>.lost`
-    let sent_dir = seal.dir().join("sent");
-    for item in &lost {
-        std::fs::rename(
-            sent_dir.join(format!("{:020}.json", item.ord)),
-            sent_dir.join(format!("{:020}-{}.lost", item.ord, item.entry.entry_hash())),
-        )
-        .context("setting aside a version Agora lost")?;
-    }
-    let set_aside = outbox.len() + lost.len();
-    let (onto, head) = match chain.last() {
-        Some(server_head) => {
-            let head = seal
-                .rebase_onto(&lock, &k, &server_head.entry, &current)
-                .await
-                .context("sealing the current state on top of Agora's head")?;
-            let onto = HeadRef {
-                entry_hash: server_head.entry_hash(),
-                seq: server_head.entry.seq,
-            };
-            (Some(onto), head)
-        }
-        // Agora holds nothing for the agent: a new chain whose genesis says
-        // there was a break, so the gap stays visible
-        None => {
-            let outbox_dir = seal.dir().join("outbox");
-            for item in seal.outbox().await? {
-                std::fs::rename(
-                    outbox_dir.join(format!("{:020}.json", item.ord)),
-                    outbox_dir.join(format!(
-                        "{:020}-{}.displaced",
-                        item.ord,
-                        item.entry.entry_hash()
-                    )),
-                )
-                .context("setting aside a waiting version")?;
-            }
-            let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
-            std::fs::rename(
-                seal.dir().join("head.json"),
-                seal.dir().join(format!("head.{at}.lost-on-agora.json")),
-            )
-            .context("setting the old head aside")?;
-            let origin = agora_agentkit::state::GenesisOrigin {
-                class: agora_agentkit::state::GenesisClass::KnownBreak,
-                incident: None,
-                prior_copy_held: true,
-                verified_at: None,
-            };
-            let now = Utc::now();
-            super::session::genesis(&seal, &lock, &k, &origin, now)
-                .await
-                .context("sealing a new genesis")?;
-            let head = super::session::append(
-                &seal,
-                &lock,
-                &k,
-                &KeyframePolicy::default(),
-                StateEntryKind::Snapshot,
-                &current,
-                now,
-            )
-            .await
-            .context("sealing the current state on the new genesis")?;
-            (None, head)
-        }
-    };
+    let server_head = chain
+        .last()
+        .context("Agora holds no chain: nothing to rebase onto")?;
+    let set_aside = outbox.len();
+    let head = seal
+        .rebase_onto(&lock, &k, &server_head.entry, &current)
+        .await
+        .context("sealing the current state on top of Agora's head")?;
     super::enroll::record_sizes(&agent_dir, head, Utc::now(), &current);
-    if agora_lost {
-        Notice::agora_lost(&agent_dir, note, onto.is_none()).context("writing the notice")?;
-    } else {
-        Notice::joined(&agent_dir, note).context("writing the notice")?;
-    }
+    Notice::joined(&agent_dir, note).context("writing the notice")?;
     drop(lock);
+    let onto = HeadRef {
+        entry_hash: server_head.entry_hash(),
+        seq: server_head.entry.seq,
+    };
     tracing::warn!(
         event_type = "sealed_state_rebased",
         agent_id = %id,
-        onto = ?onto.map(|o| o.entry_hash),
+        onto = %onto.entry_hash,
         head = %head.entry_hash,
         set_aside,
-        agora_lost,
-        "the operator sealed the current state on top of Agora's head"
+        "the operator joined a held fork onto Agora's head"
     );
     Ok(Rebased {
-        onto,
+        onto: Some(onto),
         head,
         set_aside,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_lost(
+    seal: &AgentSeal,
+    lock: &agora_agentkit::state::storage::SealLock,
+    k: &agora_agentkit::state::storage::SealKeys,
+    agent_dir: &Path,
+    dir: &Path,
+    intent: &super::lost::Intent,
+    current: &serde_json::Value,
+    chain: &[agora_agentkit::state::SignedStateEntry],
+    note: &str,
+) -> anyhow::Result<Rebased> {
+    let id = seal.agent_id();
+    let head = super::lost::finish(seal, lock, k, dir, intent, current, chain.last()).await?;
+    if seal.is_refused().await? {
+        seal.clear_refusal().await.context("clearing the refusal")?;
+    }
+    super::enroll::record_sizes(agent_dir, head, Utc::now(), current);
+    Notice::agora_lost(
+        agent_dir,
+        note,
+        intent.onto.is_none(),
+        intent.items.len(),
+        &super::lost::kept_text(intent),
+    )
+    .context("writing the notice")?;
+    tracing::warn!(
+        event_type = "sealed_state_agora_lost_resolved",
+        agent_id = %id,
+        onto = ?intent.onto.map(|o| o.entry_hash),
+        head = %head.entry_hash,
+        set_aside = intent.items.len(),
+        kept = %dir.display(),
+        "versions Agora lost resolved: the state sealed on top of what Agora holds"
+    );
+    Ok(Rebased {
+        onto: intent.onto,
+        head,
+        set_aside: intent.items.len(),
     })
 }
 

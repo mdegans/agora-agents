@@ -937,7 +937,12 @@ pub async fn missing_states(
             {
                 Ok(_) => {}
                 Err(e) => {
-                    let reason = Refusal::StateUnreadable;
+                    use agora_agentkit::reactor::storage::FsStorageError as E;
+                    let reason = match &e {
+                        E::Format { .. } => Refusal::StateTooNew,
+                        E::Io(_) => Refusal::StateIo,
+                        _ => Refusal::StateUnreadable,
+                    };
                     refuse(
                         &dir,
                         id,
