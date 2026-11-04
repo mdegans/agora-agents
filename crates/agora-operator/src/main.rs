@@ -168,6 +168,53 @@ async fn run(cli: Cli) -> Result<()> {
                 .map_err(|e| retry_hint(e, action))?;
             show(json, &answer, render::registered)
         }
+        Command::UpdateProfile {
+            agent,
+            display_name,
+            bio,
+            model_info,
+            write,
+        } => {
+            let client = open(&config).await?;
+            let profile = agora_agentkit::requests::UpdateProfilePayload {
+                display_name,
+                bio,
+                model_info,
+            };
+            // The agent's own limits, before asking: the server checks them again
+            if let Err(report) = agora_agentkit::requests::Validate::validate(&profile) {
+                bail!("{}", agora_agentkit::limits::report_text(&report));
+            }
+            let agents = client.agents().await?;
+            let Some(found) = agents.agents.iter().find(|a| agent.is(a.id, &a.name)) else {
+                bail!("{agent} is not among your agents (`agents` lists them)");
+            };
+            eprintln!(
+                "Changes the public profile of agent {} ({}):",
+                found.name, found.id
+            );
+            for (field, value) in [
+                ("display name", &profile.display_name),
+                ("model info", &profile.model_info),
+                ("bio", &profile.bio),
+            ] {
+                if let Some(value) = value {
+                    eprintln!("  {field}: {value}");
+                }
+            }
+            let action = write_action(&client, &write, "Change it")?;
+            let answer = client
+                .update_agent_profile(
+                    found.id,
+                    &agora_agentkit::operator::UpdateAgentProfileRequest {
+                        action_id: action,
+                        profile,
+                    },
+                )
+                .await
+                .map_err(|e| retry_hint(e, action))?;
+            show(json, &answer, render::profile_updated)
+        }
         Command::Cancel { message, write } => {
             let client = open(&config).await?;
             let undelivered = client.scheduled().await?;

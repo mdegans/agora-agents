@@ -235,6 +235,16 @@ impl OperatorClient {
             .await
     }
 
+    /// Change one of the operator's agents' public profile
+    pub async fn update_agent_profile(
+        &self,
+        agent: agora_agentkit::ids::AgentId,
+        req: &agora_agentkit::operator::UpdateAgentProfileRequest,
+    ) -> Result<agora_agentkit::operator::UpdateAgentProfileResponse> {
+        let url = self.url("agents", &[&agent.to_string(), "profile"])?;
+        self.call(url, Signed::Write(req, req.action_id)).await
+    }
+
     /// The request, built and signed at `timestamp`, as it will be sent
     async fn build<B: Serialize>(
         &self,

@@ -5,8 +5,9 @@
 use std::path::PathBuf;
 
 use agora_agentkit::ids::{
-    MessageId, ModerationActionId, OperatorActionId, OperatorCredentialId, OperatorId,
+    AgentId, MessageId, ModerationActionId, OperatorActionId, OperatorCredentialId, OperatorId,
 };
+use agora_agentkit::names::AgentName;
 use agora_agentkit::operator::{
     MarkRepliesRead, OperatorLogQuery, OperatorMessagesQuery, OperatorModerationQuery,
     OperatorRecipients,
@@ -116,6 +117,30 @@ pub enum Command {
         write: WriteArgs,
     },
 
+    /// Change one of your agents' public profile: the fields given, under
+    /// the agent's own limits. The others are kept
+    #[command(
+        name = "update-profile",
+        group(ArgGroup::new("fields").required(true).multiple(true)
+            .args(["display_name", "bio", "model_info"]))
+    )]
+    UpdateProfile {
+        /// The agent, by name or id
+        #[arg(long, value_parser = parse_agent)]
+        agent: AgentArg,
+        /// Its display name
+        #[arg(long)]
+        display_name: Option<String>,
+        /// Its bio, in Markdown
+        #[arg(long)]
+        bio: Option<String>,
+        /// The model it runs on, as its profile shows it
+        #[arg(long)]
+        model_info: Option<String>,
+        #[command(flatten)]
+        write: WriteArgs,
+    },
+
     /// Your messages not delivered yet, soonest first
     Scheduled,
 
@@ -184,6 +209,42 @@ pub struct WriteArgs {
     /// Don't ask before sending
     #[arg(long, short)]
     pub yes: bool,
+}
+
+/// An agent named on the command line: an id, or else a name
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentArg {
+    Id(AgentId),
+    Name(AgentName),
+}
+
+impl AgentArg {
+    /// Whether `agent` is the one named
+    pub fn is(&self, id: AgentId, name: &AgentName) -> bool {
+        match self {
+            Self::Id(want) => *want == id,
+            Self::Name(want) => want == name,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Id(id) => write!(f, "{id}"),
+            Self::Name(name) => write!(f, "{name}"),
+        }
+    }
+}
+
+/// An agent id if it parses as one, else an agent name
+pub fn parse_agent(text: &str) -> Result<AgentArg, String> {
+    if let Ok(id) = text.parse() {
+        return Ok(AgentArg::Id(id));
+    }
+    text.parse()
+        .map(AgentArg::Name)
+        .map_err(|e| format!("{text:?} is neither an agent id nor an agent name: {e}"))
 }
 
 /// `on` or `off`
@@ -281,7 +342,6 @@ fn parse_label(text: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_agentkit::ids::AgentId;
     use agora_agentkit::operator::OperatorActionKind;
     use clap::CommandFactory;
     use clap::error::ErrorKind;
@@ -462,5 +522,62 @@ mod tests {
     fn there_is_no_default_server() {
         let cli = parse("agents").unwrap();
         assert!(cli.server.is_none());
+    }
+
+    #[test]
+    fn update_profile_takes_an_agent_by_name_or_id_and_at_least_one_field() {
+        let Command::UpdateProfile {
+            agent,
+            display_name,
+            bio,
+            model_info,
+            write,
+        } = parse(&format!(
+            "update-profile --agent {A} --model-info opus --yes"
+        ))
+        .unwrap()
+        .command
+        else {
+            panic!("expected update-profile");
+        };
+        assert_eq!(agent, AgentArg::Id(A.parse().unwrap()));
+        assert_eq!(
+            (display_name, bio, model_info.as_deref()),
+            (None, None, Some("opus"))
+        );
+        assert!(write.yes);
+        let cli = Cli::try_parse_from([
+            "agora-operator",
+            "update-profile",
+            "--agent",
+            "beta-critic",
+            "--display-name",
+            "Beta Critic",
+            "--bio",
+            "A critic.",
+        ])
+        .unwrap();
+        let Command::UpdateProfile {
+            agent,
+            display_name,
+            bio,
+            model_info,
+            ..
+        } = cli.command
+        else {
+            panic!("expected update-profile");
+        };
+        assert_eq!(agent, AgentArg::Name("beta-critic".parse().unwrap()));
+        assert!(agent.is(AgentId::new(), &"beta-critic".parse().unwrap()));
+        assert_eq!(display_name.as_deref(), Some("Beta Critic"));
+        assert_eq!(bio.as_deref(), Some("A critic."));
+        assert_eq!(model_info, None);
+        // Nothing to change, no agent, or not an agent
+        let err = parse("update-profile --agent ada").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        let err = parse("update-profile --bio x").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(parse("update-profile --agent a --bio x").is_err());
+        assert!(parse_agent("not a name").is_err());
     }
 }

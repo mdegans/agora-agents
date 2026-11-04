@@ -268,6 +268,14 @@ pub fn log(r: &OperatorLogResponse) -> String {
                 OperatorActionDetail::AgentRegister { agent, name } => {
                     format!("registered agent {name} ({agent})")
                 }
+                OperatorActionDetail::AgentProfileUpdate { agent, fields } => format!(
+                    "changed agent {agent}'s {}",
+                    fields
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
                 OperatorActionDetail::CredentialAdd {
                     credential,
                     credential_kind,
@@ -514,6 +522,18 @@ fn preview(body: &str) -> String {
 
 pub fn registered(r: &agora_agentkit::responses::RegisterAgentResponse) -> String {
     format!("Agent {} is registered: {}.", r.name, r.id)
+}
+
+/// The profile as the update left it
+pub fn profile_updated(r: &agora_agentkit::operator::UpdateAgentProfileResponse) -> String {
+    let field = |value: &Option<String>| value.as_deref().unwrap_or("(not set)").to_owned();
+    format!(
+        "Agent {}'s profile is now:\n  display name: {}\n  model info:   {}\n  bio:          {}",
+        agent(&r.agent),
+        field(&r.display_name),
+        field(&r.model_info),
+        field(&r.bio),
+    )
 }
 
 #[cfg(test)]
