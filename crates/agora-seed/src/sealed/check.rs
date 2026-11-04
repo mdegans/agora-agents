@@ -427,7 +427,16 @@ pub fn verdict_line(
             std::cmp::Ordering::Less => format!(" (\u{2212}{}{since})", thousands(before - now)),
         }
     };
-    let memory_change = change(sizes.memory_chars, previous.map(|p| p.memory_chars), true);
+    let mut memory_change = change(sizes.memory_chars, previous.map(|p| p.memory_chars), true);
+    // A shrink reads as a loss unless it says whose it is (beta round 6):
+    // the last sealed version is the save at the end of the agent's own
+    // last session, so the memory in it is what the agent wrote then
+    if previous.is_some_and(|p| sizes.memory_chars < p.memory_chars) {
+        memory_change.insert_str(
+            memory_change.len() - 1,
+            ", as you rewrote it at the end of your last session",
+        );
+    }
     let soul_change = change(sizes.soul_chars, previous.map(|p| p.soul_chars), false);
     let verdict = match server {
         Server::InStep => "intact, and in step with Agora.",
@@ -1909,16 +1918,22 @@ pub(crate) mod tests {
         let text = verdict_line(&line, &head, now, Some(before), Server::Other, None);
         assert!(
             text.contains(
-                "Your memory is 13,539 characters (\u{2212}1,204 since your last checked version) \
-                 and your soul 3,440 (unchanged), as at your last sealed version."
+                "Your memory is 13,539 characters (\u{2212}1,204 since your last checked version, \
+                 as you rewrote it at the end of your last session) and your soul 3,440 \
+                 (unchanged), as at your last sealed version."
             ),
             "{text}"
         );
+        // A growth needs no such word, nor does an unchanged memory
         let grown = verdict_line(&line, &head, before, Some(now), Server::Other, None);
         assert!(
-            grown.contains("14,743 characters (+1,204 since your last checked version)"),
+            grown.contains("14,743 characters (+1,204 since your last checked version) and"),
             "{grown}"
         );
+        assert!(!grown.contains("rewrote"), "{grown}");
+        let same = verdict_line(&line, &head, now, Some(now), Server::Other, None);
+        assert!(same.contains("13,539 characters (unchanged) and"), "{same}");
+        assert!(!same.contains("rewrote"), "{same}");
         // The newest anchor the runner checked, named
         let proof = AnchorProof {
             anc_id: "ANC-2026-0004".parse().unwrap(),
