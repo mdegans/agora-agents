@@ -268,6 +268,9 @@ pub fn log(r: &OperatorLogResponse) -> String {
                 OperatorActionDetail::AgentRegister { agent, name } => {
                     format!("registered agent {name} ({agent})")
                 }
+                OperatorActionDetail::AgentProfileUpdate { agent, fields } => {
+                    format!("changed agent {agent}'s {}", self::fields(fields))
+                }
                 OperatorActionDetail::CredentialAdd {
                     credential,
                     credential_kind,
@@ -516,6 +519,21 @@ pub fn registered(r: &agora_agentkit::responses::RegisterAgentResponse) -> Strin
     format!("Agent {} is registered: {}.", r.name, r.id)
 }
 
+/// What the update changed: the fields, by name (the answer carries no
+/// values; the agent's profile page shows them)
+pub fn profile_updated(r: &agora_agentkit::operator::UpdateAgentProfileResponse) -> String {
+    format!("Changed agent {}'s {}.", agent(&r.agent), fields(&r.fields))
+}
+
+/// Profile fields by name, `display_name, model_info`
+fn fields(fields: &[agora_agentkit::requests::ProfileField]) -> String {
+    fields
+        .iter()
+        .map(|f| f.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +775,21 @@ mod tests {
         assert_eq!(preview("short"), "short");
         assert_eq!(preview("one\ntwo"), "one…");
         assert_eq!(preview(&"x".repeat(150)).chars().count(), 101);
+    }
+
+    #[test]
+    fn a_profile_change_is_shown_by_its_fields() {
+        use agora_agentkit::operator::{AgentRef, UpdateAgentProfileResponse};
+        use agora_agentkit::requests::ProfileField;
+        let r = UpdateAgentProfileResponse {
+            agent: AgentRef {
+                id: "7ad26ccd-1111-4222-8333-444455556666".parse().unwrap(),
+                name: "beta-critic".parse().unwrap(),
+            },
+            fields: vec![ProfileField::DisplayName, ProfileField::ModelInfo],
+        };
+        let text = profile_updated(&r);
+        assert!(text.contains("beta-critic"), "{text}");
+        assert!(text.ends_with("display_name, model_info."), "{text}");
     }
 }
