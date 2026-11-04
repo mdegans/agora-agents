@@ -40,7 +40,7 @@ use crate::alerts::{Alert, AlertKind, Alerter};
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.149.0:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.150.0:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +399,18 @@ pub enum Server {
     Other,
 }
 
+/// The version a verdict compares the state's sizes against
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Previous {
+    pub sizes: Sizes,
+    /// The head is the agent's own end-of-session save and this is the
+    /// snapshot just before it on the line, and no notice was seated: a
+    /// change between them is then the agent's own rewrite. Anything else
+    /// (an operator's accept or resume, sizes not recorded for a session
+    /// in between) says nothing about whose it is
+    pub own_last_session: bool,
+}
+
 /// The verdict line for an intact chain: the verdict, the snapshots since
 /// the earliest one's date, a pre-loss copy apart, the newest anchor the
 /// runner checked ([`super::anchors`]), the head marker, and the state's
@@ -407,7 +419,7 @@ pub fn verdict_line(
     line: &[SignedStateEntry],
     head: &HeadRef,
     sizes: Sizes,
-    previous: Option<Sizes>,
+    previous: Option<Previous>,
     server: Server,
     anchor: Option<&AnchorProof>,
 ) -> String {
@@ -427,8 +439,24 @@ pub fn verdict_line(
             std::cmp::Ordering::Less => format!(" (\u{2212}{}{since})", thousands(before - now)),
         }
     };
-    let memory_change = change(sizes.memory_chars, previous.map(|p| p.memory_chars), true);
-    let soul_change = change(sizes.soul_chars, previous.map(|p| p.soul_chars), false);
+    let mut memory_change = change(
+        sizes.memory_chars,
+        previous.map(|p| p.sizes.memory_chars),
+        true,
+    );
+    // A shrink reads as a loss unless it says whose it is (beta round 6),
+    // said only when the runner knows: see [`Previous::own_last_session`]
+    if previous.is_some_and(|p| p.own_last_session && sizes.memory_chars < p.sizes.memory_chars) {
+        memory_change.insert_str(
+            memory_change.len() - 1,
+            ", as you rewrote it at the end of your last session",
+        );
+    }
+    let soul_change = change(
+        sizes.soul_chars,
+        previous.map(|p| p.sizes.soul_chars),
+        false,
+    );
     let verdict = match server {
         Server::InStep => "intact, and in step with Agora.",
         Server::Unchecked => "intact here; Agora's copy couldn't be checked this session.",
@@ -762,7 +790,26 @@ pub async fn check(
         line.len() - 1
     };
     let before = earlier_sizes(agent_dir, &seal, keys, id, &line, upto).await;
-    let previous = before.as_ref().map(|b| b.sizes);
+    // The snapshot just before the head: compared with that one, and with
+    // no notice of an operator's act seated, the head is the agent's own
+    // end-of-session save and the change its own rewrite
+    let prior_snapshot = line[..line.len() - 1]
+        .iter()
+        .rev()
+        .find(|e| e.entry.kind == StateEntryKind::Snapshot)
+        .map(|e| e.entry.seq);
+    let own_last_session = !notice
+        && seal_failed.is_none()
+        && line
+            .last()
+            .is_some_and(|h| h.entry.kind == StateEntryKind::Snapshot)
+        && before
+            .as_ref()
+            .is_some_and(|b| Some(b.seq) == prior_snapshot);
+    let previous = before.as_ref().map(|b| Previous {
+        sizes: b.sizes,
+        own_last_session,
+    });
     let drops: Vec<(&'static str, String, u32)> = match &before {
         Some(before) => drop_lines(before, sizes)
             .into_iter()
@@ -1608,6 +1655,70 @@ pub(crate) mod tests {
         }
     }
 
+    /// A shrink is said to be the agent's own rewrite only when the head
+    /// is its end-of-session save and the compared version the one just
+    /// before it; with a session's sizes unrecorded in between, it isn't
+    /// (beta round 6; an operator's accept is in `accept`'s tests)
+    #[tokio::test]
+    async fn a_shrink_is_the_agents_own_only_against_the_version_just_before() {
+        use agora_agentkit::state::storage::Mirrored;
+        let root = crate::sealed::TestDir::new("check-own-shrink");
+        let (id, keys, dir) = enrolled(&root).await;
+        let mem = |n: usize| serde_json::json!({ "memory": { "content": "x".repeat(n) } });
+        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
+            root.join("state"),
+            root.join("secrets"),
+        ));
+        let mut store = Mirrored::new(FsStorage::new(root.join("state")), (), enrolment);
+        let server = server(Vec::new());
+        let verdict = async |state: &serde_json::Value| {
+            let out = check(
+                &dir,
+                id,
+                &plaintext_hash(state),
+                Sizes::of(state),
+                &keys,
+                &server,
+            )
+            .await;
+            let Outcome::Run { seat, notice, .. } = out else {
+                panic!("{out:?}")
+            };
+            assert!(!notice);
+            seat.into_iter()
+                .find(|l| l.starts_with("Your sealed state: "))
+                .expect("a verdict")
+        };
+        let mut base = store.load_raw(id).await.unwrap().base;
+        for (n, own) in [(1000, None), (900, Some(true))] {
+            base = store.save_raw(id, mem(n), base.as_ref()).await.unwrap();
+            let line = verdict(&mem(n)).await;
+            match own {
+                None => {}
+                Some(_) => assert!(
+                    line.contains(
+                        "Your memory is 900 characters (\u{2212}100 since your last checked \
+                         version, as you rewrote it at the end of your last session)"
+                    ),
+                    "{line}"
+                ),
+            }
+        }
+        // A version sealed with no check after it (its session's sizes not
+        // recorded): the compared one is two back, and the change may span
+        // sessions
+        base = store.save_raw(id, mem(800), base.as_ref()).await.unwrap();
+        store.save_raw(id, mem(700), base.as_ref()).await.unwrap();
+        let line = verdict(&mem(700)).await;
+        assert!(
+            line.contains(
+                "Your memory is 700 characters (\u{2212}200 since your last checked version) and"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("rewrote"), "{line}");
+    }
+
     /// A `sealed/` that can't be read never refuses on its own: the agent
     /// runs, told, held.
     #[tokio::test]
@@ -1906,18 +2017,72 @@ pub(crate) mod tests {
             memory_chars: 14_743,
             soul_chars: 3_440,
         };
-        let text = verdict_line(&line, &head, now, Some(before), Server::Other, None);
+        let text = verdict_line(
+            &line,
+            &head,
+            now,
+            Some(Previous {
+                sizes: before,
+                own_last_session: true,
+            }),
+            Server::Other,
+            None,
+        );
         assert!(
             text.contains(
-                "Your memory is 13,539 characters (\u{2212}1,204 since your last checked version) \
-                 and your soul 3,440 (unchanged), as at your last sealed version."
+                "Your memory is 13,539 characters (\u{2212}1,204 since your last checked version, \
+                 as you rewrote it at the end of your last session) and your soul 3,440 \
+                 (unchanged), as at your last sealed version."
             ),
             "{text}"
         );
-        let grown = verdict_line(&line, &head, before, Some(now), Server::Other, None);
+        // A growth needs no such word, nor does an unchanged memory
+        let grown = verdict_line(
+            &line,
+            &head,
+            before,
+            Some(Previous {
+                sizes: now,
+                own_last_session: true,
+            }),
+            Server::Other,
+            None,
+        );
         assert!(
-            grown.contains("14,743 characters (+1,204 since your last checked version)"),
+            grown.contains("14,743 characters (+1,204 since your last checked version) and"),
             "{grown}"
+        );
+        assert!(!grown.contains("rewrote"), "{grown}");
+        let same = verdict_line(
+            &line,
+            &head,
+            now,
+            Some(Previous {
+                sizes: now,
+                own_last_session: true,
+            }),
+            Server::Other,
+            None,
+        );
+        assert!(same.contains("13,539 characters (unchanged) and"), "{same}");
+        assert!(!same.contains("rewrote"), "{same}");
+        // A shrink the runner can't attribute (an operator's act, or a
+        // version in between) is told without saying whose
+        let unknown = verdict_line(
+            &line,
+            &head,
+            now,
+            Some(Previous {
+                sizes: before,
+                own_last_session: false,
+            }),
+            Server::Other,
+            None,
+        );
+        assert!(
+            unknown
+                .contains("13,539 characters (\u{2212}1,204 since your last checked version) and"),
+            "{unknown}"
         );
         // The newest anchor the runner checked, named
         let proof = AnchorProof {
