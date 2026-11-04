@@ -555,6 +555,64 @@ mod tests {
         assert!(matches!(out, Outcome::Run { notice: false, .. }), "{out:?}");
     }
 
+    /// A shrink an operator accepted is never told as the agent's own
+    /// rewrite, beside the notice that says the operator accepted it (beta
+    /// round 6)
+    #[tokio::test]
+    async fn an_accepted_shrink_is_not_called_the_agents_rewrite() {
+        use agora_agentkit::state::storage::Mirrored;
+        let root = crate::sealed::TestDir::new("accept-shrink");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        let state_dir = root.join("state");
+        let full = serde_json::json!({ "memory": { "content": "x".repeat(1000) } });
+        let cut = serde_json::json!({ "memory": { "content": "x".repeat(400) } });
+        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
+            state_dir.clone(),
+            root.join("secrets"),
+        ));
+        let mut store = Mirrored::new(FsStorage::new(&state_dir), (), enrolment);
+        let base = store.load_raw(id).await.unwrap().base;
+        store
+            .save_raw(id, full.clone(), base.as_ref())
+            .await
+            .unwrap();
+        let sizes = crate::sealed::sizes::Sizes::of;
+        // Checked, so its sizes are recorded
+        let out = check::check(&dir, id, &local(&root, id).await, sizes(&full), &keys, &api).await;
+        assert!(matches!(out, Outcome::Run { hold: None, .. }), "{out:?}");
+        // Cut outside a session: refused, then accepted
+        FsStorage::new(&state_dir)
+            .save_raw(id, cut.clone(), None)
+            .await
+            .unwrap();
+        let Outcome::Refuse { reason, detail } =
+            check::check(&dir, id, &local(&root, id).await, sizes(&cut), &keys, &api).await
+        else {
+            panic!()
+        };
+        check::refuse(&dir, id, "tarn", reason, &detail, &Alerter::off()).await;
+        accept(&state_dir, &keys, &api, id, Some("Trimmed by hand."))
+            .await
+            .unwrap();
+        let out = check::check(&dir, id, &local(&root, id).await, sizes(&cut), &keys, &api).await;
+        let Outcome::Run { seat, notice, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert!(notice, "{seat:?}");
+        let verdict = seat
+            .iter()
+            .find(|l| l.starts_with("Your sealed state: "))
+            .expect("a verdict");
+        assert!(
+            verdict.contains(
+                "Your memory is 400 characters (\u{2212}600 since your last checked version) and"
+            ),
+            "{verdict}"
+        );
+        assert!(!verdict.contains("rewrote"), "{verdict}");
+    }
+
     /// A deliberate edit, accepted: the agent reads the note, then what
     /// changed, counted; with the last version unopenable, it is told no
     /// diff could be made.
