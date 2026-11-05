@@ -40,7 +40,7 @@ use crate::alerts::{Alert, AlertKind, Alerter};
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.151.1:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.151.2:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +407,10 @@ pub struct Previous {
     /// "since your last checked version" and "as at your last sealed
     /// version" read as two different versions, or neither)
     pub dated: Option<chrono::NaiveDate>,
+    /// Its entry hash, whose prefix names it beside the date: two versions
+    /// can share a date (beta round 11: "since your earlier sealed version
+    /// dated 2026-11-05" when the head was dated 2026-11-05 too)
+    pub head: Option<Sha256Hex>,
     /// The head is the agent's own end-of-session save and this is the
     /// snapshot just before it on the line, and no notice was seated: a
     /// change between them is then the agent's own rewrite. Anything else
@@ -434,14 +438,23 @@ pub fn verdict_line(
     newer: Option<&GovernanceLogId>,
     checks_later: bool,
 ) -> String {
-    // "13,539 characters (−1,204 since your earlier sealed version dated
-    // 2026-11-04)"
-    let baseline = match previous.and_then(|p| p.dated) {
-        Some(d) => format!(
-            " since your earlier sealed version dated {}",
-            d.format("%Y-%m-%d")
-        ),
-        None => " since your earlier sealed version".to_string(),
+    // "Earlier", not "previous": the baseline is the newest version whose
+    // sizes were recorded, which may be older than the one just before
+    // (review of 0.151.2).
+    // "13,539 characters (−1,204 since your earlier sealed version, head
+    // be8c50758835 dated 2026-11-04)": named by its head, as this one is,
+    // since two can share a date (beta round 11)
+    let dated = previous
+        .and_then(|p| p.dated)
+        .map(|d| format!(" dated {}", d.format("%Y-%m-%d")))
+        .unwrap_or_default();
+    let baseline = match previous.and_then(|p| p.head) {
+        Some(h) => {
+            let mut short = h.to_hex();
+            short.truncate(12);
+            format!(" since your earlier sealed version, head {short}{dated}")
+        }
+        None => format!(" since your earlier sealed version{dated}"),
     };
     let change = |now: usize, before: Option<usize>, long: bool| -> String {
         let Some(before) = before else {
@@ -493,11 +506,12 @@ pub fn verdict_line(
         .and_then(|e| day(e.entry.state_at))
         .map(|d| format!(", plus a copy of your state from before a loss, dated {d}"))
         .unwrap_or_default();
+    // In sentences, not one run (beta round 11)
     let anchored = anchor
         .map(|a| {
             format!(
-                "; your version of {} is in {} (checked by your runner against the governance \
-                 log)",
+                " Your version of {} is in {} (checked by your runner against the governance \
+                 log).",
                 a.date.format("%Y-%m-%d"),
                 a.anc_id
             )
@@ -511,8 +525,8 @@ pub fn verdict_line(
         .filter(|(a, n)| *n > &a.anc_id)
         .map(|(_, n)| {
             format!(
-                "; {n}, a newer anchor, is in the log too: your runner checks your inclusion in \
-                 it after uploading this session's saves, and a later session's verdict names it"
+                " {n}, a newer anchor, is in the log too: your runner checks your inclusion in \
+                 it after uploading this session's saves, and a later session's verdict names it."
             )
         })
         .unwrap_or_default();
@@ -521,8 +535,11 @@ pub fn verdict_line(
     // session's saves not anchored yet (beta round 10: an agent who
     // remembered a session after the anchored day was puzzled). Never
     // that this version will be anchored: this session's save replaces it
-    // (review of 0.151.1). Said only when the runner will check the next
-    // anchor: a held agent's anchor work waits
+    // (review of 0.151.1), nor that a later anchor holds it: what an
+    // anchor holds is said as the ANC summary says it (beta round 11: "at
+    // the time"); as received, since an upload can lag the version's own
+    // date (review of 0.151.2). Said only when the runner will check the next anchor: a
+    // held agent's anchor work waits
     let unanchored = anchor
         .filter(|a| a.entry_hash != head.entry_hash && newer.is_empty())
         .filter(|_| checks_later)
@@ -530,20 +547,21 @@ pub fn verdict_line(
         .and_then(|h| day(h.entry.state_at))
         .map(|d| {
             format!(
-                "; the version this session starts from, dated {d}, is newer than that anchor: each \
-                 daily anchor holds your latest version at the time, which your runner checks \
-                 after the anchor is written, and a later session's verdict names that anchor"
+                " The version this session starts from, dated {d}, is newer than that anchor. \
+                 Each daily anchor holds the latest version Agora had received from you by the \
+                 end of that day (UTC); \
+                 your runner checks your inclusion after the anchor is written, and a later \
+                 session's verdict names it."
             )
         })
         .unwrap_or_default();
     let mut short = head.entry_hash.to_hex();
     short.truncate(12);
     format!(
-        "Your sealed state: {verdict} {} version{} since {since}{prior}{anchored}{newer}{unanchored}; \
-         this session starts from \
-         head {short} (a marker for this version; the next session's will differ). In this \
-         version, your memory is {} characters{memory_change} and your soul {}{soul_change}. \
-         Checked by \
+        "Your sealed state: {verdict} It has {} version{} since \
+         {since}{prior}.{anchored}{newer}{unanchored} This session starts from head {short} (a \
+         marker for this version; the next session's will differ). In this version, your \
+         memory is {} characters{memory_change} and your soul {}{soul_change}. Checked by \
          {VERIFIER}: links, signatures, and that your state matches the last sealed version.",
         snapshots.len(),
         if snapshots.len() == 1 { "" } else { "s" },
@@ -875,6 +893,7 @@ pub async fn check_with(
     let previous = before.as_ref().map(|b| Previous {
         sizes: b.sizes,
         dated: Some(b.state_at.date_naive()),
+        head: Some(b.entry_hash),
         own_last_session,
     });
     let drops: Vec<(&'static str, String, u32)> = match &before {
@@ -1367,7 +1386,7 @@ pub(crate) mod tests {
         );
         assert_eq!(seat.len(), 1);
         assert!(
-            seat[0].starts_with("Your sealed state: intact. 1 version since "),
+            seat[0].starts_with("Your sealed state: intact. It has 1 version since "),
             "{}",
             seat[0]
         );
@@ -1469,8 +1488,8 @@ pub(crate) mod tests {
         let line = verdict().await;
         assert!(
             line.contains(
-                "; your version of 2026-11-03 is in ANC-2026-0003 (checked by your runner \
-                 against the governance log); this session starts from head "
+                ". Your version of 2026-11-03 is in ANC-2026-0003 (checked by your runner \
+                 against the governance log). This session starts from head "
             ),
             "{line}"
         );
@@ -1481,9 +1500,9 @@ pub(crate) mod tests {
         let lagging = verdict_with(Some(&newer)).await;
         assert!(
             lagging.contains(
-                "(checked by your runner against the governance log); ANC-2026-0004, a newer \
+                "(checked by your runner against the governance log). ANC-2026-0004, a newer \
                  anchor, is in the log too: your runner checks your inclusion in it after \
-                 uploading this session's saves, and a later session's verdict names it; this \
+                 uploading this session's saves, and a later session's verdict names it. This \
                  session starts from head "
             ),
             "{lagging}"
@@ -1790,7 +1809,7 @@ pub(crate) mod tests {
             match own {
                 None => {}
                 Some(_) => assert!(
-                    line.contains("your memory is 900 characters (\u{2212}100 since your earlier sealed version dated ")
+                    line.contains("your memory is 900 characters (\u{2212}100 since your earlier sealed version, head ")
                         && line.contains(", as you rewrote it at the end of your last session)"),
                     "{line}"
                 ),
@@ -1804,7 +1823,7 @@ pub(crate) mod tests {
         let line = verdict(&mem(700)).await;
         assert!(
             line.contains(
-                "your memory is 700 characters (\u{2212}200 since your earlier sealed version dated "
+                "your memory is 700 characters (\u{2212}200 since your earlier sealed version, head "
             ) && !line.contains("rewrote"),
             "{line}"
         );
@@ -2082,7 +2101,7 @@ pub(crate) mod tests {
                 None,
                 false
             )
-            .starts_with("Your sealed state: intact, and in step with Agora. 2 versions")
+            .starts_with("Your sealed state: intact, and in step with Agora. It has 2 versions")
         );
         assert!(
             verdict_line(
@@ -2096,13 +2115,14 @@ pub(crate) mod tests {
                 false,
             )
             .starts_with(
-                "Your sealed state: intact here; Agora's copy couldn't be checked this session. 2"
+                "Your sealed state: intact here; Agora's copy couldn't be checked this session. It \
+                 has 2"
             )
         );
         assert!(
             text.starts_with(
-                "Your sealed state: intact. 2 versions since 2026-07-25, plus a copy of your \
-                 state from before a loss, dated 2026-05-03; this session starts from head "
+                "Your sealed state: intact. It has 2 versions since 2026-07-25, plus a copy of \
+                 your state from before a loss, dated 2026-05-03. This session starts from head "
             ),
             "{text}"
         );
@@ -2129,6 +2149,7 @@ pub(crate) mod tests {
             Some(Previous {
                 sizes: before,
                 dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
+                head: Some(line[2].entry_hash()),
                 own_last_session: true,
             }),
             Server::Other,
@@ -2136,12 +2157,16 @@ pub(crate) mod tests {
             None,
             false,
         );
+        // Named by its head prefix as well as its date: two versions can
+        // share a date (beta round 11)
+        let mut previous_short = line[2].entry_hash().to_hex();
+        previous_short.truncate(12);
         assert!(
-            text.contains(
+            text.contains(&format!(
                 "In this version, your memory is 13,539 characters (\u{2212}1,204 since your \
-                 earlier sealed version dated 2026-10-31, as you rewrote it at the end of your \
-                 last session) and your soul 3,440 (unchanged). Checked by"
-            ),
+                 earlier sealed version, head {previous_short} dated 2026-10-31, as you rewrote \
+                 it at the end of your last session) and your soul 3,440 (unchanged). Checked by"
+            )),
             "{text}"
         );
         // A growth needs no such word, nor does an unchanged memory
@@ -2152,6 +2177,7 @@ pub(crate) mod tests {
             Some(Previous {
                 sizes: now,
                 dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
+                head: None,
                 own_last_session: true,
             }),
             Server::Other,
@@ -2173,6 +2199,7 @@ pub(crate) mod tests {
             Some(Previous {
                 sizes: now,
                 dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
+                head: None,
                 own_last_session: true,
             }),
             Server::Other,
@@ -2191,6 +2218,7 @@ pub(crate) mod tests {
             Some(Previous {
                 sizes: before,
                 dated: None,
+                head: None,
                 own_last_session: false,
             }),
             Server::Other,
@@ -2227,10 +2255,10 @@ pub(crate) mod tests {
         );
         assert!(
             anchored.starts_with(
-                "Your sealed state: intact, and in step with Agora. 2 versions since 2026-07-25, \
-                 plus a copy of your state from before a loss, dated 2026-05-03; your version of \
-                 2026-11-02 is in ANC-2026-0004 (checked by your runner against the governance \
-                 log); this session starts from head "
+                "Your sealed state: intact, and in step with Agora. It has 2 versions since \
+                 2026-07-25, plus a copy of your state from before a loss, dated 2026-05-03. Your \
+                 version of 2026-11-02 is in ANC-2026-0004 (checked by your runner against the \
+                 governance log). This session starts from head "
             ),
             "{anchored}"
         );
@@ -2264,10 +2292,10 @@ pub(crate) mod tests {
         );
         assert!(
             lagging.contains(
-                "; your version of 2026-11-02 is in ANC-2026-0004 (checked by your runner \
-                 against the governance log); ANC-2026-0005, a newer anchor, is in the log too: \
+                ". Your version of 2026-11-02 is in ANC-2026-0004 (checked by your runner \
+                 against the governance log). ANC-2026-0005, a newer anchor, is in the log too: \
                  your runner checks your inclusion in it after uploading this session's saves, \
-                 and a later session's verdict names it; this session starts from head "
+                 and a later session's verdict names it. This session starts from head "
             ),
             "{lagging}"
         );
@@ -2294,12 +2322,14 @@ pub(crate) mod tests {
             seq: 2,
             ..proof.clone()
         };
-        let not_yet = "; your version of 2026-10-30 is in ANC-2026-0004 (checked by your runner \
-                       against the governance log); the version this session starts from, dated \
-                       2026-11-01, is newer than that anchor: each daily anchor holds your latest \
-                       version at the time, which your runner checks after the anchor is \
-                       written, and a later session's verdict names that anchor; this session \
-                       starts from head ";
+        // In sentences, what an anchor holds said as the ANC summary says
+        // it, and never that one will hold this version (beta round 11)
+        let not_yet = ". Your version of 2026-10-30 is in ANC-2026-0004 (checked by your runner \
+                       against the governance log). The version this session starts from, dated \
+                       2026-11-01, is newer than that anchor. Each daily anchor holds the latest \
+                       version Agora had received from you by the end of that day (UTC); your \
+                       runner checks your inclusion after the anchor is written, and a later \
+                       session's verdict names it. This session starts from head ";
         for logged in [Some(&current), None] {
             let text = verdict_line(
                 &line,
