@@ -29,8 +29,9 @@
 //! uploads, or from the drainer for an agent enrolled before this; success
 //! writes `sealed/published`. Only the agent's own choice sets it. After
 //! that the choice is the agent's, changed with `config` (agentkit 0.151):
-//! the marker is never removed, and a restore puts it back without asking
-//! Agora, so the runner never sends `publish: true` behind the agent's back.
+//! the marker is never removed, a restore puts it back without asking
+//! Agora, and the one publish is skipped when Agora already has a choice on
+//! record, so the runner never sends `publish: true` behind the agent's back.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -326,6 +327,19 @@ pub async fn publish_if_chosen(
         .await
         .map_err(|e| format!("sealed-state ledger unreadable: {e}"))?;
     if ledger.choice() != Some(SealChoice::Publish) {
+        return Ok(false);
+    }
+    // A choice already on record is the agent's own (`config`, while this
+    // publish waited on a retry or the enrolment's drain) or this runner's
+    // whose marker wasn't written: either way, never sent over it
+    if api.publish_chosen(id, signing).await? {
+        write_atomic(&marker, chrono::Utc::now().to_rfc3339().as_bytes())
+            .map_err(|e| format!("sealed/published not written: {e}"))?;
+        tracing::info!(
+            event_type = "sealed_state_anchor_choice_on_record",
+            agent_id = %id,
+            "a publish choice is already on record with Agora; the runner sends none"
+        );
         return Ok(false);
     }
     api.post_anchor(id, signing, true).await?;
@@ -638,6 +652,31 @@ pub(crate) mod tests {
         assert!(dir.join("sealed").join(PUBLISHED).exists());
         assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
         assert_eq!(api.anchored.lock().unwrap().len(), 1, "once");
+    }
+
+    /// An agent that set its choice with `config` while the runner's one
+    /// publish was still waiting (a failed try, or the enrolment's drain)
+    /// keeps it: the runner sends nothing over a choice on record
+    #[tokio::test]
+    async fn a_choice_the_agent_made_first_is_not_overridden() {
+        let root = crate::sealed::TestDir::new("anchors-publish-first");
+        let (id, keys, dir) = enrolled(&root).await;
+        let signing = keys.signing(id).unwrap();
+        chose(&dir, SealChoice::Publish).await;
+        let api = FakeApi::new();
+        *api.fail.lock().unwrap() = Some("post_anchor");
+        assert!(publish_if_chosen(&dir, id, &signing, &api).await.is_err());
+        *api.fail.lock().unwrap() = None;
+        // The agent turns it off with `config` before the retry
+        *api.chosen.lock().unwrap() = true;
+        assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
+        assert!(api.anchored.lock().unwrap().is_empty(), "nothing sent");
+        assert!(
+            dir.join("sealed").join(PUBLISHED).exists(),
+            "and never again"
+        );
+        assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
+        assert!(api.anchored.lock().unwrap().is_empty());
     }
 
     /// Once told, the runner never sends `publish` again, whatever Agora
