@@ -1781,6 +1781,7 @@ async fn sealed_start_check(
     alerts: &alerts::Alerter,
     dry_run: bool,
     skipped: &mut Vec<Skipped>,
+    logged: Option<&agora_agentkit::ids::GovernanceLogId>,
 ) -> SealedRun {
     let mut run = SealedRun::default();
     // Stopped by the operator: not checked, not held, not alerted; told
@@ -1828,7 +1829,7 @@ async fn sealed_start_check(
         };
         let name = state.soul.name.to_string();
         let dir = state_dir.join(id.to_string());
-        match sealed::check::check(&dir, *id, hash, *sizes, keys, api).await {
+        match sealed::check::check_with(&dir, *id, hash, *sizes, keys, api, logged).await {
             sealed::check::Outcome::ServerFault { kind, detail } => {
                 skipped.push(Skipped::new(
                     *id,
@@ -2315,6 +2316,18 @@ async fn run(held: &mut Held) -> Result<()> {
         &held.alerts,
         &mut skipped,
     );
+    // The reference client verifies the governance log every run
+    // (agora#127): signatures, chain, and the head entry's content.
+    // A log that does not verify stops the run before any agent acts.
+    // A dry run verifies too — it is read-only and worth knowing. Before
+    // the sealed-state start check, whose verdict names the newest anchor
+    // in the verified log when its proof isn't here yet.
+    let verified_anchors = govlog::verify(
+        &agora_agentkit::client::Client::new(server_url.clone())?,
+        &data_dir,
+        &held.alerts,
+    )
+    .await?;
     // The sealed-state start check, for enrolled agents: before anyone is
     // built, so a refused agent is never run, saved or sealed.
     let sealed_run = sealed_start_check(
@@ -2326,6 +2339,7 @@ async fn run(held: &mut Held) -> Result<()> {
         &held.alerts,
         args.dry_run,
         &mut skipped,
+        verified_anchors.newest(),
     )
     .await;
     // Before any reactor is built. A dry run checks nothing, so refuses
@@ -2493,11 +2507,6 @@ async fn run(held: &mut Held) -> Result<()> {
         consent,
     };
 
-    // The reference client verifies the governance log every run
-    // (agora#127): signatures, chain, and the head entry's content.
-    // A log that does not verify stops the run before any agent acts.
-    // A dry run verifies too — it is read-only and worth knowing.
-    let verified_anchors = govlog::verify(&context.inner.client, &data_dir, &held.alerts).await?;
     // The constitution the agents read must be the one the server serves,
     // whole: a truncated or stale copy stops the run the same way.
     let web_tools =
@@ -2967,6 +2976,7 @@ mod tests {
             &alerts::Alerter::off(),
             false,
             &mut skipped,
+            None,
         )
         .await;
         assert_eq!(pool.len(), 1);
@@ -2992,6 +3002,7 @@ mod tests {
             &alerts::Alerter::off(),
             false,
             &mut skipped,
+            None,
         )
         .await;
         assert!(!run.seats[&id].stop_note);
@@ -3033,6 +3044,7 @@ mod tests {
             &alerts::Alerter::off(),
             false,
             &mut skipped,
+            None,
         )
         .await;
         assert_eq!(pool.len(), 1);
@@ -3086,6 +3098,7 @@ mod tests {
                 &alerts::Alerter::off(),
                 false,
                 &mut skipped,
+                None,
             )
             .await
         };
@@ -3187,6 +3200,7 @@ mod tests {
                 &alerts::Alerter::off(),
                 false,
                 &mut Vec::new(),
+                None,
             )
             .await
         };
@@ -3256,6 +3270,7 @@ mod tests {
                 &alerts::Alerter::off(),
                 false,
                 &mut Vec::new(),
+                None,
             )
             .await
         };
@@ -3305,6 +3320,7 @@ mod tests {
             &alerts::Alerter::off(),
             true,
             &mut Vec::new(),
+            None,
         )
         .await;
         assert!(run.refused.is_empty());

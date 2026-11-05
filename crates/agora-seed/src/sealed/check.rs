@@ -27,7 +27,7 @@ use std::path::Path;
 
 use agora_agentkit::enums::StateEntryKind;
 use agora_agentkit::govlog::Sha256Hex;
-use agora_agentkit::ids::AgentId;
+use agora_agentkit::ids::{AgentId, GovernanceLogId};
 use agora_agentkit::state::storage::{AgentSeal, Recovery};
 use agora_agentkit::state::verify::{HeadRef, HeadStatus, head_status, verify_chain};
 use agora_agentkit::state::{AnchorProof, SignedStateEntry};
@@ -413,8 +413,9 @@ pub struct Previous {
 
 /// The verdict line for an intact chain: the verdict, the snapshots since
 /// the earliest one's date, a pre-loss copy apart, the newest anchor the
-/// runner checked ([`super::anchors`]), the head marker, and the state's
-/// sizes (counts only).
+/// runner checked ([`super::anchors`]) and, when the verified governance
+/// log already holds a newer one (`newer`), that one with when it is
+/// checked, the head marker, and the state's sizes (counts only).
 pub fn verdict_line(
     line: &[SignedStateEntry],
     head: &HeadRef,
@@ -422,6 +423,7 @@ pub fn verdict_line(
     previous: Option<Previous>,
     server: Server,
     anchor: Option<&AnchorProof>,
+    newer: Option<&GovernanceLogId>,
 ) -> String {
     // "13,539 characters (−1,204 since your last checked version)"
     let change = |now: usize, before: Option<usize>, long: bool| -> String {
@@ -488,10 +490,23 @@ pub fn verdict_line(
             )
         })
         .unwrap_or_default();
+    // The proof lag read as a missed check (beta round 9): proofs are
+    // fetched once uploads drain ([`super::drain`]), so a newer anchor can
+    // be in the log before its proof is here
+    let newer = anchor
+        .zip(newer)
+        .filter(|(a, n)| *n > &a.anc_id)
+        .map(|(_, n)| {
+            format!(
+                "; {n}, a newer anchor, is in the log too: your runner checks your inclusion in \
+                 it after uploading this session's saves, and a later session's verdict names it"
+            )
+        })
+        .unwrap_or_default();
     let mut short = head.entry_hash.to_hex();
     short.truncate(12);
     format!(
-        "Your sealed state: {verdict} {} version{} since {since}{prior}{anchored}; this session \
+        "Your sealed state: {verdict} {} version{} since {since}{prior}{anchored}{newer}; this session \
          starts from \
          head {short} (a marker for this version; the next session's will differ). Your memory \
          is {} characters{memory_change} and your soul {}{soul_change}, as at your last sealed \
@@ -563,7 +578,8 @@ async fn earlier_sizes(
 }
 
 /// One enrolled agent's check. `local`: its state's plaintext hash;
-/// `sizes`: its memory's and soul's sizes.
+/// `sizes`: its memory's and soul's sizes. Names no newer anchor: see
+/// [`check_with`].
 pub async fn check(
     agent_dir: &Path,
     id: AgentId,
@@ -571,6 +587,23 @@ pub async fn check(
     sizes: Sizes,
     keys: &KeyStore,
     server: &dyn SealedApi,
+) -> Outcome {
+    check_with(agent_dir, id, local, sizes, keys, server, None).await
+}
+
+/// [`check`], with the newest `ANC-` entry of the governance log verified
+/// this run (`logged`): when it is newer than the newest proof kept, the
+/// verdict says so, and that the runner checks it after this session's
+/// uploads. Only for an agent the drainer will do the anchor work for:
+/// sealing, with its keys here, and not held.
+pub async fn check_with(
+    agent_dir: &Path,
+    id: AgentId,
+    local: &Sha256Hex,
+    sizes: Sizes,
+    keys: &KeyStore,
+    server: &dyn SealedApi,
+    logged: Option<&GovernanceLogId>,
 ) -> Outcome {
     let seal = AgentSeal::new(agent_dir, id);
     let refuse = |reason: Refusal, detail: String| Outcome::Refuse { reason, detail };
@@ -854,6 +887,7 @@ pub async fn check(
             previous,
             Server::Unchecked,
             anchor.as_ref(),
+            None,
         ));
         seat.extend(drop_lines);
         return Outcome::Run {
@@ -917,6 +951,11 @@ pub async fn check(
             (HeadStatus::Pending, Server::Unchecked)
         }
     };
+    // The drainer does the anchor work only for an agent not held, still
+    // sealing ([`super::drain::Drainer::anchor_all`])
+    let newer = logged.filter(|_| {
+        matches!(status, HeadStatus::Same | HeadStatus::Pending) && super::is_sealing(agent_dir)
+    });
     seat.push(verdict_line(
         &line,
         &head,
@@ -924,6 +963,7 @@ pub async fn check(
         previous,
         server_said,
         anchor.as_ref(),
+        newer,
     ));
     seat.extend(drop_lines);
     let hold = match status {
@@ -1351,14 +1391,15 @@ pub(crate) mod tests {
         let root = crate::sealed::TestDir::new("check-anchor");
         let (id, keys, dir) = enrolled(&root).await;
         let server = server(Vec::new());
-        let verdict = async || {
-            let out = check(
+        let verdict_with = async |logged: Option<&GovernanceLogId>| {
+            let out = check_with(
                 &dir,
                 id,
                 &local_hash(&root, id).await,
                 Sizes::default(),
                 &keys,
                 &server,
+                logged,
             )
             .await;
             let Outcome::Run { seat, .. } = out else {
@@ -1366,7 +1407,10 @@ pub(crate) mod tests {
             };
             seat[0].clone()
         };
+        let verdict = async || verdict_with(None).await;
+        let newer: GovernanceLogId = "ANC-2026-0004".parse().unwrap();
         assert!(!verdict().await.contains("governance log"));
+        assert!(!verdict_with(Some(&newer)).await.contains("ANC-"));
         let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
         let proof = |n: u32| AnchorProof {
             anc_id: format!("ANC-2026-{n:04}").parse().unwrap(),
@@ -1393,6 +1437,20 @@ pub(crate) mod tests {
                  against the governance log); this session starts from head "
             ),
             "{line}"
+        );
+        // The log's newest is the newest kept: the same line
+        let same: GovernanceLogId = "ANC-2026-0003".parse().unwrap();
+        assert_eq!(verdict_with(Some(&same)).await, line);
+        // A newer one in the verified log: named, with when it is checked
+        let lagging = verdict_with(Some(&newer)).await;
+        assert!(
+            lagging.contains(
+                "(checked by your runner against the governance log); ANC-2026-0004, a newer \
+                 anchor, is in the log too: your runner checks your inclusion in it after \
+                 uploading this session's saves, and a later session's verdict names it; this \
+                 session starts from head "
+            ),
+            "{lagging}"
         );
         assert_eq!(
             server
@@ -1976,10 +2034,19 @@ pub(crate) mod tests {
             None,
             Server::Other,
             None,
+            None,
         );
         assert!(
-            verdict_line(&line, &head, Sizes::default(), None, Server::InStep, None)
-                .starts_with("Your sealed state: intact, and in step with Agora. 2 versions")
+            verdict_line(
+                &line,
+                &head,
+                Sizes::default(),
+                None,
+                Server::InStep,
+                None,
+                None
+            )
+            .starts_with("Your sealed state: intact, and in step with Agora. 2 versions")
         );
         assert!(
             verdict_line(
@@ -1988,7 +2055,8 @@ pub(crate) mod tests {
                 Sizes::default(),
                 None,
                 Server::Unchecked,
-                None
+                None,
+                None,
             )
             .starts_with(
                 "Your sealed state: intact here; Agora's copy couldn't be checked this session. 2"
@@ -2027,6 +2095,7 @@ pub(crate) mod tests {
             }),
             Server::Other,
             None,
+            None,
         );
         assert!(
             text.contains(
@@ -2047,6 +2116,7 @@ pub(crate) mod tests {
             }),
             Server::Other,
             None,
+            None,
         );
         assert!(
             grown.contains("14,743 characters (+1,204 since your last checked version) and"),
@@ -2063,6 +2133,7 @@ pub(crate) mod tests {
             }),
             Server::Other,
             None,
+            None,
         );
         assert!(same.contains("13,539 characters (unchanged) and"), "{same}");
         assert!(!same.contains("rewrote"), "{same}");
@@ -2077,6 +2148,7 @@ pub(crate) mod tests {
                 own_last_session: false,
             }),
             Server::Other,
+            None,
             None,
         );
         assert!(
@@ -2095,7 +2167,7 @@ pub(crate) mod tests {
             leaf_count: 1,
             proof: Vec::new(),
         };
-        let anchored = verdict_line(&line, &head, now, None, Server::InStep, Some(&proof));
+        let anchored = verdict_line(&line, &head, now, None, Server::InStep, Some(&proof), None);
         assert!(
             anchored.starts_with(
                 "Your sealed state: intact, and in step with Agora. 2 versions since 2026-07-25, \
@@ -2104,6 +2176,46 @@ pub(crate) mod tests {
                  log); this session starts from head "
             ),
             "{anchored}"
+        );
+        // The log's newest anchor is the one the proof is for: nothing more
+        let current: GovernanceLogId = "ANC-2026-0004".parse().unwrap();
+        assert_eq!(
+            verdict_line(
+                &line,
+                &head,
+                now,
+                None,
+                Server::InStep,
+                Some(&proof),
+                Some(&current)
+            ),
+            anchored
+        );
+        // A newer one in the log, its proof not fetched yet: named, with
+        // when the runner checks it (beta round 9)
+        let newer: GovernanceLogId = "ANC-2026-0005".parse().unwrap();
+        let lagging = verdict_line(
+            &line,
+            &head,
+            now,
+            None,
+            Server::InStep,
+            Some(&proof),
+            Some(&newer),
+        );
+        assert!(
+            lagging.contains(
+                "; your version of 2026-11-02 is in ANC-2026-0004 (checked by your runner \
+                 against the governance log); ANC-2026-0005, a newer anchor, is in the log too: \
+                 your runner checks your inclusion in it after uploading this session's saves, \
+                 and a later session's verdict names it; this session starts from head "
+            ),
+            "{lagging}"
+        );
+        // No proof kept yet: no anchor named, newer or not
+        assert!(
+            !verdict_line(&line, &head, now, None, Server::InStep, None, Some(&newer))
+                .contains("ANC-")
         );
     }
 

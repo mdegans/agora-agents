@@ -62,6 +62,12 @@ impl VerifiedAnchors {
         Self(entries.into_iter().collect())
     }
 
+    /// The newest `ANC-` entry, by id (`ANC-YYYY-NNNN`, as the proofs'
+    /// `after` orders them), for the start check's verdict.
+    pub fn newest(&self) -> Option<&GovernanceLogId> {
+        self.0.keys().next_back()
+    }
+
     /// The log's [`AnchorData`] for `proof`'s entry: the proof's own
     /// fields, if they hash to what the log attests. `None` when the entry
     /// isn't in the verified log; `Some(Err)` when they don't hash to it.
