@@ -787,7 +787,6 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
         };
         assert_eq!(refused, vec![(b.id, reason)]);
         assert!(b.seal().is_refused().await.unwrap(), "marked");
-        b.api.anchor_shown.lock().unwrap().clone_from(&true);
         super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
             .await
             .unwrap_or_else(|e| panic!("{missing}: {e:#}"));
@@ -813,8 +812,21 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
                 .join("sealed")
                 .join(super::anchors::PUBLISHED)
                 .exists(),
-            "published, as its profile shows"
+            "the marker is back: a restore never re-sends the publish"
         );
+        // Even with a ledger saying publish: the agent may have turned it
+        // off with `config`, and its profile can't say so
+        super::anchors::tests::chose(
+            &b.dir,
+            crate::consent::sealed_state::prompt::SealChoice::Publish,
+        )
+        .await;
+        let signing = b.keys.signing(b.id).unwrap();
+        assert_eq!(
+            super::anchors::publish_if_chosen(&b.dir, b.id, &signing, &b.api).await,
+            Ok(false)
+        );
+        assert!(b.api.anchored.lock().unwrap().is_empty(), "nothing sent");
         assert!(
             check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off())
                 .await

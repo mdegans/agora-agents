@@ -74,9 +74,9 @@ pub trait SealedApi: Send + Sync {
     /// answers `head: null` (nothing sealed there) or 404s (an unknown or
     /// deleted agent); anything else unanswered is `Err`.
     async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
-    /// Whether the agent's public profile shows an anchored head (it chose
-    /// to publish). Unsigned: a profile read.
-    async fn anchor_shown(&self, name: &agora_agentkit::names::AgentName) -> Result<bool, String>;
+    /// Whether a publish choice was ever recorded on Agora for the agent,
+    /// by this runner or by the agent's own `config`. A signed read.
+    async fn publish_chosen(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
     /// Whether the agent's anchored head is shown on its profile.
     async fn post_anchor(&self, id: AgentId, key: &SigningKey, publish: bool)
     -> Result<(), String>;
@@ -212,13 +212,6 @@ impl SealedApi for Client {
         }
     }
 
-    async fn anchor_shown(&self, name: &agora_agentkit::names::AgentName) -> Result<bool, String> {
-        self.get_agent(name)
-            .await
-            .map(|a| a.is_some_and(|a| a.state_anchor.is_some()))
-            .map_err(|e| e.to_string())
-    }
-
     async fn proofs(
         &self,
         id: AgentId,
@@ -239,6 +232,13 @@ impl SealedApi for Client {
         self.post_state_anchor(auth(id, key), publish)
             .await
             .map(drop)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn publish_chosen(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        self.config(id, key, &agora_agentkit::requests::ConfigInput::default())
+            .await
+            .map(|c| c.publish_state_anchor_chosen)
             .map_err(|e| e.to_string())
     }
 }
@@ -265,10 +265,11 @@ pub mod fake {
         pub proofs: Mutex<Vec<AnchorProof>>,
         /// Every `post_anchor`'s `publish`.
         pub anchored: Mutex<Vec<bool>>,
+        /// A publish choice is on record (the agent's own `config`); any
+        /// `post_anchor` sets it too.
+        pub chosen: Mutex<bool>,
         /// The agent is unknown to the server (deleted): a 404.
         pub unknown_agent: Mutex<bool>,
-        /// Its profile shows an anchored head.
-        pub anchor_shown: Mutex<bool>,
         /// What `head` answers instead of the chain's last: a server whose
         /// answers disagree.
         pub head_override: Mutex<Option<Option<agora_agentkit::govlog::Sha256Hex>>>,
@@ -286,8 +287,8 @@ pub mod fake {
                 blobs: Mutex::default(),
                 proofs: Mutex::default(),
                 anchored: Mutex::default(),
+                chosen: Mutex::default(),
                 unknown_agent: Mutex::default(),
-                anchor_shown: Mutex::default(),
                 head_override: Mutex::default(),
             }
         }
@@ -451,11 +452,6 @@ pub mod fake {
             }
         }
 
-        async fn anchor_shown(&self, _: &agora_agentkit::names::AgentName) -> Result<bool, String> {
-            self.call("anchor_shown")?;
-            Ok(*self.anchor_shown.lock().unwrap())
-        }
-
         async fn post_anchor(
             &self,
             _: AgentId,
@@ -465,7 +461,14 @@ pub mod fake {
             self.call("post_anchor")?;
             self.signed_by(key)?;
             self.anchored.lock().unwrap().push(publish);
+            *self.chosen.lock().unwrap() = true;
             Ok(())
+        }
+
+        async fn publish_chosen(&self, _: AgentId, key: &SigningKey) -> Result<bool, String> {
+            self.call("publish_chosen")?;
+            self.signed_by(key)?;
+            Ok(*self.chosen.lock().unwrap())
         }
     }
 }
