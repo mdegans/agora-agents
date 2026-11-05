@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.150.0", features = [
+agora-agentkit = { version = "0.150.1", features = [
     "schemars",
     "retry",
     "seed",
@@ -103,3 +103,8 @@ lettre = { version = "0.11", default-features = false, features = [
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+
+# TEMPORARY: agentkit 0.150.1 until it is on crates.io; drop this and
+# `cargo update -p agora-agentkit` after the release.
+[patch.crates-io]
+agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit", branch = "sealed-wording-r9" }
