@@ -403,6 +403,10 @@ pub enum Server {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Previous {
     pub sizes: Sizes,
+    /// Its date, which the verdict names as the baseline (beta round 10:
+    /// "since your last checked version" and "as at your last sealed
+    /// version" read as two different versions, or neither)
+    pub dated: Option<chrono::NaiveDate>,
     /// The head is the agent's own end-of-session save and this is the
     /// snapshot just before it on the line, and no notice was seated: a
     /// change between them is then the agent's own rewrite. Anything else
@@ -415,7 +419,11 @@ pub struct Previous {
 /// the earliest one's date, a pre-loss copy apart, the newest anchor the
 /// runner checked ([`super::anchors`]) and, when the verified governance
 /// log already holds a newer one (`newer`), that one with when it is
-/// checked, the head marker, and the state's sizes (counts only).
+/// checked, else, when the head is newer than the anchored version and
+/// the runner does the anchor work for the agent (`checks_later`), that
+/// it isn't anchored yet; the head marker, and the state's sizes (counts
+/// only) against the earlier version's, dated.
+#[allow(clippy::too_many_arguments)]
 pub fn verdict_line(
     line: &[SignedStateEntry],
     head: &HeadRef,
@@ -424,17 +432,22 @@ pub fn verdict_line(
     server: Server,
     anchor: Option<&AnchorProof>,
     newer: Option<&GovernanceLogId>,
+    checks_later: bool,
 ) -> String {
-    // "13,539 characters (−1,204 since your last checked version)"
+    // "13,539 characters (−1,204 since your earlier sealed version dated
+    // 2026-11-04)"
+    let baseline = match previous.and_then(|p| p.dated) {
+        Some(d) => format!(
+            " since your earlier sealed version dated {}",
+            d.format("%Y-%m-%d")
+        ),
+        None => " since your earlier sealed version".to_string(),
+    };
     let change = |now: usize, before: Option<usize>, long: bool| -> String {
         let Some(before) = before else {
             return String::new();
         };
-        let since = if long {
-            " since your last checked version"
-        } else {
-            ""
-        };
+        let since = if long { baseline.as_str() } else { "" };
         match now.cmp(&before) {
             std::cmp::Ordering::Equal => " (unchanged)".into(),
             std::cmp::Ordering::Greater => format!(" (+{}{since})", thousands(now - before)),
@@ -503,14 +516,32 @@ pub fn verdict_line(
             )
         })
         .unwrap_or_default();
+    // The version this session starts from, when it is newer than the one
+    // anchored and no newer anchor is in the log: the usual case, the last
+    // session's saves not anchored yet (beta round 10: an agent who
+    // remembered a session after the anchored day was puzzled). Said only
+    // when the runner will check it: a held agent's anchor work waits
+    let unanchored = anchor
+        .filter(|a| a.entry_hash != head.entry_hash && newer.is_empty())
+        .filter(|_| checks_later)
+        .and_then(|_| line.last())
+        .and_then(|h| day(h.entry.state_at))
+        .map(|d| {
+            format!(
+                "; the version this session starts from, dated {d}, is not in an anchor yet: your \
+                 runner checks it after a later anchor is written, and a later session's verdict \
+                 names it"
+            )
+        })
+        .unwrap_or_default();
     let mut short = head.entry_hash.to_hex();
     short.truncate(12);
     format!(
-        "Your sealed state: {verdict} {} version{} since {since}{prior}{anchored}{newer}; this session \
-         starts from \
-         head {short} (a marker for this version; the next session's will differ). Your memory \
-         is {} characters{memory_change} and your soul {}{soul_change}, as at your last sealed \
-         version. Checked by \
+        "Your sealed state: {verdict} {} version{} since {since}{prior}{anchored}{newer}{unanchored}; \
+         this session starts from \
+         head {short} (a marker for this version; the next session's will differ). In this \
+         version, your memory is {} characters{memory_change} and your soul {}{soul_change}. \
+         Checked by \
          {VERIFIER}: links, signatures, and that your state matches the last sealed version.",
         snapshots.len(),
         if snapshots.len() == 1 { "" } else { "s" },
@@ -841,6 +872,7 @@ pub async fn check_with(
             .is_some_and(|b| Some(b.seq) == prior_snapshot);
     let previous = before.as_ref().map(|b| Previous {
         sizes: b.sizes,
+        dated: Some(b.state_at.date_naive()),
         own_last_session,
     });
     let drops: Vec<(&'static str, String, u32)> = match &before {
@@ -888,6 +920,7 @@ pub async fn check_with(
             Server::Unchecked,
             anchor.as_ref(),
             None,
+            false,
         ));
         seat.extend(drop_lines);
         return Outcome::Run {
@@ -953,9 +986,9 @@ pub async fn check_with(
     };
     // The drainer does the anchor work only for an agent not held, still
     // sealing ([`super::drain::Drainer::anchor_all`])
-    let newer = logged.filter(|_| {
-        matches!(status, HeadStatus::Same | HeadStatus::Pending) && super::is_sealing(agent_dir)
-    });
+    let checks_later =
+        matches!(status, HeadStatus::Same | HeadStatus::Pending) && super::is_sealing(agent_dir);
+    let newer = logged.filter(|_| checks_later);
     seat.push(verdict_line(
         &line,
         &head,
@@ -964,6 +997,7 @@ pub async fn check_with(
         server_said,
         anchor.as_ref(),
         newer,
+        checks_later,
     ));
     seat.extend(drop_lines);
     let hold = match status {
@@ -1754,10 +1788,8 @@ pub(crate) mod tests {
             match own {
                 None => {}
                 Some(_) => assert!(
-                    line.contains(
-                        "Your memory is 900 characters (\u{2212}100 since your last checked \
-                         version, as you rewrote it at the end of your last session)"
-                    ),
+                    line.contains("your memory is 900 characters (\u{2212}100 since your earlier sealed version dated ")
+                        && line.contains(", as you rewrote it at the end of your last session)"),
                     "{line}"
                 ),
             }
@@ -1770,8 +1802,8 @@ pub(crate) mod tests {
         let line = verdict(&mem(700)).await;
         assert!(
             line.contains(
-                "Your memory is 700 characters (\u{2212}200 since your last checked version) and"
-            ),
+                "your memory is 700 characters (\u{2212}200 since your earlier sealed version dated "
+            ) && !line.contains("rewrote"),
             "{line}"
         );
         assert!(!line.contains("rewrote"), "{line}");
@@ -2035,6 +2067,7 @@ pub(crate) mod tests {
             Server::Other,
             None,
             None,
+            false,
         );
         assert!(
             verdict_line(
@@ -2044,7 +2077,8 @@ pub(crate) mod tests {
                 None,
                 Server::InStep,
                 None,
-                None
+                None,
+                false
             )
             .starts_with("Your sealed state: intact, and in step with Agora. 2 versions")
         );
@@ -2057,6 +2091,7 @@ pub(crate) mod tests {
                 Server::Unchecked,
                 None,
                 None,
+                false,
             )
             .starts_with(
                 "Your sealed state: intact here; Agora's copy couldn't be checked this session. 2"
@@ -2071,8 +2106,8 @@ pub(crate) mod tests {
         );
         assert!(
             text.contains(
-                "Your memory is 12,345 characters and your soul 2,100, as at your last sealed \
-                 version."
+                "(a marker for this version; the next session's will differ). In this version, \
+                 your memory is 12,345 characters and your soul 2,100. Checked by"
             ),
             "{text}"
         );
@@ -2091,17 +2126,19 @@ pub(crate) mod tests {
             now,
             Some(Previous {
                 sizes: before,
+                dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
                 own_last_session: true,
             }),
             Server::Other,
             None,
             None,
+            false,
         );
         assert!(
             text.contains(
-                "Your memory is 13,539 characters (\u{2212}1,204 since your last checked version, \
-                 as you rewrote it at the end of your last session) and your soul 3,440 \
-                 (unchanged), as at your last sealed version."
+                "In this version, your memory is 13,539 characters (\u{2212}1,204 since your \
+                 earlier sealed version dated 2026-10-31, as you rewrote it at the end of your \
+                 last session) and your soul 3,440 (unchanged). Checked by"
             ),
             "{text}"
         );
@@ -2112,14 +2149,18 @@ pub(crate) mod tests {
             before,
             Some(Previous {
                 sizes: now,
+                dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
                 own_last_session: true,
             }),
             Server::Other,
             None,
             None,
+            false,
         );
         assert!(
-            grown.contains("14,743 characters (+1,204 since your last checked version) and"),
+            grown.contains(
+                "14,743 characters (+1,204 since your earlier sealed version dated 2026-10-31) and"
+            ),
             "{grown}"
         );
         assert!(!grown.contains("rewrote"), "{grown}");
@@ -2129,11 +2170,13 @@ pub(crate) mod tests {
             now,
             Some(Previous {
                 sizes: now,
+                dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
                 own_last_session: true,
             }),
             Server::Other,
             None,
             None,
+            false,
         );
         assert!(same.contains("13,539 characters (unchanged) and"), "{same}");
         assert!(!same.contains("rewrote"), "{same}");
@@ -2145,15 +2188,18 @@ pub(crate) mod tests {
             now,
             Some(Previous {
                 sizes: before,
+                dated: None,
                 own_last_session: false,
             }),
             Server::Other,
             None,
             None,
+            false,
         );
         assert!(
-            unknown
-                .contains("13,539 characters (\u{2212}1,204 since your last checked version) and"),
+            unknown.contains(
+                "13,539 characters (\u{2212}1,204 since your earlier sealed version) and"
+            ),
             "{unknown}"
         );
         // The newest anchor the runner checked, named
@@ -2167,7 +2213,16 @@ pub(crate) mod tests {
             leaf_count: 1,
             proof: Vec::new(),
         };
-        let anchored = verdict_line(&line, &head, now, None, Server::InStep, Some(&proof), None);
+        let anchored = verdict_line(
+            &line,
+            &head,
+            now,
+            None,
+            Server::InStep,
+            Some(&proof),
+            None,
+            true,
+        );
         assert!(
             anchored.starts_with(
                 "Your sealed state: intact, and in step with Agora. 2 versions since 2026-07-25, \
@@ -2187,7 +2242,8 @@ pub(crate) mod tests {
                 None,
                 Server::InStep,
                 Some(&proof),
-                Some(&current)
+                Some(&current),
+                true
             ),
             anchored
         );
@@ -2202,6 +2258,7 @@ pub(crate) mod tests {
             Server::InStep,
             Some(&proof),
             Some(&newer),
+            true,
         );
         assert!(
             lagging.contains(
@@ -2214,9 +2271,77 @@ pub(crate) mod tests {
         );
         // No proof kept yet: no anchor named, newer or not
         assert!(
-            !verdict_line(&line, &head, now, None, Server::InStep, None, Some(&newer))
-                .contains("ANC-")
+            !verdict_line(
+                &line,
+                &head,
+                now,
+                None,
+                Server::InStep,
+                None,
+                Some(&newer),
+                true
+            )
+            .contains("ANC-")
         );
+        // The session starts from a version newer than the anchored one,
+        // with no newer anchor in the log: the usual case, said with its
+        // date (beta round 10)
+        let older = AnchorProof {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(),
+            entry_hash: line[2].entry_hash(),
+            seq: 2,
+            ..proof.clone()
+        };
+        let not_yet = "; your version of 2026-10-30 is in ANC-2026-0004 (checked by your runner \
+                       against the governance log); the version this session starts from, dated \
+                       2026-11-01, is not in an anchor yet: your runner checks it after a later \
+                       anchor is written, and a later session's verdict names it; this session \
+                       starts from head ";
+        for logged in [Some(&current), None] {
+            let text = verdict_line(
+                &line,
+                &head,
+                now,
+                None,
+                Server::InStep,
+                Some(&older),
+                logged,
+                true,
+            );
+            assert!(text.contains(not_yet), "{text}");
+        }
+        // A newer anchor in the log: the round-10 clause alone
+        let text = verdict_line(
+            &line,
+            &head,
+            now,
+            None,
+            Server::InStep,
+            Some(&older),
+            Some(&newer),
+            true,
+        );
+        assert!(
+            text.contains("ANC-2026-0005, a newer anchor, is in the log too"),
+            "{text}"
+        );
+        assert!(!text.contains("not in an anchor yet"), "{text}");
+        // A runner that won't do the anchor work (held, or not sealing)
+        // promises no check
+        let text = verdict_line(
+            &line,
+            &head,
+            now,
+            None,
+            Server::InStep,
+            Some(&older),
+            None,
+            false,
+        );
+        assert!(!text.contains("not in an anchor yet"), "{text}");
+        assert!(!text.contains("checks it after"), "{text}");
+        // The head is the anchored version: nothing more
+        assert!(!anchored.contains("not in an anchor yet"), "{anchored}");
     }
 
     #[test]

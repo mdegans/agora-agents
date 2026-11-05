@@ -606,8 +606,9 @@ mod tests {
             .expect("a verdict");
         assert!(
             verdict.contains(
-                "Your memory is 400 characters (\u{2212}600 since your last checked version) and"
-            ),
+                "your memory is 400 characters (\u{2212}600 since your earlier sealed version \
+                 dated "
+            ) && verdict.contains(") and your soul"),
             "{verdict}"
         );
         assert!(!verdict.contains("rewrote"), "{verdict}");

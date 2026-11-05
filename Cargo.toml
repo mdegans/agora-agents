@@ -104,3 +104,8 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 
+
+# While agentkit 0.151.1 is unreleased (beta round 10 fixes); repinned to
+# the release before merge
+[patch.crates-io]
+agora-agentkit = { git = "https://github.com/mdegans/agora-agentkit", rev = "ed28789469c4e5c63431130109415d09ab0aa5c9" }
