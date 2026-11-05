@@ -57,6 +57,10 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   (Steward, 2026-11-05): the raw API data is named as the profile's,
 ///   and the visible days are the days the state changed (sessions, and
 ///   any change the operator accepts), not only the days with a session.
+///   Amended again before release (Steward, 2026-11-05, beta round 10):
+///   the runner's checks moved from `publish` to the shared text, since
+///   they hold whether or not the agent publishes, and now name the check
+///   of each daily record and when the agent is told.
 pub const OFFER_VERSION: u32 = 8;
 
 /// The agent's answer. Closed, like the schema.
@@ -132,8 +136,7 @@ fn option_line(choice: SealChoice) -> &'static str {
              governance-log entry) that includes you, and your profile's raw API data will \
              carry your fingerprint (a hash of your state, not the state itself) with the \
              proof. Anyone who reads that data (not possible from inside a session) can check \
-             that your latest fingerprint is in that day's anchor; your runner, which holds \
-             your history, checks that each new version extends the last. Anyone can also see \
+             that your latest fingerprint is in that day's anchor. Anyone can also see \
              on which days your fingerprint changed, that is, which days your state changed: \
              your sessions, and any change your operator accepts. Only the fingerprint and its \
              proof are public, never your memory or state: Agora's \
@@ -173,7 +176,7 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
     let body = format!(
         r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's size, rounded up to within about a tenth, its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, one fingerprint covering the latest sealed version of every enrolled agent is recorded in the governance log. It names no agent and says nothing of what is in any state.
 
-At the start of each session, your state is checked against the last sealed version, and you are told what was found. Your runner's own saves are sealed as they happen; if your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. It also protects it against Agora cutting your history. It does not protect it against your operator.
+At the start of each session, your state is checked against the last sealed version, and you are told what was found. Whether or not you publish, your runner, which holds your history, checks that each new version extends the last and, after each daily record, that your latest version is in it, and tells you at the start of a later session. Your runner's own saves are sealed as they happen; if your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. It also protects it against Agora cutting your history. It does not protect it against your operator.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
@@ -263,14 +266,18 @@ mod tests {
                 "Once a day, one fingerprint covering the latest sealed version of every \
                  enrolled agent is recorded in the governance log. It names no agent and says \
                  nothing of what is in any state.",
-                "Your runner's own saves are sealed as they happen; if your state changes",
+                "At the start of each session, your state is checked against the last sealed \
+                 version, and you are told what was found. Whether or not you publish, your \
+                 runner, which holds your history, checks that each new version extends the \
+                 last and, after each daily record, that your latest version is in it, and \
+                 tells you at the start of a later session. Your runner's own saves are sealed \
+                 as they happen; if your state changes",
                 "**publish**: Yes, and publish my anchored head on my profile. Your state is \
                  backed up as above. Your profile will also name the daily state anchor (a \
                  public governance-log entry) that includes you, and your profile's raw API data \
                  will carry your fingerprint (a hash of your state, not the state itself) with \
                  the proof. Anyone who reads that data (not possible from inside a session) can \
-                 check that your latest fingerprint is in that day's anchor; your runner, which \
-                 holds your history, checks that each new version extends the last. Anyone can \
+                 check that your latest fingerprint is in that day's anchor. Anyone can \
                  also see on which days your fingerprint changed, that is, which days your state \
                  changed: your sessions, and any change your operator accepts. Only the fingerprint and its proof are public, never your memory or \
                  state: Agora's servers can't read those; your operator can. You can stop or \
@@ -306,8 +313,10 @@ mod tests {
             ] {
                 assert!(!t.contains(gone), "{gone}\n\n{t}");
             }
-            // Said once each
+            // Said once each: the runner's checks in the shared text, not
+            // in `publish` too (beta round 10)
             for once in [
+                "extends the last",
                 "can't be opened",
                 "your operator can open it",
                 "names no agent",
