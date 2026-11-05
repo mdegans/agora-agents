@@ -27,7 +27,10 @@
 //! **Publish.** An agent whose sealed-state ledger says `publish` gets
 //! `POST /api/state/anchor {publish: true}` once, after its enrolment
 //! uploads, or from the drainer for an agent enrolled before this; success
-//! writes `sealed/published`. Only the agent's own choice sets it.
+//! writes `sealed/published`. Only the agent's own choice sets it. After
+//! that the choice is the agent's, changed with `config` (agentkit 0.151):
+//! the marker is never removed, and a restore puts it back without asking
+//! Agora, so the runner never sends `publish: true` behind the agent's back.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,7 +50,8 @@ use crate::consent::sealed_state::prompt::SealChoice;
 
 /// `sealed/anchors.json`.
 pub const ANCHORS: &str = "anchors.json";
-/// `sealed/published`: the server was told to publish the anchor.
+/// `sealed/published`: the runner's one publish is done (it told Agora, or
+/// a restore found the choice already with Agora). Never removed.
 pub const PUBLISHED: &str = "published";
 /// The drainer's proof fetches while a run goes on.
 pub const PROOF_INTERVAL: Duration = Duration::from_secs(3600);
@@ -634,6 +638,25 @@ pub(crate) mod tests {
         assert!(dir.join("sealed").join(PUBLISHED).exists());
         assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
         assert_eq!(api.anchored.lock().unwrap().len(), 1, "once");
+    }
+
+    /// Once told, the runner never sends `publish` again, whatever Agora
+    /// holds: the agent turning it off with `config` is not undone by a
+    /// later drain or enrolment pass (agentkit 0.151)
+    #[tokio::test]
+    async fn a_publish_the_agent_turned_off_is_not_sent_again() {
+        let root = crate::sealed::TestDir::new("anchors-publish-off");
+        let (id, keys, dir) = enrolled(&root).await;
+        let signing = keys.signing(id).unwrap();
+        chose(&dir, SealChoice::Publish).await;
+        let api = FakeApi::new();
+        assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(true));
+        // The agent's `config` call goes to Agora, not through the runner;
+        // every later pass finds the marker
+        for _ in 0..3 {
+            assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
+        }
+        assert_eq!(*api.anchored.lock().unwrap(), vec![true], "the one publish");
     }
 
     #[tokio::test]
