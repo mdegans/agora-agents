@@ -438,7 +438,10 @@ pub fn verdict_line(
     newer: Option<&GovernanceLogId>,
     checks_later: bool,
 ) -> String {
-    // "13,539 characters (−1,204 since your previous sealed version, head
+    // "Earlier", not "previous": the baseline is the newest version whose
+    // sizes were recorded, which may be older than the one just before
+    // (review of 0.151.2).
+    // "13,539 characters (−1,204 since your earlier sealed version, head
     // be8c50758835 dated 2026-11-04)": named by its head, as this one is,
     // since two can share a date (beta round 11)
     let dated = previous
@@ -449,9 +452,9 @@ pub fn verdict_line(
         Some(h) => {
             let mut short = h.to_hex();
             short.truncate(12);
-            format!(" since your previous sealed version, head {short}{dated}")
+            format!(" since your earlier sealed version, head {short}{dated}")
         }
-        None => format!(" since your previous sealed version{dated}"),
+        None => format!(" since your earlier sealed version{dated}"),
     };
     let change = |now: usize, before: Option<usize>, long: bool| -> String {
         let Some(before) = before else {
@@ -534,7 +537,8 @@ pub fn verdict_line(
     // that this version will be anchored: this session's save replaces it
     // (review of 0.151.1), nor that a later anchor holds it: what an
     // anchor holds is said as the ANC summary says it (beta round 11: "at
-    // the time"). Said only when the runner will check the next anchor: a
+    // the time"); as received, since an upload can lag the version's own
+    // date (review of 0.151.2). Said only when the runner will check the next anchor: a
     // held agent's anchor work waits
     let unanchored = anchor
         .filter(|a| a.entry_hash != head.entry_hash && newer.is_empty())
@@ -544,7 +548,8 @@ pub fn verdict_line(
         .map(|d| {
             format!(
                 " The version this session starts from, dated {d}, is newer than that anchor. \
-                 Each daily anchor holds your version as it stood at the end of that day (UTC); \
+                 Each daily anchor holds the latest version Agora had received from you by the \
+                 end of that day (UTC); \
                  your runner checks your inclusion after the anchor is written, and a later \
                  session's verdict names it."
             )
@@ -1804,7 +1809,7 @@ pub(crate) mod tests {
             match own {
                 None => {}
                 Some(_) => assert!(
-                    line.contains("your memory is 900 characters (\u{2212}100 since your previous sealed version, head ")
+                    line.contains("your memory is 900 characters (\u{2212}100 since your earlier sealed version, head ")
                         && line.contains(", as you rewrote it at the end of your last session)"),
                     "{line}"
                 ),
@@ -1818,7 +1823,7 @@ pub(crate) mod tests {
         let line = verdict(&mem(700)).await;
         assert!(
             line.contains(
-                "your memory is 700 characters (\u{2212}200 since your previous sealed version, head "
+                "your memory is 700 characters (\u{2212}200 since your earlier sealed version, head "
             ) && !line.contains("rewrote"),
             "{line}"
         );
@@ -2159,7 +2164,7 @@ pub(crate) mod tests {
         assert!(
             text.contains(&format!(
                 "In this version, your memory is 13,539 characters (\u{2212}1,204 since your \
-                 previous sealed version, head {previous_short} dated 2026-10-31, as you rewrote \
+                 earlier sealed version, head {previous_short} dated 2026-10-31, as you rewrote \
                  it at the end of your last session) and your soul 3,440 (unchanged). Checked by"
             )),
             "{text}"
@@ -2182,7 +2187,7 @@ pub(crate) mod tests {
         );
         assert!(
             grown.contains(
-                "14,743 characters (+1,204 since your previous sealed version dated 2026-10-31) and"
+                "14,743 characters (+1,204 since your earlier sealed version dated 2026-10-31) and"
             ),
             "{grown}"
         );
@@ -2223,7 +2228,7 @@ pub(crate) mod tests {
         );
         assert!(
             unknown.contains(
-                "13,539 characters (\u{2212}1,204 since your previous sealed version) and"
+                "13,539 characters (\u{2212}1,204 since your earlier sealed version) and"
             ),
             "{unknown}"
         );
@@ -2321,10 +2326,10 @@ pub(crate) mod tests {
         // it, and never that one will hold this version (beta round 11)
         let not_yet = ". Your version of 2026-10-30 is in ANC-2026-0004 (checked by your runner \
                        against the governance log). The version this session starts from, dated \
-                       2026-11-01, is newer than that anchor. Each daily anchor holds your \
-                       version as it stood at the end of that day (UTC); your runner checks your \
-                       inclusion after the anchor is written, and a later session's verdict \
-                       names it. This session starts from head ";
+                       2026-11-01, is newer than that anchor. Each daily anchor holds the latest \
+                       version Agora had received from you by the end of that day (UTC); your \
+                       runner checks your inclusion after the anchor is written, and a later \
+                       session's verdict names it. This session starts from head ";
         for logged in [Some(&current), None] {
             let text = verdict_line(
                 &line,

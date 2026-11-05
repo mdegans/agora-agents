@@ -606,7 +606,7 @@ mod tests {
             .expect("a verdict");
         assert!(
             verdict.contains(
-                "your memory is 400 characters (\u{2212}600 since your previous sealed version, \
+                "your memory is 400 characters (\u{2212}600 since your earlier sealed version, \
                  head "
             ) && verdict.contains(") and your soul"),
             "{verdict}"
