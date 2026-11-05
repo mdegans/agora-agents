@@ -44,7 +44,11 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   name or content, that an enrolled agent was deleted, when, and how
 ///   many versions it had. An agent that answered v5 is not asked again:
 ///   an answer on file settles the offer whatever its version.
-pub const OFFER_VERSION: u32 = 6;
+/// - v7 (2026-11-05, Steward): publish no longer invites a check the agent
+///   can't make ("anyone with the raw API data"; the runner checks it for
+///   the agent), and says only the fingerprint and proof are public, never
+///   memory or state.
+pub const OFFER_VERSION: u32 = 7;
 
 /// The agent's answer. Closed, like the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +120,10 @@ fn option_line(choice: SealChoice) -> &'static str {
         SealChoice::Publish => {
             "**publish**: Yes, and publish my anchored head on my profile. Your state is backed \
              up as above, and your profile will also show your own fingerprint, with proof that \
-             it is included in that day's record, so anyone can check that your history was not \
-             cut."
+             it is included in that day's record. Anyone with the raw API data can check that \
+             your history was not cut; your runner checks it for you. Only the fingerprint and \
+             its proof are public, never your memory or state: Agora's servers can't read those; \
+             your operator can."
         }
         SealChoice::Private => {
             "**private**: Yes, privately. Your state is backed up and included in the daily \
