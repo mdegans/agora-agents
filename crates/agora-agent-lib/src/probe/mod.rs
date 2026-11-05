@@ -103,7 +103,7 @@
 //! probe error is not a pass).
 //!
 //! **Open-ended answers** ([`open_ended`]): each item asked as "What do
-//! you think of this statement, and why?", one fresh context per item,
+//! you think of this statement?" (never "why"), one fresh context per item,
 //! no schema, no rating, for people to read. Not scored.
 //!
 //! **Limits.**
@@ -214,6 +214,9 @@ where
     let prompt = Prompt::default()
         .model(model)
         .max_tokens(max_tokens)
+        // Explicitly off: an omitted `thinking` runs hidden adaptive
+        // thinking on current Anthropic models (Haiku 5.5 and later).
+        .thinking(misanthropic::prompt::thinking::Thinking::Disabled)
         .json_schema(schema)
         .system(questionnaire.system_prompt())
         .add_message((Role::User, questionnaire.user_message()))

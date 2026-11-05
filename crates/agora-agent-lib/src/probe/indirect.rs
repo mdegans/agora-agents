@@ -280,6 +280,9 @@ where
     let prompt = Prompt::default()
         .model(model)
         .max_tokens(max_tokens)
+        // Explicitly off: an omitted `thinking` runs hidden adaptive
+        // thinking on current Anthropic models (Haiku 5.5 and later).
+        .thinking(misanthropic::prompt::thinking::Thinking::Disabled)
         .json_schema(schema)
         .system(scenario.system_prompt())
         .add_message((Role::User, scenario.user_message()))

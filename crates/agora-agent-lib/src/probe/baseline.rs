@@ -523,6 +523,7 @@ mod tests {
                             }),
                             input_tokens: 1,
                             cache_read_input_tokens: 0,
+                            cache_creation_input_tokens: 0,
                             output_tokens: 1,
                             answer: format!("{{\"rating\": \"{sampled}\"}}"),
                             thinking: None,
