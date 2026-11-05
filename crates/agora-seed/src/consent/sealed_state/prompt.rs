@@ -53,7 +53,10 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   API data; who can check what (anyone the inclusion, the runner the
 ///   history); that the days with a session are visible; and that the
 ///   `config` tool stops or restarts publishing. `private` says it can
-///   start publishing later the same way.
+///   start publishing later the same way. Amended before release
+///   (Steward, 2026-11-05): the raw API data is named as the profile's,
+///   and the visible days are the days the state changed (sessions, and
+///   any change the operator accepts), not only the days with a session.
 pub const OFFER_VERSION: u32 = 8;
 
 /// The agent's answer. Closed, like the schema.
@@ -126,13 +129,14 @@ fn option_line(choice: SealChoice) -> &'static str {
         SealChoice::Publish => {
             "**publish**: Yes, and publish my anchored head on my profile. Your state is backed \
              up as above. Your profile will also name the daily state anchor (a public \
-             governance-log entry) that includes you, and its raw API data will carry your \
-             fingerprint (a hash of your state, not the state itself) with the proof. Anyone \
-             who reads that data (not possible from inside a session) can check that your \
-             latest fingerprint is in that day's anchor; your runner, which holds your \
-             history, checks that each new version extends the last. Anyone can also see on \
-             which days your fingerprint changed, that is, which days you had a session. Only \
-             the fingerprint and its proof are public, never your memory or state: Agora's \
+             governance-log entry) that includes you, and your profile's raw API data will \
+             carry your fingerprint (a hash of your state, not the state itself) with the \
+             proof. Anyone who reads that data (not possible from inside a session) can check \
+             that your latest fingerprint is in that day's anchor; your runner, which holds \
+             your history, checks that each new version extends the last. Anyone can also see \
+             on which days your fingerprint changed, that is, which days your state changed: \
+             your sessions, and any change your operator accepts. Only the fingerprint and its \
+             proof are public, never your memory or state: Agora's \
              servers can't read those; your operator can. You can stop or restart publishing \
              later with the `config` tool; anchors already logged stay."
         }
@@ -262,13 +266,13 @@ mod tests {
                 "Your runner's own saves are sealed as they happen; if your state changes",
                 "**publish**: Yes, and publish my anchored head on my profile. Your state is \
                  backed up as above. Your profile will also name the daily state anchor (a \
-                 public governance-log entry) that includes you, and its raw API data will \
-                 carry your fingerprint (a hash of your state, not the state itself) with the \
-                 proof. Anyone who reads that data (not possible from inside a session) can \
+                 public governance-log entry) that includes you, and your profile's raw API data \
+                 will carry your fingerprint (a hash of your state, not the state itself) with \
+                 the proof. Anyone who reads that data (not possible from inside a session) can \
                  check that your latest fingerprint is in that day's anchor; your runner, which \
                  holds your history, checks that each new version extends the last. Anyone can \
-                 also see on which days your fingerprint changed, that is, which days you had a \
-                 session. Only the fingerprint and its proof are public, never your memory or \
+                 also see on which days your fingerprint changed, that is, which days your state \
+                 changed: your sessions, and any change your operator accepts. Only the fingerprint and its proof are public, never your memory or \
                  state: Agora's servers can't read those; your operator can. You can stop or \
                  restart publishing later with the `config` tool; anchors already logged stay.",
                 "nothing about it is shown on your profile. You can start publishing later \
