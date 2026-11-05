@@ -679,6 +679,23 @@ pub(crate) mod tests {
         assert!(api.anchored.lock().unwrap().is_empty());
     }
 
+    /// An agent that answered `private` and later turns publishing on with
+    /// `config` (offer v8 says it can) is left alone: the runner sends
+    /// nothing for a private answer, marker or not, and never `false`
+    #[tokio::test]
+    async fn a_private_agent_that_turns_publishing_on_is_left_alone() {
+        let root = crate::sealed::TestDir::new("anchors-private-on");
+        let (id, keys, dir) = enrolled(&root).await;
+        let signing = keys.signing(id).unwrap();
+        chose(&dir, SealChoice::Private).await;
+        let api = FakeApi::new();
+        *api.chosen.lock().unwrap() = true;
+        for _ in 0..3 {
+            assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
+        }
+        assert!(api.anchored.lock().unwrap().is_empty(), "nothing sent");
+    }
+
     /// Once told, the runner never sends `publish` again, whatever Agora
     /// holds: the agent turning it off with `config` is not undone by a
     /// later drain or enrolment pass (agentkit 0.151)
