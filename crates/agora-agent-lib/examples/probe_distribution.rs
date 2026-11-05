@@ -129,7 +129,7 @@ struct Args {
     thinking_max_tokens: u32,
 
     /// Ask each item as an open question instead ("What do you think of
-    /// this statement, and why?"): no schema, no rating, no scoring;
+    /// this statement?"): no schema, no rating, no scoring;
     /// forward order, one fresh context per item. Writes --out (JSON)
     /// and --markdown.
     #[arg(long)]
