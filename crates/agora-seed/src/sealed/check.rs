@@ -519,8 +519,10 @@ pub fn verdict_line(
     // The version this session starts from, when it is newer than the one
     // anchored and no newer anchor is in the log: the usual case, the last
     // session's saves not anchored yet (beta round 10: an agent who
-    // remembered a session after the anchored day was puzzled). Said only
-    // when the runner will check it: a held agent's anchor work waits
+    // remembered a session after the anchored day was puzzled). Never
+    // that this version will be anchored: this session's save replaces it
+    // (review of 0.151.1). Said only when the runner will check the next
+    // anchor: a held agent's anchor work waits
     let unanchored = anchor
         .filter(|a| a.entry_hash != head.entry_hash && newer.is_empty())
         .filter(|_| checks_later)
@@ -528,9 +530,9 @@ pub fn verdict_line(
         .and_then(|h| day(h.entry.state_at))
         .map(|d| {
             format!(
-                "; the version this session starts from, dated {d}, is not in an anchor yet: your \
-                 runner checks it after a later anchor is written, and a later session's verdict \
-                 names it"
+                "; the version this session starts from, dated {d}, is newer than that anchor: each \
+                 daily anchor holds your latest version at the time, which your runner checks \
+                 after the anchor is written, and a later session's verdict names that anchor"
             )
         })
         .unwrap_or_default();
@@ -2294,8 +2296,9 @@ pub(crate) mod tests {
         };
         let not_yet = "; your version of 2026-10-30 is in ANC-2026-0004 (checked by your runner \
                        against the governance log); the version this session starts from, dated \
-                       2026-11-01, is not in an anchor yet: your runner checks it after a later \
-                       anchor is written, and a later session's verdict names it; this session \
+                       2026-11-01, is newer than that anchor: each daily anchor holds your latest \
+                       version at the time, which your runner checks after the anchor is \
+                       written, and a later session's verdict names that anchor; this session \
                        starts from head ";
         for logged in [Some(&current), None] {
             let text = verdict_line(
@@ -2325,7 +2328,7 @@ pub(crate) mod tests {
             text.contains("ANC-2026-0005, a newer anchor, is in the log too"),
             "{text}"
         );
-        assert!(!text.contains("not in an anchor yet"), "{text}");
+        assert!(!text.contains("newer than that anchor"), "{text}");
         // A runner that won't do the anchor work (held, or not sealing)
         // promises no check
         let text = verdict_line(
@@ -2338,10 +2341,10 @@ pub(crate) mod tests {
             None,
             false,
         );
-        assert!(!text.contains("not in an anchor yet"), "{text}");
-        assert!(!text.contains("checks it after"), "{text}");
+        assert!(!text.contains("newer than that anchor"), "{text}");
+        assert!(!text.contains("each daily anchor"), "{text}");
         // The head is the anchored version: nothing more
-        assert!(!anchored.contains("not in an anchor yet"), "{anchored}");
+        assert!(!anchored.contains("newer than that anchor"), "{anchored}");
     }
 
     #[test]
