@@ -593,6 +593,19 @@ impl KeyStore {
             .transpose()
     }
 
+    /// The agent's memory-id keys, read only, and only when its state
+    /// directory's fingerprint records one of them: `None` otherwise (no
+    /// key yet, no fingerprint yet, or a key that isn't the recorded one).
+    /// Never writes; for naming versions outside a session (the verdict).
+    pub fn memory_id_keys_checked(&self, id: AgentId, agent_dir: &Path) -> Option<MemoryIdKeys> {
+        let fingerprint = read_fingerprint(agent_dir).ok()??;
+        let keys = self.memory_id_keys(id).ok()??;
+        let recorded = keys
+            .all()
+            .any(|k| memory_id_key_fingerprint(k) == fingerprint.fingerprint);
+        recorded.then_some(keys)
+    }
+
     /// The agent's memory-id keys, the key made once if there is none: 32
     /// random bytes, written whole or not at all, never over a key already
     /// there (a concurrent maker's is taken instead). Nothing deletes or

@@ -710,12 +710,16 @@ where
     /// no key matches) never stops the session: it runs with the plain
     /// Memory heading, the operator is alerted (one mail an hour for the
     /// fleet), and no key is made over the evidence of one.
+    ///
+    /// Also says whether this session made the key: no key and no
+    /// fingerprint of one before it (a revived key had a fingerprint), so
+    /// the agent is told once that the `memory` tool is new.
     async fn memory_keys(
         rt: Arc<ConsentRuntime>,
         id: AgentId,
         name: String,
         dir: std::path::PathBuf,
-    ) -> Option<crate::sealed::keys::MemoryIdKeys> {
+    ) -> (Option<crate::sealed::keys::MemoryIdKeys>, bool) {
         // No state yet (a first session): nothing to name, nothing made,
         // and nothing for the operator to fix
         if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
@@ -724,10 +728,18 @@ where
                 agent_id = %id,
                 "no state directory yet; memory ids start at the next session"
             );
-            return None;
+            return (None, false);
         }
+        let exists = async |p: std::path::PathBuf| tokio::fs::try_exists(p).await.unwrap_or(true);
+        let had = exists(
+            rt.key_store
+                .agent_dir(id)
+                .join(crate::sealed::keys::MEMORY_ID_KEY_FILE),
+        )
+        .await
+            || exists(dir.join(crate::sealed::keys::MEMORY_ID_FINGERPRINT_FILE)).await;
         match memory_tool::session_keys(&rt.key_store, id, &dir).await {
-            Ok(keys) => Some(keys),
+            Ok(keys) => (Some(keys), !had),
             Err(e) => {
                 tracing::warn!(
                     event_type = "memory_id_key_refused",
@@ -744,7 +756,7 @@ where
                     .detail("agent", format!("{name} ({id})"))
                     .detail("error", e),
                 );
-                None
+                (None, false)
             }
         }
     }
@@ -3950,7 +3962,7 @@ where
         let interrupted = self.open_journal().await;
         let early = set_model.is_some();
         // Before the inner init, so the Memory heading shows the id
-        let memory_keys = Self::memory_keys(
+        let (memory_keys, memory_new) = Self::memory_keys(
             self.rt.clone(),
             self.inner.id(),
             self.inner.state().soul.name.to_string(),
@@ -3964,6 +3976,11 @@ where
         self.apply_model_effort();
         let memory = self.memory_tool(memory_keys);
         self.seat_tail_tools(set_model, memory);
+        // Once, in the session that made the key: the tool is new to it
+        if memory_new {
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(prompt, Content::from(memory_tool::NEW_TOOL_LINE))?;
+        }
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
             self.known_posts = ledger.created_posts.clone();
@@ -10704,9 +10721,13 @@ mod tests {
         );
         let made = std::fs::read(&key_file).unwrap();
         // The next session reuses it: the same id for the same memory
+        // The session that made the key says the tool is new, once
+        use crate::sealed::memory_tool::NEW_TOOL_LINE;
+        assert_eq!(seen.matches(NEW_TOOL_LINE).count(), 1, "{seen}");
         let mut again = h.agent(OLD, true);
         again.on_init().await.unwrap();
         assert_eq!(again.inner.memory_id(), Some(mem));
+        assert!(!intro(&again).contains(NEW_TOOL_LINE), "a key that existed");
         assert_eq!(std::fs::read(&key_file).unwrap(), made, "never replaced");
 
         // No signing secrets: refused, nothing minted, the session runs
@@ -10736,6 +10757,7 @@ mod tests {
         let seen = intro(&b);
         assert!(seen.contains(&verdict_naming_a_head()), "{seen}");
         assert!(!seen.contains("Its memory is"), "{seen}");
+        assert!(!seen.contains(NEW_TOOL_LINE), "no key, no news: {seen}");
         h2.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
         let sent = sent.sent();
         assert_eq!(sent.len(), 1, "{sent:?}");

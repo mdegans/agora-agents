@@ -86,6 +86,11 @@ pub async fn session_keys(
         .map_err(std::io::Error::other)?
 }
 
+/// Told once, in the session that makes the agent's memory-id key (the
+/// first after the `memory` tool ships), so a new tool reads as new.
+pub const NEW_TOOL_LINE: &str = "New: the `memory` tool shows your memory's earlier versions; \
+     `search` finds what you wrote, `diff` shows what changed.";
+
 /// What the tool says when the session has no memory-id key.
 pub const NO_KEY: &str = "Your memory ids couldn't be worked out this session, so this tool \
      can't name your memory's versions. Your operator has been told.";
@@ -358,7 +363,8 @@ async fn anchored(agent_dir: &Path) -> HashMap<Sha256Hex, GovernanceLogId> {
 /// under (sealed on the main line first).
 fn version_source(source: &Source) -> VersionSource {
     match source {
-        Source::Sealed { .. } | Source::ArchivedPrior { .. } => VersionSource::Sealed,
+        Source::Sealed { .. } => VersionSource::Sealed,
+        Source::ArchivedPrior { .. } => VersionSource::PriorCopy,
         Source::SideLine { .. } => VersionSource::SideLine,
         Source::OffLine { .. } => VersionSource::OffLine,
         Source::SetAside { on, .. } => VersionSource::SetAside {
@@ -1439,6 +1445,43 @@ mod tests {
             ],
             left_out: Vec::new(),
         }
+    }
+
+    /// The copy from before the May loss is labelled as that, and the
+    /// first real version isn't sized against it (beta-memory: a −449
+    /// against the prior copy read as a loss).
+    #[test]
+    fn the_prior_copy_is_labelled_and_not_compared() {
+        let agent = AgentId::new();
+        let k = keys(1);
+        let h = History {
+            versions: vec![
+                held(
+                    at(1),
+                    vec![Source::ArchivedPrior { head: head(1) }],
+                    Some("a much longer memory from before the loss\n"),
+                ),
+                held(
+                    at(2),
+                    vec![Source::Sealed { head: head(2) }],
+                    Some("first\n"),
+                ),
+            ],
+            left_out: Vec::new(),
+        };
+        let view = View::new(h, &k, agent, &HashMap::new());
+        let now = "first\n";
+        let current = view.current(MemoryId::of(&k.current, agent, now), now);
+        let out = view.log(None, None, &current);
+        let rows: Vec<&str> = out.lines().collect();
+        assert!(
+            rows[1].contains("a copy from before a memory loss"),
+            "{out}"
+        );
+        assert!(
+            !rows[0].contains('\u{2212}'),
+            "no delta across kinds: {out}"
+        );
     }
 
     #[test]
