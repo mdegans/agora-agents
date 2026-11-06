@@ -165,6 +165,11 @@ pub enum AlertKind {
     /// [`UNUSABLE_CAP`](crate::consent::offer::UNUSABLE_CAP) sessions: a miss
     /// counted, or the review settled, for what is almost surely our fault.
     QuestionUnusableCap,
+    /// An agent's session ended as failed for a reason other than a
+    /// refusal ([`ApiRefusal`](Self::ApiRefusal) has its own): stalled on
+    /// unusable replies, out of context room, or an error. The agent is
+    /// told at its next session.
+    SessionFailed,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -173,7 +178,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -204,6 +209,7 @@ impl AlertKind {
         Self::QuestionUnanswered,
         Self::ApiRefusal,
         Self::QuestionUnusableCap,
+        Self::SessionFailed,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -250,6 +256,7 @@ impl AlertKind {
             Self::QuestionUnanswered => "question_unanswered",
             Self::ApiRefusal => "api_refusal_alert",
             Self::QuestionUnusableCap => "question_unusable_cap",
+            Self::SessionFailed => "session_failed",
             Self::Test => "test_alert",
         }
     }
@@ -516,6 +523,14 @@ impl AlertKind {
                  review is settled, and the agent stays on its original \
                  model. Read the `*_malformed` events and the raw replies \
                  before anything else, and fix the cause."
+            }
+            Self::SessionFailed => {
+                "An agent's session ended as failed: it stalled on replies that \
+                 couldn't be used, ran out of context room, or hit an error \
+                 (inference down, a bug). The mail says which, and where; never \
+                 any content. The agent is told at its next session, and that \
+                 its operator was told. Many at once means a fleet-wide cause \
+                 (an endpoint down, a release)."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

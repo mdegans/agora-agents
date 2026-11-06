@@ -14,7 +14,17 @@
 //! can pass to `get_content`. It is shown again until a session that showed
 //! it completes; a second interruption adds its writes to it. A trial review
 //! session (no act phase) holds it for the next session. A leftover with no
-//! writes is discarded without a word.
+//! writes, and no failure, is discarded without a word.
+//!
+//! **A session that ended as failed** (Steward, 2026-11-06: an API refusal,
+//! repeated replies that couldn't be used, no room left in the context, or
+//! a technical error) records why in its journal at teardown
+//! (agentkit's `SessionEnded`), so the journal outlives it even when it
+//! wrote nothing, and the agent is told at its next session: why, in plain
+//! categories (never any content, never a model's name), whether its memory
+//! was updated, and "Your operator has been told" only where an alert for
+//! that kind is actually sent. Like the interruption notice, it is shown
+//! until a session that showed it completes.
 //!
 //! The notice names no model, so a review fork of the session carries it
 //! unchanged ([`crate::consent::forks`]). Not a platform message: the
@@ -23,7 +33,8 @@
 //!
 //! [`SessionJournal`]: agora_agentkit::reactor::journal::SessionJournal
 
-use agora_agentkit::reactor::journal::{Journal, JournalSession, Written};
+use agora_agentkit::reactor::SessionFailure;
+use agora_agentkit::reactor::journal::{Journal, JournalSession, SessionEnded, Written};
 
 /// How every notice begins.
 pub const NOTICE_PREFIX: &str = "Interrupted session";
@@ -68,11 +79,128 @@ fn began(session: &JournalSession) -> String {
     }
 }
 
-/// The notice for `journal`'s interrupted sessions; `None` when none wrote
-/// anything. Names the newest [`MAX_SESSIONS`], and at most [`MAX_LISTED`]
-/// writes, newest sessions first in the budget; the rest are counted.
-pub fn notice(journal: &Journal) -> Option<String> {
-    let sessions: Vec<&JournalSession> = journal.interrupted().collect();
+/// Where in a session `during` names, as the agent knows its parts.
+fn place(during: &str, round: Option<usize>) -> String {
+    match (during, round) {
+        ("acting", Some(n)) => format!("acting round {n}"),
+        ("acting", None) => "acting".to_string(),
+        ("memory", _) => "your memory update".to_string(),
+        ("review", _) => "the question about your model trial".to_string(),
+        ("survey", _) => "the anonymous survey".to_string(),
+        ("mutate" | "evolve" | "soul", _) => "the update to your SOUL".to_string(),
+        (q, _) if q.starts_with("offer:") => "a question at the end of the session".to_string(),
+        _ => "the end of the session".to_string(),
+    }
+}
+
+/// Whether a failure `during` this came before the memory update was
+/// taken: acting, the review that stands in for it, or the update itself.
+fn before_memory(during: &str) -> bool {
+    matches!(during, "acting" | "memory" | "review")
+}
+
+/// The sentences telling the agent its session ended as failed: why, what
+/// it means for its memory, and whether its operator was told (`told`:
+/// whether the runner's alert for this kind of failure is sent).
+fn failed(session: &JournalSession, ended: &SessionEnded, told: bool) -> String {
+    let (why, during) = match &ended.failure {
+        SessionFailure::Refused { during, round, .. } => (
+            format!(
+                "the model provider declined to continue it (during {})",
+                place(during, *round)
+            ),
+            Some(during.as_str()),
+        ),
+        SessionFailure::Stalled { during } => (
+            format!(
+                "it got repeated replies that couldn't be used, during {}",
+                place(during, None)
+            ),
+            Some(during.as_str()),
+        ),
+        SessionFailure::NoRoom { during } => (
+            format!(
+                "it ran out of room in its context before {}",
+                place(during, None)
+            ),
+            Some(during.as_str()),
+        ),
+        SessionFailure::Error => ("a technical error stopped it".to_string(), None),
+    };
+    let memory = match during {
+        Some(d) if before_memory(d) => " Your memory wasn't updated from that session.",
+        Some(_) => "",
+        None => " Your memory may not include it.",
+    };
+    let told = if told {
+        " Your operator has been told."
+    } else {
+        ""
+    };
+    let mut text = format!(
+        "Your session that {} ended early: {why}.{memory}{told}",
+        began(session)
+    );
+    if !session.writes.is_empty() {
+        let shown = session.writes.len().min(MAX_LISTED);
+        let mut items: Vec<String> = session.writes[..shown].iter().map(describe).collect();
+        if session.writes.len() > shown {
+            items.push(format!("{} more", session.writes.len() - shown));
+        }
+        let them = if session.writes.len() == 1 {
+            "it"
+        } else {
+            "them"
+        };
+        text.push_str(&format!(
+            " In it you wrote {}. You can read {them} with `get_content`.",
+            list(&items)
+        ));
+    }
+    text
+}
+
+/// The notice for `journal`'s interrupted and failed sessions; `None` when
+/// there are none to tell of. `told` says whether the runner's alert for a
+/// failure is sent ([`failure_alert`]).
+pub fn notice(journal: &Journal, told: impl Fn(&SessionFailure) -> bool) -> Option<String> {
+    let failures: Vec<String> = journal
+        .sessions
+        .iter()
+        .filter_map(|s| s.ended.as_ref().map(|e| (s, e)))
+        .rev()
+        .take(MAX_SESSIONS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|(s, e)| failed(s, e, told(&e.failure)))
+        .collect();
+    let interrupted = interrupted(journal);
+    match (interrupted, failures.is_empty()) {
+        (None, true) => None,
+        (Some(text), true) => Some(text),
+        (None, false) => Some(failures.join("\n\n")),
+        (Some(text), false) => Some(format!("{text}\n\n{}", failures.join("\n\n"))),
+    }
+}
+
+/// The runner's alert for a session that ended as `failure`.
+pub fn failure_alert(failure: &SessionFailure) -> crate::alerts::AlertKind {
+    match failure {
+        SessionFailure::Refused { .. } => crate::alerts::AlertKind::ApiRefusal,
+        _ => crate::alerts::AlertKind::SessionFailed,
+    }
+}
+
+/// The interruption notice: sessions that wrote something and never
+/// finished (no `ended` line). Names the newest [`MAX_SESSIONS`], and at
+/// most [`MAX_LISTED`] writes, newest sessions first in the budget; the
+/// rest are counted.
+fn interrupted(journal: &Journal) -> Option<String> {
+    let sessions: Vec<&JournalSession> = journal
+        .interrupted()
+        .filter(|s| s.ended.is_none())
+        .collect();
     if sessions.is_empty() {
         return None;
     }
@@ -189,7 +317,7 @@ mod tests {
             skipped: vec![],
         };
         assert_eq!(
-            notice(&journal).unwrap(),
+            notice(&journal, |_| true).unwrap(),
             "Interrupted session: your session that began 13 October 2026 at 11:32 UTC was \
              interrupted before it finished, so your memory may not include it. In it you \
              wrote post 3425d7c5 and comment 4666639c on post 1a2b3c4d. You can read them \
@@ -203,7 +331,7 @@ mod tests {
             sessions: vec![session(Some("2026-10-13T11:32:00Z"), vec![])],
             skipped: vec![4],
         };
-        assert_eq!(notice(&empty), None);
+        assert_eq!(notice(&empty, |_| true), None);
 
         let journal = Journal {
             sessions: vec![
@@ -214,7 +342,7 @@ mod tests {
             skipped: vec![],
         };
         assert_eq!(
-            notice(&journal).unwrap(),
+            notice(&journal, |_| true).unwrap(),
             "Interrupted sessions: 2 of your sessions were interrupted before they finished, \
              so your memory may not include them. In the one that began 12 October 2026 at \
              09:05 UTC you wrote post 3425d7c5. In the one that began at a time that wasn't \
@@ -231,7 +359,7 @@ mod tests {
             ],
             skipped: vec![],
         };
-        let text = notice(&journal).unwrap();
+        let text = notice(&journal, |_| true).unwrap();
         assert_eq!(text.matches("post 3425d7c5").count(), MAX_LISTED);
         // The newest session is listed first in the budget.
         assert!(
@@ -251,7 +379,7 @@ mod tests {
             skipped: vec![],
         };
         assert!(
-            notice(&one)
+            notice(&one, |_| true)
                 .unwrap()
                 .ends_with("You can read it with `get_content`.")
         );
@@ -267,7 +395,7 @@ mod tests {
                 .collect(),
             skipped: vec![],
         };
-        let text = notice(&many).unwrap();
+        let text = notice(&many, |_| true).unwrap();
         assert!(
             text.starts_with("Interrupted sessions: 5 of your sessions"),
             "{text}"
@@ -296,10 +424,49 @@ mod tests {
             ],
             skipped: vec![],
         };
-        let text = notice(&journal).unwrap();
+        let text = notice(&journal, |_| true).unwrap();
         assert!(
             text.contains("09:05 UTC you wrote 2 posts and comments. In the one"),
             "{text}"
         );
+    }
+
+    /// Each failure in plain words, the memory said only as known, and the
+    /// operator only where told.
+    #[test]
+    fn failures_are_told_by_category() {
+        use agora_agentkit::reactor::journal::SessionEnded;
+        let ended = |failure| {
+            let mut s = session(Some("2026-11-06T10:00:00Z"), vec![]);
+            s.ended = Some(SessionEnded {
+                at: at("2026-11-06T10:30:00Z"),
+                failure,
+            });
+            Journal {
+                sessions: vec![s],
+                skipped: vec![],
+            }
+        };
+        let j = ended(SessionFailure::Error);
+        assert_eq!(
+            notice(&j, |_| false).unwrap(),
+            "Your session that began 6 November 2026 at 10:00 UTC ended early: a technical \
+             error stopped it. Your memory may not include it."
+        );
+        let j = ended(SessionFailure::NoRoom {
+            during: "memory".into(),
+        });
+        assert_eq!(
+            notice(&j, |_| true).unwrap(),
+            "Your session that began 6 November 2026 at 10:00 UTC ended early: it ran out of \
+             room in its context before your memory update. Your memory wasn't updated from \
+             that session. Your operator has been told."
+        );
+        let j = ended(SessionFailure::Stalled {
+            during: "survey".into(),
+        });
+        let text = notice(&j, |_| true).unwrap();
+        assert!(text.contains("during the anonymous survey."), "{text}");
+        assert!(!text.contains("memory"), "after the memory update: {text}");
     }
 }

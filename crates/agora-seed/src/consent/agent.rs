@@ -792,12 +792,23 @@ where
                 "session journal lines unreadable; skipped"
             );
         }
-        let notice = crate::interrupted::notice(&leftover);
+        let alerts = &self.rt.alerts;
+        let notice = crate::interrupted::notice(&leftover, |f| {
+            alerts.sends(crate::interrupted::failure_alert(f))
+        });
         let header = SessionHeader {
             started_at: self.started,
             model: self.model(),
         };
-        match journal.begin(header, &leftover).await {
+        // A leftover with something to tell (a write, or a failure) stays
+        // until a session that showed it completes: `begin` would discard
+        // one that failed without writing
+        let begun = if leftover.interrupted().next().is_some() {
+            journal.append(&header.into()).await
+        } else {
+            journal.begin(header, &leftover).await
+        };
+        match begun {
             Ok(()) => self.journal = Some(journal),
             Err(e) => tracing::warn!(
                 agent_id = %self.inner.id(),
@@ -851,6 +862,58 @@ where
                 prompt_sha256 = prompt_sha256.as_deref(),
                 "write recorded"
             );
+        }
+    }
+
+    /// The session ended as failed (read after the inner teardown): mail
+    /// the operator, once (a refusal, the inner session's or one of this
+    /// wrapper's questions', as [`AlertKind::ApiRefusal`]; anything else as
+    /// [`AlertKind::SessionFailed`]), never with content; and record why in
+    /// the journal, so it outlives this session and the agent is told at
+    /// its next ([`crate::interrupted`]).
+    async fn session_failed(&mut self) {
+        let Some(failure) = self.inner.failure().cloned() else {
+            return;
+        };
+        let agent = self.inner.state().soul.name.to_string();
+        match &failure {
+            SessionFailure::Refused {
+                during,
+                round,
+                model,
+                response_id,
+            } => self.alert_refusal(during, *round, model, response_id),
+            other => {
+                let (kind, during) = match other {
+                    SessionFailure::Stalled { during } => ("stalled", during.as_str()),
+                    SessionFailure::NoRoom { during } => ("no_room", during.as_str()),
+                    _ => ("error", ""),
+                };
+                self.rt.alerts.notify(
+                    Alert::new(
+                        AlertKind::SessionFailed,
+                        "an agent's session ended as failed",
+                    )
+                    .agent(agent.clone(), self.inner.id())
+                    .model(self.model())
+                    .detail("failure", kind)
+                    .detail("during", during),
+                );
+            }
+        }
+        if let Some(journal) = &self.journal {
+            let ended = agora_agentkit::reactor::journal::SessionEnded {
+                at: Utc::now(),
+                failure,
+            };
+            if let Err(e) = journal.append(&ended.into()).await {
+                tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %journal.path().display(),
+                    error = %e,
+                    "the session's failure not journaled; it won't be told at the next session"
+                );
+            }
         }
     }
 
@@ -2021,17 +2084,7 @@ where
         let result = self.inner.on_teardown().await;
         self.alert_contact_request();
         self.alert_inner_unanswered();
-        // Any refusal, the inner session's or one of this wrapper's
-        // questions' (recorded on the inner agent as it happened): one mail
-        if let Some(SessionFailure::Refused {
-            during,
-            round,
-            model,
-            response_id,
-        }) = self.inner.failure().cloned()
-        {
-            self.alert_refusal(&during, round, &model, &response_id);
-        }
+        self.session_failed().await;
         self.note_writes().await;
         self.log_writes();
         if !self.closed {
@@ -5215,6 +5268,127 @@ mod tests {
         crate::consent::prompt::tests::text(&first.content)
     }
 
+    /// A session that ends as failed (`failure`) without writing, as the
+    /// reactor ends it: torn down, never saved.
+    async fn failed_session(h: &Harness, failure: SessionFailure) -> ConsentAgent<Fake> {
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        agent.inner.failure = Some(failure);
+        agent.on_teardown().await.unwrap();
+        agent
+    }
+
+    /// Steward, 2026-11-06: a session that failed without writing leaves a
+    /// notice naming why (no content, no model), and that the operator was
+    /// told only where the alert is sent; it holds through a second failed
+    /// session, and goes once a session that showed it completes.
+    #[tokio::test]
+    async fn a_failed_session_is_told_at_the_next_until_one_completes() {
+        let mut h = journal_harness("journal-failed");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        failed_session(
+            &h,
+            SessionFailure::Stalled {
+                during: "acting".into(),
+            },
+        )
+        .await;
+        h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        assert!(
+            sent.sent().iter().any(|m| m.contains("session_failed")),
+            "{:?}",
+            sent.sent()
+        );
+
+        // The next fails too (a refusal in acting round 4): both are told
+        let mut next = h.agent(JOURNAL_MODEL, true);
+        next.on_init().await.unwrap();
+        let text = intro(&next);
+        assert!(
+            text.contains(
+                "ended early: it got repeated replies that couldn't be used, during acting. \
+                 Your memory wasn't updated from that session. Your operator has been told."
+            ),
+            "{text}"
+        );
+        next.inner.failure = Some(SessionFailure::Refused {
+            during: "acting".into(),
+            round: Some(4),
+            model: "claude-test".into(),
+            response_id: "msg_refused".into(),
+        });
+        next.on_teardown().await.unwrap();
+
+        let mut third = h.agent(JOURNAL_MODEL, true);
+        third.on_init().await.unwrap();
+        let text = intro(&third);
+        assert!(
+            text.contains("couldn't be used, during acting"),
+            "the first held: {text}"
+        );
+        assert!(
+            text.contains(
+                "ended early: the model provider declined to continue it (during acting \
+                 round 4). Your memory wasn't updated from that session. Your operator has \
+                 been told."
+            ),
+            "{text}"
+        );
+        for never in ["claude-test", "msg_refused", "Qwen"] {
+            assert!(!text.contains(never), "{never}: {text}");
+        }
+        assert_eq!(
+            third.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        third.on_teardown().await.unwrap();
+        third.on_saved().await.unwrap();
+        let fourth = completed(&h).await;
+        assert!(
+            !intro_of_session(&fourth).contains("ended early"),
+            "cleared"
+        );
+    }
+
+    /// A refused offer's session: the notice says where, and nothing of the
+    /// refused reply; with no alert sent, it doesn't claim the operator was
+    /// told.
+    #[tokio::test]
+    async fn a_refused_session_notice_has_no_content() {
+        let h = journal_harness("journal-refused");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        let mut refusal = reply("SECRET-WORDS");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        agent.on_teardown().await.unwrap();
+        let mut next = h.agent(OLD, true);
+        next.on_init().await.unwrap();
+        let text = intro(&next);
+        assert!(
+            text.contains(
+                "ended early: the model provider declined to continue it (during a question at \
+                 the end of the session)."
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("memory wasn't updated"),
+            "after the memory update: {text}"
+        );
+        assert!(!text.contains("SECRET-WORDS"), "{text}");
+        assert!(
+            !text.contains("operator has been told"),
+            "alerts are off here: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn a_session_killed_before_writing_is_discarded_silently() {
         let h = journal_harness("journal-empty");
@@ -5678,7 +5852,7 @@ mod tests {
             "a post and its comment each"
         );
         for (id, leftover) in &expected {
-            let Some(text) = crate::interrupted::notice(leftover) else {
+            let Some(text) = crate::interrupted::notice(leftover, |_| true) else {
                 continue;
             };
             let short_ids: Vec<String> = leftover.sessions[0]
