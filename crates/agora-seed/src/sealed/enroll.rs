@@ -694,6 +694,7 @@ mod tests {
     use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
     use crate::consent::sealed_state::prompt::SealChoice;
     use crate::sealed::api::fake::FakeApi;
+    use agora_agentkit::reactor::seed::memory::memory_text;
     use agora_agentkit::state::verify::verify_chain;
 
     fn yes(dir: &Path) {
@@ -917,20 +918,13 @@ mod tests {
                 "the same canonical bytes"
             );
             assert_eq!(
-                crate::sealed::notice::memory_content(found)
-                    .unwrap()
-                    .as_bytes(),
-                crate::sealed::notice::memory_content(&local)
-                    .unwrap()
-                    .as_bytes(),
+                memory_text(found).as_bytes(),
+                memory_text(&local).as_bytes(),
                 "memory byte for byte"
             );
         }
         // And in order, each memory once
-        let opened: Vec<&str> = sealed
-            .iter()
-            .map(|v| crate::sealed::notice::memory_content(v).unwrap())
-            .collect();
+        let opened: Vec<&str> = sealed.iter().map(memory_text).collect();
         assert_eq!(
             opened,
             memories.iter().map(String::as_str).collect::<Vec<_>>()

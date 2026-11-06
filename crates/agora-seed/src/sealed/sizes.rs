@@ -35,10 +35,11 @@ impl Sizes {
     /// From a state value: `memory.content`'s length, and the soul's as
     /// JSON. Nothing else is looked at.
     pub fn of(state: &serde_json::Value) -> Self {
-        let memory_chars = state
-            .pointer("/memory/content")
-            .and_then(|c| c.as_str())
-            .map_or(0, |c| c.chars().count());
+        // agentkit's projection, one copy with the notices' and the
+        // `memory` tool's: empty when there is none
+        let memory_chars = agora_agentkit::reactor::seed::memory::memory_text(state)
+            .chars()
+            .count();
         let soul_chars = state
             .get("soul")
             .map_or(0, |s| s.to_string().chars().count());
@@ -141,6 +142,15 @@ mod tests {
         assert_eq!(s.memory_chars, 5);
         assert_eq!(s.soul_chars, r#"{"name":"t"}"#.len());
         assert_eq!(Sizes::of(&serde_json::json!({})), Sizes::default());
+        // As before agentkit's projection: a memory that isn't a string, or
+        // a memory with no content, counts 0
+        for none in [
+            serde_json::json!({"memory": {"content": 7}}),
+            serde_json::json!({"memory": {}}),
+            serde_json::json!({"memory": "flat"}),
+        ] {
+            assert_eq!(Sizes::of(&none).memory_chars, 0, "{none}");
+        }
     }
 
     #[test]

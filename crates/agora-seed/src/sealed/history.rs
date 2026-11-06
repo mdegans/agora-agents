@@ -70,6 +70,10 @@ use super::version::{Opener, verified_line};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Line {
     /// The main line to `sealed/head.json`'s head.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "named by `Source::line`, which the tests read")
+    )]
     Main,
     /// Off it: displaced by a fork, set aside by a rebase, or otherwise
     /// not on the current line.
@@ -122,6 +126,7 @@ impl Source {
     }
 
     /// Its line, if it is sealed.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the resolver's tests read it"))]
     pub fn line(&self) -> Option<Line> {
         match self {
             Self::Sealed { .. } | Self::ArchivedPrior { .. } => Some(Line::Main),
@@ -155,8 +160,8 @@ pub struct Version {
     /// For an unopened sealed version, the hash the runner recorded when
     /// it sealed it, if it has one.
     pub state_hash: Option<Sha256Hex>,
-    /// `memory.content`, raw (the pre-loss copy's `content`); `None` if the
-    /// state holds no memory, or it couldn't be opened. Never logged.
+    /// `memory.content`, raw (the pre-loss copy's `content`); empty if the
+    /// state holds no memory, `None` if it couldn't be opened. Never logged.
     pub memory: Option<Zeroizing<String>>,
     /// Why a sealed version couldn't be opened just now (Agora unreachable,
     /// a blob not served): it is listed, without its memory.
@@ -396,16 +401,18 @@ impl Builder {
 }
 
 /// The memory text a sealed value holds: a state's `memory.content`, or
-/// the pre-loss copy's `content` (a `MEMORY.json`).
+/// the pre-loss copy's `content` (a `MEMORY.json`); empty when it holds
+/// none (agentkit's projection, one copy with the notices').
 fn memory_of(kind: StateEntryKind, value: &serde_json::Value) -> Option<Zeroizing<String>> {
+    use agora_agentkit::reactor::seed::memory::memory_text;
     let text = match kind {
         StateEntryKind::ArchivedPrior => value
             .get("content")
             .and_then(serde_json::Value::as_str)
-            .or_else(|| super::notice::memory_content(value)),
-        _ => super::notice::memory_content(value),
+            .unwrap_or_else(|| memory_text(value)),
+        _ => memory_text(value),
     };
-    text.map(|t| Zeroizing::new(t.to_string()))
+    Some(Zeroizing::new(text.to_string()))
 }
 
 fn head_of(entry: &SignedStateEntry) -> HeadRef {
@@ -867,8 +874,7 @@ fn local_files(agent_dir: &Path, mut cache: Files) -> (anyhow::Result<Vec<Found>
                 Ok((_, state)) => {
                     let opened = Opened {
                         state_hash: plaintext_hash(&state),
-                        memory: super::notice::memory_content(&state)
-                            .map(|m| Zeroizing::new(m.to_string())),
+                        memory: memory_of(StateEntryKind::Snapshot, &state),
                     };
                     if let Some(k) = key {
                         kept.insert(k, opened.clone());
@@ -1044,7 +1050,10 @@ mod tests {
         // check::tests::enrolled seals a first state with no `memory.content`
         let memories: Vec<&str> = h.versions.iter().map(Version::memory_str).collect();
         assert_eq!(memories, ["", &memory(2), &memory(3), &memory(4)]);
-        assert!(h.versions[0].memory.is_none());
+        assert_eq!(
+            h.versions[0].memory.as_deref().map(String::as_str),
+            Some("")
+        );
         assert_eq!(
             sources(&h),
             [
