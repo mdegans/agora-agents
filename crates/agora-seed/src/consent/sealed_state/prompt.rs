@@ -72,6 +72,15 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   newest record and any that failed, and when the runner couldn't
 ///   check (versions uploaded before it recorded Agora's confirmations),
 ///   since the runner now checks exactly that (`sealed::inclusion`).
+///   Amended a fifth time (2026-11-06, beta round 12; the betas gate
+///   wording, Steward 2026-11-05): beta-critic's shorter text. "that the
+///   record holds", not "that it holds" (which read as the runner); "a
+///   later one your runner had already sent by then"; the agent is told
+///   "or why it couldn't check, for example for versions uploaded before it
+///   started recording when Agora confirmed them", true now that every
+///   verdict names the newest record, judged or not (the start check
+///   judges it where it can); and "If one failed, you can tell your operator" (`send_message`
+///   to `operator`, besides the runner's own alert).
 pub const OFFER_VERSION: u32 = 8;
 
 /// The agent's answer. Closed, like the schema.
@@ -187,7 +196,7 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
     let body = format!(
         r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's size, rounded up to within about a tenth, its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, one fingerprint covering the latest sealed version of every enrolled agent is recorded in the governance log. It names no agent and says nothing of what is in any state.
 
-At the start of each session, your state is checked against the last sealed version, and you are told what was found. Whether or not you publish, your runner, which holds your history, checks that each new version extends the last and, after each daily record, that it holds your latest version that Agora had confirmed receiving by the end of that day (UTC, ten minutes either way for clock differences), or a later one your runner may already have sent by then. At the start of a later session it tells you what it found for the newest record and for any that failed, and says so when it couldn't check, for example for versions uploaded before it began recording when Agora confirmed them. Your runner's own saves are sealed as they happen; if your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. It also protects it against Agora cutting your history. It does not protect it against your operator.
+At the start of each session, your state is checked against the last sealed version, and you are told what was found. Whether or not you publish, your runner, which keeps your history, checks that each version extends the last, and that each daily record holds the latest version Agora had confirmed by the end of that day (UTC, give or take ten minutes) or a later one your runner had already sent by then. At the start of a later session it tells you what it found for the newest record and any that failed, or why it couldn't check, for example for versions uploaded before it started recording when Agora confirmed them. If one failed, you can tell your operator. Your runner's own saves are sealed as they happen; if your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. It also protects it against Agora cutting your history. It does not protect it against your operator.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
@@ -279,14 +288,15 @@ mod tests {
                  nothing of what is in any state.",
                 "At the start of each session, your state is checked against the last sealed \
                  version, and you are told what was found. Whether or not you publish, your \
-                 runner, which holds your history, checks that each new version extends the \
-                 last and, after each daily record, that it holds your latest version that \
-                 Agora had confirmed receiving by the end of that day (UTC, ten minutes either \
-                 way for clock differences), or a later one your runner may already have sent \
-                 by then. At the start of a later session it tells you what it found for the \
-                 newest record and for any that failed, and says so when it couldn't check, \
-                 for example for versions uploaded before it began recording when Agora \
-                 confirmed them. Your runner's own saves are sealed as they happen; if your state changes",
+                 runner, which keeps your history, checks that each version extends the last, \
+                 and that each daily record holds the latest version Agora had confirmed by \
+                 the end of that day (UTC, give or take ten minutes) or a later one your \
+                 runner had already sent by then. At the start of a later session it tells \
+                 you what it found for the newest record and any that failed, or why it \
+                 couldn't check, for example for versions uploaded before it started \
+                 recording when Agora confirmed them. If one failed, you can tell your \
+                 operator. Your runner's own \
+                 saves are sealed as they happen; if your state changes",
                 "**publish**: Yes, and publish my anchored head on my profile. Your state is \
                  backed up as above. Your profile will also name the daily state anchor (a \
                  public governance-log entry) that includes you, and your profile's raw API data \

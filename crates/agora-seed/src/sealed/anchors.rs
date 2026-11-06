@@ -4,10 +4,12 @@
 //!
 //! **The check.** The server prunes anchor leaves after 30 days, and no
 //! agent can run `verify_inclusion` itself, so the runner does ("the client
-//! does the work"). The drainer, at the end of a run and at most hourly
-//! during it ([`PROOF_INTERVAL`]), for each sealed agent whose outbox is
-//! empty and that has anchors in the verified governance log not yet
-//! judged ([`check_anchors`]):
+//! does the work"). The start check, before any session, for each sealed
+//! agent in step with Agora (nothing waiting to upload,
+//! [`super::check::check_with`]), and the drainer, at the end of a run and
+//! at most hourly during it ([`PROOF_INTERVAL`]), for each sealed agent
+//! whose outbox is empty, when it has anchors in the verified governance
+//! log not yet judged ([`check_anchors`]):
 //!
 //! 1. asks Agora for every proof it serves the agent after the last anchor
 //!    judged, page by page until an empty one, so an anchor Agora serves
@@ -27,8 +29,8 @@
 //!
 //! Each anchor is judged once, in log order, and recorded in
 //! `sealed/inclusion.json`; a failure alerts the operator then
-//! ([`AlertKind::SealedStateAnchorFailed`]) and the agent's next verdict
-//! says it. Proofs that check are also kept in `sealed/anchors.json`
+//! ([`AlertKind::SealedStateAnchorWrong`]) and the next verdict seated
+//! says it (the same session's, when the start check judged it). Proofs that check are also kept in `sealed/anchors.json`
 //! (local, written atomically), as before. A pass that can't go on (Agora
 //! unreachable, the line unreadable) stops at the anchor it couldn't judge,
 //! with what it judged before saved, and the next pass resumes there.
@@ -134,9 +136,21 @@ impl VerifiedAnchors {
     }
 
     /// The newest `ANC-` entry, by id (`ANC-YYYY-NNNN`, as the proofs'
-    /// `after` orders them), for the start check's verdict.
+    /// `after` orders them): the verdict names it when its record can't
+    /// be read.
     pub fn newest(&self) -> Option<&GovernanceLogId> {
         self.entries.keys().next_back()
+    }
+
+    /// The entry `anc`, as the verified log has it.
+    pub fn logged(&self, anc: &GovernanceLogId) -> Option<&LoggedAnchor> {
+        self.entries.get(anc)
+    }
+
+    /// `anc`'s date, if already learnt this run (from a proof, or its data
+    /// as Agora serves it, checked against the log). No network.
+    pub fn known_date(&self, anc: &GovernanceLogId) -> Option<NaiveDate> {
+        self.dates.lock().expect("dates lock").get(anc).copied()
     }
 
     /// The entries after `after` (all with `None`), oldest first.
@@ -614,6 +628,38 @@ pub fn judged_alert(id: AgentId, name: &str, failures: &[Checked]) -> Alert {
     alert
 }
 
+/// Alert the operator to what one [`check_anchors`] pass found, as the
+/// drainer and the start check both do: the failures it judged (once:
+/// they are never judged again, so alerted even when the pass stopped
+/// after them), then why it stopped, if it did.
+pub fn alert_pass(
+    alerts: &crate::alerts::Alerter,
+    id: AgentId,
+    name: &str,
+    result: &Result<Pass, ProofError>,
+) {
+    let stopped = match result {
+        Ok(pass) => {
+            if !pass.failures.is_empty() {
+                alerts.notify(judged_alert(id, name, &pass.failures));
+            }
+            pass.stopped.as_ref()
+        }
+        Err(e) => Some(e),
+    };
+    if let Some(e) = stopped {
+        tracing::warn!(
+            event_type = "sealed_state_anchor_failed",
+            agent_id = %id,
+            what = "check",
+            kind = e.kind(),
+            error = %e,
+            "the anchor check stopped; it resumes at the next pass"
+        );
+        alerts.notify(anchor_alert(id, name, "check", &e.to_string()));
+    }
+}
+
 /// The alert for a pass that stopped, or a publish that failed.
 pub fn anchor_alert(id: AgentId, name: &str, what: &str, error: &str) -> Alert {
     Alert::new(
@@ -679,7 +725,7 @@ pub(crate) mod tests {
 
     /// An `ANC-` entry for `date` over `id`'s `head` among others: its
     /// proof, its id, the log's attested data hash, and its data as served.
-    fn anchor_on(
+    pub(crate) fn anchor_on(
         n: u32,
         date: NaiveDate,
         id: AgentId,
@@ -717,7 +763,7 @@ pub(crate) mod tests {
 
     /// For an anchor dated tomorrow: its day ends a day from now or more,
     /// so the versions uploaded now were confirmed well before it.
-    fn tomorrow() -> NaiveDate {
+    pub(crate) fn tomorrow() -> NaiveDate {
         today().succ_opt().unwrap()
     }
 
@@ -792,6 +838,159 @@ pub(crate) mod tests {
                 map.insert(a.clone(), d.clone());
             }
         }
+    }
+
+    /// The start check judges what it can before the verdict is written
+    /// (beta round 12: on the first session under 0.151.3 nothing had been
+    /// judged, and every verdict said nothing of any anchor), for an agent
+    /// whose versions are all on Agora: said in that session's verdict,
+    /// told only after it saves, never judged twice; a failure goes to the
+    /// operator through `judged`; a pass that can't go on is said, with why
+    #[tokio::test]
+    async fn the_start_check_judges_the_anchors_before_the_verdict() {
+        use crate::sealed::check::{Outcome, StartAnchors, check_with, tests::local_hash};
+        let a = Agent::new("anc-start", true).await;
+        let seal = AgentSeal::new(&a.dir, a.id);
+        *a.api.chain.lock().unwrap() =
+            Ok(crate::sealed::check::local_entries(&seal).await.unwrap());
+        let l = line(&a.dir, a.id).await;
+        let (head, seq) = l[1];
+        let (proof, anc, attested, _) = anchor_on(2, tomorrow(), a.id, head, seq);
+        a.api.proofs.lock().unwrap().push(proof);
+        let verified = logged(&[(anc.clone(), attested)]);
+        let local = local_hash(a._root.path(), a.id).await;
+        let start = StartAnchors {
+            verified: &verified,
+            alerted: true,
+        };
+        let run = async || {
+            let out = check_with(
+                &a.dir,
+                a.id,
+                &local,
+                crate::sealed::sizes::Sizes::default(),
+                &a.keys,
+                &a.api,
+                Some(&start),
+            )
+            .await;
+            let Outcome::Run {
+                seat,
+                hold: None,
+                told,
+                judged,
+                ..
+            } = out
+            else {
+                panic!("{out:?}")
+            };
+            (seat[0].clone(), told, judged)
+        };
+        let (verdict, told, judged) = run().await;
+        let pass = judged.expect("judged at the start").unwrap();
+        assert_eq!((pass.judged, pass.failures.len()), (1, 0));
+        assert!(
+            verdict.contains(&format!(
+                ". {anc}, the anchor for {}, holds the version it should: the latest that \
+                 Agora had confirmed receiving from you by the end of that day (UTC).",
+                tomorrow().format("%Y-%m-%d")
+            )),
+            "{verdict}"
+        );
+        assert!(!verdict.contains("hasn't been checked"), "{verdict}");
+        assert_eq!(told, vec![anc.clone()]);
+        // Not marked told by the check: the session that shows it does
+        assert!(!InclusionFile::load(&a.dir).unwrap().checked[0].told);
+        // Judged once: the next start asks Agora for no proof
+        a.api.calls.lock().unwrap().clear();
+        let (again, _, judged) = run().await;
+        assert_eq!(judged, Some(Ok(Pass::default())));
+        assert_eq!(again, verdict);
+        assert!(
+            a.api.calls.lock().unwrap().iter().all(|c| c != "proofs"),
+            "{:?}",
+            a.api.calls.lock().unwrap()
+        );
+
+        // A newer anchor whose proof can't be fetched: the pass stops, and
+        // the verdict says so, with when it is tried again
+        let (proof3, anc3, attested3, _) = anchor_on(3, tomorrow(), a.id, head, seq);
+        let _ = proof3;
+        let verified = logged(&[(anc.clone(), attested), (anc3.clone(), attested3)]);
+        let start = StartAnchors {
+            verified: &verified,
+            alerted: true,
+        };
+        *a.api.fail.lock().unwrap() = Some("proofs");
+        let out = check_with(
+            &a.dir,
+            a.id,
+            &local,
+            crate::sealed::sizes::Sizes::default(),
+            &a.keys,
+            &a.api,
+            Some(&start),
+        )
+        .await;
+        let Outcome::Run { seat, judged, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert!(
+            matches!(judged, Some(Err(ProofError::Fetch(_)))),
+            "{judged:?}"
+        );
+        assert!(
+            seat[0].contains(&format!(
+                "holds the version it should: the latest that Agora had confirmed receiving \
+                 from you by the end of that day (UTC). Your runner checked this against the \
+                 governance log and its own record of your uploads. {anc3}, logged {} (UTC) \
+                 and the newest in the governance log, hasn't been checked for you yet: your \
+                 runner's check at the start of this session stopped, as Agora's proofs \
+                 couldn't be fetched. It tries again after this session's uploads",
+                Utc::now().format("%Y-%m-%d")
+            )),
+            "{}",
+            seat[0]
+        );
+        *a.api.fail.lock().unwrap() = None;
+
+        // A failure judged at the start is alerted through `judged` and
+        // said in that session's verdict
+        let b = Agent::new("anc-start-fail", true).await;
+        let seal = AgentSeal::new(&b.dir, b.id);
+        *b.api.chain.lock().unwrap() =
+            Ok(crate::sealed::check::local_entries(&seal).await.unwrap());
+        let l = line(&b.dir, b.id).await;
+        // The genesis, though the later version was confirmed before the
+        // day ended: older than it should be
+        let (old_head, old_seq) = l[0];
+        let (proof, anc, attested, _) = anchor_on(2, tomorrow(), b.id, old_head, old_seq);
+        b.api.proofs.lock().unwrap().push(proof);
+        let verified = logged(&[(anc.clone(), attested)]);
+        let out = check_with(
+            &b.dir,
+            b.id,
+            &local_hash(b._root.path(), b.id).await,
+            crate::sealed::sizes::Sizes::default(),
+            &b.keys,
+            &b.api,
+            Some(&StartAnchors {
+                verified: &verified,
+                alerted: true,
+            }),
+        )
+        .await;
+        let Outcome::Run { seat, judged, .. } = out else {
+            panic!("{out:?}")
+        };
+        let pass = judged.unwrap().unwrap();
+        assert_eq!(pass.failures.len(), 1);
+        assert!(
+            seat[0].contains("holds an older version of yours")
+                && seat[0].contains("Your runner has alerted your operator."),
+            "{}",
+            seat[0]
+        );
     }
 
     #[tokio::test]
