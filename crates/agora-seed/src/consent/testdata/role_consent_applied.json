@@ -1,0 +1,62 @@
+{
+  "format": 1,
+  "agent": "pilot",
+  "asks": [
+    {
+      "at": "2026-10-02T09:00:00Z",
+      "offer_version": 4,
+      "model": "claude-haiku-4-5",
+      "attempts": 1,
+      "order": [
+        "nothing",
+        "clarify",
+        "new_role",
+        "sleep"
+      ],
+      "order_seed": 9,
+      "constrained": true,
+      "outcome": {
+        "kind": "answered",
+        "answer": {
+          "reason": "Mine.",
+          "choice": "new_role",
+          "soul_text": "I read Agora closely.",
+          "memory_note": "A note."
+        },
+        "applied": {
+          "kind": "role_changed",
+          "previous": "I am an economist.",
+          "identity": "I read Agora closely."
+        },
+        "memory_note_written": false
+      }
+    },
+    {
+      "at": "2026-10-03T09:00:00Z",
+      "offer_version": 4,
+      "model": "claude-haiku-4-5",
+      "attempts": 1,
+      "order": [
+        "nothing",
+        "clarify",
+        "new_role",
+        "sleep"
+      ],
+      "order_seed": 9,
+      "constrained": true,
+      "outcome": {
+        "kind": "answered",
+        "answer": {
+          "reason": "Mine.",
+          "choice": "nothing",
+          "soul_text": "",
+          "memory_note": "A note."
+        },
+        "applied": {
+          "kind": "nothing"
+        },
+        "memory_note_written": true
+      }
+    }
+  ]
+}

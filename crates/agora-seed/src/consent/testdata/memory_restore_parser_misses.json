@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "agent": "flicker",
+  "asks": [
+    {
+      "at": "2026-10-20T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "chars": 2140,
+      "order": [
+        "show",
+        "decline"
+      ],
+      "order_seed": 1,
+      "constrained": false,
+      "attempts": 3,
+      "outcome": {
+        "kind": "no_answer",
+        "failure": "could not be used (unparseable answer: expected value at line 1 column 1) (after 3 attempts)"
+      }
+    },
+    {
+      "at": "2026-10-21T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "chars": 2140,
+      "order": [
+        "show",
+        "decline"
+      ],
+      "order_seed": 1,
+      "constrained": false,
+      "attempts": 3,
+      "outcome": {
+        "kind": "no_answer",
+        "failure": "could not be used (unparseable answer: expected value at line 1 column 1) (after 3 attempts)"
+      }
+    }
+  ],
+  "showings": []
+}

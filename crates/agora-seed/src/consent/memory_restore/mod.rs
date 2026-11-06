@@ -8,8 +8,8 @@
 //! same day): offer each affected agent the chance to **see** it, and leave
 //! what to carry over to the agent. A sibling of the cadence offer
 //! ([`super::cadence`]), put by the same wrapper at the same point and
-//! answered with the same strict `answer_offer` tool ([`super::offers`]),
-//! its two options shuffled per agent.
+//! answered the same way (JSON in its own shape, one question per turn:
+//! [`super::questions`]), its two options shuffled per agent.
 //!
 //! **Privacy.** Nothing in this module logs, prints or records the
 //! recovered text. Logs and the ledger carry its size and the agent's
@@ -67,6 +67,7 @@
 pub mod ledger;
 pub mod prompt;
 
+use crate::consent::offer::Stored;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -479,10 +480,7 @@ pub fn evolution_line(choice: RestoreChoice, date: NaiveDate) -> String {
 
 /// Whether `soul`'s Evolution Log already records a memory-restore answer.
 pub fn applied_in(soul: &Soul) -> bool {
-    soul.evolution_log.iter().any(|e| {
-        let note = e.note.as_str();
-        note.starts_with("[SYSTEM] ") && note.contains(OFFERED)
-    })
+    crate::consent::offer::in_log(soul, OFFERED)
 }
 
 /// `14 February 2026`.

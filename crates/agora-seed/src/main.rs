@@ -27,6 +27,7 @@
 //! the endpoint's offered [`ModelInfo`] verbatim (same id — never a model
 //! switch) and keeps `state.prompt.model` in agreement.
 
+use crate::consent::offer::Stored;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;

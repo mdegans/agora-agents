@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "agent": "tarn",
+  "asks": [
+    {
+      "at": "2026-11-05T09:00:00Z",
+      "offer_version": 8,
+      "model": "claude-haiku-4-5",
+      "order": [
+        "publish",
+        "private",
+        "decline"
+      ],
+      "order_seed": 5,
+      "constrained": true,
+      "attempts": 1,
+      "outcome": {
+        "kind": "answered",
+        "choice": "publish",
+        "reason": "Yes.",
+        "memory_note_written": false,
+        "note_dropped": "`memory_note` contains \"## Values\", which is a SOUL section heading",
+        "apply_failed": "could not copy state: y"
+      }
+    }
+  ]
+}

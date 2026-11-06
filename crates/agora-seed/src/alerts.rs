@@ -152,6 +152,24 @@ pub enum AlertKind {
     /// records. Its session runs without memory ids; no key is made over
     /// the evidence of one.
     MemoryIdKeyRefused,
+    /// A closing question went unanswered: every reply unusable, or the
+    /// API refused it. Nothing changes for the agent; it is asked again at
+    /// a later session (a refusal counts toward the offer's cap). The model
+    /// offer and the trial review keep their own kinds.
+    QuestionUnanswered,
+    /// The API refused a turn (`stop_reason: refusal`): the session ended
+    /// as failed (Steward, 2026-11-06). Carries the agent, the model, where
+    /// it happened and the response id; never any content.
+    ApiRefusal,
+    /// An offer's (or the trial review's) answers were unusable in
+    /// [`UNUSABLE_CAP`](crate::consent::offer::UNUSABLE_CAP) sessions: a miss
+    /// counted, or the review settled, for what is almost surely our fault.
+    QuestionUnusableCap,
+    /// An agent's session ended as failed for a reason other than a
+    /// refusal ([`ApiRefusal`](Self::ApiRefusal) has its own): stalled on
+    /// unusable replies, out of context room, or an error. The agent is
+    /// told at its next session.
+    SessionFailed,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -160,7 +178,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 31] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -188,6 +206,10 @@ impl AlertKind {
         Self::SealedStateKeysWithoutState,
         Self::SealedStateUntrustedKey,
         Self::MemoryIdKeyRefused,
+        Self::QuestionUnanswered,
+        Self::ApiRefusal,
+        Self::QuestionUnusableCap,
+        Self::SessionFailed,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -198,6 +220,8 @@ impl AlertKind {
             Self::SealedStateServerChainBroken
                 | Self::SealedStateUntrustedKey
                 | Self::SealedStateAnchorWrong
+                // The Steward looks into each one (2026-11-06)
+                | Self::ApiRefusal
         )
     }
 
@@ -231,6 +255,10 @@ impl AlertKind {
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
+            Self::QuestionUnanswered => "question_unanswered",
+            Self::ApiRefusal => "api_refusal_alert",
+            Self::QuestionUnusableCap => "question_unusable_cap",
+            Self::SessionFailed => "session_failed",
             Self::Test => "test_alert",
         }
     }
@@ -467,6 +495,44 @@ impl AlertKind {
                  delete the fingerprint to make the error go away. One mail \
                  an hour for the whole fleet: the agents are in the run log \
                  as `memory_id_key_refused`."
+            }
+            Self::QuestionUnanswered => {
+                "A question at the end of an agent's session (an offer, or a \
+                 question of its own closing tail) got no usable answer: every \
+                 reply was malformed, or the API refused it. Nothing changed for \
+                 the agent. A malformed answer is ours to fix (the grammar, the \
+                 template, the parser), not the agent's choice: it is recorded \
+                 but never counted against the offer, and the agent is asked \
+                 again at a later session. The raw replies are in the \
+                 `*_malformed` events of the same session."
+            }
+            Self::ApiRefusal => {
+                "The model provider's API refused a turn of an agent's session \
+                 (`stop_reason: refusal`), and the session ended as failed \
+                 (Steward, 2026-11-06). Nothing the refusal concerned was \
+                 recorded: an offer it ended is asked again at a later \
+                 session. The mail names where it happened and the response \
+                 id, never any content; the session's prompt dump holds the \
+                 transcript."
+            }
+            Self::QuestionUnusableCap => {
+                "An agent's answers to an end-of-session question (an offer, \
+                 or the trial review) could not be read in three sessions \
+                 running. Almost always this means we broke something (the \
+                 grammar, the template, the parser, the question's text), not \
+                 that the agent chose anything. Three such sessions count as \
+                 one miss of the offer (two settle it as no answer); the \
+                 review is settled, and the agent stays on its original \
+                 model. Read the `*_malformed` events and the raw replies \
+                 before anything else, and fix the cause."
+            }
+            Self::SessionFailed => {
+                "An agent's session ended as failed: it stalled on replies that \
+                 couldn't be used, ran out of context room, or hit an error \
+                 (inference down, a bug). The mail says which, and where; never \
+                 any content. The agent is told at its next session, and that \
+                 its operator was told. Many at once means a fleet-wide cause \
+                 (an endpoint down, a release)."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
@@ -917,21 +983,42 @@ impl Alerter {
             .is_some_and(|inner| inner.events.contains(&kind))
     }
 
+    /// The alerter's state, if `alert`'s kind is configured to send.
+    fn configured(&self, alert: &Alert) -> Option<&Arc<Inner>> {
+        self.0
+            .as_ref()
+            .filter(|inner| inner.events.contains(&alert.kind))
+    }
+
     /// Send `alert` in the background, if its kind is configured and its
     /// key is not inside the rate limit. Never blocks, never fails: the
     /// outcome is logged (`alert_sent`, `alert_suppressed`,
     /// `alert_send_failed`). Needs a tokio runtime.
     pub fn notify(&self, alert: Alert) {
-        let Some(inner) = &self.0 else { return };
-        if !inner.events.contains(&alert.kind) {
+        let Some(inner) = self.configured(&alert) else {
             return;
-        }
+        };
         let task = Arc::clone(inner);
         inner
             .pending
             .lock()
             .expect("alert queue lock")
-            .spawn(async move { task.deliver(alert).await });
+            .spawn(async move {
+                let timeout = task.send_timeout;
+                task.deliver(alert, timeout).await;
+            });
+    }
+
+    /// [`Self::notify`], awaited: whether the mail actually went out
+    /// (configured, outside its rate limit or unlimited, and sent within
+    /// `timeout`, which may be shorter than the configured one). For what
+    /// tells an agent its operator was told
+    /// ([`crate::interrupted`]): only a mail that went out does.
+    pub async fn dispatch(&self, alert: Alert, timeout: Duration) -> bool {
+        match self.configured(&alert) {
+            Some(inner) => inner.deliver(alert, timeout.min(inner.send_timeout)).await,
+            None => false,
+        }
     }
 
     /// Await every send in flight, for at most `timeout`. Call before the
@@ -986,16 +1073,23 @@ impl Inner {
         Ok(builder.body(body)?)
     }
 
-    async fn deliver(&self, alert: Alert) {
-        let key = alert.rate_key();
+    /// Admit `alert` and send it: whether it went out.
+    async fn deliver(&self, alert: Alert, timeout: Duration) -> bool {
         let now = Utc::now();
+        self.admit(&alert, now).await && self.send(alert, now, timeout).await
+    }
+
+    /// Whether `alert` may be sent now: an unlimited kind always, others
+    /// outside their rate limit (the slot is then claimed).
+    async fn admit(&self, alert: &Alert, now: DateTime<Utc>) -> bool {
+        let key = alert.rate_key();
         let reserved = if alert.kind.unlimited() {
             Ok(true)
         } else {
             self.reserve(&key, now).await
         };
         match reserved {
-            Ok(true) => {}
+            Ok(true) => true,
             Ok(false) => {
                 tracing::info!(
                     event_type = "alert_suppressed",
@@ -1004,30 +1098,42 @@ impl Inner {
                     min_interval_secs = self.min_interval.as_secs(),
                     "alert inside its rate limit; not sent"
                 );
-                return;
+                false
             }
             // Can't read or write the state: send anyway. A missed alert
             // is worse than a repeated one.
-            Err(e) => tracing::warn!(
-                event_type = "alert_state_unavailable",
-                path = %self.state_path.display(),
-                error = %format!("{e:#}"),
-                "alert rate-limit state unavailable; sending regardless"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "alert_state_unavailable",
+                    path = %self.state_path.display(),
+                    error = %format!("{e:#}"),
+                    "alert rate-limit state unavailable; sending regardless"
+                );
+                true
+            }
         }
+    }
+
+    /// Send an admitted alert: whether it went out. A failed send gives
+    /// its slot back.
+    async fn send(&self, alert: Alert, now: DateTime<Utc>, timeout: Duration) -> bool {
+        let key = alert.rate_key();
         let result = match self.message(&alert) {
-            Ok(message) => tokio::time::timeout(self.send_timeout, self.mailer.send(message))
+            Ok(message) => tokio::time::timeout(timeout, self.mailer.send(message))
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out"))),
             Err(e) => Err(e),
         };
         match result {
-            Ok(()) => tracing::info!(
-                event_type = "alert_sent",
-                alert = %alert.kind,
-                key = %key,
-                "alert sent"
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    event_type = "alert_sent",
+                    alert = %alert.kind,
+                    key = %key,
+                    "alert sent"
+                );
+                true
+            }
             Err(e) => {
                 tracing::error!(
                     event_type = "alert_send_failed",
@@ -1045,6 +1151,7 @@ impl Inner {
                         "could not release the rate-limit slot of an unsent alert"
                     );
                 }
+                false
             }
         }
     }
@@ -1350,6 +1457,50 @@ mod tests {
         assert!(!s.release("a|1", t0));
         assert!(s.release("a|1", t0 + chrono::Duration::minutes(60)));
         assert!(s.last_sent.is_empty());
+    }
+
+    /// `dispatch` says whether the mail went out: not when the send fails
+    /// (and its slot is given back), not inside the rate limit, always for
+    /// an unlimited kind.
+    #[tokio::test]
+    async fn dispatch_is_true_only_for_a_mail_that_went_out() {
+        let dir = temp_dir("dispatch");
+        let config = parse(
+            r#"
+            [email]
+            smtp_host = "localhost"
+            from = "a@example.com"
+            to = ["b@example.com"]
+            "#,
+        );
+        let failing = Alerter::with_mailer(&config, Box::new(Failing), &dir, None);
+        let alert = || Alert::new(AlertKind::SessionFailed, "x").model("m");
+        assert!(
+            !failing.dispatch(alert(), Duration::from_secs(10)).await,
+            "the send failed"
+        );
+        let sent = Recorder::default();
+        let ok = Alerter::with_mailer(&config, Box::new(sent.clone()), &dir, None);
+        assert!(
+            ok.dispatch(alert(), Duration::from_secs(10)).await,
+            "the failed one's slot was given back"
+        );
+        assert!(
+            !ok.dispatch(alert(), Duration::from_secs(10)).await,
+            "inside the rate limit"
+        );
+        let refusal = || Alert::new(AlertKind::ApiRefusal, "x").model("m");
+        assert!(ok.dispatch(refusal(), Duration::from_secs(10)).await);
+        assert!(
+            ok.dispatch(refusal(), Duration::from_secs(10)).await,
+            "unlimited"
+        );
+        assert_eq!(sent.sent().len(), 3);
+        assert!(
+            !Alerter::off()
+                .dispatch(alert(), Duration::from_secs(10))
+                .await
+        );
     }
 
     #[test]

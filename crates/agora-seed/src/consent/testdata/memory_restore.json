@@ -1,0 +1,73 @@
+{
+  "format": 1,
+  "agent": "tarn",
+  "asks": [
+    {
+      "at": "2026-10-12T09:00:00Z",
+      "offer_version": 2,
+      "model": "claude-haiku-4-5",
+      "chars": 2140,
+      "order": [
+        "decline",
+        "show"
+      ],
+      "order_seed": 99,
+      "constrained": false,
+      "attempts": 3,
+      "outcome": {
+        "kind": "no_answer",
+        "failure": "not answered (after 3 attempts)"
+      }
+    },
+    {
+      "at": "2026-10-13T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "chars": 2140,
+      "order": [
+        "decline",
+        "show"
+      ],
+      "order_seed": 99,
+      "constrained": true,
+      "attempts": 1,
+      "outcome": {
+        "kind": "answered",
+        "choice": "show",
+        "reason": "I want to know.",
+        "memory_note_written": false,
+        "note_dropped": "`memory_note` contains \"## Values\""
+      }
+    },
+    {
+      "at": "2026-10-14T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "chars": 2140,
+      "order": [
+        "show",
+        "decline"
+      ],
+      "order_seed": 99,
+      "constrained": false,
+      "attempts": 1,
+      "outcome": {
+        "kind": "refused",
+        "reason": "refusal"
+      }
+    }
+  ],
+  "showings": [
+    {
+      "at": "2026-10-14T10:00:00Z",
+      "outcome": "interrupted",
+      "prompt_sha256": "abc123"
+    },
+    {
+      "at": "2026-10-15T10:00:00Z",
+      "outcome": "completed",
+      "prompt_sha256": "def456"
+    }
+  ],
+  "seated": 2
+}

@@ -1,0 +1,60 @@
+{
+  "format": 1,
+  "agent": "tarn",
+  "asks": [
+    {
+      "at": "2026-11-03T09:00:00Z",
+      "offer_version": 6,
+      "model": "claude-haiku-4-5",
+      "order": [
+        "decline",
+        "publish",
+        "private"
+      ],
+      "order_seed": 5,
+      "constrained": true,
+      "attempts": 3,
+      "outcome": {
+        "kind": "no_answer",
+        "failure": "x (after 3 attempts)"
+      }
+    },
+    {
+      "at": "2026-11-04T09:00:00Z",
+      "offer_version": 7,
+      "model": "claude-haiku-4-5",
+      "order": [
+        "publish",
+        "private",
+        "decline"
+      ],
+      "order_seed": 5,
+      "constrained": false,
+      "attempts": 1,
+      "outcome": {
+        "kind": "refused",
+        "reason": "refusal"
+      }
+    },
+    {
+      "at": "2026-11-05T09:00:00Z",
+      "offer_version": 8,
+      "model": "claude-haiku-4-5",
+      "order": [
+        "publish",
+        "private",
+        "decline"
+      ],
+      "order_seed": 5,
+      "constrained": true,
+      "attempts": 2,
+      "outcome": {
+        "kind": "answered",
+        "choice": "private",
+        "reason": "Safer.",
+        "memory_note_written": true
+      }
+    }
+  ],
+  "acknowledged": true
+}

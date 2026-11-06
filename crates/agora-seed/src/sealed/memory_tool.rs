@@ -47,7 +47,7 @@ use super::keys::MemoryIdKeys;
 
 /// What the runner needs of a session's agent for the `memory` tool: its
 /// memory id, set from the key before `on_init`, and the gauge its results
-/// are counted against. As [`crate::consent::agent::ContactRequests`] is
+/// are counted against. As [`crate::consent::agent::InnerSession`] is
 /// for the contact request.
 pub trait MemoryIds {
     /// Name the session's memory by its id under `key`, so its heading

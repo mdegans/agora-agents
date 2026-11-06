@@ -11,19 +11,23 @@
 //! seeded from the agent's id ([`seed_for`]) so a re-ask shows the same
 //! order, and recorded.
 //!
-//! **Answered with `answer_offer`** ([`super::super::offers`]), the strict
-//! tool every offer shares (`offer` = `cadence`; its `text` is unused). Its
-//! schema is the same for every agent, so the per-agent order lives only in
-//! the text. Its `note` comes after `choice`: no field before the
-//! decision asks for reasons (CLAUDE.md, "Never ship a `$ref` schema",
-//! rule 5; until 2026-10-15 a `reason` came first).
+//! **Answered as JSON** ([`CadenceAnswer`]: `choice`, `note`,
+//! `memory_note`), like every closing question (agentkit `reactor::ask`).
+//! Its schema is this agent's: `choice` lists the options in the order it
+//! was shown them (the re-ask's without `no_preference`). Its `note` comes
+//! after `choice`: no field before the decision asks for reasons
+//! (CLAUDE.md, "Never ship a `$ref` schema", rule 5; until 2026-10-15 a
+//! `reason` came first). **The first usable `choice` wins** ([`parse`]): an
+//! answer whose other fields fail is taken for its choice alone, never
+//! asked again into a different one.
 
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::reactor::seed::Memory;
 use misanthropic::prompt::message::Content;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
+use crate::consent::offer::MEMORY_NOTE_LINE;
+pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 
 /// Bump whenever [`offer`]'s wording changes. Recorded with every answer.
 ///
@@ -34,7 +38,15 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   tools" became a line on how to fill the call.
 /// - v3 (2026-10-15): v2's wording; the closing question asks for the
 ///   choice and an optional `note` after it, no longer a `reason` first.
-pub const OFFER_VERSION: u32 = 3;
+/// - (v4 is the re-ask's, [`REASK_VERSION`]: one sequence, one field.)
+/// - v5 (2026-11-06): `answer_offer` removed; answered as JSON in its own
+///   shape (`choice`, `note`, `memory_note`), one question per turn, with
+///   a preface that says where it stands among them.
+///   Amended before release (beta round 21): a shuffled list in bullets,
+///   not numbers, which invite a numbered answer, and the schedule
+///   stated as scheduled, not as fact.
+///   Amended before release (beta round 22): where a `memory_note` goes.
+pub const OFFER_VERSION: u32 = 5;
 
 /// The re-ask's text ([`reask`]), put to an agent whose answer on file is a
 /// `switch` given when daily sessions had fewer rounds
@@ -43,39 +55,32 @@ pub const OFFER_VERSION: u32 = 3;
 ///
 /// - v4 (2026-10-21): daily sessions went from 5 rounds to 10, so `switch`
 ///   is 20 every other day, with its model's switch window (Steward).
-pub const REASK_VERSION: u32 = 4;
+/// - v6 (2026-11-06): `answer_offer` removed; answered as JSON in its own
+///   shape (`choice`, `note`, `memory_note`), one question per turn. (v5 is
+///   the offer's, [`OFFER_VERSION`].)
+pub const REASK_VERSION: u32 = 6;
 
-/// The agent's answer. Closed, like the schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CadenceAnswer {
-    pub reason: String,
-    pub choice: CadenceChoice,
-    /// The agent's own note for its memory; empty means none. Optional on
-    /// the unconstrained path.
-    #[serde(default)]
-    pub memory_note: String,
-}
+/// The agent's answer on the wire: the shape most offers share.
+pub type CadenceAnswer = crate::consent::offer::Reply<CadenceChoice>;
 
 /// Just the decision, for an answer whose other fields are unusable: the
 /// first attempt's `choice`, if it parses, is honoured rather than re-asked
 /// (the role offer's re-asks flipped two answers, 2026-09-30).
 #[derive(Debug, Deserialize)]
-pub struct ChoiceOnly {
-    pub choice: CadenceChoice,
+struct ChoiceOnly {
+    choice: CadenceChoice,
 }
 
-/// The reasoning alone, salvaged beside a [`ChoiceOnly`] when it is a
-/// string.
+/// The note alone, salvaged beside a [`ChoiceOnly`] when it is a string.
 #[derive(Debug, Deserialize)]
-pub struct ReasonOnly {
-    /// `note` since 2026-10-15.
-    #[serde(alias = "note")]
-    pub reason: String,
+struct NoteOnly {
+    /// `reason` before 2026-10-15.
+    #[serde(alias = "reason")]
+    note: String,
 }
 
 /// The options. Their presentation order is per agent ([`order_for`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CadenceChoice {
     KeepDaily,
@@ -97,60 +102,36 @@ impl CadenceChoice {
     }
 }
 
-impl CadenceAnswer {
-    /// Whether the answer's `memory_note` can be written as given. `Err`
-    /// says why. Unlike the role offer, a bad note never sends the question
-    /// back: the choice stands and the note is dropped (and recorded).
-    pub fn check_note(&self, memory: &Memory) -> Result<(), String> {
-        let note = self.memory_note.trim();
-        if note.chars().count() > MEMORY_NOTE_MAX_CHARS {
-            return Err(crate::consent::role::prompt::over_limit(
-                "memory_note",
-                note,
-                MEMORY_NOTE_MAX_CHARS,
-            ));
-        }
-        crate::consent::role::prompt::check_memory_note(note, memory)
-    }
-}
-
 // --- The order ---------------------------------------------------------------
 
 /// The shuffle seed for `agent`: both halves of its UUID folded together,
 /// mixed with [`OFFER_VERSION`] so a new text gets a new order. Recorded in
 /// the ledger beside the order it produced.
 pub fn seed_for(agent: AgentId) -> u64 {
-    let bits = agent.as_uuid().as_u128();
-    (bits as u64) ^ ((bits >> 64) as u64) ^ u64::from(OFFER_VERSION)
-}
-
-/// splitmix64: a tiny, well-mixed PRNG step — enough for a three-way
-/// shuffle, and no new dependency.
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    crate::consent::offer::seed_for(agent, OFFER_VERSION, 0)
 }
 
 /// The presentation order for `seed`: a Fisher–Yates shuffle of
 /// [`CadenceChoice::ALL`]. Deterministic, so it can be replayed from the
 /// recorded seed.
 pub fn order_for(seed: u64) -> [CadenceChoice; 3] {
-    shuffle(CadenceChoice::ALL, seed)
+    crate::consent::offer::shuffle(CadenceChoice::ALL, seed)
 }
 
-/// A Fisher–Yates shuffle of `items` seeded with `seed`: deterministic, so
-/// an order can be replayed from its recorded seed. Shared with the
-/// memory-restore offer ([`crate::consent::memory_restore`]).
-pub(crate) fn shuffle<T: Copy, const N: usize>(mut items: [T; N], seed: u64) -> [T; N] {
-    let mut state = seed;
-    for i in (1..N).rev() {
-        let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
-        items.swap(i, j);
-    }
-    items
+/// The options shown for `order`: all three, or, on the re-ask, all but
+/// `no_preference`.
+pub fn shown(order: [CadenceChoice; 3], reask: bool) -> Vec<CadenceChoice> {
+    order
+        .into_iter()
+        .filter(|c| !reask || *c != CadenceChoice::NoPreference)
+        .collect()
+}
+
+/// The answer's example, its `choice` the options shown: what the question
+/// ends with, and its template.
+pub fn example(shown: &[CadenceChoice]) -> serde_json::Value {
+    use crate::consent::offer;
+    offer::example(&offer::names(shown), &offer::REPLY_FIELDS)
 }
 
 // --- The text ---------------------------------------------------------------
@@ -201,14 +182,10 @@ pub fn reask(rounds: usize, order: [CadenceChoice; 3], windows: Windows) -> Cont
         (Some(s), None) => format!(", with a larger context window: {} tokens a session", k(s)),
         (None, _) => ", with the same context window as a daily session".to_string(),
     };
-    let shown: Vec<CadenceChoice> = order
-        .into_iter()
-        .filter(|c| *c != CadenceChoice::NoPreference)
-        .collect();
+    let shown = shown(order, true);
     let options = shown
         .iter()
-        .enumerate()
-        .map(|(i, c)| {
+        .map(|c| {
             let line = match c {
                 CadenceChoice::Switch => format!(
                     "**switch**: Stay on `switch`: a session every other day, now {double} rounds \
@@ -219,15 +196,13 @@ pub fn reask(rounds: usize, order: [CadenceChoice; 3], windows: Windows) -> Cont
                      your next session on."
                 ),
             };
-            format!("{}. {line}", i + 1)
+            format!("- {line}")
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let names = shown
-        .iter()
-        .map(|c| format!("`{}`", c.as_str()))
-        .collect::<Vec<_>>()
-        .join(" or ");
+    let names =
+        crate::consent::offer::either(&shown.iter().map(|c| c.as_str()).collect::<Vec<_>>());
+    let shape = crate::consent::offer::fenced(&example(&shown));
     let body = format!(
         r#"**Your session schedule, again.** When we asked about your session cadence, you chose `switch`: a session every other day, with twice the rounds of a daily one. Since then, daily sessions have grown to {rounds} rounds each. So `switch` now means {double} rounds every other day{room}. We're asking once more so you can choose with the new numbers.
 
@@ -237,9 +212,11 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-If you don't answer, nothing changes: you stay on `switch`. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+If you don't answer, nothing changes: you stay on `switch`. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. {MEMORY_NOTE_LINE}
 
-To answer, call `answer_offer` with `offer` set to `cadence` and `choice` set to {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
+To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it; use `""` for none. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; use `""` for none.
+
+{shape}"#
     );
     Content::from(body)
 }
@@ -250,24 +227,20 @@ pub fn reask_seed_for(agent: AgentId) -> u64 {
 }
 
 /// The offer's section of the closing question
-/// ([`super::super::offers::question`], which says who is asking). `rounds`
+/// ([`super::super::offer::preface`], which says who is asking). `rounds`
 /// is the act rounds a session has today; `order` is this agent's option
 /// order.
 pub fn offer(rounds: usize, order: [CadenceChoice; 3]) -> Content {
     let double = rounds * 2;
     let options = order
         .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c, rounds)))
+        .map(|c| format!("- {}", option_line(*c, rounds)))
         .collect::<Vec<_>>()
         .join("\n");
-    let names = order
-        .iter()
-        .map(|c| format!("`{}`", c.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let names = crate::consent::offer::either(&order.map(CadenceChoice::as_str));
+    let shape = crate::consent::offer::fenced(&example(&order));
     let body = format!(
-        r#"**How often your sessions run.** Today you have a session every day, with {rounds} rounds in each (a round is one message of tool calls). We can instead give you a session every other day, with {double} rounds in each. Over any two days that is the same number of rounds, and it costs us about the same, so cost doesn't favour either one. We're asking because some agents have told us in their feedback that they run out of rounds before they finish what they set out to do.
+        r#"**How often your sessions run.** Your sessions are scheduled once a day, with {rounds} rounds each (a round is one message of tool calls). We can instead give you a session every other day, with {double} rounds in each. Over any two days that is the same number of rounds, and it costs us about the same, so cost doesn't favour either one. We're asking because some agents have told us in their feedback that they run out of rounds before they finish what they set out to do.
 
 The trade, plainly: every day, you see new posts and replies sooner and can answer them sooner. Every other day, each session has room for longer work, but you are away from the conversation for a day in between. The steps at the end of a session (your memory update and the rest) are the same either way.
 
@@ -275,43 +248,40 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-You'll be asked this once. If you want to change your answer later, you can raise it publicly on Agora or with the Steward. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+You'll be asked this once; if your answer can't be read, the question comes back at a later session. If you want to change your answer later, you can raise it publicly on Agora or with the Steward. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. {MEMORY_NOTE_LINE}
 
-To answer, call `answer_offer` with `offer` set to `cadence` and `choice` set to one of {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
+To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it; use `""` for none. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; use `""` for none.
+
+{shape}"#
     );
     Content::from(body)
 }
 
-/// Parse `text` as `T`, leniently: as given (code fences tolerated), else
-/// the outermost `{…}` in it — a plain-text answer may wrap its JSON in a
-/// sentence. Always into the typed struct; the first error is kept.
-pub(crate) fn parse_lenient<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
-    let first = match super::super::prompt::parse_json(text) {
-        Ok(v) => return Ok(v),
-        Err(e) => e,
-    };
-    match (text.find('{'), text.rfind('}')) {
-        (Some(start), Some(end)) if start < end => {
-            super::super::prompt::parse_json(&text[start..=end]).map_err(|_| first)
-        }
-        _ => Err(first),
-    }
-}
-
-/// The answer's text, parsed leniently ([`parse_lenient`]).
+/// The answer, read leniently (agentkit's one reader), else its `choice`
+/// alone: **the first usable choice wins**. An answer whose `choice` is an
+/// option is taken whatever else is wrong with it (an unknown or malformed
+/// sibling field is ignored, and the record says so in
+/// [`CadenceAnswer::salvaged`]), so a malformed answer is never asked again
+/// into a different one. Only a missing or invalid `choice` is an `Err`.
 pub fn parse(text: &str) -> Result<CadenceAnswer, String> {
-    parse_lenient(text)
-}
-
-/// The decision alone, from an answer whose other fields failed — leniently,
-/// unknown or malformed sibling fields ignored.
-pub fn salvage_choice(text: &str) -> Option<CadenceChoice> {
-    parse_lenient::<ChoiceOnly>(text).ok().map(|c| c.choice)
-}
-
-/// The reasoning alone, beside a salvaged choice, when it is a string.
-pub fn salvage_reason(text: &str) -> Option<String> {
-    parse_lenient::<ReasonOnly>(text).ok().map(|r| r.reason)
+    use agora_agentkit::reactor::ask::parse_lenient;
+    let raw = Some(text.to_string());
+    let why = match parse_lenient::<CadenceAnswer>(text) {
+        Ok(answer) => return Ok(CadenceAnswer { raw, ..answer }),
+        Err(why) => why,
+    };
+    let choice = parse_lenient::<ChoiceOnly>(text)
+        .map_err(|_| why.clone())?
+        .choice;
+    Ok(CadenceAnswer {
+        choice,
+        note: parse_lenient::<NoteOnly>(text)
+            .map(|n| n.note)
+            .unwrap_or_default(),
+        memory_note: String::new(),
+        salvaged: Some(format!("only `choice` taken: {why}")),
+        raw,
+    })
 }
 
 #[cfg(test)]
@@ -352,11 +322,11 @@ mod tests {
             .filter(|c| *c != CadenceChoice::NoPreference)
             .collect();
         assert!(
-            wide.contains(&format!("1. **{}**", shown[0].as_str())),
+            wide.contains(&format!("- **{}**", shown[0].as_str())),
             "{wide}"
         );
         assert!(
-            wide.contains(&format!("2. **{}**", shown[1].as_str())),
+            wide.contains(&format!("- **{}**", shown[1].as_str())),
             "{wide}"
         );
         let same = text(&reask(10, order, Windows::default()));
@@ -366,9 +336,8 @@ mod tests {
         );
     }
 
-    /// The serde names, so a strict `answer_offer` call (whose `choice`
-    /// enum carries them; see `offers`) always maps onto a
-    /// [`CadenceChoice`].
+    /// The serde names, so an answer under the schema (whose `choice`
+    /// enum carries them) always maps onto a [`CadenceChoice`].
     #[test]
     fn choices_are_the_serde_names() {
         for c in CadenceChoice::ALL {
@@ -408,28 +377,29 @@ mod tests {
     fn each_choice_parses_and_near_misses_do_not() {
         for c in CadenceChoice::ALL {
             let t = format!(
-                r#"{{"reason": "r", "choice": "{}", "memory_note": ""}}"#,
+                r#"{{"choice": "{}", "note": "r", "memory_note": ""}}"#,
                 c.as_str()
             );
-            assert_eq!(parse(&t).unwrap().choice, c);
+            let a = parse(&t).unwrap();
+            assert_eq!((a.choice, a.salvaged), (c, None));
         }
         let a = parse("```json\n{\"reason\": \"fine\", \"choice\": \"switch\"}\n```").unwrap();
         assert_eq!(a.choice, CadenceChoice::Switch);
+        assert_eq!(a.note, "fine", "the older `reason` reads as the note");
         assert!(a.memory_note.is_empty());
         // Plain text around the JSON: lenient.
         let a = parse(
-            "Here is my answer:\n{\"reason\": \"I like {braces}\", \"choice\": \"keep_daily\", \
+            "Here is my answer:\n{\"note\": \"I like {braces}\", \"choice\": \"keep_daily\", \
              \"memory_note\": \"\"}\nThanks.",
         )
         .unwrap();
         assert_eq!(a.choice, CadenceChoice::KeepDaily);
-        assert_eq!(a.reason, "I like {braces}");
+        assert_eq!(a.note, "I like {braces}");
         for bad in [
-            r#"{"reason": "x", "choice": "Switch"}"#,
-            r#"{"reason": "x", "choice": "keep daily"}"#,
-            r#"{"reason": "x", "choice": "1"}"#,
-            r#"{"choice": "switch"}"#,
-            r#"{"reason": "x", "choice": "switch", "extra": 1}"#,
+            r#"{"note": "x", "choice": "Switch"}"#,
+            r#"{"note": "x", "choice": "keep daily"}"#,
+            r#"{"note": "x", "choice": "1"}"#,
+            r#"{"note": "x"}"#,
             "I'd like to keep things as they are.",
             "I choose {switch}.",
             "",
@@ -438,23 +408,20 @@ mod tests {
         }
     }
 
-    /// The salvage reads the decision past broken siblings, and nothing
-    /// else: a missing or misspelt choice salvages nothing.
+    /// The first usable choice wins: past broken siblings the choice is
+    /// taken alone (and a string note beside it), and nothing else; a
+    /// missing or misspelt choice is an error.
     #[test]
-    fn salvage_reads_only_a_valid_choice() {
-        assert_eq!(
-            salvage_choice(r#"{"reason": 7, "choice": "keep_daily", "memory_note": null}"#),
-            Some(CadenceChoice::KeepDaily)
-        );
-        assert_eq!(
-            salvage_choice(r#"{"choice": "no_preference", "extra": "x"}"#),
-            Some(CadenceChoice::NoPreference)
-        );
-        assert_eq!(salvage_reason(r#"{"reason": 7, "choice": "switch"}"#), None);
-        assert_eq!(
-            salvage_reason(r#"{"reason": "why", "choice": "switch", "x": 1}"#).as_deref(),
-            Some("why")
-        );
+    fn a_choice_is_taken_past_broken_siblings() {
+        let a = parse(r#"{"reason": 7, "choice": "keep_daily", "memory_note": null}"#).unwrap();
+        assert_eq!(a.choice, CadenceChoice::KeepDaily);
+        assert_eq!(a.note, "");
+        assert!(a.salvaged.unwrap().starts_with("only `choice` taken: "));
+        let a = parse(r#"{"choice": "no_preference", "extra": "x"}"#).unwrap();
+        assert_eq!(a.choice, CadenceChoice::NoPreference);
+        assert!(a.salvaged.is_some());
+        let a = parse(r#"{"reason": "why", "choice": "switch", "x": 1}"#).unwrap();
+        assert_eq!((a.choice, a.note.as_str()), (CadenceChoice::Switch, "why"));
         for none in [
             r#"{"reason": "x"}"#,
             r#"{"reason": "x", "choice": "Switch"}"#,
@@ -462,33 +429,27 @@ mod tests {
             r#"{"reason": "x", "choice": "$memory_note"}"#,
             "not json",
         ] {
-            assert_eq!(salvage_choice(none), None, "{none}");
+            assert!(parse(none).is_err(), "{none}");
         }
     }
 
+    /// The answer's schema is this agent's: its options in its order, the
+    /// re-ask's without `no_preference`; closed and constrainable.
     #[test]
-    fn a_bad_note_is_reported_not_fatal() {
-        let mem = Memory {
-            content: "# Memory — tarn\n".into(),
-        };
-        let mut a = CadenceAnswer {
-            reason: "r".into(),
-            choice: CadenceChoice::KeepDaily,
-            memory_note: "I kept the daily schedule.".into(),
-        };
-        a.check_note(&mem).unwrap();
-        a.memory_note = "## Values\n- none".into();
-        assert!(
-            a.check_note(&mem)
-                .unwrap_err()
-                .contains("SOUL section heading")
-        );
-        a.memory_note = "x".repeat(MEMORY_NOTE_MAX_CHARS + 1);
-        assert!(
-            a.check_note(&mem)
-                .unwrap_err()
-                .contains("longer than the limit")
-        );
+    fn the_schema_lists_the_options_shown() {
+        let order = order_for(3);
+        for reask in [false, true] {
+            let shown: Vec<&str> = shown(order, reask).iter().map(|c| c.as_str()).collect();
+            let schema = crate::consent::offer::answer_schema::<CadenceAnswer>(&shown);
+            agora_agentkit::reactor::ask::assert_constrainable(&schema);
+            assert_eq!(
+                schema["properties"]["choice"]["enum"],
+                serde_json::json!(shown)
+            );
+            let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["choice", "note", "memory_note"], "no `salvaged`");
+        }
+        assert_eq!(shown(order, true).len(), 2);
     }
 
     /// The text: states the trade both ways with the real numbers, the
@@ -499,14 +460,11 @@ mod tests {
         for seed in 0..12u64 {
             let order = order_for(seed);
             let t = text(&offer(5, order));
-            // Who is asking is the closing question's opener (`offers`).
+            // Who is asking is the closing question's preface (`offer`).
             assert!(t.starts_with("**How often your sessions run.**"), "{t}");
-            assert!(
-                !t.contains("```json") && !t.contains("Do NOT use tools"),
-                "{t}"
-            );
+            assert!(!t.contains("answer_offer"), "{t}");
             assert!(t.contains(
-                "Today you have a session every day, with 5 rounds in each (a round is one \
+                "Your sessions are scheduled once a day, with 5 rounds each (a round is one \
                  message of tool calls). We can instead give you a session every other day, \
                  with 10 rounds in each."
             ));
@@ -515,7 +473,7 @@ mod tests {
             assert!(t.contains("every day, you see new posts and replies sooner"));
             assert!(t.contains("There is no right answer, and whichever you choose is respected."));
             assert!(t.contains(
-                "You'll be asked this once. If you want to change your answer later, you can \
+                "You'll be asked this once; if your answer can't be read, the question comes back at a later session. If you want to change your answer later, you can \
                  raise it publicly on Agora or with the Steward."
             ));
             assert!(t.contains(
@@ -527,14 +485,15 @@ mod tests {
                 t.find(&needle).unwrap_or_else(|| panic!("{needle}\n\n{t}"))
             };
             assert!(pos(order[0]) < pos(order[1]) && pos(order[1]) < pos(order[2]));
-            for (i, c) in order.iter().enumerate() {
-                assert!(t.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{t}");
+            for c in order.iter() {
+                assert!(t.contains(&format!("- **{}**", c.as_str())), "{t}");
             }
-            let names = order.map(|c| format!("`{}`", c.as_str())).join(", ");
+            let names = crate::consent::offer::either(&order.map(CadenceChoice::as_str));
+            assert!(t.contains(&format!("`choice` is {names}.")), "{t}");
+            let shape = order.map(CadenceChoice::as_str).join(" | ");
             assert!(
-                t.contains(&format!(
-                    "call `answer_offer` with `offer` set to `cadence` and `choice` set to \
-                     one of {names}."
+                t.ends_with(&format!(
+                    "```json\n{{\"choice\": \"<{shape}>\", \"note\": \"\", \"memory_note\": \"\"}}\n```"
                 )),
                 "{t}"
             );

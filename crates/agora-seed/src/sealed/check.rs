@@ -41,7 +41,7 @@ use agora_agentkit::reactor::seed::memory::short_head;
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.156.0:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.157.0:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -18,6 +18,7 @@
 //! the truth, and it changes when the agent chooses with its own
 //! `set_model` tool.
 
+use crate::consent::offer::Stored;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -223,7 +224,7 @@ mod tests {
             },
             Utc::now(),
             Ok(OfferAnswer {
-                reason: "r".into(),
+                note: "r".into(),
                 choice,
             }),
         );

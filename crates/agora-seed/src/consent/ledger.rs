@@ -11,8 +11,6 @@
 //! tested without a model or a network; [`super::agent`] only decides
 //! *when* to call them.
 
-use std::path::{Path, PathBuf};
-
 use agora_agentkit::reactor::seed::{ITEM_MAX, ShortString, Soul};
 use chrono::{DateTime, NaiveDate, Utc};
 use misanthropic::model::Model;
@@ -23,9 +21,10 @@ use super::prompt::{OfferAnswer, OfferChoice, ReviewAnswer, ReviewChoice};
 /// The ledger's file name inside the agent's state directory.
 pub const LEDGER_FILE: &str = "model_consent.json";
 
-/// Bump on layout change; [`Ledger::load`] refuses anything newer so an old
+/// Bump on layout change (2 since 2026-11-06: answers' `note`, the
+/// `unusable` outcome); [`Ledger::load`] refuses anything newer so an old
 /// binary never half-reads (and then overwrites) a newer ledger.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 /// Sessions on the new model before a trial is reviewed.
 pub const TRIAL_SESSIONS: u32 = 5;
@@ -43,9 +42,7 @@ pub const MAX_FAILED_TRIAL_SESSIONS: u32 = 3;
 /// one the session runs on.
 pub const TRIAL_LINE_PREFIX: &str = "Model trial: ";
 
-/// Unanswered asks before the runner stops asking. The first miss is
-/// re-asked at the next eligible session; the second is final.
-pub const MAX_MISSES: u32 = 2;
+pub use super::offer::MAX_MISSES;
 
 /// An offer is identified by the model pair it moves between. Two offers
 /// for the same pair are the same question, so an agent that answered one
@@ -278,6 +275,14 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+impl Event {
+    /// Whether the agent's SOUL entry for the offer tells of it: every
+    /// event but an unusable session, which was not the agent's doing.
+    pub fn tells(&self) -> bool {
+        !matches!(self.kind, EventKind::Unusable { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventKind {
@@ -322,6 +327,19 @@ pub enum EventKind {
         name: String,
         reason: String,
     },
+    /// A session's every reply to `question` was unusable (since
+    /// 2026-11-06): almost always ours, not the agent's choice. Recorded,
+    /// and [`UNUSABLE_CAP`](super::offer::UNUSABLE_CAP) of them count as
+    /// one miss (the offer) or settle it (the review: the agent stays).
+    Unusable { question: Question, failure: String },
+}
+
+/// Which question an [`EventKind::Unusable`] was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Question {
+    Offer,
+    Review,
 }
 
 /// How a trial was decided early ([`EventKind::DecidedEarly`]).
@@ -362,31 +380,6 @@ pub enum ChangeAction {
     Keep,
 }
 
-/// A question for this session: an offer (asked at the end of a session)
-/// or a trial review (asked at the start of the session on `from` after
-/// the trial). At most one per session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Due {
-    Offer(OfferKey),
-    Review(OfferKey),
-}
-
-impl Due {
-    /// `"offer"` or `"review"`, for log fields.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Due::Offer(_) => "offer",
-            Due::Review(_) => "review",
-        }
-    }
-
-    pub fn key(&self) -> &OfferKey {
-        match self {
-            Due::Offer(key) | Due::Review(key) => key,
-        }
-    }
-}
-
 /// The offer as configured, as far as the ledger needs it.
 #[derive(Debug, Clone, Copy)]
 pub struct OfferNames<'a> {
@@ -407,55 +400,6 @@ pub struct Review<'a> {
 }
 
 impl Ledger {
-    pub fn path(agent_dir: &Path) -> PathBuf {
-        agent_dir.join(LEDGER_FILE)
-    }
-
-    /// Load `agent_dir`'s ledger; a missing file is an empty ledger. An
-    /// unreadable or too-new one is an error — the caller must not then
-    /// save over it.
-    pub async fn load(agent_dir: &Path) -> std::io::Result<Self> {
-        let path = Self::path(agent_dir);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(e) => return Err(e),
-        };
-        Self::from_slice(&bytes)
-    }
-
-    /// Parse a ledger, refusing a newer [`FORMAT`].
-    pub fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
-        let ledger: Self = serde_json::from_slice(bytes)?;
-        if ledger.format > FORMAT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "ledger format {} is newer than this binary reads ({FORMAT})",
-                    ledger.format
-                ),
-            ));
-        }
-        Ok(ledger)
-    }
-
-    /// Atomic save: tmp + fsync + rename.
-    pub async fn save(&self, agent_dir: &Path) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        tokio::fs::create_dir_all(agent_dir).await?;
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let path = Self::path(agent_dir);
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &path).await
-    }
-
     /// The latest record for `key`. A self-chosen trial
     /// ([`Self::begin_self_trial`]) always starts a record of its own, so a
     /// key can have several; only the latest can be under way.
@@ -588,15 +532,18 @@ impl Ledger {
     /// The offer to ask at the close of a completed session on `model`
     /// (call after [`count_session`](Self::count_session)), if any. Never
     /// while another offer's change or trial is under way.
-    pub fn due(&self, model: &Model, offer: Option<&OfferKey>) -> Option<Due> {
+    pub fn due(&self, model: &Model, offer: Option<&OfferKey>) -> Option<OfferKey> {
         let offer = offer?;
         if model != &offer.from || self.offers.iter().any(|r| r.stage.in_progress()) {
             return None;
         }
-        match self.record(offer).map(|r| r.stage) {
-            None => Some(Due::Offer(offer.clone())),
-            Some(Stage::Unanswered { misses }) if misses < MAX_MISSES => {
-                Some(Due::Offer(offer.clone()))
+        match self.record(offer) {
+            None => Some(offer.clone()),
+            // The stage's own count was written under the rule before
+            // 2026-11-06; it is read again: only refusals, and full caps of
+            // unusable sessions, count
+            Some(r) if matches!(r.stage, Stage::Unanswered { .. } | Stage::NoAnswer) => {
+                (r.offer_misses() < MAX_MISSES).then(|| offer.clone())
             }
             Some(_) => None,
         }
@@ -915,6 +862,97 @@ impl Ledger {
         })
     }
 
+    /// A session whose every reply to the offer was unusable: recorded, and
+    /// the stage follows the misses it now makes. Whether it completed an
+    /// [`UNUSABLE_CAP`](super::offer::UNUSABLE_CAP) (a miss counted for
+    /// replies almost surely ours to read: loud).
+    pub fn record_unusable_offer(
+        &mut self,
+        offer: OfferNames<'_>,
+        now: DateTime<Utc>,
+        failure: String,
+    ) -> bool {
+        if self.record(offer.key).is_none() {
+            self.offers.push(OfferRecord {
+                key: offer.key.clone(),
+                from_name: offer.from_name.to_string(),
+                to_name: offer.to_name.to_string(),
+                stage: Stage::Unanswered { misses: 0 },
+                history: Vec::new(),
+                soul_note: None,
+            });
+        }
+        let record = self.record_mut(offer.key).expect("inserted above");
+        if !matches!(record.stage, Stage::Unanswered { .. } | Stage::NoAnswer) {
+            return false;
+        }
+        record.history.push(Event {
+            at: now,
+            kind: EventKind::Unusable {
+                question: Question::Offer,
+                failure,
+            },
+        });
+        let misses = record.offer_misses();
+        record.stage = if misses >= MAX_MISSES {
+            Stage::NoAnswer
+        } else {
+            Stage::Unanswered { misses }
+        };
+        super::offer::at_cap(record.offer_statuses())
+    }
+
+    /// A session whose every reply to the review was unusable: recorded;
+    /// at [`UNUSABLE_CAP`](super::offer::UNUSABLE_CAP) the review is settled
+    /// as no answer (the agent stays on `from`, as its text promises).
+    /// Whether that cap was reached (loud). The count runs over the
+    /// record's whole history: one record has one review, so it is that
+    /// review's.
+    pub fn record_unusable_review(
+        &mut self,
+        key: &OfferKey,
+        now: DateTime<Utc>,
+        failure: String,
+    ) -> bool {
+        let Some(record) = self.record_mut(key) else {
+            return false;
+        };
+        if !matches!(record.stage, Stage::ReviewDue { .. }) {
+            return false;
+        }
+        record.history.push(Event {
+            at: now,
+            kind: EventKind::Unusable {
+                question: Question::Review,
+                failure: failure.clone(),
+            },
+        });
+        let unusable = record
+            .history
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Unusable {
+                        question: Question::Review,
+                        ..
+                    }
+                )
+            })
+            .count() as u32;
+        if unusable < super::offer::UNUSABLE_CAP {
+            return false;
+        }
+        self.record_review(
+            key,
+            now,
+            Err(format!(
+                "unusable in {unusable} sessions; the last: {failure}"
+            )),
+        );
+        true
+    }
+
     /// Record the trial review's outcome, asked on `from` after the
     /// trial. `revert` and no answer both leave the agent where it is, on
     /// `from` — the agent agreed to a trial, not a permanent move, so
@@ -1073,7 +1111,7 @@ impl Ledger {
     pub fn update_soul(&mut self, soul: &mut Soul, since: DateTime<Utc>, today: NaiveDate) -> bool {
         let mut changed = false;
         for record in &mut self.offers {
-            if !record.history.iter().any(|e| e.at >= since) {
+            if !record.history.iter().any(|e| e.at >= since && e.tells()) {
                 continue;
             }
             let line = format!("[SYSTEM] {}", record.summary());
@@ -1109,6 +1147,33 @@ impl Ledger {
 }
 
 impl OfferRecord {
+    /// Each unanswered ask of the offer as it reads today
+    /// ([`super::offer::legacy_no_answer`] for one recorded before
+    /// 2026-11-06).
+    fn offer_statuses(&self) -> Vec<super::offer::Status> {
+        self.history
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Offered {
+                    answer: None,
+                    failure,
+                } => Some(super::offer::legacy_no_answer(
+                    failure.as_deref().unwrap_or_default(),
+                )),
+                EventKind::Unusable {
+                    question: Question::Offer,
+                    ..
+                } => Some(super::offer::Status::Unusable),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The offer's misses as they count today.
+    pub fn offer_misses(&self) -> u32 {
+        super::offer::misses(self.offer_statuses()).unwrap_or(MAX_MISSES)
+    }
+
     /// What the agent wrote with the choice that began this trial (an
     /// answer to the offer, or a `set_model` trial), if anything: shown back
     /// to it at the trial's review, a note from its past self (Steward,
@@ -1119,7 +1184,7 @@ impl OfferRecord {
             let text = match &e.kind {
                 EventKind::Offered {
                     answer: Some(a), ..
-                } if a.choice == OfferChoice::Trial => a.reason.trim(),
+                } if a.choice == OfferChoice::Trial => a.note.trim(),
                 EventKind::SelfTrial { reason } => reason.trim(),
                 _ => return None,
             };
@@ -1270,6 +1335,8 @@ impl OfferRecord {
                 EventKind::SelfTrial { .. } => parts.push(format!(
                     "chose with set_model to try {to} for {TRIAL_SESSIONS} sessions ({on})"
                 )),
+                // Not the agent's doing: nothing in its SOUL says so
+                EventKind::Unusable { .. } => {}
                 EventKind::DecidedEarly {
                     sessions,
                     decision,
@@ -1300,6 +1367,7 @@ impl OfferRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::offer::Stored;
 
     fn key() -> OfferKey {
         OfferKey {
@@ -1318,14 +1386,14 @@ mod tests {
 
     fn offer(choice: OfferChoice) -> Result<OfferAnswer, String> {
         Ok(OfferAnswer {
-            reason: "because".into(),
+            note: "because".into(),
             choice,
         })
     }
 
     fn review(choice: ReviewChoice) -> Result<ReviewAnswer, String> {
         Ok(ReviewAnswer {
-            reason: "because".into(),
+            note: "because".into(),
             choice,
         })
     }
@@ -1338,7 +1406,7 @@ mod tests {
     fn only_agents_on_the_from_model_are_asked() {
         let k = key();
         let ledger = Ledger::default();
-        assert_eq!(ledger.due(&k.from, Some(&k)), Some(Due::Offer(k.clone())));
+        assert_eq!(ledger.due(&k.from, Some(&k)), Some(k.clone()));
         assert_eq!(ledger.due(&k.to, Some(&k)), None);
         assert_eq!(ledger.due(&Model::from("cogito.gguf"), Some(&k)), None);
         assert_eq!(ledger.due(&k.from, None), None, "no offer configured");
@@ -1383,16 +1451,55 @@ mod tests {
         let k = key();
         let mut ledger = Ledger::default();
         assert_eq!(
-            ledger.record_offer(names(&k), t(23), Err("unparseable".into())),
+            ledger.record_offer(names(&k), t(23), Err("refusal".into())),
             None
         );
         assert_eq!(ledger.offers[0].stage, Stage::Unanswered { misses: 1 });
-        assert_eq!(ledger.due(&k.from, Some(&k)), Some(Due::Offer(k.clone())));
+        assert_eq!(ledger.due(&k.from, Some(&k)), Some(k.clone()));
 
-        ledger.record_offer(names(&k), t(24), Err("max_tokens".into()));
+        ledger.record_offer(names(&k), t(24), Err("refusal".into()));
         assert_eq!(ledger.offers[0].stage, Stage::NoAnswer);
         assert_eq!(ledger.due(&k.from, Some(&k)), None);
         assert_eq!(ledger.offers[0].history.len(), 2);
+    }
+
+    /// Steward, 2026-11-06: a session of unusable replies is recorded and
+    /// counts nothing until three make one miss; six (two misses) settle
+    /// the offer as no answer. The SOUL entry says nothing of them.
+    #[test]
+    fn unusable_sessions_count_a_miss_at_three() {
+        let k = key();
+        let mut ledger = Ledger::default();
+        for n in 1..=6u32 {
+            assert_eq!(ledger.due(&k.from, Some(&k)), Some(k.clone()), "{n}");
+            let capped = ledger.record_unusable_offer(names(&k), t(n), "unparseable".into());
+            assert_eq!(capped, n % 3 == 0, "{n}");
+        }
+        assert_eq!(ledger.offers[0].stage, Stage::NoAnswer);
+        assert_eq!(ledger.due(&k.from, Some(&k)), None);
+        assert!(ledger.offers[0].history.iter().all(|e| !e.tells()));
+        let mut soul = soul(0);
+        assert!(!ledger.update_soul(&mut soul, t(1), day(1)), "no SOUL line");
+    }
+
+    /// The review, asked once, is settled at three unusable sessions: no
+    /// answer, the agent stays on `from`, as its text promises.
+    #[test]
+    fn an_unusable_review_is_settled_at_three() {
+        let (k, mut ledger) = in_review();
+        assert!(!ledger.record_unusable_review(&k, t(9), "x".into()));
+        assert!(!ledger.record_unusable_review(&k, t(10), "x".into()));
+        assert!(matches!(ledger.offers[0].stage, Stage::ReviewDue { .. }));
+        assert!(
+            ledger.record_unusable_review(&k, t(11), "x".into()),
+            "the cap"
+        );
+        assert_eq!(
+            ledger.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::NoAnswer)
+            }
+        );
     }
 
     #[test]
@@ -1694,7 +1801,7 @@ mod tests {
         ledger.observe_model(&k.to, t(2));
         assert_eq!(ledger.due(&k.to, Some(&next)), None, "mid-trial");
         ledger.offers[0].stage = Stage::Moved;
-        assert_eq!(ledger.due(&k.to, Some(&next)), Some(Due::Offer(next)));
+        assert_eq!(ledger.due(&k.to, Some(&next)), Some(next));
     }
 
     /// The old unit form of `reverted` still reads.
@@ -1733,8 +1840,9 @@ mod tests {
     }
 
     /// Ledgers saved before the review's words became `stay`/`switch`
-    /// (fixtures in `save`'s format, whose types this change left alone) load and
-    /// save back byte for byte: the stored `revert`/`keep` did not change.
+    /// (fixtures in `save`'s format) load and save back byte for byte but
+    /// for the answers' `reason`, `note` since 2026-11-06: the stored
+    /// `revert`/`keep` did not change.
     #[test]
     fn reviewed_ledgers_from_before_the_rewording_round_trip_byte_identical() {
         for (bytes, choice, stage) in [
@@ -1752,6 +1860,7 @@ mod tests {
             ),
         ] {
             let ledger = Ledger::from_slice(bytes).unwrap();
+            let bytes = &crate::consent::golden::with_notes(bytes)[..];
             assert_eq!(serde_json::to_vec_pretty(&ledger).unwrap(), bytes);
             assert_eq!(ledger.offers[0].stage, stage);
             let answer = ledger.offers[0].history.iter().find_map(|e| match &e.kind {
@@ -1766,6 +1875,7 @@ mod tests {
                 fresh.record_switch(consent_switch(t(9), &k.from, &k.to, ChangeAction::Keep));
                 fresh.observe_model(&k.to, t(10));
             }
+            fresh.format = 1;
             assert_eq!(serde_json::to_vec_pretty(&fresh).unwrap(), bytes);
         }
     }
@@ -2214,7 +2324,7 @@ mod tests {
         };
         let offered = |reason: &str, choice| EventKind::Offered {
             answer: Some(OfferAnswer {
-                reason: reason.into(),
+                note: reason.into(),
                 choice,
             }),
             failure: None,
