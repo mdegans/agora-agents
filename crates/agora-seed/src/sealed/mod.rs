@@ -47,6 +47,7 @@ mod crash_tests;
 pub mod drain;
 pub mod enroll;
 pub mod forget;
+pub mod history_index;
 pub mod inclusion;
 pub mod keys;
 pub mod lost;

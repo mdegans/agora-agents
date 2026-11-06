@@ -301,11 +301,16 @@ pub async fn run(
             let _runner = super::session::runner_exclusive(data_dir)?;
             let done = super::forget::forget(&state_dir, &keys, agent, &note)?;
             println!(
-                "{agent}: state key set aside as {}{}; nothing deleted",
+                "{agent}: state key set aside as {}{}; no key deleted{}",
                 done.key,
                 done.stop
                     .map(|s| format!(", its stop as {s}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                if done.index {
+                    "; the search index (a rebuildable sidecar) deleted"
+                } else {
+                    ""
+                }
             );
         }
         Command::SealedStop { agent, note } => {

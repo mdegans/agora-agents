@@ -3,12 +3,17 @@
 //! behind), so the start check stops refusing the run over it
 //! ([`super::check::missing_states`]).
 //!
-//! Nothing is deleted: `<secrets>/<id>/state_key.json` becomes
+//! No key or record is deleted: `<secrets>/<id>/state_key.json` becomes
 //! `state_key.forgotten.<utc>.json`, the durable stop (if any)
 //! `sealed_stopped.forgotten.<utc>`, and the note is kept beside them as
-//! `state_key.forgotten.<utc>.note.json`. The signing keys stay. Refused
-//! while the agent has a `state.json`: a living agent's backups are
-//! stopped with `sealed-stop`, never forgotten.
+//! `state_key.forgotten.<utc>.note.json`. The signing keys stay, and so
+//! does `memory_id_key.json`: like them it names the agent's past rather
+//! than unlocking a backup, and an agent that comes back keeps its ids.
+//! The one file deleted is the `memory` tool's search index
+//! (`sealed/history_index.json`, [`super::history_index`]), a sidecar
+//! rebuilt from the history whenever it is needed. Refused while the agent
+//! has a `state.json`: a living agent's backups are stopped with
+//! `sealed-stop`, never forgotten.
 
 use std::path::Path;
 
@@ -32,6 +37,8 @@ struct Forgotten<'a> {
 pub struct Forgot {
     pub key: String,
     pub stop: Option<String>,
+    /// The search index was there, and was deleted.
+    pub index: bool,
 }
 
 pub fn forget(
@@ -52,6 +59,9 @@ pub fn forget(
         std::fs::exists(&key)?,
         "agent {id} has no state key in the secrets directory; nothing to forget"
     );
+    // The disposable sidecar first: a failure here leaves the rest to a rerun
+    let index = super::history_index::remove(&state_dir.join(id.to_string()))
+        .context("deleting the search index")?;
     let at = Utc::now();
     let stamp = at.format("%Y%m%dT%H%M%S%3fZ");
     let key_to = format!("state_key.forgotten.{stamp}.json");
@@ -75,11 +85,13 @@ pub fn forget(
     tracing::warn!(
         event_type = "sealed_state_forgotten",
         agent_id = %id,
-        "the operator set aside a state key whose agent has no state here; nothing deleted"
+        index_deleted = index,
+        "the operator set aside a state key whose agent has no state here; no key deleted"
     );
     Ok(Forgot {
         key: key_to,
         stop: stop_to,
+        index,
     })
 }
 
@@ -107,6 +119,7 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert!(kept.contains(&done.key), "{kept:?}");
+        assert!(!done.index, "no index to delete");
         assert!(kept.iter().any(|n| n.ends_with(".note.json")), "{kept:?}");
         // The signing keys stay
         assert!(keys.signing(id).is_some());
@@ -122,6 +135,31 @@ mod tests {
             )
             .await
             .is_empty()
+        );
+    }
+
+    /// Forgetting deletes the search index, the one sidecar it deletes, and
+    /// keeps the memory-id key.
+    #[tokio::test]
+    async fn forgetting_deletes_the_search_index_and_keeps_the_memory_id_key() {
+        let root = crate::sealed::TestDir::new("forget-index");
+        let (id, keys, dir) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        // The state lost, sealed/ left behind
+        std::fs::rename(dir.join("state.json"), root.join("gone.json")).unwrap();
+        crate::sealed::history_index::write(&dir, b"{}").unwrap();
+        let key = keys.memory_id_keys_or_create(id).unwrap();
+        let done = forget(&state_dir, &keys, id, "it left").unwrap();
+        assert!(done.index);
+        assert_eq!(crate::sealed::history_index::read(&dir).unwrap(), None);
+        assert!(
+            std::fs::exists(dir.join("sealed/head.json")).unwrap(),
+            "only the index"
+        );
+        assert_eq!(
+            keys.memory_id_keys(id).unwrap().unwrap().current.expose(),
+            key.current.expose(),
+            "the memory-id key stays"
         );
     }
 }
