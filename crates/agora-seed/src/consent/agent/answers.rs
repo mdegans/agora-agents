@@ -49,7 +49,7 @@ pub(super) fn unanswered_why(why: &Unanswered) -> String {
 #[async_trait::async_trait]
 impl<A> AskHost for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     fn asks(&mut self) -> &mut Asks<Self> {
         &mut self.asks
@@ -85,7 +85,7 @@ where
 
 impl<A> ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     /// The model that answered, else the session's.
     fn answered_by(&self, asked: &Asked) -> Model {
@@ -98,8 +98,9 @@ where
 
     /// Replies that couldn't be used, each under its question's own event
     /// (stall-watch's `*_malformed`), with the question in `field` (`offer`
-    /// for an offer, `question` for the review): they are never seated as
-    /// an answer, so this is the record of what the model wrote.
+    /// for an offer, `question` for the review): the failure's kind only,
+    /// never the reply (Steward, 2026-11-06: logs minimal; the reply is in
+    /// the saved transcript and the prompt-log archive).
     fn log_unusable(&self, event_type: &'static str, field: Field, name: &str, asked: &Asked) {
         let model = asked.model.as_deref();
         for (i, attempt) in asked.attempts.iter().enumerate() {
@@ -114,7 +115,6 @@ where
                         attempt = i + 1,
                         constrained = asked.constrained,
                         failure = %attempt.failure,
-                        raw = %attempt.raw,
                         "closing question's answer unusable"
                     )
                 };
@@ -357,7 +357,7 @@ trait Offering: agora_agentkit::reactor::ask::Ask {
 
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<Self::Ledger>
     where
-        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds;
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds;
 
     /// The outcome of a session whose every reply was unusable.
     fn unusable(failure: String) -> Self::Outcome;
@@ -388,7 +388,7 @@ impl Offering for OfferQuestion<RoleChoice, 4> {
 
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<RoleLedger>
     where
-        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
     {
         &mut agent.role
     }
@@ -433,7 +433,7 @@ impl Offering for CadenceQuestion {
 
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<CadenceLedger>
     where
-        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
     {
         &mut agent.cadence
     }
@@ -487,7 +487,7 @@ impl Offering for OfferQuestion<RestoreChoice, 2> {
 
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<RestoreLedger>
     where
-        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
     {
         &mut agent.restore
     }
@@ -533,7 +533,7 @@ impl Offering for OfferQuestion<SealChoice, 3> {
 
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<SealLedger>
     where
-        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
     {
         &mut agent.sealed
     }
@@ -589,7 +589,7 @@ trait NotedOffer: Offering<Answer = Reply<Self::Choice>> {
     ) -> Self::Outcome;
     fn stage<A>(agent: &mut ConsentAgent<A>, write: Write)
     where
-        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
     {
         Self::slot(agent).stage(write);
     }
@@ -647,7 +647,7 @@ impl NotedOffer for OfferQuestion<SealChoice, 3> {
 
 impl<A> ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     /// Take an answer to the memory-restore or sealed-state offer. Nothing
     /// is applied here: the SOUL line and the agent's note are written at
@@ -724,7 +724,7 @@ where
 #[async_trait::async_trait]
 impl<A> Answer<ReviewQuestion> for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     async fn answer(
         &mut self,
@@ -844,7 +844,7 @@ where
 #[async_trait::async_trait]
 impl<A> Answer<ModelSwapQuestion> for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     async fn answer(
         &mut self,
@@ -945,7 +945,7 @@ where
 #[async_trait::async_trait]
 impl<A> Answer<OfferQuestion<RoleChoice, 4>> for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     /// Checked against the agent's SOUL and memory first: an empty or
     /// over-long `text`, or a `memory_note` that can't be written, is asked
@@ -1045,7 +1045,7 @@ where
 #[async_trait::async_trait]
 impl<A> Answer<CadenceQuestion> for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     /// Every attempt goes into the record, verbatim, the answering one too.
     /// **The first usable choice wins**: its question's parser took the
@@ -1173,7 +1173,7 @@ where
 #[async_trait::async_trait]
 impl<A> Answer<OfferQuestion<RestoreChoice, 2>> for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     async fn answer(
         &mut self,
@@ -1207,7 +1207,7 @@ where
 #[async_trait::async_trait]
 impl<A> Answer<OfferQuestion<SealChoice, 3>> for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     async fn answer(
         &mut self,

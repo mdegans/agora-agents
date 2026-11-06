@@ -164,10 +164,11 @@ use crate::alerts::{Alert, AlertKind};
 use crate::sealed::memory_tool::{self, MemoryIds, MemoryReader, MemoryTool};
 use agora_agentkit::reactor::seed::Gauged;
 
-/// What the runner needs of the inner agent's session beyond [`Agent`]:
-/// the contact request it filed, and the questions of its own closing tail
-/// that went unanswered (both alerted from the wrapper's teardown).
-pub trait ContactRequests: Agent {
+/// The wrapper's interface to the inner session, beyond [`Agent`]: the
+/// contact request it filed, the questions of its own closing tail that
+/// went unanswered, why it failed (all alerted from the wrapper's
+/// teardown), and resuming a pause in one of the wrapper's own questions.
+pub trait InnerSession: Agent {
     fn contact_request(&self) -> Option<ContactRequestId>;
 
     /// Resume a paused server-tool turn in one of the wrapper's own
@@ -197,7 +198,7 @@ pub trait ContactRequests: Agent {
     }
 }
 
-impl ContactRequests for SeedAgent {
+impl InnerSession for SeedAgent {
     fn contact_request(&self) -> Option<ContactRequestId> {
         SeedAgent::contact_request(self)
     }
@@ -402,7 +403,7 @@ pub struct ConsentAgent<A> {
 
 impl<A> ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     /// The model's own `thinking_effort` from `[[model]]`, over the
     /// session's `[seed]` one. Patched once, right after the inner init
@@ -1698,7 +1699,7 @@ where
 #[async_trait::async_trait]
 impl<A> Agent for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     type State = SeedState;
     type Context = ConsentContext<A::Context>;
@@ -2326,7 +2327,7 @@ mod tests {
         }
     }
 
-    impl ContactRequests for Fake {
+    impl InnerSession for Fake {
         fn contact_request(&self) -> Option<ContactRequestId> {
             self.contact
         }
@@ -2334,7 +2335,8 @@ mod tests {
             &mut self,
             response: response::Message,
         ) -> Result<Control, SeedError> {
-            self.state.prompt.push_message(response.inner).unwrap();
+            agora_agentkit::reactor::seat_assistant(&mut self.state.prompt, response.inner)
+                .map_err(|e| SeedError::Prompt(e.to_string()))?;
             Ok(Control::Continue)
         }
         fn failure(&self) -> Option<&SessionFailure> {
@@ -5385,6 +5387,42 @@ mod tests {
         assert!(
             !intro_of_session(&fourth).contains("ended early"),
             "cleared"
+        );
+    }
+
+    /// `told` in the journal is whether the mail went out: true for the
+    /// first error on a model, false for a second inside the hour, whose
+    /// mail is keyed per model (not per agent: one outage, one mail).
+    #[tokio::test]
+    async fn told_is_journaled_and_an_error_mail_is_keyed_per_model() {
+        let mut h = journal_harness("journal-told");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        failed_session(&h, SessionFailure::Error).await;
+        let told = |j: &Journal| j.sessions.last().unwrap().ended.as_ref().unwrap().told;
+        assert!(told(&journal(&h).await), "the mail went out");
+        let mails = sent.sent();
+        let mail = mails.iter().find(|m| m.contains("session_failed")).unwrap();
+        assert!(
+            mail.contains(&format!("session_failed: {JOURNAL_MODEL}")),
+            "{mail}"
+        );
+        assert!(
+            mail.contains(&h.id.to_string()),
+            "the agent in the details: {mail}"
+        );
+        failed_session(&h, SessionFailure::Error).await;
+        assert!(
+            !told(&journal(&h).await),
+            "inside the model's hour: not sent, not claimed"
+        );
+        assert_eq!(
+            sent.sent()
+                .iter()
+                .filter(|m| m.contains("session_failed"))
+                .count(),
+            1
         );
     }
 

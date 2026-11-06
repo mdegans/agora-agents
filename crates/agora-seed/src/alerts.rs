@@ -983,43 +983,40 @@ impl Alerter {
             .is_some_and(|inner| inner.events.contains(&kind))
     }
 
+    /// The alerter's state, if `alert`'s kind is configured to send.
+    fn configured(&self, alert: &Alert) -> Option<&Arc<Inner>> {
+        self.0
+            .as_ref()
+            .filter(|inner| inner.events.contains(&alert.kind))
+    }
+
     /// Send `alert` in the background, if its kind is configured and its
     /// key is not inside the rate limit. Never blocks, never fails: the
     /// outcome is logged (`alert_sent`, `alert_suppressed`,
     /// `alert_send_failed`). Needs a tokio runtime.
-    /// [`Self::notify`], deciding now whether the alert goes out: `true`
-    /// when it is configured and outside its rate limit (or unlimited), and
-    /// its send is under way. For what tells an agent its operator was told
-    /// ([`crate::interrupted`]): only an alert that went out does.
-    pub async fn dispatch(&self, alert: Alert) -> bool {
-        let Some(inner) = &self.0 else { return false };
-        if !inner.events.contains(&alert.kind) {
-            return false;
-        }
-        let now = Utc::now();
-        if !inner.admit(&alert, now).await {
-            return false;
-        }
+    pub fn notify(&self, alert: Alert) {
+        let Some(inner) = self.configured(&alert) else {
+            return;
+        };
         let task = Arc::clone(inner);
         inner
             .pending
             .lock()
             .expect("alert queue lock")
-            .spawn(async move { task.send(alert, now).await });
-        true
+            .spawn(async move {
+                task.deliver(alert).await;
+            });
     }
 
-    pub fn notify(&self, alert: Alert) {
-        let Some(inner) = &self.0 else { return };
-        if !inner.events.contains(&alert.kind) {
-            return;
+    /// [`Self::notify`], awaited: whether the mail actually went out
+    /// (configured, outside its rate limit or unlimited, and sent within
+    /// the send timeout). For what tells an agent its operator was told
+    /// ([`crate::interrupted`]): only a mail that went out does.
+    pub async fn dispatch(&self, alert: Alert) -> bool {
+        match self.configured(&alert) {
+            Some(inner) => inner.deliver(alert).await,
+            None => false,
         }
-        let task = Arc::clone(inner);
-        inner
-            .pending
-            .lock()
-            .expect("alert queue lock")
-            .spawn(async move { task.deliver(alert).await });
     }
 
     /// Await every send in flight, for at most `timeout`. Call before the
@@ -1074,11 +1071,10 @@ impl Inner {
         Ok(builder.body(body)?)
     }
 
-    async fn deliver(&self, alert: Alert) {
+    /// Admit `alert` and send it: whether it went out.
+    async fn deliver(&self, alert: Alert) -> bool {
         let now = Utc::now();
-        if self.admit(&alert, now).await {
-            self.send(alert, now).await;
-        }
+        self.admit(&alert, now).await && self.send(alert, now).await
     }
 
     /// Whether `alert` may be sent now: an unlimited kind always, others
@@ -1116,8 +1112,9 @@ impl Inner {
         }
     }
 
-    /// Send an admitted alert; a failed send gives its slot back.
-    async fn send(&self, alert: Alert, now: DateTime<Utc>) {
+    /// Send an admitted alert: whether it went out. A failed send gives
+    /// its slot back.
+    async fn send(&self, alert: Alert, now: DateTime<Utc>) -> bool {
         let key = alert.rate_key();
         let result = match self.message(&alert) {
             Ok(message) => tokio::time::timeout(self.send_timeout, self.mailer.send(message))
@@ -1126,12 +1123,15 @@ impl Inner {
             Err(e) => Err(e),
         };
         match result {
-            Ok(()) => tracing::info!(
-                event_type = "alert_sent",
-                alert = %alert.kind,
-                key = %key,
-                "alert sent"
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    event_type = "alert_sent",
+                    alert = %alert.kind,
+                    key = %key,
+                    "alert sent"
+                );
+                true
+            }
             Err(e) => {
                 tracing::error!(
                     event_type = "alert_send_failed",
@@ -1149,6 +1149,7 @@ impl Inner {
                         "could not release the rate-limit slot of an unsent alert"
                     );
                 }
+                false
             }
         }
     }
@@ -1454,6 +1455,37 @@ mod tests {
         assert!(!s.release("a|1", t0));
         assert!(s.release("a|1", t0 + chrono::Duration::minutes(60)));
         assert!(s.last_sent.is_empty());
+    }
+
+    /// `dispatch` says whether the mail went out: not when the send fails
+    /// (and its slot is given back), not inside the rate limit, always for
+    /// an unlimited kind.
+    #[tokio::test]
+    async fn dispatch_is_true_only_for_a_mail_that_went_out() {
+        let dir = temp_dir("dispatch");
+        let config = parse(
+            r#"
+            [email]
+            smtp_host = "localhost"
+            from = "a@example.com"
+            to = ["b@example.com"]
+            "#,
+        );
+        let failing = Alerter::with_mailer(&config, Box::new(Failing), &dir, None);
+        let alert = || Alert::new(AlertKind::SessionFailed, "x").model("m");
+        assert!(!failing.dispatch(alert()).await, "the send failed");
+        let sent = Recorder::default();
+        let ok = Alerter::with_mailer(&config, Box::new(sent.clone()), &dir, None);
+        assert!(
+            ok.dispatch(alert()).await,
+            "the failed one's slot was given back"
+        );
+        assert!(!ok.dispatch(alert()).await, "inside the rate limit");
+        let refusal = || Alert::new(AlertKind::ApiRefusal, "x").model("m");
+        assert!(ok.dispatch(refusal()).await);
+        assert!(ok.dispatch(refusal()).await, "unlimited");
+        assert_eq!(sent.sent().len(), 3);
+        assert!(!Alerter::off().dispatch(alert()).await);
     }
 
     #[test]

@@ -476,4 +476,25 @@ mod tests {
         assert!(text.contains("during the anonymous survey."), "{text}");
         assert!(!text.contains("memory"), "after the memory update: {text}");
     }
+
+    /// Every part of a session agentkit names is rendered, `evolution`
+    /// included, and the runner's own questions through the same function.
+    #[test]
+    fn every_session_part_is_placed() {
+        assert_eq!(place("evolution", None), "the update to your SOUL");
+        assert_eq!(place("soul", None), "the update to your SOUL");
+        assert_eq!(place("acting", Some(2)), "acting round 2");
+        assert_eq!(place("review", None), "the question about your model trial");
+        assert_eq!(
+            place("offer:role", None),
+            "a question at the end of the session"
+        );
+        for part in SessionPart::ALL {
+            assert_ne!(
+                place(part.as_str(), None),
+                "the end of the session",
+                "{part}"
+            );
+        }
+    }
 }
