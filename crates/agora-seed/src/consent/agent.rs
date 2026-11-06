@@ -6733,10 +6733,13 @@ mod tests {
         let q = last_user_text(&agent);
         let seed = cadence::prompt::seed_for(h.id);
         let order = cadence::prompt::order_for(seed);
-        assert!(q.contains("with 5 rounds in each"), "{q}");
+        assert!(
+            q.contains("scheduled once a day, with 5 rounds each"),
+            "{q}"
+        );
         assert!(q.contains("with 10 rounds in each"), "{q}");
-        for (i, c) in order.iter().enumerate() {
-            assert!(q.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{q}");
+        for c in order.iter() {
+            assert!(q.contains(&format!("- **{}**", c.as_str())), "{q}");
         }
         // Plain text on Anthropic: no `output_config` change, no miss.
         assert!(agent.prompt().output_config.is_none(), "unconstrained");

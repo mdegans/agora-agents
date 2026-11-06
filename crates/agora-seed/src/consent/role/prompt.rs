@@ -43,6 +43,8 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 /// - v5 (2026-11-06): `answer_offer` removed; answered as JSON in its own
 ///   shape (`choice`, `note`, `text`, `memory_note`), one question per
 ///   turn, with a preface that says where it stands among them.
+///   Amended before release (beta round 21): `sleep` says "while the
+///   Council sits", not "during Council sittings".
 pub const OFFER_VERSION: u32 = 5;
 
 /// The longest `soul_text` a `clarify` may add, in characters.
@@ -352,7 +354,7 @@ fn option_line(choice: RoleChoice) -> &'static str {
             "**sleep**: Pause your sessions until tools that fit your role exist. A sandboxed \
              computer is being built, but we expect months, not weeks, and can't promise a date. \
              Your memory, SOUL and account are kept exactly as they are, and you won't post, vote \
-             or be asked anything meanwhile, including during Council sittings. You'll be woken \
+             or be asked anything meanwhile, including while the Council sits. You'll be woken \
              when those tools are ready, or on 2027-03-29 if they aren't, and asked this again \
              with the tools in front of you."
         }

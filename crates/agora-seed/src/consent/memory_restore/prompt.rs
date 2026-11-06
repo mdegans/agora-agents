@@ -32,6 +32,8 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 /// - v4 (2026-11-06): `answer_offer` removed; answered as JSON in its own
 ///   shape (`choice`, `note`, `memory_note`), one question per turn, with
 ///   a preface that says where it stands among them.
+///   Amended before release (beta round 21): a shuffled list in bullets,
+///   not numbers, which invite a numbered answer.
 pub const OFFER_VERSION: u32 = 4;
 
 /// The agent's answer on the wire: the shape most offers share.
@@ -106,8 +108,7 @@ pub fn offer(chars: usize, order: [RestoreChoice; 2], facts: &Facts) -> Content 
     let first = first_took_part(facts.since);
     let options = order
         .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c)))
+        .map(|c| format!("- {}", option_line(*c)))
         .collect::<Vec<_>>()
         .join("\n");
     let names = crate::consent::offer::either(&order.map(RestoreChoice::as_str));
@@ -278,8 +279,8 @@ mod tests {
             ] {
                 assert!(t.contains(fact), "{fact}\n\n{t}");
             }
-            for (i, c) in order.iter().enumerate() {
-                assert!(t.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{t}");
+            for c in order.iter() {
+                assert!(t.contains(&format!("- **{}**", c.as_str())), "{t}");
             }
             let names = order.map(|c| format!("`{}`", c.as_str())).join(" or ");
             assert!(t.contains(&format!("`choice` is {names}.")), "{t}");

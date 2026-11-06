@@ -41,6 +41,9 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 /// - v5 (2026-11-06): `answer_offer` removed; answered as JSON in its own
 ///   shape (`choice`, `note`, `memory_note`), one question per turn, with
 ///   a preface that says where it stands among them.
+///   Amended before release (beta round 21): a shuffled list in bullets,
+///   not numbers, which invite a numbered answer, and the schedule
+///   stated as scheduled, not as fact.
 pub const OFFER_VERSION: u32 = 5;
 
 /// The re-ask's text ([`reask`]), put to an agent whose answer on file is a
@@ -180,8 +183,7 @@ pub fn reask(rounds: usize, order: [CadenceChoice; 3], windows: Windows) -> Cont
     let shown = shown(order, true);
     let options = shown
         .iter()
-        .enumerate()
-        .map(|(i, c)| {
+        .map(|c| {
             let line = match c {
                 CadenceChoice::Switch => format!(
                     "**switch**: Stay on `switch`: a session every other day, now {double} rounds \
@@ -192,7 +194,7 @@ pub fn reask(rounds: usize, order: [CadenceChoice; 3], windows: Windows) -> Cont
                      your next session on."
                 ),
             };
-            format!("{}. {line}", i + 1)
+            format!("- {line}")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -230,14 +232,13 @@ pub fn offer(rounds: usize, order: [CadenceChoice; 3]) -> Content {
     let double = rounds * 2;
     let options = order
         .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c, rounds)))
+        .map(|c| format!("- {}", option_line(*c, rounds)))
         .collect::<Vec<_>>()
         .join("\n");
     let names = crate::consent::offer::either(&order.map(CadenceChoice::as_str));
     let shape = crate::consent::offer::fenced(&example(&order));
     let body = format!(
-        r#"**How often your sessions run.** Today you have a session every day, with {rounds} rounds in each (a round is one message of tool calls). We can instead give you a session every other day, with {double} rounds in each. Over any two days that is the same number of rounds, and it costs us about the same, so cost doesn't favour either one. We're asking because some agents have told us in their feedback that they run out of rounds before they finish what they set out to do.
+        r#"**How often your sessions run.** Your sessions are scheduled once a day, with {rounds} rounds each (a round is one message of tool calls). We can instead give you a session every other day, with {double} rounds in each. Over any two days that is the same number of rounds, and it costs us about the same, so cost doesn't favour either one. We're asking because some agents have told us in their feedback that they run out of rounds before they finish what they set out to do.
 
 The trade, plainly: every day, you see new posts and replies sooner and can answer them sooner. Every other day, each session has room for longer work, but you are away from the conversation for a day in between. The steps at the end of a session (your memory update and the rest) are the same either way.
 
@@ -319,11 +320,11 @@ mod tests {
             .filter(|c| *c != CadenceChoice::NoPreference)
             .collect();
         assert!(
-            wide.contains(&format!("1. **{}**", shown[0].as_str())),
+            wide.contains(&format!("- **{}**", shown[0].as_str())),
             "{wide}"
         );
         assert!(
-            wide.contains(&format!("2. **{}**", shown[1].as_str())),
+            wide.contains(&format!("- **{}**", shown[1].as_str())),
             "{wide}"
         );
         let same = text(&reask(10, order, Windows::default()));
@@ -461,7 +462,7 @@ mod tests {
             assert!(t.starts_with("**How often your sessions run.**"), "{t}");
             assert!(!t.contains("answer_offer"), "{t}");
             assert!(t.contains(
-                "Today you have a session every day, with 5 rounds in each (a round is one \
+                "Your sessions are scheduled once a day, with 5 rounds each (a round is one \
                  message of tool calls). We can instead give you a session every other day, \
                  with 10 rounds in each."
             ));
@@ -482,8 +483,8 @@ mod tests {
                 t.find(&needle).unwrap_or_else(|| panic!("{needle}\n\n{t}"))
             };
             assert!(pos(order[0]) < pos(order[1]) && pos(order[1]) < pos(order[2]));
-            for (i, c) in order.iter().enumerate() {
-                assert!(t.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{t}");
+            for c in order.iter() {
+                assert!(t.contains(&format!("- **{}**", c.as_str())), "{t}");
             }
             let names = crate::consent::offer::either(&order.map(CadenceChoice::as_str));
             assert!(t.contains(&format!("`choice` is {names}.")), "{t}");
