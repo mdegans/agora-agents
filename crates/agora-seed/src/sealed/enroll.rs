@@ -210,13 +210,45 @@ struct NameOnly {
 /// An archive's state, from its `{format, state}` envelope. `None`: not
 /// one this binary reads. Its content is never logged.
 fn archived_state(path: &Path) -> Option<serde_json::Value> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let format = envelope.get("format")?.as_u64()?;
-    if format > agora_agentkit::reactor::storage::FORMAT {
-        return None;
+    envelope_state(path)
+        .ok()
+        .filter(|(format, _)| *format <= agora_agentkit::reactor::storage::FORMAT)
+        .map(|(_, state)| state)
+}
+
+/// Why an FsStorage envelope (`state.json`, an archive, an `unsaved`
+/// rescue) couldn't be read. Never content.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvelopeError {
+    #[error("unreadable: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("not JSON ({0:?})")]
+    Json(serde_json::error::Category),
+    #[error("not an envelope: no {0}")]
+    Shape(&'static str),
+    #[error("envelope format {0} is newer than this binary reads")]
+    Newer(u64),
+}
+
+/// The `state` of an FsStorage `{format, state}` envelope at `path`, and
+/// its format: any format this binary's FsStorage loads (format 2 is a
+/// sealed agent's).
+pub fn envelope_state(path: &Path) -> Result<(u64, serde_json::Value), EnvelopeError> {
+    let bytes = zeroize::Zeroizing::new(std::fs::read(path)?);
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| EnvelopeError::Json(e.classify()))?;
+    let format = envelope
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(EnvelopeError::Shape("format"))?;
+    if format > agora_agentkit::reactor::storage::MAX_FORMAT {
+        return Err(EnvelopeError::Newer(format));
     }
-    Some(envelope.get_mut("state")?.take())
+    let state = envelope
+        .get_mut("state")
+        .ok_or(EnvelopeError::Shape("state"))?
+        .take();
+    Ok((format, state))
 }
 
 /// The sizes of a version just sealed, in the local sidecar.

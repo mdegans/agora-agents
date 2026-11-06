@@ -40,35 +40,42 @@ pub struct LastSealed {
     pub state: serde_json::Value,
 }
 
-/// A sealed blob: from `sealed/blobs/` if it is still here, else from
+/// A sealed blob: from the first of `seals` whose `blobs/` holds it (the
+/// agent's `sealed/`, then any `sealed/lost/<utc>/` copies), else from
 /// Agora. Unchecked: [`open_entry_blob`] checks it against the entry.
+/// Nothing fetched is written anywhere.
 async fn blob(
-    seal: &AgentSeal,
+    seals: &[&AgentSeal],
     api: &dyn SealedApi,
     id: AgentId,
     signing: &SigningKey,
     sha: &Sha256Hex,
 ) -> anyhow::Result<Vec<u8>> {
-    match seal.read_blob(sha).await {
-        Ok(bytes) => Ok(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => api
-            .blob(id, signing, sha)
-            .await
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("fetching blob {sha} from Agora")),
-        Err(e) => Err(e).with_context(|| format!("reading blob {sha}")),
+    for seal in seals {
+        match seal.read_blob(sha).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading blob {sha}")),
+        }
     }
+    api.blob(id, signing, sha)
+        .await
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("fetching blob {sha} from Agora"))
 }
+
+/// A keyframe's plaintext, the dictionary its deltas open against.
+type Dict = std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>;
 
 /// One entry's compressed-then-decompressed plaintext, against `dict`.
 /// The decompression (brotli, up to a whole state) runs on a blocking
 /// thread.
 async fn plaintext(
-    seal: &AgentSeal,
+    seals: &[&AgentSeal],
     api: &dyn SealedApi,
     keys: &SealKeys,
     entry: &StateEntry,
-    dict: Option<zeroize::Zeroizing<Vec<u8>>>,
+    dict: Option<Dict>,
 ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     let sha = entry
         .blob
@@ -82,7 +89,7 @@ async fn plaintext(
         entry.key_gen,
         keys.key_gen
     );
-    let sealed = blob(seal, api, entry.agent_id, &keys.signing, &sha).await?;
+    let sealed = blob(seals, api, entry.agent_id, &keys.signing, &sha).await?;
     let compressed = open_entry_blob(&keys.state_key, entry, &sealed)
         .with_context(|| format!("opening blob {sha} (entry seq {})", entry.seq))?;
     let seq = entry.seq;
@@ -103,33 +110,80 @@ pub async fn open(
     line: &[SignedStateEntry],
     entry: &StateEntry,
 ) -> anyhow::Result<serde_json::Value> {
-    let encoding = entry
-        .blob
-        .as_ref()
-        .map(|b| b.encoding)
-        .context("the entry has no blob")?;
-    let dict = match encoding {
-        BlobEncoding::Keyframe => None,
-        BlobEncoding::Delta { base } => {
-            let keyframe = line
-                .iter()
-                .map(|e| &e.entry)
-                .find(|e| e.entry_hash() == base)
-                .with_context(|| format!("the delta's keyframe {base} is not on the main line"))?;
-            Some(plaintext(seal, api, keys, keyframe, None).await?)
+    Opener::new(vec![seal], api, keys).open(line, entry).await
+}
+
+/// Opens one agent's sealed versions, one after another: blobs looked for
+/// in each of its seals in turn, then on Agora, and the last keyframe
+/// opened kept for the deltas after it (consecutive versions mostly share
+/// one). Read-only: nothing is written, fetched blobs included.
+pub struct Opener<'a> {
+    seals: Vec<&'a AgentSeal>,
+    api: &'a dyn SealedApi,
+    keys: &'a SealKeys,
+    keyframe: Option<(Sha256Hex, Dict)>,
+}
+
+impl<'a> Opener<'a> {
+    pub fn new(seals: Vec<&'a AgentSeal>, api: &'a dyn SealedApi, keys: &'a SealKeys) -> Self {
+        Self {
+            seals,
+            api,
+            keys,
+            keyframe: None,
         }
-    };
-    let bytes = plaintext(seal, api, keys, entry, dict).await?;
-    tokio::task::spawn_blocking(move || {
-        let mut envelope: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("the sealed plaintext isn't JSON ({:?})", e.classify()))?;
-        envelope
-            .get_mut("state")
-            .map(serde_json::Value::take)
-            .context("the sealed plaintext holds no state")
-    })
-    .await
-    .context("the parsing task failed")?
+    }
+
+    /// Open `entry`, sealed on `line` (whose entries hold its keyframe):
+    /// the value it sealed, a state for a snapshot.
+    pub async fn open(
+        &mut self,
+        line: &[SignedStateEntry],
+        entry: &StateEntry,
+    ) -> anyhow::Result<serde_json::Value> {
+        let encoding = entry
+            .blob
+            .as_ref()
+            .map(|b| b.encoding)
+            .context("the entry has no blob")?;
+        let dict = match encoding {
+            BlobEncoding::Keyframe => None,
+            BlobEncoding::Delta { base } => Some(self.keyframe(line, base).await?),
+        };
+        let bytes = plaintext(&self.seals, self.api, self.keys, entry, dict).await?;
+        tokio::task::spawn_blocking(move || {
+            let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                anyhow::anyhow!("the sealed plaintext isn't JSON ({:?})", e.classify())
+            })?;
+            envelope
+                .get_mut("state")
+                .map(serde_json::Value::take)
+                .context("the sealed plaintext holds no state")
+        })
+        .await
+        .context("the parsing task failed")?
+    }
+
+    async fn keyframe(
+        &mut self,
+        line: &[SignedStateEntry],
+        base: Sha256Hex,
+    ) -> anyhow::Result<Dict> {
+        if let Some((hash, dict)) = &self.keyframe
+            && *hash == base
+        {
+            return Ok(dict.clone());
+        }
+        let keyframe = line
+            .iter()
+            .map(|e| &e.entry)
+            .find(|e| e.entry_hash() == base)
+            .with_context(|| format!("the delta's keyframe {base} is not on its line"))?;
+        let dict: Dict =
+            std::sync::Arc::new(plaintext(&self.seals, self.api, self.keys, keyframe, None).await?);
+        self.keyframe = Some((base, dict.clone()));
+        Ok(dict)
+    }
 }
 
 /// The main line to `head`, oldest first: from the entries here, and

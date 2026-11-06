@@ -139,6 +139,14 @@ pub struct Diff {
     pub cut: bool,
 }
 
+/// A seed agent's memory text in its state (`memory.content`, the raw
+/// string, not as rendered for a prompt), or `None` if it has none. The
+/// one projection of memory from a state in the runner, until agentkit's
+/// `seed/memory` takes it.
+pub fn memory_content(state: &serde_json::Value) -> Option<&str> {
+    state.pointer("/memory/content").and_then(|c| c.as_str())
+}
+
 /// Where the diff an agent is shown is cut, in characters.
 pub const DIFF_CAP: usize = 4_000;
 
@@ -151,12 +159,7 @@ impl Diff {
     /// and soul (pretty JSON, keys sorted), with counts, cut at
     /// [`DIFF_CAP`] characters.
     pub fn between(before: &serde_json::Value, after: &serde_json::Value) -> Self {
-        let memory = |v: &serde_json::Value| {
-            v.pointer("/memory/content")
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string()
-        };
+        let memory = |v: &serde_json::Value| memory_content(v).unwrap_or_default().to_string();
         // Both sides in one form: the canonical JSON sealing uses (keys
         // sorted), pretty-printed. serde_json keeps insertion order here
         // (`preserve_order` is on in the graph), so printing the values as
