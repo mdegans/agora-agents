@@ -17,11 +17,14 @@
 //! With [`Anchors`], the drainer also does the anchor work
 //! ([`super::anchors`]) for each agent not held whose outbox is empty:
 //! once at [`Drainer::finish`] and at most every
-//! [`super::anchors::PROOF_INTERVAL`] while the run goes on (never at the
-//! start check), it publishes the anchor of an agent that chose `publish`
-//! and hasn't been, and judges each anchor not yet judged
-//! ([`super::anchors::check_anchors`]): a failure is one
-//! [`AlertKind::SealedStateAnchorWrong`] per pass, never repeated.
+//! [`super::anchors::PROOF_INTERVAL`] while the run goes on, it publishes
+//! the anchor of an agent that chose `publish` and hasn't been, and judges
+//! each anchor not yet judged ([`super::anchors::check_anchors`]): a
+//! failure is one [`AlertKind::SealedStateAnchorWrong`] per pass, never
+//! repeated. The start check runs the same judging pass first, for an
+//! agent in step with Agora, so a session's verdict says what was found
+//! for the newest anchor ([`super::check::check_with`]); the drainer's
+//! passes then judge what came after.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -148,7 +151,7 @@ impl Drainer {
                 self.alerts
                     .notify(super::anchors::anchor_alert(*id, name, "publish", &e));
             }
-            match super::anchors::check_anchors(
+            let result = super::anchors::check_anchors(
                 &dir,
                 *id,
                 &a.keys,
@@ -157,39 +160,9 @@ impl Drainer {
                 &a.verified,
                 self.alerts.sends(AlertKind::SealedStateAnchorWrong),
             )
-            .await
-            {
-                Ok(pass) => {
-                    // Judged failures first: alerted even when the pass
-                    // stopped after them (they are never judged again)
-                    if !pass.failures.is_empty() {
-                        self.alerts
-                            .notify(super::anchors::judged_alert(*id, name, &pass.failures));
-                    }
-                    if let Some(e) = pass.stopped {
-                        self.check_failed(*id, name, &e);
-                    }
-                }
-                Err(e) => self.check_failed(*id, name, &e),
-            }
+            .await;
+            super::anchors::alert_pass(&self.alerts, *id, name, &result);
         }
-    }
-
-    fn check_failed(&self, id: AgentId, name: &str, e: &super::anchors::ProofError) {
-        tracing::warn!(
-            event_type = "sealed_state_anchor_failed",
-            agent_id = %id,
-            what = "check",
-            kind = e.kind(),
-            error = %e,
-            "the anchor check stopped; it resumes at the next pass"
-        );
-        self.alerts.notify(super::anchors::anchor_alert(
-            id,
-            name,
-            "check",
-            &e.to_string(),
-        ));
     }
 
     fn anchors_due(&self) -> bool {

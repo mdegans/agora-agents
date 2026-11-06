@@ -40,7 +40,7 @@ use crate::alerts::{Alert, AlertKind, Alerter};
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.151.3:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.152.0:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +93,10 @@ pub enum Outcome {
         /// The anchors the verdict told of: marked told once the session
         /// showing it saves ([`super::inclusion::mark_told`]).
         told: Vec<GovernanceLogId>,
+        /// What the anchor pass at the start found, when one ran
+        /// ([`StartAnchors`]): its failures and any stop are for the
+        /// operator ([`super::anchors::alert_pass`]).
+        judged: Option<Result<super::anchors::Pass, super::anchors::ProofError>>,
     },
     /// Leave it out, refused. `detail` is for the operator, hashes and
     /// counts only.
@@ -425,15 +429,258 @@ pub struct Previous {
 /// What the anchor check found, for the verdict.
 pub type AnchorReport = super::inclusion::Untold;
 
+/// What the start check needs for the anchors: the governance log verified
+/// this run, and whether a failure is alerted (the alert kind is on).
+/// With it, the anchors the runner can judge are judged before the verdict
+/// is written ([`check_with`]), and those it can't are named with why.
+#[derive(Debug, Clone, Copy)]
+pub struct StartAnchors<'a> {
+    pub verified: &'a super::anchors::VerifiedAnchors,
+    pub alerted: bool,
+}
+
+/// An anchor named in a verdict, with its date as far as it is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedAnchor {
+    pub id: GovernanceLogId,
+    pub day: AnchorDay,
+}
+
+/// What a verdict can say of an anchor's date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorDay {
+    /// The day it covers, from its data checked against the log.
+    For(chrono::NaiveDate),
+    /// When it was logged (UTC), from the log's own signed entry: the day
+    /// it covers wasn't learnt this run.
+    Logged(chrono::NaiveDate),
+    Unknown,
+}
+
+impl NamedAnchor {
+    /// "ANC-2026-0004, the anchor for 2026-11-05" / "…, logged 2026-11-06
+    /// (UTC)" / the id alone
+    fn phrase(&self) -> String {
+        match self.day {
+            AnchorDay::For(d) => format!("{}, the anchor for {}", self.id, d.format("%Y-%m-%d")),
+            AnchorDay::Logged(d) => {
+                format!("{}, logged {} (UTC)", self.id, d.format("%Y-%m-%d"))
+            }
+            AnchorDay::Unknown => self.id.to_string(),
+        }
+    }
+}
+
+/// Why anchors in the verified log haven't been judged for the agent by
+/// the time its verdict is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotJudged {
+    /// Versions wait to upload: anchors are judged only once Agora has
+    /// every version ([`super::drain::Drainer::anchor_all`]).
+    Uploading,
+    /// Agora couldn't be reached at the start.
+    Unreachable,
+    /// The pass at the start stopped before it.
+    Stopped(&'static str),
+    /// Uploads are held this run: the drainer does no anchor work for a
+    /// held agent.
+    Held,
+    /// No key here to sign the proof request with.
+    NoKey,
+    /// None of the above known: the drainer looks again after the run's
+    /// uploads (another process judged first, or the outbox couldn't be
+    /// read).
+    Later,
+}
+
+impl NotJudged {
+    /// After "…hasn't been checked for you yet: ". `them`: more than one.
+    fn said(self, them: bool) -> String {
+        let it = if them { "them" } else { "it" };
+        let after_uploads = format!(
+            "Your runner checks {it} after this session's uploads, and a later \
+             session's verdict says what it found."
+        );
+        match self {
+            Self::Uploading => format!(
+                "your runner checks anchors only once every version of yours \
+                 has reached Agora, and some are still waiting to upload. \
+                 {after_uploads}"
+            ),
+            Self::Unreachable => format!(
+                "your runner couldn't get your history from Agora at the start \
+                 of this session. {after_uploads}"
+            ),
+            Self::Later => format!("your runner hasn't come to {it} yet. {after_uploads}"),
+            Self::Stopped(why) => format!(
+                "your runner's check at the start of this session stopped, \
+                 as {why}. It tries again after this session's uploads, and a \
+                 later session's verdict says what it found."
+            ),
+            Self::Held => format!(
+                "your runner doesn't check anchors while your uploads to \
+                 Agora are held, as they are this session. It checks {it} once \
+                 they go ahead again."
+            ),
+            Self::NoKey => format!(
+                "your runner doesn't have the key here that it asks Agora for \
+                 your proofs with, and can't check {it} until it does."
+            ),
+        }
+    }
+
+    /// Why a pass stopped, for [`Self::Stopped`]
+    pub fn stopped(e: &super::anchors::ProofError) -> Self {
+        use super::anchors::ProofError as E;
+        Self::Stopped(match e {
+            E::Fetch(_) => "Agora's proofs couldn't be fetched",
+            E::AnchorData { .. } => "an anchor's data couldn't be fetched from Agora",
+            E::Local(_) => "its own records couldn't be read",
+            E::Line(_) => "your sealed history couldn't be read to place Agora's proof",
+        })
+    }
+}
+
+/// Anchors in the verified log not judged for the agent, oldest first (the
+/// log's newest last), named (the newest and up to [`super::inclusion::LISTED`]
+/// before it), and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unjudged {
+    /// The named ones, oldest first; the last is the log's newest.
+    pub named: Vec<NamedAnchor>,
+    /// How many in all.
+    pub count: usize,
+    pub why: NotJudged,
+}
+
+/// What the runner's record of its anchor checks lets a verdict say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Record {
+    /// Read: the newest judged and failures not yet told (`None`: nothing
+    /// judged yet).
+    Read(Option<AnchorReport>),
+    /// `sealed/inclusion.json` couldn't be read.
+    Unreadable,
+}
+
+/// What a verdict says of the anchors: what the check found, and the
+/// anchors in the log it hasn't judged, with why. Never silent about the
+/// log's newest anchor when the log was given ([`StartAnchors`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorsSaid {
+    pub record: Record,
+    pub unjudged: Option<Unjudged>,
+}
+
+impl Default for AnchorsSaid {
+    fn default() -> Self {
+        Self {
+            record: Record::Read(None),
+            unjudged: None,
+        }
+    }
+}
+
+impl AnchorsSaid {
+    /// The report, when the record was read and holds one.
+    pub fn report(&self) -> Option<&AnchorReport> {
+        match &self.record {
+            Record::Read(r) => r.as_ref(),
+            Record::Unreadable => None,
+        }
+    }
+
+    /// What the verdict says of them, as sentences, each with a leading
+    /// space: the newest judged, earlier failures not yet told, then the
+    /// anchors not judged and why ([`super::inclusion::sentence`]).
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        if let Some(r) = self.report() {
+            out.push_str(&super::inclusion::sentence(&r.newest));
+            for c in &r.earlier {
+                out.push_str(&super::inclusion::sentence(c));
+            }
+            if r.more > 0 {
+                out.push_str(&format!(
+                    " Your runner found {} more problem{} with earlier anchors.",
+                    r.more,
+                    if r.more == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        let Some(u) = &self.unjudged else {
+            return out;
+        };
+        let Some((newest, earlier)) = u.named.split_last() else {
+            return out;
+        };
+        if self.record == Record::Unreadable {
+            out.push_str(&format!(
+                " Your runner couldn't read its record of what it found for \
+                 each anchor, so this verdict can't say what it found for {}, \
+                 the newest in the governance log: {}",
+                newest.phrase(),
+                u.why.said(false)
+            ));
+            return out;
+        }
+        let more = u.count - 1;
+        let list = if more == 0 {
+            format!(
+                "{}{}, hasn't",
+                newest.phrase(),
+                if matches!(newest.day, AnchorDay::Unknown) {
+                    ", the newest in the governance log"
+                } else {
+                    " and the newest in the governance log"
+                }
+            )
+        } else {
+            let ids: Vec<String> = earlier.iter().map(|a| a.id.to_string()).collect();
+            let which = if ids.len() == more {
+                format!(
+                    " ({})",
+                    match ids.split_last() {
+                        Some((last, rest)) if !rest.is_empty() => {
+                            format!("{} and {last}", rest.join(", "))
+                        }
+                        _ => ids.concat(),
+                    }
+                )
+            } else {
+                format!(
+                    ", from {} on,",
+                    ids.first().map_or(String::new(), Clone::clone)
+                )
+            };
+            format!(
+                "{}{} the newest in the governance log, and {} earlier one{}{which} haven't",
+                newest.phrase(),
+                if matches!(newest.day, AnchorDay::Unknown) {
+                    ","
+                } else {
+                    " and"
+                },
+                more,
+                if more == 1 { "" } else { "s" },
+            )
+        };
+        out.push_str(&format!(
+            " {list} been checked for you yet: {}",
+            u.why.said(more > 0)
+        ));
+        out
+    }
+}
+
 /// The verdict line for an intact chain: the verdict, the snapshots since
 /// the earliest one's date, a pre-loss copy apart, what the anchor check
-/// found ([`super::inclusion::sentence`]: the newest anchor judged, and
-/// earlier failures not yet told) and, when the verified governance log
-/// already holds a newer one (`newer`), that one with when it is checked,
-/// else, when the head is newer than the version the newest anchor holds
-/// and the runner does the anchor work for the agent (`checks_later`),
-/// that it isn't anchored yet; the head marker, and the state's sizes
-/// (counts only) against the earlier version's, dated.
+/// found and the anchors in the verified log it hasn't judged, with why
+/// ([`AnchorsSaid::text`]) and, when every one is judged, the head is
+/// newer than the version the newest anchor holds and the runner does the
+/// anchor work for the agent (`checks_later`), that it isn't anchored yet;
+/// the head marker, and the state's sizes (counts only) against the
+/// earlier version's, dated.
 #[allow(clippy::too_many_arguments)]
 pub fn verdict_line(
     line: &[SignedStateEntry],
@@ -441,8 +688,7 @@ pub fn verdict_line(
     sizes: Sizes,
     previous: Option<Previous>,
     server: Server,
-    anchors: Option<&AnchorReport>,
-    newer: Option<&GovernanceLogId>,
+    anchors: &AnchorsSaid,
     checks_later: bool,
 ) -> String {
     // "Earlier", not "previous": the baseline is the newest version whose
@@ -516,35 +762,12 @@ pub fn verdict_line(
     // In sentences, not one run (beta round 11). What the newest anchor
     // judged holds, as the check found it, never more: a version not
     // shown right is said to be unchecked or wrong (the review of 0.151.2
-    // found the old "is in" true of any version of the agent's)
-    let newest = anchors.map(|r| &r.newest);
-    let mut anchored = newest.map(super::inclusion::sentence).unwrap_or_default();
-    if let Some(r) = anchors {
-        for c in &r.earlier {
-            anchored.push_str(&super::inclusion::sentence(c));
-        }
-        if r.more > 0 {
-            anchored.push_str(&format!(
-                " Your runner found {} more problem{} with earlier anchors.",
-                r.more,
-                if r.more == 1 { "" } else { "s" }
-            ));
-        }
-    }
-    // The proof lag read as a missed check (beta round 9): anchors are
-    // judged once uploads drain ([`super::drain`]), so a newer anchor can
-    // be in the log before its judgement is here
-    let newer = newest
-        .zip(newer)
-        .filter(|_| checks_later)
-        .filter(|(c, n)| *n > &c.anc_id)
-        .map(|(_, n)| {
-            format!(
-                " {n}, a newer anchor, is in the log too: your runner checks it after uploading \
-                 this session's saves, and a later session's verdict says what it found."
-            )
-        })
-        .unwrap_or_default();
+    // found the old "is in" true of any version of the agent's). The
+    // log's anchors not judged yet are named with why and when (beta
+    // round 9: the proof lag read as a missed check; beta round 12: with
+    // nothing judged, the verdict said nothing of any anchor)
+    let newest = anchors.report().map(|r| &r.newest);
+    let anchored = anchors.text();
     // The version this session starts from, when it is newer than the one
     // the newest anchor holds and no newer anchor is in the log: the usual
     // case, the last session's saves not anchored yet (beta round 10: an
@@ -566,7 +789,7 @@ pub fn verdict_line(
             )
         })
         .and_then(|c| c.finding.held())
-        .filter(|held| held.entry_hash != head.entry_hash && newer.is_empty())
+        .filter(|held| held.entry_hash != head.entry_hash && anchors.unjudged.is_none())
         .filter(|_| checks_later)
         .and_then(|_| line.last())
         .and_then(|h| day(h.entry.state_at))
@@ -583,7 +806,7 @@ pub fn verdict_line(
     short.truncate(12);
     format!(
         "Your sealed state: {verdict} It has {} version{} since \
-         {since}{prior}.{anchored}{newer}{unanchored} This session starts from head {short} (a \
+         {since}{prior}.{anchored}{unanchored} This session starts from head {short} (a \
          marker for this version; the next session's will differ). In this version, your \
          memory is {} characters{memory_change} and your soul {}{soul_change}. Checked by \
          {VERIFIER}: links, signatures, and that your state matches the last sealed version.",
@@ -653,8 +876,9 @@ async fn earlier_sizes(
 }
 
 /// One enrolled agent's check. `local`: its state's plaintext hash;
-/// `sizes`: its memory's and soul's sizes. Names no newer anchor: see
-/// [`check_with`].
+/// `sizes`: its memory's and soul's sizes. Without the governance log
+/// (`sealed-accept` and the like): judges no anchor, and names only what
+/// was judged before; see [`check_with`].
 pub async fn check(
     agent_dir: &Path,
     id: AgentId,
@@ -666,11 +890,23 @@ pub async fn check(
     check_with(agent_dir, id, local, sizes, keys, server, None).await
 }
 
-/// [`check`], with the newest `ANC-` entry of the governance log verified
-/// this run (`logged`): when it is newer than the newest proof kept, the
-/// verdict says so, and that the runner checks it after this session's
-/// uploads. Only for an agent the drainer will do the anchor work for:
-/// sealing, with its keys here, and not held.
+/// [`check`], with the governance log verified this run (`start`):
+///
+/// - **Judged first** (beta round 12: on the first session under 0.151.3
+///   no anchor had been judged, and the verdict said nothing of any):
+///   for an agent the drainer would do the anchor work for (sealing, its
+///   keys here, not held) whose versions are all on Agora (in step, the
+///   outbox empty), the anchors not judged yet are judged now
+///   ([`super::anchors::check_anchors`]), after the versions already
+///   uploaded are given their observed acknowledgements
+///   ([`super::receipts::baseline`]), as the drainer's pass would find
+///   them. The same pass the drainer runs, so each anchor is still judged
+///   once, under the agent's `sealed/lock`; told only once the session
+///   that shows it saves. Its failures and stop go to the operator from
+///   [`Outcome::Run`]'s `judged`.
+/// - **Named with why**: every anchor of the log still not judged, the
+///   newest first, with why and when it will be ([`NotJudged`]), on every
+///   line the agent is seated with, held or not.
 pub async fn check_with(
     agent_dir: &Path,
     id: AgentId,
@@ -678,7 +914,141 @@ pub async fn check_with(
     sizes: Sizes,
     keys: &KeyStore,
     server: &dyn SealedApi,
-    logged: Option<&GovernanceLogId>,
+    start: Option<&StartAnchors<'_>>,
+) -> Outcome {
+    let out = check_chain(agent_dir, id, local, sizes, keys, server, start).await;
+    // A hold decided before the verdict could be written (the sealed
+    // history unreadable, or not checkable): its one line still says what
+    // was found of the anchors, and that none is checked while held
+    match out {
+        Outcome::Run {
+            mut seat,
+            notice,
+            hold: Some(hold @ (Hold::Unreadable | Hold::Unchecked)),
+            drops,
+            told: _,
+            judged,
+        } if seat.len() == 1 => {
+            let (said, told) = anchors_said(agent_dir, id, start, NotJudged::Held, None).await;
+            seat[0].push_str(&said.text());
+            Outcome::Run {
+                seat,
+                notice,
+                hold: Some(hold),
+                drops,
+                told,
+                judged,
+            }
+        }
+        out => out,
+    }
+}
+
+/// What a verdict says of the anchors for `id` ([`AnchorsSaid`]), and the
+/// anchors it tells of, to mark told once the session that shows it saves.
+/// Read from `sealed/inclusion.json`; with the log (`start`), the anchors
+/// after the newest judged are named with `why`, their dates learnt this
+/// run or, with `api`, asked of Agora (checked against the log), else the
+/// day each was logged.
+async fn anchors_said(
+    agent_dir: &Path,
+    id: AgentId,
+    start: Option<&StartAnchors<'_>>,
+    why: NotJudged,
+    api: Option<&dyn SealedApi>,
+) -> (AnchorsSaid, Vec<GovernanceLogId>) {
+    let (record, through) = match super::inclusion::InclusionFile::load(agent_dir) {
+        Ok(file) => (
+            Record::Read(super::inclusion::untold(&file)),
+            Some(file.through),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                agent_id = %id,
+                error = %e,
+                "sealed/inclusion.json unreadable; the verdict says so"
+            );
+            (Record::Unreadable, None)
+        }
+    };
+    let told = match &record {
+        Record::Read(Some(r)) => r.ids.clone(),
+        _ => Vec::new(),
+    };
+    let unjudged = match start {
+        Some(start) => {
+            let ids: Vec<GovernanceLogId> = match &through {
+                Some(through) => start
+                    .verified
+                    .after(through.as_ref())
+                    .map(|(a, _)| a.clone())
+                    .collect(),
+                // Unreadable: only the newest is named
+                None => start.verified.newest().cloned().into_iter().collect(),
+            };
+            match ids.split_last() {
+                None => None,
+                Some((newest, earlier)) => {
+                    let listed: Vec<&GovernanceLogId> = if earlier.len() <= super::inclusion::LISTED
+                    {
+                        earlier.iter().collect()
+                    } else {
+                        earlier.first().into_iter().collect()
+                    };
+                    let mut named = Vec::new();
+                    for a in listed.into_iter().chain(std::iter::once(newest)) {
+                        named.push(name_anchor(start.verified, a, api).await);
+                    }
+                    Some(Unjudged {
+                        named,
+                        count: ids.len(),
+                        why,
+                    })
+                }
+            }
+        }
+        None => None,
+    };
+    (AnchorsSaid { record, unjudged }, told)
+}
+
+/// `anc` with its date: the day it covers when learnt this run (or asked
+/// of Agora with `api`, checked against the log), else the day it was
+/// logged.
+async fn name_anchor(
+    verified: &super::anchors::VerifiedAnchors,
+    anc: &GovernanceLogId,
+    api: Option<&dyn SealedApi>,
+) -> NamedAnchor {
+    let mut date = verified.known_date(anc);
+    if date.is_none()
+        && let Some(api) = api
+    {
+        match verified.date(anc, api).await {
+            Ok(d) => date = d,
+            Err(e) => tracing::debug!(anc_id = %anc, error = %e, "an anchor's date wasn't fetched"),
+        }
+    }
+    let day = match (date, verified.logged(anc)) {
+        (Some(d), _) => AnchorDay::For(d),
+        (None, Some(l)) => AnchorDay::Logged(l.logged_at.date_naive()),
+        (None, None) => AnchorDay::Unknown,
+    };
+    NamedAnchor {
+        id: anc.clone(),
+        day,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_chain(
+    agent_dir: &Path,
+    id: AgentId,
+    local: &Sha256Hex,
+    sizes: Sizes,
+    keys: &KeyStore,
+    server: &dyn SealedApi,
+    start: Option<&StartAnchors<'_>>,
 ) -> Outcome {
     let seal = AgentSeal::new(agent_dir, id);
     let refuse = |reason: Refusal, detail: String| Outcome::Refuse { reason, detail };
@@ -688,6 +1058,7 @@ pub async fn check_with(
         hold: Some(Hold::Unreadable),
         drops: Vec::new(),
         told: Vec::new(),
+        judged: None,
     };
     let unchecked = || Outcome::Run {
         seat: vec![UNCHECKED_LINE.to_string()],
@@ -695,6 +1066,7 @@ pub async fn check_with(
         hold: Some(Hold::Unchecked),
         drops: Vec::new(),
         told: Vec::new(),
+        judged: None,
     };
 
     match seal.is_refused().await {
@@ -740,6 +1112,7 @@ pub async fn check_with(
                 hold: None,
                 drops: Vec::new(),
                 told: Vec::new(),
+                judged: None,
             };
         }
         Ok(Recovery::Unreadable(kind)) => {
@@ -948,27 +1321,27 @@ pub async fn check_with(
     let drop_lines: Vec<String> = drops.iter().map(|d| d.1.clone()).collect();
     let drops: Vec<(&'static str, u32)> = drops.iter().map(|d| (d.0, d.2)).collect();
     if seal_failed.is_some() {
-        seat.push(SEAL_FAILED_LINE.into());
+        let (said, told) = anchors_said(agent_dir, id, start, NotJudged::Held, None).await;
+        seat.push(format!("{SEAL_FAILED_LINE}{}", said.text()));
         seat.extend(drop_lines);
         return Outcome::Run {
             seat,
             notice,
             hold: Some(Hold::SealFailed),
             drops,
-            told: Vec::new(),
+            told,
+            judged: None,
         };
     }
-    let report = anchor_report(agent_dir, id);
-    let told = report.as_ref().map(|r| r.ids.clone()).unwrap_or_default();
     let Some(signing) = keys.signing(id) else {
+        let (said, told) = anchors_said(agent_dir, id, start, NotJudged::NoKey, None).await;
         seat.push(verdict_line(
             &line,
             &head,
             sizes,
             previous,
             Server::Unchecked,
-            report.as_ref(),
-            None,
+            &said,
             false,
         ));
         seat.extend(drop_lines);
@@ -978,6 +1351,7 @@ pub async fn check_with(
             hold: None,
             drops,
             told,
+            judged: None,
         };
     };
     let outbox: Vec<_> = match seal.outbox().await {
@@ -1038,15 +1412,69 @@ pub async fn check_with(
     // sealing ([`super::drain::Drainer::anchor_all`])
     let checks_later =
         matches!(status, HeadStatus::Same | HeadStatus::Pending) && super::is_sealing(agent_dir);
-    let newer = logged.filter(|_| checks_later);
+    // Every version on Agora (in step, nothing waiting): what the drainer
+    // would judge after this session, judged before it, so the verdict
+    // says what was found for the newest anchor whenever it can
+    // `None`: the outbox couldn't be read, so whether versions wait is
+    // unknown (no pass, and the verdict doesn't say they wait)
+    let waiting = match seal.outbox().await {
+        Ok(items) => Some(!items.is_empty()),
+        Err(e) => {
+            tracing::warn!(agent_id = %id, error = %e, "sealed outbox unreadable; no anchor pass at the start");
+            None
+        }
+    };
+    let mut judged = None;
+    if let Some(start) = start
+        && checks_later
+        && status == HeadStatus::Same
+        && server_said == Server::InStep
+        && waiting == Some(false)
+    {
+        // The versions already uploaded get their observed acknowledgement
+        // first, as before the drainer's pass (a no-op once given)
+        super::receipts::baseline(agent_dir, id).await;
+        judged = Some(
+            super::anchors::check_anchors(
+                agent_dir,
+                id,
+                keys,
+                &signing,
+                server,
+                start.verified,
+                start.alerted,
+            )
+            .await,
+        );
+    }
+    let why = if !checks_later {
+        NotJudged::Held
+    } else if server_said == Server::Unchecked {
+        NotJudged::Unreachable
+    } else if waiting == Some(true) || (waiting.is_some() && status != HeadStatus::Same) {
+        NotJudged::Uploading
+    } else if waiting.is_none() {
+        NotJudged::Later
+    } else {
+        match &judged {
+            Some(Ok(super::anchors::Pass {
+                stopped: Some(e), ..
+            }))
+            | Some(Err(e)) => NotJudged::stopped(e),
+            // Judged up to the newest, unless another process merged
+            // first; either way the drainer looks again after uploads
+            _ => NotJudged::Later,
+        }
+    };
+    let api = (server_said != Server::Unchecked).then_some(server);
+    let (said, told) = anchors_said(agent_dir, id, start, why, api).await;
     seat.push(verdict_line(
         &line,
         &head,
         sizes,
         previous,
         server_said,
-        report.as_ref(),
-        newer,
+        &said,
         checks_later,
     ));
     seat.extend(drop_lines);
@@ -1067,24 +1495,7 @@ pub async fn check_with(
         hold,
         drops,
         told,
-    }
-}
-
-/// What the anchor check found, for a verdict being seated: read here,
-/// never fetched (no network for this at the start). Marks nothing: the
-/// session that shows it marks it told when it saves ([`Outcome::Run`]'s
-/// `told`). Unreadable: no report, and a WARN.
-fn anchor_report(agent_dir: &Path, id: AgentId) -> Option<AnchorReport> {
-    match super::inclusion::InclusionFile::load(agent_dir) {
-        Ok(file) => super::inclusion::untold(&file),
-        Err(e) => {
-            tracing::warn!(
-                agent_id = %id,
-                error = %e,
-                "sealed/inclusion.json unreadable; no anchor named"
-            );
-            None
-        }
+        judged,
     }
 }
 
@@ -1345,6 +1756,25 @@ pub(crate) mod tests {
 
     use crate::sealed::api::fake::FakeApi;
 
+    /// What a verdict says of the anchors: `report` as judged, and
+    /// `newer`, in the log after it, not judged yet (named by its id, to be
+    /// judged after this session's uploads)
+    fn said(report: Option<&AnchorReport>, newer: Option<&GovernanceLogId>) -> AnchorsSaid {
+        AnchorsSaid {
+            record: Record::Read(report.cloned()),
+            unjudged: newer
+                .filter(|n| report.is_none_or(|r| *n > &r.newest.anc_id))
+                .map(|n| Unjudged {
+                    named: vec![NamedAnchor {
+                        id: n.clone(),
+                        day: AnchorDay::Unknown,
+                    }],
+                    count: 1,
+                    why: NotJudged::Uploading,
+                }),
+        }
+    }
+
     /// A server that holds exactly these entries.
     fn server(chain: Vec<SignedStateEntry>) -> FakeApi {
         let api = FakeApi::new();
@@ -1394,7 +1824,7 @@ pub(crate) mod tests {
         (id, keys, dir)
     }
 
-    async fn local_hash(root: &Path, id: AgentId) -> Sha256Hex {
+    pub(crate) async fn local_hash(root: &Path, id: AgentId) -> Sha256Hex {
         let v = FsStorage::new(root.join("state"))
             .load_raw(id)
             .await
@@ -1488,15 +1918,35 @@ pub(crate) mod tests {
     }
 
     /// What the anchor check judged is read from sealed/inclusion.json at
-    /// the check, never fetched; nothing judged, no anchor named. A
-    /// failure is told once, then only while it is the newest.
+    /// the check. A failure is told once, then only while it is the newest.
+    /// With the log given, every anchor in it not judged is named, with
+    /// why: here the agent's versions wait to upload (its genesis is in
+    /// the outbox), so nothing is judged at the start (beta round 12: with
+    /// nothing judged the verdict said nothing of any anchor)
     #[tokio::test]
     async fn the_verdict_says_what_the_anchor_check_found() {
+        use crate::sealed::anchors::VerifiedAnchors;
         use crate::sealed::inclusion::{Checked, Finding, InclusionFile};
         let root = crate::sealed::TestDir::new("check-anchor");
         let (id, keys, dir) = enrolled(&root).await;
         let server = server(Vec::new());
-        let verdict_with = async |logged: Option<&GovernanceLogId>| {
+        let logged_at = chrono::DateTime::parse_from_rfc3339("2026-11-06T00:05:00Z")
+            .unwrap()
+            .to_utc();
+        let log = |ns: &[u32]| {
+            VerifiedAnchors::new(ns.iter().map(|n| {
+                (
+                    format!("ANC-2026-{n:04}").parse().unwrap(),
+                    Sha256Hex::from([*n as u8; 32]),
+                    logged_at,
+                )
+            }))
+        };
+        let verdict_with = async |verified: Option<&VerifiedAnchors>| {
+            let start = verified.map(|verified| StartAnchors {
+                verified,
+                alerted: true,
+            });
             let out = check_with(
                 &dir,
                 id,
@@ -1504,18 +1954,76 @@ pub(crate) mod tests {
                 Sizes::default(),
                 &keys,
                 &server,
-                logged,
+                start.as_ref(),
             )
             .await;
-            let Outcome::Run { seat, .. } = out else {
+            let Outcome::Run { seat, judged, .. } = out else {
                 panic!("{out:?}")
             };
+            // Versions wait to upload: no pass at the start
+            assert_eq!(judged, None);
             seat[0].clone()
         };
         let verdict = async || verdict_with(None).await;
-        let newer: GovernanceLogId = "ANC-2026-0004".parse().unwrap();
-        assert!(!verdict().await.contains("governance log"));
-        assert!(!verdict_with(Some(&newer)).await.contains("ANC-"));
+        // No log, nothing judged: nothing to say
+        assert!(!verdict().await.contains("ANC-"));
+        // Nothing judged, the log's newest named, with why and when
+        let waiting = " your runner checks anchors only once every version of \
+                       yours has reached Agora, and some are still waiting to \
+                       upload. Your runner checks it after this session's \
+                       uploads, and a later session's verdict says what it \
+                       found. This session starts from head ";
+        let never = verdict_with(Some(&log(&[4]))).await;
+        assert!(
+            never.contains(&format!(
+                ". ANC-2026-0004, logged 2026-11-06 (UTC) and the newest in the \
+                 governance log, hasn't been checked for you yet:{waiting}"
+            )),
+            "{never}"
+        );
+        // Its day, once Agora serves its data and it hashes to the log's
+        let data = serde_json::json!({
+            "date": "2026-11-05",
+            "root": "ab".repeat(32),
+            "agents": 3,
+        });
+        let attested = agora_agentkit::govlog::data_hash(&data);
+        server
+            .anchor_data
+            .lock()
+            .unwrap()
+            .insert("ANC-2026-0004".parse().unwrap(), data);
+        let dated = VerifiedAnchors::new([("ANC-2026-0004".parse().unwrap(), attested, logged_at)]);
+        let named = verdict_with(Some(&dated)).await;
+        assert!(
+            named.contains(
+                ". ANC-2026-0004, the anchor for 2026-11-05 and the newest in the \
+                 governance log, hasn't been checked for you yet:"
+            ),
+            "{named}"
+        );
+        // Several: the earlier ones listed
+        let three = verdict_with(Some(&log(&[2, 3, 4]))).await;
+        assert!(
+            three.contains(
+                ". ANC-2026-0004, logged 2026-11-06 (UTC) and the newest in the \
+                 governance log, and 2 earlier ones (ANC-2026-0002 and ANC-2026-0003) \
+                 haven't been checked for you yet: your runner checks anchors only \
+                 once every version of yours has reached Agora, and some are still \
+                 waiting to upload. Your runner checks them after this session's"
+            ),
+            "{three}"
+        );
+        // Many: from the oldest on
+        let many = verdict_with(Some(&log(&[1, 2, 3, 4, 5, 6]))).await;
+        assert!(
+            many.contains(
+                ". ANC-2026-0006, logged 2026-11-06 (UTC) and the newest in the \
+                 governance log, and 5 earlier ones, from ANC-2026-0001 on, \
+                 haven't been checked"
+            ),
+            "{many}"
+        );
         let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
         let checked = |n: u32, finding: Finding| Checked {
             anc_id: format!("ANC-2026-{n:04}").parse().unwrap(),
@@ -1583,26 +2091,33 @@ pub(crate) mod tests {
             "{again}"
         );
         // The log's newest is the newest judged: the same line
-        let same: GovernanceLogId = "ANC-2026-0003".parse().unwrap();
-        assert_eq!(verdict_with(Some(&same)).await, again);
-        // A newer one in the verified log: named, with when it is checked
-        let lagging = verdict_with(Some(&newer)).await;
+        assert_eq!(verdict_with(Some(&log(&[2, 3]))).await, again);
+        // A newer one in the verified log: named, with why and when
+        let lagging = verdict_with(Some(&log(&[2, 3, 4]))).await;
         assert!(
-            lagging.contains(
-                "record of your uploads. ANC-2026-0004, a newer anchor, is in the log too: your \
-                 runner checks it after uploading this session's saves, and a later session's \
-                 verdict says what it found. This session starts from head "
-            ),
+            lagging.contains(&format!(
+                "record of your uploads. ANC-2026-0004, logged 2026-11-06 (UTC) and the \
+                 newest in the governance log, hasn't been checked for you yet:{waiting}"
+            )),
             "{lagging}"
         );
+        // An unreadable record is said, never silence
+        std::fs::write(dir.join("sealed/inclusion.json"), b"{not json").unwrap();
+        let lost = verdict_with(Some(&log(&[2, 3, 4]))).await;
         assert!(
-            server
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|c| c != "proofs" && c != "anchor_data"),
-            "no network for it"
+            lost.contains(
+                ". Your runner couldn't read its record of what it found for each \
+                 anchor, so this verdict can't say what it found for ANC-2026-0004, \
+                 logged 2026-11-06 (UTC), the newest in the governance log: your \
+                 runner checks anchors only once"
+            ),
+            "{lost}"
+        );
+        // Waiting uploads: no proof asked for at the start
+        assert!(
+            server.calls.lock().unwrap().iter().all(|c| c != "proofs"),
+            "{:?}",
+            server.calls.lock().unwrap()
         );
     }
 
@@ -1940,7 +2455,66 @@ pub(crate) mod tests {
                 hold: Some(Hold::Unreadable),
                 drops: Vec::new(),
                 told: Vec::new(),
+                judged: None,
             }
+        );
+        // With the log: what was judged before, and that no anchor is
+        // checked while held, on the one line it has (beta round 12)
+        let checked = crate::sealed::inclusion::Checked {
+            anc_id: "ANC-2026-0003".parse().unwrap(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 11, 3),
+            finding: crate::sealed::inclusion::Finding::NotIncluded,
+            at: chrono::Utc::now(),
+            told: false,
+            alerted: false,
+        };
+        crate::sealed::inclusion::InclusionFile {
+            through: Some(checked.anc_id.clone()),
+            checked: vec![checked],
+        }
+        .save(&dir)
+        .unwrap();
+        let verified = crate::sealed::anchors::VerifiedAnchors::new([3, 4].map(|n: u8| {
+            (
+                format!("ANC-2026-{n:04}").parse().unwrap(),
+                Sha256Hex::from([n; 32]),
+                chrono::DateTime::parse_from_rfc3339("2026-11-06T00:05:00Z")
+                    .unwrap()
+                    .to_utc(),
+            )
+        }));
+        let out = check_with(
+            &dir,
+            id,
+            &local_hash(&root, id).await,
+            Sizes::default(),
+            &keys,
+            &server(Vec::new()),
+            Some(&StartAnchors {
+                verified: &verified,
+                alerted: true,
+            }),
+        )
+        .await;
+        let Outcome::Run {
+            seat, told, hold, ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert_eq!(hold, Some(Hold::Unreadable));
+        assert_eq!(told, vec!["ANC-2026-0003".parse().unwrap()]);
+        assert_eq!(
+            seat,
+            vec![format!(
+                "{UNREADABLE_LINE} ANC-2026-0003, the anchor for 2026-11-03, doesn't \
+                 include you, and needn't: Agora hadn't confirmed receiving any version \
+                 of yours by the end of that day (UTC). ANC-2026-0004, logged \
+                 2026-11-06 (UTC) and the newest in the governance log, hasn't been \
+                 checked for you yet: your runner doesn't check anchors while your \
+                 uploads to Agora are held, as they are this session. It checks it \
+                 once they go ahead again."
+            )]
         );
     }
 
@@ -2173,8 +2747,7 @@ pub(crate) mod tests {
             },
             None,
             Server::Other,
-            None,
-            None,
+            &said(None, None),
             false,
         );
         assert!(
@@ -2184,9 +2757,8 @@ pub(crate) mod tests {
                 Sizes::default(),
                 None,
                 Server::InStep,
-                None,
-                None,
-                false
+                &said(None, None),
+                false,
             )
             .starts_with("Your sealed state: intact, and in step with Agora. It has 2 versions")
         );
@@ -2197,8 +2769,7 @@ pub(crate) mod tests {
                 Sizes::default(),
                 None,
                 Server::Unchecked,
-                None,
-                None,
+                &said(None, None),
                 false,
             )
             .starts_with(
@@ -2240,8 +2811,7 @@ pub(crate) mod tests {
                 own_last_session: true,
             }),
             Server::Other,
-            None,
-            None,
+            &said(None, None),
             false,
         );
         // Named by its head prefix as well as its date: two versions can
@@ -2268,8 +2838,7 @@ pub(crate) mod tests {
                 own_last_session: true,
             }),
             Server::Other,
-            None,
-            None,
+            &said(None, None),
             false,
         );
         assert!(
@@ -2290,8 +2859,7 @@ pub(crate) mod tests {
                 own_last_session: true,
             }),
             Server::Other,
-            None,
-            None,
+            &said(None, None),
             false,
         );
         assert!(same.contains("13,539 characters (unchanged) and"), "{same}");
@@ -2309,8 +2877,7 @@ pub(crate) mod tests {
                 own_last_session: false,
             }),
             Server::Other,
-            None,
-            None,
+            &said(None, None),
             false,
         );
         assert!(
@@ -2348,8 +2915,7 @@ pub(crate) mod tests {
             now,
             None,
             Server::InStep,
-            Some(&holds),
-            None,
+            &said(Some(&holds), None),
             true,
         );
         assert!(
@@ -2372,9 +2938,8 @@ pub(crate) mod tests {
                 now,
                 None,
                 Server::InStep,
-                Some(&holds),
-                Some(&current),
-                true
+                &said(Some(&holds), Some(&current)),
+                true,
             ),
             anchored
         );
@@ -2387,32 +2952,88 @@ pub(crate) mod tests {
             now,
             None,
             Server::InStep,
-            Some(&holds),
-            Some(&newer),
+            &said(Some(&holds), Some(&newer)),
             true,
         );
         assert!(
             lagging.contains(
-                "own record of your uploads. ANC-2026-0005, a newer anchor, is in the log too: \
-                 your runner checks it after uploading this session's saves, and a later \
-                 session's verdict says what it found. This session starts from head "
+                "own record of your uploads. ANC-2026-0005, the newest in the governance log, \
+                 hasn't been checked for you yet: your runner checks anchors only once every \
+                 version of yours has reached Agora, and some are still waiting to upload. Your \
+                 runner checks it after this session's uploads, and a later session's verdict \
+                 says what it found. This session starts from head "
             ),
             "{lagging}"
         );
-        // Nothing judged yet: no anchor named, newer or not
-        assert!(
-            !verdict_line(
-                &line,
-                &head,
-                now,
-                None,
-                Server::InStep,
-                None,
-                Some(&newer),
-                true
-            )
-            .contains("ANC-")
+        // Nothing judged yet: the newest named all the same (beta round 12:
+        // the verdict was silent), and no "newer than that anchor"
+        let none = verdict_line(
+            &line,
+            &head,
+            now,
+            None,
+            Server::InStep,
+            &said(None, Some(&newer)),
+            true,
         );
+        assert!(
+            none.contains(
+                "dated 2026-05-03. ANC-2026-0005, the newest in the governance log, hasn't \
+                 been checked for you yet: "
+            ),
+            "{none}"
+        );
+        assert!(!none.contains("newer than that anchor"), "{none}");
+        // Each reason, in its words
+        for (why, words) in [
+            (
+                NotJudged::Unreachable,
+                "your runner couldn't get your history from Agora at the start of this \
+                 session. Your runner checks it after this session's uploads, and a later \
+                 session's verdict says what it found.",
+            ),
+            (
+                NotJudged::Later,
+                "your runner hasn't come to it yet. Your runner checks it after this \
+                 session's uploads, and a later session's verdict says what it found.",
+            ),
+            (
+                NotJudged::Held,
+                "your runner doesn't check anchors while your uploads to Agora are held, as \
+                 they are this session. It checks it once they go ahead again.",
+            ),
+            (
+                NotJudged::NoKey,
+                "your runner doesn't have the key here that it asks Agora for your proofs \
+                 with, and can't check it until it does.",
+            ),
+            (
+                NotJudged::stopped(&crate::sealed::anchors::ProofError::Fetch("x".into())),
+                "your runner's check at the start of this session stopped, as Agora's proofs \
+                 couldn't be fetched. It tries again after this session's uploads, and a later \
+                 session's verdict says what it found.",
+            ),
+            (
+                NotJudged::stopped(&crate::sealed::anchors::ProofError::Line("x".into())),
+                "stopped, as your sealed history couldn't be read to place Agora's proof.",
+            ),
+            (
+                NotJudged::stopped(&crate::sealed::anchors::ProofError::Local("x".into())),
+                "stopped, as its own records couldn't be read.",
+            ),
+            (
+                NotJudged::stopped(&crate::sealed::anchors::ProofError::AnchorData {
+                    anc_id: newer.clone(),
+                    error: "x".into(),
+                }),
+                "stopped, as an anchor's data couldn't be fetched from Agora.",
+            ),
+        ] {
+            let mut s = said(Some(&holds), Some(&newer));
+            s.unjudged.as_mut().unwrap().why = why;
+            let text = verdict_line(&line, &head, now, None, Server::InStep, &s, true);
+            assert!(text.contains(words), "{text}");
+        }
         // The session starts from a version newer than the one the anchor
         // holds, with no newer anchor in the log: the usual case, said with
         // its date (beta round 10), and never that one will hold this
@@ -2439,8 +3060,7 @@ pub(crate) mod tests {
                     now,
                     None,
                     Server::InStep,
-                    Some(&report(held.clone())),
-                    logged,
+                    &said(Some(&report(held.clone())), logged),
                     true,
                 );
                 assert!(text.contains(not_yet), "{text}");
@@ -2460,8 +3080,7 @@ pub(crate) mod tests {
                 now,
                 None,
                 Server::InStep,
-                Some(&report(failed)),
-                None,
+                &said(Some(&report(failed)), None),
                 true,
             );
             assert!(!text.contains("newer than that anchor"), "{text}");
@@ -2477,17 +3096,20 @@ pub(crate) mod tests {
             now,
             None,
             Server::InStep,
-            Some(&report(Finding::Unchecked {
-                why: Unchecked::NoTimes,
-            })),
-            None,
+            &said(
+                Some(&report(Finding::Unchecked {
+                    why: Unchecked::NoTimes,
+                })),
+                None,
+            ),
             true,
         );
         assert!(
             text.contains("Your runner couldn't check ANC-2026-0004"),
             "{text}"
         );
-        // A newer anchor in the log: the round-10 clause alone
+        // A newer anchor in the log: that one named, not "newer than that
+        // anchor"
         let older = report(Finding::Holds {
             held: at(2),
             in_flight: false,
@@ -2498,12 +3120,11 @@ pub(crate) mod tests {
             now,
             None,
             Server::InStep,
-            Some(&older),
-            Some(&newer),
+            &said(Some(&older), Some(&newer)),
             true,
         );
         assert!(
-            text.contains("ANC-2026-0005, a newer anchor, is in the log too"),
+            text.contains("ANC-2026-0005, the newest in the governance log, hasn't been checked"),
             "{text}"
         );
         assert!(!text.contains("newer than that anchor"), "{text}");
@@ -2515,8 +3136,7 @@ pub(crate) mod tests {
             now,
             None,
             Server::InStep,
-            Some(&older),
-            None,
+            &said(Some(&older), None),
             false,
         );
         assert!(!text.contains("newer than that anchor"), "{text}");
@@ -2540,8 +3160,7 @@ pub(crate) mod tests {
             now,
             None,
             Server::InStep,
-            Some(&many),
-            None,
+            &said(Some(&many), None),
             true,
         );
         assert!(
