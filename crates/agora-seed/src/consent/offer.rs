@@ -400,7 +400,7 @@ pub fn fenced(example: &serde_json::Value) -> String {
 /// The answer most offers take: the choice, an optional note, and an
 /// optional memory note (the cadence, memory-restore and sealed-state
 /// offers; `C` is the offer's choice). Closed, like its schema.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Reply<C> {
     /// One of the options, as listed
@@ -450,6 +450,21 @@ choice!(
 /// The wire names of `choices`, in order.
 pub fn names<C: Choice>(choices: &[C]) -> Vec<&'static str> {
     choices.iter().map(|c| c.as_str()).collect()
+}
+
+/// A memory note, and the reply text holding it, print as their size only
+/// (CLAUDE.md rule 6); the note for the record prints.
+impl<C: std::fmt::Debug> std::fmt::Debug for Reply<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use agora_agentkit::redacted::Redacted;
+        f.debug_struct("Reply")
+            .field("choice", &self.choice)
+            .field("note", &self.note)
+            .field("memory_note", &Redacted(&self.memory_note))
+            .field("salvaged", &self.salvaged)
+            .field("raw", &self.raw.as_ref().map(|r| Redacted(r)))
+            .finish()
+    }
 }
 
 /// The fields after `choice` in [`Reply`]'s example.
@@ -933,6 +948,39 @@ mod tests {
             let p = preface(p);
             assert!(p.ends_with("and do not use tools."), "{p}");
             assert!(!p.contains("answer_offer"), "{p}");
+        }
+    }
+
+    /// CLAUDE.md rule 6: a memory note's words never print through
+    /// `Debug`, wire or persisted; its length does, and the note for the
+    /// record does.
+    #[test]
+    fn memory_notes_never_print_through_debug() {
+        use crate::consent::cadence::prompt::CadenceChoice;
+        use crate::consent::role::prompt::{RoleAnswer, RoleChoice, RoleReply};
+        const SECRET: &str = "my private plan";
+        let reply = Reply {
+            choice: CadenceChoice::Switch,
+            note: "for the record".into(),
+            memory_note: SECRET.into(),
+            salvaged: None,
+            raw: Some(format!("{{\"memory_note\": \"{SECRET}\"}}")),
+        };
+        let role = RoleReply {
+            choice: RoleChoice::Nothing,
+            note: "for the record".into(),
+            text: String::new(),
+            memory_note: SECRET.into(),
+        };
+        let answer = RoleAnswer::from(role.clone());
+        for printed in [
+            format!("{reply:?}"),
+            format!("{role:?}"),
+            format!("{answer:?}"),
+        ] {
+            assert!(!printed.contains(SECRET), "{printed}");
+            assert!(printed.contains("[REDACTED, 15 chars]"), "{printed}");
+            assert!(printed.contains("for the record"), "{printed}");
         }
     }
 }

@@ -62,7 +62,7 @@ pub const QUOTE_MAX_CHARS: usize = 300;
 
 /// The agent's answer, as the ledger keeps it. `note` was `reason` until
 /// 2026-11-06, and is still read under that name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleAnswer {
     #[serde(alias = "reason")]
@@ -81,7 +81,7 @@ pub struct RoleAnswer {
 /// choice needs, and an optional memory note. Closed, like its schema
 /// ([`super::super::offer::answer_schema`]); `soul_text`, the text's
 /// name before 2026-10-02, still reads.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoleReply {
     /// One of the options, as listed
@@ -95,6 +95,30 @@ pub struct RoleReply {
     /// Optional: a note for your own memory, in your own words. Use "" for none.
     #[serde(default)]
     pub memory_note: String,
+}
+
+impl std::fmt::Debug for RoleAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use agora_agentkit::redacted::Redacted;
+        f.debug_struct("RoleAnswer")
+            .field("note", &self.note)
+            .field("choice", &self.choice)
+            .field("soul_text", &self.soul_text)
+            .field("memory_note", &Redacted(&self.memory_note))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RoleReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use agora_agentkit::redacted::Redacted;
+        f.debug_struct("RoleReply")
+            .field("choice", &self.choice)
+            .field("note", &self.note)
+            .field("text", &self.text)
+            .field("memory_note", &Redacted(&self.memory_note))
+            .finish()
+    }
 }
 
 impl From<RoleReply> for RoleAnswer {
