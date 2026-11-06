@@ -41,9 +41,12 @@
 //!   agent's state is backed up to Agora, sealed under its own key
 //!   (`publish`, `private`, `decline`); the runner's side is
 //!   [`crate::sealed`].
-//! - [`offers`] — `answer_offer`, the strict tool all five are answered
-//!   with: every offer due at a session's close is seated in one question
-//!   turn, each under a heading naming its key.
+//! - [`offer`] — what every offer shares, once: the miss cap, the option
+//!   order, when an offer is due, the memory note's checks, the answer's
+//!   schema, the receipt, and the per-offer slot the wrapper keeps.
+//! - [`questions`] — the review and the five offers as agentkit `Ask`s,
+//!   asked one per turn as JSON in each one's own shape (`answer_offer`,
+//!   the strict tool they shared, went on 2026-11-06).
 //!
 //! ```toml
 //! [model_consent]
@@ -71,8 +74,9 @@ pub mod comparison;
 pub mod forks;
 pub mod ledger;
 pub mod memory_restore;
-pub mod offers;
+pub mod offer;
 pub mod prompt;
+pub mod questions;
 pub mod queue;
 pub mod role;
 pub mod sealed_state;

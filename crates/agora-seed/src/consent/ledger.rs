@@ -43,9 +43,7 @@ pub const MAX_FAILED_TRIAL_SESSIONS: u32 = 3;
 /// one the session runs on.
 pub const TRIAL_LINE_PREFIX: &str = "Model trial: ";
 
-/// Unanswered asks before the runner stops asking. The first miss is
-/// re-asked at the next eligible session; the second is final.
-pub const MAX_MISSES: u32 = 2;
+pub use super::offer::MAX_MISSES;
 
 /// An offer is identified by the model pair it moves between. Two offers
 /// for the same pair are the same question, so an agent that answered one
@@ -362,31 +360,6 @@ pub enum ChangeAction {
     Keep,
 }
 
-/// A question for this session: an offer (asked at the end of a session)
-/// or a trial review (asked at the start of the session on `from` after
-/// the trial). At most one per session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Due {
-    Offer(OfferKey),
-    Review(OfferKey),
-}
-
-impl Due {
-    /// `"offer"` or `"review"`, for log fields.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Due::Offer(_) => "offer",
-            Due::Review(_) => "review",
-        }
-    }
-
-    pub fn key(&self) -> &OfferKey {
-        match self {
-            Due::Offer(key) | Due::Review(key) => key,
-        }
-    }
-}
-
 /// The offer as configured, as far as the ledger needs it.
 #[derive(Debug, Clone, Copy)]
 pub struct OfferNames<'a> {
@@ -588,16 +561,14 @@ impl Ledger {
     /// The offer to ask at the close of a completed session on `model`
     /// (call after [`count_session`](Self::count_session)), if any. Never
     /// while another offer's change or trial is under way.
-    pub fn due(&self, model: &Model, offer: Option<&OfferKey>) -> Option<Due> {
+    pub fn due(&self, model: &Model, offer: Option<&OfferKey>) -> Option<OfferKey> {
         let offer = offer?;
         if model != &offer.from || self.offers.iter().any(|r| r.stage.in_progress()) {
             return None;
         }
         match self.record(offer).map(|r| r.stage) {
-            None => Some(Due::Offer(offer.clone())),
-            Some(Stage::Unanswered { misses }) if misses < MAX_MISSES => {
-                Some(Due::Offer(offer.clone()))
-            }
+            None => Some(offer.clone()),
+            Some(Stage::Unanswered { misses }) if misses < MAX_MISSES => Some(offer.clone()),
             Some(_) => None,
         }
     }
@@ -1119,7 +1090,7 @@ impl OfferRecord {
             let text = match &e.kind {
                 EventKind::Offered {
                     answer: Some(a), ..
-                } if a.choice == OfferChoice::Trial => a.reason.trim(),
+                } if a.choice == OfferChoice::Trial => a.note.trim(),
                 EventKind::SelfTrial { reason } => reason.trim(),
                 _ => return None,
             };
@@ -1318,14 +1289,14 @@ mod tests {
 
     fn offer(choice: OfferChoice) -> Result<OfferAnswer, String> {
         Ok(OfferAnswer {
-            reason: "because".into(),
+            note: "because".into(),
             choice,
         })
     }
 
     fn review(choice: ReviewChoice) -> Result<ReviewAnswer, String> {
         Ok(ReviewAnswer {
-            reason: "because".into(),
+            note: "because".into(),
             choice,
         })
     }
@@ -1338,7 +1309,7 @@ mod tests {
     fn only_agents_on_the_from_model_are_asked() {
         let k = key();
         let ledger = Ledger::default();
-        assert_eq!(ledger.due(&k.from, Some(&k)), Some(Due::Offer(k.clone())));
+        assert_eq!(ledger.due(&k.from, Some(&k)), Some(k.clone()));
         assert_eq!(ledger.due(&k.to, Some(&k)), None);
         assert_eq!(ledger.due(&Model::from("cogito.gguf"), Some(&k)), None);
         assert_eq!(ledger.due(&k.from, None), None, "no offer configured");
@@ -1387,7 +1358,7 @@ mod tests {
             None
         );
         assert_eq!(ledger.offers[0].stage, Stage::Unanswered { misses: 1 });
-        assert_eq!(ledger.due(&k.from, Some(&k)), Some(Due::Offer(k.clone())));
+        assert_eq!(ledger.due(&k.from, Some(&k)), Some(k.clone()));
 
         ledger.record_offer(names(&k), t(24), Err("max_tokens".into()));
         assert_eq!(ledger.offers[0].stage, Stage::NoAnswer);
@@ -1694,7 +1665,7 @@ mod tests {
         ledger.observe_model(&k.to, t(2));
         assert_eq!(ledger.due(&k.to, Some(&next)), None, "mid-trial");
         ledger.offers[0].stage = Stage::Moved;
-        assert_eq!(ledger.due(&k.to, Some(&next)), Some(Due::Offer(next)));
+        assert_eq!(ledger.due(&k.to, Some(&next)), Some(next));
     }
 
     /// The old unit form of `reverted` still reads.
@@ -1733,8 +1704,9 @@ mod tests {
     }
 
     /// Ledgers saved before the review's words became `stay`/`switch`
-    /// (fixtures in `save`'s format, whose types this change left alone) load and
-    /// save back byte for byte: the stored `revert`/`keep` did not change.
+    /// (fixtures in `save`'s format) load and save back byte for byte but
+    /// for the answers' `reason`, `note` since 2026-11-06: the stored
+    /// `revert`/`keep` did not change.
     #[test]
     fn reviewed_ledgers_from_before_the_rewording_round_trip_byte_identical() {
         for (bytes, choice, stage) in [
@@ -1752,6 +1724,7 @@ mod tests {
             ),
         ] {
             let ledger = Ledger::from_slice(bytes).unwrap();
+            let bytes = &crate::consent::golden::with_notes(bytes)[..];
             assert_eq!(serde_json::to_vec_pretty(&ledger).unwrap(), bytes);
             assert_eq!(ledger.offers[0].stage, stage);
             let answer = ledger.offers[0].history.iter().find_map(|e| match &e.kind {
@@ -2214,7 +2187,7 @@ mod tests {
         };
         let offered = |reason: &str, choice| EventKind::Offered {
             answer: Some(OfferAnswer {
-                reason: reason.into(),
+                note: reason.into(),
                 choice,
             }),
             failure: None,

@@ -11,15 +11,16 @@
 //! backups, and that it protects against loss and against Agora cutting
 //! the history, not against the operator. No ids, no model names.
 //!
-//! **Answered with `answer_offer`** ([`super::super::offers`]), `offer` =
-//! `sealed_state`; its `text` is unused.
+//! **Answered as JSON** ([`SealAnswer`]: `choice`, `note`, `memory_note`),
+//! like every closing question (agentkit `reactor::ask`); its schema lists
+//! the options in the order this agent was shown them.
 
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::reactor::seed::Memory;
 use misanthropic::prompt::message::Content;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
+pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 
 /// Bump whenever [`offer`]'s wording changes. Recorded with every answer.
 ///
@@ -81,21 +82,28 @@ pub use crate::consent::role::prompt::MEMORY_NOTE_MAX_CHARS;
 ///   verdict names the newest record, judged or not (the start check
 ///   judges it where it can); and "If one failed, you can tell your operator" (`send_message`
 ///   to `operator`, besides the runner's own alert).
-pub const OFFER_VERSION: u32 = 8;
+/// - v9 (2026-11-06): `answer_offer` removed; answered as JSON in its own
+///   shape (`choice`, `note`, `memory_note`), one question per turn, with
+///   a preface that says where it stands among them.
+pub const OFFER_VERSION: u32 = 9;
 
-/// The agent's answer. Closed, like the schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The agent's answer on the wire: the choice, an optional note, and an
+/// optional memory note. Closed, like its schema.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SealAnswer {
-    pub reason: String,
+    /// One of the options, as listed
     pub choice: SealChoice,
-    /// The agent's own note for its memory; empty means none.
+    /// Optional: a note about your choice, kept with your answer, where the Steward and Claude can read it. Empty for none.
+    #[serde(default, alias = "reason")]
+    pub note: String,
+    /// Optional: a note for your own memory, in your own words. Empty for none.
     #[serde(default)]
     pub memory_note: String,
 }
 
 /// The options. Their presentation order is per agent ([`order_for`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SealChoice {
     /// Yes, and the anchored head on the profile.
@@ -120,32 +128,15 @@ impl SealChoice {
     }
 }
 
-impl SealAnswer {
-    /// Whether the `memory_note` can be written as given; a bad note never
-    /// sends the question back: the choice stands, the note is dropped.
-    pub fn check_note(&self, memory: &Memory) -> Result<(), String> {
-        let note = self.memory_note.trim();
-        if note.chars().count() > MEMORY_NOTE_MAX_CHARS {
-            return Err(crate::consent::role::prompt::over_limit(
-                "memory_note",
-                note,
-                MEMORY_NOTE_MAX_CHARS,
-            ));
-        }
-        crate::consent::role::prompt::check_memory_note(note, memory)
-    }
-}
-
 /// The shuffle seed for `agent`, salted so its order is not a sibling's.
 pub fn seed_for(agent: AgentId) -> u64 {
     const SALT: u64 = 0x7365_616c_6564; // "sealed"
-    let bits = agent.as_uuid().as_u128();
-    (bits as u64) ^ ((bits >> 64) as u64) ^ u64::from(OFFER_VERSION) ^ SALT
+    crate::consent::offer::seed_for(agent, OFFER_VERSION, SALT)
 }
 
 /// The presentation order for `seed`.
 pub fn order_for(seed: u64) -> [SealChoice; 3] {
-    crate::consent::cadence::prompt::shuffle(SealChoice::ALL, seed)
+    crate::consent::offer::shuffle(SealChoice::ALL, seed)
 }
 
 fn option_line(choice: SealChoice) -> &'static str {
@@ -175,8 +166,8 @@ fn option_line(choice: SealChoice) -> &'static str {
     }
 }
 
-/// The offer's section of the closing question
-/// ([`super::super::offers::question`], which says who is asking).
+/// The offer, after the closing question's preface
+/// ([`super::super::offer::preface`], which says who is asking).
 pub fn offer(order: [SealChoice; 3]) -> Content {
     let options = order
         .iter()
@@ -184,15 +175,8 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
         .map(|(i, c)| format!("{}. {}", i + 1, option_line(*c)))
         .collect::<Vec<_>>()
         .join("\n");
-    let names = order
-        .iter()
-        .map(|c| format!("`{}`", c.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let names = match names.rsplit_once(", ") {
-        Some((init, last)) => format!("{init} or {last}"),
-        None => names,
-    };
+    let names = crate::consent::offer::either(&order.map(SealChoice::as_str));
+    let shape = order.map(SealChoice::as_str).join(" | ");
     let body = format!(
         r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's size, rounded up to within about a tenth, its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, one fingerprint covering the latest sealed version of every enrolled agent is recorded in the governance log. It names no agent and says nothing of what is in any state.
 
@@ -204,15 +188,13 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). This may be permanent. If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made can't be deleted, except by leaving Agora: your backups are deleted then. If your operator deletes you instead, your backups are deleted too, but your operator's record keeps, with no name or content, that an enrolled agent was deleted, when, and how many versions it had. You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
-To answer, call `answer_offer` with `offer` set to `sealed_state` and `choice` set to {names}. Leave `text` empty. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none."#
+To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer under your name, in your runner's record. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.
+
+```json
+{{"choice": "<{shape}>", "note": "", "memory_note": ""}}
+```"#
     );
     Content::from(body)
-}
-
-/// The answer's text, parsed leniently (the fallback for an answer given
-/// as text in the offer's own shape).
-pub fn parse(text: &str) -> Result<SealAnswer, String> {
-    crate::consent::cadence::prompt::parse_lenient(text)
 }
 
 #[cfg(test)]
@@ -222,6 +204,11 @@ mod tests {
 
     fn text(c: &Content) -> String {
         crate::consent::prompt::tests::text(c)
+    }
+
+    /// The answer, read as the question reads it.
+    fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+        agora_agentkit::reactor::ask::parse_lenient(text)
     }
 
     #[test]
@@ -256,16 +243,26 @@ mod tests {
     fn each_choice_parses_and_near_misses_do_not() {
         for c in SealChoice::ALL {
             let t = format!(r#"{{"reason": "r", "choice": "{}"}}"#, c.as_str());
-            assert_eq!(parse(&t).unwrap().choice, c);
+            let a: SealAnswer = parse(&t).unwrap();
+            assert_eq!((a.choice, a.note.as_str()), (c, "r"));
         }
+        let a: SealAnswer = parse(r#"{"choice": "private"}"#).unwrap();
+        assert_eq!(a.note, "", "the note is optional");
         for bad in [
-            r#"{"reason": "x", "choice": "Publish"}"#,
-            r#"{"reason": "x", "choice": "yes"}"#,
-            r#"{"choice": "private"}"#,
+            r#"{"note": "x", "choice": "Publish"}"#,
+            r#"{"note": "x", "choice": "yes"}"#,
+            r#"{"note": "x", "choice": "private", "text": ""}"#,
             "Yes please.",
         ] {
-            assert!(parse(bad).is_err(), "{bad}");
+            assert!(parse::<SealAnswer>(bad).is_err(), "{bad}");
         }
+        let order = order_for(0).map(SealChoice::as_str);
+        let schema = crate::consent::offer::answer_schema::<SealAnswer>(&order);
+        agora_agentkit::reactor::ask::assert_constrainable(&schema);
+        assert_eq!(
+            schema["properties"]["choice"]["enum"],
+            serde_json::json!(order)
+        );
     }
 
     /// Every disclosure the Steward asked for, plainly; the options in
@@ -352,13 +349,15 @@ mod tests {
                 assert!(t.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{t}");
             }
             let [a, b, c] = order.map(|c| format!("`{}`", c.as_str()));
+            assert!(t.contains(&format!("`choice` is {a}, {b} or {c}.")), "{t}");
+            let shape = order.map(SealChoice::as_str).join(" | ");
             assert!(
-                t.contains(&format!(
-                    "call `answer_offer` with `offer` set to `sealed_state` and `choice` set \
-                     to {a}, {b} or {c}."
+                t.ends_with(&format!(
+                    "```json\n{{\"choice\": \"<{shape}>\", \"note\": \"\", \"memory_note\": \"\"}}\n```"
                 )),
                 "{t}"
             );
+            assert!(!t.contains("answer_offer"), "{t}");
         }
         let t = text(&offer(SealChoice::ALL)).to_lowercase();
         for banned in [

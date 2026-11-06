@@ -223,7 +223,7 @@ mod tests {
             },
             Utc::now(),
             Ok(OfferAnswer {
-                reason: "r".into(),
+                note: "r".into(),
                 choice,
             }),
         );

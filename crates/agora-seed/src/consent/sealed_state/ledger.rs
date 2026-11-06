@@ -5,7 +5,7 @@
 //! One entry per time the offer was put: when, which version of the text,
 //! on which model, the option order shown and its seed, how many attempts,
 //! and the outcome. **Asked once**: an answer on file, or an explicit
-//! refusal, ends it; a missing answer is re-asked up to [`MAX_MISSES`] in
+//! refusal, ends it; a missing answer is re-asked up to [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) in
 //! all. `sealed-enroll` reads [`SealLedger::choice`] and nothing else.
 
 use std::path::{Path, PathBuf};
@@ -22,9 +22,6 @@ pub const LEDGER_FILE: &str = "sealed_state.json";
 
 /// Bump on layout change; [`SealLedger::load`] refuses anything newer.
 pub const FORMAT: u32 = 1;
-
-/// Unanswered asks before the runner stops asking.
-pub const MAX_MISSES: u32 = 2;
 
 /// The whole per-agent file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,8 +89,23 @@ pub enum SealOutcome {
     },
     /// An explicit refusal: nothing changes, and that is final.
     Refused { reason: String },
-    /// No usable choice: nothing changes this time.
+    /// No answer, the agent's doing (an API refusal, since 2026-11-06):
+    /// nothing changes this time; counts toward [`MAX_MISSES`](crate::consent::offer::MAX_MISSES).
     NoAnswer { failure: String },
+    /// Every reply unusable (since 2026-11-06): our failure, not the
+    /// agent's choice. Recorded, never counted: asked again later.
+    Unusable { failure: String },
+}
+
+impl crate::consent::offer::Outcome for SealOutcome {
+    fn status(&self) -> crate::consent::offer::Status {
+        use crate::consent::offer::Status;
+        match self {
+            Self::Answered { .. } | Self::Refused { .. } => Status::Settled,
+            Self::NoAnswer { .. } => Status::Miss,
+            Self::Unusable { .. } => Status::Unrecorded,
+        }
+    }
 }
 
 impl SealLedger {
@@ -152,24 +164,13 @@ impl SealLedger {
     }
 
     /// Whether the offer should be put this session: nothing final on
-    /// file, fewer than [`MAX_MISSES`] misses, and no recorded answer in
+    /// file, fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no recorded answer in
     /// `soul`'s Evolution Log.
     pub fn due(&self, soul: &Soul) -> bool {
-        if super::applied_in(soul) {
-            return false;
-        }
-        let settled = self.asks.iter().any(|a| {
-            matches!(
-                a.outcome,
-                SealOutcome::Answered { .. } | SealOutcome::Refused { .. }
-            )
-        });
-        let misses = self
-            .asks
-            .iter()
-            .filter(|a| matches!(a.outcome, SealOutcome::NoAnswer { .. }))
-            .count();
-        !settled && misses < MAX_MISSES as usize
+        crate::consent::offer::due(
+            self.asks.iter().map(|a| &a.outcome),
+            super::applied_in(soul),
+        )
     }
 
     /// The choice on file, if any (asked once: at most one).
@@ -276,16 +277,19 @@ mod tests {
         }
     }
 
-    /// An answer to an older text settles the offer: a new version
-    /// (v6) asks nobody who answered v5 again.
+    /// An answer to an older text settles the offer: a new version asks
+    /// nobody who answered an older one again (v6 nobody who answered v5;
+    /// v9, the JSON answer, nobody who answered with `answer_offer`).
     #[test]
     fn an_answer_to_an_older_offer_text_is_not_asked_again() {
-        let mut l = SealLedger::default();
-        let mut a = ask(answered(SealChoice::Private));
-        a.offer_version = 5;
-        l.record(a);
-        const { assert!(super::super::prompt::OFFER_VERSION > 5) };
-        assert!(!l.due(&soul()));
+        for old in [5, 8] {
+            let mut l = SealLedger::default();
+            let mut a = ask(answered(SealChoice::Private));
+            a.offer_version = old;
+            l.record(a);
+            assert!(!l.due(&soul()), "v{old}");
+        }
+        const { assert!(super::super::prompt::OFFER_VERSION > 8) };
     }
 
     #[test]
@@ -303,7 +307,7 @@ mod tests {
         l.record(ask(SealOutcome::Refused { reason: "r".into() }));
         assert!(!l.due(&soul()) && !l.opted_in(), "a refusal is final");
         let mut l = SealLedger::default();
-        for _ in 0..MAX_MISSES {
+        for _ in 0..crate::consent::offer::MAX_MISSES {
             assert!(l.due(&soul()));
             l.record(ask(SealOutcome::NoAnswer {
                 failure: "x".into(),

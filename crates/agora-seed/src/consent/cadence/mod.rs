@@ -12,12 +12,10 @@
 //!   any one option, and the options in an order **shuffled per agent**,
 //!   seeded from its id and recorded ([`prompt::order_for`]).
 //! - **Never a cache miss to constrain an answer** (Steward, 2026-10-01).
-//!   Since v2 (2026-10-02) the answer is a call to the strict
-//!   `answer_offer` tool ([`super::offers`]), registered for every agent
-//!   from the first turn, so the request is left byte-for-byte as it was
-//!   plus the question on every backend, and `reason` is still written
-//!   before `choice`. An answer given as JSON text instead is parsed
-//!   leniently into the same typed struct (the fallback).
+//!   From v2 (2026-10-02) to v4 the answer was a call to the strict
+//!   `answer_offer` tool; since 2026-11-06 it is JSON in its own shape
+//!   ([`super::questions`]), its schema sent as `output_config` only where
+//!   that is cache-safe (blallama), and parsed leniently everywhere.
 //! - **The first parsed choice wins.** An answer whose `choice` parses is
 //!   honoured even if its other fields are broken (the note is then
 //!   dropped and the salvage recorded). Only a missing or invalid `choice`
@@ -250,10 +248,7 @@ pub fn reasked_in(soul: &Soul, rounds: usize) -> bool {
 
 /// Whether `soul`'s Evolution Log already records a cadence answer.
 pub fn applied_in(soul: &Soul) -> bool {
-    soul.evolution_log.iter().any(|e| {
-        let note = e.note.as_str();
-        note.starts_with("[SYSTEM] ") && note.contains(ASKED)
-    })
+    crate::consent::offer::in_log(soul, ASKED)
 }
 
 /// What the sweep planner applies: per-agent rounds and cycle for agents

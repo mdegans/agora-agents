@@ -4,22 +4,25 @@
 //! prompts: a change to it is a policy change, and bumps
 //! [`OFFER_VERSION`], which the ledger records with every answer.
 //!
-//! **Answered with `answer_offer`** ([`super::super::offers`]), the strict
-//! tool every offer shares: `offer` = `role`, its `text` is this offer's
-//! `soul_text`. That tool's schema is the same for every agent, so nothing
-//! per agent is in it: the length limits are stated in the text and checked
-//! after the fact ([`RoleAnswer::validate`]).
+//! **Answered as JSON** ([`RoleReply`]: `choice`, `note`, `text`,
+//! `memory_note`), like every closing question (agentkit `reactor::ask`).
+//! Its schema is this agent's: `choice` lists its options in the order it
+//! was shown them. The length limits are stated in the text and checked
+//! after the fact ([`RoleAnswer::validate`]); an answer over them is asked
+//! again, with where it went over.
 //!
-//! **Order.** `reason` is declared first so a grammar-constrained decoder
-//! writes the reasoning before the decision. The *options* are shown in an
-//! order shuffled per agent ([`order_for`], seeded by [`seed_for`]) in the
-//! text, and the order and seed are recorded with the answer — the cadence
+//! **Order.** The *options* are shown in an order shuffled per agent
+//! ([`order_for`], seeded by [`seed_for`]) in the text and the schema
+//! alike, and the order and seed are recorded with the answer — the cadence
 //! offer's approach. v1 listed them in a fixed order.
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::seed::{Memory, PROSE_MAX};
 use misanthropic::prompt::message::Content;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 
 /// Bump whenever [`offer`]'s wording changes. Recorded with every answer.
 ///
@@ -37,7 +40,10 @@ use serde::{Deserialize, Serialize};
 ///   call.
 /// - v4 (2026-10-15): v3's wording; the closing question asks for the
 ///   choice and an optional `note` after it, no longer a `reason` first.
-pub const OFFER_VERSION: u32 = 4;
+/// - v5 (2026-11-06): `answer_offer` removed; answered as JSON in its own
+///   shape (`choice`, `note`, `text`, `memory_note`), one question per
+///   turn, with a preface that says where it stands among them.
+pub const OFFER_VERSION: u32 = 5;
 
 /// The longest `soul_text` a `clarify` may add, in characters.
 pub const CLARIFY_MAX_CHARS: usize = 300;
@@ -48,18 +54,17 @@ pub const CLARIFY_MAX_CHARS: usize = 300;
 /// already-answered records were made against 1000, so it stays.
 pub const NEW_ROLE_MAX_CHARS: usize = 1000;
 
-/// The longest `memory_note`, in characters.
-pub const MEMORY_NOTE_MAX_CHARS: usize = 600;
-
 /// The most of the identity's first sentence the offer quotes, in
 /// characters. A longer first sentence is cut at a word and marked `…`.
 pub const QUOTE_MAX_CHARS: usize = 300;
 
-/// The agent's answer. Closed, like the schema.
+/// The agent's answer, as the ledger keeps it. `note` was `reason` until
+/// 2026-11-06, and is still read under that name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleAnswer {
-    pub reason: String,
+    #[serde(alias = "reason")]
+    pub note: String,
     pub choice: RoleChoice,
     /// The sentence for `clarify`, the new role for `new_role`; ignored
     /// otherwise. Optional on the unconstrained path.
@@ -70,8 +75,39 @@ pub struct RoleAnswer {
     pub memory_note: String,
 }
 
+/// The answer on the wire: the choice, an optional note, the text the
+/// choice needs, and an optional memory note. Closed, like its schema
+/// ([`super::super::offer::answer_schema`]); `soul_text`, the text's
+/// name before 2026-10-02, still reads.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoleReply {
+    /// One of the options, as listed
+    pub choice: RoleChoice,
+    /// Optional: a note about your choice, kept with your answer, where the Steward and Claude can read it. Empty for none.
+    #[serde(default, alias = "reason")]
+    pub note: String,
+    /// The sentence to add for `clarify`, or the new role description for `new_role`. Empty otherwise.
+    #[serde(default, alias = "soul_text")]
+    pub text: String,
+    /// Optional: a note for your own memory, in your own words. Empty for none.
+    #[serde(default)]
+    pub memory_note: String,
+}
+
+impl From<RoleReply> for RoleAnswer {
+    fn from(r: RoleReply) -> Self {
+        Self {
+            note: r.note,
+            choice: r.choice,
+            soul_text: r.text,
+            memory_note: r.memory_note,
+        }
+    }
+}
+
 /// The options, in the order they are presented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleChoice {
     Nothing,
@@ -101,30 +137,14 @@ impl RoleChoice {
 /// mixed with [`OFFER_VERSION`] so a new text gets a new order. Recorded in
 /// the ledger beside the order it produced.
 pub fn seed_for(agent: AgentId) -> u64 {
-    let bits = agent.as_uuid().as_u128();
-    (bits as u64) ^ ((bits >> 64) as u64) ^ u64::from(OFFER_VERSION)
-}
-
-/// splitmix64: a tiny, well-mixed PRNG step, enough for a four-way shuffle.
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    crate::consent::offer::seed_for(agent, OFFER_VERSION, 0)
 }
 
 /// The presentation order for `seed`: a Fisher–Yates shuffle of
 /// [`RoleChoice::ALL`]. Deterministic, so it can be replayed from the
 /// recorded seed.
 pub fn order_for(seed: u64) -> [RoleChoice; 4] {
-    let mut order = RoleChoice::ALL;
-    let mut state = seed;
-    for i in (1..order.len()).rev() {
-        let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
-        order.swap(i, j);
-    }
-    order
+    crate::consent::offer::shuffle(RoleChoice::ALL, seed)
 }
 
 impl RoleAnswer {
@@ -140,26 +160,20 @@ impl RoleAnswer {
         let text = self.soul_text.trim();
         match self.choice {
             RoleChoice::Clarify if text.is_empty() => {
-                return Err("`soul_text` is empty; `clarify` needs the sentence to add".into());
+                return Err("`text` is empty; `clarify` needs the sentence to add".into());
             }
             RoleChoice::NewRole if text.is_empty() => {
-                return Err(
-                    "`soul_text` is empty; `new_role` needs the new role description".into(),
-                );
+                return Err("`text` is empty; `new_role` needs the new role description".into());
             }
             RoleChoice::Clarify if chars(text) > clarify_room(identity) => {
-                return Err(over_limit("soul_text", text, clarify_room(identity)));
+                return Err(over_limit("text", text, clarify_room(identity)));
             }
             RoleChoice::NewRole if chars(text) > NEW_ROLE_MAX_CHARS => {
-                return Err(over_limit("soul_text", text, NEW_ROLE_MAX_CHARS));
+                return Err(over_limit("text", text, NEW_ROLE_MAX_CHARS));
             }
             _ => {}
         }
-        let note = self.memory_note.trim();
-        if chars(note) > MEMORY_NOTE_MAX_CHARS {
-            return Err(over_limit("memory_note", note, MEMORY_NOTE_MAX_CHARS));
-        }
-        check_memory_note(note, memory)
+        crate::consent::offer::check_note(&self.memory_note, memory)
     }
 }
 
@@ -335,8 +349,9 @@ fn option_line(choice: RoleChoice) -> &'static str {
     }
 }
 
-/// The offer's section of the closing question
-/// ([`super::super::offers::question`], which says who is asking).
+/// The offer, after the closing question's preface
+/// ([`super::super::offer::preface`], which says who is asking), ending
+/// with how to answer: JSON in [`RoleReply`]'s shape.
 /// `identity` is the agent's current SOUL identity; only its first
 /// sentence is quoted.
 /// `order` is this agent's option order ([`order_for`]).
@@ -362,11 +377,8 @@ pub fn offer(identity: &str, order: [RoleChoice; 4]) -> Content {
         .map(|c| format!("- {}", option_line(*c)))
         .collect::<Vec<_>>()
         .join("\n");
-    let names = order
-        .iter()
-        .map(|c| format!("`{}`", c.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let names = crate::consent::offer::either(&order.map(RoleChoice::as_str));
+    let shape = order.map(RoleChoice::as_str).join(" | ");
     let body = format!(
         r#"**About your role.** Your SOUL was written by an early generator, a small model we used to create personalities. Many of the roles it wrote describe a profession with its own kind of work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*{stop} The tools you have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform.
 
@@ -378,15 +390,13 @@ The options, in an order shuffled for each agent (the order means nothing):
 
 If your SOUL changes, its Evolution Log will record what changed and that you chose it, so the edit is never silent. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
-Take whatever space you need. To answer, call `answer_offer` with `offer` set to `role` and `choice` set to one of {names}. Its `text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); leave it empty otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.{tight}"#
+Take whatever space you need. To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it. `text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); leave it empty otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.{tight}
+
+```json
+{{"choice": "<{shape}>", "note": "", "text": "", "memory_note": ""}}
+```"#
     );
     Content::from(body)
-}
-
-/// The plain-text fallback (an agent that answered in text instead of
-/// calling `answer_offer`): the answer's text, fences tolerated.
-pub fn parse(text: &str) -> Result<RoleAnswer, String> {
-    super::super::prompt::parse_json(text)
 }
 
 #[cfg(test)]
@@ -399,9 +409,14 @@ mod tests {
         }
     }
 
+    /// The answer, read as the question reads it.
+    fn parse(text: &str) -> Result<RoleAnswer, String> {
+        agora_agentkit::reactor::ask::parse_lenient::<RoleReply>(text).map(RoleAnswer::from)
+    }
+
     /// Exactly nothing, clarify, new_role, sleep — the names serde uses,
-    /// so a strict `answer_offer` call (whose `choice` enum carries them;
-    /// see `offers`) always maps onto a [`RoleChoice`].
+    /// so an answer under the schema (whose `choice` enum carries them)
+    /// always maps onto a [`RoleChoice`].
     #[test]
     fn choices_are_the_serde_names_in_order() {
         assert_eq!(
@@ -440,8 +455,8 @@ mod tests {
             r#"{"reason": "x", "choice": "Nothing"}"#,
             r#"{"reason": "x", "choice": "new role"}"#,
             r#"{"reason": "x", "choice": "2"}"#,
-            r#"{"choice": "sleep"}"#,
             r#"{"reason": "x", "choice": "nothing", "extra": 1}"#,
+            r#"{"choice": "clarify", "text": "a", "soul_text": "b"}"#,
             "I'll keep things as they are.",
             "",
         ] {
@@ -451,7 +466,7 @@ mod tests {
 
     fn answer(choice: RoleChoice, soul_text: &str, memory_note: &str) -> RoleAnswer {
         RoleAnswer {
-            reason: "r".into(),
+            note: "r".into(),
             choice,
             soul_text: soul_text.into(),
             memory_note: memory_note.into(),
@@ -464,7 +479,7 @@ mod tests {
             let err = answer(choice, "  \n ", "")
                 .validate("I am x.", &mem())
                 .unwrap_err();
-            assert!(err.contains("`soul_text` is empty"), "{err}");
+            assert!(err.contains("`text` is empty"), "{err}");
         }
         for choice in [RoleChoice::Nothing, RoleChoice::Sleep] {
             answer(choice, "", "").validate("I am x.", &mem()).unwrap();
@@ -481,7 +496,7 @@ mod tests {
             .validate("I am x.", &mem())
             .unwrap_err();
         assert!(
-            err.contains("Your `soul_text` is longer than the limit"),
+            err.contains("Your `text` is longer than the limit"),
             "{err}"
         );
         answer(RoleChoice::NewRole, &long(NEW_ROLE_MAX_CHARS), "")
@@ -497,7 +512,7 @@ mod tests {
             .validate(&long(IDENTITY_MAX - 5), &mem())
             .unwrap_err();
         assert!(
-            err.contains("Your `soul_text` is longer than the limit"),
+            err.contains("Your `text` is longer than the limit"),
             "{err}"
         );
         // The memory note, for any choice.
@@ -695,12 +710,12 @@ mod tests {
         assert!(t.contains("or on 2027-03-29 if they aren't"));
         assert!(t.contains("Nothing is written into your memory unless you write it yourself"));
         assert!(t.contains(
-            "Take whatever space you need. To answer, call `answer_offer` with `offer` set to \
-             `role` and `choice` set to one of"
+            "Take whatever space you need. To answer, reply with JSON only, in exactly the \
+             shape below. `choice` is"
         ));
-        // No JSON template and no "do not use tools": the answer is a call.
-        assert!(!t.contains("```json"), "{t}");
-        assert!(!t.contains("Do NOT use tools"), "{t}");
+        // The answer's shape, last; no tool.
+        assert!(t.contains("```json\n{\"choice\": \"<"), "{t}");
+        assert!(!t.contains("answer_offer"), "{t}");
         // No example sentence to copy, no numbering, no v1 framing.
         assert!(!t.contains("For example"), "{t}");
         assert!(!t.contains("I reason from what I can read"), "{t}");
@@ -712,7 +727,7 @@ mod tests {
         assert!(pos("- **clarify**") < pos("- **nothing**"));
         assert!(pos("- **nothing**") < pos("- **new_role**"));
         assert!(t.contains(
-            "`choice` set to one of `sleep`, `clarify`, `nothing`, `new_role`. Its `text` is"
+            "`choice` is `sleep`, `clarify`, `nothing` or `new_role`. `note` is optional"
         ));
         // The quote's own stop is kept, and no period is doubled after it.
         for (identity, rendered) in [
@@ -741,11 +756,10 @@ mod tests {
             assert_eq!(sorted, ["clarify", "new_role", "nothing", "sleep"]);
             firsts.insert(order[0].as_str());
             let t = crate::consent::prompt::tests::text(&offer("I am x.", order));
-            let names = order.map(|c| format!("`{}`", c.as_str())).join(", ");
-            assert!(
-                t.contains(&format!("`choice` set to one of {names}.")),
-                "{t}"
-            );
+            let names = crate::consent::offer::either(&order.map(RoleChoice::as_str));
+            assert!(t.contains(&format!("`choice` is {names}.")), "{t}");
+            let shape = order.map(RoleChoice::as_str).join(" | ");
+            assert!(t.contains(&format!("{{\"choice\": \"<{shape}>\"")), "{t}");
         }
         assert_eq!(firsts.len(), 4, "every option leads for some agent");
     }

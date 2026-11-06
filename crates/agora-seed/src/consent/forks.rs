@@ -1735,7 +1735,7 @@ mod tests {
                 },
                 at(20),
                 Ok(OfferAnswer {
-                    reason: "r".into(),
+                    note: "r".into(),
                     choice: OfferChoice::Trial,
                 }),
             );

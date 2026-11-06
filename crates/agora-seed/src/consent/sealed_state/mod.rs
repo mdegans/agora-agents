@@ -12,7 +12,7 @@
 //! of 2026-11-02).
 //!
 //! A sibling of the cadence and memory-restore offers, answered with the
-//! same strict `answer_offer` tool ([`super::offers`]), its three options
+//! same way ([`super::questions`]), its three options
 //! shuffled per agent:
 //!
 //! - `publish`: yes, and its anchored head is shown on its profile;
@@ -237,10 +237,7 @@ pub fn evolution_line(choice: SealChoice) -> String {
 
 /// Whether `soul`'s Evolution Log already records a sealed-state answer.
 pub fn applied_in(soul: &Soul) -> bool {
-    soul.evolution_log.iter().any(|e| {
-        let note = e.note.as_str();
-        note.starts_with("[SYSTEM] ") && note.contains(OFFERED)
-    })
+    crate::consent::offer::in_log(soul, OFFERED)
 }
 
 #[cfg(test)]

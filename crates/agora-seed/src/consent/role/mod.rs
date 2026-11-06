@@ -15,8 +15,8 @@
 //!   and `enabled`, and only for the agents listed (`agents` and/or
 //!   `agents_file`). The offer's text is in code ([`prompt`]), versioned and
 //!   test-pinned, not in config.
-//! - [`prompt`] — the text and the answer (given with `answer_offer`,
-//!   [`super::offers`]).
+//! - [`prompt`] — the text and the answer (JSON in its own shape,
+//!   [`super::questions`]).
 //! - [`ledger`] — `state/<agent_id>/role_consent.json`: asked once, the
 //!   full answer and what was applied (including, permanently, a replaced
 //!   identity). Never the agent's memory. The SOUL's own disclosure lines
@@ -145,10 +145,7 @@ pub const ROLE_CHANGED: &str = "[SYSTEM] Role changed by the agent's own choice"
 
 /// Whether `soul`'s Evolution Log already discloses a role answer applied.
 pub fn applied_in(soul: &Soul) -> bool {
-    soul.evolution_log.iter().any(|e| {
-        let note = e.note.as_str();
-        note.starts_with(CLARIFIED) || note.starts_with(ROLE_CHANGED)
-    })
+    super::offer::in_log(soul, CLARIFIED) || super::offer::in_log(soul, ROLE_CHANGED)
 }
 
 /// Why the SOUL changed, in the Evolution Log. Neutral on purpose: it says
@@ -281,7 +278,7 @@ mod tests {
 
     fn answer(choice: RoleChoice, soul_text: &str) -> RoleAnswer {
         RoleAnswer {
-            reason: "r".into(),
+            note: "r".into(),
             choice,
             soul_text: soul_text.into(),
             memory_note: String::new(),

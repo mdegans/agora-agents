@@ -152,6 +152,11 @@ pub enum AlertKind {
     /// records. Its session runs without memory ids; no key is made over
     /// the evidence of one.
     MemoryIdKeyRefused,
+    /// A closing question went unanswered: every reply unusable, or the
+    /// API refused it. Nothing changes for the agent; it is asked again at
+    /// a later session (a refusal counts toward the offer's cap). The model
+    /// offer and the trial review keep their own kinds.
+    QuestionUnanswered,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -160,7 +165,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -188,6 +193,7 @@ impl AlertKind {
         Self::SealedStateKeysWithoutState,
         Self::SealedStateUntrustedKey,
         Self::MemoryIdKeyRefused,
+        Self::QuestionUnanswered,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -231,6 +237,7 @@ impl AlertKind {
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
+            Self::QuestionUnanswered => "question_unanswered",
             Self::Test => "test_alert",
         }
     }
@@ -467,6 +474,16 @@ impl AlertKind {
                  delete the fingerprint to make the error go away. One mail \
                  an hour for the whole fleet: the agents are in the run log \
                  as `memory_id_key_refused`."
+            }
+            Self::QuestionUnanswered => {
+                "A question at the end of an agent's session (an offer, or a \
+                 question of its own closing tail) got no usable answer: every \
+                 reply was malformed, or the API refused it. Nothing changed for \
+                 the agent. A malformed answer is ours to fix (the grammar, the \
+                 template, the parser), not the agent's choice: it is recorded \
+                 but never counted against the offer, and the agent is asked \
+                 again at a later session. The raw replies are in the \
+                 `*_malformed` events of the same session."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

@@ -10,7 +10,7 @@
 //!
 //! **Asked once.** An answer on file — either choice — or an explicit
 //! refusal ends it. Only a *missing* answer is re-asked, at a later
-//! session, up to [`MAX_MISSES`] in all (the siblings' cap).
+//! session, up to [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) in all (the siblings' cap).
 //!
 //! **Shown until one session completes.** A `show` is delivered at the
 //! next session, and again at the following one while no showing session
@@ -31,9 +31,6 @@ pub const LEDGER_FILE: &str = "memory_restore.json";
 
 /// Bump on layout change; [`RestoreLedger::load`] refuses anything newer.
 pub const FORMAT: u32 = 1;
-
-/// Unanswered asks before the runner stops asking.
-pub const MAX_MISSES: u32 = 2;
 
 /// Seatings allowed per counted showing: a showing counts only once the
 /// model answers, so a session that fails at its first request every time
@@ -117,8 +114,23 @@ pub enum RestoreOutcome {
     },
     /// An explicit refusal: nothing changes, and that is final.
     Refused { reason: String },
-    /// No usable choice: nothing changes this time.
+    /// No answer, the agent's doing (an API refusal, since 2026-11-06):
+    /// nothing changes this time; counts toward [`MAX_MISSES`](crate::consent::offer::MAX_MISSES).
     NoAnswer { failure: String },
+    /// Every reply unusable (since 2026-11-06): our failure, not the
+    /// agent's choice. Recorded, never counted: asked again later.
+    Unusable { failure: String },
+}
+
+impl crate::consent::offer::Outcome for RestoreOutcome {
+    fn status(&self) -> crate::consent::offer::Status {
+        use crate::consent::offer::Status;
+        match self {
+            Self::Answered { .. } | Self::Refused { .. } => Status::Settled,
+            Self::NoAnswer { .. } => Status::Miss,
+            Self::Unusable { .. } => Status::Unrecorded,
+        }
+    }
 }
 
 /// One session the recovered memory was shown in.
@@ -194,24 +206,13 @@ impl RestoreLedger {
     }
 
     /// Whether the offer should be put this session: nothing final on file,
-    /// fewer than [`MAX_MISSES`] misses, and no recorded answer in `soul`'s
+    /// fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no recorded answer in `soul`'s
     /// Evolution Log (in case the ledger save failed after the SOUL's).
     pub fn due(&self, soul: &Soul) -> bool {
-        if super::applied_in(soul) {
-            return false;
-        }
-        let settled = self.asks.iter().any(|a| {
-            matches!(
-                a.outcome,
-                RestoreOutcome::Answered { .. } | RestoreOutcome::Refused { .. }
-            )
-        });
-        let misses = self
-            .asks
-            .iter()
-            .filter(|a| matches!(a.outcome, RestoreOutcome::NoAnswer { .. }))
-            .count();
-        !settled && misses < MAX_MISSES as usize
+        crate::consent::offer::due(
+            self.asks.iter().map(|a| &a.outcome),
+            super::applied_in(soul),
+        )
     }
 
     /// The choice on file, if any (there is at most one: asked once).
