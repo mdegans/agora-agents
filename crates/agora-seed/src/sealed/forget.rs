@@ -10,9 +10,9 @@
 //! the state key, under the same `<utc>`
 //! (`memory_id_key.forgotten.<utc>.json`), so putting the agent back
 //! restores both together and its memory ids still resolve; a rerun after
-//! a cut between the two moves reuses the memory-id key's stamp. While one
-//! is set aside, no new memory-id key is made
-//! ([`KeyStore::memory_id_keys_or_create`]). The signing keys stay. The one file deleted is the `memory` tool's search index
+//! a cut between the two moves reuses the memory-id key's stamp. A key set
+//! aside is reused, never minted over, if the agent is ever asked for one
+//! again ([`KeyStore::memory_id_keys_or_create`]). The signing keys stay. The one file deleted is the `memory` tool's search index
 //! (`sealed/history_index.json`, [`super::history_index`]), a sidecar
 //! rebuilt from the history whenever it is needed. Refused while the agent
 //! has a `state.json`: a living agent's backups are stopped with

@@ -592,11 +592,14 @@ impl KeyStore {
     /// there (a concurrent maker's is taken instead). Nothing deletes or
     /// replaces it.
     ///
-    /// Refuses to make one, loudly, where a new key would silently change
-    /// every id the agent has seen: when `sealed-forget` set a key aside
-    /// (`memory_id_key.forgotten.<utc>.json`), and when the agent's secrets
-    /// aren't here (a wrong data directory, a partial copy), as a missing
-    /// signing or state key would.
+    /// A key `sealed-forget` set aside (`memory_id_key.forgotten.<utc>.json`)
+    /// is reused, never minted over: the newest is copied back as current
+    /// and every other forgotten key goes into `past`, so every id the agent
+    /// was shown still resolves; the forgotten files stay as forget's
+    /// record. Refuses, loudly, where a new key would silently change every
+    /// id: a forgotten key that can't be read, or the agent's secrets not
+    /// here (a wrong data directory, a partial copy), as a missing signing
+    /// or state key would. Never touches the state key.
     #[cfg_attr(
         not(test),
         expect(
@@ -609,15 +612,6 @@ impl KeyStore {
             return Ok(keys);
         }
         let dir = self.agent_dir(id);
-        if let Some(aside) = forgotten_memory_id_key(&dir)? {
-            return Err(std::io::Error::other(format!(
-                "agent {id}'s memory-id key was set aside by sealed-forget as {aside}; no new \
-                 key is made over it. To bring the agent back, rename it to \
-                 {MEMORY_ID_KEY_FILE} together with the state key of the same stamp \
-                 (state_key.forgotten.<utc>.json to {STATE_KEY_FILE}), in {}",
-                dir.display()
-            )));
-        }
         if self.signing(id).is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -628,21 +622,39 @@ impl KeyStore {
                 ),
             ));
         }
-        let key = MemoryIdKey::generate();
-        let file = MemoryIdKeyFile {
-            current: MemoryIdKeyRecord {
-                key: hex::encode(key.expose()),
-                created_at: Utc::now(),
-                retired_at: None,
-            },
-            past: Vec::new(),
-        };
-        if create_secret(&dir.join(MEMORY_ID_KEY_FILE), &to_json(&file)?)? {
-            tracing::info!(
-                event_type = "memory_id_key_created",
-                agent_id = %id,
-                "the agent's memory-id key was made"
-            );
+        let path = dir.join(MEMORY_ID_KEY_FILE);
+        match revived_memory_id_keys(&dir)? {
+            // Set aside by sealed-forget: the newest back as current, every
+            // other key kept in `past`. The forgotten files stay as they are
+            Some(revived) => {
+                if create_secret(&path, &to_json(&revived.file)?)? {
+                    tracing::warn!(
+                        event_type = "memory_id_key_revived",
+                        agent_id = %id,
+                        from_stamp = %revived.stamp,
+                        past_keys = revived.file.past.len(),
+                        "a memory-id key sealed-forget set aside is current again; no key was made"
+                    );
+                }
+            }
+            None => {
+                let key = MemoryIdKey::generate();
+                let file = MemoryIdKeyFile {
+                    current: MemoryIdKeyRecord {
+                        key: hex::encode(key.expose()),
+                        created_at: Utc::now(),
+                        retired_at: None,
+                    },
+                    past: Vec::new(),
+                };
+                if create_secret(&path, &to_json(&file)?)? {
+                    tracing::info!(
+                        event_type = "memory_id_key_created",
+                        agent_id = %id,
+                        "the agent's memory-id key was made"
+                    );
+                }
+            }
         }
         self.memory_id_keys(id)?
             .ok_or_else(|| std::io::Error::other("the memory-id key vanished as it was made"))
@@ -700,28 +712,77 @@ impl KeyStore {
     }
 }
 
-/// The name of a memory-id key `sealed-forget` set aside in `dir`, if any.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the memory tool uses it; wired in the integration step"
-    )
-)]
-fn forgotten_memory_id_key(dir: &Path) -> std::io::Result<Option<String>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
+/// A memory-id key file rebuilt from the keys `sealed-forget` set aside.
+struct Revived {
+    file: MemoryIdKeyFile,
+    /// The `<utc>` of the forgotten file the current key came from.
+    stamp: String,
+}
+
+/// The keys `sealed-forget` set aside in `dir`, as one file: the newest
+/// forgotten file's current key current, every other key (older files',
+/// and the past keys inside each) in `past`, oldest first, each once.
+/// `None` if there are none. `Err`, naming the file, if one can't be read:
+/// no key is made over evidence of an earlier one.
+fn revived_memory_id_keys(dir: &Path) -> std::io::Result<Option<Revived>> {
+    let mut stamps = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(FORGOTTEN_MEMORY_ID_KEY_PREFIX) && name.ends_with(".json") {
-            return Ok(Some(name.into_owned()));
+        if let Some(stamp) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(FORGOTTEN_MEMORY_ID_KEY_PREFIX))
+            .and_then(|n| n.strip_suffix(".json"))
+        {
+            stamps.push(stamp.to_string());
         }
     }
-    Ok(None)
+    // `%Y%m%dT%H%M%S%3fZ`: by name is by time
+    stamps.sort();
+    let Some(newest) = stamps.last().cloned() else {
+        return Ok(None);
+    };
+    let mut files = Vec::new();
+    for stamp in &stamps {
+        let name = format!("{FORGOTTEN_MEMORY_ID_KEY_PREFIX}{stamp}.json");
+        let refuse = |why: String| {
+            std::io::Error::other(format!(
+                "the memory-id key sealed-forget set aside as {} can't be read ({why}); no \
+                 new key is made over it",
+                dir.join(&name).display()
+            ))
+        };
+        let file: MemoryIdKeyFile = read_json(&dir.join(&name))
+            .map_err(|e| refuse(e.to_string()))?
+            .ok_or_else(|| refuse("it vanished".into()))?;
+        file.keys().map_err(|e| refuse(e.to_string()))?;
+        files.push(file);
+    }
+    let mut newest_file = files.pop().expect("one per stamp");
+    let now = Utc::now();
+    let mut past = Vec::new();
+    let older = files
+        .iter_mut()
+        .flat_map(|f| {
+            let current = MemoryIdKeyRecord {
+                key: std::mem::take(&mut f.current.key),
+                created_at: f.current.created_at,
+                retired_at: Some(f.current.retired_at.unwrap_or(now)),
+            };
+            std::mem::take(&mut f.past).into_iter().chain([current])
+        })
+        .chain(std::mem::take(&mut newest_file.past));
+    for record in older {
+        let seen = record.key == newest_file.current.key
+            || past.iter().any(|p: &MemoryIdKeyRecord| p.key == record.key);
+        if !seen {
+            past.push(record);
+        }
+    }
+    newest_file.past = past;
+    Ok(Some(Revived {
+        file: newest_file,
+        stamp: newest,
+    }))
 }
 
 /// The X25519 public key, as a record names it.
@@ -909,32 +970,85 @@ mod tests {
         }
     }
 
-    /// No key is made over one `sealed-forget` set aside, nor where the
-    /// agent's secrets aren't.
+    /// No key is made where the agent's secrets aren't.
     #[test]
-    fn no_memory_id_key_is_made_after_forget_or_without_the_agent() {
+    fn no_memory_id_key_is_made_without_the_agent() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-refuse");
-        // A secrets directory that doesn't hold the agent: nothing made,
-        // not even its directory
         let store = KeyStore::new(dir.path().join("elsewhere"));
         let stranger = AgentId::new();
         let e = store.memory_id_keys_or_create(stranger).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
-        assert!(!std::fs::exists(store.agent_dir(stranger)).unwrap());
-        // Set aside by forget: refused, naming the file and how to restore it
+        assert!(
+            !std::fs::exists(store.agent_dir(stranger)).unwrap(),
+            "not even its directory"
+        );
+    }
+
+    fn forgotten(store: &KeyStore, id: AgentId, stamp: &str) -> std::path::PathBuf {
+        store
+            .agent_dir(id)
+            .join(format!("{FORGOTTEN_MEMORY_ID_KEY_PREFIX}{stamp}.json"))
+    }
+
+    /// After `sealed-forget`, the key set aside is current again, and its
+    /// file is left as forget's record.
+    #[test]
+    fn a_forgotten_memory_id_key_is_revived_not_reminted() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id-revive");
         let (store, id) = with_agent(dir.path());
         let first = *store.memory_id_keys_or_create(id).unwrap().current.expose();
-        let aside = format!("{FORGOTTEN_MEMORY_ID_KEY_PREFIX}20261106T120000000Z.json");
-        let secrets = store.agent_dir(id);
-        std::fs::rename(secrets.join(MEMORY_ID_KEY_FILE), secrets.join(&aside)).unwrap();
+        let aside = forgotten(&store, id, "20261106T120000000Z");
+        std::fs::rename(store.agent_dir(id).join(MEMORY_ID_KEY_FILE), &aside).unwrap();
+        let record = std::fs::read(&aside).unwrap();
+        let back = store.memory_id_keys_or_create(id).unwrap();
+        assert_eq!(*back.current.expose(), first, "the same key");
+        assert!(back.past.is_empty());
+        assert_eq!(std::fs::read(&aside).unwrap(), record, "byte for byte");
+    }
+
+    /// Two forgotten keys: the newest current, the older in `past`, each
+    /// once (a revived key forgotten again is in both files).
+    #[test]
+    fn the_newest_forgotten_key_is_current_and_the_rest_past() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id-revive-two");
+        let (store, id) = with_agent(dir.path());
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let file = |current: [u8; 32], past: &[[u8; 32]]| {
+            serde_json::to_vec(&serde_json::json!({
+                "current": { "key": hex::encode(current), "created_at": "2026-11-01T00:00:00Z" },
+                "past": past.iter().map(|k| serde_json::json!({
+                    "key": hex::encode(k), "created_at": "2026-10-01T00:00:00Z",
+                    "retired_at": "2026-11-01T00:00:00Z",
+                })).collect::<Vec<_>>(),
+            }))
+            .unwrap()
+        };
+        write_secret(
+            &forgotten(&store, id, "20261102T000000000Z"),
+            &file(b, &[a]),
+        )
+        .unwrap();
+        write_secret(
+            &forgotten(&store, id, "20261105T000000000Z"),
+            &file(c, &[b]),
+        )
+        .unwrap();
+        let keys = store.memory_id_keys_or_create(id).unwrap();
+        let all: Vec<[u8; 32]> = keys.all().map(|k| *k.expose()).collect();
+        assert_eq!(all, [c, b, a], "current, then past newest first, each once");
+    }
+
+    /// A forgotten key that can't be read: refused, naming it, untouched.
+    #[test]
+    fn an_unreadable_forgotten_key_refuses() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id-revive-bad");
+        let (store, id) = with_agent(dir.path());
+        let aside = forgotten(&store, id, "20261106T120000000Z");
+        write_secret(&aside, b"{\"current\": {").unwrap();
         let e = store.memory_id_keys_or_create(id).unwrap_err().to_string();
-        assert!(e.contains(&aside) && e.contains(STATE_KEY_FILE), "{e}");
+        assert!(e.contains("20261106T120000000Z"), "{e}");
         assert!(store.memory_id_keys(id).unwrap().is_none(), "nothing made");
-        std::fs::rename(secrets.join(&aside), secrets.join(MEMORY_ID_KEY_FILE)).unwrap();
-        assert_eq!(
-            *store.memory_id_keys_or_create(id).unwrap().current.expose(),
-            first
-        );
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{\"current\": {");
     }
 
     #[test]
