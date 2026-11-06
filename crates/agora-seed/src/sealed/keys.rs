@@ -9,6 +9,10 @@
 //! - `<secrets>/<id>/rotations.json`: the agent-signed rotations of its
 //!   signing key, in order. Trust in old chain entries follows them
 //!   ([`KeyStore::trusted`]): a key is trusted only until its rotation.
+//! - `<secrets>/<id>/memory_id_key.json`: the key memory ids are made with
+//!   ([`MemoryIdKeys`]), and any it replaced. Never in the agent's state:
+//!   a field added outside a sealing save would trip the start check, and a
+//!   restored pre-key archive would silently mint a new key.
 //!
 //! All `0600`. Every type that holds a secret prints `[REDACTED]`.
 
@@ -37,6 +41,8 @@ pub const NEXT_SECRETS_FILE: &str = "secrets.next.json";
 pub const ROTATIONS_FILE: &str = "rotations.json";
 /// A rotation sent, its answer not yet in hand.
 pub const PENDING_ROTATION_FILE: &str = "rotation.pending.json";
+/// The key memory ids are made with ([`MemoryIdKeys`]).
+pub const MEMORY_ID_KEY_FILE: &str = "memory_id_key.json";
 
 /// `state_key.json`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -143,6 +149,96 @@ impl PastKeys {
     }
 }
 
+/// One agent's memory-id key: 32 random bytes, the HMAC key memory ids
+/// are made with. Prints `[REDACTED]`.
+#[derive(Clone)]
+pub struct MemoryIdKey(Zeroizing<[u8; 32]>);
+
+impl std::fmt::Debug for MemoryIdKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemoryIdKey([REDACTED])")
+    }
+}
+
+impl MemoryIdKey {
+    /// 32 fresh bytes from the OS's CSPRNG. Drawn through agentkit's
+    /// `StateKey::generate` (`OsRng`), so the runner needs no RNG crate of
+    /// its own; the two keys share nothing else.
+    fn generate() -> Self {
+        Self(Zeroizing::new(*StateKey::generate().expose()))
+    }
+
+    fn from_hex(hex_key: &str) -> std::io::Result<Self> {
+        let bytes = Zeroizing::new(hex::decode(hex_key.trim()).map_err(std::io::Error::other)?);
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| std::io::Error::other("a memory-id key is 32 bytes"))?;
+        Ok(Self(Zeroizing::new(arr)))
+    }
+
+    /// The raw bytes, for the HMAC.
+    pub fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// An agent's memory-id keys: the one new ids are made with, and every one
+/// it replaced, newest first, so an id made with an old key still
+/// resolves. Nothing replaces a key yet; the file can hold them.
+#[derive(Debug, Clone)]
+pub struct MemoryIdKeys {
+    pub current: MemoryIdKey,
+    pub past: Vec<MemoryIdKey>,
+}
+
+impl MemoryIdKeys {
+    /// Every key, the current first: the order to try an id against.
+    pub fn all(&self) -> impl Iterator<Item = &MemoryIdKey> {
+        std::iter::once(&self.current).chain(self.past.iter())
+    }
+}
+
+/// One key in `memory_id_key.json`, hex.
+#[derive(Clone, Serialize, Deserialize)]
+struct MemoryIdKeyRecord {
+    key: String,
+    created_at: DateTime<Utc>,
+    /// When it was replaced; `None` for the current key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired_at: Option<DateTime<Utc>>,
+}
+
+impl Drop for MemoryIdKeyRecord {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+    }
+}
+
+/// `memory_id_key.json`. Append-only in `past`, like `past_keys.json`.
+#[derive(Clone, Serialize, Deserialize)]
+struct MemoryIdKeyFile {
+    current: MemoryIdKeyRecord,
+    /// Replaced keys, oldest first.
+    #[serde(default)]
+    past: Vec<MemoryIdKeyRecord>,
+}
+
+impl MemoryIdKeyFile {
+    fn keys(&self) -> std::io::Result<MemoryIdKeys> {
+        Ok(MemoryIdKeys {
+            current: MemoryIdKey::from_hex(&self.current.key)?,
+            past: self
+                .past
+                .iter()
+                .rev()
+                .map(|r| MemoryIdKey::from_hex(&r.key))
+                .collect::<std::io::Result<_>>()?,
+        })
+    }
+}
+
 /// `secrets.json`'s wire shape, as agentkit's `FsKeyring` reads it
 /// (pinned by `the_secrets_file_is_what_fskeyring_reads`).
 #[derive(Serialize, Deserialize)]
@@ -197,15 +293,46 @@ pub struct KeyStore {
 
 /// Write `bytes` to `path` with mode 0600: a `.tmp` sibling, fsync, rename.
 pub fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     let dir = path.parent().expect("a file in a directory");
+    let tmp = path.with_extension("json.tmp");
+    write_secret_tmp(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Write `bytes` to `path` (0600) only if nothing is there: `Ok(false)`
+/// when a file already is, which is left as it was. Never replaces one,
+/// so two processes creating the same key at once agree on the first.
+/// The new file is whole or absent: a uniquely named `.tmp` sibling,
+/// fsynced, hard-linked into place, the directory fsynced. The `.tmp` name
+/// is then removed: after a link it is a second name for the same file;
+/// after a lost race, a key nothing ever used.
+pub fn create_secret(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let dir = path.parent().expect("a file in a directory");
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    write_secret_tmp(&tmp, bytes)?;
+    let linked = std::fs::hard_link(&tmp, path);
+    std::fs::remove_file(&tmp)?;
+    match linked {
+        Ok(()) => {
+            std::fs::File::open(dir)?.sync_all()?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// `bytes` at `tmp` (0600, its directory 0700), fsynced.
+fn write_secret_tmp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = tmp.parent().expect("a file in a directory");
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let tmp = path.with_extension("json.tmp");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -213,13 +340,9 @@ pub fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    {
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    std::fs::File::open(dir)?.sync_all()
+    let mut file = options.open(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<Option<T>> {
@@ -418,6 +541,42 @@ impl KeyStore {
         )
     }
 
+    /// The agent's memory-id keys, if it has any yet.
+    pub fn memory_id_keys(&self, id: AgentId) -> std::io::Result<Option<MemoryIdKeys>> {
+        read_json::<MemoryIdKeyFile>(&self.agent_dir(id).join(MEMORY_ID_KEY_FILE))?
+            .map(|f| f.keys())
+            .transpose()
+    }
+
+    /// The agent's memory-id keys, the key made once if there is none: 32
+    /// random bytes, written whole or not at all, never over a key already
+    /// there (a concurrent maker's is taken instead). Nothing deletes or
+    /// replaces it.
+    pub fn memory_id_keys_or_create(&self, id: AgentId) -> std::io::Result<MemoryIdKeys> {
+        if let Some(keys) = self.memory_id_keys(id)? {
+            return Ok(keys);
+        }
+        let key = MemoryIdKey::generate();
+        let file = MemoryIdKeyFile {
+            current: MemoryIdKeyRecord {
+                key: hex::encode(key.expose()),
+                created_at: Utc::now(),
+                retired_at: None,
+            },
+            past: Vec::new(),
+        };
+        let path = self.agent_dir(id).join(MEMORY_ID_KEY_FILE);
+        if create_secret(&path, &to_json(&file)?)? {
+            tracing::info!(
+                event_type = "memory_id_key_created",
+                agent_id = %id,
+                "the agent's memory-id key was made"
+            );
+        }
+        self.memory_id_keys(id)?
+            .ok_or_else(|| std::io::Error::other("the memory-id key vanished as it was made"))
+    }
+
     /// What an enrolled agent's entries are signed and sealed with.
     pub fn seal_keys(&self, id: AgentId) -> Option<SealKeys> {
         let signing = self.signing(id)?;
@@ -527,6 +686,78 @@ mod tests {
         );
         assert_eq!(past.encryption_secrets()[0].to_bytes(), e.to_bytes());
         assert!(!format!("{past:?}").contains(&past.signing[0].secret.clone()));
+    }
+
+    #[test]
+    fn the_memory_id_key_is_made_once_and_kept() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id");
+        let store = KeyStore::new(dir.path());
+        let id = AgentId::new();
+        assert!(store.memory_id_keys(id).unwrap().is_none());
+        let made = store.memory_id_keys_or_create(id).unwrap();
+        assert!(made.past.is_empty());
+        let again = store.memory_id_keys_or_create(id).unwrap();
+        assert_eq!(again.current.expose(), made.current.expose(), "made once");
+        assert_ne!(made.current.expose(), &[0u8; 32]);
+        // Redacted, as a whole and alone
+        let hex_key = hex::encode(made.current.expose());
+        assert!(!format!("{made:?}").contains(&hex_key));
+        assert_eq!(format!("{:?}", made.current), "MemoryIdKey([REDACTED])");
+        let path = store.agent_dir(id).join(MEMORY_ID_KEY_FILE);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Nothing left beside it
+        let names: Vec<String> = std::fs::read_dir(store.agent_dir(id))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, [MEMORY_ID_KEY_FILE]);
+        // Never in the state key's file, and never touching it
+        assert!(store.state_key_file(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_memory_id_key_is_never_written_over() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id-race");
+        let path = dir.path().join("a").join(MEMORY_ID_KEY_FILE);
+        assert!(create_secret(&path, b"first").unwrap());
+        assert!(!create_secret(&path, b"second").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    /// The format holds replaced keys, newest tried first after the
+    /// current one.
+    #[test]
+    fn replaced_memory_id_keys_still_resolve() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id-past");
+        let store = KeyStore::new(dir.path());
+        let id = AgentId::new();
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let file = serde_json::json!({
+            "current": { "key": hex::encode(c), "created_at": "2026-11-06T00:00:00Z" },
+            "past": [
+                { "key": hex::encode(a), "created_at": "2026-11-01T00:00:00Z",
+                  "retired_at": "2026-11-03T00:00:00Z" },
+                { "key": hex::encode(b), "created_at": "2026-11-03T00:00:00Z",
+                  "retired_at": "2026-11-06T00:00:00Z" },
+            ],
+        });
+        write_secret(
+            &store.agent_dir(id).join(MEMORY_ID_KEY_FILE),
+            &serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let keys = store.memory_id_keys_or_create(id).unwrap();
+        let all: Vec<[u8; 32]> = keys.all().map(|k| *k.expose()).collect();
+        assert_eq!(all, [c, b, a]);
     }
 
     #[test]
