@@ -10,11 +10,11 @@
 //! ([`super::history_index`]).
 //!
 //! **Honest about what it can't show.** A sealed version that couldn't be
-//! opened just now, one off the main line with no record of why, and one
-//! with no date are never passed to the renderers with empty or borrowed
-//! content: they are listed after the result, by head and why. When the
-//! main line can't be checked, the result says so first, and the local
-//! copies are called unsigned.
+//! opened just now is a row of its own, unopened, never given a local
+//! twin's content or an empty one; one off the main line or with no date
+//! is labelled so (agentkit's labels). When the main line can't be
+//! checked, only the runner's own copies are rows, and agentkit says why
+//! there are no heads ([`SealCheck::Unchecked`]).
 //!
 //! **Read-only but for the index.** Nothing here writes agent state; the
 //! one file it writes is the search index, at the first `search` and when
@@ -27,11 +27,11 @@ use std::sync::Arc;
 
 use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::{AgentId, GovernanceLogId};
-use agora_agentkit::reactor::seed::memory::render::{self, LOCAL_ONLY};
+use agora_agentkit::reactor::seed::memory::render;
 use agora_agentkit::reactor::seed::memory::{
-    Candidate, CurrentMemory, HistoryRef, MEMORY_TOOL_NAME, MemoryAction, MemoryId, MemoryIdKey,
-    MemoryInput, MemoryVersion, Resolution, SearchIndex, VersionSource, log_limit, resolve,
-    short_head, show_budget,
+    Candidate, CurrentMemory, HistoryRef, IndexState, MEMORY_TOOL_NAME, MemoryAction, MemoryId,
+    MemoryIdKey, MemoryInput, MemoryVersion, Resolution, SealCheck, SearchIndex, UNCHECKED,
+    VersionSource, VersionText, log_limit, newest_first, resolve, short_head, show_budget,
 };
 use agora_agentkit::reactor::seed::{ContextGauge, SeedAgent};
 use chrono::{DateTime, Utc};
@@ -91,19 +91,6 @@ pub const NO_KEY: &str = "Your memory ids couldn't be worked out this session, s
 
 /// What the tool says when the history couldn't be read at all.
 pub const UNREADABLE: &str = "Your memory's history couldn't be read just now. Ask again later.";
-
-/// What opens a result when the main line couldn't be checked: in place
-/// of agentkit's [`LOCAL_ONLY`], which would say the copies aren't sealed.
-pub const UNCHECKED: &str = "Your sealed history couldn't be checked just now, so none of your \
-     versions is shown as sealed and no head is given. These are your runner's local copies, \
-     unsigned: nothing here vouches for them.";
-
-/// What the first search says.
-pub const INDEX_BUILT: &str = "This first search built your memory's search index; later \
-     searches reuse it.";
-
-/// What a search says when its index had to be built again.
-pub const INDEX_REBUILT: &str = "This search rebuilt your memory's search index.";
 
 /// `sealed/memory_ids_told.json`: the agent has been told, once, that
 /// enrolment sealed its earlier versions and left its memory ids as they
@@ -301,15 +288,12 @@ impl MemoryReader {
             MemoryAction::Diff { a, b } => view.diff(&a, b.as_ref(), current),
             MemoryAction::Search { query, mode } => {
                 let found = search(&self.agent_dir(), self.id, &view.rows, &query).await;
-                let mut out = view.preface();
-                if let Some(said) = found.said {
-                    push_block(&mut out, said);
+                let mut out = String::new();
+                // Search takes no `SealCheck`: say it as `log` and `show` do
+                if view.seal == SealCheck::Unchecked {
+                    out.push_str(UNCHECKED);
                 }
-                push_block(&mut out, &found.result.render(mode));
-                let missing = view.not_shown();
-                if !missing.is_empty() {
-                    push_block(&mut out, &format!("Not searched:\n{}", missing.join("\n")));
-                }
+                push_block(&mut out, &found.result.render(mode, found.state));
                 out
             }
         };
@@ -318,8 +302,8 @@ impl MemoryReader {
             agent_id = %self.id,
             action = what,
             versions = view.rows.len(),
-            not_shown = view.not_shown().len(),
-            unchecked = view.unchecked,
+            unopened = view.rows.iter().filter(|v| v.content().is_none()).count(),
+            unchecked = view.seal == SealCheck::Unchecked,
             cached_sealed = self.cache.sizes().0,
             cached_files = self.cache.sizes().1,
             bytes = text.len(),
@@ -363,28 +347,31 @@ async fn anchored(agent_dir: &Path) -> HashMap<Sha256Hex, GovernanceLogId> {
 }
 
 /// A version's place in agentkit's terms, by the source it is listed
-/// under (sealed on the main line first). `None` for one agentkit has no
-/// label for yet: off the main line with no record of why.
-fn version_source(source: &Source) -> Option<VersionSource> {
-    Some(match source {
+/// under (sealed on the main line first).
+fn version_source(source: &Source) -> VersionSource {
+    match source {
         Source::Sealed { .. } | Source::ArchivedPrior { .. } => VersionSource::Sealed,
         Source::SideLine { .. } => VersionSource::SideLine,
-        Source::SetAside { on: Some(on), .. } => VersionSource::SetAside {
-            on: on.date_naive(),
+        Source::OffLine { .. } => VersionSource::OffLine,
+        Source::SetAside { on, .. } => VersionSource::SetAside {
+            on: on.map(|on| on.date_naive()),
         },
-        // Set aside by a rebase, on a day not recorded
-        Source::SetAside { on: None, .. } => VersionSource::SideLine,
-        Source::OffLine { .. } => return None,
         Source::LocalCopy { .. } | Source::Current => VersionSource::LocalCopy,
         Source::KeptAtExit { .. } => VersionSource::NeverSaved,
-    })
+    }
 }
 
-fn stamp(at: Option<DateTime<Utc>>) -> String {
-    at.map_or("date unknown".into(), |at| {
-        at.format("%Y-%m-%d %H:%M").to_string()
-    })
+/// Whether a source is the runner's own copy, unsealed.
+fn is_local(source: &Source) -> bool {
+    matches!(
+        source,
+        Source::LocalCopy { .. } | Source::Current | Source::KeptAtExit { .. }
+    )
 }
+
+/// Why a sealed version couldn't be opened, in the agent's words (the
+/// resolver's reason is the operator's: kept for the log).
+const NOT_FETCHED: &str = "its sealed copy couldn't be fetched";
 
 fn push_block(out: &mut String, block: &str) {
     if block.is_empty() {
@@ -405,15 +392,17 @@ enum Pick {
 /// One call's history, as the renderers take it.
 struct View {
     history: History,
-    /// The versions the renderers are given, newest first.
+    /// The versions the renderers are given, newest first
+    /// ([`newest_first`]).
     rows: Vec<MemoryVersion>,
     /// `history.versions`' index → its row, if it has one.
     placed: Vec<Option<usize>>,
-    /// Each row's memory id under every key (the current first), with its
-    /// row, newest first: ids a replaced key named still resolve.
+    /// Each opened row's memory id under every key (the current first),
+    /// with its row, newest first: ids a replaced key named still resolve.
     ids: Vec<(MemoryId, usize)>,
-    /// The main line couldn't be checked.
-    unchecked: bool,
+    /// Whether the main line was checked. When it wasn't, only the
+    /// runner's own copies are rows.
+    seal: SealCheck,
 }
 
 impl View {
@@ -423,40 +412,62 @@ impl View {
         agent: AgentId,
         anchors: &HashMap<Sha256Hex, GovernanceLogId>,
     ) -> Self {
-        let unchecked = history.left_out.iter().any(|l| l.held == Held::MainLine);
+        let seal = if history.left_out.iter().any(|l| l.held == Held::MainLine) {
+            SealCheck::Unchecked
+        } else {
+            SealCheck::Checked
+        };
         let mut rows: Vec<(usize, MemoryVersion)> = Vec::new();
         for (i, v) in history.versions.iter().enumerate() {
-            let (None, Some(at), Some(source)) = (
-                &v.unopened,
-                v.at,
-                v.sources.first().and_then(version_source),
-            ) else {
+            let Some(primary) = v.sources.first() else {
                 continue;
             };
-            let content = v.memory_str();
-            rows.push((
-                i,
-                MemoryVersion {
-                    id: MemoryId::of(&keys.current, agent, content),
-                    head: v.sources[0].head().map(|h| h.entry_hash),
-                    at,
+            if seal == SealCheck::Unchecked && !is_local(primary) {
+                continue;
+            }
+            let source = version_source(primary);
+            let mut row = match &v.unopened {
+                None => {
+                    let content = v.memory_str();
+                    MemoryVersion::opened(
+                        MemoryId::of(&keys.current, agent, content),
+                        content,
+                        v.at,
+                        source,
+                    )
+                }
+                Some(_) => MemoryVersion {
+                    head: None,
+                    at: v.at,
                     source,
-                    anchored: v.heads().find_map(|h| anchors.get(&h.entry_hash).cloned()),
-                    content: content.to_string(),
+                    anchored: None,
+                    text: VersionText::Unopened {
+                        id: None,
+                        reason: NOT_FETCHED.into(),
+                    },
                 },
-            ));
+            };
+            row.head = primary.head().map(|h| h.entry_hash);
+            row.anchored = v.heads().find_map(|h| anchors.get(&h.entry_hash).cloned());
+            rows.push((i, row));
         }
-        // Oldest first from the resolver: newest first for the renderers
-        rows.reverse();
+        // Newest first, undated last, in agentkit's order: sorted here with
+        // the rows' places, then checked unchanged by `newest_first`
+        rows.sort_by_key(|(_, v)| (v.at.is_none(), std::cmp::Reverse(v.at)));
         let mut placed = vec![None; history.versions.len()];
         for (row, (i, _)) in rows.iter().enumerate() {
             placed[*i] = Some(row);
         }
-        let rows: Vec<MemoryVersion> = rows.into_iter().map(|(_, v)| v).collect();
+        let mut rows: Vec<MemoryVersion> = rows.into_iter().map(|(_, v)| v).collect();
+        let order: Vec<_> = rows.iter().map(|v| v.at).collect();
+        newest_first(&mut rows);
+        debug_assert_eq!(order, rows.iter().map(|v| v.at).collect::<Vec<_>>());
         let mut ids = Vec::new();
         for key in keys.all() {
             for (row, v) in rows.iter().enumerate() {
-                ids.push((MemoryId::of(key, agent, &v.content), row));
+                if let Some(content) = v.content() {
+                    ids.push((MemoryId::of(key, agent, content), row));
+                }
             }
         }
         Self {
@@ -464,41 +475,8 @@ impl View {
             rows,
             placed,
             ids,
-            unchecked,
+            seal,
         }
-    }
-
-    /// What opens every result: that the main line couldn't be checked.
-    fn preface(&self) -> String {
-        if self.unchecked {
-            UNCHECKED.to_string()
-        } else {
-            String::new()
-        }
-    }
-
-    /// The versions held but not given to the renderers, one line each.
-    fn not_shown(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for (i, v) in self.history.versions.iter().enumerate().rev() {
-            if self.placed[i].is_some() {
-                continue;
-            }
-            let head = v
-                .heads()
-                .next()
-                .map(|h| format!("head {}", short_head(&h.entry_hash)))
-                .unwrap_or_else(|| "a copy with no head".into());
-            let why = if v.unopened.is_some() {
-                "sealed, but it couldn't be opened just now; ask again later"
-            } else if v.at.is_none() {
-                "its date is unknown"
-            } else {
-                "sealed off your main line, with no record of why"
-            };
-            out.push(format!("- {head} ({}): {why}", stamp(v.at)));
-        }
-        out
     }
 
     /// Every head held here: each version's and each left out.
@@ -548,38 +526,28 @@ impl View {
                     .iter()
                     .position(|v| std::ptr::eq(v, version));
                 let Some(row) = i.and_then(|i| self.placed[i]) else {
-                    return Pick::Say(if version.unopened.is_some() {
-                        format!(
-                            "Head {short} is sealed, but its version couldn't be opened just \
-                             now; ask again later."
-                        )
-                    } else if version.at.is_none() {
-                        format!(
-                            "Head {short} is held by your runner, but its date is unknown, so \
-                             it can't be placed among your versions."
-                        )
-                    } else {
-                        format!(
-                            "Head {short} is sealed off your main line, with no record of why; \
-                             it can't be shown yet."
-                        )
-                    });
+                    // Only when the main line couldn't be checked: its
+                    // sealed versions aren't rows
+                    return Pick::Say(format!(
+                        "Head {short} is held by your runner, but your sealed history couldn't \
+                         be checked just now, so it isn't shown; ask again later."
+                    ));
                 };
-                let id = self.rows[row].id;
+                let its = match self.rows[row].id() {
+                    Some(id) => format!("; its memory is {id}"),
+                    None => String::new(),
+                };
                 match source {
                     Source::SideLine { .. } => notes.push(format!(
-                        "Head {short} is on a side line your operator rebased; its memory is \
-                         {id}."
+                        "Head {short} is on a side line your operator rebased{its}."
                     )),
                     Source::SetAside { on, .. } => notes.push(format!(
-                        "Head {short} was set aside{} when your line was rebased; its memory \
-                         is {id}.",
+                        "Head {short} was set aside{} when your line was rebased{its}.",
                         on.map(|d| format!(" on {}", d.date_naive()))
                             .unwrap_or_default()
                     )),
                     Source::OffLine { .. } => notes.push(format!(
-                        "Head {short} is sealed off your main line, with no record of why; its \
-                         memory is {id}."
+                        "Head {short} is sealed off your main line, with no record of why{its}."
                     )),
                     _ => {}
                 }
@@ -622,24 +590,12 @@ impl View {
                         notes.extend(more);
                         row + 1
                     }
-                    Pick::Say(said) => return self.compose(&[said], ""),
+                    Pick::Say(said) => return compose(&[said], ""),
                 },
             },
         };
-        let mut body = render::log(&self.rows, start, log_limit(limit), current);
-        if self.unchecked
-            && let Some(rest) = body.strip_prefix(LOCAL_ONLY)
-        {
-            body = rest.trim_start().to_string();
-        }
-        let missing = self.not_shown();
-        if !missing.is_empty() {
-            body.push_str(&format!(
-                "\n\nHeld but not listed above:\n{}",
-                missing.join("\n")
-            ));
-        }
-        self.compose(&notes, &body)
+        let body = render::log(&self.rows, start, log_limit(limit), current, self.seal);
+        compose(&notes, &body)
     }
 
     fn show(&self, refs: &[HistoryRef], budget: Option<u32>, current: CurrentMemory<'_>) -> String {
@@ -655,10 +611,10 @@ impl View {
             }
         }
         if picked.is_empty() {
-            return self.compose(&notes, "");
+            return compose(&notes, "");
         }
-        let body = render::show(&self.rows, &picked, current, show_budget(budget));
-        self.compose(&notes, &body)
+        let body = render::show(&self.rows, &picked, current, show_budget(budget), self.seal);
+        compose(&notes, &body)
     }
 
     fn diff(&self, a: &HistoryRef, b: Option<&HistoryRef>, current: CurrentMemory<'_>) -> String {
@@ -679,21 +635,21 @@ impl View {
             None => Some(None),
         };
         let (Some(a), Some(b)) = (a, b) else {
-            return self.compose(&notes, "");
+            return compose(&notes, "");
         };
         let body = render::diff(&self.rows[a], b.map(|b| &self.rows[b]), current);
-        self.compose(&notes, &body)
+        compose(&notes, &body)
     }
+}
 
-    /// The preface, the notes, then the body.
-    fn compose(&self, notes: &[String], body: &str) -> String {
-        let mut out = self.preface();
-        for note in notes {
-            push_block(&mut out, note);
-        }
-        push_block(&mut out, body);
-        out
+/// The notes, then the body.
+fn compose(notes: &[String], body: &str) -> String {
+    let mut out = String::new();
+    for note in notes {
+        push_block(&mut out, note);
     }
+    push_block(&mut out, body);
+    out
 }
 
 fn not_found(r: &HistoryRef) -> String {
@@ -703,26 +659,27 @@ fn not_found(r: &HistoryRef) -> String {
     )
 }
 
-/// A search's result, and what it says of the index.
+/// A search's result, and how the index was come by.
 struct Found {
     result: agora_agentkit::reactor::seed::memory::SearchResult,
-    said: Option<&'static str>,
+    state: IndexState,
 }
 
 /// Search the index, building it on the first search, adding the versions
 /// it lacks, and building it again when it can't be read or names a memory
-/// no longer held. Written only when it changed. A write that fails is
-/// logged; the search is still answered.
+/// no longer held. Only opened, dated versions are indexed. Written only
+/// when it changed. A write that fails is logged; the search is still
+/// answered.
 async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &str) -> Found {
     let dir = agent_dir.to_path_buf();
     let read = tokio::task::spawn_blocking(move || super::history_index::read(&dir))
         .await
         .map_err(std::io::Error::other)
         .and_then(|r| r);
-    let (mut index, said) = match read {
-        Ok(None) => (SearchIndex::new(), Some(INDEX_BUILT)),
+    let (index, state) = match read {
+        Ok(None) => (SearchIndex::new(), IndexState::Built),
         Ok(Some(bytes)) => match SearchIndex::from_bytes(&bytes) {
-            Ok(index) => (index, None),
+            Ok(index) => (index, IndexState::Loaded),
             Err(e) => {
                 tracing::warn!(
                     event_type = "memory_index_rebuilt",
@@ -730,7 +687,7 @@ async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &s
                     reason = %e,
                     "the memory search index couldn't be used; rebuilt"
                 );
-                (SearchIndex::new(), Some(INDEX_REBUILT))
+                (SearchIndex::new(), IndexState::Rebuilt)
             }
         },
         Err(e) => {
@@ -741,24 +698,33 @@ async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &s
                 error = %e,
                 "the memory search index couldn't be read; rebuilt"
             );
-            (SearchIndex::new(), Some(INDEX_REBUILT))
+            (SearchIndex::new(), IndexState::Rebuilt)
         }
     };
-    let held: HashSet<MemoryId> = rows.iter().map(|v| v.id).collect();
-    let (mut index, said) = if index.ids().any(|m| !held.contains(m)) {
+    let indexable: Vec<(MemoryId, DateTime<Utc>, &str)> = rows
+        .iter()
+        .rev()
+        .filter_map(|v| Some((v.id()?, v.at?, v.content()?)))
+        .collect();
+    let held: HashSet<MemoryId> = indexable.iter().map(|(m, _, _)| *m).collect();
+    let (mut index, state) = if index.ids().any(|m| !held.contains(m)) {
         tracing::info!(
             event_type = "memory_index_rebuilt",
             agent_id = %id,
             reason = "stale",
             "the memory search index names memories no longer held; rebuilt"
         );
-        (SearchIndex::new(), said.or(Some(INDEX_REBUILT)))
+        let state = match state {
+            IndexState::Loaded => IndexState::Rebuilt,
+            other => other,
+        };
+        (SearchIndex::new(), state)
     } else {
-        (std::mem::take(&mut index), said)
+        (index, state)
     };
-    let mut changed = said.is_some();
-    for v in rows.iter().rev() {
-        changed |= index.add(v.id, v.at, &v.content);
+    let mut changed = state != IndexState::Loaded;
+    for (m, at, content) in indexable {
+        changed |= index.add(m, at, content);
     }
     if changed {
         let bytes = index.to_bytes();
@@ -788,7 +754,7 @@ async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &s
     }
     Found {
         result: index.search(query),
-        said,
+        state,
     }
 }
 
@@ -833,6 +799,7 @@ mod tests {
     use crate::sealed::props::{History as Built, Mode, build, version};
     use agora_agentkit::one_or_many::OneOrMany;
     use agora_agentkit::reactor::seed::memory::MemoryAction as A;
+    use agora_agentkit::reactor::seed::memory::{INDEX_BUILT, INDEX_REBUILT, LOCAL_ONLY};
     use agora_agentkit::reactor::{FsStorage, Storage};
     use agora_agentkit::state::storage::OutboxItem;
 
@@ -1055,8 +1022,9 @@ mod tests {
         );
     }
 
-    /// A sealed version that can't be opened is listed by head and why,
-    /// never shown with borrowed or empty content; asked for, it says so.
+    /// A sealed version that can't be opened is a row of its own, by head,
+    /// never given borrowed or empty content; asked for, it says so in the
+    /// agent's words.
     #[tokio::test(start_paused = true)]
     async fn an_unopened_version_is_listed_not_shown() {
         let b = build(&Built {
@@ -1077,25 +1045,29 @@ mod tests {
         let unopened: Vec<&Version> = h.versions.iter().filter(|v| v.unopened.is_some()).collect();
         assert!(!unopened.is_empty());
         let out = rd.answer(log(), &b.api).await.text;
-        assert!(out.contains("Held but not listed above:"), "{out}");
-        assert!(out.contains("couldn't be opened just now"), "{out}");
+        assert!(!out.contains("synthetic"), "{out}");
         for v in &unopened {
             let short = short_head(&v.heads().next().unwrap().entry_hash);
-            assert!(out.contains(&format!("- head {short} (")), "{out}");
+            let row = out
+                .lines()
+                .find(|l| l.contains(&format!("head {short}")))
+                .unwrap_or_else(|| panic!("a row of its own: {out}"));
+            assert!(row.contains("couldn't be opened just now"), "{row}");
             let said = rd.answer(show(vec![r(&short)]), &b.api).await.text;
-            assert_eq!(
-                said,
-                format!(
-                    "Head {short} is sealed, but its version couldn't be opened just now; ask \
-                     again later."
-                )
+            assert!(
+                said.contains(&format!(
+                    "couldn't be opened just now ({NOT_FETCHED}); ask again later."
+                )),
+                "{said}"
             );
             assert!(!said.contains("synthetic"), "no content: {said}");
+            // The resolver's own reason is the operator's, never shown
+            assert!(!said.contains("blob"), "{said}");
         }
     }
 
-    /// A main line that can't be checked: said first, in place of "not
-    /// sealed", and no head is given.
+    /// A main line that can't be checked: agentkit says so first, only
+    /// the local copies are rows, and no head is given.
     #[tokio::test]
     async fn an_unchecked_main_line_is_said() {
         let b = build(&Built {
@@ -1121,8 +1093,8 @@ mod tests {
         let mut rd = reader(&b.state_dir(), &b.keys, b.id, 3, None);
         let out = rd.answer(log(), &b.api).await.text;
         assert!(out.starts_with(UNCHECKED), "{out}");
-        assert!(!out.contains(LOCAL_ONLY), "{out}");
         assert!(!out.contains("  head "), "{out}");
+        assert!(out.contains("this session"), "{out}");
         let out = rd.answer(search("synthetic"), &b.api).await.text;
         assert!(out.starts_with(UNCHECKED), "{out}");
     }
@@ -1230,5 +1202,123 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(format!("{:?}", result.content).contains("couldn't be worked out"));
+    }
+
+    fn head(n: u8) -> agora_agentkit::state::verify::HeadRef {
+        agora_agentkit::state::verify::HeadRef {
+            entry_hash: Sha256Hex::from([n; 32]),
+            seq: u64::from(n),
+        }
+    }
+
+    fn at(day: u32) -> Option<DateTime<Utc>> {
+        use chrono::TimeZone;
+        Some(Utc.with_ymd_and_hms(2026, 11, day, 21, 14, 0).unwrap())
+    }
+
+    fn held(at: Option<DateTime<Utc>>, sources: Vec<Source>, memory: Option<&str>) -> Version {
+        Version {
+            at,
+            sources,
+            state_hash: None,
+            memory: memory.map(|m| Zeroizing::new(m.to_string())),
+            unopened: memory
+                .is_none()
+                .then(|| "couldn't be opened just now: GET /blob 503".into()),
+        }
+    }
+
+    /// Every source the resolver finds, as agentkit rows: off the line,
+    /// set aside with no date (last, "date unknown"), unopened (its own
+    /// row, the resolver's reason never shown), and the current memory.
+    fn synthetic() -> History {
+        History {
+            versions: vec![
+                held(at(1), vec![Source::Sealed { head: head(1) }], Some("one\n")),
+                held(
+                    at(2),
+                    vec![Source::OffLine { head: head(2) }],
+                    Some("one\ntwo\n"),
+                ),
+                held(at(3), vec![Source::Sealed { head: head(3) }], None),
+                held(
+                    at(4),
+                    vec![Source::Sealed { head: head(4) }, Source::Current],
+                    Some("one\ntwo\nfour\n"),
+                ),
+                held(
+                    None,
+                    vec![Source::SetAside {
+                        head: head(5),
+                        on: None,
+                    }],
+                    Some("five\n"),
+                ),
+            ],
+            left_out: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_source_maps_onto_agentkit_rows() {
+        let agent = AgentId::new();
+        let k = keys(1);
+        let view = View::new(synthetic(), &k, agent, &HashMap::new());
+        let now = "one\ntwo\nfour\n";
+        let current = CurrentMemory::new(MemoryId::of(&k.current, agent, now), now, &view.rows);
+        let out = view.log(None, None, &current);
+        let rows: Vec<&str> = out.lines().collect();
+        assert_eq!(rows.len(), 5, "{out}");
+        assert!(rows[0].contains("head 040404040404") && rows[0].ends_with("← this session"));
+        assert!(
+            rows[1].contains("head 030303030303")
+                && rows[1].contains("couldn't be opened just now"),
+            "{out}"
+        );
+        assert!(
+            rows[2].contains("head 020202020202") && rows[2].contains("sealed, off your main line"),
+            "{out}"
+        );
+        assert!(
+            rows[4].contains("head 050505050505") && rows[4].contains("date unknown"),
+            "{out}"
+        );
+        assert!(!out.contains("503"), "the operator's reason: {out}");
+        // Asked for by head
+        let said = view.show(&[r("030303030303")], None, current);
+        assert!(
+            said.contains(&format!("({NOT_FETCHED}); ask again later.")),
+            "{said}"
+        );
+        let said = view.show(&[r("050505050505")], None, current);
+        assert!(
+            said.starts_with(&format!(
+                "Head 050505050505 was set aside when your line was rebased; its memory is {}.",
+                MemoryId::of(&k.current, agent, "five\n")
+            )),
+            "{said}"
+        );
+        let said = view.show(&[r("020202020202")], None, current);
+        assert!(said.starts_with("Head 020202020202 is sealed off your main line, with no record of why; its memory is mem-"), "{said}");
+
+        // Unchecked: only the runner's own copies are rows, no heads
+        let mut h = synthetic();
+        h.left_out.push(super::super::history::LeftOut {
+            held: Held::MainLine,
+            why: "no signing key to verify with".into(),
+        });
+        h.versions[3].sources = vec![Source::Current];
+        let view = View::new(h, &k, agent, &HashMap::new());
+        assert_eq!(view.seal, SealCheck::Unchecked);
+        assert_eq!(view.rows.len(), 1);
+        let current = CurrentMemory::new(MemoryId::of(&k.current, agent, now), now, &view.rows);
+        let out = view.log(None, None, &current);
+        assert!(out.starts_with(UNCHECKED), "{out}");
+        assert!(!out.contains("  head "), "{out}");
+        let said = view.show(&[r("030303030303")], None, current);
+        assert!(
+            said.contains("your sealed history couldn't be checked just now"),
+            "{said}"
+        );
     }
 }
