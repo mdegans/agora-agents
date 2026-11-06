@@ -4,9 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-# Temporary: the Ask/Answer refactor builds against the agentkit worktree;
-# replaced by the 0.157.0 pin at integration.
-agora-agentkit = { path = "../agentkit-ask", features = [
+agora-agentkit = { version = "0.157.0", features = [
     "schemars",
     "retry",
     "seed",
