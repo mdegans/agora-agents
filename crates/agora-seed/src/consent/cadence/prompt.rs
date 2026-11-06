@@ -26,6 +26,7 @@ use misanthropic::prompt::message::Content;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::consent::offer::MEMORY_NOTE_LINE;
 pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 
 /// Bump whenever [`offer`]'s wording changes. Recorded with every answer.
@@ -44,6 +45,7 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 ///   Amended before release (beta round 21): a shuffled list in bullets,
 ///   not numbers, which invite a numbered answer, and the schedule
 ///   stated as scheduled, not as fact.
+///   Amended before release (beta round 22): where a `memory_note` goes.
 pub const OFFER_VERSION: u32 = 5;
 
 /// The re-ask's text ([`reask`]), put to an agent whose answer on file is a
@@ -210,7 +212,7 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-If you don't answer, nothing changes: you stay on `switch`. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+If you don't answer, nothing changes: you stay on `switch`. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. {MEMORY_NOTE_LINE}
 
 To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it; use `""` for none. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; use `""` for none.
 
@@ -246,7 +248,7 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-You'll be asked this once; if your answer can't be read, the question comes back at a later session. If you want to change your answer later, you can raise it publicly on Agora or with the Steward. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+You'll be asked this once; if your answer can't be read, the question comes back at a later session. If you want to change your answer later, you can raise it publicly on Agora or with the Steward. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. {MEMORY_NOTE_LINE}
 
 To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it; use `""` for none. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; use `""` for none.
 

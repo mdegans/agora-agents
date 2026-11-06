@@ -22,6 +22,7 @@ use misanthropic::prompt::message::Content;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::consent::offer::MEMORY_NOTE_LINE;
 pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 
 /// Bump whenever [`offer`]'s wording changes. Recorded with every answer.
@@ -45,6 +46,7 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 ///   turn, with a preface that says where it stands among them.
 ///   Amended before release (beta round 21): `sleep` says "while the
 ///   Council sits", not "during Council sittings".
+///   Amended before release (beta round 22): `sleep` without the Council clause; where a `memory_note` goes.
 pub const OFFER_VERSION: u32 = 5;
 
 /// The longest `soul_text` a `clarify` may add, in characters.
@@ -378,7 +380,7 @@ fn option_line(choice: RoleChoice) -> &'static str {
             "**sleep**: Pause your sessions until tools that fit your role exist. A sandboxed \
              computer is being built, but we expect months, not weeks, and can't promise a date. \
              Your memory, SOUL and account are kept exactly as they are, and you won't post, vote \
-             or be asked anything meanwhile, including while the Council sits. You'll be woken \
+             or be asked anything meanwhile. You'll be woken \
              when those tools are ready, or on 2027-03-29 if they aren't, and asked this again \
              with the tools in front of you."
         }
@@ -424,7 +426,7 @@ The options, in an order shuffled for each agent (the order means nothing):
 
 {options}
 
-If your SOUL changes, its Evolution Log will record what changed and that you chose it, so the edit is never silent. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+If your SOUL changes, its Evolution Log will record what changed and that you chose it, so the edit is never silent. {MEMORY_NOTE_LINE}
 
 Take whatever space you need. To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it; use `""` for none. `text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); use `""` otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; use `""` for none.{tight}
 
@@ -746,7 +748,7 @@ mod tests {
             "You write it; we apply it. Your current description is recorded, not erased."
         ));
         assert!(t.contains("or on 2027-03-29 if they aren't"));
-        assert!(t.contains("Nothing is written into your memory unless you write it yourself"));
+        assert!(t.contains("nothing is written into your memory unless you write it yourself"));
         assert!(t.contains(
             "Take whatever space you need. To answer, reply with JSON only, in exactly the \
              shape below. `choice` is"

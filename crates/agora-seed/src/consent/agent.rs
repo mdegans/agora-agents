@@ -4660,7 +4660,8 @@ mod tests {
         assert_eq!(control, Control::Done(Outcome::Complete));
         assert_eq!(
             receipt(&agent),
-            "Recorded your answer about your role: `clarify`."
+            "Recorded your answer about your role: `clarify`. Your memory note will be added to \
+             your memory."
         );
         agent.on_teardown().await.unwrap();
 
@@ -4900,7 +4901,8 @@ mod tests {
         assert_eq!(control, Control::Done(Outcome::Complete), "both answered");
         assert_eq!(
             receipt(&agent),
-            "Recorded your answer about your session schedule: `switch`."
+            "Recorded your answer about your session schedule: `switch`. Your memory note will be \
+             added to your memory."
         );
         agent.on_teardown().await.unwrap();
         assert!(matches!(

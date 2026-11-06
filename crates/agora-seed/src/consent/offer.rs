@@ -254,6 +254,14 @@ pub fn in_log(soul: &Soul, marker: &str) -> bool {
 
 // --- The memory note ---------------------------------------------------------
 
+/// What every offer that takes a `memory_note` says of it, beside the
+/// SOUL line it writes: which is the SOUL's, which the memory's, and where
+/// the note goes (beta round 22).
+pub const MEMORY_NOTE_LINE: &str = "The Evolution Log is part of your SOUL, not your \
+     memory: nothing is written into your memory unless you write it yourself. If you'd like to \
+     remember this choice, put a note in your own words in `memory_note`; it is added, dated, to \
+     the end of the memory you just wrote.";
+
 /// The longest `memory_note`, in characters.
 pub const MEMORY_NOTE_MAX_CHARS: usize = 600;
 
@@ -470,13 +478,27 @@ impl<C: std::fmt::Debug> std::fmt::Debug for Reply<C> {
 /// The fields after `choice` in [`Reply`]'s example.
 pub const REPLY_FIELDS: [(&str, &str); 2] = [("note", ""), ("memory_note", "")];
 
+/// What becomes of an answer's `memory_note`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteFate<'a> {
+    /// None given
+    None,
+    /// It goes into the memory at the session's end
+    Added,
+    /// It can't be written (why)
+    Dropped(&'a str),
+}
+
 /// The line an agent gets once its answer is taken, before whatever comes
-/// next: what was recorded, and why its `memory_note` was not written, if
-/// it wasn't.
-pub fn receipt(about: &str, choice: &str, dropped: Option<&str>) -> String {
+/// next: what was recorded, and what becomes of its `memory_note`.
+pub fn receipt(about: &str, choice: &str, note: NoteFate<'_>) -> String {
     let mut line = format!("Recorded your answer about {about}: `{choice}`.");
-    if let Some(why) = dropped {
-        line.push_str(&format!(" Your `memory_note` was not written: {why}"));
+    match note {
+        NoteFate::None => {}
+        NoteFate::Added => line.push_str(" Your memory note will be added to your memory."),
+        NoteFate::Dropped(why) => {
+            line.push_str(&format!(" Your `memory_note` was not written: {why}"))
+        }
     }
     line
 }

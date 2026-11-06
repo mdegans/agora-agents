@@ -29,7 +29,7 @@ use crate::consent::cadence::ledger::{Attempt, CadenceAsk, CadenceOutcome};
 use crate::consent::cadence::prompt::CadenceAnswer;
 use crate::consent::memory_restore::ledger::{RestoreAsk, RestoreOutcome};
 use crate::consent::offer::{
-    self, Choice, Edit, OfferKind, OfferLedger, Reply, Status, Write, nonempty, receipt,
+    self, Choice, Edit, NoteFate, OfferKind, OfferLedger, Reply, Status, Write, nonempty, receipt,
 };
 use crate::consent::prompt::{ModelSwapReply, OfferAnswer, ReviewAnswer, ReviewArgs};
 use crate::consent::questions::OfferQuestion;
@@ -153,9 +153,9 @@ where
         &mut self,
         kind: OfferKind,
         choice: &str,
-        dropped: Option<&str>,
+        note: NoteFate<'_>,
     ) -> Result<(), Rejection<A::Error>> {
-        let line = receipt(kind.about(), choice, dropped);
+        let line = receipt(kind.about(), choice, note);
         let (_, prompt) = self.inner.parts();
         Self::seat_user(prompt, Content::from(line)).map_err(Rejection::Error)
     }
@@ -705,7 +705,12 @@ where
         );
         let outcome = Q::answered(choice, note, memory_note.is_some(), dropped.clone());
         self.record_offer(ask, asked, None, outcome);
-        self.seat_receipt(Q::KIND, choice.as_str(), dropped.as_deref())?;
+        let fate = match (&dropped, &memory_note) {
+            (Some(why), _) => NoteFate::Dropped(why),
+            (None, Some(_)) => NoteFate::Added,
+            (None, None) => NoteFate::None,
+        };
+        self.seat_receipt(Q::KIND, choice.as_str(), fate)?;
         Ok(Next::Continue)
     }
 
@@ -891,7 +896,7 @@ where
         if let Some(change) = change {
             self.apply_consented(&change, now, true).await;
         }
-        self.seat_receipt(KIND, choice, None)?;
+        self.seat_receipt(KIND, choice, NoteFate::None)?;
         Ok(Next::Continue)
     }
 
@@ -1007,6 +1012,7 @@ where
         }
         let edit = (!matches!(applied, Applied::Nothing | Applied::Sleep))
             .then(|| Edit::Role(applied.clone()));
+        let staged_note = note.is_some();
         self.role.stage(Write {
             edit,
             note: note.clone(),
@@ -1022,7 +1028,12 @@ where
                 apply_failed: None,
             },
         );
-        self.seat_receipt(KIND, choice, None)?;
+        let fate = if staged_note {
+            NoteFate::Added
+        } else {
+            NoteFate::None
+        };
+        self.seat_receipt(KIND, choice, fate)?;
         Ok(Next::Continue)
     }
 
@@ -1145,7 +1156,12 @@ where
                 apply_failed: None,
             },
         );
-        self.seat_receipt(KIND, choice.as_str(), dropped.as_deref())?;
+        let fate = match (&dropped, &memory_note) {
+            (Some(why), _) => NoteFate::Dropped(why),
+            (None, Some(_)) => NoteFate::Added,
+            (None, None) => NoteFate::None,
+        };
+        self.seat_receipt(KIND, choice.as_str(), fate)?;
         Ok(Next::Continue)
     }
 
