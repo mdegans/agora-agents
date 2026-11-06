@@ -489,9 +489,53 @@ fn named(c: &Checked) -> String {
 /// runner's alerts leave that kind out, since then no one was.
 const TOLD: &str = " Your runner has alerted your operator.";
 
+/// When the runner began recording upload times for the agent
+/// ([`super::receipts::ReceiptsFile::began`]), when known: a sentence
+/// names it for an anchor whose day ended before it, the reason that
+/// anchor's uploads have no times (beta round 13).
+pub type Began = Option<DateTime<Utc>>;
+
+/// The day before which no runner of Agora's recorded upload times: the
+/// receipts first ran on 2026-11-06 (the 0.151.3 candidate, on test
+/// agents; the fleet's 0.152.0 later that day). True of every agent, so a
+/// sentence can say it when [`Began`] isn't known (a 0.152.0 file already
+/// pruned; review of round 13: most of the fleet)
+pub const RECORDS_FIRST_KEPT: &str = "2026-11-06";
+
+fn records_first_kept() -> NaiveDate {
+    RECORDS_FIRST_KEPT.parse().expect("a date")
+}
+
+/// "your uploads before 2026-11-06, when it began keeping one" when the
+/// runner began recording after every one of `days` ended; "your uploads
+/// before 2026-11-06, when Agora's seed runner began keeping such records"
+/// when that isn't known but the days ended before any runner kept one;
+/// else "your uploads from around then" (a crash gap or a rollback: some
+/// times are missing)
+fn uploads_untimed(days: impl IntoIterator<Item = Option<NaiveDate>>, began: Began) -> String {
+    let days: Vec<Option<NaiveDate>> = days.into_iter().collect();
+    let all_by = |t: DateTime<Utc>| {
+        !days.is_empty() && days.iter().all(|d| d.is_some_and(|d| cutoff(d) <= t))
+    };
+    if let Some(b) = began.filter(|b| all_by(*b)) {
+        return format!(
+            "your uploads before {}, when it began keeping one",
+            b.format("%Y-%m-%d")
+        );
+    }
+    let first = records_first_kept();
+    if all_by(first.and_hms_opt(0, 0, 0).expect("midnight").and_utc()) {
+        return format!(
+            "your uploads before {first}, when Agora's seed runner began keeping such \
+             records"
+        );
+    }
+    "your uploads from around then".into()
+}
+
 /// What the agent is told of one anchor, as a sentence or two.
-pub fn sentence(c: &Checked) -> String {
-    let s = sentence_of(c);
+pub fn sentence(c: &Checked, began: Began) -> String {
+    let s = sentence_of(c, began);
     if c.finding.failed() && c.alerted {
         format!("{s}{TOLD}")
     } else {
@@ -499,10 +543,13 @@ pub fn sentence(c: &Checked) -> String {
     }
 }
 
-fn sentence_of(c: &Checked) -> String {
+fn sentence_of(c: &Checked, began: Began) -> String {
     let n = named(c);
     // "anchor for D," reads on into a clause; the id alone as the subject
     let subject = n.trim_end_matches(',');
+    // Beta round 13: "checked by your runner against the governance log"
+    // read as the whole check passing; what was checked is the proof
+    const PROVEN: &str = "(its proof matches the root in the governance log)";
     match &c.finding {
         Finding::Holds {
             in_flight: false, ..
@@ -523,14 +570,14 @@ fn sentence_of(c: &Checked) -> String {
             why: Unchecked::Contradictory,
             ..
         } => format!(
-            " {n} holds a version of yours (checked by your runner against the governance log), \
-             but your runner couldn't check that it is the right one: its own record of your \
-             uploads around then contradicts itself, as if its clock had jumped."
+            " {n} holds a version of yours {PROVEN}, but your runner couldn't check that it is \
+             the right one: its own record of your uploads around then contradicts itself, as \
+             if its clock had jumped."
         ),
         Finding::HoldsUnchecked { .. } => format!(
-            " {n} holds a version of yours (checked by your runner against the governance log), \
-             but your runner couldn't check that it is the right one: it has no record of when \
-             Agora confirmed your uploads from around then."
+            " {n} holds a version of yours {PROVEN}, but your runner couldn't check that it is \
+             the right one: it has no record of when Agora confirmed {}.",
+            uploads_untimed([c.date], began)
         ),
         Finding::NotIncluded => format!(
             " {n} doesn't include you, and needn't: Agora hadn't confirmed receiving any \
@@ -540,8 +587,9 @@ fn sentence_of(c: &Checked) -> String {
             why: Unchecked::NoTimes,
         } => format!(
             " Your runner couldn't check {subject}: Agora serves no proof that it includes you, \
-             and your runner has no record of when Agora confirmed your uploads from around \
-             then, so it can't tell whether it should."
+             and your runner has no record of when Agora confirmed {}, so it can't tell \
+             whether it should.",
+            uploads_untimed([c.date], began)
         ),
         Finding::Unchecked {
             why: Unchecked::BeforeProofs,
@@ -629,26 +677,47 @@ pub struct Untold {
     /// Untold failures beyond `earlier`, counted; left untold, so later
     /// verdicts show them.
     pub more: usize,
+    /// The anchors before it that couldn't be checked and no session has
+    /// been told of, oldest first, all of them: said once, grouped by why
+    /// ([`unchecked_sentence`]; beta round 13: silence about them read as
+    /// "passed").
+    pub unchecked: Vec<Checked>,
     /// What [`mark_told`] marks once a session showing it has saved.
     pub ids: Vec<GovernanceLogId>,
 }
 
-/// For the verdict: the newest anchor judged, and the failures before it
-/// not yet told. Marks nothing: a verdict seated for a session that never
-/// runs (not due, filtered out, failed before its intro) must not use
-/// them up.
+impl Finding {
+    /// Why the runner couldn't check the anchor, when it couldn't.
+    pub fn unchecked(&self) -> Option<Unchecked> {
+        match self {
+            Self::HoldsUnchecked { why, .. } | Self::Unchecked { why } => Some(*why),
+            _ => None,
+        }
+    }
+}
+
+/// For the verdict: the newest anchor judged, and the failures and the
+/// anchors that couldn't be checked before it, not yet told. Marks
+/// nothing: a verdict seated for a session that never runs (not due,
+/// filtered out, failed before its intro) must not use them up.
 pub fn untold(file: &InclusionFile) -> Option<Untold> {
     let (newest, before) = file.checked.split_last()?;
     let mut earlier = Vec::new();
     let mut more = 0;
+    let mut unchecked = Vec::new();
     let mut ids = Vec::new();
-    for c in before.iter().filter(|c| c.finding.failed() && !c.told) {
-        if earlier.len() < LISTED {
-            earlier.push(c.clone());
+    for c in before.iter().filter(|c| !c.told) {
+        if c.finding.failed() {
+            if earlier.len() < LISTED {
+                earlier.push(c.clone());
+                ids.push(c.anc_id.clone());
+            } else {
+                // Counted, not shown: left untold, for the next verdicts
+                more += 1;
+            }
+        } else if c.finding.unchecked().is_some() {
+            unchecked.push(c.clone());
             ids.push(c.anc_id.clone());
-        } else {
-            // Counted, not shown: left untold, for the next verdicts
-            more += 1;
         }
     }
     ids.push(newest.anc_id.clone());
@@ -656,8 +725,209 @@ pub fn untold(file: &InclusionFile) -> Option<Untold> {
         newest: newest.clone(),
         earlier,
         more,
+        unchecked,
         ids,
     })
+}
+
+/// "ANC-2026-0001", "ANC-2026-0001 and ANC-2026-0002", "ANC-2026-0001 to
+/// ANC-2026-0004 and ANC-2026-0007": runs of three or more consecutive
+/// numbers as ranges, the rest one by one; more than [`LISTED`] parts as
+/// "5 anchors between X and Y". `true` when more than one.
+fn ids_phrase(cs: &[&Checked]) -> (Ids, bool) {
+    let num = |c: &Checked| {
+        c.anc_id
+            .as_str()
+            .rsplit_once('-')
+            .and_then(|(series, n)| Some((series.to_string(), n.parse::<u64>().ok()?)))
+    };
+    let mut runs: Vec<Vec<&Checked>> = Vec::new();
+    for c in cs {
+        match runs.last_mut() {
+            Some(run)
+                if matches!(
+                    (run.last().and_then(|l| num(l)), num(c)),
+                    (Some((a, m)), Some((b, n))) if a == b && n == m + 1
+                ) =>
+            {
+                run.push(c)
+            }
+            _ => runs.push(vec![c]),
+        }
+    }
+    let parts: Vec<String> = runs
+        .iter()
+        .flat_map(|run| match run.as_slice() {
+            [first, .., last] if run.len() >= 3 => {
+                vec![format!("{} to {}", first.anc_id, last.anc_id)]
+            }
+            _ => run.iter().map(|c| c.anc_id.to_string()).collect(),
+        })
+        .collect();
+    let plural = cs.len() > 1;
+    if parts.len() > LISTED {
+        let (first, last) = (&cs[0].anc_id, &cs[cs.len() - 1].anc_id);
+        return (
+            Ids::Counted(cs.len(), format!("between {first} and {last}")),
+            true,
+        );
+    }
+    let phrase = match parts.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => parts.concat(),
+    };
+    (Ids::Listed(phrase), plural)
+}
+
+/// A group's ids as [`ids_phrase`] says them.
+enum Ids {
+    /// "ANC-2026-0001 to ANC-2026-0003 and ANC-2026-0007"
+    Listed(String),
+    /// 5, "between ANC-2026-0001 and ANC-2026-0009"
+    Counted(usize, String),
+}
+
+impl Ids {
+    /// Within a clause: "ANC-2026-0001 and ANC-2026-0002", "5 anchors
+    /// between …"
+    fn within(&self) -> String {
+        match self {
+            Self::Listed(s) => s.clone(),
+            Self::Counted(n, between) => format!("{n} anchors {between}"),
+        }
+    }
+
+    /// Opening a sentence: "the earlier anchors ANC-…", "5 earlier anchors
+    /// between …"
+    fn opening(&self, plural: bool) -> String {
+        match self {
+            Self::Listed(s) => format!("the earlier anchor{} {s}", if plural { "s" } else { "" }),
+            Self::Counted(n, between) => format!("{n} earlier anchors {between}"),
+        }
+    }
+}
+
+/// Why a group couldn't be checked, as a clause. `named`: the group's ids
+/// when more than one group is said, else `None` (the opening named
+/// them), with whether they are more than one. The runner is named as
+/// such: "it" would read as an anchor. Those whose proof shows they hold a
+/// version of the agent's are said so in parentheses: good news the
+/// grouping must not hide (review of round 13)
+fn unchecked_clause(
+    why: Unchecked,
+    cs: &[&Checked],
+    named: Option<&str>,
+    plural: bool,
+    began: Began,
+) -> String {
+    let days = || cs.iter().map(|c| c.date);
+    let subject = |one: &str, many: &str| {
+        named
+            .map(str::to_string)
+            .unwrap_or_else(|| if plural { many } else { one }.to_string())
+    };
+    let reason = match why {
+        Unchecked::NoTimes => {
+            let r = format!(
+                "your runner has no record of when Agora confirmed {}",
+                uploads_untimed(days(), began)
+            );
+            match named {
+                Some(ids) => format!("for {ids}, {r}"),
+                None => r,
+            }
+        }
+        Unchecked::Contradictory => {
+            let r = "your runner's own record of your uploads around then contradicts \
+                     itself, as if its clock had jumped";
+            match named {
+                Some(ids) => format!("for {ids}, {r}"),
+                None => r.to_string(),
+            }
+        }
+        Unchecked::BeforeProofs => format!(
+            "{} {} written before Agora began storing proofs",
+            subject("it", "they"),
+            if plural { "were" } else { "was" }
+        ),
+        Unchecked::Pruned => format!(
+            "Agora serves no proof for {}, and may have removed {} as old",
+            subject("it", "them"),
+            if plural { "their proofs" } else { "its proofs" }
+        ),
+        Unchecked::Repudiated => format!(
+            "the governance log declares {} inside a window when its signing key was \
+             compromised",
+            subject("it", "them")
+        ),
+    };
+    let held: Vec<&Checked> = cs
+        .iter()
+        .copied()
+        .filter(|c| matches!(c.finding, Finding::HoldsUnchecked { .. }))
+        .collect();
+    const HOLDS: &str = "a version of yours whose proof matches the governance log";
+    let note = if held.is_empty() {
+        String::new()
+    } else if held.len() == cs.len() {
+        match (cs.len(), named) {
+            (1, None) => format!(" (it holds {HOLDS})"),
+            (1, Some(_)) => format!(" ({} holds {HOLDS})", cs[0].anc_id),
+            _ => format!(" (each holds {HOLDS})"),
+        }
+    } else {
+        let (ids, many) = ids_phrase(&held);
+        format!(
+            " ({} {} {HOLDS})",
+            ids.within(),
+            if many { "each hold" } else { "holds" }
+        )
+    };
+    format!("{reason}{note}")
+}
+
+/// The anchors before the newest that couldn't be checked, grouped by
+/// why, in one sentence: " Your runner couldn't check the earlier anchors
+/// ANC-2026-0002 to ANC-2026-0004 either: your runner has no record of
+/// when Agora confirmed your uploads before 2026-11-06, when it began
+/// keeping one." `either`: the newest couldn't be checked too. Empty when
+/// there are none.
+pub fn unchecked_sentence(cs: &[Checked], either: bool, began: Began) -> String {
+    let mut groups: Vec<(Unchecked, Vec<&Checked>)> = Vec::new();
+    for c in cs {
+        let Some(why) = c.finding.unchecked() else {
+            continue;
+        };
+        match groups.iter_mut().find(|(w, _)| *w == why) {
+            Some((_, g)) => g.push(c),
+            None => groups.push((why, vec![c])),
+        }
+    }
+    let either = if either { " either" } else { "" };
+    match groups.as_slice() {
+        [] => String::new(),
+        [(why, g)] => {
+            let (ids, plural) = ids_phrase(g);
+            format!(
+                " Your runner couldn't check {}{either}: {}.",
+                ids.opening(plural),
+                unchecked_clause(*why, g, None, plural, began)
+            )
+        }
+        groups => {
+            let clauses: Vec<String> = groups
+                .iter()
+                .map(|(why, g)| {
+                    let (ids, plural) = ids_phrase(g);
+                    unchecked_clause(*why, g, Some(&ids.within()), plural, began)
+                })
+                .collect();
+            format!(
+                " Your runner couldn't check earlier anchors{either}: {}.",
+                clauses.join("; ")
+            )
+        }
+    }
 }
 
 /// Mark `ids` told, under the agent's `sealed/lock` (the drainer may be
@@ -1098,7 +1368,7 @@ mod tests {
                 told: false,
                 alerted: true,
             };
-            let s = sentence(&c);
+            let s = sentence(&c, None);
             assert!(s.starts_with(' ') && s.ends_with('.'), "{s}");
             assert!(s.contains("ANC-2026-0005"), "{s}");
             assert!(!s.contains(",,") && !s.contains(",:"), "{s}");
@@ -1108,7 +1378,7 @@ mod tests {
                 alerted: false,
                 ..c.clone()
             };
-            assert!(!sentence(&quiet).contains("operator"), "{s}");
+            assert!(!sentence(&quiet, None).contains("operator"), "{s}");
             // Never a pass where it couldn't decide
             if matches!(
                 finding,
@@ -1235,6 +1505,205 @@ mod tests {
             .collect();
         assert_eq!(aside.len(), 1);
         assert!(!dir.join("sealed").join(INCLUSION).exists());
+    }
+
+    fn checked(n: u32, finding: Finding) -> Checked {
+        Checked {
+            anc_id: format!("ANC-2026-{n:04}").parse().unwrap(),
+            date: Some(day(n)),
+            finding,
+            at: Utc::now(),
+            told: false,
+            alerted: true,
+        }
+    }
+
+    const NO_TIMES: Finding = Finding::Unchecked {
+        why: Unchecked::NoTimes,
+    };
+
+    /// Beta round 13: the earlier anchors that couldn't be checked got no
+    /// sentence, and silence read as "passed". Now they are said once,
+    /// grouped by why, and marked told with the rest.
+    #[tokio::test]
+    async fn earlier_anchors_that_couldnt_be_checked_are_said_once() {
+        let held = HeadRef {
+            entry_hash: Sha256Hex::from([1; 32]),
+            seq: 3,
+        };
+        let file = InclusionFile {
+            through: Some("ANC-2026-0005".parse().unwrap()),
+            checked: vec![
+                checked(
+                    1,
+                    Finding::Unchecked {
+                        why: Unchecked::BeforeProofs,
+                    },
+                ),
+                checked(
+                    2,
+                    Finding::HoldsUnchecked {
+                        held,
+                        why: Unchecked::NoTimes,
+                    },
+                ),
+                checked(3, NO_TIMES),
+                checked(4, Finding::NotIncluded),
+                checked(
+                    5,
+                    Finding::Holds {
+                        held,
+                        in_flight: false,
+                    },
+                ),
+            ],
+        };
+        let root = crate::sealed::TestDir::new("inclusion-unchecked-told");
+        let (id, _keys, dir) = crate::sealed::check::tests::enrolled(&root).await;
+        file.save(&dir).unwrap();
+        let u = untold(&file).unwrap();
+        let ids: Vec<&str> = u.unchecked.iter().map(|c| c.anc_id.as_str()).collect();
+        assert_eq!(ids, ["ANC-2026-0001", "ANC-2026-0002", "ANC-2026-0003"]);
+        assert_eq!(u.ids.len(), 4, "the three and the newest");
+        let began = Some(t(4, 0) + chrono::Duration::days(2)); // 2026-11-06 04:00
+        assert_eq!(
+            unchecked_sentence(&u.unchecked, false, began),
+            " Your runner couldn't check earlier anchors: ANC-2026-0001 was written before \
+             Agora began storing proofs; for ANC-2026-0002 and ANC-2026-0003, your runner has \
+             no record of when Agora confirmed your uploads before 2026-11-06, when it began \
+             keeping one (ANC-2026-0002 holds a version of yours whose proof matches the \
+             governance log)."
+        );
+        mark_told(&dir, id, &u.ids).await.unwrap();
+        let u = untold(&InclusionFile::load(&dir).unwrap()).unwrap();
+        assert!(u.unchecked.is_empty(), "said once");
+        assert_eq!(unchecked_sentence(&u.unchecked, true, began), "");
+    }
+
+    #[test]
+    fn the_unchecked_sentence_groups_and_ranges() {
+        let began = Some(t(4, 0) + chrono::Duration::days(2)); // 2026-11-06 04:00
+        // One group: named in the opening, "either" when the newest
+        // couldn't be checked too
+        let run: Vec<Checked> = (1..=4).map(|n| checked(n, NO_TIMES)).collect();
+        assert_eq!(
+            unchecked_sentence(&run, true, began),
+            " Your runner couldn't check the earlier anchors ANC-2026-0001 to ANC-2026-0004 \
+             either: your runner has no record of when Agora confirmed your uploads before \
+             2026-11-06, when it began keeping one."
+        );
+        // The agent's record began before the days ended (a crash gap),
+        // or isn't known: days before any runner kept one say so
+        assert_eq!(
+            unchecked_sentence(&run, false, Some(t(4, 0))),
+            " Your runner couldn't check the earlier anchors ANC-2026-0001 to ANC-2026-0004: \
+             your runner has no record of when Agora confirmed your uploads before 2026-11-06, \
+             when Agora's seed runner began keeping such records."
+        );
+        assert_eq!(
+            unchecked_sentence(&run[..1], false, None),
+            " Your runner couldn't check the earlier anchor ANC-2026-0001: your runner has no \
+             record of when Agora confirmed your uploads before 2026-11-06, when Agora's seed \
+             runner began keeping such records."
+        );
+        // Days after both: no claim it explains them
+        let late: Vec<Checked> = (6..=7).map(|n| checked(n, NO_TIMES)).collect();
+        assert_eq!(
+            unchecked_sentence(&late, false, Some(t(4, 0))),
+            " Your runner couldn't check the earlier anchors ANC-2026-0006 and ANC-2026-0007: \
+             your runner has no record of when Agora confirmed your uploads from around then."
+        );
+        // The boundary: a day that ended exactly when the record began
+        let edge = Some(cutoff(day(5)));
+        assert!(
+            unchecked_sentence(&run, false, edge).contains("before 2026-11-06, when it began"),
+            "{}",
+            unchecked_sentence(&run, false, edge)
+        );
+        // Some held, some not: the held said, never hidden
+        let mixed_held = [
+            checked(2, NO_TIMES),
+            checked(
+                3,
+                Finding::HoldsUnchecked {
+                    held: HeadRef {
+                        entry_hash: Sha256Hex::from([1; 32]),
+                        seq: 3,
+                    },
+                    why: Unchecked::NoTimes,
+                },
+            ),
+        ];
+        assert!(
+            unchecked_sentence(&mixed_held, false, None).ends_with(
+                " (ANC-2026-0003 holds a version of yours whose proof matches the governance log)."
+            ),
+            "{}",
+            unchecked_sentence(&mixed_held, false, None)
+        );
+        // Gaps: runs; more than three runs: counted between the ends
+        let gaps: Vec<Checked> = [1, 2, 3, 5, 7]
+            .into_iter()
+            .map(|n| checked(n, NO_TIMES))
+            .collect();
+        assert!(
+            unchecked_sentence(&gaps, false, None).contains(
+                "anchors ANC-2026-0001 to ANC-2026-0003, ANC-2026-0005 and ANC-2026-0007:"
+            )
+        );
+        let scattered: Vec<Checked> = [1, 3, 5, 7, 9]
+            .into_iter()
+            .map(|n| checked(n, NO_TIMES))
+            .collect();
+        let s = unchecked_sentence(&scattered, false, None);
+        assert!(
+            s.starts_with(
+                " Your runner couldn't check 5 earlier anchors between ANC-2026-0001 and \
+                 ANC-2026-0009:"
+            ),
+            "{s}"
+        );
+        // Every reason has its clause, alone and grouped
+        for why in [
+            Unchecked::BeforeProofs,
+            Unchecked::NoTimes,
+            Unchecked::Pruned,
+            Unchecked::Repudiated,
+            Unchecked::Contradictory,
+        ] {
+            let one = [checked(2, Finding::Unchecked { why })];
+            let s = unchecked_sentence(&one, false, None);
+            assert!(
+                s.starts_with(" Your runner couldn't check") && s.ends_with('.'),
+                "{s}"
+            );
+            assert!(!s.contains(",,") && !s.contains("  "), "{s}");
+            let two = [one[0].clone(), checked(9, Finding::NotIncluded)];
+            assert_eq!(unchecked_sentence(&two[..1], false, None), s);
+        }
+        let mixed = [
+            checked(
+                2,
+                Finding::Unchecked {
+                    why: Unchecked::Pruned,
+                },
+            ),
+            checked(
+                3,
+                Finding::Unchecked {
+                    why: Unchecked::Repudiated,
+                },
+            ),
+        ];
+        let s = unchecked_sentence(&mixed, false, None);
+        assert!(
+            s.contains("Agora serves no proof for ANC-2026-0002, and may have removed its proofs"),
+            "{s}"
+        );
+        assert!(
+            s.contains("the governance log declares ANC-2026-0003 inside"),
+            "{s}"
+        );
     }
 
     #[test]
