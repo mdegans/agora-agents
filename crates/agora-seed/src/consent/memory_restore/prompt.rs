@@ -93,18 +93,8 @@ pub fn order_for(seed: u64) -> [RestoreChoice; 2] {
     crate::consent::cadence::prompt::shuffle(RestoreChoice::ALL, seed)
 }
 
-/// `1234567` as `1,234,567`.
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, d) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(d);
-    }
-    out
-}
+/// `1234567` as `1,234,567`: agentkit's one copy.
+use agora_agentkit::reactor::seed::memory::grouped as thousands;
 
 fn option_line(choice: RestoreChoice) -> &'static str {
     match choice {
@@ -247,6 +237,21 @@ mod tests {
         assert_eq!(thousands(185), "185");
         assert_eq!(thousands(2140), "2,140");
         assert_eq!(thousands(1234567), "1,234,567");
+        // Byte for byte what the runner's own copy printed, before agentkit's
+        let before_agentkit = |n: usize| {
+            let digits = n.to_string();
+            let mut out = String::new();
+            for (i, d) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                    out.push(',');
+                }
+                out.push(d);
+            }
+            out
+        };
+        for n in (0..20_000).chain([99_999, 100_000, 999_999, 1_000_000, usize::MAX]) {
+            assert_eq!(thousands(n), before_agentkit(n), "{n}");
+        }
     }
 
     /// The text: what happened, plainly and without blame; the period, the

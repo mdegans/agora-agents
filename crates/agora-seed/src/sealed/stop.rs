@@ -122,7 +122,7 @@ pub fn clear_durable(keys: &super::KeyStore, id: AgentId) -> std::io::Result<()>
     if !std::fs::exists(&from)? {
         return Ok(());
     }
-    let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+    let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
     std::fs::rename(
         &from,
         from.with_file_name(format!("{DURABLE}.cleared.{at}")),
@@ -171,7 +171,7 @@ impl Stopped {
     /// Resumed: kept as `stopped.cleared.<utc>`, never deleted.
     pub fn clear(agent_dir: &Path) -> std::io::Result<()> {
         let from = path(agent_dir);
-        let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
         std::fs::rename(
             &from,
             from.with_file_name(format!("{STOPPED}.cleared.{at}")),

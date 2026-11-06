@@ -54,7 +54,7 @@ pub trait SealedApi: Send + Sync {
         id: AgentId,
         key: &SigningKey,
         sha256: &agora_agentkit::govlog::Sha256Hex,
-    ) -> Result<Vec<u8>, String>;
+    ) -> Result<Vec<u8>, BlobError>;
     /// The agent's heads in `ANC-` entries after `after`, oldest first.
     /// Untrusted until checked ([`super::anchors`]).
     async fn proofs(
@@ -84,6 +84,32 @@ pub trait SealedApi: Send + Sync {
     /// Whether the agent's anchored head is shown on its profile.
     async fn post_anchor(&self, id: AgentId, key: &SigningKey, publish: bool)
     -> Result<(), String>;
+}
+
+/// A blob fetch that failed, and whether trying again could help.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct BlobError {
+    /// Transient (a 5xx, a timeout, a connection): worth another try. A
+    /// 4xx (a 404 above all) is not: the answer won't change.
+    pub retry: bool,
+    pub message: String,
+}
+
+impl BlobError {
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            retry: true,
+            message: message.into(),
+        }
+    }
+
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            retry: false,
+            message: message.into(),
+        }
+    }
 }
 
 /// [`SealedApi::chain`], in seq order with duplicates dropped: the order
@@ -186,10 +212,17 @@ impl SealedApi for Client {
         id: AgentId,
         key: &SigningKey,
         sha256: &agora_agentkit::govlog::Sha256Hex,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, BlobError> {
         self.get_state_blob(auth(id, key), sha256)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| match &e {
+                agora_agentkit::client::Error::Status { status, .. }
+                    if status.is_client_error() =>
+                {
+                    BlobError::permanent(e.to_string())
+                }
+                _ => BlobError::transient(e.to_string()),
+            })
     }
 
     async fn head(
@@ -281,6 +314,8 @@ pub mod fake {
         pub public_key: Mutex<Option<agora_agentkit::crypto::VerifyingKey>>,
         /// What the server lists as the agent's rotations.
         pub rotations: Mutex<Vec<KeyRotation>>,
+        /// How long each blob answer takes, if set (a server hanging).
+        pub blob_delay: Mutex<Option<std::time::Duration>>,
         /// Blobs the server holds, by hash.
         pub blobs: Mutex<std::collections::HashMap<agora_agentkit::govlog::Sha256Hex, Vec<u8>>>,
         /// The proofs the server lists, all of them: `after` filters.
@@ -315,6 +350,7 @@ pub mod fake {
                 public_key: Mutex::default(),
                 rotations: Mutex::default(),
                 blobs: Mutex::default(),
+                blob_delay: Mutex::default(),
                 proofs: Mutex::default(),
                 proofs_page: Mutex::default(),
                 proofs_ignore_after: Mutex::default(),
@@ -424,14 +460,18 @@ pub mod fake {
             _: AgentId,
             _: &SigningKey,
             sha256: &agora_agentkit::govlog::Sha256Hex,
-        ) -> Result<Vec<u8>, String> {
-            self.call("blob")?;
+        ) -> Result<Vec<u8>, BlobError> {
+            self.call("blob").map_err(BlobError::transient)?;
+            let delay = *self.blob_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             self.blobs
                 .lock()
                 .unwrap()
                 .get(sha256)
                 .cloned()
-                .ok_or_else(|| "404".to_string())
+                .ok_or_else(|| BlobError::permanent("HTTP 404 Not Found"))
         }
 
         async fn proofs(

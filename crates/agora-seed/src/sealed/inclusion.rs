@@ -470,10 +470,9 @@ impl InclusionFile {
     }
 }
 
+/// A head as an agent is shown it: agentkit's one copy of the cut.
 fn short(h: &Sha256Hex) -> String {
-    let mut s = h.to_hex();
-    s.truncate(12);
-    s
+    agora_agentkit::reactor::seed::memory::short_head(h)
 }
 
 /// "ANC-2026-0005, the anchor for 2026-11-04," (an appositive, to read on

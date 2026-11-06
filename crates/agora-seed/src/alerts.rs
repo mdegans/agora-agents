@@ -146,6 +146,12 @@ pub enum AlertKind {
     /// recognise (its record of past keys lost, or a forgery): the run is
     /// refused, nothing marked. Never rate-limited.
     SealedStateUntrustedKey,
+    /// An agent's memory-id key couldn't be had: a key `sealed-forget` set
+    /// aside that can't be read, its secrets not in the secrets tree, or a
+    /// key there that isn't the one its state directory's fingerprint
+    /// records. Its session runs without memory ids; no key is made over
+    /// the evidence of one.
+    MemoryIdKeyRefused,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -154,7 +160,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -181,6 +187,7 @@ impl AlertKind {
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
         Self::SealedStateUntrustedKey,
+        Self::MemoryIdKeyRefused,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -223,6 +230,7 @@ impl AlertKind {
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
+            Self::MemoryIdKeyRefused => "memory_id_key_refused",
             Self::Test => "test_alert",
         }
     }
@@ -445,6 +453,20 @@ impl AlertKind {
                  If not, nothing can be restored: if it left, `agora-seed \
                  sealed-forget --agent <id> --note \"…\"` sets its key aside \
                  (nothing is deleted). It was skipped either way."
+            }
+            Self::MemoryIdKeyRefused => {
+                "An agent's memory-id key (<secrets>/<id>/memory_id_key.json) \
+                 couldn't be had, and none was made: the agent has had a key \
+                 (its state directory records the key's fingerprint, or \
+                 `sealed-forget` set one aside that can't be read), or its \
+                 signing secrets aren't in the secrets tree. A new key would \
+                 silently change every memory id the agent has been shown. \
+                 Its sessions run, with the plain Memory heading and a \
+                 `memory` tool that says ids are unavailable. Restore the \
+                 key that matches (the error below says which file); never \
+                 delete the fingerprint to make the error go away. One mail \
+                 an hour for the whole fleet: the agents are in the run log \
+                 as `memory_id_key_refused`."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

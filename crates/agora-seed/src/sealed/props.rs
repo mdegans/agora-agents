@@ -156,7 +156,7 @@ pub fn version(n: usize) -> serde_json::Value {
     })
 }
 
-async fn save(root: &Path, id: AgentId, value: serde_json::Value) {
+pub async fn save(root: &Path, id: AgentId, value: serde_json::Value) {
     let enrolment = Arc::new(super::SealedEnrolment::new(
         root.join("state"),
         root.join("secrets"),

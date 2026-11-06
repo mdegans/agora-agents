@@ -335,7 +335,7 @@ pub async fn restore(
     // by the write below
     let tmp = agent_dir.join("state.json.tmp");
     if std::fs::exists(&tmp)? {
-        let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
         // Not `*.json`: the enrolment's archive listing would take it
         std::fs::rename(&tmp, agent_dir.join(format!("state.json.tmp.{at}.aside")))
             .context("setting a stray state.json.tmp aside")?;

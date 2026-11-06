@@ -71,6 +71,37 @@ pub fn pending(seal: &AgentSeal) -> anyhow::Result<Option<(PathBuf, Intent)>> {
     Ok(found.pop())
 }
 
+/// Every resolution under `sealed/lost/`, finished or not, oldest first:
+/// its directory and its intent (when it began, what it set aside).
+/// Read-only.
+pub fn resolutions(seal: &AgentSeal) -> anyhow::Result<Vec<(PathBuf, Intent)>> {
+    let root = seal.dir().join(LOST);
+    let dirs = match std::fs::read_dir(&root) {
+        Ok(dirs) => dirs,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+    let mut found = Vec::new();
+    for d in dirs {
+        let d = d?.path();
+        for marker in [DONE, INTENT] {
+            let path = d.join(marker);
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let intent: Intent = serde_json::from_slice(&bytes)
+                        .with_context(|| format!("{} unreadable", path.display()))?;
+                    found.push((d.clone(), intent));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            }
+        }
+    }
+    found.sort_by_key(|f| f.1.at);
+    Ok(found)
+}
+
 fn sync(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
@@ -104,7 +135,7 @@ pub async fn begin(
     let dir = seal
         .dir()
         .join(LOST)
-        .join(at.format("%Y%m%dT%H%M%S%3fZ").to_string());
+        .join(at.format(crate::sealed::STAMP_FORMAT).to_string());
     let mut items = lost.to_vec();
     // On a new chain the waiting versions go too
     if onto.is_none() {

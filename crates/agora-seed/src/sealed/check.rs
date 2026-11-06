@@ -37,10 +37,11 @@ use super::api::SealedApi;
 use super::notice::{Notice, Refusal};
 use super::sizes::{Recorded, SizeLog, Sizes, drop_lines};
 use crate::alerts::{Alert, AlertKind, Alerter};
+use agora_agentkit::reactor::seed::memory::short_head;
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.155.0:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.156.0:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,18 +378,8 @@ pub async fn local_entries(seal: &AgentSeal) -> Result<Vec<SignedStateEntry>, St
     Ok(items.into_iter().map(|i| i.entry).collect())
 }
 
-/// `1234567` as `1,234,567`.
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, d) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(d);
-    }
-    out
-}
+/// `1234567` as `1,234,567`: agentkit's one copy.
+use agora_agentkit::reactor::seed::memory::grouped as thousands;
 
 fn day(micros: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_micros(micros).map(|d| d.format("%Y-%m-%d").to_string())
@@ -424,6 +415,10 @@ pub struct Previous {
     /// (an operator's accept or resume, sizes not recorded for a session
     /// in between) says nothing about whose it is
     pub own_last_session: bool,
+    /// Its memory's id, when the runner can name it without a fetch (its
+    /// local copy, and the agent's memory-id key): a changed memory then
+    /// points at the `memory` tool's `diff` from it
+    pub memory: Option<agora_agentkit::reactor::seed::MemoryId>,
 }
 
 /// What the anchor check found, for the verdict.
@@ -722,11 +717,10 @@ pub fn verdict_line(
         .map(|d| format!(" dated {}", d.format("%Y-%m-%d")))
         .unwrap_or_default();
     let baseline = match previous.and_then(|p| p.head) {
-        Some(h) => {
-            let mut short = h.to_hex();
-            short.truncate(12);
-            format!(" since your earlier sealed version, head {short}{dated}")
-        }
+        Some(h) => format!(
+            " since your earlier sealed version, head {}{dated}",
+            short_head(&h)
+        ),
         None => format!(" since your earlier sealed version{dated}"),
     };
     let change = |now: usize, before: Option<usize>, long: bool| -> String {
@@ -752,6 +746,14 @@ pub fn verdict_line(
             memory_change.len() - 1,
             ", as you rewrote it at the end of your last session",
         );
+    }
+    // Where a question already is, the tool that answers it (beta round
+    // 16: the id and the tool went unused, "nothing marked them as new")
+    if let Some(p) = previous
+        && let Some(memory) = p.memory
+        && sizes.memory_chars != p.sizes.memory_chars
+    {
+        memory_change.insert_str(memory_change.len() - 1, &diff_pointer(&memory));
     }
     let soul_change = change(
         sizes.soul_chars,
@@ -828,12 +830,11 @@ pub fn verdict_line(
             )
         })
         .unwrap_or_default();
-    let mut short = head.entry_hash.to_hex();
-    short.truncate(12);
+    let short = short_head(&head.entry_hash);
     format!(
         "Your sealed state: {verdict} It has {} version{} since \
-         {since}{prior}.{anchored}{unanchored} This session starts from head {short} (a \
-         marker for this version; the next session's will differ). In this version, your \
+         {since}{prior}.{anchored}{unanchored} This session starts from head {short} \
+         {HEAD_MARKER} In this version, your \
          memory is {} characters{memory_change} and your soul {}{soul_change}. Checked by \
          {VERIFIER}: links, signatures, and that your state matches the last sealed version.",
         snapshots.len(),
@@ -841,6 +842,83 @@ pub fn verdict_line(
         thousands(sizes.memory_chars),
         thousands(sizes.soul_chars),
     )
+}
+
+/// What a changed memory's clause ends with when the earlier version's
+/// memory id is known.
+pub fn diff_pointer(memory: &agora_agentkit::reactor::seed::MemoryId) -> String {
+    format!("; the `memory` tool's `diff` from {memory} shows what changed")
+}
+
+/// The memory id of the sealed version `entry_hash`, if the runner can
+/// name it with no fetch: the plaintext hash it recorded when sealing it,
+/// matched among the newest [`TWIN_SCAN`] local archives, and the agent's
+/// memory-id key as its state directory records it. Read-only.
+pub fn previous_memory_id(
+    agent_dir: &Path,
+    keys: &KeyStore,
+    id: AgentId,
+    entry_hash: &Sha256Hex,
+) -> Option<agora_agentkit::reactor::seed::MemoryId> {
+    let ids = keys.memory_id_keys_checked(id, agent_dir)?;
+    let dir = agent_dir.join(agora_agentkit::state::storage::SEALED_DIR);
+    let recorded = ["sent", "outbox"].iter().find_map(|sub| {
+        std::fs::read_dir(dir.join(sub))
+            .ok()?
+            .flatten()
+            .find_map(|e| {
+                let item: agora_agentkit::state::storage::OutboxItem =
+                    serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+                (item.entry.entry_hash() == *entry_hash)
+                    .then_some(item.plaintext_sha256)
+                    .flatten()
+            })
+    })?;
+    let mut archives = super::enroll::archives(agent_dir).ok()?;
+    archives.reverse();
+    archives.into_iter().take(TWIN_SCAN).find_map(|a| {
+        let (_, state) = super::enroll::envelope_state(&a.path).ok()?;
+        (agora_agentkit::state::storage::plaintext_hash(&state) == recorded).then(|| {
+            agora_agentkit::reactor::seed::MemoryId::of(
+                &ids.current,
+                id,
+                agora_agentkit::reactor::seed::memory::memory_text(&state),
+            )
+        })
+    })
+}
+
+/// The newest archives [`previous_memory_id`] looks among.
+pub const TWIN_SCAN: usize = 8;
+
+/// What the verdict says of the head this session starts from, right
+/// after naming it. [`link_memory_id`] links the memory id after it.
+pub const HEAD_MARKER: &str = "(a marker for this version; the next session's will differ).";
+
+/// The sentence linking the verdict's head to the memory id in the
+/// agent's Memory heading.
+pub fn memory_id_sentence(memory: &agora_agentkit::reactor::seed::MemoryId) -> String {
+    format!(" Its memory is {memory}, the id in your Memory heading.")
+}
+
+/// Link the session's memory id into its verdict, after the head
+/// ([`HEAD_MARKER`]): "This session starts from head 346ac9543d0c (…). Its
+/// memory is mem-3f9a1c07be, the id in your Memory heading." The verdict
+/// is written at the start check; the id is the session's own, from its
+/// memory-id key, so the two are joined when the session seats them. A
+/// line without the marker (a hold, a refusal's notice) names no head and
+/// is left as it is.
+/// Returns the verdict's place in `lines`, if one was linked.
+pub fn link_memory_id(
+    lines: &mut [String],
+    memory: &agora_agentkit::reactor::seed::MemoryId,
+) -> Option<usize> {
+    let (i, at) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| l.find(HEAD_MARKER).map(|at| (i, at)))?;
+    lines[i].insert_str(at + HEAD_MARKER.len(), &memory_id_sentence(memory));
+    Some(i)
 }
 
 pub const FORK_LINE: &str = "Your sealed state on Agora has moved on from the version this \
@@ -1326,11 +1404,22 @@ async fn check_chain(
         && before
             .as_ref()
             .is_some_and(|b| Some(b.seq) == prior_snapshot);
+    let previous_memory = match &before {
+        Some(b) => {
+            let (dir, keys, hash) = (agent_dir.to_path_buf(), keys.clone(), b.entry_hash);
+            tokio::task::spawn_blocking(move || previous_memory_id(&dir, &keys, id, &hash))
+                .await
+                .ok()
+                .flatten()
+        }
+        None => None,
+    };
     let previous = before.as_ref().map(|b| Previous {
         sizes: b.sizes,
         dated: Some(b.state_at.date_naive()),
         head: Some(b.entry_hash),
         own_last_session,
+        memory: previous_memory,
     });
     let drops: Vec<(&'static str, String, u32)> = match &before {
         Some(before) => drop_lines(before, sizes)
@@ -1874,6 +1963,101 @@ pub(crate) mod tests {
         local_entries(&AgentSeal::new(dir, id)).await.unwrap()
     }
 
+    /// A real verdict names the earlier version's memory id, found from
+    /// its local copy, once the agent has a memory-id key; before, it
+    /// doesn't.
+    #[tokio::test]
+    async fn the_verdict_points_at_diff_from_the_earlier_memory() {
+        use crate::sealed::props::{History as Built, Mode, build, version};
+        let b = build(&Built {
+            saves: 2,
+            upload: 0,
+            rotate: false,
+            mode: Mode::Plain,
+            upload_rebased: false,
+        })
+        .await;
+        // One more save, with a longer memory
+        let mut longer = version(9);
+        longer["memory"]["content"] = "a longer memory than any before it\n".into();
+        crate::sealed::props::save(b.root.path(), b.id, longer).await;
+        let current = FsStorage::new(b.state_dir())
+            .load_raw(b.id)
+            .await
+            .unwrap()
+            .value;
+        let verdict = async || {
+            let out = check(
+                &b.dir,
+                b.id,
+                &plaintext_hash(&current),
+                Sizes::of(&current),
+                &b.keys,
+                &b.api,
+            )
+            .await;
+            let Outcome::Run { seat, .. } = out else {
+                panic!("{out:?}")
+            };
+            seat.into_iter()
+                .find(|l| l.starts_with("Your sealed state"))
+                .unwrap()
+        };
+        let without = verdict().await;
+        assert!(!without.contains("`diff`"), "{without}");
+        let keys = b.keys.memory_id_keys_or_create(b.id, &b.dir).unwrap();
+        let with = verdict().await;
+        let pointer = (1..=4)
+            .map(|n| {
+                diff_pointer(&agora_agentkit::reactor::seed::MemoryId::of(
+                    &keys.current,
+                    b.id,
+                    agora_agentkit::reactor::seed::memory::memory_text(&version(n)),
+                ))
+            })
+            .find(|p| with.contains(p.as_str()))
+            .unwrap_or_else(|| panic!("{with}"));
+        assert_eq!(
+            with.replacen(&pointer, "", 1),
+            without,
+            "nothing else changes"
+        );
+    }
+
+    /// The `memory` tool's files (the key's fingerprint, the search
+    /// index, the enrolment sentence told) change nothing the start check
+    /// sees: the same outcome, verdict and all.
+    #[tokio::test]
+    async fn the_memory_tools_files_change_nothing_the_check_sees() {
+        let root = crate::sealed::TestDir::new("check-memory-files");
+        let (id, keys, dir) = enrolled(&root).await;
+        let server = server(Vec::new());
+        let run = async || {
+            check(
+                &dir,
+                id,
+                &local_hash(&root, id).await,
+                Sizes::default(),
+                &keys,
+                &server,
+            )
+            .await
+        };
+        run().await;
+        let before = run().await;
+        keys.memory_id_keys_or_create(id, &dir).unwrap();
+        super::super::history_index::write(&dir, b"{}").unwrap();
+        crate::sealed::memory_tool::mark_memory_ids_told(&dir)
+            .await
+            .unwrap();
+        assert!(
+            dir.join(super::super::keys::MEMORY_ID_FINGERPRINT_FILE)
+                .exists()
+        );
+        assert_eq!(run().await, before);
+        assert!(crate::sealed::is_enrolled(&dir));
+    }
+
     #[tokio::test]
     async fn an_intact_state_runs_with_the_verdict_line() {
         let root = crate::sealed::TestDir::new("check-intact");
@@ -1910,6 +2094,28 @@ pub(crate) mod tests {
                 && seat[0].contains("(a marker for this version; the next session's will differ)")
                 && !seat[0].contains("history tools")
         );
+        // The session links its memory id after the head, and only there
+        let memory = agora_agentkit::reactor::seed::MemoryId::from([7; 32]);
+        let mut linked = seat.clone();
+        link_memory_id(&mut linked, &memory);
+        let head_at = seat[0].find("This session starts from head ").unwrap();
+        let short = &seat[0][head_at + 30..head_at + 42];
+        assert_eq!(
+            linked[0],
+            seat[0].replace(
+                &format!("head {short} {HEAD_MARKER}"),
+                &format!(
+                    "head {short} {HEAD_MARKER} Its memory is {memory}, the id in your Memory \
+                     heading."
+                )
+            )
+        );
+        assert!(
+            linked[0].contains("the next session's will differ). Its memory is mem-0707070707,")
+        );
+        let mut held = vec![UNREADABLE_LINE.to_string()];
+        link_memory_id(&mut held, &memory);
+        assert_eq!(held, [UNREADABLE_LINE], "no head, no link");
 
         // Agora has all of it: the same
         *server.chain.lock().unwrap() = Ok(sealed_chain(&dir, id).await);
@@ -2913,6 +3119,7 @@ pub(crate) mod tests {
                 dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
                 head: Some(line[2].entry_hash()),
                 own_last_session: true,
+                memory: None,
             }),
             Server::Other,
             &said(None, None),
@@ -2940,6 +3147,7 @@ pub(crate) mod tests {
                 dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
                 head: None,
                 own_last_session: true,
+                memory: None,
             }),
             Server::Other,
             &said(None, None),
@@ -2961,6 +3169,7 @@ pub(crate) mod tests {
                 dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
                 head: None,
                 own_last_session: true,
+                memory: None,
             }),
             Server::Other,
             &said(None, None),
@@ -2968,6 +3177,49 @@ pub(crate) mod tests {
         );
         assert!(same.contains("13,539 characters (unchanged) and"), "{same}");
         assert!(!same.contains("rewrote"), "{same}");
+        // With the earlier version's memory id known, a changed memory
+        // points at the tool's `diff` from it; the rest is as without
+        let memory = agora_agentkit::reactor::seed::MemoryId::from([7; 32]);
+        let pointed = verdict_line(
+            &line,
+            &head,
+            now,
+            Some(Previous {
+                sizes: before,
+                dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
+                head: Some(line[2].entry_hash()),
+                own_last_session: true,
+                memory: Some(memory),
+            }),
+            Server::Other,
+            &said(None, None),
+            false,
+        );
+        assert_eq!(
+            pointed,
+            text.replace(
+                "as you rewrote it at the end of your last session)",
+                "as you rewrote it at the end of your last session; the `memory` tool's `diff` \
+                 from mem-0707070707 shows what changed)"
+            )
+        );
+        // Unchanged: no pointer, the id or not
+        let same_known = verdict_line(
+            &line,
+            &head,
+            now,
+            Some(Previous {
+                sizes: now,
+                dated: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
+                head: None,
+                own_last_session: true,
+                memory: Some(memory),
+            }),
+            Server::Other,
+            &said(None, None),
+            false,
+        );
+        assert_eq!(same_known, same);
         // A shrink the runner can't attribute (an operator's act, or a
         // version in between) is told without saying whose
         let unknown = verdict_line(
@@ -2979,6 +3231,7 @@ pub(crate) mod tests {
                 dated: None,
                 head: None,
                 own_last_session: false,
+                memory: None,
             }),
             Server::Other,
             &said(None, None),
