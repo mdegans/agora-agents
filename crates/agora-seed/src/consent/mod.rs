@@ -347,3 +347,5 @@ mod tests {
         assert!(same.offer.unwrap().validate().is_err());
     }
 }
+#[cfg(test)]
+mod golden;
