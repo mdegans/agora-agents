@@ -64,16 +64,12 @@ use zeroize::Zeroizing;
 use super::KeyStore;
 use super::api::SealedApi;
 use super::check::{merge_server, walk_line};
-use super::version::{Opener, verified_line};
+use super::version::{ChainCache, FailedBlobs, Opener, verified_line_cached};
 
 /// Which line a sealed version is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Line {
     /// The main line to `sealed/head.json`'s head.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "named by `Source::line`, which the tests read")
-    )]
     Main,
     /// Off it: displaced by a fork, set aside by a rebase, or otherwise
     /// not on the current line.
@@ -166,6 +162,11 @@ pub struct Version {
     /// Why a sealed version couldn't be opened just now (Agora unreachable,
     /// a blob not served): it is listed, without its memory.
     pub unopened: Option<String>,
+    /// An unopened version's memory as a local copy of the same state
+    /// holds it (matched by the plaintext hash the runner recorded when it
+    /// sealed it): unsigned, so never shown as the version's memory, only
+    /// used to name it by its memory id. Never logged.
+    pub twin_memory: Option<Zeroizing<String>>,
 }
 
 impl std::fmt::Debug for Version {
@@ -182,6 +183,7 @@ impl std::fmt::Debug for Version {
                     .map(|m| format!("[{} chars]", m.chars().count())),
             )
             .field("unopened", &self.unopened)
+            .field("twin_memory", &self.twin_memory.as_ref().map(|_| "[held]"))
             .finish()
     }
 }
@@ -305,6 +307,10 @@ struct Opened {
 pub struct HistoryCache {
     sealed: HashMap<Sha256Hex, Opened>,
     files: HashMap<(PathBuf, u64, std::time::SystemTime), Opened>,
+    /// Agora's chain, asked once a session.
+    chain: ChainCache,
+    /// Blob fetches that failed lately, not tried again yet.
+    failed: FailedBlobs,
 }
 
 impl std::fmt::Debug for HistoryCache {
@@ -312,6 +318,8 @@ impl std::fmt::Debug for HistoryCache {
         f.debug_struct("HistoryCache")
             .field("sealed", &self.sealed.len())
             .field("files", &self.files.len())
+            .field("chain", &self.chain.held())
+            .field("failed", &self.failed.count())
             .finish()
     }
 }
@@ -338,7 +346,11 @@ impl Builder {
                 v.sources.push(source);
             }
             // A sealed twin that couldn't be opened gets no content from a
-            // local copy: it stays as sealed, unopened
+            // local copy: it stays as sealed, unopened, named by the copy's
+            // memory only
+            if v.unopened.is_some() && v.twin_memory.is_none() {
+                v.twin_memory = opened.memory;
+            }
             return;
         }
         self.by_hash
@@ -349,6 +361,7 @@ impl Builder {
             state_hash: Some(opened.state_hash),
             memory: opened.memory,
             unopened: None,
+            twin_memory: None,
         });
     }
 
@@ -377,6 +390,7 @@ impl Builder {
             state_hash: recorded,
             memory: None,
             unopened: Some(why),
+            twin_memory: None,
         });
     }
 
@@ -434,7 +448,11 @@ pub async fn resolve(
 ) -> anyhow::Result<History> {
     let agent_dir = state_dir.join(id.to_string());
     let mut b = Builder::default();
-    sealed(&agent_dir, keys, api, id, cache, &mut b).await;
+    let deadline = tokio::time::Instant::now() + RESOLVE_DEADLINE;
+    sealed(&agent_dir, keys, api, id, cache, &mut b, deadline).await;
+    if b.history.left_out.iter().any(|l| l.held == Held::MainLine) {
+        hold_unchecked(&agent_dir, id, &mut b).await;
+    }
     let dir = agent_dir.clone();
     let files = std::mem::take(&mut cache.files);
     let (local, files) = tokio::task::spawn_blocking(move || local_files(&dir, files))
@@ -448,6 +466,54 @@ pub async fn resolve(
         }
     }
     Ok(b.finish())
+}
+
+/// The longest [`resolve`] spends opening sealed versions: past it, the
+/// versions not opened yet are listed unopened, and what was opened is
+/// answered.
+pub const RESOLVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What an agent is told of a version not tried before the deadline.
+pub const PAST_DEADLINE: &str = "not opened: gathering your history took too long";
+
+/// With the main line unchecked, every head held on it (`head.json`'s,
+/// `sent/`'s, `outbox/`'s) is still answered: held, but unchecked, never
+/// "not found".
+async fn hold_unchecked(agent_dir: &Path, id: AgentId, b: &mut Builder) {
+    let seal = AgentSeal::new(agent_dir, id);
+    let mut heads: Vec<HeadRef> = Vec::new();
+    if let Ok(Some(h)) = seal.head().await {
+        heads.push(h.head);
+    }
+    for items in [seal.sent().await, seal.outbox().await]
+        .into_iter()
+        .flatten()
+    {
+        heads.extend(items.iter().map(|i| head_of(&i.entry)));
+    }
+    let known: HashSet<Sha256Hex> = b
+        .history
+        .versions
+        .iter()
+        .flat_map(Version::heads)
+        .chain(b.history.left_out.iter().filter_map(|l| match &l.held {
+            Held::Entry { head, .. } => Some(*head),
+            _ => None,
+        }))
+        .map(|h| h.entry_hash)
+        .collect();
+    let mut seen = known;
+    for head in heads {
+        if seen.insert(head.entry_hash) {
+            b.leave_out(
+                Held::Entry {
+                    head,
+                    line: Line::Main,
+                },
+                "your sealed history couldn't be checked just now",
+            );
+        }
+    }
 }
 
 /// How a side entry was found.
@@ -549,6 +615,7 @@ async fn sealed(
     id: AgentId,
     cache: &mut HistoryCache,
     b: &mut Builder,
+    deadline: tokio::time::Instant,
 ) {
     let seal = AgentSeal::new(agent_dir, id);
     if !tokio::fs::try_exists(seal.dir()).await.unwrap_or(true) {
@@ -630,17 +697,19 @@ async fn sealed(
     let mut seals = vec![&seal];
     seals.extend(lost_seals.iter());
     let mut opener = Opener::new(seals, api, &k);
+    opener.failed = std::mem::take(&mut cache.failed);
     let mut ctx = Ctx {
         b,
         opener: &mut opener,
         cache,
         recorded: &recorded,
+        deadline,
     };
 
     // The main line
     let mut main = Vec::new();
     if let Some(head) = &head {
-        match verified_line(&seal, keys, api, id, head).await {
+        match verified_line_cached(&seal, keys, api, id, head, &mut ctx.cache.chain).await {
             Ok(line) => main = line,
             Err(e) => {
                 tracing::warn!(
@@ -699,7 +768,6 @@ async fn sealed(
     let mut pool = main.clone();
     pool.extend(side.iter().map(|(e, _)| e.clone()));
     let mut seen = on_main;
-    let mut server: Option<Result<Vec<SignedStateEntry>, String>> = None;
     for (entry, aside) in side {
         if !seen.insert(entry.entry_hash()) {
             continue;
@@ -711,7 +779,8 @@ async fn sealed(
             continue;
         }
         let head = head_of(&entry);
-        let Some(line) = side_line(&pool, &entry, id, &trusted, keys, api, &mut server).await
+        let Some(line) =
+            side_line(&pool, &entry, id, &trusted, keys, api, &mut ctx.cache.chain).await
         else {
             tracing::warn!(
                 event_type = "memory_history_side_line_unverified",
@@ -736,6 +805,7 @@ async fn sealed(
         };
         ctx.open(&line, &entry, source).await;
     }
+    ctx.cache.failed = std::mem::take(&mut ctx.opener.failed);
 }
 
 /// `entry`'s line from the genesis, verified with the runner's trust:
@@ -747,21 +817,15 @@ async fn side_line(
     trusted: &TrustedKeys,
     keys: &KeyStore,
     api: &dyn SealedApi,
-    server: &mut Option<Result<Vec<SignedStateEntry>, String>>,
+    server: &mut ChainCache,
 ) -> Option<Vec<SignedStateEntry>> {
     let hash = entry.entry_hash();
     let line = match walk_line(pool, &hash, Some(entry.entry.seq)) {
         Ok(line) => line,
         Err(_) => {
-            if server.is_none() {
-                let fetched = match keys.signing(id) {
-                    Some(signing) => super::api::chain(api, id, &signing).await,
-                    None => Err("no signing key".into()),
-                };
-                *server = Some(fetched);
-            }
-            let chain = server.as_ref()?.as_ref().ok()?;
-            let all = merge_server(pool, chain).ok()?;
+            let signing = keys.signing(id)?;
+            let chain = server.get(api, id, &signing).await.ok()?;
+            let all = merge_server(pool, &chain).ok()?;
             walk_line(&all, &hash, Some(entry.entry.seq)).ok()?
         }
     };
@@ -775,6 +839,8 @@ struct Ctx<'b, 'o, 'a> {
     opener: &'o mut Opener<'a>,
     cache: &'b mut HistoryCache,
     recorded: &'b HashMap<Sha256Hex, Sha256Hex>,
+    /// Past it, nothing more is fetched ([`RESOLVE_DEADLINE`]).
+    deadline: tokio::time::Instant,
 }
 
 impl Ctx<'_, '_, '_> {
@@ -787,7 +853,14 @@ impl Ctx<'_, '_, '_> {
             self.b.add(source, at, opened.clone());
             return;
         }
-        match self.opener.open(line, &entry.entry).await {
+        let opened = if tokio::time::Instant::now() >= self.deadline {
+            Err(anyhow::anyhow!("{PAST_DEADLINE}"))
+        } else {
+            tokio::time::timeout_at(self.deadline, self.opener.open(line, &entry.entry))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("{PAST_DEADLINE}")))
+        };
+        match opened {
             Ok(value) => {
                 let opened = Opened {
                     state_hash: plaintext_hash(&value),
@@ -1293,6 +1366,7 @@ mod tests {
         }
         for v in &unopened {
             assert!(v.memory.is_none(), "no content from the unsigned twin");
+            assert!(v.twin_memory.is_some(), "the twin's memory names it");
             assert!(
                 v.sources
                     .iter()
@@ -1314,9 +1388,26 @@ mod tests {
             .iter()
             .filter(|c| *c == "blob")
             .count();
-        assert_eq!(tries, 3 * unopened.len(), "three tries each");
-        // Served again
+        // Three tries a blob, each blob once (a delta's keyframe is shared)
+        assert_eq!(tries, 3 * cache.failed.count(), "three tries each");
+        assert!(cache.failed.count() >= 1);
+        // Asked again within the session: no fetch at all, the same answer
+        b.api.calls.lock().unwrap().clear();
+        let again = resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+            .await
+            .unwrap();
+        assert!(b.api.calls.lock().unwrap().is_empty(), "remembered");
+        assert_eq!(
+            again
+                .versions
+                .iter()
+                .filter(|v| v.unopened.is_some())
+                .count(),
+            unopened.len()
+        );
+        // Served again, once the failures are old enough to try again
         *b.api.fail.lock().unwrap() = None;
+        tokio::time::advance(crate::sealed::version::FAILED_FOR).await;
         b.api.calls.lock().unwrap().clear();
         let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
             .await
@@ -1538,5 +1629,84 @@ mod tests {
             panic!("{h:?}")
         };
         assert!(matches!(source, Source::OffLine { .. }), "{source:?}");
+    }
+
+    /// A server that never answers costs at most the resolver's deadline:
+    /// each try is bounded, and past the deadline nothing more is fetched;
+    /// what wasn't opened is listed unopened.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_server_costs_at_most_the_deadline() {
+        let b = build(&plain(3, 9)).await;
+        b.seal().prune_blobs().await.unwrap();
+        *b.api.blob_delay.lock().unwrap() = Some(std::time::Duration::from_secs(3600));
+        let start = tokio::time::Instant::now();
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            start.elapsed() <= RESOLVE_DEADLINE + std::time::Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(h.versions.iter().any(|v| v.unopened.is_some()), "{h:?}");
+        assert_eq!(h.versions.len(), 4, "every version still listed");
+    }
+
+    /// A 404 is the answer: asked once, never retried.
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_blob_is_asked_for_once() {
+        let b = build(&plain(3, 9)).await;
+        b.seal().prune_blobs().await.unwrap();
+        b.api.blobs.lock().unwrap().clear();
+        let mut cache = HistoryCache::default();
+        let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+            .await
+            .unwrap();
+        assert!(h.versions.iter().any(|v| v.unopened.is_some()));
+        let gets = b
+            .api
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "blob")
+            .count();
+        assert_eq!(gets, cache.failed.count(), "one GET a blob");
+    }
+
+    /// Agora's chain is asked once a session, however often the history
+    /// is: a main line through Agora's entries, a side line too.
+    #[tokio::test]
+    async fn the_chain_is_asked_once_a_session() {
+        let b = build(&Built {
+            saves: 2,
+            upload: 0,
+            rotate: false,
+            mode: Mode::Rebase,
+            upload_rebased: false,
+        })
+        .await;
+        let mut cache = HistoryCache::default();
+        b.api.calls.lock().unwrap().clear();
+        for _ in 0..3 {
+            resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+                .await
+                .unwrap();
+        }
+        let chains = b
+            .api
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "chain")
+            .count();
+        assert!(chains <= 1, "{chains}");
     }
 }

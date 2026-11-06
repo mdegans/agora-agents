@@ -1893,6 +1893,40 @@ pub(crate) mod tests {
         local_entries(&AgentSeal::new(dir, id)).await.unwrap()
     }
 
+    /// The `memory` tool's files (the key's fingerprint, the search
+    /// index, the enrolment sentence told) change nothing the start check
+    /// sees: the same outcome, verdict and all.
+    #[tokio::test]
+    async fn the_memory_tools_files_change_nothing_the_check_sees() {
+        let root = crate::sealed::TestDir::new("check-memory-files");
+        let (id, keys, dir) = enrolled(&root).await;
+        let server = server(Vec::new());
+        let run = async || {
+            check(
+                &dir,
+                id,
+                &local_hash(&root, id).await,
+                Sizes::default(),
+                &keys,
+                &server,
+            )
+            .await
+        };
+        run().await;
+        let before = run().await;
+        keys.memory_id_keys_or_create(id, &dir).unwrap();
+        super::super::history_index::write(&dir, b"{}").unwrap();
+        crate::sealed::memory_tool::mark_memory_ids_told(&dir)
+            .await
+            .unwrap();
+        assert!(
+            dir.join(super::super::keys::MEMORY_ID_FINGERPRINT_FILE)
+                .exists()
+        );
+        assert_eq!(run().await, before);
+        assert!(crate::sealed::is_enrolled(&dir));
+    }
+
     #[tokio::test]
     async fn an_intact_state_runs_with_the_verdict_line() {
         let root = crate::sealed::TestDir::new("check-intact");

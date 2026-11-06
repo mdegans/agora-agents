@@ -47,6 +47,13 @@ pub fn location(agent_dir: &Path) -> PathBuf {
     }
 }
 
+/// Whether the index is moving into `sealed/`: the agent has `sealed/`
+/// now, and an index from before it still stands beside its state (removed
+/// at the next write, the next search's).
+pub fn moving(agent_dir: &Path) -> bool {
+    location(agent_dir) == path(agent_dir) && unsealed_path(agent_dir).exists()
+}
+
 /// The index's bytes, or `None` if there is none.
 pub fn read(agent_dir: &Path) -> std::io::Result<Option<Vec<u8>>> {
     match std::fs::read(location(agent_dir)) {

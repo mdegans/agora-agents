@@ -619,6 +619,18 @@ impl KeyStore {
         agent_dir: &Path,
     ) -> std::io::Result<MemoryIdKeys> {
         let dir = self.agent_dir(id);
+        // Never makes the agent's state directory: an agent with no state
+        // yet has no memory to name
+        if !agent_dir.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "agent {id} has no state directory ({}): no memory-id key is made before \
+                     it has a state",
+                    agent_dir.display()
+                ),
+            ));
+        }
         let fingerprint = read_fingerprint(agent_dir)?;
         let matches = |keys: &MemoryIdKeys| -> std::io::Result<()> {
             match &fingerprint {
@@ -918,6 +930,7 @@ mod tests {
     #[test]
     fn the_secrets_file_is_what_fskeyring_reads() {
         let dir = crate::sealed::TestDir::new("keys-secrets");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let store = KeyStore::new(dir.path());
         let id = AgentId::new();
         let (sk, _) = agora_agentkit::crypto::generate_keypair();
@@ -946,6 +959,7 @@ mod tests {
     #[test]
     fn retiring_appends_and_never_drops() {
         let dir = crate::sealed::TestDir::new("keys-past");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let store = KeyStore::new(dir.path());
         let id = AgentId::new();
         let (a, _) = agora_agentkit::crypto::generate_keypair();
@@ -968,7 +982,14 @@ mod tests {
     #[test]
     fn the_memory_id_key_is_made_once_and_kept() {
         let dir = crate::sealed::TestDir::new("keys-memory-id");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
+        assert!(store.memory_id_keys(id).unwrap().is_none());
+        // No state directory yet: refused, and nothing made, it included
+        let missing = dir.path().join("no-state-yet");
+        let err = store.memory_id_keys_or_create(id, &missing).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert!(!missing.exists());
         assert!(store.memory_id_keys(id).unwrap().is_none());
         let made = store
             .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
@@ -1015,6 +1036,7 @@ mod tests {
     #[test]
     fn a_memory_id_key_is_never_written_over() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-race");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let path = dir.path().join("a").join(MEMORY_ID_KEY_FILE);
         assert_eq!(
             create_secret(&path, b"first").unwrap_err().kind(),
@@ -1036,6 +1058,7 @@ mod tests {
     #[test]
     fn replaced_memory_id_keys_still_resolve() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-past");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
         let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
         let file = serde_json::json!({
@@ -1063,6 +1086,7 @@ mod tests {
     #[test]
     fn concurrent_makers_agree_on_one_key() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-threads");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
         let keys: Vec<[u8; 32]> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..16)
@@ -1091,6 +1115,7 @@ mod tests {
     #[test]
     fn a_bad_memory_id_key_file_is_an_error_and_left_alone() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-bad");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
         let path = store.agent_dir(id).join(MEMORY_ID_KEY_FILE);
         let short = serde_json::json!({
@@ -1113,6 +1138,7 @@ mod tests {
     #[test]
     fn no_memory_id_key_is_made_without_the_agent() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-refuse");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let store = KeyStore::new(dir.path().join("elsewhere"));
         let stranger = AgentId::new();
         let e = store
@@ -1136,6 +1162,7 @@ mod tests {
     #[test]
     fn a_forgotten_memory_id_key_is_revived_not_reminted() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-revive");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
         let first = *store
             .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
@@ -1158,6 +1185,7 @@ mod tests {
     #[test]
     fn the_newest_forgotten_key_is_current_and_the_rest_past() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-revive-two");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
         let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
         let file = |current: [u8; 32], past: &[[u8; 32]]| {
@@ -1191,6 +1219,7 @@ mod tests {
     #[test]
     fn an_unreadable_forgotten_key_refuses() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-revive-bad");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
         let aside = forgotten(&store, id, "20261106T120000000Z");
         write_secret(&aside, b"{\"current\": {").unwrap();
@@ -1209,6 +1238,7 @@ mod tests {
     #[test]
     fn a_secrets_tree_without_the_recorded_key_refuses() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-fingerprint");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let agent = dir.path().join("state-agent");
         let (store, id) = with_agent(dir.path());
         let key = *store
@@ -1260,6 +1290,7 @@ mod tests {
     #[test]
     fn concurrent_revivers_agree() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-revive-threads");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
         let agent = dir.path().join("state-agent");
         let key = *store
@@ -1294,6 +1325,7 @@ mod tests {
     #[test]
     fn stale_key_tmps_are_swept() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-sweep");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let (store, id) = with_agent(dir.path());
         let secrets = store.agent_dir(id);
         let stale = secrets.join(format!("memory_id_key.{}.tmp", uuid::Uuid::new_v4()));
@@ -1316,6 +1348,7 @@ mod tests {
     #[test]
     fn the_state_key_cache_round_trips_and_is_redacted() {
         let dir = crate::sealed::TestDir::new("keys-state");
+        std::fs::create_dir_all(dir.path().join("state-agent")).unwrap();
         let store = KeyStore::new(dir.path());
         let id = AgentId::new();
         assert!(store.state_key_file(id).unwrap().is_none());

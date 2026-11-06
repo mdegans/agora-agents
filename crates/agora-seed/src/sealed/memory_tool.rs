@@ -29,9 +29,10 @@ use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::{AgentId, GovernanceLogId};
 use agora_agentkit::reactor::seed::memory::render;
 use agora_agentkit::reactor::seed::memory::{
-    Candidate, CurrentMemory, HistoryRef, IndexState, MEMORY_TOOL_NAME, MemoryAction, MemoryId,
-    MemoryIdKey, MemoryInput, MemoryVersion, Resolution, SealCheck, SearchIndex, UNCHECKED,
-    VersionSource, VersionText, log_limit, newest_first, resolve, short_head, show_budget,
+    Candidate, CurrentMemory, HistoryRef, IndexError, IndexState, MEMORY_TOOL_NAME, MemoryAction,
+    MemoryId, MemoryIdKey, MemoryInput, MemoryVersion, Resolution, SealCheck, SearchIndex,
+    UNCHECKED, VersionSource, VersionText, log_limit, newest_first, resolve, short_head,
+    show_budget,
 };
 use agora_agentkit::reactor::seed::{ContextGauge, SeedAgent};
 use chrono::{DateTime, Utc};
@@ -281,7 +282,7 @@ impl MemoryReader {
         };
         let anchors = anchored(&self.agent_dir()).await;
         let view = View::new(history, ids, self.id, &anchors);
-        let current = CurrentMemory::new(current_id, &current, &view.rows);
+        let current = view.current(current_id, &current);
         let text = match action {
             MemoryAction::Log { before, limit } => view.log(before.as_ref(), limit, &current),
             MemoryAction::Show { id, budget } => view.show(id.as_slice(), budget, current),
@@ -373,6 +374,9 @@ fn is_local(source: &Source) -> bool {
 /// resolver's reason is the operator's: kept for the log).
 const NOT_FETCHED: &str = "its sealed copy couldn't be fetched";
 
+/// Why a sealed version wasn't tried, past the resolver's deadline.
+const PAST_DEADLINE: &str = "gathering your history took too long";
+
 fn push_block(out: &mut String, block: &str) {
     if block.is_empty() {
         return;
@@ -417,7 +421,9 @@ impl View {
         } else {
             SealCheck::Checked
         };
-        let mut rows: Vec<(usize, MemoryVersion)> = Vec::new();
+        // Each row with its place in the history and the text it is named
+        // by: its memory, or an unopened version's local twin's
+        let mut rows: Vec<(usize, MemoryVersion, Option<&str>)> = Vec::new();
         for (i, v) in history.versions.iter().enumerate() {
             let Some(primary) = v.sources.first() else {
                 continue;
@@ -426,56 +432,81 @@ impl View {
                 continue;
             }
             let source = version_source(primary);
-            let mut row = match &v.unopened {
+            let (mut row, named) = match &v.unopened {
                 None => {
                     let content = v.memory_str();
-                    MemoryVersion::opened(
-                        MemoryId::of(&keys.current, agent, content),
-                        content,
-                        v.at,
-                        source,
+                    (
+                        MemoryVersion::opened(
+                            MemoryId::of(&keys.current, agent, content),
+                            content,
+                            v.at,
+                            source,
+                        ),
+                        Some(content),
                     )
                 }
-                Some(_) => MemoryVersion {
-                    head: None,
-                    at: v.at,
-                    source,
-                    anchored: None,
-                    text: VersionText::Unopened {
-                        id: None,
-                        reason: NOT_FETCHED.into(),
-                    },
-                },
+                Some(why) => {
+                    let twin = v.twin_memory.as_deref().map(String::as_str);
+                    let reason = if why.contains(super::history::PAST_DEADLINE) {
+                        PAST_DEADLINE
+                    } else {
+                        NOT_FETCHED
+                    };
+                    (
+                        MemoryVersion {
+                            head: None,
+                            at: v.at,
+                            source,
+                            anchored: None,
+                            text: VersionText::Unopened {
+                                id: twin.map(|t| MemoryId::of(&keys.current, agent, t)),
+                                reason: reason.into(),
+                            },
+                        },
+                        twin,
+                    )
+                }
             };
             row.head = primary.head().map(|h| h.entry_hash);
             row.anchored = v.heads().find_map(|h| anchors.get(&h.entry_hash).cloned());
-            rows.push((i, row));
+            rows.push((i, row, named));
         }
         // Newest first, undated last, in agentkit's order: sorted here with
         // the rows' places, then checked unchanged by `newest_first`
-        rows.sort_by_key(|(_, v)| (v.at.is_none(), std::cmp::Reverse(v.at)));
+        rows.sort_by_key(|(_, v, _)| (v.at.is_none(), std::cmp::Reverse(v.at)));
         let mut placed = vec![None; history.versions.len()];
-        for (row, (i, _)) in rows.iter().enumerate() {
-            placed[*i] = Some(row);
-        }
-        let mut rows: Vec<MemoryVersion> = rows.into_iter().map(|(_, v)| v).collect();
-        let order: Vec<_> = rows.iter().map(|v| v.at).collect();
-        newest_first(&mut rows);
-        debug_assert_eq!(order, rows.iter().map(|v| v.at).collect::<Vec<_>>());
         let mut ids = Vec::new();
         for key in keys.all() {
-            for (row, v) in rows.iter().enumerate() {
-                if let Some(content) = v.content() {
-                    ids.push((MemoryId::of(key, agent, content), row));
+            for (row, (_, _, named)) in rows.iter().enumerate() {
+                if let Some(text) = named {
+                    ids.push((MemoryId::of(key, agent, text), row));
                 }
             }
         }
+        for (row, (i, _, _)) in rows.iter().enumerate() {
+            placed[*i] = Some(row);
+        }
+        let mut rows: Vec<MemoryVersion> = rows.into_iter().map(|(_, v, _)| v).collect();
+        let order: Vec<_> = rows.iter().map(|v| v.at).collect();
+        newest_first(&mut rows);
+        debug_assert_eq!(order, rows.iter().map(|v| v.at).collect::<Vec<_>>());
         Self {
             history,
             rows,
             placed,
             ids,
             seal,
+        }
+    }
+
+    /// The memory in context, placed at its newest row by memory id: an
+    /// unopened row named by its local twin places it too, where
+    /// agentkit's [`CurrentMemory::new`] matches opened text only.
+    fn current<'a>(&self, id: MemoryId, content: &'a str) -> CurrentMemory<'a> {
+        CurrentMemory {
+            id,
+            content,
+            position: self.rows.iter().position(|v| v.id() == Some(id)),
         }
     }
 
@@ -654,8 +685,9 @@ fn compose(notes: &[String], body: &str) -> String {
 
 fn not_found(r: &HistoryRef) -> String {
     format!(
-        "No version of your memory has the id or head \"{r}\". `log` lists them, with their \
-         memory ids and heads."
+        "No version of your memory has the id or head \"{}\". `log` lists them, with their \
+         memory ids and heads.",
+        r.shown()
     )
 }
 
@@ -672,11 +704,19 @@ struct Found {
 /// answered.
 async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &str) -> Found {
     let dir = agent_dir.to_path_buf();
-    let read = tokio::task::spawn_blocking(move || super::history_index::read(&dir))
-        .await
-        .map_err(std::io::Error::other)
-        .and_then(|r| r);
+    let read = tokio::task::spawn_blocking(move || {
+        super::history_index::read(&dir).map(|r| (r, super::history_index::moving(&dir)))
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|r| r);
+    let (read, moved) = match read {
+        Ok((r, moved)) => (Ok(r), moved),
+        Err(e) => (Err(e), false),
+    };
     let (index, state) = match read {
+        // Moved into `sealed/` since the last search: built again there
+        Ok(None) if moved => (SearchIndex::new(), IndexState::Rebuilt),
         Ok(None) => (SearchIndex::new(), IndexState::Built),
         Ok(Some(bytes)) => match SearchIndex::from_bytes(&bytes) {
             Ok(index) => (index, IndexState::Loaded),
@@ -684,7 +724,7 @@ async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &s
                 tracing::warn!(
                     event_type = "memory_index_rebuilt",
                     agent_id = %id,
-                    reason = %e,
+                    reason = index_error_kind(&e),
                     "the memory search index couldn't be used; rebuilt"
                 );
                 (SearchIndex::new(), IndexState::Rebuilt)
@@ -706,8 +746,12 @@ async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &s
         .rev()
         .filter_map(|v| Some((v.id()?, v.at?, v.content()?)))
         .collect();
-    let held: HashSet<MemoryId> = indexable.iter().map(|(m, _, _)| *m).collect();
-    let (mut index, state) = if index.ids().any(|m| !held.contains(m)) {
+    // Every row's id is held, unopened ones' too; a row with no id (an
+    // unopened version with no local twin) may be any indexed memory, so
+    // nothing is dropped for it: an Agora blip never costs a rebuild
+    let held: HashSet<MemoryId> = rows.iter().filter_map(MemoryVersion::id).collect();
+    let all_named = rows.iter().all(|v| v.id().is_some());
+    let (mut index, state) = if all_named && index.ids().any(|m| !held.contains(m)) {
         tracing::info!(
             event_type = "memory_index_rebuilt",
             agent_id = %id,
@@ -755,6 +799,18 @@ async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &s
     Found {
         result: index.search(query),
         state,
+    }
+}
+
+/// What was wrong with an index file, for the log: the variant only (a
+/// JSON error's text can quote the file, which holds memory).
+fn index_error_kind(e: &IndexError) -> &'static str {
+    match e {
+        IndexError::Json(_) => "json",
+        IndexError::Format(_) => "format",
+        IndexError::Mismatch => "mismatch",
+        IndexError::LineOutOfRange => "line_out_of_range",
+        IndexError::Unsorted => "unsorted",
     }
 }
 
@@ -934,6 +990,11 @@ mod tests {
         assert!(out.contains(&memory(1).trim_end().to_string()), "{out}");
         let out = rd.answer(show(vec![r("mem-abcdef")]), &api).await.text;
         assert!(out.starts_with("No version of your memory"), "{out}");
+        // A whole id asked for is echoed short
+        let whole = format!("mem-{}", "ab".repeat(32));
+        let out = rd.answer(show(vec![r(&whole)]), &api).await.text;
+        assert!(out.contains("\"mem-ababababab\""), "{out}");
+        assert!(!out.contains(&whole), "{out}");
         assert_eq!(files(root.path()), before, "read-only but for search");
         assert!(api.calls.lock().unwrap().is_empty(), "no network");
 
@@ -971,6 +1032,17 @@ mod tests {
         std::fs::write(&index, b"{ not an index").unwrap();
         let out = rd.answer(search("synthetic"), &api).await.text;
         assert!(out.starts_with(INDEX_REBUILT), "{out}");
+        // Enrolled since: the next search moves the index into sealed/, as
+        // a rebuild, never a "first search"
+        std::fs::create_dir_all(dir.join("sealed")).unwrap();
+        assert!(index.exists(), "not removed until the next search");
+        let out = rd.answer(search("synthetic"), &api).await.text;
+        assert!(
+            out.contains(INDEX_REBUILT) && !out.contains(INDEX_BUILT),
+            "{out}"
+        );
+        assert!(!index.exists(), "moved");
+        assert!(super::super::history_index::path(&dir).exists());
     }
 
     /// An enrolled agent with a rebased fork: rows carry heads; the
@@ -1063,7 +1135,42 @@ mod tests {
             assert!(!said.contains("synthetic"), "no content: {said}");
             // The resolver's own reason is the operator's, never shown
             assert!(!said.contains("blob"), "{said}");
+            // Named by its local twin's memory: its id reaches it too
+            if let Some(twin) = &v.twin_memory {
+                let id = MemoryId::of(&keys(1).current, b.id, twin);
+                let said = rd.answer(show(vec![r(id)]), &b.api).await.text;
+                assert!(said.contains("couldn't be opened just now"), "{said}");
+                assert!(!said.contains("No version"), "{said}");
+            }
         }
+    }
+
+    /// An index built while Agora served is kept through a blip: the
+    /// unopened versions' memories are still held.
+    #[tokio::test(start_paused = true)]
+    async fn a_blip_does_not_rebuild_the_index() {
+        let b = build(&Built {
+            saves: 3,
+            upload: 9,
+            rotate: false,
+            mode: Mode::Plain,
+            upload_rebased: false,
+        })
+        .await;
+        b.seal().prune_blobs().await.unwrap();
+        let mut rd = reader(&b.state_dir(), &b.keys, b.id, 4, None);
+        let out = rd.answer(search("synthetic"), &b.api).await.text;
+        assert!(out.starts_with(INDEX_BUILT), "{out}");
+        let index = super::super::history_index::path(&b.dir);
+        let written = std::fs::read(&index).unwrap();
+        *b.api.fail.lock().unwrap() = Some("blob");
+        let mut fresh = reader(&b.state_dir(), &b.keys, b.id, 4, None);
+        let out = fresh.answer(search("synthetic"), &b.api).await.text;
+        assert!(
+            !out.contains(INDEX_REBUILT) && !out.contains(INDEX_BUILT),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), written, "not rewritten");
     }
 
     /// A main line that can't be checked: agentkit says so first, only
@@ -1097,6 +1204,26 @@ mod tests {
         assert!(out.contains("this session"), "{out}");
         let out = rd.answer(search("synthetic"), &b.api).await.text;
         assert!(out.starts_with(UNCHECKED), "{out}");
+        // Every head held on the line is answered, never "not found"
+        let mut heads = vec![b.seal().head().await.unwrap().unwrap().head.entry_hash];
+        heads.extend(
+            b.seal()
+                .sent()
+                .await
+                .unwrap()
+                .iter()
+                .chain(b.seal().outbox().await.unwrap().iter())
+                .map(|i| i.entry.entry_hash()),
+        );
+        for h in heads {
+            let short = short_head(&h);
+            let said = rd.answer(show(vec![r(&short)]), &b.api).await.text;
+            assert!(
+                said.contains("your sealed history couldn't be checked just now"),
+                "{short}: {said}"
+            );
+            assert!(!said.contains("No version"), "{said}");
+        }
     }
 
     /// `anchored` only for a head the inclusion record shows held.
@@ -1222,6 +1349,7 @@ mod tests {
             sources,
             state_hash: None,
             memory: memory.map(|m| Zeroizing::new(m.to_string())),
+            twin_memory: None,
             unopened: memory
                 .is_none()
                 .then(|| "couldn't be opened just now: GET /blob 503".into()),
@@ -1265,7 +1393,7 @@ mod tests {
         let k = keys(1);
         let view = View::new(synthetic(), &k, agent, &HashMap::new());
         let now = "one\ntwo\nfour\n";
-        let current = CurrentMemory::new(MemoryId::of(&k.current, agent, now), now, &view.rows);
+        let current = view.current(MemoryId::of(&k.current, agent, now), now);
         let out = view.log(None, None, &current);
         let rows: Vec<&str> = out.lines().collect();
         assert_eq!(rows.len(), 5, "{out}");
@@ -1300,6 +1428,24 @@ mod tests {
         );
         let said = view.show(&[r("020202020202")], None, current);
         assert!(said.starts_with("Head 020202020202 is sealed off your main line, with no record of why; its memory is mem-"), "{said}");
+
+        // The memory in context whose sealed version couldn't be opened,
+        // named by its local twin: still placed, still reachable by id
+        let mut h = synthetic();
+        h.versions[3].memory = None;
+        h.versions[3].unopened = Some("couldn't be opened just now: 503".into());
+        h.versions[3].twin_memory = Some(Zeroizing::new(now.to_string()));
+        let view = View::new(h, &k, agent, &HashMap::new());
+        let id = MemoryId::of(&k.current, agent, now);
+        let current = view.current(id, now);
+        assert_eq!(current.position, Some(0));
+        let out = view.log(None, None, &current);
+        assert!(
+            out.lines().next().unwrap().ends_with("← this session"),
+            "{out}"
+        );
+        let said = view.show(&[r(id)], None, current);
+        assert!(said.contains("couldn't be opened just now"), "{said}");
 
         // Unchecked: only the runner's own copies are rows, no heads
         let mut h = synthetic();

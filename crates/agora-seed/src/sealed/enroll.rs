@@ -722,6 +722,45 @@ mod tests {
         serde_json::json!({ "soul": { "name": name }, "memory": { "content": memory } })
     }
 
+    /// An agent keyed and searched before it enrols: `sealed-enroll
+    /// --dry-run` counts the same, the key's fingerprint and the index
+    /// beside its state are never taken for archives, and no `sealed/` is
+    /// made.
+    #[tokio::test]
+    async fn the_memory_tools_files_change_nothing_a_dry_run_counts() {
+        let api = std::sync::Arc::new(FakeApi::new());
+        let root = crate::sealed::TestDir::new("enroll-memory-files");
+        let state_dir = root.join("state");
+        let keys = KeyStore::new(root.join("secrets"));
+        let id = AgentId::new();
+        keys.ring()
+            .insert(id, &agora_agentkit::crypto::generate_keypair().0)
+            .unwrap();
+        let mut fs = FsStorage::new(&state_dir);
+        for m in ["one", "two", "three"] {
+            fs.save_raw(id, state("tarn", m), None).await.unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let dir = state_dir.join(id.to_string());
+        yes(&dir);
+        let enroller = Enroller {
+            state_dir: state_dir.clone(),
+            keys: keys.clone(),
+            api,
+            restore: None,
+        };
+        let before = enroller.enroll(id, true).await.unwrap();
+        keys.memory_id_keys_or_create(id, &dir).unwrap();
+        crate::sealed::history_index::write(&dir, b"{}").unwrap();
+        assert!(crate::sealed::history_index::unsealed_path(&dir).exists());
+        assert_eq!(enroller.enroll(id, true).await.unwrap(), before);
+        assert_eq!(enroller.opted_in().unwrap(), vec![id]);
+        assert!(
+            !dir.join(agora_agentkit::state::storage::SEALED_DIR)
+                .exists()
+        );
+    }
+
     #[tokio::test]
     async fn enrolment_seals_archives_oldest_first_then_the_current_state() {
         let api = std::sync::Arc::new(FakeApi::new());

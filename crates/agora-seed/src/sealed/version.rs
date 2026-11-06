@@ -24,7 +24,7 @@ use agora_agentkit::state::{SignedStateEntry, StateEntry};
 use anyhow::Context;
 
 use super::KeyStore;
-use super::api::SealedApi;
+use super::api::{BlobError, SealedApi};
 use super::check::{local_entries, main_line};
 
 /// The last sealed version, opened.
@@ -44,12 +44,19 @@ pub struct LastSealed {
 /// agent's `sealed/`, then any `sealed/lost/<utc>/` copies), else from
 /// Agora. Unchecked: [`open_entry_blob`] checks it against the entry.
 /// Nothing fetched is written anywhere.
+///
+/// A fetch is bounded ([`FETCH_TIMEOUT`] a try) and retried only when
+/// trying again could help ([`BlobError::retry`]: a 5xx, a timeout, a
+/// connection; never a 404 or another 4xx). A blob that couldn't be had
+/// is remembered in `failed` and not asked for again until
+/// [`FAILED_FOR`] has passed.
 async fn blob(
     seals: &[&AgentSeal],
     api: &dyn SealedApi,
     id: AgentId,
     signing: &SigningKey,
     sha: &Sha256Hex,
+    failed: &mut FailedBlobs,
 ) -> anyhow::Result<Vec<u8>> {
     for seal in seals {
         match seal.read_blob(sha).await {
@@ -58,24 +65,100 @@ async fn blob(
             Err(e) => return Err(e).with_context(|| format!("reading blob {sha}")),
         }
     }
-    // A transient failure is retried a little; a lasting one is the caller's
-    let mut last = String::new();
+    if let Some(why) = failed.recent(sha) {
+        anyhow::bail!(
+            "blob {sha} couldn't be fetched from Agora a moment ago ({why}); not asked again yet"
+        );
+    }
+    let mut last = BlobError::transient("not tried");
     for wait in FETCH_RETRIES {
         tokio::time::sleep(wait).await;
-        match api.blob(id, signing, sha).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => last = e,
+        last = match tokio::time::timeout(FETCH_TIMEOUT, api.blob(id, signing, sha)).await {
+            Ok(Ok(bytes)) => return Ok(bytes),
+            Ok(Err(e)) => e,
+            Err(_) => BlobError::transient(format!("no answer in {FETCH_TIMEOUT:?}")),
+        };
+        if !last.retry {
+            break;
         }
     }
-    Err(anyhow::Error::msg(last)).with_context(|| format!("fetching blob {sha} from Agora"))
+    failed.record(*sha, last.message.clone());
+    Err(anyhow::Error::new(last)).with_context(|| format!("fetching blob {sha} from Agora"))
 }
 
-/// The waits before each try of a blob fetch: three tries in all.
+/// The waits before each try of a blob fetch: three tries in all, for a
+/// failure that may pass.
 const FETCH_RETRIES: [std::time::Duration; 3] = [
     std::time::Duration::ZERO,
     std::time::Duration::from_millis(200),
     std::time::Duration::from_millis(800),
 ];
+
+/// The longest one try of a fetch from Agora may take (agentkit's client
+/// sets no timeout of its own).
+pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a fetch that failed is remembered and not tried again.
+pub const FAILED_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Fetches from Agora that failed lately, by blob hash: not tried again
+/// until [`FAILED_FOR`] has passed. Hold one for a session.
+#[derive(Debug, Default, Clone)]
+pub struct FailedBlobs(std::collections::HashMap<Sha256Hex, (tokio::time::Instant, String)>);
+
+impl FailedBlobs {
+    /// Why `sha` failed, if it did within [`FAILED_FOR`].
+    fn recent(&self, sha: &Sha256Hex) -> Option<&str> {
+        self.0
+            .get(sha)
+            .filter(|(at, _)| at.elapsed() < FAILED_FOR)
+            .map(|(_, why)| why.as_str())
+    }
+
+    fn record(&mut self, sha: Sha256Hex, why: String) {
+        self.0.insert(sha, (tokio::time::Instant::now(), why));
+    }
+
+    /// How many are remembered.
+    pub fn count(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// The agent's chain as Agora serves it ([`super::api::chain`]), asked
+/// once a session: a chain that came back is kept for the session (what
+/// it adds since is the runner's own, held here too), and one that didn't
+/// isn't asked for again until [`FAILED_FOR`] has passed. Each ask is
+/// bounded by [`FETCH_TIMEOUT`].
+#[derive(Debug, Default, Clone)]
+pub struct ChainCache(Option<(tokio::time::Instant, Result<Vec<SignedStateEntry>, String>)>);
+
+impl ChainCache {
+    pub async fn get(
+        &mut self,
+        api: &dyn SealedApi,
+        id: AgentId,
+        signing: &SigningKey,
+    ) -> Result<Vec<SignedStateEntry>, String> {
+        match &self.0 {
+            Some((_, Ok(chain))) => return Ok(chain.clone()),
+            Some((at, Err(e))) if at.elapsed() < FAILED_FOR => return Err(e.clone()),
+            _ => {}
+        }
+        let got =
+            match tokio::time::timeout(FETCH_TIMEOUT, super::api::chain(api, id, signing)).await {
+                Ok(got) => got,
+                Err(_) => Err(format!("no answer in {FETCH_TIMEOUT:?}")),
+            };
+        self.0 = Some((tokio::time::Instant::now(), got.clone()));
+        got
+    }
+
+    /// Whether a chain is held.
+    pub fn held(&self) -> bool {
+        matches!(self.0, Some((_, Ok(_))))
+    }
+}
 
 /// A keyframe's plaintext, the dictionary its deltas open against.
 type Dict = std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>;
@@ -89,6 +172,7 @@ async fn plaintext(
     keys: &SealKeys,
     entry: &StateEntry,
     dict: Option<Dict>,
+    failed: &mut FailedBlobs,
 ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     let sha = entry
         .blob
@@ -102,7 +186,7 @@ async fn plaintext(
         entry.key_gen,
         keys.key_gen
     );
-    let sealed = blob(seals, api, entry.agent_id, &keys.signing, &sha).await?;
+    let sealed = blob(seals, api, entry.agent_id, &keys.signing, &sha, failed).await?;
     let compressed = open_entry_blob(&keys.state_key, entry, &sealed)
         .with_context(|| format!("opening blob {sha} (entry seq {})", entry.seq))?;
     let seq = entry.seq;
@@ -135,6 +219,8 @@ pub struct Opener<'a> {
     api: &'a dyn SealedApi,
     keys: &'a SealKeys,
     keyframe: Option<(Sha256Hex, Dict)>,
+    /// Fetches that failed lately: not tried again ([`FailedBlobs`]).
+    pub failed: FailedBlobs,
 }
 
 impl<'a> Opener<'a> {
@@ -144,6 +230,7 @@ impl<'a> Opener<'a> {
             api,
             keys,
             keyframe: None,
+            failed: FailedBlobs::default(),
         }
     }
 
@@ -163,7 +250,15 @@ impl<'a> Opener<'a> {
             BlobEncoding::Keyframe => None,
             BlobEncoding::Delta { base } => Some(self.keyframe(line, base).await?),
         };
-        let bytes = plaintext(&self.seals, self.api, self.keys, entry, dict).await?;
+        let bytes = plaintext(
+            &self.seals,
+            self.api,
+            self.keys,
+            entry,
+            dict,
+            &mut self.failed,
+        )
+        .await?;
         tokio::task::spawn_blocking(move || {
             let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
                 anyhow::anyhow!("the sealed plaintext isn't JSON ({:?})", e.classify())
@@ -193,8 +288,17 @@ impl<'a> Opener<'a> {
         {
             return Ok(dict.clone());
         }
-        let dict: Dict =
-            std::sync::Arc::new(plaintext(&self.seals, self.api, self.keys, keyframe, None).await?);
+        let dict: Dict = std::sync::Arc::new(
+            plaintext(
+                &self.seals,
+                self.api,
+                self.keys,
+                keyframe,
+                None,
+                &mut self.failed,
+            )
+            .await?,
+        );
         self.keyframe = Some((base, dict.clone()));
         Ok(dict)
     }
@@ -210,13 +314,27 @@ pub async fn verified_line(
     id: AgentId,
     head: &HeadFile,
 ) -> anyhow::Result<Vec<SignedStateEntry>> {
+    verified_line_cached(seal, keys, api, id, head, &mut ChainCache::default()).await
+}
+
+/// [`verified_line`], asking Agora for the chain through `chain` (a
+/// session's [`ChainCache`]).
+pub async fn verified_line_cached(
+    seal: &AgentSeal,
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    id: AgentId,
+    head: &HeadFile,
+    chain: &mut ChainCache,
+) -> anyhow::Result<Vec<SignedStateEntry>> {
     let entries = local_entries(seal).await.map_err(anyhow::Error::msg)?;
     let line = match main_line(&entries, &head.head.entry_hash) {
         Some(line) => line,
         // Through Agora's entries (after a rebase or a restore)
         None => {
             let signing = keys.signing(id).context("no signing key for the agent")?;
-            let chain = super::api::chain(api, id, &signing)
+            let chain = chain
+                .get(api, id, &signing)
                 .await
                 .map_err(anyhow::Error::msg)
                 .context("reading the agent's chain on Agora")?;

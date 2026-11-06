@@ -716,6 +716,16 @@ where
         name: String,
         dir: std::path::PathBuf,
     ) -> Option<crate::sealed::keys::MemoryIdKeys> {
+        // No state yet (a first session): nothing to name, nothing made,
+        // and nothing for the operator to fix
+        if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+            tracing::info!(
+                event_type = "memory_id_key_deferred",
+                agent_id = %id,
+                "no state directory yet; memory ids start at the next session"
+            );
+            return None;
+        }
         match memory_tool::session_keys(&rt.key_store, id, &dir).await {
             Ok(keys) => Some(keys),
             Err(e) => {
@@ -10646,6 +10656,7 @@ mod tests {
             },
         );
         h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        std::fs::create_dir_all(h.rt.state_dir.join(h.id.to_string())).unwrap();
         let mut a = h.agent(OLD, true);
         a.on_init().await.unwrap();
         let mem = a.inner.memory_id().expect("keyed before on_init");
@@ -10710,6 +10721,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        std::fs::create_dir_all(h2.rt.state_dir.join(h2.id.to_string())).unwrap();
         let mut b = h2.agent(OLD, true);
         b.on_init().await.unwrap();
         assert_eq!(b.inner.memory_id(), None);
@@ -10738,6 +10750,7 @@ mod tests {
         use agora_agentkit::reactor::seed::SeedConfig;
         let h = Harness::new("memory-heading");
         h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        std::fs::create_dir_all(h.rt.state_dir.join(h.id.to_string())).unwrap();
         let mut agent = seed_agent(&h, OLD, SeedConfig::default());
         agent.on_init().await.unwrap();
         let mem = agent.inner.memory_id().expect("keyed");
