@@ -276,26 +276,43 @@ async fn run(client: &Client, data_dir: &Path) -> anyhow::Result<(Vec<Alarm>, Ve
     Ok((alarms, verified_anchors(&links, &report)))
 }
 
-/// The `ANC-` links whose signature and link verified and that no
-/// compromise window repudiates, with their attested `data_hash`.
+/// The `ANC-` links whose signature and link verified, with their attested
+/// `data_hash` and when each was logged; those a compromise window
+/// repudiates listed apart, so the anchor check names them unchecked
+/// rather than passing over them.
 fn verified_anchors(
     links: &[GovernanceChainLink],
     report: &GovernanceVerification,
 ) -> VerifiedAnchors {
+    let valid = |e: &&agora_agentkit::govlog::EntryVerdict| e.signature_valid && e.link_valid;
     let good: std::collections::BTreeSet<&GovernanceLogId> = report
         .entries
         .iter()
-        .filter(|e| e.signature_valid && e.link_valid && !e.repudiated)
+        .filter(valid)
+        .filter(|e| !e.repudiated)
         .map(|e| &e.id)
         .collect();
-    VerifiedAnchors::new(
+    let repudiated: std::collections::BTreeSet<&GovernanceLogId> = report
+        .entries
+        .iter()
+        .filter(valid)
+        .filter(|e| e.repudiated)
+        .map(|e| &e.id)
+        .collect();
+    let anchors = || {
         links
             .iter()
-            .filter(|l| {
-                l.entry_type == agora_agentkit::enums::GovernanceLogEntryType::Anchor
-                    && good.contains(&l.id)
-            })
-            .map(|l| (l.id.clone(), l.attestation.data_hash)),
+            .filter(|l| l.entry_type == agora_agentkit::enums::GovernanceLogEntryType::Anchor)
+    };
+    VerifiedAnchors::new(
+        anchors()
+            .filter(|l| good.contains(&l.id))
+            .map(|l| (l.id.clone(), l.attestation.data_hash, l.created_at)),
+    )
+    .with_repudiated(
+        anchors()
+            .filter(|l| repudiated.contains(&l.id))
+            .map(|l| (l.id.clone(), l.attestation.data_hash, l.created_at)),
     )
 }
 

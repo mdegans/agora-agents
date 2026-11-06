@@ -593,6 +593,8 @@ pub struct ConsentAgent<A> {
     /// The stop's first note was seated: marked shown once the session
     /// saves.
     sealed_stop_note: bool,
+    /// The anchors the seated verdict told of, marked told after the save.
+    sealed_anchors_told: Vec<agora_agentkit::ids::GovernanceLogId>,
     /// The closing questions have been put (or there were none): the inner
     /// session's next `Done` is its epilogue's.
     closed: bool,
@@ -3706,6 +3708,7 @@ where
             sealed_written: None,
             sealed_notice: false,
             sealed_stop_note: false,
+            sealed_anchors_told: Vec::new(),
             closed: false,
             epilogue: false,
         })
@@ -3891,6 +3894,7 @@ where
         if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id()) {
             self.sealed_notice = seat.notice;
             self.sealed_stop_note = seat.stop_note;
+            self.sealed_anchors_told = seat.anchors_told.clone();
             sealed_lines.extend(seat.lines.iter().cloned());
         }
         if !sealed_lines.is_empty() {
@@ -4003,6 +4007,20 @@ where
                 agent_id = %self.inner.id(),
                 error = %e,
                 "sealed-state notice not set aside after the save; it is shown again"
+            );
+        }
+        if !self.sealed_anchors_told.is_empty()
+            && let Err(e) = crate::sealed::inclusion::mark_told(
+                &self.agent_dir(),
+                self.inner.id(),
+                &self.sealed_anchors_told,
+            )
+            .await
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "anchor findings not marked told after the save; the next verdict repeats them"
             );
         }
         if self.sealed_stop_note
@@ -10354,6 +10372,24 @@ mod tests {
             None,
         )
         .unwrap();
+        // An anchor failure the verdict tells of: told only once the
+        // session saves, so a seat for a session that never runs leaves it
+        // for the next
+        use crate::sealed::inclusion::{Checked, Finding, InclusionFile};
+        let anc: agora_agentkit::ids::GovernanceLogId = "ANC-2026-0002".parse().unwrap();
+        InclusionFile {
+            through: Some(anc.clone()),
+            checked: vec![Checked {
+                anc_id: anc.clone(),
+                date: None,
+                finding: Finding::DidNotCheck,
+                at: chrono::Utc::now(),
+                told: false,
+                alerted: true,
+            }],
+        }
+        .save(&dir)
+        .unwrap();
         let rt = Arc::get_mut(&mut h.rt).unwrap();
         rt.sealed_seats.insert(
             h.id,
@@ -10361,6 +10397,7 @@ mod tests {
                 lines: vec!["NOTICE LINE".into(), "VERDICT LINE".into()],
                 notice: true,
                 stop_note: false,
+                anchors_told: vec![anc],
             },
         );
         let mut agent = anthropic_agent(&h);
@@ -10371,11 +10408,13 @@ mod tests {
             "{intro}"
         );
         assert!(crate::sealed::notice::Notice::load(&dir).unwrap().is_some());
+        assert!(!InclusionFile::load(&dir).unwrap().checked[0].told);
         agent.on_saved().await.unwrap();
         assert!(
             crate::sealed::notice::Notice::load(&dir).unwrap().is_none(),
             "set aside"
         );
+        assert!(InclusionFile::load(&dir).unwrap().checked[0].told, "told");
     }
 
     /// Beta round 1: an agent listed only in `[sealed_state]`, no other

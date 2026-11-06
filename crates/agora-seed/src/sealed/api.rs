@@ -63,6 +63,10 @@ pub trait SealedApi: Send + Sync {
         key: &SigningKey,
         after: Option<GovernanceLogId>,
     ) -> Result<Vec<AnchorProof>, String>;
+    /// An `ANC-` entry's `data`, as Agora serves it (public, unsigned).
+    /// Untrusted until it hashes to the `data_hash` the verified
+    /// governance log attests ([`super::anchors::VerifiedAnchors::date`]).
+    async fn anchor_data(&self, anc: &GovernanceLogId) -> Result<serde_json::Value, String>;
     /// Agora's head for the agent, asked apart from its chain: `None` for
     /// `head: null` or a 404.
     async fn head(
@@ -223,6 +227,24 @@ impl SealedApi for Client {
             .map_err(|e| e.to_string())
     }
 
+    async fn anchor_data(&self, anc: &GovernanceLogId) -> Result<serde_json::Value, String> {
+        use agora_agentkit::enums::DetailLevel;
+        use agora_agentkit::requests::GetContentInput;
+        use agora_agentkit::responses::ContentResponse;
+        // As signed, not with revisions applied: the log attests the
+        // original's hash
+        let mut input =
+            GetContentInput::new(anc.clone()).with_detail(DetailLevel::FullWithAttachments);
+        input.version = Some(agora_agentkit::enums::RecordVersion::Original);
+        let content = self.get_content(&input).await.map_err(|e| e.to_string())?;
+        match content {
+            ContentResponse::Governance(entry) => entry
+                .data
+                .ok_or_else(|| format!("{anc} was served without its data")),
+            _ => Err(format!("{anc} was not served as a governance-log entry")),
+        }
+    }
+
     async fn post_anchor(
         &self,
         id: AgentId,
@@ -263,6 +285,14 @@ pub mod fake {
         pub blobs: Mutex<std::collections::HashMap<agora_agentkit::govlog::Sha256Hex, Vec<u8>>>,
         /// The proofs the server lists, all of them: `after` filters.
         pub proofs: Mutex<Vec<AnchorProof>>,
+        /// At most this many proofs a request (the real server's page is
+        /// 100); `None`, all.
+        pub proofs_page: Mutex<Option<usize>>,
+        /// Answer every proof whatever `after` asks: a server whose pages
+        /// don't advance.
+        pub proofs_ignore_after: Mutex<bool>,
+        /// `ANC-` entries' `data`, as served, by id.
+        pub anchor_data: Mutex<std::collections::HashMap<GovernanceLogId, serde_json::Value>>,
         /// Every `post_anchor`'s `publish`.
         pub anchored: Mutex<Vec<bool>>,
         /// A publish choice is on record (the agent's own `config`); any
@@ -286,6 +316,9 @@ pub mod fake {
                 rotations: Mutex::default(),
                 blobs: Mutex::default(),
                 proofs: Mutex::default(),
+                proofs_page: Mutex::default(),
+                proofs_ignore_after: Mutex::default(),
+                anchor_data: Mutex::default(),
                 anchored: Mutex::default(),
                 chosen: Mutex::default(),
                 unknown_agent: Mutex::default(),
@@ -408,14 +441,29 @@ pub mod fake {
             after: Option<GovernanceLogId>,
         ) -> Result<Vec<AnchorProof>, String> {
             self.call("proofs")?;
-            Ok(self
+            let after = after.filter(|_| !*self.proofs_ignore_after.lock().unwrap());
+            let mut page: Vec<AnchorProof> = self
                 .proofs
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|p| after.as_ref().is_none_or(|a| p.anc_id > *a))
                 .cloned()
-                .collect())
+                .collect();
+            if let Some(n) = *self.proofs_page.lock().unwrap() {
+                page.truncate(n);
+            }
+            Ok(page)
+        }
+
+        async fn anchor_data(&self, anc: &GovernanceLogId) -> Result<serde_json::Value, String> {
+            self.call("anchor_data")?;
+            self.anchor_data
+                .lock()
+                .unwrap()
+                .get(anc)
+                .cloned()
+                .ok_or_else(|| "404".to_string())
         }
 
         async fn head(

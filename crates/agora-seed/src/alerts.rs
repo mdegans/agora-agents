@@ -123,9 +123,16 @@ pub enum AlertKind {
     /// The start check refused one or more agents, so the whole run did
     /// not start (exit [`crate::sealed::REFUSED_RUN_EXIT`]).
     SealedStateRefusedRun,
-    /// An anchor proof didn't check, couldn't be fetched, or publishing
-    /// the anchor failed. Nothing was stored.
+    /// The anchor check couldn't finish a pass (Agora unreachable, the
+    /// agent's line unreadable), or publishing the anchor failed. Retried
+    /// at the next pass.
     SealedStateAnchorFailed,
+    /// A daily anchor doesn't hold what it should for an agent: no proof
+    /// though one is owed, an older or later version than the runner's
+    /// records allow, an entry not on the agent's line, or a proof that
+    /// doesn't check against the governance log. Judged once per anchor,
+    /// so sent every time.
+    SealedStateAnchorWrong,
     /// Agora's copy of agents' sealed histories failed verification
     /// while their local states are intact: the run is refused, nothing
     /// is marked against them, and the next start checks again. Never
@@ -147,7 +154,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -170,6 +177,7 @@ impl AlertKind {
         Self::SealedStateRotationUnfinished,
         Self::SealedStateRefusedRun,
         Self::SealedStateAnchorFailed,
+        Self::SealedStateAnchorWrong,
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
         Self::SealedStateUntrustedKey,
@@ -180,7 +188,9 @@ impl AlertKind {
     pub fn unlimited(self) -> bool {
         matches!(
             self,
-            Self::SealedStateServerChainBroken | Self::SealedStateUntrustedKey
+            Self::SealedStateServerChainBroken
+                | Self::SealedStateUntrustedKey
+                | Self::SealedStateAnchorWrong
         )
     }
 
@@ -209,6 +219,7 @@ impl AlertKind {
             Self::SealedStateRotationUnfinished => "sealed_state_rotation_unfinished",
             Self::SealedStateRefusedRun => "sealed_state_refused_run",
             Self::SealedStateAnchorFailed => "sealed_state_anchor_failed",
+            Self::SealedStateAnchorWrong => "sealed_state_anchor_wrong",
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
@@ -385,13 +396,26 @@ impl AlertKind {
                  at counts and sizes, not content."
             }
             Self::SealedStateAnchorFailed => {
-                "An agent's sealed-state anchor proof could not be fetched or \
-                 did not check against the governance log (it names an entry \
-                 that isn't the agent's, or its root or path isn't the \
-                 log's), or telling Agora to publish the agent's anchor \
-                 failed. Nothing was stored; the runner tries again later. A \
-                 proof that doesn't check is the server's claim failing: \
-                 compare it with the ANC entry before anything else."
+                "The runner's anchor check for an agent stopped before it \
+                 judged every anchor (Agora's proofs or an anchor's data \
+                 couldn't be fetched, or the agent's sealed line couldn't be \
+                 read), or telling Agora to publish the agent's anchor \
+                 failed. What was judged before is kept; the runner tries \
+                 again at its next pass."
+            }
+            Self::SealedStateAnchorWrong => {
+                "A daily anchor (ANC- entry) doesn't hold what it should for \
+                 the agent, judged by the runner against the governance log \
+                 and its own record of when Agora acknowledged the agent's \
+                 uploads: Agora serves no proof though it had acknowledged a \
+                 version before that day ended, or the anchor holds an older \
+                 version than one acknowledged before the day ended, or one \
+                 first sent after it, or an entry not on the agent's line, \
+                 or Agora's proof doesn't check against the log. It is \
+                 recorded in the agent's sealed/inclusion.json and the agent \
+                 is told at its next session. This is Agora's claim failing \
+                 (or the runner's clock off by more than ten minutes): \
+                 compare the proof with the ANC entry before anything else."
             }
             Self::SealedStateServerChainBroken => {
                 "The seed runner refused to run: Agora's copy of the sealed \
@@ -861,6 +885,14 @@ impl Alerter {
             state_lock: tokio::sync::Mutex::new(()),
             pending: Mutex::new(JoinSet::new()),
         })))
+    }
+
+    /// Whether alerts of `kind` are sent at all (configured, and the
+    /// alerter on): what an agent may be told its operator was.
+    pub fn sends(&self, kind: AlertKind) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|inner| inner.events.contains(&kind))
     }
 
     /// Send `alert` in the background, if its kind is configured and its

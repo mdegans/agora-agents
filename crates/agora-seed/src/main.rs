@@ -1798,6 +1798,7 @@ async fn sealed_start_check(
                         lines: vec![stopped.line()],
                         notice: false,
                         stop_note: !stopped.shown,
+                        anchors_told: Vec::new(),
                     },
                 );
             }
@@ -1856,6 +1857,7 @@ async fn sealed_start_check(
                 notice,
                 hold,
                 drops,
+                told,
             } => {
                 tracing::info!(
                     event_type = "sealed_state_checked",
@@ -1903,6 +1905,7 @@ async fn sealed_start_check(
                         stop_note: false,
                         lines: seat,
                         notice,
+                        anchors_told: told,
                     },
                 );
                 run.drained.push((*id, name));
@@ -2702,11 +2705,18 @@ async fn run(held: &mut Held) -> Result<()> {
 
     tracing::info!(agents = total, reactors = labels.len(), "starting run");
     let run_started = chrono::Utc::now();
+    // Before any session saves: a version committed after this is this
+    // process's own, and its upload times are recorded
+    // (sealed::receipts)
+    let drain_baselines =
+        sealed::receipts::baselines(&state_dir, sealed_run.drained.iter().map(|(id, _)| *id)).await;
     // Uploads, away from the reactors' storage lock: during the run, and
     // once more before exit
     let drainer = Arc::new(
         sealed::drain::Drainer::new(
             outbox.clone(),
+            state_dir.clone(),
+            drain_baselines,
             sealed_run.drained,
             sealed_run.held,
             held.alerts.clone(),
@@ -3060,6 +3070,59 @@ mod tests {
         assert!(run.seats[&ok].lines[0].starts_with("Your sealed state: "));
         assert_eq!(run.drained.len(), 1);
         assert!(run.held.is_empty());
+    }
+
+    /// A dry run checks nothing: an anchor failure not yet told stays
+    /// untold for the next real session, and no sealed file is written.
+    #[tokio::test]
+    async fn a_dry_run_tells_no_anchor_finding_and_writes_nothing() {
+        use sealed::inclusion::{Checked, Finding, InclusionFile};
+        let root = sealed::TestDir::new("main-sealed-dry");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let file = InclusionFile {
+            through: Some("ANC-2026-0002".parse().unwrap()),
+            checked: vec![Checked {
+                anc_id: "ANC-2026-0002".parse().unwrap(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 11, 2),
+                finding: Finding::DidNotCheck,
+                at: chrono::Utc::now(),
+                told: false,
+                alerted: true,
+            }],
+        };
+        file.save(&dir).unwrap();
+        let before: Vec<_> = std::fs::read_dir(dir.join("sealed"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let mut pool = vec![(id, tarn)];
+        let mut skipped = Vec::new();
+        let api = sealed::api::fake::FakeApi::new();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            true,
+            &mut skipped,
+            None,
+        )
+        .await;
+        assert!(run.seats.is_empty() && run.drained.is_empty());
+        assert_eq!(InclusionFile::load(&dir).unwrap(), file, "still untold");
+        let after: Vec<_> = std::fs::read_dir(dir.join("sealed"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before.len(), after.len(), "no file added");
+        assert!(api.calls.lock().unwrap().is_empty());
     }
 
     /// Fail closed: one refused agent among many refuses the whole run,
