@@ -37,6 +37,7 @@ use super::api::SealedApi;
 use super::notice::{Notice, Refusal};
 use super::sizes::{Recorded, SizeLog, Sizes, drop_lines};
 use crate::alerts::{Alert, AlertKind, Alerter};
+use agora_agentkit::reactor::seed::memory::short_head;
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
@@ -377,18 +378,8 @@ pub async fn local_entries(seal: &AgentSeal) -> Result<Vec<SignedStateEntry>, St
     Ok(items.into_iter().map(|i| i.entry).collect())
 }
 
-/// `1234567` as `1,234,567`.
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, d) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(d);
-    }
-    out
-}
+/// `1234567` as `1,234,567`: agentkit's one copy.
+use agora_agentkit::reactor::seed::memory::grouped as thousands;
 
 fn day(micros: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_micros(micros).map(|d| d.format("%Y-%m-%d").to_string())
@@ -722,11 +713,10 @@ pub fn verdict_line(
         .map(|d| format!(" dated {}", d.format("%Y-%m-%d")))
         .unwrap_or_default();
     let baseline = match previous.and_then(|p| p.head) {
-        Some(h) => {
-            let mut short = h.to_hex();
-            short.truncate(12);
-            format!(" since your earlier sealed version, head {short}{dated}")
-        }
+        Some(h) => format!(
+            " since your earlier sealed version, head {}{dated}",
+            short_head(&h)
+        ),
         None => format!(" since your earlier sealed version{dated}"),
     };
     let change = |now: usize, before: Option<usize>, long: bool| -> String {
@@ -828,12 +818,11 @@ pub fn verdict_line(
             )
         })
         .unwrap_or_default();
-    let mut short = head.entry_hash.to_hex();
-    short.truncate(12);
+    let short = short_head(&head.entry_hash);
     format!(
         "Your sealed state: {verdict} It has {} version{} since \
-         {since}{prior}.{anchored}{unanchored} This session starts from head {short} (a \
-         marker for this version; the next session's will differ). In this version, your \
+         {since}{prior}.{anchored}{unanchored} This session starts from head {short} \
+         {HEAD_MARKER} In this version, your \
          memory is {} characters{memory_change} and your soul {}{soul_change}. Checked by \
          {VERIFIER}: links, signatures, and that your state matches the last sealed version.",
         snapshots.len(),
@@ -841,6 +830,32 @@ pub fn verdict_line(
         thousands(sizes.memory_chars),
         thousands(sizes.soul_chars),
     )
+}
+
+/// What the verdict says of the head this session starts from, right
+/// after naming it. [`link_memory_id`] links the memory id after it.
+pub const HEAD_MARKER: &str = "(a marker for this version; the next session's will differ).";
+
+/// The sentence linking the verdict's head to the memory id in the
+/// agent's Memory heading.
+pub fn memory_id_sentence(memory: &agora_agentkit::reactor::seed::MemoryId) -> String {
+    format!(" Its memory is {memory}, the id in your Memory heading.")
+}
+
+/// Link the session's memory id into its verdict, after the head
+/// ([`HEAD_MARKER`]): "This session starts from head 346ac9543d0c (…). Its
+/// memory is mem-3f9a1c07be, the id in your Memory heading." The verdict
+/// is written at the start check; the id is the session's own, from its
+/// memory-id key, so the two are joined when the session seats them. A
+/// line without the marker (a hold, a refusal's notice) names no head and
+/// is left as it is.
+pub fn link_memory_id(lines: &mut [String], memory: &agora_agentkit::reactor::seed::MemoryId) {
+    if let Some((line, at)) = lines
+        .iter_mut()
+        .find_map(|l| l.find(HEAD_MARKER).map(|at| (l, at)))
+    {
+        line.insert_str(at + HEAD_MARKER.len(), &memory_id_sentence(memory));
+    }
 }
 
 pub const FORK_LINE: &str = "Your sealed state on Agora has moved on from the version this \
@@ -1910,6 +1925,28 @@ pub(crate) mod tests {
                 && seat[0].contains("(a marker for this version; the next session's will differ)")
                 && !seat[0].contains("history tools")
         );
+        // The session links its memory id after the head, and only there
+        let memory = agora_agentkit::reactor::seed::MemoryId::from([7; 32]);
+        let mut linked = seat.clone();
+        link_memory_id(&mut linked, &memory);
+        let head_at = seat[0].find("This session starts from head ").unwrap();
+        let short = &seat[0][head_at + 30..head_at + 42];
+        assert_eq!(
+            linked[0],
+            seat[0].replace(
+                &format!("head {short} {HEAD_MARKER}"),
+                &format!(
+                    "head {short} {HEAD_MARKER} Its memory is {memory}, the id in your Memory \
+                     heading."
+                )
+            )
+        );
+        assert!(
+            linked[0].contains("the next session's will differ). Its memory is mem-0707070707,")
+        );
+        let mut held = vec![UNREADABLE_LINE.to_string()];
+        link_memory_id(&mut held, &memory);
+        assert_eq!(held, [UNREADABLE_LINE], "no head, no link");
 
         // Agora has all of it: the same
         *server.chain.lock().unwrap() = Ok(sealed_chain(&dir, id).await);

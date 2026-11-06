@@ -210,26 +210,12 @@ impl PastKeys {
 /// ids are made with, and every one it replaced, newest first, so an id
 /// made with an old key still resolves. Nothing replaces a key yet; the
 /// file can hold them.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the memory tool uses it; wired in the integration step"
-    )
-)]
 #[derive(Debug)]
 pub struct MemoryIdKeys {
     pub current: MemoryIdKey,
     pub past: Vec<MemoryIdKey>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the memory tool uses it; wired in the integration step"
-    )
-)]
 impl MemoryIdKeys {
     /// Every key, the current first: the order to try an id against.
     pub fn all(&self) -> impl Iterator<Item = &MemoryIdKey> {
@@ -248,13 +234,6 @@ fn memory_id_key_from_hex(hex_key: &str) -> std::io::Result<MemoryIdKey> {
 }
 
 /// One key in `memory_id_key.json`, hex.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the memory tool uses it; wired in the integration step"
-    )
-)]
 #[derive(Serialize, Deserialize)]
 struct MemoryIdKeyRecord {
     key: String,
@@ -272,13 +251,6 @@ impl Drop for MemoryIdKeyRecord {
 }
 
 /// `memory_id_key.json`. Append-only in `past`, like `past_keys.json`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the memory tool uses it; wired in the integration step"
-    )
-)]
 #[derive(Serialize, Deserialize)]
 struct MemoryIdKeyFile {
     current: MemoryIdKeyRecord,
@@ -287,13 +259,6 @@ struct MemoryIdKeyFile {
     past: Vec<MemoryIdKeyRecord>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the memory tool uses it; wired in the integration step"
-    )
-)]
 impl MemoryIdKeyFile {
     fn keys(&self) -> std::io::Result<MemoryIdKeys> {
         Ok(MemoryIdKeys {
@@ -378,13 +343,6 @@ pub fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// went. The `.tmp` name is then removed (a warning if it can't be): after
 /// a link it is a second name for the same file; after a lost race, a key
 /// nothing ever used.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the memory tool uses it; wired in the integration step"
-    )
-)]
 pub fn create_secret(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     let dir = path.parent().expect("a file in a directory");
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -629,13 +587,6 @@ impl KeyStore {
     }
 
     /// The agent's memory-id keys, if it has any yet.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the memory tool uses it; wired in the integration step"
-        )
-    )]
     pub fn memory_id_keys(&self, id: AgentId) -> std::io::Result<Option<MemoryIdKeys>> {
         read_json::<MemoryIdKeyFile>(&self.agent_dir(id).join(MEMORY_ID_KEY_FILE))?
             .map(|f| f.keys())
@@ -662,13 +613,6 @@ impl KeyStore {
     ///   another time).
     ///
     /// Never touches the state key.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the memory tool uses it; wired in the integration step"
-        )
-    )]
     pub fn memory_id_keys_or_create(
         &self,
         id: AgentId,

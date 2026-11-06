@@ -207,6 +207,11 @@ pub struct ConsentRuntime {
     /// What the sealed-state start check seats in each enrolled agent's
     /// intro ([`crate::sealed::check`]).
     pub sealed_seats: std::collections::BTreeMap<agora_agentkit::ids::AgentId, SealedSeat>,
+    /// The secrets tree, for each session's memory-id key and the `memory`
+    /// tool's sealed history.
+    pub key_store: crate::sealed::KeyStore,
+    /// What the `memory` tool fetches pruned sealed versions with: Agora.
+    pub memory_api: Arc<dyn crate::sealed::api::SealedApi>,
 }
 
 /// Lines the sealed-state start check left for an agent's intro.
@@ -241,7 +246,6 @@ impl ConsentRuntime {
             state_dir: data_dir.join("state"),
             secrets_dir: data_dir.join("secrets"),
             queue_path: queue::queue_path(data_dir),
-            client,
             keys,
             catalog,
             max_tokens,
@@ -251,6 +255,9 @@ impl ConsentRuntime {
             memory_restore: None,
             sealed_state: None,
             sealed_seats: Default::default(),
+            key_store: crate::sealed::KeyStore::new(data_dir.join("secrets")),
+            memory_api: Arc::new(client.clone()),
+            client,
         })
     }
 

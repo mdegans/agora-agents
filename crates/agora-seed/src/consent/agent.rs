@@ -179,6 +179,8 @@ use super::sealed_state::{
 };
 use super::switch::{self, SelfKind, SetModel, SwitchError};
 use crate::alerts::{Alert, AlertKind};
+use crate::sealed::memory_tool::{self, MemoryIds, MemoryReader, MemoryTool};
+use agora_agentkit::reactor::seed::Gauged;
 
 /// The contact request an inner agent's session filed at its teardown, for
 /// the `contact_requested` alert
@@ -604,7 +606,7 @@ pub struct ConsentAgent<A> {
 
 impl<A> ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests,
+    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
 {
     /// The model's own `thinking_effort` from `[[model]]`, over the
     /// session's `[seed]` one. Patched once, right after the inner init
@@ -674,19 +676,89 @@ where
     /// first request: the prefix is never changed mid-session. `set_model`
     /// stays last, where it was before `answer_offer` existed, so the
     /// prefix up to it is unchanged but for the one new definition.
-    fn seat_tail_tools(&mut self, set_model: Option<SetModel>) {
+    ///
+    /// The runner's `memory` tool goes just before `answer_offer`: seated
+    /// for every agent, enrolled or not, keyed or not (its definition is
+    /// the same bytes for all), and wrapped in [`Gauged`] so its results
+    /// count against the session's context.
+    fn seat_tail_tools(&mut self, set_model: Option<SetModel>, memory: Gauged<MemoryTool>) {
         use misanthropic::tool::Tool;
         let answer_offer = offers::AnswerOffer::new(set_model.is_some());
-        let mut defs = answer_offer.definitions();
+        let mut defs = memory.definitions();
+        defs.extend(answer_offer.definitions());
         let (tools, prompt) = self.inner.parts();
+        tools.push(memory);
         tools.push(answer_offer);
         if let Some(tool) = set_model {
             defs.extend(tool.definitions());
             tools.push(tool);
         }
         let list = prompt.tools.get_or_insert_default();
-        list.retain(|d| d.name() != switch::TOOL_NAME && d.name() != offers::TOOL_NAME);
+        list.retain(|d| {
+            d.name() != switch::TOOL_NAME
+                && d.name() != offers::TOOL_NAME
+                && d.name() != agora_agentkit::reactor::seed::memory::MEMORY_TOOL_NAME
+        });
         list.extend(defs);
+    }
+
+    /// The session's memory-id keys, made once if the agent has none. A
+    /// refusal (a key that can't be read, secrets not here, a fingerprint
+    /// no key matches) never stops the session: it runs with the plain
+    /// Memory heading, the operator is alerted (one mail an hour for the
+    /// fleet), and no key is made over the evidence of one.
+    async fn memory_keys(
+        rt: Arc<ConsentRuntime>,
+        id: AgentId,
+        name: String,
+        dir: std::path::PathBuf,
+    ) -> Option<crate::sealed::keys::MemoryIdKeys> {
+        match memory_tool::session_keys(&rt.key_store, id, &dir).await {
+            Ok(keys) => Some(keys),
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "memory_id_key_refused",
+                    agent = %name,
+                    agent_id = %id,
+                    error = %e,
+                    "memory-id key refused; the session runs without memory ids"
+                );
+                rt.alerts.notify(
+                    Alert::new(
+                        AlertKind::MemoryIdKeyRefused,
+                        format!("{name}: memory-id key refused; running without memory ids"),
+                    )
+                    .detail("agent", format!("{name} ({id})"))
+                    .detail("error", e),
+                );
+                None
+            }
+        }
+    }
+
+    /// The `memory` tool for this session, after the inner init: anchored
+    /// on the memory the heading names.
+    fn memory_tool(&self, keys: Option<crate::sealed::keys::MemoryIdKeys>) -> Gauged<MemoryTool> {
+        let current = self
+            .inner
+            .memory_id()
+            .map(|m| (m, self.inner.state().memory.content.as_str()));
+        let (keys, current) = match (keys, current) {
+            (Some(k), Some(c)) => (Some(k), Some(c)),
+            _ => (None, None),
+        };
+        let reader = MemoryReader::new(
+            self.rt.state_dir.clone(),
+            self.rt.key_store.clone(),
+            self.inner.id(),
+            keys,
+            current,
+        );
+        Gauged::new(
+            MemoryTool::new(reader, self.rt.memory_api.clone()),
+            self.inner.context_gauge(),
+        )
+        .for_agent(self.inner.id())
     }
 
     /// Apply a model change for this agent: report `to` to Agora as the
@@ -3649,7 +3721,7 @@ fn cap(mut text: String) -> String {
 #[async_trait::async_trait]
 impl<A> Agent for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests,
+    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
 {
     type State = SeedState;
     type Context = ConsentContext<A::Context>;
@@ -3863,9 +3935,21 @@ where
         }
         let interrupted = self.open_journal().await;
         let early = set_model.is_some();
+        // Before the inner init, so the Memory heading shows the id
+        let memory_keys = Self::memory_keys(
+            self.rt.clone(),
+            self.inner.id(),
+            self.inner.state().soul.name.to_string(),
+            dir.clone(),
+        )
+        .await;
+        if let Some(keys) = &memory_keys {
+            self.inner.set_memory_id_key(&keys.current);
+        }
         self.inner.on_init().await?;
         self.apply_model_effort();
-        self.seat_tail_tools(set_model);
+        let memory = self.memory_tool(memory_keys);
+        self.seat_tail_tools(set_model, memory);
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
             self.known_posts = ledger.created_posts.clone();
@@ -3895,7 +3979,12 @@ where
             self.sealed_notice = seat.notice;
             self.sealed_stop_note = seat.stop_note;
             self.sealed_anchors_told = seat.anchors_told.clone();
-            sealed_lines.extend(seat.lines.iter().cloned());
+            let mut lines = seat.lines.clone();
+            // The verdict's head, linked to the heading's memory id
+            if let Some(memory) = self.inner.memory_id() {
+                crate::sealed::check::link_memory_id(&mut lines, &memory);
+            }
+            sealed_lines.extend(lines);
         }
         if !sealed_lines.is_empty() {
             let (_, prompt) = self.inner.parts();
@@ -4276,7 +4365,7 @@ mod tests {
     use crate::consent::queue::QueueEntry;
     use crate::consent::role::ledger::{Applied, RoleLedger, RoleOutcome};
     use crate::consent::{ConsentConfig, ConsentRuntime, OfferConfig};
-    use agora_agentkit::reactor::seed::{SeedError, ShortString};
+    use agora_agentkit::reactor::seed::{MemoryId, SeedError, ShortString};
     use agora_agentkit::reactor::{Stop, StopLevel};
     use misanthropic::model::{Kind, Model};
     use std::collections::BTreeMap;
@@ -4366,6 +4455,21 @@ mod tests {
         writes: bool,
         /// `on_stop` has closed it
         stopped: bool,
+        /// The heading's memory id, as `SeedAgent` sets it
+        memory_id: Option<MemoryId>,
+        gauge: agora_agentkit::reactor::seed::ContextGauge,
+    }
+
+    impl MemoryIds for Fake {
+        fn set_memory_id_key(&mut self, key: &agora_agentkit::reactor::seed::MemoryIdKey) {
+            self.memory_id = Some(MemoryId::of(key, self.id, &self.state.memory.content));
+        }
+        fn memory_id(&self) -> Option<MemoryId> {
+            self.memory_id
+        }
+        fn context_gauge(&self) -> agora_agentkit::reactor::seed::ContextGauge {
+            self.gauge.clone()
+        }
     }
 
     impl ContactRequests for Fake {
@@ -4419,6 +4523,8 @@ mod tests {
                 contact: None,
                 writes: false,
                 stopped: false,
+                memory_id: None,
+                gauge: Default::default(),
             })
         }
         fn id(&self) -> AgentId {
@@ -6303,6 +6409,9 @@ mod tests {
         let mut h = Harness::new("contact-alert");
         let sent = crate::alerts::testing::Recorder::default();
         Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        // The agent's secrets, as every runner agent has: its memory-id key
+        // is made, not refused (which alerts too)
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
 
         plain_session(&h, NEW).await;
         h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
@@ -10485,5 +10594,142 @@ mod tests {
         third.on_init().await.unwrap();
         let seen = serde_json::to_string(&third.prompt().messages).unwrap();
         assert!(!seen.contains("is recorded: decline"), "once");
+    }
+
+    // --- The memory tool ---------------------------------------------------
+
+    /// A verdict line as the start check writes it, naming a head.
+    fn verdict_naming_a_head() -> String {
+        format!(
+            "Your sealed state: intact. This session starts from head 346ac9543d0c {} In this \
+             version, your memory is 3 characters.",
+            crate::sealed::check::HEAD_MARKER
+        )
+    }
+
+    /// The `memory` tool is seated for every agent, keyed or not, just
+    /// before `answer_offer`, its schema the nested object, the same bytes
+    /// either way; the key is made once and reused; the verdict names the
+    /// heading's memory id after its head. With no signing secrets the key
+    /// is refused, never minted: no id, no verdict link, the tool still
+    /// seated.
+    #[tokio::test]
+    async fn the_memory_tool_is_seated_keyed_or_not_and_the_verdict_names_the_id() {
+        use crate::sealed::check::HEAD_MARKER;
+        use agora_agentkit::reactor::seed::memory::MEMORY_TOOL_NAME;
+        let mut h = Harness::new("memory-tool");
+        Arc::get_mut(&mut h.rt).unwrap().sealed_seats.insert(
+            h.id,
+            crate::consent::SealedSeat {
+                lines: vec![verdict_naming_a_head()],
+                ..Default::default()
+            },
+        );
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        let mut a = h.agent(OLD, true);
+        a.on_init().await.unwrap();
+        let mem = a.inner.memory_id().expect("keyed before on_init");
+        let names: Vec<&str> = a
+            .prompt()
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|d| d.name())
+            .collect();
+        let n = names.len();
+        assert_eq!(
+            names[n - 3..],
+            [MEMORY_TOOL_NAME, "answer_offer", "set_model"],
+            "{names:?}"
+        );
+        let wire: serde_json::Value = serde_json::from_str(&prefix(&a).0).unwrap();
+        let schema = &wire[n - 3]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(
+            schema["properties"]["request"]["anyOf"].is_array(),
+            "{schema}"
+        );
+        assert!(!schema.to_string().contains("oneOf"), "{schema}");
+        assert_ne!(wire[n - 3]["strict"], true);
+        let seen = intro(&a);
+        assert!(
+            seen.contains(&format!(
+                "head 346ac9543d0c {HEAD_MARKER} Its memory is {mem}, the id in your Memory \
+                 heading. In this version"
+            )),
+            "{seen}"
+        );
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        let key_file = h
+            .root
+            .join("secrets")
+            .join(h.id.to_string())
+            .join("memory_id_key.json");
+        assert!(key_file.exists());
+        assert!(
+            dir.join(crate::sealed::keys::MEMORY_ID_FINGERPRINT_FILE)
+                .exists()
+        );
+        let made = std::fs::read(&key_file).unwrap();
+        // The next session reuses it: the same id for the same memory
+        let mut again = h.agent(OLD, true);
+        again.on_init().await.unwrap();
+        assert_eq!(again.inner.memory_id(), Some(mem));
+        assert_eq!(std::fs::read(&key_file).unwrap(), made, "never replaced");
+
+        // No signing secrets: refused, nothing minted, the session runs
+        let mut h2 = Harness::new("memory-tool-unkeyed");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h2.rt).unwrap().alerts =
+            crate::alerts::testing::recording(&h2.root, &sent);
+        Arc::get_mut(&mut h2.rt).unwrap().sealed_seats.insert(
+            h2.id,
+            crate::consent::SealedSeat {
+                lines: vec![verdict_naming_a_head()],
+                ..Default::default()
+            },
+        );
+        let mut b = h2.agent(OLD, true);
+        b.on_init().await.unwrap();
+        assert_eq!(b.inner.memory_id(), None);
+        assert_eq!(prefix(&a).0, prefix(&b).0, "the same tool bytes");
+        assert!(
+            !h2.root
+                .join("secrets")
+                .join(h2.id.to_string())
+                .join("memory_id_key.json")
+                .exists()
+        );
+        let seen = intro(&b);
+        assert!(seen.contains(&verdict_naming_a_head()), "{seen}");
+        assert!(!seen.contains("Its memory is"), "{seen}");
+        h2.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        let sent = sent.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("memory_id_key_refused"), "{}", sent[0]);
+        assert!(sent[0].contains(&h2.id.to_string()), "{}", sent[0]);
+    }
+
+    /// The real seed agent's heading: the memory id with a key, plain
+    /// without one.
+    #[tokio::test]
+    async fn the_memory_heading_shows_the_id_with_a_key_and_not_without() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("memory-heading");
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        let mut agent = seed_agent(&h, OLD, SeedConfig::default());
+        agent.on_init().await.unwrap();
+        let mem = agent.inner.memory_id().expect("keyed");
+        let sent = serde_json::to_string(agent.prompt()).unwrap();
+        assert!(sent.contains(&format!("## Your Memory ({mem})")), "{sent}");
+
+        let h2 = Harness::new("memory-heading-unkeyed");
+        let mut agent = seed_agent(&h2, OLD, SeedConfig::default());
+        agent.on_init().await.unwrap();
+        assert_eq!(agent.inner.memory_id(), None);
+        let sent = serde_json::to_string(agent.prompt()).unwrap();
+        assert!(sent.contains("## Your Memory\\n"), "{sent}");
+        assert!(!sent.contains("## Your Memory (mem-"), "{sent}");
     }
 }
