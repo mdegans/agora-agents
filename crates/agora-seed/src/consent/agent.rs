@@ -597,6 +597,9 @@ pub struct ConsentAgent<A> {
     sealed_stop_note: bool,
     /// The anchors the seated verdict told of, marked told after the save.
     sealed_anchors_told: Vec<agora_agentkit::ids::GovernanceLogId>,
+    /// The verdict told that enrolment kept the memory ids: marked told
+    /// after the save.
+    memory_ids_note: bool,
     /// The closing questions have been put (or there were none): the inner
     /// session's next `Done` is its epilogue's.
     closed: bool,
@@ -3781,6 +3784,7 @@ where
             sealed_notice: false,
             sealed_stop_note: false,
             sealed_anchors_told: Vec::new(),
+            memory_ids_note: false,
             closed: false,
             epilogue: false,
         })
@@ -3975,14 +3979,21 @@ where
             self.sealed_dirty = true;
             sealed_lines.push(line);
         }
-        if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id()) {
+        if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id()).cloned() {
             self.sealed_notice = seat.notice;
             self.sealed_stop_note = seat.stop_note;
-            self.sealed_anchors_told = seat.anchors_told.clone();
-            let mut lines = seat.lines.clone();
-            // The verdict's head, linked to the heading's memory id
-            if let Some(memory) = self.inner.memory_id() {
-                crate::sealed::check::link_memory_id(&mut lines, &memory);
+            self.sealed_anchors_told = seat.anchors_told;
+            let mut lines = seat.lines;
+            // The verdict's head, linked to the heading's memory id; and,
+            // once after enrolment, that the ids stayed as they were
+            if let Some(memory) = self.inner.memory_id()
+                && let Some(verdict) = crate::sealed::check::link_memory_id(&mut lines, &memory)
+                && let Some(note) =
+                    memory_tool::enrollment_note(&self.agent_dir(), self.inner.id()).await
+            {
+                lines[verdict].push(' ');
+                lines[verdict].push_str(&note);
+                self.memory_ids_note = true;
             }
             sealed_lines.extend(lines);
         }
@@ -4110,6 +4121,15 @@ where
                 agent_id = %self.inner.id(),
                 error = %e,
                 "anchor findings not marked told after the save; the next verdict repeats them"
+            );
+        }
+        if self.memory_ids_note
+            && let Err(e) = memory_tool::mark_memory_ids_told(&self.agent_dir()).await
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "the enrolment sentence not marked told after the save; the next verdict repeats it"
             );
         }
         if self.sealed_stop_note
@@ -10731,5 +10751,85 @@ mod tests {
         let sent = serde_json::to_string(agent.prompt()).unwrap();
         assert!(sent.contains("## Your Memory\\n"), "{sent}");
         assert!(!sent.contains("## Your Memory (mem-"), "{sent}");
+    }
+
+    /// Enrolment's sentence, once: to an agent that had memory ids before
+    /// its versions were sealed (its key's fingerprint older than its
+    /// `sealed/enrolled`), appended to the verdict, marked told only when
+    /// the session saves; never to one enrolled before it had a key.
+    #[tokio::test]
+    async fn the_enrolment_sentence_is_told_once_to_agents_keyed_before_enrolling() {
+        use crate::sealed::memory_tool::{enrollment_sentence, memory_ids_told_path};
+        let mut h = Harness::new("memory-ids-enrolled");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled(&h.root).await;
+        Arc::get_mut(&mut h.rt).unwrap().sealed_seats.insert(
+            id,
+            crate::consent::SealedSeat {
+                lines: vec![verdict_naming_a_head()],
+                ..Default::default()
+            },
+        );
+        keys.memory_id_keys_or_create(id, &dir).unwrap();
+        let fingerprint = dir.join(crate::sealed::keys::MEMORY_ID_FINGERPRINT_FILE);
+        let set_mtime = |path: &std::path::Path, ago: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(ago))
+                .unwrap();
+        };
+        let agent = |h: &Harness| {
+            ConsentAgent::<Fake>::new(
+                id,
+                state(OLD),
+                ConsentContext {
+                    inner: Quirks::default(),
+                    consent: h.rt.clone(),
+                },
+            )
+            .unwrap()
+        };
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let sentence = enrollment_sentence(&today);
+
+        // Enrolled before it had a key (the betas): never told
+        set_mtime(&dir.join("sealed/enrolled"), 3600);
+        let mut a = agent(&h);
+        a.on_init().await.unwrap();
+        let seen = intro(&a);
+        assert!(seen.contains("Its memory is mem-"), "{seen}");
+        assert!(!seen.contains("are sealed now"), "{seen}");
+        assert!(!a.memory_ids_note);
+
+        // Keyed first, then enrolled: told, on the verdict
+        set_mtime(&fingerprint, 7200);
+        let mut a = agent(&h);
+        a.on_init().await.unwrap();
+        let seen = intro(&a);
+        assert!(
+            seen.contains(&format!("the id in your Memory heading. In this version, your memory is 3 characters. {sentence}")),
+            "{seen}"
+        );
+        assert!(!memory_ids_told_path(&dir).exists(), "not until it saves");
+        // A session that never saves leaves it due
+        let mut again = agent(&h);
+        again.on_init().await.unwrap();
+        assert!(intro(&again).contains(&sentence));
+        a.on_saved().await.unwrap();
+        assert!(memory_ids_told_path(&dir).exists());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(memory_ids_told_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let mut after = agent(&h);
+        after.on_init().await.unwrap();
+        let seen = intro(&after);
+        assert!(seen.contains("Its memory is mem-"), "{seen}");
+        assert!(!seen.contains("are sealed now"), "once: {seen}");
     }
 }

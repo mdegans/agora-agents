@@ -105,6 +105,90 @@ pub const INDEX_BUILT: &str = "This first search built your memory's search inde
 /// What a search says when its index had to be built again.
 pub const INDEX_REBUILT: &str = "This search rebuilt your memory's search index.";
 
+/// `sealed/memory_ids_told.json`: the agent has been told, once, that
+/// enrolment sealed its earlier versions and left its memory ids as they
+/// were. Written when the session that told it saves, as anchor findings
+/// are marked told. `sealed-forget` leaves it, as it leaves the rest of
+/// `sealed/`.
+pub const MEMORY_IDS_TOLD: &str = "memory_ids_told.json";
+
+/// `<agent_dir>/sealed/memory_ids_told.json`.
+pub fn memory_ids_told_path(agent_dir: &Path) -> PathBuf {
+    agent_dir
+        .join(agora_agentkit::state::storage::SEALED_DIR)
+        .join(MEMORY_IDS_TOLD)
+}
+
+/// The sentence enrolment's first verdict adds, the earliest sealed
+/// version's date in it.
+pub fn enrollment_sentence(earliest: &str) -> String {
+    format!(
+        "Your earlier versions back to {earliest} are sealed now, so each has a head too. Your \
+         memory ids haven't changed."
+    )
+}
+
+/// Whether the agent is due the enrolment sentence: enrolled, its
+/// memory-id key's fingerprint written before its `sealed/enrolled` marker
+/// (it had memory ids before its versions were sealed; an agent enrolled
+/// before it had a key has no ids to keep), and not told yet. Anything
+/// unreadable is "not due": the sentence is never worth a guess.
+fn enrollment_due(agent_dir: &Path) -> bool {
+    let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let sealed = agent_dir.join(agora_agentkit::state::storage::SEALED_DIR);
+    let (Some(enrolled), Some(fingerprint)) = (
+        mtime(sealed.join("enrolled")),
+        mtime(agent_dir.join(super::keys::MEMORY_ID_FINGERPRINT_FILE)),
+    ) else {
+        return false;
+    };
+    fingerprint < enrolled && !std::fs::exists(memory_ids_told_path(agent_dir)).unwrap_or(true)
+}
+
+/// The enrolment sentence, if the agent is due it
+/// ([`enrollment_due`]), dated by its earliest sealed snapshot, as the
+/// verdict's "since" is.
+pub async fn enrollment_note(agent_dir: &Path, id: AgentId) -> Option<String> {
+    let dir = agent_dir.to_path_buf();
+    if !tokio::task::spawn_blocking(move || enrollment_due(&dir))
+        .await
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let seal = agora_agentkit::state::storage::AgentSeal::new(agent_dir, id);
+    let entries = match super::check::local_entries(&seal).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                agent_id = %id,
+                error = %e,
+                "sealed entries unreadable; the enrolment sentence waits"
+            );
+            return None;
+        }
+    };
+    let earliest = entries
+        .iter()
+        .filter(|e| e.entry.kind == agora_agentkit::enums::StateEntryKind::Snapshot)
+        .map(|e| e.entry.state_at)
+        .min()
+        .and_then(DateTime::<Utc>::from_timestamp_micros)?;
+    Some(enrollment_sentence(
+        &earliest.format("%Y-%m-%d").to_string(),
+    ))
+}
+
+/// Mark the enrolment sentence told: once the session that showed it
+/// saves. Atomic, 0600.
+pub async fn mark_memory_ids_told(agent_dir: &Path) -> std::io::Result<()> {
+    let path = memory_ids_told_path(agent_dir);
+    let body = serde_json::to_vec_pretty(&serde_json::json!({ "told_at": Utc::now() }))?;
+    tokio::task::spawn_blocking(move || super::write_private(&path, &body))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// One answer: its text, and whether it is a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {

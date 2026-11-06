@@ -849,13 +849,17 @@ pub fn memory_id_sentence(memory: &agora_agentkit::reactor::seed::MemoryId) -> S
 /// memory-id key, so the two are joined when the session seats them. A
 /// line without the marker (a hold, a refusal's notice) names no head and
 /// is left as it is.
-pub fn link_memory_id(lines: &mut [String], memory: &agora_agentkit::reactor::seed::MemoryId) {
-    if let Some((line, at)) = lines
-        .iter_mut()
-        .find_map(|l| l.find(HEAD_MARKER).map(|at| (l, at)))
-    {
-        line.insert_str(at + HEAD_MARKER.len(), &memory_id_sentence(memory));
-    }
+/// Returns the verdict's place in `lines`, if one was linked.
+pub fn link_memory_id(
+    lines: &mut [String],
+    memory: &agora_agentkit::reactor::seed::MemoryId,
+) -> Option<usize> {
+    let (i, at) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| l.find(HEAD_MARKER).map(|at| (i, at)))?;
+    lines[i].insert_str(at + HEAD_MARKER.len(), &memory_id_sentence(memory));
+    Some(i)
 }
 
 pub const FORK_LINE: &str = "Your sealed state on Agora has moved on from the version this \

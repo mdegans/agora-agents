@@ -14,7 +14,9 @@
 //! ([`KeyStore::memory_id_keys_or_create`]). The one file deleted is the
 //! `memory` tool's search index (`sealed/history_index.json`,
 //! [`super::history_index`]), a sidecar rebuilt from the history whenever
-//! it is needed. Refused while the agent has a `state.json`: a living
+//! it is needed. The rest of `sealed/` stays as it is, the `memory` tool's
+//! `memory_ids_told.json` included (the agent was told; put back, it isn't
+//! told again). Refused while the agent has a `state.json`: a living
 //! agent's backups are stopped with `sealed-stop`, never forgotten.
 //!
 //! **Order.** The note (with the names it will move to), then the state
