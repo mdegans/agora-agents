@@ -34,19 +34,14 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 ///   a preface that says where it stands among them.
 pub const OFFER_VERSION: u32 = 4;
 
-/// The agent's answer on the wire: the choice, an optional note, and an
-/// optional memory note. Closed, like its schema.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RestoreAnswer {
-    /// One of the options, as listed
-    pub choice: RestoreChoice,
-    /// Optional: a note about your choice, kept with your answer, where the Steward and Claude can read it. Empty for none.
-    #[serde(default, alias = "reason")]
-    pub note: String,
-    /// Optional: a note for your own memory, in your own words. Empty for none.
-    #[serde(default)]
-    pub memory_note: String,
+/// The agent's answer on the wire: the shape most offers share.
+pub type RestoreAnswer = crate::consent::offer::Reply<RestoreChoice>;
+
+/// The answer's example, its `choice` the options in `order`: what the
+/// question ends with, and its template.
+pub fn example(order: &[RestoreChoice]) -> serde_json::Value {
+    use crate::consent::offer;
+    offer::example(&offer::names(order), &offer::REPLY_FIELDS)
 }
 
 /// The options. Their presentation order is per agent ([`order_for`]).
@@ -116,7 +111,7 @@ pub fn offer(chars: usize, order: [RestoreChoice; 2], facts: &Facts) -> Content 
         .collect::<Vec<_>>()
         .join("\n");
     let names = crate::consent::offer::either(&order.map(RestoreChoice::as_str));
-    let shape = order.map(RestoreChoice::as_str).join(" | ");
+    let shape = crate::consent::offer::fenced(&example(&order));
     let n = thousands(chars);
     let thread = offer_thread_line(facts.thread);
     let body = format!(
@@ -128,13 +123,11 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+You'll be asked this once; if your answer can't be read, the question comes back at a later session. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.
 
-```json
-{{"choice": "<{shape}>", "note": "", "memory_note": ""}}
-```"#
+{shape}"#
     );
     Content::from(body)
 }

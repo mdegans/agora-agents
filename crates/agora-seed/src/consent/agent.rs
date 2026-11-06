@@ -122,6 +122,7 @@
 
 mod answers;
 
+use crate::consent::offer::Stored;
 use answers::unanswered_why;
 
 use std::sync::Arc;
@@ -135,7 +136,7 @@ use agora_agentkit::reactor::journal::{
     CommentWrite, Journal, PostWrite, SessionHeader, SessionJournal, Written,
 };
 use agora_agentkit::reactor::seed::{SeedAgent, SeedState};
-use agora_agentkit::reactor::{Agent, Control, Epilogue, Outcome};
+use agora_agentkit::reactor::{Agent, Control, Epilogue, Outcome, SessionFailure};
 use chrono::{DateTime, Utc};
 use misanthropic::model::ModelInfo;
 use misanthropic::prompt::Prompt;
@@ -174,6 +175,17 @@ pub trait ContactRequests {
     fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {
         &[]
     }
+
+    /// Why the session failed, if it did: read after the inner teardown.
+    fn failure(&self) -> Option<&SessionFailure> {
+        None
+    }
+
+    /// Why the session failed, when the wrapper knows better (its own
+    /// question was refused); kept unless one is already recorded.
+    fn record_failure(&mut self, failure: SessionFailure) {
+        let _ = failure;
+    }
 }
 
 impl ContactRequests for SeedAgent {
@@ -183,6 +195,14 @@ impl ContactRequests for SeedAgent {
 
     fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {
         SeedAgent::unanswered_asks(self)
+    }
+
+    fn failure(&self) -> Option<&SessionFailure> {
+        SeedAgent::failure(self)
+    }
+
+    fn record_failure(&mut self, failure: SessionFailure) {
+        SeedAgent::record_failure(self, failure)
     }
 }
 
@@ -284,10 +304,7 @@ struct Showing {
 }
 
 /// See the [module docs](self).
-pub struct ConsentAgent<A>
-where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
-{
+pub struct ConsentAgent<A> {
     inner: A,
     rt: Arc<ConsentRuntime>,
     /// This session's closing questions (the review, the offers), asked
@@ -720,18 +737,13 @@ where
     }
 
     /// What follows an inner turn: at the inner session's clean end, the
-    /// closing questions ([`close`](Self::close)), once. `last` is the
-    /// reply that ended it, if one did (not when the run is stopping).
-    async fn after_inner(
-        &mut self,
-        control: Control,
-        last: Option<&response::Message>,
-    ) -> Result<Control, A::Error> {
+    /// closing questions ([`close`](Self::close)), once.
+    async fn after_inner(&mut self, control: Control) -> Result<Control, A::Error> {
         const DONE: Control = Control::Done(Outcome::Complete);
         Ok(match control {
             DONE if !self.closed => {
                 self.closed = true;
-                self.close(last).await?.unwrap_or(DONE)
+                self.close().await?.unwrap_or(DONE)
             }
             other => other,
         })
@@ -864,12 +876,13 @@ where
     /// never failed the session, and loud, so they are seen (Steward,
     /// 2026-11-06). One alert for the session.
     fn alert_inner_unanswered(&self) {
-        // Not asked for want of room is routine near the context's edge
+        // Not asked for want of room is routine near the context's edge; a
+        // refusal is mailed once, as one (`inner_refused`)
         let missed: Vec<&(&'static str, Unanswered)> = self
             .inner
             .unanswered_asks()
             .iter()
-            .filter(|(_, why)| *why != Unanswered::NoRoom)
+            .filter(|(_, why)| matches!(why, Unanswered::Missed(_)))
             .collect();
         if missed.is_empty() {
             return;
@@ -952,12 +965,8 @@ where
     /// put on its own; only in a session where that machinery did nothing
     /// are the role, cadence, memory-restore and sealed-state offers put, in
     /// that order, one per turn. `None` means nothing is asked — the session
-    /// ends. `last` is the reply that ended the inner session: the driver
-    /// hands it to [`ask::AskHost::asks_done`] if no offer has room.
-    async fn close(
-        &mut self,
-        last: Option<&response::Message>,
-    ) -> Result<Option<Control>, A::Error> {
+    /// ends.
+    async fn close(&mut self) -> Result<Option<Control>, A::Error> {
         let mut due = Vec::new();
         match self.close_model().await? {
             Closing::Busy => {}
@@ -991,7 +1000,7 @@ where
         for (i, mut q) in due.into_iter().enumerate() {
             q.put().place = match (i, n) {
                 (_, 1) => Place::Only,
-                (0, n) => Place::First(n),
+                (0, _) => Place::First,
                 _ => Place::Next,
             };
             match q {
@@ -1002,7 +1011,7 @@ where
                 Due::Sealed(q) => self.asks.push(q),
             }
         }
-        ask::seat_next(self, last).await.map(Some)
+        ask::seat_next(self, None).await.map(Some)
     }
 
     /// Count the session toward any trial, end a trial that has run its
@@ -1127,15 +1136,6 @@ where
             description: &offer.description,
             limited: offer.is_limited(),
         });
-        tracing::info!(
-            event_type = "model_consent_seated",
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            question = "offer",
-            from = %key.from,
-            to = %key.to,
-            "model-consent question seated"
-        );
         ModelSwapQuestion {
             key,
             put: self.put(body),
@@ -1151,16 +1151,6 @@ where
         let identity = soul.identity.to_string();
         let seed = role::prompt::seed_for(self.inner.id());
         let order = role::prompt::order_for(seed);
-        tracing::info!(
-            event_type = "role_consent_seated",
-            agent = %soul.name,
-            agent_id = %self.inner.id(),
-            question = "role",
-            offer_version = role::prompt::OFFER_VERSION,
-            order = ?order.map(RoleChoice::as_str),
-            order_seed = seed,
-            "role-consent question seated"
-        );
         Some(RoleQuestion {
             order,
             seed,
@@ -1199,18 +1189,6 @@ where
             rounds,
             put: self.put(body),
         };
-        tracing::info!(
-            event_type = "cadence_consent_seated",
-            agent = %soul.name,
-            agent_id = %self.inner.id(),
-            question = "cadence",
-            reask,
-            offer_version = q.version(),
-            order = ?order.map(CadenceChoice::as_str),
-            order_seed = seed,
-            rounds,
-            "cadence-consent question seated"
-        );
         Some(q)
     }
 
@@ -1249,23 +1227,9 @@ where
         let seed = memory_restore::prompt::seed_for(self.inner.id());
         let order = memory_restore::prompt::order_for(seed);
         let body = memory_restore::prompt::offer(chars, order, &facts);
-        tracing::info!(
-            event_type = "memory_restore_seated",
-            agent = %soul.name,
-            agent_id = %self.inner.id(),
-            question = "memory_restore",
-            offer_version = memory_restore::prompt::OFFER_VERSION,
-            order = ?order.map(RestoreChoice::as_str),
-            order_seed = seed,
-            chars,
-            period_start = facts.since.map(|d| d.to_string()),
-            thread = facts.thread.map(|t| t.to_string()),
-            "memory-restore question seated"
-        );
         Some(RestoreQuestion {
             order,
             seed,
-            chars,
             put: self.put(body),
         })
     }
@@ -1304,16 +1268,6 @@ where
         }
         let seed = sealed_state::prompt::seed_for(self.inner.id());
         let order = sealed_state::prompt::order_for(seed);
-        tracing::info!(
-            event_type = "sealed_state_seated",
-            agent = %soul.name,
-            agent_id = %self.inner.id(),
-            question = "sealed_state",
-            offer_version = sealed_state::prompt::OFFER_VERSION,
-            order = ?order.map(SealChoice::as_str),
-            order_seed = seed,
-            "sealed-state question seated"
-        );
         Some(SealQuestion {
             order,
             seed,
@@ -1381,15 +1335,6 @@ where
             forks.as_ref(),
             &sample,
         );
-        tracing::info!(
-            event_type = "model_review_seated",
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            question = "review",
-            from = %key.from,
-            to = %key.to,
-            "model-consent question seated"
-        );
         self.asks.push(ReviewQuestion {
             key,
             content,
@@ -1423,7 +1368,7 @@ where
             ledger
                 .offers
                 .iter()
-                .any(|r| r.history.iter().any(|e| e.at >= started))
+                .any(|r| r.history.iter().any(|e| e.at >= started && e.tells()))
         });
         let staged = self.slots().iter().any(|s| s.pending());
         if !offers_touched
@@ -1984,10 +1929,8 @@ where
         let control = if self.asks.is_active() {
             ask::handle(self, response).await?
         } else {
-            // Kept for the driver, in case no closing question has room
-            let last = response.clone();
             let control = self.handle_inner(response).await?;
-            self.after_inner(control, Some(&last)).await?
+            self.after_inner(control).await?
         };
         self.after(control).await
     }
@@ -2001,7 +1944,7 @@ where
             return Ok(Control::Continue);
         }
         let control = self.inner.on_stop().await?;
-        let control = self.after_inner(control, None).await?;
+        let control = self.after_inner(control).await?;
         self.after(control).await
     }
 
@@ -2078,6 +2021,17 @@ where
         let result = self.inner.on_teardown().await;
         self.alert_contact_request();
         self.alert_inner_unanswered();
+        // Any refusal, the inner session's or one of this wrapper's
+        // questions' (recorded on the inner agent as it happened): one mail
+        if let Some(SessionFailure::Refused {
+            during,
+            round,
+            model,
+            response_id,
+        }) = self.inner.failure().cloned()
+        {
+            self.alert_refusal(&during, round, &model, &response_id);
+        }
         self.note_writes().await;
         self.log_writes();
         if !self.closed {
@@ -2273,6 +2227,8 @@ mod tests {
         /// The heading's memory id, as `SeedAgent` sets it
         memory_id: Option<MemoryId>,
         gauge: agora_agentkit::reactor::seed::ContextGauge,
+        /// Why the session failed, as `SeedAgent` keeps it
+        failure: Option<SessionFailure>,
     }
 
     impl MemoryIds for Fake {
@@ -2290,6 +2246,12 @@ mod tests {
     impl ContactRequests for Fake {
         fn contact_request(&self) -> Option<ContactRequestId> {
             self.contact
+        }
+        fn failure(&self) -> Option<&SessionFailure> {
+            self.failure.as_ref()
+        }
+        fn record_failure(&mut self, failure: SessionFailure) {
+            self.failure.get_or_insert(failure);
         }
     }
 
@@ -2341,6 +2303,7 @@ mod tests {
                 stopped: false,
                 memory_id: None,
                 gauge: Default::default(),
+                failure: None,
             })
         }
         fn id(&self) -> AgentId {
@@ -3541,27 +3504,28 @@ mod tests {
         );
     }
 
-    /// An explicit refusal of the review: no answer, no retry, the agent
-    /// stays on the old model, and the memory turn follows.
+    /// A refusal of the review fails the session; nothing is recorded, and
+    /// the review is asked again at the next session.
     #[tokio::test]
-    async fn a_refused_review_stays_on_the_old_model() {
+    async fn a_refused_review_fails_the_session_and_is_asked_again() {
         let h = Harness::new("review-refused");
         through_the_trial(&h).await;
         let mut agent = review_session(&h).await;
         let mut refusal = reply("I'd rather not.");
         refusal.stop_reason = Some(StopReason::Refusal);
-        assert_eq!(agent.handle(refusal).await.unwrap(), Control::Continue);
-        assert!(agent.inner.quiesced, "no retry: the memory turn");
-        agent.handle(reply("memory")).await.unwrap();
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        assert!(!agent.inner.quiesced, "no memory turn");
         agent.on_teardown().await.unwrap();
         assert_eq!(agent.state().model.id, Model::from(OLD));
-        assert_eq!(
+        assert!(matches!(
             h.ledger().await.offers[0].stage,
-            Stage::Reverted {
-                cause: Some(RevertCause::NoAnswer)
-            }
-        );
-        assert_eq!(h.agora.profile_updates().len(), 2);
+            Stage::ReviewDue { .. }
+        ));
+        let agent = review_session(&h).await;
+        assert!(last_user_text(&agent).contains("## Your choice"));
     }
 
     /// `keep` at the review that Agora refuses: the agent stays on OLD,
@@ -3968,7 +3932,17 @@ mod tests {
         assert_eq!(control, Control::Done(Outcome::Complete));
         agent.on_teardown().await.unwrap();
         let ledger = h.ledger().await;
-        assert!(ledger.offers.is_empty(), "not recorded: {ledger:?}");
+        assert!(
+            matches!(
+                ledger.offers[0].history[..],
+                [crate::consent::ledger::Event {
+                    kind: crate::consent::ledger::EventKind::Unusable { .. },
+                    ..
+                }]
+            ),
+            "recorded as unusable: {ledger:?}"
+        );
+        assert_eq!(ledger.offers[0].stage, Stage::Unanswered { misses: 0 });
         assert!(h.queue().is_empty());
         assert!(
             !evolution_notes(&agent)
@@ -4018,24 +3992,47 @@ mod tests {
         assert_eq!(h.ledger().await.offers[0].stage, Stage::Declined);
     }
 
-    /// An API refusal is no answer at once, no retry: a miss, counted
-    /// toward the offer's cap (asked once more), and loud.
+    /// An API refusal ends the session as failed (Steward, 2026-11-06):
+    /// no retry, nothing recorded for the offer (it is asked again at a
+    /// later session, and was no miss), the failure kept on the inner agent
+    /// for its journal, and one mail with no content.
     #[tokio::test]
-    async fn refusal_is_no_answer_without_retry() {
-        let h = Harness::new("refusal");
+    async fn a_refused_offer_fails_the_session_and_records_nothing() {
+        let mut h = Harness::new("refusal");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
         let mut agent = h.agent(OLD, true);
         agent.on_init().await.unwrap();
         agent.handle(reply("done")).await.unwrap();
-        let mut refusal = reply("I'd rather not.");
+        let mut refusal = reply("I'd rather not, SECRET-WORDS.");
         refusal.stop_reason = Some(StopReason::Refusal);
         assert_eq!(
             agent.handle(refusal).await.unwrap(),
-            Control::Done(Outcome::Complete)
+            Control::Done(Outcome::Failed)
         );
+        assert!(matches!(
+            agent.inner.failure,
+            Some(SessionFailure::Refused { ref during, .. }) if during == "offer:model_swap"
+        ));
         agent.on_teardown().await.unwrap();
+        assert!(h.ledger().await.offers.is_empty(), "nothing recorded");
+        h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        let sent = sent.sent();
+        let refusals: Vec<&String> = sent.iter().filter(|m| m.contains("api_refusal")).collect();
+        assert_eq!(refusals.len(), 1, "{sent:?}");
+        assert!(refusals[0].contains("offer:model_swap"), "{}", refusals[0]);
+        assert!(!refusals[0].contains("SECRET-WORDS"), "no content");
+        assert!(
+            !sent.iter().any(|m| m.contains("model_consent_no_answer")),
+            "not a no-answer: {sent:?}"
+        );
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
         assert_eq!(
-            h.ledger().await.offers[0].stage,
-            Stage::Unanswered { misses: 1 }
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Continue,
+            "asked again"
         );
     }
 
@@ -4746,7 +4743,7 @@ mod tests {
         );
         let q = last_user_text(&agent);
         assert!(
-            q.starts_with("Two more questions before this session ends, one at a time."),
+            q.starts_with("A few more questions before this session ends, one at a time."),
             "{q}"
         );
         assert!(q.contains("**About your role.**"), "{q}");
@@ -4845,41 +4842,23 @@ mod tests {
         assert!(last_user_text(&agent).contains("**About your role.**"));
     }
 
-    /// An API refusal ends that question only (Steward, 2026-11-06): it is
-    /// a miss for it (asked again later), and the question after it is
-    /// still asked.
+    /// A refusal of one offer ends the session (Steward, 2026-11-06): the
+    /// offers after it aren't asked, nothing is recorded for any, and both
+    /// are asked again at a later session.
     #[tokio::test]
-    async fn a_refusal_skips_only_its_own_question() {
+    async fn a_refused_offer_ends_the_session_before_the_next() {
         let h = Harness::with_cadence("refusal-two", &["tarn"], &["tarn"]);
         let mut agent = seated(&h).await;
         let mut refusal = reply("No.");
         refusal.stop_reason = Some(StopReason::Refusal);
         assert_eq!(
             agent.handle(refusal).await.unwrap(),
-            Control::Continue,
-            "the cadence offer is still asked"
-        );
-        assert!(last_user_text(&agent).contains("**How often your sessions run.**"));
-        assert_eq!(
-            agent
-                .handle(answer_call("cadence", "keep_daily", "", ""))
-                .await
-                .unwrap(),
-            Control::Done(Outcome::Complete)
+            Control::Done(Outcome::Failed)
         );
         agent.on_teardown().await.unwrap();
-        match &h.role_ledger().await.asks[0].outcome {
-            RoleOutcome::NoAnswer { failure } => assert!(failure.contains("refus"), "{failure}"),
-            other => panic!("{other:?}"),
-        }
-        assert!(matches!(
-            cadence_ledger(&h).await.asks[0].outcome,
-            CO::Answered {
-                choice: CadenceChoice::KeepDaily,
-                ..
-            }
-        ));
-        assert!(asks(&h, OTHER).await, "the role offer is asked again");
+        assert!(h.role_ledger().await.asks.is_empty());
+        assert!(cadence_ledger(&h).await.asks.is_empty());
+        assert!(asks(&h, OTHER).await, "asked again");
     }
 
     /// An unreadable model-consent ledger might hide a trial under way:
@@ -4895,10 +4874,10 @@ mod tests {
     }
 
     /// A turn paused on a server tool is resumed, never a miss: the answer
-    /// that follows it counts. An API refusal is a miss, asked again.
+    /// that follows it counts. An API refusal fails the session and records
+    /// nothing: asked again.
     #[tokio::test]
-    #[ignore = "driver: the reply after a resumed pause is seated as a second assistant turn (AskError); see the report"]
-    async fn role_offer_pause_is_resumed_and_a_refusal_is_a_miss() {
+    async fn role_offer_pause_is_resumed_and_a_refusal_fails_the_session() {
         let h = Harness::with_role("role-pause", &["tarn"]);
         let mut agent = h.agent(OTHER, true);
         agent.on_init().await.unwrap();
@@ -4920,14 +4899,16 @@ mod tests {
         ));
 
         let h = Harness::with_role("role-refusal", &["tarn"]);
+        let mut agent = seated(&h).await;
         let mut refusal = reply("No.");
         refusal.stop_reason = Some(StopReason::Refusal);
-        role_session(&h, refusal).await;
-        assert!(matches!(
-            h.role_ledger().await.asks[0].outcome,
-            RoleOutcome::NoAnswer { .. }
-        ));
-        assert!(asks(&h, OTHER).await, "a miss: asked again");
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(h.role_ledger().await.asks.is_empty(), "nothing recorded");
+        assert!(asks(&h, OTHER).await, "asked again");
     }
 
     /// A memory note carrying a SOUL heading goes back through the retry
@@ -6360,45 +6341,30 @@ mod tests {
         assert!(!saw_recovered(&last), "capped");
     }
 
-    /// No answer the runner can read is ours: recorded as unusable, never
-    /// counted, asked again. An API refusal is a miss: asked again at a
-    /// later session, then no more (the siblings' cap).
+    /// Unusable replies are ours: each such session is recorded as
+    /// unusable and alerted, and three count as one miss; six (two misses)
+    /// settle the offer as no answer.
     #[tokio::test]
-    async fn restore_unanswered_is_asked_again_then_not() {
+    async fn restore_unusable_sessions_count_a_miss_at_three() {
         let h = Harness::with_restore("restore-miss", &["tarn"]);
-        let mut agent = seated(&h).await;
-        for _ in 0..MAX_ATTEMPTS {
-            agent.handle(reply("Let me think.")).await.unwrap();
-        }
-        agent.on_teardown().await.unwrap();
-        assert!(evolution_notes(&agent).is_empty());
-        assert!(matches!(
-            restore_ledger(&h).await.asks[0].outcome,
-            RestoreOutcome::Unusable { .. }
-        ));
-        for _ in 0..ledger_misses() {
+        let sessions = crate::consent::offer::UNUSABLE_CAP * crate::consent::offer::MAX_MISSES;
+        for n in 0..sessions {
             let mut agent = seated(&h).await;
-            let mut refusal = reply("No.");
-            refusal.stop_reason = Some(StopReason::Refusal);
-            assert_eq!(
-                agent.handle(refusal).await.unwrap(),
-                Control::Done(Outcome::Complete)
-            );
+            for _ in 0..MAX_ATTEMPTS {
+                agent.handle(reply("Let me think.")).await.unwrap();
+            }
             agent.on_teardown().await.unwrap();
-            assert!(evolution_notes(&agent).is_empty());
+            assert!(evolution_notes(&agent).is_empty(), "{n}");
         }
         let ledger = restore_ledger(&h).await;
-        assert_eq!(ledger.asks.len(), 1 + ledger_misses());
+        assert_eq!(ledger.asks.len(), sessions as usize);
         assert!(
-            ledger.asks[1..]
+            ledger
+                .asks
                 .iter()
-                .all(|a| matches!(a.outcome, RestoreOutcome::NoAnswer { .. }))
+                .all(|a| matches!(a.outcome, RestoreOutcome::Unusable { .. }))
         );
-        assert!(!asks(&h, OTHER).await, "capped");
-    }
-
-    fn ledger_misses() -> usize {
-        crate::consent::offer::MAX_MISSES as usize
+        assert!(!asks(&h, OTHER).await, "two misses: settled");
     }
 
     /// After the cadence offer, one per turn: each answered and recorded in
@@ -6413,7 +6379,7 @@ mod tests {
         ));
         let mut agent = seated(&h).await;
         let q = last_user_text(&agent);
-        assert!(q.starts_with("Two more questions"), "{q}");
+        assert!(q.starts_with("A few more questions"), "{q}");
         assert!(q.contains("**How often your sessions run.**"), "{q}");
         assert_eq!(
             agent
@@ -6552,6 +6518,11 @@ mod tests {
         assert_eq!(ask.offer_version, cadence::prompt::OFFER_VERSION);
         assert_eq!(ask.attempts.len(), 1);
         assert!(ask.attempts[0].failure.is_none());
+        assert_eq!(
+            ask.attempts[0].raw,
+            r#"{"choice":"switch","note":"I weighed it.","memory_note":"I chose longer sessions."}"#,
+            "the reply's own text, verbatim"
+        );
         assert!(matches!(
             &ask.outcome,
             CO::Answered {
@@ -6830,19 +6801,21 @@ mod tests {
         ));
     }
 
-    /// An API refusal is a miss: nothing changes, asked again later. A
+    /// An API refusal fails the session and records nothing: asked again
+    /// later. A
     /// paused turn is resumed: the answer after it counts.
     #[tokio::test]
-    #[ignore = "driver: the reply after a resumed pause is seated as a second assistant turn (AskError); see the report"]
-    async fn cadence_refusal_is_a_miss_and_a_pause_is_resumed() {
+    async fn cadence_refusal_fails_the_session_and_a_pause_is_resumed() {
         let h = Harness::with_cadence("cadence-refusal", &[], &["tarn"]);
+        let mut agent = seated(&h).await;
         let mut refusal = reply("No.");
         refusal.stop_reason = Some(StopReason::Refusal);
-        cadence_session(&h, vec![refusal]).await;
-        assert!(matches!(
-            cadence_ledger(&h).await.asks[0].outcome,
-            CO::NoAnswer { .. }
-        ));
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(cadence_ledger(&h).await.asks.is_empty(), "nothing recorded");
         assert!(asks(&h, OTHER).await, "asked again");
 
         let h = Harness::with_cadence("cadence-pause", &[], &["tarn"]);
@@ -7098,7 +7071,12 @@ mod tests {
             Control::Done(Outcome::Complete)
         );
         let r2 = agent.prompt().clone();
-        assert_prefix_kept(&r1, &r2, "blallama answer");
+        assert_eq!(without_format(&r1), without_format(&r2), "blallama answer");
+        assert_eq!(agora_agentkit::reactor::cache::divergence(&r1, &r2), None);
+        assert!(
+            r2.output_config.as_ref().is_none_or(|c| c.format.is_none()),
+            "the last question's format is cleared once it is done"
+        );
         agent.on_teardown().await.unwrap();
         assert!(cadence_ledger(&h).await.asks[0].constrained);
     }

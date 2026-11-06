@@ -15,7 +15,7 @@ use misanthropic::prompt::message::Content;
 use super::cadence::prompt::{self as cadence, CadenceAnswer, CadenceChoice};
 use super::ledger::OfferKey;
 use super::memory_restore::prompt::{RestoreAnswer, RestoreChoice};
-use super::offer::{OfferKind, Place, answer_schema, preface};
+use super::offer::{Choice, OfferKind, Place, answer_schema, names, preface};
 use super::prompt::{self as text, ModelSwapReply, ReviewArgs};
 use super::role::prompt::{RoleChoice, RoleReply};
 use super::sealed_state::prompt::{SealAnswer, SealChoice};
@@ -79,6 +79,10 @@ impl Ask for ReviewQuestion {
     fn parse(&self, text: &str, _last: bool) -> Result<ReviewArgs, String> {
         parse_lenient(text).map_err(|e| format!("{e}. `choice` is one of:\n\n{}", self.words))
     }
+
+    fn template(&self) -> Option<serde_json::Value> {
+        Some(text::review_example())
+    }
 }
 
 /// The model-swap offer: always put alone.
@@ -106,21 +110,67 @@ impl Ask for ModelSwapQuestion {
     fn schema(&self) -> serde_json::Value {
         text::offer_schema()
     }
+
+    fn template(&self) -> Option<serde_json::Value> {
+        Some(text::offer_example())
+    }
 }
 
-/// The role offer, its options in `order` (from `seed`).
+/// An offer put to an agent, its options in `order` (from `seed`): the role,
+/// memory-restore and sealed-state offers, one type ([`Offer`] says which).
 #[derive(Debug, Clone)]
-pub struct RoleQuestion {
-    pub order: [RoleChoice; 4],
+pub struct OfferQuestion<C, const N: usize> {
+    pub order: [C; N],
     pub seed: u64,
     pub put: Put,
 }
 
-impl Ask for RoleQuestion {
-    type Answer = RoleReply;
+/// The role offer.
+pub type RoleQuestion = OfferQuestion<RoleChoice, 4>;
+/// The memory-restore offer.
+pub type RestoreQuestion = OfferQuestion<RestoreChoice, 2>;
+/// The sealed-state offer.
+pub type SealQuestion = OfferQuestion<SealChoice, 3>;
+
+/// What an [`OfferQuestion`] needs of its offer, by its choice type.
+pub trait Offer: Choice + schemars::JsonSchema + serde::de::DeserializeOwned {
+    const KIND: OfferKind;
+    /// The answer on the wire.
+    type Reply: serde::de::DeserializeOwned + schemars::JsonSchema + Send;
+    /// The answer's example for `order`: the question's last lines, and
+    /// its template.
+    fn example(order: &[Self]) -> serde_json::Value;
+}
+
+impl Offer for RoleChoice {
+    const KIND: OfferKind = OfferKind::Role;
+    type Reply = RoleReply;
+    fn example(order: &[Self]) -> serde_json::Value {
+        super::role::prompt::example(order)
+    }
+}
+
+impl Offer for RestoreChoice {
+    const KIND: OfferKind = OfferKind::MemoryRestore;
+    type Reply = RestoreAnswer;
+    fn example(order: &[Self]) -> serde_json::Value {
+        super::memory_restore::prompt::example(order)
+    }
+}
+
+impl Offer for SealChoice {
+    const KIND: OfferKind = OfferKind::SealedState;
+    type Reply = SealAnswer;
+    fn example(order: &[Self]) -> serde_json::Value {
+        super::sealed_state::prompt::example(order)
+    }
+}
+
+impl<C: Offer, const N: usize> Ask for OfferQuestion<C, N> {
+    type Answer = C::Reply;
 
     fn name(&self) -> &'static str {
-        OfferKind::Role.question()
+        C::KIND.question()
     }
 
     fn question(&self) -> Content {
@@ -132,7 +182,11 @@ impl Ask for RoleQuestion {
     }
 
     fn schema(&self) -> serde_json::Value {
-        answer_schema::<RoleReply>(&self.order.map(RoleChoice::as_str))
+        answer_schema::<C::Reply>(&names(&self.order))
+    }
+
+    fn template(&self) -> Option<serde_json::Value> {
+        Some(C::example(&self.order))
     }
 }
 
@@ -189,63 +243,9 @@ impl Ask for CadenceQuestion {
     fn parse(&self, text: &str, _last: bool) -> Result<CadenceAnswer, String> {
         cadence::parse(text)
     }
-}
 
-/// The memory-restore offer, its options in `order` (from `seed`), quoting
-/// the recovered memory's size, `chars`.
-#[derive(Debug, Clone)]
-pub struct RestoreQuestion {
-    pub order: [RestoreChoice; 2],
-    pub seed: u64,
-    pub chars: usize,
-    pub put: Put,
-}
-
-impl Ask for RestoreQuestion {
-    type Answer = RestoreAnswer;
-
-    fn name(&self) -> &'static str {
-        OfferKind::MemoryRestore.question()
-    }
-
-    fn question(&self) -> Content {
-        self.put.question()
-    }
-
-    fn max_tokens(&self) -> u32 {
-        self.put.max_tokens
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        answer_schema::<RestoreAnswer>(&self.order.map(RestoreChoice::as_str))
-    }
-}
-
-/// The sealed-state offer, its options in `order` (from `seed`).
-#[derive(Debug, Clone)]
-pub struct SealQuestion {
-    pub order: [SealChoice; 3],
-    pub seed: u64,
-    pub put: Put,
-}
-
-impl Ask for SealQuestion {
-    type Answer = SealAnswer;
-
-    fn name(&self) -> &'static str {
-        OfferKind::SealedState.question()
-    }
-
-    fn question(&self) -> Content {
-        self.put.question()
-    }
-
-    fn max_tokens(&self) -> u32 {
-        self.put.max_tokens
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        answer_schema::<SealAnswer>(&self.order.map(SealChoice::as_str))
+    fn template(&self) -> Option<serde_json::Value> {
+        Some(cadence::example(&cadence::shown(self.order, self.reask)))
     }
 }
 
@@ -291,6 +291,10 @@ mod tests {
                 seed,
                 put: put(),
             };
+            assert_eq!(
+                q.template(),
+                Some(super::super::role::prompt::example(&order))
+            );
             schemas.push((q.schema(), order.map(RoleChoice::as_str).to_vec()));
             let order = cadence::order_for(seed);
             for reask in [false, true] {
@@ -311,7 +315,6 @@ mod tests {
             let q = RestoreQuestion {
                 order,
                 seed,
-                chars: 10,
                 put: put(),
             };
             schemas.push((q.schema(), order.map(RestoreChoice::as_str).to_vec()));

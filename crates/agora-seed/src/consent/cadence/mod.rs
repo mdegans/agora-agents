@@ -55,6 +55,7 @@
 pub mod ledger;
 pub mod prompt;
 
+use crate::consent::offer::Stored;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 

@@ -8,8 +8,6 @@
 //! refusal, ends it; a missing answer is re-asked up to [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) in
 //! all. `sealed-enroll` reads [`SealLedger::choice`] and nothing else.
 
-use std::path::{Path, PathBuf};
-
 use agora_agentkit::reactor::seed::{ShortString, Soul};
 use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
@@ -20,8 +18,9 @@ use super::prompt::SealChoice;
 /// The ledger's file name inside the agent's state directory.
 pub const LEDGER_FILE: &str = "sealed_state.json";
 
-/// Bump on layout change; [`SealLedger::load`] refuses anything newer.
-pub const FORMAT: u32 = 1;
+/// Bump on layout change (2 since 2026-11-06: answers' `note`, the
+/// `unusable` outcome); [`SealLedger::load`] refuses anything newer.
+pub const FORMAT: u32 = 2;
 
 /// The whole per-agent file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,72 +96,7 @@ pub enum SealOutcome {
     Unusable { failure: String },
 }
 
-impl crate::consent::offer::Outcome for SealOutcome {
-    fn status(&self) -> crate::consent::offer::Status {
-        use crate::consent::offer::Status;
-        match self {
-            Self::Answered { .. } | Self::Refused { .. } => Status::Settled,
-            Self::NoAnswer { .. } => Status::Miss,
-            Self::Unusable { .. } => Status::Unrecorded,
-        }
-    }
-}
-
 impl SealLedger {
-    pub fn path(agent_dir: &Path) -> PathBuf {
-        agent_dir.join(LEDGER_FILE)
-    }
-
-    /// Load `agent_dir`'s ledger; a missing file is an empty ledger. An
-    /// unreadable or too-new one is an error: the caller then neither asks
-    /// nor saves over it.
-    pub async fn load(agent_dir: &Path) -> std::io::Result<Self> {
-        match tokio::fs::read(Self::path(agent_dir)).await {
-            Ok(bytes) => Self::from_slice(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// [`Self::load`], blocking: for the start of a run, before any agent.
-    pub fn load_blocking(agent_dir: &Path) -> std::io::Result<Self> {
-        match std::fs::read(Self::path(agent_dir)) {
-            Ok(bytes) => Self::from_slice(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Parse a ledger, refusing a newer [`FORMAT`].
-    pub fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
-        let ledger: Self = serde_json::from_slice(bytes)?;
-        if ledger.format > FORMAT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "sealed-state ledger format {} is newer than this binary reads ({FORMAT})",
-                    ledger.format
-                ),
-            ));
-        }
-        Ok(ledger)
-    }
-
-    /// Atomic save: tmp + fsync + rename.
-    pub async fn save(&self, agent_dir: &Path) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        tokio::fs::create_dir_all(agent_dir).await?;
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let path = Self::path(agent_dir);
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &path).await
-    }
-
     /// Whether the offer should be put this session: nothing final on
     /// file, fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no recorded answer in
     /// `soul`'s Evolution Log.
@@ -242,6 +176,7 @@ impl SealLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::offer::Stored;
 
     fn soul() -> Soul {
         serde_json::from_value(serde_json::json!({
@@ -310,7 +245,7 @@ mod tests {
         for _ in 0..crate::consent::offer::MAX_MISSES {
             assert!(l.due(&soul()));
             l.record(ask(SealOutcome::NoAnswer {
-                failure: "x".into(),
+                failure: "refusal".into(),
             }));
         }
         assert!(!l.due(&soul()), "misses capped");
@@ -322,7 +257,7 @@ mod tests {
         let mut l = SealLedger::default();
         assert_eq!(l.ack_line(), None, "nothing answered");
         l.record(ask(SealOutcome::NoAnswer {
-            failure: "x".into(),
+            failure: "refusal".into(),
         }));
         assert_eq!(l.ack_line(), None, "no answer, nothing to tell");
         l.record(ask(answered(SealChoice::Publish)));

@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "agent": "herald",
+  "asks": [
+    {
+      "at": "2026-10-20T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "chars": 2140,
+      "order": [
+        "show",
+        "decline"
+      ],
+      "order_seed": 1,
+      "constrained": false,
+      "attempts": 1,
+      "outcome": {
+        "kind": "no_answer",
+        "failure": "refusal, with more than one offer in the question (after 1 attempts)"
+      }
+    },
+    {
+      "at": "2026-10-21T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "chars": 2140,
+      "order": [
+        "show",
+        "decline"
+      ],
+      "order_seed": 1,
+      "constrained": false,
+      "attempts": 1,
+      "outcome": {
+        "kind": "no_answer",
+        "failure": "refusal, with more than one offer in the question (after 1 attempts)"
+      }
+    }
+  ],
+  "showings": []
+}

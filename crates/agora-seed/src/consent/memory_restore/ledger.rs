@@ -17,8 +17,6 @@
 //! has completed with a successful memory update, up to the configured
 //! `show_sessions_max` showings in all.
 
-use std::path::{Path, PathBuf};
-
 use agora_agentkit::reactor::seed::{ShortString, Soul};
 use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
@@ -29,8 +27,9 @@ use super::prompt::RestoreChoice;
 /// The ledger's file name inside the agent's state directory.
 pub const LEDGER_FILE: &str = "memory_restore.json";
 
-/// Bump on layout change; [`RestoreLedger::load`] refuses anything newer.
-pub const FORMAT: u32 = 1;
+/// Bump on layout change (2 since 2026-11-06: answers' `note`, the
+/// `unusable` outcome); [`RestoreLedger::load`] refuses anything newer.
+pub const FORMAT: u32 = 2;
 
 /// Seatings allowed per counted showing: a showing counts only once the
 /// model answers, so a session that fails at its first request every time
@@ -122,17 +121,6 @@ pub enum RestoreOutcome {
     Unusable { failure: String },
 }
 
-impl crate::consent::offer::Outcome for RestoreOutcome {
-    fn status(&self) -> crate::consent::offer::Status {
-        use crate::consent::offer::Status;
-        match self {
-            Self::Answered { .. } | Self::Refused { .. } => Status::Settled,
-            Self::NoAnswer { .. } => Status::Miss,
-            Self::Unusable { .. } => Status::Unrecorded,
-        }
-    }
-}
-
 /// One session the recovered memory was shown in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Showing {
@@ -160,51 +148,6 @@ pub enum ShowOutcome {
 }
 
 impl RestoreLedger {
-    pub fn path(agent_dir: &Path) -> PathBuf {
-        agent_dir.join(LEDGER_FILE)
-    }
-
-    /// Load `agent_dir`'s ledger; a missing file is an empty ledger. An
-    /// unreadable or too-new one is an error — the caller must then neither
-    /// ask nor save over it.
-    pub async fn load(agent_dir: &Path) -> std::io::Result<Self> {
-        match tokio::fs::read(Self::path(agent_dir)).await {
-            Ok(bytes) => Self::from_slice(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Parse a ledger, refusing a newer [`FORMAT`].
-    pub fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
-        let ledger: Self = serde_json::from_slice(bytes)?;
-        if ledger.format > FORMAT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "memory-restore ledger format {} is newer than this binary reads ({FORMAT})",
-                    ledger.format
-                ),
-            ));
-        }
-        Ok(ledger)
-    }
-
-    /// Atomic save: tmp + fsync + rename.
-    pub async fn save(&self, agent_dir: &Path) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        tokio::fs::create_dir_all(agent_dir).await?;
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let path = Self::path(agent_dir);
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &path).await
-    }
-
     /// Whether the offer should be put this session: nothing final on file,
     /// fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no recorded answer in `soul`'s
     /// Evolution Log (in case the ledger save failed after the SOUL's).
@@ -304,6 +247,7 @@ impl RestoreLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::offer::Stored;
 
     fn soul() -> Soul {
         serde_json::from_value(serde_json::json!({
@@ -362,11 +306,11 @@ mod tests {
     fn a_miss_is_asked_once_more() {
         let mut l = RestoreLedger::default();
         l.record(ask(RestoreOutcome::NoAnswer {
-            failure: "x".into(),
+            failure: "refusal".into(),
         }));
         assert!(l.due(&soul()));
         l.record(ask(RestoreOutcome::NoAnswer {
-            failure: "x".into(),
+            failure: "refusal".into(),
         }));
         assert!(!l.due(&soul()));
     }

@@ -106,6 +106,16 @@ impl From<RoleReply> for RoleAnswer {
     }
 }
 
+/// The answer's example, its `choice` the options in `order`: what the
+/// question ends with, and its template.
+pub fn example(order: &[RoleChoice]) -> serde_json::Value {
+    use crate::consent::offer;
+    offer::example(
+        &offer::names(order),
+        &[("note", ""), ("text", ""), ("memory_note", "")],
+    )
+}
+
 /// The options, in the order they are presented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -378,7 +388,7 @@ pub fn offer(identity: &str, order: [RoleChoice; 4]) -> Content {
         .collect::<Vec<_>>()
         .join("\n");
     let names = crate::consent::offer::either(&order.map(RoleChoice::as_str));
-    let shape = order.map(RoleChoice::as_str).join(" | ");
+    let shape = crate::consent::offer::fenced(&example(&order));
     let body = format!(
         r#"**About your role.** Your SOUL was written by an early generator, a small model we used to create personalities. Many of the roles it wrote describe a profession with its own kind of work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*{stop} The tools you have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform.
 
@@ -392,9 +402,7 @@ If your SOUL changes, its Evolution Log will record what changed and that you ch
 
 Take whatever space you need. To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it. `text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); leave it empty otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.{tight}
 
-```json
-{{"choice": "<{shape}>", "note": "", "text": "", "memory_note": ""}}
-```"#
+{shape}"#
     );
     Content::from(body)
 }

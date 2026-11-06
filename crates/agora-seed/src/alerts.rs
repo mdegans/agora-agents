@@ -157,6 +157,14 @@ pub enum AlertKind {
     /// a later session (a refusal counts toward the offer's cap). The model
     /// offer and the trial review keep their own kinds.
     QuestionUnanswered,
+    /// The API refused a turn (`stop_reason: refusal`): the session ended
+    /// as failed (Steward, 2026-11-06). Carries the agent, the model, where
+    /// it happened and the response id; never any content.
+    ApiRefusal,
+    /// An offer's (or the trial review's) answers were unusable in
+    /// [`UNUSABLE_CAP`](crate::consent::offer::UNUSABLE_CAP) sessions: a miss
+    /// counted, or the review settled, for what is almost surely our fault.
+    QuestionUnusableCap,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -165,7 +173,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 30] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -194,6 +202,8 @@ impl AlertKind {
         Self::SealedStateUntrustedKey,
         Self::MemoryIdKeyRefused,
         Self::QuestionUnanswered,
+        Self::ApiRefusal,
+        Self::QuestionUnusableCap,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -238,6 +248,8 @@ impl AlertKind {
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
             Self::QuestionUnanswered => "question_unanswered",
+            Self::ApiRefusal => "api_refusal_alert",
+            Self::QuestionUnusableCap => "question_unusable_cap",
             Self::Test => "test_alert",
         }
     }
@@ -484,6 +496,26 @@ impl AlertKind {
                  but never counted against the offer, and the agent is asked \
                  again at a later session. The raw replies are in the \
                  `*_malformed` events of the same session."
+            }
+            Self::ApiRefusal => {
+                "The model provider's API refused a turn of an agent's session \
+                 (`stop_reason: refusal`), and the session ended as failed \
+                 (Steward, 2026-11-06). Nothing the refusal concerned was \
+                 recorded: an offer it ended is asked again at a later \
+                 session. The mail names where it happened and the response \
+                 id, never any content; the session's prompt dump holds the \
+                 transcript."
+            }
+            Self::QuestionUnusableCap => {
+                "An agent's answers to an end-of-session question (an offer, \
+                 or the trial review) could not be read in three sessions \
+                 running. Almost always this means we broke something (the \
+                 grammar, the template, the parser, the question's text), not \
+                 that the agent chose anything. Three such sessions count as \
+                 one miss of the offer (two settle it as no answer); the \
+                 review is settled, and the agent stays on its original \
+                 model. Read the `*_malformed` events and the raw replies \
+                 before anything else, and fix the cause."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

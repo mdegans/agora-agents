@@ -44,6 +44,7 @@
 //! Agora, and the one publish is skipped when Agora already has a choice on
 //! record, so the runner never sends `publish: true` behind the agent's back.
 
+use crate::consent::offer::Stored;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

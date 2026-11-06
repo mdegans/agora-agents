@@ -4,15 +4,23 @@
 //! driver ([`ask`]) seats the questions, retries unusable replies, and hands
 //! over the outcome.
 //!
-//! **Optional, never a failed session** (Steward, 2026-11-06). An answer
-//! settles an offer; so does the agent's own decline, which is an answer.
-//! Every reply unusable is ours, not the agent's choice: loud (an
-//! [`Alert`]), recorded so it can be seen (`unusable`), never counted
-//! toward [`MAX_MISSES`](crate::consent::offer::MAX_MISSES), and asked again
-//! at a later session. An API refusal is loud too, and a miss. No room
-//! left: not put, not recorded.
+//! **Optional, never a failed session by themselves** (Steward,
+//! 2026-11-06). An answer settles an offer; so does the agent's own
+//! decline, which is an answer. A session whose every reply was unusable is
+//! almost always ours (the grammar, the template, the parser, a check the
+//! answer failed), not the agent's choice: loud (an [`Alert`]), recorded
+//! (`unusable`), and asked again at a later session; [`UNUSABLE_CAP`] of
+//! them count as one miss (an offer) or settle it (the review), louder
+//! still. No room left: not put, not recorded.
+//!
+//! **An API refusal** (`stop_reason: refusal`) ends the session as failed,
+//! whatever the question (the driver does that), and mails the Steward
+//! ([`AlertKind::ApiRefusal`], no content). Nothing is recorded for the
+//! question it ended: it is asked again at a later session.
+//!
+//! [`UNUSABLE_CAP`]: crate::consent::offer::UNUSABLE_CAP
 
-use agora_agentkit::reactor::ask::{Answer, AskHost, Asked, Next, Rejection};
+use agora_agentkit::reactor::ask::{Answer, AskHost, Asked, Mark, Next, Rejection};
 use agora_agentkit::reactor::seed::ContextGauge;
 use misanthropic::model::Model;
 
@@ -20,18 +28,19 @@ use super::*;
 use crate::consent::cadence::ledger::{Attempt, CadenceAsk, CadenceOutcome};
 use crate::consent::cadence::prompt::CadenceAnswer;
 use crate::consent::memory_restore::ledger::{RestoreAsk, RestoreOutcome};
-use crate::consent::memory_restore::prompt::RestoreAnswer;
-use crate::consent::offer::{self, Edit, OfferKind, Write, nonempty, receipt};
+use crate::consent::offer::{
+    self, Choice, Edit, OfferKind, OfferLedger, Reply, Status, Write, nonempty, receipt,
+};
 use crate::consent::prompt::{ModelSwapReply, OfferAnswer, ReviewAnswer, ReviewArgs};
+use crate::consent::questions::OfferQuestion;
 use crate::consent::role::ledger::{Applied, RoleAsk, RoleOutcome};
 use crate::consent::role::prompt::{RoleAnswer, RoleReply};
 use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
-use crate::consent::sealed_state::prompt::SealAnswer;
 
 /// Why a question ended without an answer, for a record or an alert.
 pub(super) fn unanswered_why(why: &Unanswered) -> String {
     match why {
-        Unanswered::Refused => "refused by the API (stop_reason: refusal)".to_string(),
+        Unanswered::Refused { .. } => "refused by the API (stop_reason: refusal)".to_string(),
         Unanswered::Missed(last) => format!("no usable answer: {last}"),
         Unanswered::NoRoom => "no room left in the context".to_string(),
     }
@@ -56,10 +65,17 @@ where
 
     /// After the review, the inner agent's memory turn (and the rest of its
     /// tail), as after any act phase that went quiet: the review replaced
-    /// the act phase. After the offers, the session's clean end, which
-    /// begins the held survey ([`ConsentAgent::after`]).
-    async fn asks_done(&mut self, last: &response::Message) -> Result<Control, A::Error> {
+    /// the act phase. A review never put (no room at the session's start:
+    /// no reply) leaves an ordinary acting session; it is asked at a later
+    /// one. After the offers, the session's clean end, which begins the
+    /// held survey ([`ConsentAgent::after`]).
+    async fn asks_done(&mut self, last: Option<&response::Message>) -> Result<Control, A::Error> {
         if std::mem::take(&mut self.reviewing) {
+            let Some(last) = last else {
+                // The feed is read in this session after all
+                self.seen_before_review = None;
+                return Ok(Control::Continue);
+            };
             self.reviewed = true;
             return self.inner.on_quiesce(last).await;
         }
@@ -80,22 +96,33 @@ where
             .unwrap_or_else(|| self.model())
     }
 
-    /// Replies that couldn't be used, each under the offer's own event
-    /// (stall-watch's `*_malformed`): they are never seated as an answer,
-    /// so this is the record of what the model wrote.
-    fn log_unusable(&self, event_type: &'static str, offer: &str, asked: &Asked) {
+    /// Replies that couldn't be used, each under its question's own event
+    /// (stall-watch's `*_malformed`), with the question in `field` (`offer`
+    /// for an offer, `question` for the review): they are never seated as
+    /// an answer, so this is the record of what the model wrote.
+    fn log_unusable(&self, event_type: &'static str, field: Field, name: &str, asked: &Asked) {
+        let model = asked.model.as_deref();
         for (i, attempt) in asked.attempts.iter().enumerate() {
-            tracing::warn!(
-                event_type,
-                agent = %self.inner.state().soul.name,
-                agent_id = %self.inner.id(),
-                offer,
-                attempt = i + 1,
-                constrained = asked.constrained,
-                failure = %attempt.failure,
-                raw = %attempt.raw,
-                "closing question's answer unusable"
-            );
+            macro_rules! unusable {
+                ($field:ident) => {
+                    tracing::warn!(
+                        event_type,
+                        agent = %self.inner.state().soul.name,
+                        agent_id = %self.inner.id(),
+                        model,
+                        $field = name,
+                        attempt = i + 1,
+                        constrained = asked.constrained,
+                        failure = %attempt.failure,
+                        raw = %attempt.raw,
+                        "closing question's answer unusable"
+                    )
+                };
+            }
+            match field {
+                Field::Offer => unusable!(offer),
+                Field::Question => unusable!(question),
+            }
         }
     }
 
@@ -127,64 +154,132 @@ where
         Self::seat_user(prompt, Content::from(line)).map_err(Rejection::Error)
     }
 
-    /// An offer ended without an answer: its unusable replies logged, and,
-    /// unless it was never put (no room), loud. The failure to record, or
-    /// `None` when there is nothing to record.
-    fn offer_unanswered(
+    /// The API refused a reply to one of this wrapper's questions: the
+    /// driver ends the session. Recorded on the inner agent, which would
+    /// otherwise call the failure an error, and mailed from teardown with
+    /// the inner session's own (once per refusal).
+    fn refused_here(&mut self, during: &str, model: &Model, response_id: &str) {
+        self.inner.record_failure(SessionFailure::Refused {
+            during: during.to_string(),
+            round: None,
+            model: model.to_string(),
+            response_id: response_id.to_string(),
+        });
+    }
+
+    /// The API refused a reply: mail the operator, with no content.
+    pub(super) fn alert_refusal(
         &self,
+        during: &str,
+        round: Option<usize>,
+        model: &str,
+        response_id: &str,
+    ) {
+        let agent = &self.inner.state().soul.name;
+        let mut alert = Alert::new(
+            AlertKind::ApiRefusal,
+            "the API refused a turn; the session ended as failed",
+        )
+        .agent(agent.to_string(), self.inner.id())
+        .model(model)
+        .detail("during", during)
+        .detail("response_id", response_id);
+        if let Some(round) = round {
+            alert = alert.detail("round", round);
+        }
+        self.rt.alerts.notify(alert);
+    }
+
+    /// An unusable session completed an [`UNUSABLE_CAP`](offer::UNUSABLE_CAP).
+    fn alert_cap(&self, question: &str, asked: &Asked, failure: &str, then: &str) {
+        let agent = &self.inner.state().soul.name;
+        let model = self.answered_by(asked);
+        tracing::error!(
+            event_type = "question_unusable_cap",
+            agent = %agent,
+            agent_id = %self.inner.id(),
+            model = %model,
+            question,
+            cap = offer::UNUSABLE_CAP,
+            failure,
+            then,
+            "a question's answers were unusable in a row of sessions"
+        );
+        self.rt.alerts.notify(
+            Alert::new(
+                AlertKind::QuestionUnusableCap,
+                "answers unusable in three sessions: almost surely ours to fix",
+            )
+            .agent(agent.to_string(), self.inner.id())
+            .model(&model)
+            .detail("question", question)
+            .detail("cap", offer::UNUSABLE_CAP)
+            .detail("then", then)
+            .detail("failure", failure),
+        );
+    }
+
+    /// An offer ended without an answer: its unusable replies logged, and
+    /// what to record: `None` for nothing (no room, or a refusal, which is
+    /// mailed and ends the session), else the failure of a session whose
+    /// every reply was unusable, logged and alerted with `alert`.
+    fn offer_unanswered(
+        &mut self,
         kind: OfferKind,
         why: &Unanswered,
         asked: &Asked,
         alert: AlertKind,
     ) -> Option<String> {
-        self.log_unusable(kind.malformed(), kind.as_str(), asked);
+        self.log_unusable(kind.malformed(), Field::Offer, kind.as_str(), asked);
         let agent = &self.inner.state().soul.name;
-        if *why == Unanswered::NoRoom {
-            tracing::info!(
-                event_type = "offer_not_put",
-                agent = %agent,
-                agent_id = %self.inner.id(),
-                offer = kind.as_str(),
-                "no room left in the context; not put, and asked at a later session"
-            );
-            return None;
-        }
-        let failure = unanswered_why(why);
         let model = self.answered_by(asked);
-        let next = match why {
-            Unanswered::Refused => {
-                "counted as a miss; asked again at a later session until the cap"
+        match why {
+            Unanswered::NoRoom => {
+                tracing::info!(
+                    event_type = "offer_not_put",
+                    agent = %agent,
+                    agent_id = %self.inner.id(),
+                    offer = kind.as_str(),
+                    "no room left in the context; not put, and asked at a later session"
+                );
+                None
             }
-            _ => "not counted against the agent; asked again at a later session",
-        };
-        tracing::error!(
-            event_type = kind.no_answer(),
-            agent = %agent,
-            agent_id = %self.inner.id(),
-            model = %model,
-            offer = kind.as_str(),
-            attempts = asked.attempts.len(),
-            constrained = asked.constrained,
-            failure = %failure,
-            next,
-            "offer got no answer; nothing changes"
-        );
-        self.rt.alerts.notify(
-            Alert::new(alert, "an offer got no answer; nothing changes")
-                .agent(agent.to_string(), self.inner.id())
-                .model(&model)
-                .detail("question", kind.question())
-                .detail("attempts", asked.attempts.len())
-                .detail("failure", &failure)
-                .detail("next", next),
-        );
-        Some(failure)
+            Unanswered::Refused { response_id } => {
+                self.refused_here(kind.question(), &model, response_id);
+                None
+            }
+            Unanswered::Missed(_) => {
+                let failure = unanswered_why(why);
+                const NEXT: &str = "recorded as unusable; asked again at a later session";
+                tracing::error!(
+                    event_type = kind.no_answer(),
+                    agent = %agent,
+                    agent_id = %self.inner.id(),
+                    model = %model,
+                    offer = kind.as_str(),
+                    attempts = asked.attempts.len(),
+                    constrained = asked.constrained,
+                    failure = %failure,
+                    next = NEXT,
+                    "offer got no usable answer; nothing changes"
+                );
+                self.rt.alerts.notify(
+                    Alert::new(alert, "an offer got no usable answer; nothing changes")
+                        .agent(agent.to_string(), self.inner.id())
+                        .model(&model)
+                        .detail("question", kind.question())
+                        .detail("attempts", asked.attempts.len())
+                        .detail("failure", &failure)
+                        .detail("next", NEXT),
+                );
+                Some(failure)
+            }
+        }
     }
 
     /// What follows an offer that ended without an answer: the next
     /// question, or, with none left, the session's clean end (the survey
-    /// follows). Said here rather than left to the driver, which has no
-    /// reply to hand `asks_done` when the last offer wasn't put for room.
+    /// follows). A refusal ends the session whatever this says.
     fn next_after_unanswered(&self) -> Next {
         if self.asks.is_empty() && !self.reviewing {
             Next::Done(Outcome::Complete)
@@ -193,11 +288,430 @@ where
         }
     }
 
-    /// The replies an unanswered or answered ask took, as a count for a
-    /// ledger: at least one.
-    fn attempts(asked: &Asked, answered: bool) -> u32 {
-        let n = asked.attempts.len() + usize::from(answered);
-        u32::try_from(n.max(1)).unwrap_or(u32::MAX)
+    /// Record `outcome` for one of the four offer questions in its ledger.
+    fn record_offer<Q: Offering>(
+        &mut self,
+        ask: &Q,
+        asked: &Asked,
+        last: Option<Attempt>,
+        outcome: Q::Outcome,
+    ) {
+        let model = self.answered_by(asked);
+        let chars = self
+            .show
+            .recovered
+            .as_ref()
+            .map_or(0, RecoveredMemory::chars);
+        Q::slot(self).record(|l| ask.push(l, Utc::now(), model, asked, last, chars, outcome));
+    }
+
+    /// One of the four offer questions ended without an answer: nothing
+    /// recorded for no room or a refusal; a session of unusable replies
+    /// recorded, and loud at its cap.
+    async fn unanswered_offer<Q: Offering>(
+        &mut self,
+        ask: &Q,
+        why: Unanswered,
+        asked: &Asked,
+    ) -> Next {
+        if let Some(failure) =
+            self.offer_unanswered(Q::KIND, &why, asked, AlertKind::QuestionUnanswered)
+        {
+            self.record_offer(ask, asked, None, Q::unusable(failure.clone()));
+            let capped = Q::slot(self)
+                .ledger
+                .as_ref()
+                .is_some_and(|l| offer::at_cap(Q::statuses(l)));
+            if capped {
+                self.alert_cap(Q::KIND.question(), asked, &failure, "one miss counted");
+            }
+        }
+        self.next_after_unanswered()
+    }
+}
+
+/// The replies an ask took, as a count for a ledger: at least one.
+fn ask_attempts(asked: &Asked, answered: bool) -> u32 {
+    let n = asked.attempts.len() + usize::from(answered);
+    u32::try_from(n.max(1)).unwrap_or(u32::MAX)
+}
+
+/// Which field names the question in a `*_malformed` event.
+#[derive(Clone, Copy)]
+enum Field {
+    Offer,
+    Question,
+}
+
+/// What the four offers recorded in their own ledgers (role, cadence,
+/// memory restore, sealed state) share: one copy of how an ask is recorded
+/// and an unanswered one handled.
+trait Offering: agora_agentkit::reactor::ask::Ask {
+    const KIND: OfferKind;
+    type Ledger: OfferLedger;
+    type Outcome: offer::Outcome;
+
+    fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<Self::Ledger>
+    where
+        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds;
+
+    /// The outcome of a session whose every reply was unusable.
+    fn unusable(failure: String) -> Self::Outcome;
+
+    /// Every ask on file, as it reads today.
+    fn statuses(ledger: &Self::Ledger) -> Vec<Status>;
+
+    /// Record one ask: `last` is the answering reply, verbatim (the cadence
+    /// offer keeps every attempt); `chars`, the recovered memory's size
+    /// (the memory-restore offer quotes it).
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &self,
+        ledger: &mut Self::Ledger,
+        at: DateTime<Utc>,
+        model: Model,
+        asked: &Asked,
+        last: Option<Attempt>,
+        chars: usize,
+        outcome: Self::Outcome,
+    );
+}
+
+impl Offering for OfferQuestion<RoleChoice, 4> {
+    const KIND: OfferKind = OfferKind::Role;
+    type Ledger = RoleLedger;
+    type Outcome = RoleOutcome;
+
+    fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<RoleLedger>
+    where
+        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    {
+        &mut agent.role
+    }
+    fn unusable(failure: String) -> RoleOutcome {
+        RoleOutcome::Unusable { failure }
+    }
+    fn statuses(ledger: &RoleLedger) -> Vec<Status> {
+        ledger
+            .asks
+            .iter()
+            .map(|a| offer::Outcome::status(&a.outcome))
+            .collect()
+    }
+    fn push(
+        &self,
+        l: &mut RoleLedger,
+        at: DateTime<Utc>,
+        model: Model,
+        asked: &Asked,
+        _: Option<Attempt>,
+        _: usize,
+        outcome: RoleOutcome,
+    ) {
+        let answered = matches!(outcome, RoleOutcome::Answered { .. });
+        l.record(RoleAsk {
+            at,
+            offer_version: role::prompt::OFFER_VERSION,
+            model,
+            attempts: ask_attempts(asked, answered),
+            order: Some(self.order),
+            order_seed: Some(self.seed),
+            constrained: Some(asked.constrained),
+            outcome,
+        })
+    }
+}
+
+impl Offering for CadenceQuestion {
+    const KIND: OfferKind = OfferKind::Cadence;
+    type Ledger = CadenceLedger;
+    type Outcome = CadenceOutcome;
+
+    fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<CadenceLedger>
+    where
+        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    {
+        &mut agent.cadence
+    }
+    fn unusable(failure: String) -> CadenceOutcome {
+        CadenceOutcome::Unusable { failure }
+    }
+    fn statuses(ledger: &CadenceLedger) -> Vec<Status> {
+        ledger
+            .asks
+            .iter()
+            .map(|a| offer::Outcome::status(&a.outcome))
+            .collect()
+    }
+    fn push(
+        &self,
+        l: &mut CadenceLedger,
+        at: DateTime<Utc>,
+        model: Model,
+        asked: &Asked,
+        last: Option<Attempt>,
+        _: usize,
+        outcome: CadenceOutcome,
+    ) {
+        let mut attempts: Vec<Attempt> = asked
+            .attempts
+            .iter()
+            .map(|a| Attempt {
+                raw: a.raw.clone(),
+                failure: Some(a.failure.clone()),
+            })
+            .collect();
+        attempts.extend(last);
+        l.record(CadenceAsk {
+            at,
+            offer_version: self.version(),
+            model,
+            rounds: self.rounds,
+            order: self.order,
+            order_seed: self.seed,
+            constrained: asked.constrained,
+            attempts,
+            outcome,
+        })
+    }
+}
+
+impl Offering for OfferQuestion<RestoreChoice, 2> {
+    const KIND: OfferKind = OfferKind::MemoryRestore;
+    type Ledger = RestoreLedger;
+    type Outcome = RestoreOutcome;
+
+    fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<RestoreLedger>
+    where
+        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    {
+        &mut agent.restore
+    }
+    fn unusable(failure: String) -> RestoreOutcome {
+        RestoreOutcome::Unusable { failure }
+    }
+    fn statuses(ledger: &RestoreLedger) -> Vec<Status> {
+        ledger
+            .asks
+            .iter()
+            .map(|a| offer::Outcome::status(&a.outcome))
+            .collect()
+    }
+    fn push(
+        &self,
+        l: &mut RestoreLedger,
+        at: DateTime<Utc>,
+        model: Model,
+        asked: &Asked,
+        _: Option<Attempt>,
+        chars: usize,
+        outcome: RestoreOutcome,
+    ) {
+        let answered = matches!(outcome, RestoreOutcome::Answered { .. });
+        l.record(RestoreAsk {
+            at,
+            offer_version: memory_restore::prompt::OFFER_VERSION,
+            model,
+            chars,
+            order: self.order,
+            order_seed: self.seed,
+            constrained: asked.constrained,
+            attempts: ask_attempts(asked, answered),
+            outcome,
+        })
+    }
+}
+
+impl Offering for OfferQuestion<SealChoice, 3> {
+    const KIND: OfferKind = OfferKind::SealedState;
+    type Ledger = SealLedger;
+    type Outcome = SealOutcome;
+
+    fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<SealLedger>
+    where
+        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    {
+        &mut agent.sealed
+    }
+    fn unusable(failure: String) -> SealOutcome {
+        SealOutcome::Unusable { failure }
+    }
+    fn statuses(ledger: &SealLedger) -> Vec<Status> {
+        ledger
+            .asks
+            .iter()
+            .map(|a| offer::Outcome::status(&a.outcome))
+            .collect()
+    }
+    fn push(
+        &self,
+        l: &mut SealLedger,
+        at: DateTime<Utc>,
+        model: Model,
+        asked: &Asked,
+        _: Option<Attempt>,
+        _: usize,
+        outcome: SealOutcome,
+    ) {
+        let answered = matches!(outcome, SealOutcome::Answered { .. });
+        l.record(SealAsk {
+            at,
+            offer_version: sealed_state::prompt::OFFER_VERSION,
+            model,
+            order: self.order,
+            order_seed: self.seed,
+            constrained: asked.constrained,
+            attempts: ask_attempts(asked, answered),
+            outcome,
+        })
+    }
+}
+
+/// The memory-restore and sealed-state offers, answered the same way: the
+/// choice, a note, and a memory note dropped (not asked again) if it can't
+/// be written; one SOUL line.
+trait NotedOffer: Offering<Answer = Reply<Self::Choice>> {
+    type Choice: Choice + PartialEq;
+    /// `event_type` of the answer
+    const ANSWERED: &'static str;
+    fn order(&self) -> &[Self::Choice];
+    /// The SOUL line recording `choice`, dated `today`.
+    fn line(choice: Self::Choice, today: chrono::NaiveDate) -> String;
+    fn answered(
+        choice: Self::Choice,
+        note: String,
+        memory_note_written: bool,
+        note_dropped: Option<String>,
+    ) -> Self::Outcome;
+    fn stage<A>(agent: &mut ConsentAgent<A>, write: Write)
+    where
+        A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+    {
+        Self::slot(agent).stage(write);
+    }
+}
+
+impl NotedOffer for OfferQuestion<RestoreChoice, 2> {
+    type Choice = RestoreChoice;
+    const ANSWERED: &'static str = "memory_restore_answer";
+    fn order(&self) -> &[RestoreChoice] {
+        &self.order
+    }
+    fn line(choice: RestoreChoice, today: chrono::NaiveDate) -> String {
+        memory_restore::evolution_line(choice, today)
+    }
+    fn answered(
+        choice: RestoreChoice,
+        note: String,
+        written: bool,
+        dropped: Option<String>,
+    ) -> RestoreOutcome {
+        RestoreOutcome::Answered {
+            choice,
+            reason: note,
+            memory_note_written: written,
+            note_dropped: dropped,
+            apply_failed: None,
+        }
+    }
+}
+
+impl NotedOffer for OfferQuestion<SealChoice, 3> {
+    type Choice = SealChoice;
+    const ANSWERED: &'static str = "sealed_state_answer";
+    fn order(&self) -> &[SealChoice] {
+        &self.order
+    }
+    fn line(choice: SealChoice, _: chrono::NaiveDate) -> String {
+        sealed_state::evolution_line(choice)
+    }
+    fn answered(
+        choice: SealChoice,
+        note: String,
+        written: bool,
+        dropped: Option<String>,
+    ) -> SealOutcome {
+        SealOutcome::Answered {
+            choice,
+            reason: note,
+            memory_note_written: written,
+            note_dropped: dropped,
+            apply_failed: None,
+        }
+    }
+}
+
+impl<A> ConsentAgent<A>
+where
+    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
+{
+    /// Take an answer to the memory-restore or sealed-state offer. Nothing
+    /// is applied here: the SOUL line and the agent's note are written at
+    /// teardown (a `show` is delivered next session; a yes to sealed state
+    /// is acted on by the operator's `sealed-enroll`). Nothing of a
+    /// recovered memory is logged or recorded but its size.
+    fn answer_noted<Q: NotedOffer>(
+        &mut self,
+        ask: &Q,
+        reply: Reply<Q::Choice>,
+        asked: &Asked,
+    ) -> Result<Next, Rejection<A::Error>> {
+        self.log_unusable(Q::KIND.malformed(), Field::Offer, Q::KIND.as_str(), asked);
+        let model = self.answered_by(asked);
+        let Reply {
+            choice,
+            note,
+            memory_note,
+            ..
+        } = reply;
+        let dropped = offer::check_note(&memory_note, &self.inner.state().memory).err();
+        let memory_note = match dropped {
+            None => nonempty(&memory_note),
+            Some(_) => None,
+        };
+        self.log_answered(Q::KIND, choice.as_str(), asked, &model);
+        let order: Vec<&str> = ask.order().iter().map(|c| c.as_str()).collect();
+        tracing::info!(
+            event_type = Q::ANSWERED,
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            model = %model,
+            attempts = asked.attempts.len() + 1,
+            choice = choice.as_str(),
+            order = ?order,
+            position = ask.order().iter().position(|c| *c == choice).map(|p| p + 1),
+            chars = self.show.recovered.as_ref().map(RecoveredMemory::chars),
+            memory_note = memory_note.is_some(),
+            note_dropped = dropped.is_some(),
+            constrained = asked.constrained,
+            "offer answer recorded"
+        );
+        Q::stage(
+            self,
+            Write {
+                edit: Some(Edit::Line(Q::line(choice, Utc::now().date_naive()))),
+                note: memory_note.clone(),
+            },
+        );
+        let outcome = Q::answered(choice, note, memory_note.is_some(), dropped.clone());
+        self.record_offer(ask, asked, None, outcome);
+        self.seat_receipt(Q::KIND, choice.as_str(), dropped.as_deref())?;
+        Ok(Next::Continue)
+    }
+
+    /// `*_seated` for an offer, when the driver seats it: its version,
+    /// order and seed.
+    fn log_seated(&self, kind: OfferKind, version: u32, order: &[&str], seed: u64) {
+        tracing::info!(
+            event_type = kind.seated(),
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            question = kind.as_str(),
+            offer_version = version,
+            order = ?order,
+            order_seed = seed,
+            "offer question seated"
+        );
     }
 }
 
@@ -214,7 +728,7 @@ where
         reply: ReviewArgs,
         asked: &Asked,
     ) -> Result<Next, Rejection<A::Error>> {
-        self.log_unusable("model_consent_malformed", "review", asked);
+        self.log_unusable("model_consent_malformed", Field::Question, "review", asked);
         let now = Utc::now();
         let answer = ReviewAnswer::from(reply);
         let (choice, word) = (format!("{:?}", answer.choice), answer.choice.word());
@@ -241,28 +755,39 @@ where
         Ok(Next::Continue)
     }
 
-    /// No answer: the agent stays on the model it came from. A refusal is
-    /// recorded as no answer, and final (the review is asked once); replies
-    /// we couldn't read are ours, so the review is asked again at its next
-    /// session. Either way it is loud: stall-watch alerts on
-    /// `model_review_no_answer` at once.
+    /// Unusable replies: the agent stays where it is this session, loudly
+    /// (stall-watch alerts on `model_review_no_answer` at once), recorded,
+    /// and the review is asked again at its next session, up to
+    /// [`UNUSABLE_CAP`](offer::UNUSABLE_CAP) sessions; at the cap it is
+    /// settled as no answer (the agent stays on its original model, as its
+    /// text promises). A refusal records nothing: mailed, the session ends.
     async fn unanswered(
         &mut self,
         ask: &ReviewQuestion,
         why: Unanswered,
         asked: &Asked,
     ) -> Result<Next, A::Error> {
-        self.log_unusable("model_consent_malformed", "review", asked);
-        if why == Unanswered::NoRoom {
-            return Ok(Next::Continue);
-        }
-        let failure = unanswered_why(&why);
+        self.log_unusable("model_consent_malformed", Field::Question, "review", asked);
         let model = self.answered_by(asked);
-        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
-        let next = match why {
-            Unanswered::Refused => "recorded: the agent stays on its original model",
-            _ => "not recorded: the review is asked again at the agent's next session",
+        let failure = match &why {
+            Unanswered::NoRoom => return Ok(Next::Continue),
+            Unanswered::Refused { response_id } => {
+                self.refused_here("review", &model, response_id);
+                return Ok(Next::Continue);
+            }
+            Unanswered::Missed(_) => unanswered_why(&why),
         };
+        let now = Utc::now();
+        let capped = self
+            .swap
+            .record(|l| l.record_unusable_review(&ask.key, now, failure.clone()))
+            .unwrap_or(false);
+        let next = if capped {
+            "unusable at the cap: settled as no answer; the agent stays on its original model"
+        } else {
+            "recorded as unusable: the review is asked again at the agent's next session"
+        };
+        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
         tracing::error!(
             event_type = "model_review_no_answer",
             agent = %agent,
@@ -288,12 +813,22 @@ where
             .detail("failure", &failure)
             .detail("next", next),
         );
-        if why == Unanswered::Refused {
-            let now = Utc::now();
-            self.swap
-                .record(|l| l.record_review(&ask.key, now, Err(failure)));
+        if capped {
+            self.alert_cap("review", asked, &failure, next);
         }
         Ok(Next::Continue)
+    }
+
+    fn seated(&mut self, ask: &ReviewQuestion, _: Mark) {
+        tracing::info!(
+            event_type = "model_review_seated",
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            question = "review",
+            from = %ask.key.from,
+            to = %ask.key.to,
+            "model-consent question seated"
+        );
     }
 }
 
@@ -311,7 +846,7 @@ where
         asked: &Asked,
     ) -> Result<Next, Rejection<A::Error>> {
         const KIND: OfferKind = OfferKind::ModelSwap;
-        self.log_unusable(KIND.malformed(), KIND.as_str(), asked);
+        self.log_unusable(KIND.malformed(), Field::Offer, KIND.as_str(), asked);
         let now = Utc::now();
         let model = self.answered_by(asked);
         let answer = OfferAnswer::from(reply);
@@ -347,23 +882,20 @@ where
         Ok(Next::Continue)
     }
 
-    /// A refusal is a miss (asked once more, then final: stay). Replies we
-    /// couldn't read are not recorded at all: the offer is asked again.
+    /// Unusable replies are recorded (an `unusable` event in the offer's
+    /// history); [`UNUSABLE_CAP`](offer::UNUSABLE_CAP) of them count a miss.
     async fn unanswered(
         &mut self,
         ask: &ModelSwapQuestion,
         why: Unanswered,
         asked: &Asked,
     ) -> Result<Next, A::Error> {
-        let Some(failure) = self.offer_unanswered(
+        if let Some(failure) = self.offer_unanswered(
             OfferKind::ModelSwap,
             &why,
             asked,
             AlertKind::ModelConsentNoAnswer,
-        ) else {
-            return Ok(self.next_after_unanswered());
-        };
-        if why == Unanswered::Refused {
+        ) {
             let now = Utc::now();
             let rt = self.rt.clone();
             let offer = rt.offer.as_ref().expect("asked, so configured");
@@ -372,45 +904,46 @@ where
                 from_name: offer.source_name(),
                 to_name: offer.target_name(),
             };
-            self.swap
-                .record(|l| l.record_offer(names, now, Err(failure)));
+            let capped = self
+                .swap
+                .record(|l| l.record_unusable_offer(names, now, failure.clone()))
+                .unwrap_or(false);
+            if capped {
+                self.alert_cap(
+                    OfferKind::ModelSwap.question(),
+                    asked,
+                    &failure,
+                    "one miss counted",
+                );
+            }
         }
-        Ok(Next::Continue)
+        Ok(self.next_after_unanswered())
+    }
+
+    fn seated(&mut self, ask: &ModelSwapQuestion, _: Mark) {
+        tracing::info!(
+            event_type = OfferKind::ModelSwap.seated(),
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            question = "offer",
+            from = %ask.key.from,
+            to = %ask.key.to,
+            "model-consent question seated"
+        );
     }
 }
 
 // --- The role offer -----------------------------------------------------------
 
-impl<A> ConsentAgent<A>
-where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
-{
-    fn record_role(&mut self, ask: &RoleQuestion, asked: &Asked, outcome: RoleOutcome) {
-        let answered = matches!(outcome, RoleOutcome::Answered { .. });
-        let model = self.answered_by(asked);
-        self.role.record(|l| {
-            l.record(RoleAsk {
-                at: Utc::now(),
-                offer_version: role::prompt::OFFER_VERSION,
-                model,
-                attempts: Self::attempts(asked, answered),
-                order: Some(ask.order),
-                order_seed: Some(ask.seed),
-                constrained: Some(asked.constrained),
-                outcome,
-            })
-        });
-    }
-}
-
 #[async_trait::async_trait]
-impl<A> Answer<RoleQuestion> for ConsentAgent<A>
+impl<A> Answer<OfferQuestion<RoleChoice, 4>> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
 {
     /// Checked against the agent's SOUL and memory first: an empty or
     /// over-long `text`, or a `memory_note` that can't be written, is asked
-    /// again with why. Nothing is applied here: the SOUL edit and the
+    /// again with why (and, every attempt failing, is a session of unusable
+    /// replies, as any). Nothing is applied here: the SOUL edit and the
     /// memory note are written into the state the reactor saves, at
     /// teardown.
     async fn answer(
@@ -426,7 +959,7 @@ where
         answer
             .validate(&identity, &state.memory)
             .map_err(Rejection::Retry)?;
-        self.log_unusable(KIND.malformed(), KIND.as_str(), asked);
+        self.log_unusable(KIND.malformed(), Field::Offer, KIND.as_str(), asked);
         let (agent_id, agent) = (self.inner.id(), state.soul.name.clone());
         let model = self.answered_by(asked);
         let choice = answer.choice.as_str();
@@ -465,9 +998,10 @@ where
             edit,
             note: note.clone(),
         });
-        self.record_role(
+        self.record_offer(
             ask,
             asked,
+            None,
             RoleOutcome::Answered {
                 memory_note_written: note.is_some(),
                 answer,
@@ -485,70 +1019,33 @@ where
         why: Unanswered,
         asked: &Asked,
     ) -> Result<Next, A::Error> {
-        let Some(failure) =
-            self.offer_unanswered(OfferKind::Role, &why, asked, AlertKind::QuestionUnanswered)
-        else {
-            return Ok(self.next_after_unanswered());
-        };
-        let outcome = match why {
-            Unanswered::Refused => RoleOutcome::NoAnswer { failure },
-            _ => RoleOutcome::Unusable { failure },
-        };
-        self.record_role(ask, asked, outcome);
-        Ok(Next::Continue)
+        Ok(self.unanswered_offer(ask, why, asked).await)
+    }
+
+    fn seated(&mut self, ask: &RoleQuestion, _: Mark) {
+        let order = offer::names(&ask.order);
+        self.log_seated(
+            OfferKind::Role,
+            role::prompt::OFFER_VERSION,
+            &order,
+            ask.seed,
+        );
     }
 }
 
 // --- The cadence offer --------------------------------------------------------
-
-impl<A> ConsentAgent<A>
-where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
-{
-    fn record_cadence(
-        &mut self,
-        ask: &CadenceQuestion,
-        asked: &Asked,
-        last: Option<Attempt>,
-        outcome: CadenceOutcome,
-    ) {
-        let model = self.answered_by(asked);
-        let mut attempts: Vec<Attempt> = asked
-            .attempts
-            .iter()
-            .map(|a| Attempt {
-                raw: a.raw.clone(),
-                failure: Some(a.failure.clone()),
-            })
-            .collect();
-        attempts.extend(last);
-        self.cadence.record(|l| {
-            l.record(CadenceAsk {
-                at: Utc::now(),
-                offer_version: ask.version(),
-                model,
-                rounds: ask.rounds,
-                order: ask.order,
-                order_seed: ask.seed,
-                constrained: asked.constrained,
-                attempts,
-                outcome,
-            })
-        });
-    }
-}
 
 #[async_trait::async_trait]
 impl<A> Answer<CadenceQuestion> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
 {
-    /// Every attempt goes into the record, verbatim. **The first usable
-    /// choice wins**: its question's parser took the `choice` past broken
-    /// siblings, and a bad `memory_note` is dropped here, not asked again
-    /// (both recorded). Nothing is applied here: the cadence is the
-    /// planner's, from the ledger; the SOUL line and the note are written
-    /// at teardown.
+    /// Every attempt goes into the record, verbatim, the answering one too.
+    /// **The first usable choice wins**: its question's parser took the
+    /// `choice` past broken siblings, and a bad `memory_note` is dropped
+    /// here, not asked again (both recorded). Nothing is applied here: the
+    /// cadence is the planner's, from the ledger; the SOUL line and the
+    /// note are written at teardown.
     async fn answer(
         &mut self,
         ask: &CadenceQuestion,
@@ -556,20 +1053,15 @@ where
         asked: &Asked,
     ) -> Result<Next, Rejection<A::Error>> {
         const KIND: OfferKind = OfferKind::Cadence;
-        self.log_unusable(KIND.malformed(), KIND.as_str(), asked);
+        self.log_unusable(KIND.malformed(), Field::Offer, KIND.as_str(), asked);
         let model = self.answered_by(asked);
-        let CadenceAnswer {
+        let Reply {
             choice,
             note,
             memory_note,
             salvaged,
+            raw,
         } = reply;
-        let raw = serde_json::json!({
-            "choice": choice.as_str(),
-            "note": note,
-            "memory_note": memory_note,
-        })
-        .to_string();
         let dropped = offer::check_note(&memory_note, &self.inner.state().memory).err();
         let memory_note = match dropped {
             None => nonempty(&memory_note),
@@ -625,11 +1117,11 @@ where
             edit: Some(Edit::Line(line)),
             note: memory_note.clone(),
         });
-        self.record_cadence(
+        self.record_offer(
             ask,
             asked,
             Some(Attempt {
-                raw,
+                raw: raw.unwrap_or_default(),
                 failure: salvaged,
             }),
             CadenceOutcome::Answered {
@@ -650,112 +1142,39 @@ where
         why: Unanswered,
         asked: &Asked,
     ) -> Result<Next, A::Error> {
-        let Some(failure) = self.offer_unanswered(
-            OfferKind::Cadence,
-            &why,
-            asked,
-            AlertKind::QuestionUnanswered,
-        ) else {
-            return Ok(self.next_after_unanswered());
-        };
-        let outcome = match why {
-            Unanswered::Refused => CadenceOutcome::NoAnswer { failure },
-            _ => CadenceOutcome::Unusable { failure },
-        };
-        self.record_cadence(ask, asked, None, outcome);
-        Ok(Next::Continue)
+        Ok(self.unanswered_offer(ask, why, asked).await)
+    }
+
+    fn seated(&mut self, ask: &CadenceQuestion, _: Mark) {
+        tracing::info!(
+            event_type = OfferKind::Cadence.seated(),
+            agent = %self.inner.state().soul.name,
+            agent_id = %self.inner.id(),
+            question = "cadence",
+            reask = ask.reask,
+            offer_version = ask.version(),
+            order = ?ask.order.map(CadenceChoice::as_str),
+            order_seed = ask.seed,
+            rounds = ask.rounds,
+            "offer question seated"
+        );
     }
 }
 
-// --- The memory-restore offer ---------------------------------------------------
-
-impl<A> ConsentAgent<A>
-where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
-{
-    fn record_restore(&mut self, ask: &RestoreQuestion, asked: &Asked, outcome: RestoreOutcome) {
-        let answered = matches!(outcome, RestoreOutcome::Answered { .. });
-        let model = self.answered_by(asked);
-        self.restore.record(|l| {
-            l.record(RestoreAsk {
-                at: Utc::now(),
-                offer_version: memory_restore::prompt::OFFER_VERSION,
-                model,
-                chars: ask.chars,
-                order: ask.order,
-                order_seed: ask.seed,
-                constrained: asked.constrained,
-                attempts: Self::attempts(asked, answered),
-                outcome,
-            })
-        });
-    }
-}
+// --- The memory-restore and sealed-state offers -----------------------------------
 
 #[async_trait::async_trait]
-impl<A> Answer<RestoreQuestion> for ConsentAgent<A>
+impl<A> Answer<OfferQuestion<RestoreChoice, 2>> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
 {
-    /// Nothing is applied here: the SOUL line and the agent's note are
-    /// written into the state the reactor saves, at teardown; a `show` is
-    /// delivered next session. Nothing of the recovered memory is logged or
-    /// recorded but its size. A bad note is dropped, not asked again.
     async fn answer(
         &mut self,
         ask: &RestoreQuestion,
-        reply: RestoreAnswer,
+        reply: Reply<RestoreChoice>,
         asked: &Asked,
     ) -> Result<Next, Rejection<A::Error>> {
-        const KIND: OfferKind = OfferKind::MemoryRestore;
-        self.log_unusable(KIND.malformed(), KIND.as_str(), asked);
-        let model = self.answered_by(asked);
-        let RestoreAnswer {
-            choice,
-            note,
-            memory_note,
-        } = reply;
-        let dropped = offer::check_note(&memory_note, &self.inner.state().memory).err();
-        let memory_note = match dropped {
-            None => nonempty(&memory_note),
-            Some(_) => None,
-        };
-        self.log_answered(KIND, choice.as_str(), asked, &model);
-        tracing::info!(
-            event_type = "memory_restore_answer",
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            model = %model,
-            attempts = asked.attempts.len() + 1,
-            choice = choice.as_str(),
-            order = ?ask.order.map(RestoreChoice::as_str),
-            position = ask.order.iter().position(|c| *c == choice).map(|p| p + 1),
-            chars = ask.chars,
-            memory_note = memory_note.is_some(),
-            note_dropped = dropped.is_some(),
-            constrained = asked.constrained,
-            "memory-restore answer recorded"
-        );
-        self.restore.stage(Write {
-            edit: Some(Edit::Line(memory_restore::evolution_line(
-                choice,
-                Utc::now().date_naive(),
-            ))),
-            note: memory_note.clone(),
-        });
-        self.record_restore(
-            ask,
-            asked,
-            RestoreOutcome::Answered {
-                choice,
-                reason: note,
-                memory_note_written: memory_note.is_some(),
-                note_dropped: dropped.clone(),
-                apply_failed: None,
-            },
-        );
-        self.seat_receipt(KIND, choice.as_str(), dropped.as_deref())?;
-        Ok(Next::Continue)
+        self.answer_noted(ask, reply, asked)
     }
 
     async fn unanswered(
@@ -764,106 +1183,32 @@ where
         why: Unanswered,
         asked: &Asked,
     ) -> Result<Next, A::Error> {
-        let Some(failure) = self.offer_unanswered(
+        Ok(self.unanswered_offer(ask, why, asked).await)
+    }
+
+    fn seated(&mut self, ask: &RestoreQuestion, _: Mark) {
+        let order = offer::names(&ask.order);
+        self.log_seated(
             OfferKind::MemoryRestore,
-            &why,
-            asked,
-            AlertKind::QuestionUnanswered,
-        ) else {
-            return Ok(self.next_after_unanswered());
-        };
-        let outcome = match why {
-            Unanswered::Refused => RestoreOutcome::NoAnswer { failure },
-            _ => RestoreOutcome::Unusable { failure },
-        };
-        self.record_restore(ask, asked, outcome);
-        Ok(Next::Continue)
-    }
-}
-
-// --- The sealed-state offer -----------------------------------------------------
-
-impl<A> ConsentAgent<A>
-where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
-{
-    fn record_sealed(&mut self, ask: &SealQuestion, asked: &Asked, outcome: SealOutcome) {
-        let answered = matches!(outcome, SealOutcome::Answered { .. });
-        let model = self.answered_by(asked);
-        self.sealed.record(|l| {
-            l.record(SealAsk {
-                at: Utc::now(),
-                offer_version: sealed_state::prompt::OFFER_VERSION,
-                model,
-                order: ask.order,
-                order_seed: ask.seed,
-                constrained: asked.constrained,
-                attempts: Self::attempts(asked, answered),
-                outcome,
-            })
-        });
+            memory_restore::prompt::OFFER_VERSION,
+            &order,
+            ask.seed,
+        );
     }
 }
 
 #[async_trait::async_trait]
-impl<A> Answer<SealQuestion> for ConsentAgent<A>
+impl<A> Answer<OfferQuestion<SealChoice, 3>> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + ContactRequests + MemoryIds,
 {
-    /// Nothing is applied here: the SOUL line and the agent's note are
-    /// written at teardown; a yes is acted on by the operator's
-    /// `sealed-enroll`. A bad note is dropped, not asked again.
     async fn answer(
         &mut self,
         ask: &SealQuestion,
-        reply: SealAnswer,
+        reply: Reply<SealChoice>,
         asked: &Asked,
     ) -> Result<Next, Rejection<A::Error>> {
-        const KIND: OfferKind = OfferKind::SealedState;
-        self.log_unusable(KIND.malformed(), KIND.as_str(), asked);
-        let model = self.answered_by(asked);
-        let SealAnswer {
-            choice,
-            note,
-            memory_note,
-        } = reply;
-        let dropped = offer::check_note(&memory_note, &self.inner.state().memory).err();
-        let memory_note = match dropped {
-            None => nonempty(&memory_note),
-            Some(_) => None,
-        };
-        self.log_answered(KIND, choice.as_str(), asked, &model);
-        tracing::info!(
-            event_type = "sealed_state_answer",
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            model = %model,
-            attempts = asked.attempts.len() + 1,
-            choice = choice.as_str(),
-            order = ?ask.order.map(SealChoice::as_str),
-            position = ask.order.iter().position(|c| *c == choice).map(|p| p + 1),
-            memory_note = memory_note.is_some(),
-            note_dropped = dropped.is_some(),
-            constrained = asked.constrained,
-            "sealed-state answer recorded"
-        );
-        self.sealed.stage(Write {
-            edit: Some(Edit::Line(sealed_state::evolution_line(choice))),
-            note: memory_note.clone(),
-        });
-        self.record_sealed(
-            ask,
-            asked,
-            SealOutcome::Answered {
-                choice,
-                reason: note,
-                memory_note_written: memory_note.is_some(),
-                note_dropped: dropped.clone(),
-                apply_failed: None,
-            },
-        );
-        self.seat_receipt(KIND, choice.as_str(), dropped.as_deref())?;
-        Ok(Next::Continue)
+        self.answer_noted(ask, reply, asked)
     }
 
     async fn unanswered(
@@ -872,19 +1217,16 @@ where
         why: Unanswered,
         asked: &Asked,
     ) -> Result<Next, A::Error> {
-        let Some(failure) = self.offer_unanswered(
+        Ok(self.unanswered_offer(ask, why, asked).await)
+    }
+
+    fn seated(&mut self, ask: &SealQuestion, _: Mark) {
+        let order = offer::names(&ask.order);
+        self.log_seated(
             OfferKind::SealedState,
-            &why,
-            asked,
-            AlertKind::QuestionUnanswered,
-        ) else {
-            return Ok(self.next_after_unanswered());
-        };
-        let outcome = match why {
-            Unanswered::Refused => SealOutcome::NoAnswer { failure },
-            _ => SealOutcome::Unusable { failure },
-        };
-        self.record_sealed(ask, asked, outcome);
-        Ok(Next::Continue)
+            sealed_state::prompt::OFFER_VERSION,
+            &order,
+            ask.seed,
+        );
     }
 }

@@ -24,6 +24,7 @@
 //!
 //! [`StateKeyRecord`]: agora_agentkit::state::StateKeyRecord
 
+use crate::consent::offer::Stored;
 use std::path::{Path, PathBuf};
 
 use agora_agentkit::enums::StateEntryKind;

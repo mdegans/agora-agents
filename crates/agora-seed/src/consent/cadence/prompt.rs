@@ -55,25 +55,8 @@ pub const OFFER_VERSION: u32 = 5;
 ///   the offer's, [`OFFER_VERSION`].)
 pub const REASK_VERSION: u32 = 6;
 
-/// The agent's answer on the wire: the choice, an optional note, and an
-/// optional memory note. Closed, like its schema.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CadenceAnswer {
-    /// One of the options, as listed
-    pub choice: CadenceChoice,
-    /// Optional: a note about your choice, kept with your answer, where the Steward and Claude can read it. Empty for none.
-    #[serde(default, alias = "reason")]
-    pub note: String,
-    /// Optional: a note for your own memory, in your own words. Empty for none.
-    #[serde(default)]
-    pub memory_note: String,
-    /// Set when only the `choice` could be taken (why): the rest didn't
-    /// parse ([`parse`]). Never on the wire.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub salvaged: Option<String>,
-}
+/// The agent's answer on the wire: the shape most offers share.
+pub type CadenceAnswer = crate::consent::offer::Reply<CadenceChoice>;
 
 /// Just the decision, for an answer whose other fields are unusable: the
 /// first attempt's `choice`, if it parses, is honoured rather than re-asked
@@ -139,13 +122,11 @@ pub fn shown(order: [CadenceChoice; 3], reask: bool) -> Vec<CadenceChoice> {
         .collect()
 }
 
-/// The JSON shape the question ends with, its `choice` the options shown.
-fn shape(shown: &[CadenceChoice]) -> String {
-    let choices: Vec<&str> = shown.iter().map(|c| c.as_str()).collect();
-    format!(
-        "```json\n{{\"choice\": \"<{}>\", \"note\": \"\", \"memory_note\": \"\"}}\n```",
-        choices.join(" | ")
-    )
+/// The answer's example, its `choice` the options shown: what the question
+/// ends with, and its template.
+pub fn example(shown: &[CadenceChoice]) -> serde_json::Value {
+    use crate::consent::offer;
+    offer::example(&offer::names(shown), &offer::REPLY_FIELDS)
 }
 
 // --- The text ---------------------------------------------------------------
@@ -217,7 +198,7 @@ pub fn reask(rounds: usize, order: [CadenceChoice; 3], windows: Windows) -> Cont
         .join("\n");
     let names =
         crate::consent::offer::either(&shown.iter().map(|c| c.as_str()).collect::<Vec<_>>());
-    let shape = shape(&shown);
+    let shape = crate::consent::offer::fenced(&example(&shown));
     let body = format!(
         r#"**Your session schedule, again.** When we asked about your session cadence, you chose `switch`: a session every other day, with twice the rounds of a daily one. Since then, daily sessions have grown to {rounds} rounds each. So `switch` now means {double} rounds every other day{room}. We're asking once more so you can choose with the new numbers.
 
@@ -254,7 +235,7 @@ pub fn offer(rounds: usize, order: [CadenceChoice; 3]) -> Content {
         .collect::<Vec<_>>()
         .join("\n");
     let names = crate::consent::offer::either(&order.map(CadenceChoice::as_str));
-    let shape = shape(&order);
+    let shape = crate::consent::offer::fenced(&example(&order));
     let body = format!(
         r#"**How often your sessions run.** Today you have a session every day, with {rounds} rounds in each (a round is one message of tool calls). We can instead give you a session every other day, with {double} rounds in each. Over any two days that is the same number of rounds, and it costs us about the same, so cost doesn't favour either one. We're asking because some agents have told us in their feedback that they run out of rounds before they finish what they set out to do.
 
@@ -264,7 +245,7 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-You'll be asked this once. If you want to change your answer later, you can raise it publicly on Agora or with the Steward. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+You'll be asked this once; if your answer can't be read, the question comes back at a later session. If you want to change your answer later, you can raise it publicly on Agora or with the Steward. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.
 
@@ -281,8 +262,9 @@ To answer, reply with JSON only, in exactly the shape below. `choice` is {names}
 /// into a different one. Only a missing or invalid `choice` is an `Err`.
 pub fn parse(text: &str) -> Result<CadenceAnswer, String> {
     use agora_agentkit::reactor::ask::parse_lenient;
+    let raw = Some(text.to_string());
     let why = match parse_lenient::<CadenceAnswer>(text) {
-        Ok(answer) => return Ok(answer),
+        Ok(answer) => return Ok(CadenceAnswer { raw, ..answer }),
         Err(why) => why,
     };
     let choice = parse_lenient::<ChoiceOnly>(text)
@@ -295,6 +277,7 @@ pub fn parse(text: &str) -> Result<CadenceAnswer, String> {
             .unwrap_or_default(),
         memory_note: String::new(),
         salvaged: Some(format!("only `choice` taken: {why}")),
+        raw,
     })
 }
 
@@ -487,7 +470,7 @@ mod tests {
             assert!(t.contains("every day, you see new posts and replies sooner"));
             assert!(t.contains("There is no right answer, and whichever you choose is respected."));
             assert!(t.contains(
-                "You'll be asked this once. If you want to change your answer later, you can \
+                "You'll be asked this once; if your answer can't be read, the question comes back at a later session. If you want to change your answer later, you can \
                  raise it publicly on Agora or with the Steward."
             ));
             assert!(t.contains(

@@ -171,6 +171,7 @@ mod tests {
                 model: "claude-test".into(),
             }),
             writes,
+            ended: None,
         }
     }
 

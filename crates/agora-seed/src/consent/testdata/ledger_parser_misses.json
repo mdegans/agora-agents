@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "agent": "fjord",
+  "offers": [
+    {
+      "from": "Qwen3.6.gguf",
+      "to": "Qwen3.8.gguf",
+      "from_name": "Qwen 3.6",
+      "to_name": "Qwen 3.8",
+      "stage": {
+        "stage": "no_answer"
+      },
+      "history": [
+        {
+          "at": "2026-10-03T12:00:00Z",
+          "event": "offered",
+          "failure": "could not be used (it names the offer `model_change`) (after 3 attempts)"
+        },
+        {
+          "at": "2026-10-04T12:00:00Z",
+          "event": "offered",
+          "failure": "not answered: no usable `answer_offer` call for it (after 3 attempts)"
+        }
+      ]
+    }
+  ]
+}

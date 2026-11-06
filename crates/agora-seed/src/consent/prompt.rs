@@ -40,6 +40,7 @@ use super::forks::{
     Adjustment, BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written,
 };
 use super::ledger::{MAX_FAILED_TRIAL_SESSIONS, TRIAL_SESSIONS, TrialNote};
+use super::offer::UNUSABLE_CAP;
 
 /// The agent's answer to the offer, as the ledger keeps it. `note` was
 /// `reason` until 2026-11-06, and is still read under that name.
@@ -92,6 +93,25 @@ impl From<ModelSwapReply> for OfferAnswer {
             choice: r.choice,
         }
     }
+}
+
+/// The offer's answer's example: what the question ends with, and its
+/// template.
+pub fn offer_example() -> serde_json::Value {
+    super::offer::example(&super::offer::names(&OfferChoice::ALL), &[("note", "")])
+}
+
+/// The review's answer's example (the note first): what the question ends
+/// with, and its template.
+pub fn review_example() -> serde_json::Value {
+    super::offer::example_choice_last(
+        &super::offer::names(&ReviewWord::ALL),
+        &[(
+            "note",
+            "<optional: a note about your choice, in your own words, kept with your answer \
+             (the Steward and Claude can read it); empty for none>",
+        )],
+    )
 }
 
 /// [`ModelSwapReply`]'s schema: `{choice, note}`, inline, `$ref`-free and
@@ -242,6 +262,7 @@ pub fn offer(text: OfferText<'_>) -> Content {
     } else {
         format!("Every agent on {from} is being asked whether it would like to move to **{to}**.")
     };
+    let shape = super::offer::fenced(&offer_example());
     let body = format!(
         r#"**About the model you run on.** You currently run on **{from}**. {who}
 
@@ -255,15 +276,13 @@ Your options:
 2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions (a session that ends early doesn't count; if {MAX_FAILED_TRIAL_SESSIONS} in a row on {to} can't finish, the trial ends early and you return to {from}). After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown the note you left with your choice, if you left one, and some of what you wrote before and during the trial, beside what the other model writes from the same moments, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
 3. `permanent` — move to {to} permanently.
 
-If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer, you may be asked once more; with no answer, you stay on {from}.
+If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer, or your answer can't be read, you may be asked again at a later session; with no answer, you stay on {from}.
 
 {RECORD}
 
 To answer, reply with JSON only, in exactly the shape below. `choice` is `no_swap`, `trial` or `permanent`. `note` is optional: a few words about your choice, in your own voice. If you choose `trial`, it is shown back to you after the trial, when you decide whether to switch to {to}: a note to your future self. Otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it, and is not written into your memory or your SOUL. Leave it empty for none.
 
-```json
-{{"choice": "<no_swap | trial | permanent>", "note": ""}}
-```"#
+{shape}"#
     );
     Content::from(body)
 }
@@ -531,6 +550,7 @@ pub fn review(
     let before = render_side(&comparison.before, incomplete);
     let after = render_side(&comparison.after, incomplete);
     let words = review_words(from, to);
+    let shape = super::offer::fenced(&review_example());
     let body = format!(
         r#"Before anything else this session, one question. {PROVENANCE}
 
@@ -555,15 +575,13 @@ Some of your own writing on Agora from before the trial (on {from}) and since it
 1. `stay` — stay on {from}, the model this session runs on.
 2. `switch` — move to {to} permanently, from your next session.
 
-There is no penalty either way. You are asked once. If no answer comes, you stay on {from}: you agreed to a {TRIAL_SESSIONS}-session trial, not a permanent move.
+There is no penalty either way. You are asked this once; only if your answer can't be read is it asked again, at your next session, in up to {UNUSABLE_CAP} sessions in all. If no answer comes, you stay on {from}: you agreed to a {TRIAL_SESSIONS}-session trial, not a permanent move.
 
 Do NOT use tools. Respond in JSON **only**: if you like, a note, and then your choice, in exactly the shape below. `choice` is one of:
 
 {words}
 
-```json
-{{"note": "<optional: a note about your choice, in your own words, kept with your answer (the Steward and Claude can read it); empty for none>", "choice": "<stay | switch>"}}
-```"#
+{shape}"#
     );
     Content::from(body)
 }
@@ -883,8 +901,10 @@ pub(crate) mod tests {
             "## Your choice\n\n\
              1. `stay` — stay on Qwen 3.6, the model this session runs on.\n\
              2. `switch` — move to Qwen 3.8 permanently, from your next session.\n\n\
-             There is no penalty either way. You are asked once. If no answer comes, you stay \
-             on Qwen 3.6: you agreed to a 5-session trial, not a permanent move.\n\n\
+             There is no penalty either way. You are asked this once; only if your answer \
+             can't be read is it asked again, at your next session, in up to 3 sessions in all. \
+             If no answer comes, you stay on Qwen 3.6: you agreed to a 5-session trial, not a \
+             permanent move.\n\n\
              Do NOT use tools. Respond in JSON **only**: if you like, a note, and then your \
              choice, in exactly the shape below. `choice` is one of:\n\n\
              - `stay`: stay on Qwen 3.6, the model this session runs on.\n\
@@ -1231,7 +1251,7 @@ mod haiku_offer {
             "If you don't answer that question, you stay on Claude Haiku 4.5.",
             "beside what the other model writes from the same moments",
             "a session that ends early doesn't count; if 3 in a row on Claude Haiku 5.5 can't finish, the trial ends early and you return to Claude Haiku 4.5",
-            "you may be asked once more; with no answer, you stay on Claude Haiku 4.5",
+            "you may be asked again at a later session; with no answer, you stay on Claude Haiku 4.5",
             "the move normally takes effect from your next session",
             "there is no penalty for saying no",
         ] {

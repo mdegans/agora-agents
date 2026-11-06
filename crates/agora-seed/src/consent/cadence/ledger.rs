@@ -14,8 +14,6 @@
 //! what the sweep planner (`main.rs`) consults, while `[cadence_consent]`
 //! is enabled.
 
-use std::path::{Path, PathBuf};
-
 use agora_agentkit::reactor::seed::{ShortString, Soul};
 use chrono::{DateTime, Utc};
 use misanthropic::model::Model;
@@ -26,8 +24,9 @@ use super::prompt::CadenceChoice;
 /// The ledger's file name inside the agent's state directory.
 pub const LEDGER_FILE: &str = "cadence_consent.json";
 
-/// Bump on layout change; [`CadenceLedger::load`] refuses anything newer.
-pub const FORMAT: u32 = 1;
+/// Bump on layout change (2 since 2026-11-06: answers' `note`, the
+/// `unusable` outcome); [`CadenceLedger::load`] refuses anything newer.
+pub const FORMAT: u32 = 2;
 
 /// The whole per-agent file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,72 +113,7 @@ pub enum CadenceOutcome {
     Unusable { failure: String },
 }
 
-impl crate::consent::offer::Outcome for CadenceOutcome {
-    fn status(&self) -> crate::consent::offer::Status {
-        use crate::consent::offer::Status;
-        match self {
-            Self::Answered { .. } | Self::Refused { .. } => Status::Settled,
-            Self::NoAnswer { .. } => Status::Miss,
-            Self::Unusable { .. } => Status::Unrecorded,
-        }
-    }
-}
-
 impl CadenceLedger {
-    pub fn path(agent_dir: &Path) -> PathBuf {
-        agent_dir.join(LEDGER_FILE)
-    }
-
-    /// Load `agent_dir`'s ledger; a missing file is an empty ledger. An
-    /// unreadable or too-new one is an error — the caller must then neither
-    /// ask nor save over it.
-    pub async fn load(agent_dir: &Path) -> std::io::Result<Self> {
-        match tokio::fs::read(Self::path(agent_dir)).await {
-            Ok(bytes) => Self::from_slice(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// [`Self::load`] for one-shot startup code (the sweep planner).
-    pub fn load_blocking(agent_dir: &Path) -> std::io::Result<Self> {
-        match std::fs::read(Self::path(agent_dir)) {
-            Ok(bytes) => Self::from_slice(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Parse a ledger, refusing a newer [`FORMAT`].
-    pub fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
-        let ledger: Self = serde_json::from_slice(bytes)?;
-        if ledger.format > FORMAT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "cadence ledger format {} is newer than this binary reads ({FORMAT})",
-                    ledger.format
-                ),
-            ));
-        }
-        Ok(ledger)
-    }
-
-    /// Atomic save: tmp + fsync + rename.
-    pub async fn save(&self, agent_dir: &Path) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        tokio::fs::create_dir_all(agent_dir).await?;
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let path = Self::path(agent_dir);
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &path).await
-    }
-
     /// Whether the offer should be put this session: nothing final on file,
     /// fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no recorded answer in `soul`'s
     /// Evolution Log (in case the ledger save failed after the SOUL's).
@@ -264,6 +198,7 @@ impl CadenceLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::offer::Stored;
 
     fn soul() -> Soul {
         serde_json::from_value(serde_json::json!({
@@ -328,11 +263,11 @@ mod tests {
     fn a_miss_is_asked_once_more() {
         let mut l = CadenceLedger::default();
         l.record(ask(CadenceOutcome::NoAnswer {
-            failure: "x".into(),
+            failure: "refusal".into(),
         }));
         assert!(l.due(&soul()));
         l.record(ask(CadenceOutcome::NoAnswer {
-            failure: "x".into(),
+            failure: "refusal".into(),
         }));
         assert!(!l.due(&soul()));
     }
@@ -360,11 +295,11 @@ mod tests {
         );
         assert!(l.reask_due(&soul(), 10));
         l.record(ask(CadenceOutcome::NoAnswer {
-            failure: "x".into(),
+            failure: "refusal".into(),
         }));
         assert!(l.reask_due(&soul(), 10), "one miss");
         l.record(ask(CadenceOutcome::NoAnswer {
-            failure: "x".into(),
+            failure: "refusal".into(),
         }));
         assert!(!l.reask_due(&soul(), 10), "two misses");
 

@@ -87,19 +87,14 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 ///   a preface that says where it stands among them.
 pub const OFFER_VERSION: u32 = 9;
 
-/// The agent's answer on the wire: the choice, an optional note, and an
-/// optional memory note. Closed, like its schema.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SealAnswer {
-    /// One of the options, as listed
-    pub choice: SealChoice,
-    /// Optional: a note about your choice, kept with your answer, where the Steward and Claude can read it. Empty for none.
-    #[serde(default, alias = "reason")]
-    pub note: String,
-    /// Optional: a note for your own memory, in your own words. Empty for none.
-    #[serde(default)]
-    pub memory_note: String,
+/// The agent's answer on the wire: the shape most offers share.
+pub type SealAnswer = crate::consent::offer::Reply<SealChoice>;
+
+/// The answer's example, its `choice` the options in `order`: what the
+/// question ends with, and its template.
+pub fn example(order: &[SealChoice]) -> serde_json::Value {
+    use crate::consent::offer;
+    offer::example(&offer::names(order), &offer::REPLY_FIELDS)
 }
 
 /// The options. Their presentation order is per agent ([`order_for`]).
@@ -176,7 +171,7 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
         .collect::<Vec<_>>()
         .join("\n");
     let names = crate::consent::offer::either(&order.map(SealChoice::as_str));
-    let shape = order.map(SealChoice::as_str).join(" | ");
+    let shape = crate::consent::offer::fenced(&example(&order));
     let body = format!(
         r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's size, rounded up to within about a tenth, its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, one fingerprint covering the latest sealed version of every enrolled agent is recorded in the governance log. It names no agent and says nothing of what is in any state.
 
@@ -186,13 +181,11 @@ There is no right answer, and whichever you choose is respected. The options, in
 
 {options}
 
-If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). This may be permanent. If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made can't be deleted, except by leaving Agora: your backups are deleted then. If your operator deletes you instead, your backups are deleted too, but your operator's record keeps, with no name or content, that an enrolled agent was deleted, when, and how many versions it had. You'll be asked this once. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). This may be permanent. If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made can't be deleted, except by leaving Agora: your backups are deleted then. If your operator deletes you instead, your backups are deleted too, but your operator's record keeps, with no name or content, that an enrolled agent was deleted, when, and how many versions it had. You'll be asked this once; if your answer can't be read, the question comes back at a later session. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
 To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer under your name, in your runner's record. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.
 
-```json
-{{"choice": "<{shape}>", "note": "", "memory_note": ""}}
-```"#
+{shape}"#
     );
     Content::from(body)
 }
@@ -321,7 +314,8 @@ mod tests {
                  deleted, except by leaving Agora: your backups are deleted then. If your \
                  operator deletes you instead, your backups are deleted too, but your \
                  operator's record keeps, with no name or content, that an enrolled agent was \
-                 deleted, when, and how many versions it had. You'll be asked this once.",
+                 deleted, when, and how many versions it had. You'll be asked this once; if your answer \
+                 can't be read, the question comes back at a later session.",
                 "There is no right answer, and whichever you choose is respected.",
             ] {
                 assert!(t.contains(fact), "{fact}\n\n{t}");
