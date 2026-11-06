@@ -552,19 +552,22 @@ impl View {
     /// or any head held here.
     fn pick(&self, r: &HistoryRef) -> Pick {
         let heads = self.heads();
+        let sealed = !heads.is_empty();
         let resolution = resolve(r, self.ids.iter().map(|(id, _)| id), heads.iter());
         let notes: Vec<String> = resolution.note(r).into_iter().collect();
         match resolution.candidate() {
             Some(Candidate::Memory(id)) => match self.ids.iter().find(|(m, _)| *m == id) {
                 Some((_, row)) => Pick::At(*row, notes),
-                None => Pick::Say(not_found(r)),
+                None => Pick::Say(not_found(r, sealed)),
             },
             Some(Candidate::Head(head)) => self.at_head(&head, notes),
             None => match resolution {
-                Resolution::Ambiguous(_) => {
-                    Pick::Say(resolution.ambiguity(r).unwrap_or_else(|| not_found(r)))
-                }
-                _ => Pick::Say(not_found(r)),
+                Resolution::Ambiguous(_) => Pick::Say(
+                    resolution
+                        .ambiguity(r)
+                        .unwrap_or_else(|| not_found(r, sealed)),
+                ),
+                _ => Pick::Say(not_found(r, sealed)),
             },
         }
     }
@@ -722,12 +725,22 @@ fn compose(notes: &[String], body: &str) -> String {
     out
 }
 
-fn not_found(r: &HistoryRef) -> String {
-    format!(
-        "No version of your memory has the id or head \"{}\". `log` lists them, with their \
-         memory ids and heads.",
-        r.shown()
-    )
+/// `sealed`: whether any head is held here, so the reply names heads only
+/// to an agent that has them (beta round 17)
+fn not_found(r: &HistoryRef, sealed: bool) -> String {
+    if sealed {
+        format!(
+            "No version of your memory has the id or head \"{}\". `log` lists them, with their \
+             memory ids and heads.",
+            r.shown()
+        )
+    } else {
+        format!(
+            "No version of your memory has the id \"{}\". `log` lists them, with their memory \
+             ids.",
+            r.shown()
+        )
+    }
 }
 
 /// A search's result, and how the index was come by.
@@ -1030,7 +1043,7 @@ mod tests {
         assert!(lowered.starts_with("Limit lowered to 50."), "{lowered}");
         assert!(lowered.contains(LOCAL_ONLY), "{lowered}");
         assert!(out.text.contains(&format!("{}  memory", mem(id, 3))));
-        assert!(out.text.contains("← this session"), "{}", out.text);
+        assert!(out.text.contains("← in your context"), "{}", out.text);
         assert!(!out.text.contains("head "), "{}", out.text);
 
         let out = rd.answer(show(vec![r(mem(id, 1))]), &api).await.text;
@@ -1053,6 +1066,8 @@ mod tests {
         assert!(out.contains(&memory(1).trim_end().to_string()), "{out}");
         let out = rd.answer(show(vec![r("mem-abcdef")]), &api).await.text;
         assert!(out.starts_with("No version of your memory"), "{out}");
+        // Nothing here is sealed, so the reply doesn't speak of heads
+        assert!(!out.contains("head"), "{out}");
         // A whole id asked for is echoed short
         let whole = format!("mem-{}", "ab".repeat(32));
         let out = rd.answer(show(vec![r(&whole)]), &api).await.text;
@@ -1286,7 +1301,7 @@ mod tests {
         let out = rd.answer(log(), &b.api).await.text;
         assert!(out.starts_with(UNCHECKED), "{out}");
         assert!(!out.contains("  head "), "{out}");
-        assert!(out.contains("this session"), "{out}");
+        assert!(out.contains("in your context"), "{out}");
         let out = rd.answer(search("synthetic"), &b.api).await.text;
         assert!(out.starts_with(UNCHECKED), "{out}");
         // Every head held on the line is answered, never "not found"
@@ -1526,7 +1541,7 @@ mod tests {
         let out = view.log(None, None, &current);
         let rows: Vec<&str> = out.lines().collect();
         assert_eq!(rows.len(), 5, "{out}");
-        assert!(rows[0].contains("head 040404040404") && rows[0].ends_with("← this session"));
+        assert!(rows[0].contains("head 040404040404") && rows[0].ends_with("← in your context"));
         assert!(
             rows[1].contains("head 030303030303")
                 && rows[1].contains("couldn't be opened just now"),
@@ -1570,7 +1585,7 @@ mod tests {
         assert_eq!(current.position, Some(0));
         let out = view.log(None, None, &current);
         assert!(
-            out.lines().next().unwrap().ends_with("← this session"),
+            out.lines().next().unwrap().ends_with("← in your context"),
             "{out}"
         );
         let said = view.show(&[r(id)], None, current);
