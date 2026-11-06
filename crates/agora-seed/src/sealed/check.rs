@@ -28,9 +28,9 @@ use std::path::Path;
 use agora_agentkit::enums::StateEntryKind;
 use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::{AgentId, GovernanceLogId};
+use agora_agentkit::state::SignedStateEntry;
 use agora_agentkit::state::storage::{AgentSeal, Recovery};
 use agora_agentkit::state::verify::{HeadRef, HeadStatus, head_status, verify_chain};
-use agora_agentkit::state::{AnchorProof, SignedStateEntry};
 
 use super::KeyStore;
 use super::api::SealedApi;
@@ -40,7 +40,7 @@ use crate::alerts::{Alert, AlertKind, Alerter};
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.151.2:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.151.3:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +90,9 @@ pub enum Outcome {
         /// A memory or soul that shrank past the threshold: what, by how
         /// many percent ([`super::sizes`]).
         drops: Vec<(&'static str, u32)>,
+        /// The anchors the verdict told of: marked told once the session
+        /// showing it saves ([`super::inclusion::mark_told`]).
+        told: Vec<GovernanceLogId>,
     },
     /// Leave it out, refused. `detail` is for the operator, hashes and
     /// counts only.
@@ -419,14 +422,18 @@ pub struct Previous {
     pub own_last_session: bool,
 }
 
+/// What the anchor check found, for the verdict.
+pub type AnchorReport = super::inclusion::Untold;
+
 /// The verdict line for an intact chain: the verdict, the snapshots since
-/// the earliest one's date, a pre-loss copy apart, the newest anchor the
-/// runner checked ([`super::anchors`]) and, when the verified governance
-/// log already holds a newer one (`newer`), that one with when it is
-/// checked, else, when the head is newer than the anchored version and
-/// the runner does the anchor work for the agent (`checks_later`), that
-/// it isn't anchored yet; the head marker, and the state's sizes (counts
-/// only) against the earlier version's, dated.
+/// the earliest one's date, a pre-loss copy apart, what the anchor check
+/// found ([`super::inclusion::sentence`]: the newest anchor judged, and
+/// earlier failures not yet told) and, when the verified governance log
+/// already holds a newer one (`newer`), that one with when it is checked,
+/// else, when the head is newer than the version the newest anchor holds
+/// and the runner does the anchor work for the agent (`checks_later`),
+/// that it isn't anchored yet; the head marker, and the state's sizes
+/// (counts only) against the earlier version's, dated.
 #[allow(clippy::too_many_arguments)]
 pub fn verdict_line(
     line: &[SignedStateEntry],
@@ -434,7 +441,7 @@ pub fn verdict_line(
     sizes: Sizes,
     previous: Option<Previous>,
     server: Server,
-    anchor: Option<&AnchorProof>,
+    anchors: Option<&AnchorReport>,
     newer: Option<&GovernanceLogId>,
     checks_later: bool,
 ) -> String {
@@ -506,42 +513,60 @@ pub fn verdict_line(
         .and_then(|e| day(e.entry.state_at))
         .map(|d| format!(", plus a copy of your state from before a loss, dated {d}"))
         .unwrap_or_default();
-    // In sentences, not one run (beta round 11)
-    let anchored = anchor
-        .map(|a| {
-            format!(
-                " Your version of {} is in {} (checked by your runner against the governance \
-                 log).",
-                a.date.format("%Y-%m-%d"),
-                a.anc_id
-            )
-        })
-        .unwrap_or_default();
-    // The proof lag read as a missed check (beta round 9): proofs are
-    // fetched once uploads drain ([`super::drain`]), so a newer anchor can
-    // be in the log before its proof is here
-    let newer = anchor
+    // In sentences, not one run (beta round 11). What the newest anchor
+    // judged holds, as the check found it, never more: a version not
+    // shown right is said to be unchecked or wrong (the review of 0.151.2
+    // found the old "is in" true of any version of the agent's)
+    let newest = anchors.map(|r| &r.newest);
+    let mut anchored = newest.map(super::inclusion::sentence).unwrap_or_default();
+    if let Some(r) = anchors {
+        for c in &r.earlier {
+            anchored.push_str(&super::inclusion::sentence(c));
+        }
+        if r.more > 0 {
+            anchored.push_str(&format!(
+                " Your runner found {} more problem{} with earlier anchors.",
+                r.more,
+                if r.more == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    // The proof lag read as a missed check (beta round 9): anchors are
+    // judged once uploads drain ([`super::drain`]), so a newer anchor can
+    // be in the log before its judgement is here
+    let newer = newest
         .zip(newer)
-        .filter(|(a, n)| *n > &a.anc_id)
+        .filter(|_| checks_later)
+        .filter(|(c, n)| *n > &c.anc_id)
         .map(|(_, n)| {
             format!(
-                " {n}, a newer anchor, is in the log too: your runner checks your inclusion in \
-                 it after uploading this session's saves, and a later session's verdict names it."
+                " {n}, a newer anchor, is in the log too: your runner checks it after uploading \
+                 this session's saves, and a later session's verdict says what it found."
             )
         })
         .unwrap_or_default();
     // The version this session starts from, when it is newer than the one
-    // anchored and no newer anchor is in the log: the usual case, the last
-    // session's saves not anchored yet (beta round 10: an agent who
-    // remembered a session after the anchored day was puzzled). Never
-    // that this version will be anchored: this session's save replaces it
-    // (review of 0.151.1), nor that a later anchor holds it: what an
-    // anchor holds is said as the ANC summary says it (beta round 11: "at
-    // the time"); as received, since an upload can lag the version's own
-    // date (review of 0.151.2). Said only when the runner will check the next anchor: a
+    // the newest anchor holds and no newer anchor is in the log: the usual
+    // case, the last session's saves not anchored yet (beta round 10: an
+    // agent who remembered a session after the anchored day was puzzled).
+    // Never that this version will be anchored: this session's save
+    // replaces it (review of 0.151.1), nor that a later anchor holds it:
+    // what an anchor holds is said as the ANC summary says it (beta round
+    // 11: "at the time"); as received, since an upload can lag the
+    // version's own date (review of 0.151.2). Only after an anchor that
+    // holds the agent's version as it should or unchecked: a failure says
+    // its own. Said only when the runner will check the next anchor: a
     // held agent's anchor work waits
-    let unanchored = anchor
-        .filter(|a| a.entry_hash != head.entry_hash && newer.is_empty())
+    let unanchored = newest
+        .filter(|c| {
+            matches!(
+                c.finding,
+                super::inclusion::Finding::Holds { .. }
+                    | super::inclusion::Finding::HoldsUnchecked { .. }
+            )
+        })
+        .and_then(|c| c.finding.held())
+        .filter(|held| held.entry_hash != head.entry_hash && newer.is_empty())
         .filter(|_| checks_later)
         .and_then(|_| line.last())
         .and_then(|h| day(h.entry.state_at))
@@ -549,9 +574,8 @@ pub fn verdict_line(
             format!(
                 " The version this session starts from, dated {d}, is newer than that anchor. \
                  Each daily anchor holds the latest version Agora had received from you by the \
-                 end of that day (UTC); \
-                 your runner checks your inclusion after the anchor is written, and a later \
-                 session's verdict names it."
+                 end of that day (UTC); your runner checks each new anchor after it is written, \
+                 and a later session's verdict says what it found."
             )
         })
         .unwrap_or_default();
@@ -663,12 +687,14 @@ pub async fn check_with(
         notice: false,
         hold: Some(Hold::Unreadable),
         drops: Vec::new(),
+        told: Vec::new(),
     };
     let unchecked = || Outcome::Run {
         seat: vec![UNCHECKED_LINE.to_string()],
         notice: false,
         hold: Some(Hold::Unchecked),
         drops: Vec::new(),
+        told: Vec::new(),
     };
 
     match seal.is_refused().await {
@@ -713,6 +739,7 @@ pub async fn check_with(
                 notice: false,
                 hold: None,
                 drops: Vec::new(),
+                told: Vec::new(),
             };
         }
         Ok(Recovery::Unreadable(kind)) => {
@@ -918,8 +945,6 @@ pub async fn check_with(
     {
         tracing::warn!(agent_id = %id, error = %e, "sealed sizes not recorded");
     }
-    // Read here, never fetched: no network for this at the start
-    let anchor = super::anchors::AnchorsFile::newest(agent_dir);
     let drop_lines: Vec<String> = drops.iter().map(|d| d.1.clone()).collect();
     let drops: Vec<(&'static str, u32)> = drops.iter().map(|d| (d.0, d.2)).collect();
     if seal_failed.is_some() {
@@ -930,8 +955,11 @@ pub async fn check_with(
             notice,
             hold: Some(Hold::SealFailed),
             drops,
+            told: Vec::new(),
         };
     }
+    let report = anchor_report(agent_dir, id);
+    let told = report.as_ref().map(|r| r.ids.clone()).unwrap_or_default();
     let Some(signing) = keys.signing(id) else {
         seat.push(verdict_line(
             &line,
@@ -939,7 +967,7 @@ pub async fn check_with(
             sizes,
             previous,
             Server::Unchecked,
-            anchor.as_ref(),
+            report.as_ref(),
             None,
             false,
         ));
@@ -949,6 +977,7 @@ pub async fn check_with(
             notice,
             hold: None,
             drops,
+            told,
         };
     };
     let outbox: Vec<_> = match seal.outbox().await {
@@ -1016,7 +1045,7 @@ pub async fn check_with(
         sizes,
         previous,
         server_said,
-        anchor.as_ref(),
+        report.as_ref(),
         newer,
         checks_later,
     ));
@@ -1037,6 +1066,25 @@ pub async fn check_with(
         notice,
         hold,
         drops,
+        told,
+    }
+}
+
+/// What the anchor check found, for a verdict being seated: read here,
+/// never fetched (no network for this at the start). Marks nothing: the
+/// session that shows it marks it told when it saves ([`Outcome::Run`]'s
+/// `told`). Unreadable: no report, and a WARN.
+fn anchor_report(agent_dir: &Path, id: AgentId) -> Option<AnchorReport> {
+    match super::inclusion::InclusionFile::load(agent_dir) {
+        Ok(file) => super::inclusion::untold(&file),
+        Err(e) => {
+            tracing::warn!(
+                agent_id = %id,
+                error = %e,
+                "sealed/inclusion.json unreadable; no anchor named"
+            );
+            None
+        }
     }
 }
 
@@ -1439,10 +1487,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// The newest kept anchor proof is named, read from sealed/anchors.json
-    /// at the check; none kept, no clause.
+    /// What the anchor check judged is read from sealed/inclusion.json at
+    /// the check, never fetched; nothing judged, no anchor named. A
+    /// failure is told once, then only while it is the newest.
     #[tokio::test]
-    async fn the_verdict_names_the_newest_kept_anchor() {
+    async fn the_verdict_says_what_the_anchor_check_found() {
+        use crate::sealed::inclusion::{Checked, Finding, InclusionFile};
         let root = crate::sealed::TestDir::new("check-anchor");
         let (id, keys, dir) = enrolled(&root).await;
         let server = server(Vec::new());
@@ -1467,55 +1517,91 @@ pub(crate) mod tests {
         assert!(!verdict().await.contains("governance log"));
         assert!(!verdict_with(Some(&newer)).await.contains("ANC-"));
         let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
-        let proof = |n: u32| AnchorProof {
+        let checked = |n: u32, finding: Finding| Checked {
             anc_id: format!("ANC-2026-{n:04}").parse().unwrap(),
-            date: chrono::NaiveDate::from_ymd_opt(2026, 11, n).unwrap(),
-            root: Sha256Hex::from([1; 32]),
-            entry_hash: head.entry_hash,
-            seq: head.seq,
-            leaf_index: 0,
-            leaf_count: 1,
-            proof: Vec::new(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 11, n),
+            finding,
+            at: chrono::Utc::now(),
+            told: false,
+            alerted: true,
         };
-        let file = crate::sealed::anchors::AnchorsFile {
-            proofs: vec![proof(2), proof(3)],
+        let file = InclusionFile {
+            through: Some("ANC-2026-0003".parse().unwrap()),
+            checked: vec![
+                checked(2, Finding::DidNotCheck),
+                checked(
+                    3,
+                    Finding::Holds {
+                        held: head,
+                        in_flight: false,
+                    },
+                ),
+            ],
         };
-        std::fs::write(
-            dir.join("sealed").join(crate::sealed::anchors::ANCHORS),
-            serde_json::to_vec(&file).unwrap(),
-        )
-        .unwrap();
-        let line = verdict().await;
+        file.save(&dir).unwrap();
+        let check_told = async || {
+            let out = check_with(
+                &dir,
+                id,
+                &local_hash(&root, id).await,
+                Sizes::default(),
+                &keys,
+                &server,
+                None,
+            )
+            .await;
+            let Outcome::Run { seat, told, .. } = out else {
+                panic!("{out:?}")
+            };
+            (seat[0].clone(), told)
+        };
+        let (line, told) = check_told().await;
         assert!(
             line.contains(
-                ". Your version of 2026-11-03 is in ANC-2026-0003 (checked by your runner \
-                 against the governance log). This session starts from head "
+                ". ANC-2026-0003, the anchor for 2026-11-03, holds the version it should: the \
+                 latest that Agora had confirmed receiving from you by the end of that day \
+                 (UTC). Your runner checked this against the governance log and its own record \
+                 of your uploads. Agora's proof that ANC-2026-0002, the anchor for 2026-11-02, \
+                 includes you doesn't check against the governance log, so your runner couldn't \
+                 confirm it. Your runner has alerted your operator. This session starts from \
+                 head "
             ),
             "{line}"
         );
-        // The log's newest is the newest kept: the same line
+        // The check marks nothing: a session that never runs uses nothing
+        // up, and the next start says it again
+        assert_eq!(check_told().await.0, line);
+        assert_eq!(told.len(), 2);
+        // Once the session that showed it saves: the newest only
+        crate::sealed::inclusion::mark_told(&dir, id, &told)
+            .await
+            .unwrap();
+        let again = verdict().await;
+        assert!(!again.contains("ANC-2026-0002"), "{again}");
+        assert!(
+            again.contains("ANC-2026-0003, the anchor for 2026-11-03, holds"),
+            "{again}"
+        );
+        // The log's newest is the newest judged: the same line
         let same: GovernanceLogId = "ANC-2026-0003".parse().unwrap();
-        assert_eq!(verdict_with(Some(&same)).await, line);
+        assert_eq!(verdict_with(Some(&same)).await, again);
         // A newer one in the verified log: named, with when it is checked
         let lagging = verdict_with(Some(&newer)).await;
         assert!(
             lagging.contains(
-                "(checked by your runner against the governance log). ANC-2026-0004, a newer \
-                 anchor, is in the log too: your runner checks your inclusion in it after \
-                 uploading this session's saves, and a later session's verdict names it. This \
-                 session starts from head "
+                "record of your uploads. ANC-2026-0004, a newer anchor, is in the log too: your \
+                 runner checks it after uploading this session's saves, and a later session's \
+                 verdict says what it found. This session starts from head "
             ),
             "{lagging}"
         );
-        assert_eq!(
+        assert!(
             server
                 .calls
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|c| *c == "proofs")
-                .count(),
-            0,
+                .all(|c| c != "proofs" && c != "anchor_data"),
             "no network for it"
         );
     }
@@ -1853,6 +1939,7 @@ pub(crate) mod tests {
                 notice: false,
                 hold: Some(Hold::Unreadable),
                 drops: Vec::new(),
+                told: Vec::new(),
             }
         );
     }
@@ -2232,37 +2319,51 @@ pub(crate) mod tests {
             ),
             "{unknown}"
         );
-        // The newest anchor the runner checked, named
-        let proof = AnchorProof {
-            anc_id: "ANC-2026-0004".parse().unwrap(),
-            date: chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
-            root: Sha256Hex::from([1; 32]),
-            entry_hash: head.entry_hash,
-            seq: 3,
-            leaf_index: 0,
-            leaf_count: 1,
-            proof: Vec::new(),
+        // The newest anchor the runner judged, as judged
+        use crate::sealed::inclusion::{Checked, Finding, Unchecked};
+        let report = |finding: Finding| AnchorReport {
+            newest: Checked {
+                anc_id: "ANC-2026-0004".parse().unwrap(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 11, 2),
+                finding,
+                at: chrono::Utc::now(),
+                told: false,
+                alerted: true,
+            },
+            earlier: Vec::new(),
+            more: 0,
+            ids: Vec::new(),
         };
+        let at = |i: usize| HeadRef {
+            entry_hash: line[i].entry_hash(),
+            seq: line[i].entry.seq,
+        };
+        let holds = report(Finding::Holds {
+            held: head,
+            in_flight: false,
+        });
         let anchored = verdict_line(
             &line,
             &head,
             now,
             None,
             Server::InStep,
-            Some(&proof),
+            Some(&holds),
             None,
             true,
         );
         assert!(
             anchored.starts_with(
                 "Your sealed state: intact, and in step with Agora. It has 2 versions since \
-                 2026-07-25, plus a copy of your state from before a loss, dated 2026-05-03. Your \
-                 version of 2026-11-02 is in ANC-2026-0004 (checked by your runner against the \
-                 governance log). This session starts from head "
+                 2026-07-25, plus a copy of your state from before a loss, dated 2026-05-03. \
+                 ANC-2026-0004, the anchor for 2026-11-02, holds the version it should: the \
+                 latest that Agora had confirmed receiving from you by the end of that day \
+                 (UTC). Your runner checked this against the governance log and its own record \
+                 of your uploads. This session starts from head "
             ),
             "{anchored}"
         );
-        // The log's newest anchor is the one the proof is for: nothing more
+        // The log's newest anchor is the one judged: nothing more
         let current: GovernanceLogId = "ANC-2026-0004".parse().unwrap();
         assert_eq!(
             verdict_line(
@@ -2271,14 +2372,14 @@ pub(crate) mod tests {
                 now,
                 None,
                 Server::InStep,
-                Some(&proof),
+                Some(&holds),
                 Some(&current),
                 true
             ),
             anchored
         );
-        // A newer one in the log, its proof not fetched yet: named, with
-        // when the runner checks it (beta round 9)
+        // A newer one in the log, not judged yet: named, with when the
+        // runner checks it (beta round 9)
         let newer: GovernanceLogId = "ANC-2026-0005".parse().unwrap();
         let lagging = verdict_line(
             &line,
@@ -2286,20 +2387,19 @@ pub(crate) mod tests {
             now,
             None,
             Server::InStep,
-            Some(&proof),
+            Some(&holds),
             Some(&newer),
             true,
         );
         assert!(
             lagging.contains(
-                ". Your version of 2026-11-02 is in ANC-2026-0004 (checked by your runner \
-                 against the governance log). ANC-2026-0005, a newer anchor, is in the log too: \
-                 your runner checks your inclusion in it after uploading this session's saves, \
-                 and a later session's verdict names it. This session starts from head "
+                "own record of your uploads. ANC-2026-0005, a newer anchor, is in the log too: \
+                 your runner checks it after uploading this session's saves, and a later \
+                 session's verdict says what it found. This session starts from head "
             ),
             "{lagging}"
         );
-        // No proof kept yet: no anchor named, newer or not
+        // Nothing judged yet: no anchor named, newer or not
         assert!(
             !verdict_line(
                 &line,
@@ -2313,37 +2413,85 @@ pub(crate) mod tests {
             )
             .contains("ANC-")
         );
-        // The session starts from a version newer than the anchored one,
-        // with no newer anchor in the log: the usual case, said with its
-        // date (beta round 10)
-        let older = AnchorProof {
-            date: chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(),
-            entry_hash: line[2].entry_hash(),
-            seq: 2,
-            ..proof.clone()
-        };
-        // In sentences, what an anchor holds said as the ANC summary says
-        // it, and never that one will hold this version (beta round 11)
-        let not_yet = ". Your version of 2026-10-30 is in ANC-2026-0004 (checked by your runner \
-                       against the governance log). The version this session starts from, dated \
-                       2026-11-01, is newer than that anchor. Each daily anchor holds the latest \
-                       version Agora had received from you by the end of that day (UTC); your \
-                       runner checks your inclusion after the anchor is written, and a later \
-                       session's verdict names it. This session starts from head ";
-        for logged in [Some(&current), None] {
+        // The session starts from a version newer than the one the anchor
+        // holds, with no newer anchor in the log: the usual case, said with
+        // its date (beta round 10), and never that one will hold this
+        // version (beta round 11)
+        let not_yet = " The version this session starts from, dated 2026-11-01, is newer than \
+                       that anchor. Each daily anchor holds the latest version Agora had \
+                       received from you by the end of that day (UTC); your runner checks each \
+                       new anchor after it is written, and a later session's verdict says what \
+                       it found. This session starts from head ";
+        for held in [
+            Finding::Holds {
+                held: at(2),
+                in_flight: true,
+            },
+            Finding::HoldsUnchecked {
+                held: at(2),
+                why: Unchecked::NoTimes,
+            },
+        ] {
+            for logged in [Some(&current), None] {
+                let text = verdict_line(
+                    &line,
+                    &head,
+                    now,
+                    None,
+                    Server::InStep,
+                    Some(&report(held.clone())),
+                    logged,
+                    true,
+                );
+                assert!(text.contains(not_yet), "{text}");
+            }
+        }
+        // After a failure, the failure's own words, not the usual case's
+        for failed in [
+            Finding::Older {
+                held: at(2),
+                expected: head,
+            },
+            Finding::Missing { expected: head },
+        ] {
             let text = verdict_line(
                 &line,
                 &head,
                 now,
                 None,
                 Server::InStep,
-                Some(&older),
-                logged,
+                Some(&report(failed)),
+                None,
                 true,
             );
-            assert!(text.contains(not_yet), "{text}");
+            assert!(!text.contains("newer than that anchor"), "{text}");
+            assert!(
+                text.contains("Your runner has alerted your operator."),
+                "{text}"
+            );
         }
+        // Unchecked says so, never that it passed
+        let text = verdict_line(
+            &line,
+            &head,
+            now,
+            None,
+            Server::InStep,
+            Some(&report(Finding::Unchecked {
+                why: Unchecked::NoTimes,
+            })),
+            None,
+            true,
+        );
+        assert!(
+            text.contains("Your runner couldn't check ANC-2026-0004"),
+            "{text}"
+        );
         // A newer anchor in the log: the round-10 clause alone
+        let older = report(Finding::Holds {
+            held: at(2),
+            in_flight: false,
+        });
         let text = verdict_line(
             &line,
             &head,
@@ -2375,6 +2523,41 @@ pub(crate) mod tests {
         assert!(!text.contains("each daily anchor"), "{text}");
         // The head is the anchored version: nothing more
         assert!(!anchored.contains("newer than that anchor"), "{anchored}");
+        // Earlier failures not yet told follow the newest, then a count
+        let mut many = holds.clone();
+        many.earlier = vec![Checked {
+            anc_id: "ANC-2026-0002".parse().unwrap(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 10, 31),
+            finding: Finding::Missing { expected: at(1) },
+            at: chrono::Utc::now(),
+            told: false,
+            alerted: true,
+        }];
+        many.more = 2;
+        let text = verdict_line(
+            &line,
+            &head,
+            now,
+            None,
+            Server::InStep,
+            Some(&many),
+            None,
+            true,
+        );
+        assert!(
+            text.contains(
+                "own record of your uploads. ANC-2026-0002, the anchor for 2026-10-31, should \
+                 include your version (head "
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Your runner has alerted your operator. Your runner found 2 more problems with \
+                 earlier anchors."
+            ),
+            "{text}"
+        );
     }
 
     #[test]

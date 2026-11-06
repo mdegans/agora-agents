@@ -217,6 +217,10 @@ pub struct SealedSeat {
     pub notice: bool,
     /// One is the stop's first note: marked shown once the session saves.
     pub stop_note: bool,
+    /// The anchors its verdict tells of: marked told once the session saves
+    /// ([`crate::sealed::inclusion::mark_told`]), so a verdict seated for a
+    /// session that never runs doesn't use them up.
+    pub anchors_told: Vec<agora_agentkit::ids::GovernanceLogId>,
 }
 
 impl ConsentRuntime {

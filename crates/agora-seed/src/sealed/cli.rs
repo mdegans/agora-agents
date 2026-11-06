@@ -146,13 +146,24 @@ pub async fn run(
             );
             let mut failed = 0;
             for id in ids {
+                // Before the enrolment commits anything: what it commits is
+                // this process's own, its upload times recorded
+                let dir = state_dir.join(id.to_string());
+                let mut baseline = super::receipts::baseline(&dir, id).await;
                 match enroller.enroll_with(id, dry_run, note.as_deref()).await {
                     Ok(report) if dry_run && report.resumed => {
                         println!("{id}: would resume its stopped backups on its existing chain")
                     }
                     Ok(report) if dry_run => println!("{id}: would seal: {report}"),
                     Ok(report) => {
-                        let uploaded = match outbox.drain(id).await {
+                        let uploaded = match super::receipts::drain(
+                            &outbox,
+                            &dir,
+                            id,
+                            &mut baseline,
+                        )
+                        .await
+                        {
                             Ok(d) => {
                                 // Its own choice: the anchor on its profile,
                                 // once its head is on Agora (else the
@@ -303,9 +314,10 @@ pub async fn run(
                 &state_dir,
                 Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
             );
+            let dir = state_dir.join(agent.to_string());
+            let mut baseline = super::receipts::baseline(&dir, agent).await;
             let drain: super::stop::Drain = Box::pin(async move {
-                outbox
-                    .drain(agent)
+                super::receipts::drain(&outbox, &dir, agent, &mut baseline)
                     .await
                     .map(drop)
                     .map_err(|e| e.to_string())
@@ -332,7 +344,9 @@ pub async fn run(
                     &state_dir,
                     Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
                 );
-                if let Err(e) = outbox.drain(agent).await {
+                let dir = state_dir.join(agent.to_string());
+                let mut baseline = super::receipts::baseline(&dir, agent).await;
+                if let Err(e) = super::receipts::drain(&outbox, &dir, agent, &mut baseline).await {
                     tracing::warn!(agent_id = %agent, error = %e, "upload before the rotation failed");
                 }
             }

@@ -13,8 +13,9 @@
 //! fleet-wide. `agora-seed sealed-restore` ([`restore`]) puts the last
 //! sealed version back; `agora-seed sealed-accept --note` ([`accept`])
 //! keeps the state as it is, and the agent is shown the note and a diff.
-//! The drainer also fetches each agent's anchor proofs and keeps those
-//! that check against the governance log ([`anchors`]).
+//! The drainer records when each version was sent and acknowledged
+//! ([`receipts`]) and judges each daily anchor against them and the
+//! governance log ([`anchors`], [`inclusion`]).
 //! `agora-seed rotate-keys` ([`rotate`]) rotates an agent's keys and
 //! re-wraps its state key.
 //!
@@ -22,8 +23,9 @@
 //! seal it; nothing here logs or prints any of its content. Writes are new
 //! files under `<state>/<id>/sealed/` (agentkit's layout, plus this
 //! module's `notice.json`) and the key files in `<secrets>/<id>/`
-//! ([`keys`]), plus `sealed/anchors.json` and `sealed/published`
-//! ([`anchors`]). The agent's `state.json` is written only by
+//! ([`keys`]), plus `sealed/anchors.json`, `sealed/inclusion.json` and
+//! `sealed/published` ([`anchors`]) and `sealed/receipts.json`
+//! ([`receipts`]). The agent's `state.json` is written only by
 //! `sealed-restore`, through agentkit's `FsStorage`, which renames the
 //! state it replaces to `state.<utc>.json` first. Nothing here deletes a
 //! file: what is superseded is renamed aside.
@@ -45,11 +47,13 @@ mod crash_tests;
 pub mod drain;
 pub mod enroll;
 pub mod forget;
+pub mod inclusion;
 pub mod keys;
 pub mod lost;
 pub mod notice;
 #[cfg(test)]
 mod props;
+pub mod receipts;
 pub mod restore;
 pub mod rotate;
 pub mod session;
