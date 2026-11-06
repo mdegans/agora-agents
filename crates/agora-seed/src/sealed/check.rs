@@ -40,7 +40,7 @@ use crate::alerts::{Alert, AlertKind, Alerter};
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.152.0:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.153.0:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -558,7 +558,7 @@ pub struct Unjudged {
 pub enum Record {
     /// Read: the newest judged and failures not yet told (`None`: nothing
     /// judged yet).
-    Read(Option<AnchorReport>),
+    Read(Option<Box<AnchorReport>>),
     /// `sealed/inclusion.json` couldn't be read.
     Unreadable,
 }
@@ -570,6 +570,9 @@ pub enum Record {
 pub struct AnchorsSaid {
     pub record: Record,
     pub unjudged: Option<Unjudged>,
+    /// When the runner began recording upload times for the agent, when
+    /// known ([`super::receipts::ReceiptsFile::began`]).
+    pub began: super::inclusion::Began,
 }
 
 impl Default for AnchorsSaid {
@@ -577,6 +580,7 @@ impl Default for AnchorsSaid {
         Self {
             record: Record::Read(None),
             unjudged: None,
+            began: None,
         }
     }
 }
@@ -585,7 +589,7 @@ impl AnchorsSaid {
     /// The report, when the record was read and holds one.
     pub fn report(&self) -> Option<&AnchorReport> {
         match &self.record {
-            Record::Read(r) => r.as_ref(),
+            Record::Read(r) => r.as_deref(),
             Record::Unreadable => None,
         }
     }
@@ -596,9 +600,9 @@ impl AnchorsSaid {
     pub fn text(&self) -> String {
         let mut out = String::new();
         if let Some(r) = self.report() {
-            out.push_str(&super::inclusion::sentence(&r.newest));
+            out.push_str(&super::inclusion::sentence(&r.newest, self.began));
             for c in &r.earlier {
-                out.push_str(&super::inclusion::sentence(c));
+                out.push_str(&super::inclusion::sentence(c, self.began));
             }
             if r.more > 0 {
                 out.push_str(&format!(
@@ -607,6 +611,11 @@ impl AnchorsSaid {
                     if r.more == 1 { "" } else { "s" }
                 ));
             }
+            out.push_str(&super::inclusion::unchecked_sentence(
+                &r.unchecked,
+                r.newest.finding.unchecked().is_some(),
+                self.began,
+            ));
         }
         let Some(u) = &self.unjudged else {
             return out;
@@ -788,17 +797,23 @@ pub fn verdict_line(
                     | super::inclusion::Finding::HoldsUnchecked { .. }
             )
         })
-        .and_then(|c| c.finding.held())
-        .filter(|held| held.entry_hash != head.entry_hash && anchors.unjudged.is_none())
+        .filter(|c| {
+            c.finding
+                .held()
+                .is_some_and(|held| held.entry_hash != head.entry_hash)
+                && anchors.unjudged.is_none()
+        })
         .filter(|_| checks_later)
-        .and_then(|_| line.last())
-        .and_then(|h| day(h.entry.state_at))
-        .map(|d| {
+        .and_then(|c| Some((&c.anc_id, line.last()?)))
+        .and_then(|(anc, h)| Some((anc, day(h.entry.state_at)?)))
+        .map(|(anc, d)| {
+            // Named: an earlier anchors' sentence may stand between
+            // (review of round 13: "that anchor" read as one of them)
             format!(
-                " The version this session starts from, dated {d}, is newer than that anchor. \
-                 Each daily anchor holds the latest version Agora had received from you by the \
-                 end of that day (UTC); your runner checks each new anchor after it is written, \
-                 and a later session's verdict says what it found."
+                " The version this session starts from, dated {d}, is newer than the one {anc} \
+                 holds. Each daily anchor should hold the latest version Agora had received \
+                 from you by the end of that day (UTC); your runner checks each new anchor after it is \
+                 written, and a later session's verdict says what it found."
             )
         })
         .unwrap_or_default();
@@ -959,7 +974,7 @@ async fn anchors_said(
 ) -> (AnchorsSaid, Vec<GovernanceLogId>) {
     let (record, through) = match super::inclusion::InclusionFile::load(agent_dir) {
         Ok(file) => (
-            Record::Read(super::inclusion::untold(&file)),
+            Record::Read(super::inclusion::untold(&file).map(Box::new)),
             Some(file.through),
         ),
         Err(e) => {
@@ -1009,7 +1024,17 @@ async fn anchors_said(
         }
         None => None,
     };
-    (AnchorsSaid { record, unjudged }, told)
+    let began = super::receipts::ReceiptsFile::load(agent_dir)
+        .ok()
+        .and_then(|f| f.began);
+    (
+        AnchorsSaid {
+            record,
+            unjudged,
+            began,
+        },
+        told,
+    )
 }
 
 /// `anc` with its date: the day it covers when learnt this run (or asked
@@ -1761,7 +1786,7 @@ pub(crate) mod tests {
     /// judged after this session's uploads)
     fn said(report: Option<&AnchorReport>, newer: Option<&GovernanceLogId>) -> AnchorsSaid {
         AnchorsSaid {
-            record: Record::Read(report.cloned()),
+            record: Record::Read(report.cloned().map(Box::new)),
             unjudged: newer
                 .filter(|n| report.is_none_or(|r| *n > &r.newest.anc_id))
                 .map(|n| Unjudged {
@@ -1772,6 +1797,7 @@ pub(crate) mod tests {
                     count: 1,
                     why: NotJudged::Uploading,
                 }),
+            began: None,
         }
     }
 
@@ -2112,6 +2138,72 @@ pub(crate) mod tests {
                  runner checks anchors only once"
             ),
             "{lost}"
+        );
+        // Earlier anchors that couldn't be checked: said once, grouped by
+        // why, the day the record began named (beta round 13)
+        use crate::sealed::inclusion::Unchecked;
+        InclusionFile {
+            through: Some("ANC-2026-0004".parse().unwrap()),
+            checked: vec![
+                checked(
+                    1,
+                    Finding::Unchecked {
+                        why: Unchecked::BeforeProofs,
+                    },
+                ),
+                checked(
+                    2,
+                    Finding::Unchecked {
+                        why: Unchecked::NoTimes,
+                    },
+                ),
+                checked(
+                    3,
+                    Finding::HoldsUnchecked {
+                        held: head,
+                        why: Unchecked::NoTimes,
+                    },
+                ),
+                checked(
+                    4,
+                    Finding::HoldsUnchecked {
+                        held: head,
+                        why: Unchecked::NoTimes,
+                    },
+                ),
+            ],
+        }
+        .save(&dir)
+        .unwrap();
+        std::fs::write(
+            dir.join("sealed/receipts.json"),
+            br#"{"versions": [], "began": "2026-11-06T03:48:00Z"}"#,
+        )
+        .unwrap();
+        let (first, told) = check_told().await;
+        assert!(
+            first.contains(
+                ". ANC-2026-0004, the anchor for 2026-11-04, holds a version of yours (its \
+                 proof matches the root in the governance log), but your runner couldn't check \
+                 that it is the right one: it has no record of when Agora confirmed your \
+                 uploads before 2026-11-06, when it began keeping one. Your runner couldn't \
+                 check earlier anchors either: ANC-2026-0001 was written before Agora began \
+                 storing proofs; for ANC-2026-0002 and ANC-2026-0003, your runner has no record \
+                 of when Agora confirmed your uploads before 2026-11-06, when it began keeping \
+                 one (ANC-2026-0003 holds a version of yours whose proof matches the governance \
+                 log). This session starts from head "
+            ),
+            "{first}"
+        );
+        assert_eq!(told.len(), 4);
+        crate::sealed::inclusion::mark_told(&dir, id, &told)
+            .await
+            .unwrap();
+        let later = check_told().await.0;
+        assert!(!later.contains("earlier anchors"), "{later}");
+        assert!(
+            later.contains("ANC-2026-0004, the anchor for 2026-11-04, holds"),
+            "{later}"
         );
         // Waiting uploads: no proof asked for at the start
         assert!(
@@ -2899,6 +2991,7 @@ pub(crate) mod tests {
             },
             earlier: Vec::new(),
             more: 0,
+            unchecked: Vec::new(),
             ids: Vec::new(),
         };
         let at = |i: usize| HeadRef {
@@ -3039,7 +3132,7 @@ pub(crate) mod tests {
         // its date (beta round 10), and never that one will hold this
         // version (beta round 11)
         let not_yet = " The version this session starts from, dated 2026-11-01, is newer than \
-                       that anchor. Each daily anchor holds the latest version Agora had \
+                       the one ANC-2026-0004 holds. Each daily anchor should hold the latest version Agora had \
                        received from you by the end of that day (UTC); your runner checks each \
                        new anchor after it is written, and a later session's verdict says what \
                        it found. This session starts from head ";

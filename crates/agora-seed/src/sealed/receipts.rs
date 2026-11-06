@@ -104,6 +104,14 @@ pub struct ReceiptsFile {
     /// none is added back for them.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub pruned_below: u64,
+    /// When this runner began recording upload times for the agent
+    /// (the first record written to the file): no version
+    /// uploaded before it has them. `None` when it isn't known: a file
+    /// from 0.152.0 or earlier that was pruned or reset before a later
+    /// runner first read it, or a file begun again after it was
+    /// unreadable (its earlier times were lost, not never kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub began: Option<DateTime<Utc>>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -150,6 +158,7 @@ impl ReceiptsFile {
                     versions: Vec::new(),
                     no_sent_below: next_ord,
                     pruned_below: 0,
+                    began: None,
                 };
                 file.save(agent_dir)?;
                 Ok(file)
@@ -162,6 +171,27 @@ impl ReceiptsFile {
         self.versions
             .sort_by_key(|r| (r.seq, r.entry_hash.to_hex()));
         super::anchors::write_atomic(&path(agent_dir), &serde_json::to_vec_pretty(self)?)
+    }
+
+    /// Set [`Self::began`] if it is unset and can be known, as the file is
+    /// saved with its first record: the earliest time in it (a new file's
+    /// first record; for a file kept by 0.152.0 that was never pruned or
+    /// reset, the first process's observed acknowledgements or its first
+    /// send). `now` only for a file with nothing in it. Whether it changed.
+    fn begin(&mut self, now: DateTime<Utc>) -> bool {
+        if self.began.is_some() || self.pruned_below > 0 || self.no_sent_below > 0 {
+            return false;
+        }
+        self.began = if self.versions.is_empty() {
+            Some(now)
+        } else {
+            self.versions
+                .iter()
+                .flat_map(|r| [r.sent, r.acked])
+                .flatten()
+                .min()
+        };
+        self.began.is_some()
     }
 
     /// By entry hash.
@@ -218,6 +248,11 @@ pub async fn baseline(agent_dir: &Path, id: AgentId) -> u64 {
                 r.observed = true;
                 changed = true;
             }
+        }
+        // Only a file with something in it: a dry run, or an agent with
+        // nothing uploaded, writes nothing (review of round 13)
+        if !file.versions.is_empty() {
+            changed |= file.begin(now);
         }
         if changed {
             file.save(agent_dir).map_err(|e| e.to_string())?;
@@ -284,6 +319,7 @@ pub async fn before(agent_dir: &Path, id: AgentId, baseline: u64) -> Result<Befo
         }
     }
     if changed {
+        file.begin(at);
         file.save(agent_dir).map_err(|e| e.to_string())?;
     }
     Ok(Before {
@@ -370,6 +406,7 @@ pub async fn after(
         }
     }
     if changed > 0 {
+        file.begin(now);
         file.save(agent_dir).map_err(|e| e.to_string())?;
     }
     Ok(changed)
@@ -475,6 +512,41 @@ mod tests {
         assert_eq!(ReceiptsFile::load(&dir).unwrap(), file);
     }
 
+    /// `began`: set by the first process; a 0.152.0 file never pruned or
+    /// reset gets its earliest time; one pruned or reset stays unknown;
+    /// never moved once set.
+    #[test]
+    fn the_record_says_when_it_began_only_when_it_knows() {
+        let t = |h: i64| DateTime::<Utc>::from_timestamp(1_762_400_000 + h * 3600, 0).unwrap();
+        let r = |seq, sent: Option<DateTime<Utc>>, acked| Receipt {
+            entry_hash: Sha256Hex::from([seq as u8; 32]),
+            seq,
+            sent,
+            acked: Some(acked),
+            observed: sent.is_none(),
+        };
+        let mut fresh = ReceiptsFile::default();
+        assert!(fresh.begin(t(5)));
+        assert_eq!(fresh.began, Some(t(5)));
+        assert!(!fresh.begin(t(9)), "never moved");
+        let mut kept = ReceiptsFile {
+            versions: vec![r(1, None, t(2)), r(2, Some(t(3)), t(4))],
+            ..Default::default()
+        };
+        assert!(kept.begin(t(9)));
+        assert_eq!(kept.began, Some(t(2)));
+        for (pruned_below, no_sent_below) in [(1, 0), (0, 4)] {
+            let mut lost = ReceiptsFile {
+                versions: vec![r(2, Some(t(3)), t(4))],
+                pruned_below,
+                no_sent_below,
+                began: None,
+            };
+            assert!(!lost.begin(t(9)));
+            assert_eq!(lost.began, None);
+        }
+    }
+
     #[tokio::test]
     async fn versions_from_before_this_process_get_no_send_time() {
         let root = crate::sealed::TestDir::new("receipts-legacy");
@@ -485,12 +557,13 @@ mod tests {
         let b = before(&dir, id, base).await.unwrap();
         assert!(
             !dir.join("sealed").join(RECEIPTS).exists(),
-            "no sent written"
+            "no sent written, and nothing begun: a dry run writes nothing"
         );
         upload(&dir, id).await;
         // Acknowledged during this drain: an upper bound that holds
         assert_eq!(after(&dir, id, base, &b).await.unwrap(), 2);
         let file = ReceiptsFile::load(&dir).unwrap();
+        assert!(file.began.is_some(), "begun with its first record");
         // No `sent`: their acknowledgement may be late (an earlier try)
         assert!(
             file.versions
