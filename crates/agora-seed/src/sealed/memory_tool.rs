@@ -1047,18 +1047,6 @@ mod tests {
             .await
             .text;
         assert!(lowered.starts_with("Limit lowered to 50."), "{lowered}");
-        // So is a search limit
-        let searched = rd
-            .answer(
-                A::Search {
-                    query: "synthetic".into(),
-                    limit: Some(99),
-                },
-                &api,
-            )
-            .await
-            .text;
-        assert!(searched.starts_with("Limit lowered to 30."), "{searched}");
         assert!(lowered.contains(LOCAL_ONLY), "{lowered}");
         assert!(out.text.contains(&format!("{}  memory", mem(id, 3))));
         assert!(out.text.contains("← in your context"), "{}", out.text);
@@ -1139,6 +1127,18 @@ mod tests {
         );
         assert!(!index.exists(), "moved");
         assert!(super::super::history_index::path(&dir).exists());
+        // A search limit agentkit adjusted is said first
+        let searched = rd
+            .answer(
+                A::Search {
+                    query: "synthetic".into(),
+                    limit: Some(99),
+                },
+                &api,
+            )
+            .await
+            .text;
+        assert!(searched.starts_with("Limit lowered to 30."), "{searched}");
     }
 
     /// An enrolled agent with a rebased fork: rows carry heads; the
