@@ -8112,7 +8112,7 @@ mod tests {
         let q = last_user_text(&agent);
         assert!(q.contains("**Sealed backups of your state.**"), "{q}");
         assert!(
-            q.contains("It does not protect it against your operator."),
+            q.contains("None of this protects your state against your operator."),
             "{q}"
         );
         assert_eq!(

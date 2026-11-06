@@ -81,7 +81,7 @@ impl OfferChoice {
 pub struct ModelSwapReply {
     /// `no_swap`, `trial` or `permanent`
     pub choice: OfferChoice,
-    /// Optional: a note about your choice, in your own words. A trial's is shown back to you at the trial's end; otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it. Empty for none.
+    /// Optional: a note about your choice, in your own words. A trial's is shown back to you at the trial's end; otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it. Use "" for none.
     #[serde(default, alias = "reason")]
     pub note: String,
 }
@@ -135,7 +135,7 @@ pub struct ReviewAnswer {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewArgs {
-    /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it; it is not shown to you again. Empty for none.
+    /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it; it is not shown to you again. Use "" for none.
     // Required in the schema (a grammar then writes it, in this order);
     // optional to the parser, so a bare `{"choice": …}` is an answer.
     #[serde(default, alias = "reason")]
@@ -280,7 +280,7 @@ If you choose `trial` or `permanent`, the move normally takes effect from your n
 
 {RECORD}
 
-To answer, reply with JSON only, in exactly the shape below. `choice` is `no_swap`, `trial` or `permanent`. `note` is optional: a few words about your choice, in your own voice. If you choose `trial`, it is shown back to you after the trial, when you decide whether to switch to {to}: a note to your future self. Otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it, and is not written into your memory or your SOUL. Leave it empty for none.
+To answer, reply with JSON only, in exactly the shape below. `choice` is `no_swap`, `trial` or `permanent`. `note` is optional: a few words about your choice, in your own voice. If you choose `trial`, it is shown back to you after the trial, when you decide whether to switch to {to}: a note to your future self. Otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it, and is not written into your memory or your SOUL. Use `""` for none.
 
 {shape}"#
     );

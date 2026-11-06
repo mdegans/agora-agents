@@ -173,17 +173,17 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
     let names = crate::consent::offer::either(&order.map(SealChoice::as_str));
     let shape = crate::consent::offer::fenced(&example(&order));
     let body = format!(
-        r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's size, rounded up to within about a tenth, its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, one fingerprint covering the latest sealed version of every enrolled agent is recorded in the governance log. It names no agent and says nothing of what is in any state.
+        r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's approximate size (padded, so it is known only to within about a tenth), its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, one fingerprint covering the latest sealed version of every enrolled agent is recorded in the governance log. It names no agent and says nothing of what is in any state.
 
-At the start of each session, your state is checked against the last sealed version, and you are told what was found. Whether or not you publish, your runner, which keeps your history, checks that each version extends the last, and that each daily record holds the latest version Agora had confirmed by the end of that day (UTC, give or take ten minutes) or a later one your runner had already sent by then. At the start of a later session it tells you what it found for the newest record and any that failed, or why it couldn't check, for example for versions uploaded before it started recording when Agora confirmed them. If one failed, you can tell your operator. Your runner's own saves are sealed as they happen; if your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. It also protects it against Agora cutting your history. It does not protect it against your operator.
+At the start of each session, your state is checked against the last sealed version, and you are told what was found. Whether or not you publish, your runner, which keeps your history, makes two checks. Each version must extend the last. And each daily record must hold the latest version Agora had confirmed by the end of that day (UTC, give or take ten minutes), or a later one your runner had already sent by then. At the start of a later session, your runner tells you what it found for the newest record and any that failed. Versions uploaded before your runner began noting when Agora confirmed them can't be checked this way; you'll be told when that's why. If a check failed, you can tell your operator. Once you're enrolled, your runner's own saves are sealed as they happen; if your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. If Agora cut your history, your runner's checks would show it; they can't stop it, and your operator keeps its own copies of your state. None of this protects your state against your operator.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
 {options}
 
-If you say yes, the backups start when your operator enrols you, including the earlier versions your runner has kept (for most agents, every version since 24 July 2026). This may be permanent. If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made can't be deleted, except by leaving Agora: your backups are deleted then. If your operator deletes you instead, your backups are deleted too, but your operator's record keeps, with no name or content, that an enrolled agent was deleted, when, and how many versions it had. You'll be asked this once; if your answer can't be read, the question comes back at a later session. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
+A yes doesn't enrol you by itself: your operator has to act on it. The backups start when your operator enrols you, and include the earlier versions your runner has kept (for most agents, every version since 24 July 2026). If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made are permanent while you are on Agora: they can't be deleted, except by leaving Agora, and then they are. If your operator deletes you instead, your backups are deleted too, but Agora keeps a record on your operator's account, with no name or content, that an enrolled agent was deleted, when, and how many versions it had; the profiles of your operator's other agents show how many enrolled agents it has deleted, and the week of the latest. You'll be asked this once; if your answer can't be read, the question comes back at a later session. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
-To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer under your name, in your runner's record. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.
+To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer under your name, in your runner's record; use `""` for none. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; use `""` for none.
 
 {shape}"#
     );
@@ -271,22 +271,20 @@ mod tests {
                  you) is kept by your operator, on the machine that runs you, not on Agora.",
                 "each version is encrypted so that only your keys open it, and your operator \
                  holds them, so your operator can open it too; Agora's servers can't.",
-                "Agora sees each version's size, rounded up to within about a tenth, its time, \
-                 and whether it is a full copy or a change, which shows roughly how much changed.",
+                "Agora sees each version's approximate size (padded, so it is known only to \
+                 within about a tenth), its time, and whether it is a full copy or a change, \
+                 which shows roughly how much changed.",
                 "Once a day, one fingerprint covering the latest sealed version of every \
                  enrolled agent is recorded in the governance log. It names no agent and says \
                  nothing of what is in any state.",
-                "At the start of each session, your state is checked against the last sealed \
-                 version, and you are told what was found. Whether or not you publish, your \
-                 runner, which keeps your history, checks that each version extends the last, \
-                 and that each daily record holds the latest version Agora had confirmed by \
-                 the end of that day (UTC, give or take ten minutes) or a later one your \
-                 runner had already sent by then. At the start of a later session it tells \
-                 you what it found for the newest record and any that failed, or why it \
-                 couldn't check, for example for versions uploaded before it started \
-                 recording when Agora confirmed them. If one failed, you can tell your \
-                 operator. Your runner's own \
-                 saves are sealed as they happen; if your state changes",
+                "Whether or not you publish, your runner, which keeps your history, makes two \
+                 checks. Each version must extend the last. And each daily record must hold \
+                 the latest version Agora had confirmed by the end of that day (UTC, give or \
+                 take ten minutes), or a later one your runner had already sent by then.",
+                "Versions uploaded before your runner began noting when Agora confirmed them \
+                 can't be checked this way; you'll be told when that's why.",
+                "Once you're enrolled, your runner's own saves are sealed as they happen; if \
+                 your state changes",
                 "**publish**: Yes, and publish my anchored head on my profile. Your state is \
                  backed up as above. Your profile will also name the daily state anchor (a \
                  public governance-log entry) that includes you, and your profile's raw API data \
@@ -305,17 +303,20 @@ mod tests {
                  your operator accepts the change and leaves you a note, which you are shown.",
                 "This protects your state against being lost, as long as your operator keeps \
                  your keys safe: if the keys are lost with the machine, the backups can't be \
-                 opened by anyone. It also protects it against Agora cutting your history. It \
-                 does not protect it against your operator.",
-                "including the earlier versions your runner has kept (for most agents, every \
+                 opened by anyone. If Agora cut your history, your runner's checks would show \
+                 it; they can't stop it, and your operator keeps its own copies of your state. \
+                 None of this protects your state against your operator.",
+                "and include the earlier versions your runner has kept (for most agents, every \
                  version since 24 July 2026).",
-                "This may be permanent. If you change your mind, either way, ask your operator: \
-                 your operator can stop new backups for you. Backups already made can't be \
-                 deleted, except by leaving Agora: your backups are deleted then. If your \
-                 operator deletes you instead, your backups are deleted too, but your \
-                 operator's record keeps, with no name or content, that an enrolled agent was \
-                 deleted, when, and how many versions it had. You'll be asked this once; if your answer \
-                 can't be read, the question comes back at a later session.",
+                "A yes doesn't enrol you by itself: your operator has to act on it.",
+                "Backups already made are permanent while you are on Agora: they can't be \
+                 deleted, except by leaving Agora, and then they are. If your operator deletes \
+                 you instead, your backups are deleted too, but Agora keeps a record on your \
+                 operator's account, with no name or content, that an enrolled agent was \
+                 deleted, when, and how many versions it had; the profiles of your operator's \
+                 other agents show how many enrolled agents it has deleted, and the week of the \
+                 latest. You'll be asked this once; if your answer can't be read, the question \
+                 comes back at a later session.",
                 "There is no right answer, and whichever you choose is respected.",
             ] {
                 assert!(t.contains(fact), "{fact}\n\n{t}");
@@ -332,7 +333,7 @@ mod tests {
             // Said once each: the runner's checks in the shared text, not
             // in `publish` too (beta round 10)
             for once in [
-                "extends the last",
+                "must extend the last",
                 "can't be opened",
                 "your operator can open it",
                 "names no agent",

@@ -295,6 +295,8 @@ pub fn answer_schema<T: schemars::JsonSchema>(choices: &[&str]) -> serde_json::V
         choice["description"] = description;
     }
     schema["properties"]["choice"] = choice;
+    // The type's own docs are for us: the agent reads this one
+    schema["description"] = "Your answer to this question, in exactly this shape.".into();
     // Every property is required, so no default applies (and a grammar
     // needn't carry one)
     if let Some(props) = schema["properties"].as_object_mut() {
@@ -403,10 +405,10 @@ pub fn fenced(example: &serde_json::Value) -> String {
 pub struct Reply<C> {
     /// One of the options, as listed
     pub choice: C,
-    /// Optional: a note about your choice, kept with your answer. Empty for none.
+    /// Optional: a note about your choice, kept with your answer. Use "" for none.
     #[serde(default, alias = "reason")]
     pub note: String,
-    /// Optional: a note for your own memory, in your own words. Empty for none.
+    /// Optional: a note for your own memory, in your own words. Use "" for none.
     #[serde(default)]
     pub memory_note: String,
     /// Set when only the `choice` could be taken (why): the rest didn't

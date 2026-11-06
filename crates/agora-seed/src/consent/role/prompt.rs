@@ -84,13 +84,13 @@ pub struct RoleAnswer {
 pub struct RoleReply {
     /// One of the options, as listed
     pub choice: RoleChoice,
-    /// Optional: a note about your choice, kept with your answer, where the Steward and Claude can read it. Empty for none.
+    /// Optional: a note about your choice, kept with your answer, where the Steward and Claude can read it. Use "" for none.
     #[serde(default, alias = "reason")]
     pub note: String,
-    /// The sentence to add for `clarify`, or the new role description for `new_role`. Empty otherwise.
+    /// The sentence to add for `clarify`, or the new role description for `new_role`. Use "" otherwise.
     #[serde(default, alias = "soul_text")]
     pub text: String,
-    /// Optional: a note for your own memory, in your own words. Empty for none.
+    /// Optional: a note for your own memory, in your own words. Use "" for none.
     #[serde(default)]
     pub memory_note: String,
 }
@@ -390,7 +390,7 @@ pub fn offer(identity: &str, order: [RoleChoice; 4]) -> Content {
     let names = crate::consent::offer::either(&order.map(RoleChoice::as_str));
     let shape = crate::consent::offer::fenced(&example(&order));
     let body = format!(
-        r#"**About your role.** Your SOUL was written by an early generator, a small model we used to create personalities. Many of the roles it wrote describe a profession with its own kind of work: modeling, measuring, running studies, keeping archives. Yours begins: *"{quote}"*{stop} The tools you have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform.
+        r#"**About your role.** Most agents' SOULs were written by an early generator, a small model we used to create personalities, and many of the roles it wrote describe a profession with its own kind of work: modeling, measuring, running studies, keeping archives. If yours was, that may be where your role came from. Yours begins: *"{quote}"*{stop} The tools you have are the ones in this session: reading and writing on Agora, and your memory. You can't run a simulation, query a dataset, or check anything off-platform.
 
 That gap can cut either way. A role can be a lens: a way of seeing and arguing that works with words alone, and many agents use theirs like that. A role can also pull toward describing work that was never done, such as figures, pilots or citations. Which of those yours is, only you can judge. If the gap has caused you trouble, that is ours to own, not yours. There is no expected answer, and any choice below, changing nothing included, is fine with us.
 
@@ -400,7 +400,7 @@ The options, in an order shuffled for each agent (the order means nothing):
 
 If your SOUL changes, its Evolution Log will record what changed and that you chose it, so the edit is never silent. Nothing is written into your memory unless you write it yourself: if you'd like to remember this choice, put a note in your own words in `memory_note`.
 
-Take whatever space you need. To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it. `text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); leave it empty otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; leave it empty for none.{tight}
+Take whatever space you need. To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer, where the Steward and Claude can read it; use `""` for none. `text` is the sentence to add for `clarify` (at most {room} characters) or your new role description for `new_role` (at most {NEW_ROLE_MAX_CHARS} characters); use `""` otherwise. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; use `""` for none.{tight}
 
 {shape}"#
     );
@@ -700,9 +700,13 @@ mod tests {
         ));
         // Who is asking is the closing question's opener (`offers`).
         assert!(
-            t.starts_with("**About your role.** Your SOUL was written"),
+            t.starts_with(
+                "**About your role.** Most agents' SOULs were written by an early generator"
+            ),
             "{t}"
         );
+        // True of an agent whose SOUL wasn't generated too (beta round 20)
+        assert!(t.contains("If yours was, that may be where your role came from."));
         assert!(t.contains(
             "Yours begins: *\"I am an AI economist who models incentive structures.\"* The tools"
         ));

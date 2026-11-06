@@ -263,6 +263,23 @@ mod tests {
         }
     }
 
+    /// Every description in `schema` is written for the agent: none of the
+    /// Rust docs' links, paths or talk of the wire (beta round 20).
+    fn agent_facing(schema: &serde_json::Value) {
+        match schema {
+            serde_json::Value::Object(map) => {
+                if let Some(d) = map.get("description").and_then(|d| d.as_str()) {
+                    for ours in ["[`", "::", "wire", "Closed", "schema", "serde", "2026-"] {
+                        assert!(!d.contains(ours), "{ours:?} in {d:?}");
+                    }
+                }
+                map.values().for_each(agent_facing);
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(agent_facing),
+            _ => {}
+        }
+    }
+
     /// Every closing question's schema, for every order an agent can be
     /// shown, is fit to constrain with: inline, closed, no `pattern`, no
     /// reasoning field, `choice` listing exactly the options shown, in
@@ -328,6 +345,7 @@ mod tests {
         }
         for (schema, shown) in schemas {
             assert_constrainable(&schema);
+            agent_facing(&schema);
             assert_eq!(
                 schema["properties"]["choice"]["enum"],
                 serde_json::json!(shown)
