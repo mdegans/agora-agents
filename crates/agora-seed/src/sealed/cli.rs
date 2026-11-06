@@ -301,8 +301,11 @@ pub async fn run(
             let _runner = super::session::runner_exclusive(data_dir)?;
             let done = super::forget::forget(&state_dir, &keys, agent, &note)?;
             println!(
-                "{agent}: state key set aside as {}{}; no key deleted{}",
+                "{agent}: state key set aside as {}{}{}; no key deleted{}",
                 done.key,
+                done.memory_id_key
+                    .map(|k| format!(", its memory-id key as {k}"))
+                    .unwrap_or_default(),
                 done.stop
                     .map(|s| format!(", its stop as {s}"))
                     .unwrap_or_default(),

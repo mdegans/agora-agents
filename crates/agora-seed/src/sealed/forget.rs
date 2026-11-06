@@ -6,10 +6,11 @@
 //! No key or record is deleted: `<secrets>/<id>/state_key.json` becomes
 //! `state_key.forgotten.<utc>.json`, the durable stop (if any)
 //! `sealed_stopped.forgotten.<utc>`, and the note is kept beside them as
-//! `state_key.forgotten.<utc>.note.json`. The signing keys stay, and so
-//! does `memory_id_key.json`: like them it names the agent's past rather
-//! than unlocking a backup, and an agent that comes back keeps its ids.
-//! The one file deleted is the `memory` tool's search index
+//! `state_key.forgotten.<utc>.note.json`. The memory-id key goes aside with
+//! the state key, under the same `<utc>`
+//! (`memory_id_key.forgotten.<utc>.json`), so putting the agent back
+//! restores both together and its memory ids still resolve. The signing
+//! keys stay. The one file deleted is the `memory` tool's search index
 //! (`sealed/history_index.json`, [`super::history_index`]), a sidecar
 //! rebuilt from the history whenever it is needed. Refused while the agent
 //! has a `state.json`: a living agent's backups are stopped with
@@ -23,7 +24,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::KeyStore;
-use super::keys::STATE_KEY_FILE;
+use super::keys::{MEMORY_ID_KEY_FILE, STATE_KEY_FILE};
 
 /// The note kept beside the forgotten key.
 #[derive(Debug, Serialize)]
@@ -37,6 +38,8 @@ struct Forgotten<'a> {
 pub struct Forgot {
     pub key: String,
     pub stop: Option<String>,
+    /// The memory-id key's new name, if the agent had one.
+    pub memory_id_key: Option<String>,
     /// The search index was there, and was deleted.
     pub index: bool,
 }
@@ -72,6 +75,18 @@ pub fn forget(
         serde_json::to_vec_pretty(&Forgotten { at, note })?,
     )
     .context("writing the note")?;
+    // Before the state key, whose move finishes the forget: cut between
+    // the two, a rerun finds the state key and sets it aside (the
+    // memory-id key then carries the first run's stamp)
+    let memory_id_key = dir.join(MEMORY_ID_KEY_FILE);
+    let memory_id_key_to = if std::fs::exists(&memory_id_key)? {
+        let to = format!("memory_id_key.forgotten.{stamp}.json");
+        std::fs::rename(&memory_id_key, dir.join(&to))
+            .context("setting the memory-id key aside")?;
+        Some(to)
+    } else {
+        None
+    };
     std::fs::rename(&key, dir.join(&key_to)).context("setting the state key aside")?;
     let stop = dir.join(super::stop::DURABLE);
     let stop_to = if std::fs::exists(&stop)? {
@@ -91,6 +106,7 @@ pub fn forget(
     Ok(Forgot {
         key: key_to,
         stop: stop_to,
+        memory_id_key: memory_id_key_to,
         index,
     })
 }
@@ -120,6 +136,7 @@ mod tests {
             .collect();
         assert!(kept.contains(&done.key), "{kept:?}");
         assert!(!done.index, "no index to delete");
+        assert_eq!(done.memory_id_key, None, "no memory-id key to set aside");
         assert!(kept.iter().any(|n| n.ends_with(".note.json")), "{kept:?}");
         // The signing keys stay
         assert!(keys.signing(id).is_some());
@@ -139,9 +156,9 @@ mod tests {
     }
 
     /// Forgetting deletes the search index, the one sidecar it deletes, and
-    /// keeps the memory-id key.
+    /// sets the memory-id key aside with the state key, under one stamp.
     #[tokio::test]
-    async fn forgetting_deletes_the_search_index_and_keeps_the_memory_id_key() {
+    async fn forgetting_deletes_the_search_index_and_sets_the_memory_id_key_aside() {
         let root = crate::sealed::TestDir::new("forget-index");
         let (id, keys, dir) = enrolled(&root).await;
         let state_dir = root.join("state");
@@ -156,10 +173,25 @@ mod tests {
             std::fs::exists(dir.join("sealed/head.json")).unwrap(),
             "only the index"
         );
+        assert!(keys.memory_id_keys(id).unwrap().is_none(), "set aside");
+        let aside = done.memory_id_key.expect("set aside");
+        let stamp = |name: &str, prefix: &str| {
+            name.strip_prefix(prefix)
+                .and_then(|n| n.strip_suffix(".json"))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            stamp(&aside, "memory_id_key.forgotten."),
+            stamp(&done.key, "state_key.forgotten."),
+            "one stamp: restored together"
+        );
+        // Kept whole: renamed back, it is the same key
+        let dir = keys.agent_dir(id);
+        std::fs::rename(dir.join(&aside), dir.join(MEMORY_ID_KEY_FILE)).unwrap();
         assert_eq!(
             keys.memory_id_keys(id).unwrap().unwrap().current.expose(),
-            key.current.expose(),
-            "the memory-id key stays"
+            key.current.expose()
         );
     }
 }

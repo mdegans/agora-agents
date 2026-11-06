@@ -151,6 +151,13 @@ impl PastKeys {
 
 /// One agent's memory-id key: 32 random bytes, the HMAC key memory ids
 /// are made with. Prints `[REDACTED]`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 #[derive(Clone)]
 pub struct MemoryIdKey(Zeroizing<[u8; 32]>);
 
@@ -160,6 +167,13 @@ impl std::fmt::Debug for MemoryIdKey {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 impl MemoryIdKey {
     /// 32 fresh bytes from the OS's CSPRNG. Drawn through agentkit's
     /// `StateKey::generate` (`OsRng`), so the runner needs no RNG crate of
@@ -186,12 +200,26 @@ impl MemoryIdKey {
 /// An agent's memory-id keys: the one new ids are made with, and every one
 /// it replaced, newest first, so an id made with an old key still
 /// resolves. Nothing replaces a key yet; the file can hold them.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 #[derive(Debug, Clone)]
 pub struct MemoryIdKeys {
     pub current: MemoryIdKey,
     pub past: Vec<MemoryIdKey>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 impl MemoryIdKeys {
     /// Every key, the current first: the order to try an id against.
     pub fn all(&self) -> impl Iterator<Item = &MemoryIdKey> {
@@ -200,6 +228,13 @@ impl MemoryIdKeys {
 }
 
 /// One key in `memory_id_key.json`, hex.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 #[derive(Clone, Serialize, Deserialize)]
 struct MemoryIdKeyRecord {
     key: String,
@@ -217,6 +252,13 @@ impl Drop for MemoryIdKeyRecord {
 }
 
 /// `memory_id_key.json`. Append-only in `past`, like `past_keys.json`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 #[derive(Clone, Serialize, Deserialize)]
 struct MemoryIdKeyFile {
     current: MemoryIdKeyRecord,
@@ -225,6 +267,13 @@ struct MemoryIdKeyFile {
     past: Vec<MemoryIdKeyRecord>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 impl MemoryIdKeyFile {
     fn keys(&self) -> std::io::Result<MemoryIdKeys> {
         Ok(MemoryIdKeys {
@@ -307,6 +356,13 @@ pub fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// fsynced, hard-linked into place, the directory fsynced. The `.tmp` name
 /// is then removed: after a link it is a second name for the same file;
 /// after a lost race, a key nothing ever used.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 pub fn create_secret(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     let dir = path.parent().expect("a file in a directory");
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -542,6 +598,13 @@ impl KeyStore {
     }
 
     /// The agent's memory-id keys, if it has any yet.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the memory tool uses it; wired in the integration step"
+        )
+    )]
     pub fn memory_id_keys(&self, id: AgentId) -> std::io::Result<Option<MemoryIdKeys>> {
         read_json::<MemoryIdKeyFile>(&self.agent_dir(id).join(MEMORY_ID_KEY_FILE))?
             .map(|f| f.keys())
@@ -552,6 +615,13 @@ impl KeyStore {
     /// random bytes, written whole or not at all, never over a key already
     /// there (a concurrent maker's is taken instead). Nothing deletes or
     /// replaces it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the memory tool uses it; wired in the integration step"
+        )
+    )]
     pub fn memory_id_keys_or_create(&self, id: AgentId) -> std::io::Result<MemoryIdKeys> {
         if let Some(keys) = self.memory_id_keys(id)? {
             return Ok(keys);

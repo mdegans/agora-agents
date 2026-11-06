@@ -23,6 +23,13 @@ pub fn path(agent_dir: &Path) -> PathBuf {
 }
 
 /// The index's bytes, or `None` if there is none.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 pub fn read(agent_dir: &Path) -> std::io::Result<Option<Vec<u8>>> {
     match std::fs::read(path(agent_dir)) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -33,6 +40,13 @@ pub fn read(agent_dir: &Path) -> std::io::Result<Option<Vec<u8>>> {
 
 /// Replace the index with `bytes`, whole: a temporary sibling, fsynced,
 /// renamed over it, the directory fsynced.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
 pub fn write(agent_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
     super::anchors::write_atomic(&path(agent_dir), bytes)
 }
