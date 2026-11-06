@@ -8143,6 +8143,8 @@ mod tests {
             SeedConfig {
                 mutation_chance: 0,
                 evolution_chance: 0,
+                // The survey is drawn at random (10%): not here
+                survey_chance: 0,
                 ..SeedConfig::default()
             },
         );
