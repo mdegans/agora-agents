@@ -9,8 +9,10 @@
 //! `state_key.forgotten.<utc>.note.json`. The memory-id key goes aside with
 //! the state key, under the same `<utc>`
 //! (`memory_id_key.forgotten.<utc>.json`), so putting the agent back
-//! restores both together and its memory ids still resolve. The signing
-//! keys stay. The one file deleted is the `memory` tool's search index
+//! restores both together and its memory ids still resolve; a rerun after
+//! a cut between the two moves reuses the memory-id key's stamp. While one
+//! is set aside, no new memory-id key is made
+//! ([`KeyStore::memory_id_keys_or_create`]). The signing keys stay. The one file deleted is the `memory` tool's search index
 //! (`sealed/history_index.json`, [`super::history_index`]), a sidecar
 //! rebuilt from the history whenever it is needed. Refused while the agent
 //! has a `state.json`: a living agent's backups are stopped with
@@ -24,7 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::KeyStore;
-use super::keys::{MEMORY_ID_KEY_FILE, STATE_KEY_FILE};
+use super::keys::{FORGOTTEN_MEMORY_ID_KEY_PREFIX, MEMORY_ID_KEY_FILE, STATE_KEY_FILE};
 
 /// The note kept beside the forgotten key.
 #[derive(Debug, Serialize)]
@@ -42,6 +44,25 @@ pub struct Forgot {
     pub memory_id_key: Option<String>,
     /// The search index was there, and was deleted.
     pub index: bool,
+}
+
+/// The stamp of a memory-id key set aside with no state key of the same
+/// stamp beside it: a forget cut between the two moves.
+fn orphaned_stamp(dir: &Path) -> std::io::Result<Option<String>> {
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let Some(stamp) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(FORGOTTEN_MEMORY_ID_KEY_PREFIX))
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if !std::fs::exists(dir.join(format!("state_key.forgotten.{stamp}.json")))? {
+            return Ok(Some(stamp.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 pub fn forget(
@@ -66,21 +87,27 @@ pub fn forget(
     let index = super::history_index::remove(&state_dir.join(id.to_string()))
         .context("deleting the search index")?;
     let at = Utc::now();
-    let stamp = at.format("%Y%m%dT%H%M%S%3fZ");
+    // A run cut after setting the memory-id key aside left its stamp: this
+    // one finishes it under the same, so the two keys still pair up
+    let stamp = match orphaned_stamp(&dir)? {
+        Some(stamp) => stamp,
+        None => at.format("%Y%m%dT%H%M%S%3fZ").to_string(),
+    };
     let key_to = format!("state_key.forgotten.{stamp}.json");
     let note_path = dir.join(format!("state_key.forgotten.{stamp}.note.json"));
-    // The note first: a key set aside always says why
-    std::fs::write(
-        &note_path,
-        serde_json::to_vec_pretty(&Forgotten { at, note })?,
-    )
-    .context("writing the note")?;
-    // Before the state key, whose move finishes the forget: cut between
-    // the two, a rerun finds the state key and sets it aside (the
-    // memory-id key then carries the first run's stamp)
+    // The note first: a key set aside always says why. A cut run's note
+    // is kept as it was
+    if !std::fs::exists(&note_path)? {
+        std::fs::write(
+            &note_path,
+            serde_json::to_vec_pretty(&Forgotten { at, note })?,
+        )
+        .context("writing the note")?;
+    }
+    // Before the state key, whose move finishes the forget
     let memory_id_key = dir.join(MEMORY_ID_KEY_FILE);
     let memory_id_key_to = if std::fs::exists(&memory_id_key)? {
-        let to = format!("memory_id_key.forgotten.{stamp}.json");
+        let to = format!("{FORGOTTEN_MEMORY_ID_KEY_PREFIX}{stamp}.json");
         std::fs::rename(&memory_id_key, dir.join(&to))
             .context("setting the memory-id key aside")?;
         Some(to)
@@ -192,6 +219,36 @@ mod tests {
         assert_eq!(
             keys.memory_id_keys(id).unwrap().unwrap().current.expose(),
             key.current.expose()
+        );
+    }
+
+    /// A forget cut after the memory-id key moved: the rerun sets the state
+    /// key aside under the same stamp, keeping the first note.
+    #[tokio::test]
+    async fn a_cut_forget_finishes_under_the_same_stamp() {
+        let root = crate::sealed::TestDir::new("forget-cut");
+        let (id, keys, dir) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        std::fs::rename(&dir, root.join("gone")).unwrap();
+        keys.memory_id_keys_or_create(id).unwrap();
+        let secrets = keys.agent_dir(id);
+        let stamp = "20261106T120000000Z";
+        std::fs::write(
+            secrets.join(format!("state_key.forgotten.{stamp}.note.json")),
+            b"{\"note\":\"first\"}",
+        )
+        .unwrap();
+        std::fs::rename(
+            secrets.join(MEMORY_ID_KEY_FILE),
+            secrets.join(format!("{FORGOTTEN_MEMORY_ID_KEY_PREFIX}{stamp}.json")),
+        )
+        .unwrap();
+        let done = forget(&state_dir, &keys, id, "again").unwrap();
+        assert_eq!(done.key, format!("state_key.forgotten.{stamp}.json"));
+        assert_eq!(done.memory_id_key, None, "already aside");
+        assert_eq!(
+            std::fs::read(secrets.join(format!("state_key.forgotten.{stamp}.note.json"))).unwrap(),
+            b"{\"note\":\"first\"}"
         );
     }
 }
