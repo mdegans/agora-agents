@@ -180,6 +180,13 @@ pub trait InnerSession: Agent {
         response: response::Message,
     ) -> Result<Control, Self::Error>;
 
+    /// Keep a reply to one of the wrapper's questions that the driver left
+    /// out of the transcript, for the inner session's prompt-log archive
+    /// (`AskHost::left_out`).
+    fn left_out(&mut self, ask: &'static str, attempt: usize, reply: &response::Message) {
+        let _ = (ask, attempt, reply);
+    }
+
     /// The inner session's own questions (the soul mutation, evolution, the
     /// survey) that ended without an answer, by name.
     fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {
@@ -208,6 +215,10 @@ impl InnerSession for SeedAgent {
         response: response::Message,
     ) -> Result<Control, Self::Error> {
         SeedAgent::resume_question_pause(self, response)
+    }
+
+    fn left_out(&mut self, ask: &'static str, attempt: usize, reply: &response::Message) {
+        <SeedAgent as ask::AskHost>::left_out(self, ask, attempt, reply)
     }
 
     fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {

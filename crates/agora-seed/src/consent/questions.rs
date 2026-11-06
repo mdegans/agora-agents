@@ -263,13 +263,15 @@ mod tests {
         }
     }
 
-    /// Every description in `schema` is written for the agent: none of the
-    /// Rust docs' links, paths or talk of the wire (beta round 20).
+    /// What agentkit's [`assert_constrainable`] doesn't already catch in a
+    /// description (it has links, paths and plumbing): the runner's own
+    /// tells of a doc comment, its talk of the wire and its dates (beta
+    /// round 20).
     fn agent_facing(schema: &serde_json::Value) {
         match schema {
             serde_json::Value::Object(map) => {
                 if let Some(d) = map.get("description").and_then(|d| d.as_str()) {
-                    for ours in ["[`", "::", "wire", "Closed", "schema", "serde", "2026-"] {
+                    for ours in ["[`", "wire", "Closed", "schema", "2026-"] {
                         assert!(!d.contains(ours), "{ours:?} in {d:?}");
                     }
                 }

@@ -63,6 +63,12 @@ where
         Some(self.inner.state().soul.name.to_string())
     }
 
+    /// The inner session archives it with its own (the driver never calls
+    /// this for an anonymous answer).
+    fn left_out(&mut self, ask: &'static str, attempt: usize, reply: &response::Message) {
+        self.inner.left_out(ask, attempt, reply);
+    }
+
     /// After the review, the inner agent's memory turn (and the rest of its
     /// tail), as after any act phase that went quiet: the review replaced
     /// the act phase. A review never put (no room at the session's start:
