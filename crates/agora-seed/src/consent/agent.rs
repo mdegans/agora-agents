@@ -4082,10 +4082,13 @@ mod tests {
             len + 2,
             "clipped turn seated, the note after it"
         );
-        assert_eq!(
-            last_user_text(&agent),
-            agora_agentkit::reactor::ask::TRUNCATION_WARNING
+        // agentkit's one note, restating the shape
+        let note = last_user_text(&agent);
+        assert!(
+            note.starts_with(agora_agentkit::reactor::ask::TRUNCATION_WARNING),
+            "{note}"
         );
+        assert!(note.contains("<no_swap | trial | permanent>"), "{note}");
         let control = agent
             .handle(reply(r#"{"choice": "no_swap", "note": "brief"}"#))
             .await
@@ -4463,13 +4466,15 @@ mod tests {
             if n + 1 < MAX_ATTEMPTS as usize {
                 let retry = last_user_text(&agent);
                 assert!(
-                    retry.ends_with(
+                    retry.contains(
                         "`choice` is one of:\n\n\
                          - `stay`: stay on Qwen 3.6, the model this session runs on.\n\
                          - `switch`: move to Qwen 3.8 permanently, from your next session."
                     ),
                     "{retry}"
                 );
+                // and the shape, through agentkit's one retry note
+                assert!(retry.contains("\"choice\":\"<stay | switch>\""), "{retry}");
             }
         }
         assert_eq!(control, Control::Continue, "memory turn follows");
@@ -7829,9 +7834,7 @@ mod tests {
         );
         // The survey is last, after the offer.
         let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
-        assert!(
-            last.contains("anonymous feedback") && last.contains("**About the model you run on.**")
-        );
+        assert!(last.contains("contact_me") && last.contains("**About the model you run on.**"));
         agent.on_teardown().await.unwrap();
         assert_survey_redacted(
             &h,
