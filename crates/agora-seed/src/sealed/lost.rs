@@ -135,7 +135,7 @@ pub async fn begin(
     let dir = seal
         .dir()
         .join(LOST)
-        .join(at.format("%Y%m%dT%H%M%S%3fZ").to_string());
+        .join(at.format(crate::sealed::STAMP_FORMAT).to_string());
     let mut items = lost.to_vec();
     // On a new chain the waiting versions go too
     if onto.is_none() {

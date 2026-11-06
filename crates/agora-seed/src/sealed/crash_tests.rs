@@ -22,7 +22,7 @@ use super::sizes::Sizes;
 fn archive_name() -> String {
     format!(
         "state.{}.json",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
+        chrono::Utc::now().format(crate::sealed::STAMP_FORMAT)
     )
 }
 

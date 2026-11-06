@@ -290,7 +290,7 @@ impl Notice {
             // Accepted but not yet shown: kept aside, never overwritten
             Some(_) => {
                 let from = path(agent_dir);
-                let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+                let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
                 std::fs::rename(
                     &from,
                     from.with_file_name(format!("notice.superseded.{at}.json")),
@@ -353,7 +353,7 @@ impl Notice {
     ) -> std::io::Result<()> {
         let from = path(agent_dir);
         if std::fs::exists(&from)? {
-            let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+            let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
             std::fs::rename(
                 &from,
                 from.with_file_name(format!("notice.superseded.{at}.json")),
@@ -531,7 +531,7 @@ impl Notice {
     /// `notice.shown.<utc>.json`.
     pub fn shown(agent_dir: &Path) -> std::io::Result<()> {
         let from = path(agent_dir);
-        let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
         std::fs::rename(
             &from,
             from.with_file_name(format!("notice.shown.{at}.json")),

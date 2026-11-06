@@ -1424,7 +1424,9 @@ fn rescue_unsaved(
     report: &agora_agentkit::reactor::Report,
 ) -> Vec<(AgentId, std::io::Result<PathBuf>)> {
     use std::io::Write;
-    let at = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
+    let at = chrono::Utc::now()
+        .format(crate::sealed::STAMP_FORMAT)
+        .to_string();
     report
         .unsaved
         .iter()

@@ -43,8 +43,63 @@ pub const ROTATIONS_FILE: &str = "rotations.json";
 pub const PENDING_ROTATION_FILE: &str = "rotation.pending.json";
 /// The key memory ids are made with ([`MemoryIdKeys`]).
 pub const MEMORY_ID_KEY_FILE: &str = "memory_id_key.json";
-/// A memory-id key `sealed-forget` set aside: this, its `<utc>`, `.json`.
-pub const FORGOTTEN_MEMORY_ID_KEY_PREFIX: &str = "memory_id_key.forgotten.";
+
+/// The name of a file `sealed-forget` set aside under a stamp
+/// ([`super::STAMP_FORMAT`]): one place to make and to parse each.
+#[derive(Debug, Clone, Copy)]
+pub struct SetAsideName {
+    prefix: &'static str,
+    suffix: &'static str,
+}
+
+impl SetAsideName {
+    pub fn name(&self, stamp: &str) -> String {
+        format!("{}{stamp}{}", self.prefix, self.suffix)
+    }
+
+    /// The stamp in `name`, if it is this kind of name with a well-formed
+    /// stamp (so a note's name is never read as a key's).
+    pub fn stamp<'a>(&self, name: &'a str) -> Option<&'a str> {
+        let stamp = name.strip_prefix(self.prefix)?.strip_suffix(self.suffix)?;
+        chrono::NaiveDateTime::parse_from_str(stamp, super::STAMP_FORMAT)
+            .is_ok()
+            .then_some(stamp)
+    }
+
+    /// Every stamp of this kind in `dir`, oldest first.
+    pub fn stamps(&self, dir: &Path) -> std::io::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            if let Some(stamp) = name.to_str().and_then(|n| self.stamp(n)) {
+                out.push(stamp.to_string());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+}
+
+/// `state_key.forgotten.<utc>.json`.
+pub const FORGOTTEN_STATE_KEY: SetAsideName = SetAsideName {
+    prefix: "state_key.forgotten.",
+    suffix: ".json",
+};
+/// `state_key.forgotten.<utc>.note.json`: why, and what that forget moves.
+pub const FORGOTTEN_NOTE: SetAsideName = SetAsideName {
+    prefix: "state_key.forgotten.",
+    suffix: ".note.json",
+};
+/// `memory_id_key.forgotten.<utc>.json`.
+pub const FORGOTTEN_MEMORY_ID_KEY: SetAsideName = SetAsideName {
+    prefix: "memory_id_key.forgotten.",
+    suffix: ".json",
+};
 
 /// `state_key.json`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -512,7 +567,7 @@ impl KeyStore {
     /// kept as `secrets.<utc>.json`. Only after the server took the change.
     pub fn promote_next_secrets(&self, id: AgentId) -> std::io::Result<()> {
         let dir = self.agent_dir(id);
-        let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
         std::fs::hard_link(
             dir.join(SECRETS_FILE),
             dir.join(format!("secrets.{at}.json")),
@@ -590,16 +645,23 @@ impl KeyStore {
     /// The agent's memory-id keys, the key made once if there is none: 32
     /// random bytes, written whole or not at all, never over a key already
     /// there (a concurrent maker's is taken instead). Nothing deletes or
-    /// replaces it.
+    /// replaces it. `agent_dir` is the agent's state directory, where the
+    /// key's fingerprint is kept ([`MEMORY_ID_FINGERPRINT_FILE`]).
     ///
     /// A key `sealed-forget` set aside (`memory_id_key.forgotten.<utc>.json`)
     /// is reused, never minted over: the newest is copied back as current
     /// and every other forgotten key goes into `past`, so every id the agent
     /// was shown still resolves; the forgotten files stay as forget's
     /// record. Refuses, loudly, where a new key would silently change every
-    /// id: a forgotten key that can't be read, or the agent's secrets not
-    /// here (a wrong data directory, a partial copy), as a missing signing
-    /// or state key would. Never touches the state key.
+    /// id:
+    /// - a forgotten key that can't be read;
+    /// - the agent's secrets not here (a wrong data directory, a partial
+    ///   copy), as a missing signing or state key would;
+    /// - a fingerprint in the state directory that no key here matches (a
+    ///   secrets tree restored from before the key was made, or from
+    ///   another time).
+    ///
+    /// Never touches the state key.
     #[cfg_attr(
         not(test),
         expect(
@@ -607,11 +669,39 @@ impl KeyStore {
             reason = "the memory tool uses it; wired in the integration step"
         )
     )]
-    pub fn memory_id_keys_or_create(&self, id: AgentId) -> std::io::Result<MemoryIdKeys> {
+    pub fn memory_id_keys_or_create(
+        &self,
+        id: AgentId,
+        agent_dir: &Path,
+    ) -> std::io::Result<MemoryIdKeys> {
+        let dir = self.agent_dir(id);
+        let fingerprint = read_fingerprint(agent_dir)?;
+        let matches = |keys: &MemoryIdKeys| -> std::io::Result<()> {
+            match &fingerprint {
+                Some(f)
+                    if !keys
+                        .all()
+                        .any(|k| memory_id_key_fingerprint(k) == f.fingerprint) =>
+                {
+                    Err(std::io::Error::other(format!(
+                        "agent {id}'s memory-id key in {} isn't the one its state directory \
+                         records ({}, fingerprint {}): the secrets tree is likely from another \
+                         time. Restore the key that matches; no key is made or used meanwhile",
+                        dir.display(),
+                        agent_dir.join(MEMORY_ID_FINGERPRINT_FILE).display(),
+                        f.fingerprint
+                    )))
+                }
+                _ => Ok(()),
+            }
+        };
         if let Some(keys) = self.memory_id_keys(id)? {
+            matches(&keys)?;
+            if fingerprint.is_none() {
+                write_fingerprint(agent_dir, &keys.current)?;
+            }
             return Ok(keys);
         }
-        let dir = self.agent_dir(id);
         if self.signing(id).is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -622,11 +712,13 @@ impl KeyStore {
                 ),
             ));
         }
+        sweep_stale_tmps(&dir);
         let path = dir.join(MEMORY_ID_KEY_FILE);
         match revived_memory_id_keys(&dir)? {
             // Set aside by sealed-forget: the newest back as current, every
             // other key kept in `past`. The forgotten files stay as they are
             Some(revived) => {
+                matches(&revived.file.keys()?)?;
                 if create_secret(&path, &to_json(&revived.file)?)? {
                     tracing::warn!(
                         event_type = "memory_id_key_revived",
@@ -638,6 +730,16 @@ impl KeyStore {
                 }
             }
             None => {
+                if let Some(f) = &fingerprint {
+                    return Err(std::io::Error::other(format!(
+                        "agent {id} had a memory-id key (fingerprint {}, recorded in {}) and \
+                         {} holds none: the secrets tree is likely from before it was made. \
+                         Restore {MEMORY_ID_KEY_FILE}; no new key is made over it",
+                        f.fingerprint,
+                        agent_dir.join(MEMORY_ID_FINGERPRINT_FILE).display(),
+                        dir.display()
+                    )));
+                }
                 let key = MemoryIdKey::generate();
                 let file = MemoryIdKeyFile {
                     current: MemoryIdKeyRecord {
@@ -648,16 +750,23 @@ impl KeyStore {
                     past: Vec::new(),
                 };
                 if create_secret(&path, &to_json(&file)?)? {
-                    tracing::info!(
+                    tracing::warn!(
                         event_type = "memory_id_key_created",
                         agent_id = %id,
-                        "the agent's memory-id key was made"
+                        "the agent's memory-id key was made; its memory ids start here"
                     );
                 }
             }
         }
-        self.memory_id_keys(id)?
-            .ok_or_else(|| std::io::Error::other("the memory-id key vanished as it was made"))
+        let keys = self
+            .memory_id_keys(id)?
+            .ok_or_else(|| std::io::Error::other("the memory-id key vanished as it was made"))?;
+        // A concurrent maker's key, if it won
+        matches(&keys)?;
+        if fingerprint.is_none_or(|f| f.fingerprint != memory_id_key_fingerprint(&keys.current)) {
+            write_fingerprint(agent_dir, &keys.current)?;
+        }
+        Ok(keys)
     }
 
     /// What an enrolled agent's entries are signed and sealed with.
@@ -712,6 +821,86 @@ impl KeyStore {
     }
 }
 
+/// `<state>/<id>/memory_id_key.fingerprint.json`: non-secret evidence that
+/// the agent has a memory-id key, so a secrets tree without it refuses
+/// rather than minting a new one.
+pub const MEMORY_ID_FINGERPRINT_FILE: &str = "memory_id_key.fingerprint.json";
+
+/// The fingerprint file's shape.
+#[derive(Debug, Serialize, Deserialize)]
+struct Fingerprint {
+    /// [`memory_id_key_fingerprint`] of the current key.
+    fingerprint: String,
+    at: DateTime<Utc>,
+}
+
+/// SHA-256 over a frozen domain tag and the key, hex: names a key without
+/// revealing it.
+fn memory_id_key_fingerprint(key: &MemoryIdKey) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"agora memory id key fingerprint v1\0");
+    h.update(key.expose());
+    hex::encode(h.finalize())
+}
+
+fn read_fingerprint(agent_dir: &Path) -> std::io::Result<Option<Fingerprint>> {
+    let path = agent_dir.join(MEMORY_ID_FINGERPRINT_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn write_fingerprint(agent_dir: &Path, key: &MemoryIdKey) -> std::io::Result<()> {
+    let f = Fingerprint {
+        fingerprint: memory_id_key_fingerprint(key),
+        at: Utc::now(),
+    };
+    super::write_private(
+        &agent_dir.join(MEMORY_ID_FINGERPRINT_FILE),
+        &serde_json::to_vec_pretty(&f)?,
+    )
+}
+
+/// How old a stray `memory_id_key.<uuid>.tmp` must be before it is swept:
+/// past any maker still between its write and its link.
+const STALE_TMP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Remove `memory_id_key.<uuid>.tmp` files a maker cut between its link
+/// and its removal left: each a second name for the real key, or a key
+/// nothing used. Only ones older than [`STALE_TMP`]; failures only warn.
+fn sweep_stale_tmps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(middle) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("memory_id_key."))
+            .and_then(|n| n.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(middle).is_err() {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_TMP);
+        if old && let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::warn!(path = %entry.path().display(), error = %e, "a stale key tmp couldn't be swept");
+        }
+    }
+}
+
 /// A memory-id key file rebuilt from the keys `sealed-forget` set aside.
 struct Revived {
     file: MemoryIdKeyFile,
@@ -725,25 +914,13 @@ struct Revived {
 /// `None` if there are none. `Err`, naming the file, if one can't be read:
 /// no key is made over evidence of an earlier one.
 fn revived_memory_id_keys(dir: &Path) -> std::io::Result<Option<Revived>> {
-    let mut stamps = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        if let Some(stamp) = name
-            .to_str()
-            .and_then(|n| n.strip_prefix(FORGOTTEN_MEMORY_ID_KEY_PREFIX))
-            .and_then(|n| n.strip_suffix(".json"))
-        {
-            stamps.push(stamp.to_string());
-        }
-    }
-    // `%Y%m%dT%H%M%S%3fZ`: by name is by time
-    stamps.sort();
+    let stamps = FORGOTTEN_MEMORY_ID_KEY.stamps(dir)?;
     let Some(newest) = stamps.last().cloned() else {
         return Ok(None);
     };
     let mut files = Vec::new();
     for stamp in &stamps {
-        let name = format!("{FORGOTTEN_MEMORY_ID_KEY_PREFIX}{stamp}.json");
+        let name = FORGOTTEN_MEMORY_ID_KEY.name(stamp);
         let refuse = |why: String| {
             std::io::Error::other(format!(
                 "the memory-id key sealed-forget set aside as {} can't be read ({why}); no \
@@ -849,9 +1026,13 @@ mod tests {
         let dir = crate::sealed::TestDir::new("keys-memory-id");
         let (store, id) = with_agent(dir.path());
         assert!(store.memory_id_keys(id).unwrap().is_none());
-        let made = store.memory_id_keys_or_create(id).unwrap();
+        let made = store
+            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+            .unwrap();
         assert!(made.past.is_empty());
-        let again = store.memory_id_keys_or_create(id).unwrap();
+        let again = store
+            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+            .unwrap();
         assert_eq!(again.current.expose(), made.current.expose(), "made once");
         assert_ne!(made.current.expose(), &[0u8; 32]);
         // Redacted, as a whole and alone
@@ -927,7 +1108,9 @@ mod tests {
             &serde_json::to_vec(&file).unwrap(),
         )
         .unwrap();
-        let keys = store.memory_id_keys_or_create(id).unwrap();
+        let keys = store
+            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+            .unwrap();
         let all: Vec<[u8; 32]> = keys.all().map(|k| *k.expose()).collect();
         assert_eq!(all, [c, b, a]);
     }
@@ -939,7 +1122,15 @@ mod tests {
         let (store, id) = with_agent(dir.path());
         let keys: Vec<[u8; 32]> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..16)
-                .map(|_| s.spawn(|| *store.memory_id_keys_or_create(id).unwrap().current.expose()))
+                .map(|_| {
+                    s.spawn(|| {
+                        *store
+                            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+                            .unwrap()
+                            .current
+                            .expose()
+                    })
+                })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
@@ -964,7 +1155,11 @@ mod tests {
         .to_string();
         for bad in [&b""[..], b"{\"current\": {\"ke", short.as_bytes()] {
             write_secret(&path, bad).unwrap();
-            assert!(store.memory_id_keys_or_create(id).is_err());
+            assert!(
+                store
+                    .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+                    .is_err()
+            );
             assert!(store.memory_id_keys(id).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), bad, "byte for byte");
         }
@@ -976,7 +1171,9 @@ mod tests {
         let dir = crate::sealed::TestDir::new("keys-memory-id-refuse");
         let store = KeyStore::new(dir.path().join("elsewhere"));
         let stranger = AgentId::new();
-        let e = store.memory_id_keys_or_create(stranger).unwrap_err();
+        let e = store
+            .memory_id_keys_or_create(stranger, &dir.path().join("state-agent"))
+            .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
         assert!(
             !std::fs::exists(store.agent_dir(stranger)).unwrap(),
@@ -987,7 +1184,7 @@ mod tests {
     fn forgotten(store: &KeyStore, id: AgentId, stamp: &str) -> std::path::PathBuf {
         store
             .agent_dir(id)
-            .join(format!("{FORGOTTEN_MEMORY_ID_KEY_PREFIX}{stamp}.json"))
+            .join(FORGOTTEN_MEMORY_ID_KEY.name(stamp))
     }
 
     /// After `sealed-forget`, the key set aside is current again, and its
@@ -996,11 +1193,17 @@ mod tests {
     fn a_forgotten_memory_id_key_is_revived_not_reminted() {
         let dir = crate::sealed::TestDir::new("keys-memory-id-revive");
         let (store, id) = with_agent(dir.path());
-        let first = *store.memory_id_keys_or_create(id).unwrap().current.expose();
+        let first = *store
+            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+            .unwrap()
+            .current
+            .expose();
         let aside = forgotten(&store, id, "20261106T120000000Z");
         std::fs::rename(store.agent_dir(id).join(MEMORY_ID_KEY_FILE), &aside).unwrap();
         let record = std::fs::read(&aside).unwrap();
-        let back = store.memory_id_keys_or_create(id).unwrap();
+        let back = store
+            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+            .unwrap();
         assert_eq!(*back.current.expose(), first, "the same key");
         assert!(back.past.is_empty());
         assert_eq!(std::fs::read(&aside).unwrap(), record, "byte for byte");
@@ -1033,7 +1236,9 @@ mod tests {
             &file(c, &[b]),
         )
         .unwrap();
-        let keys = store.memory_id_keys_or_create(id).unwrap();
+        let keys = store
+            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+            .unwrap();
         let all: Vec<[u8; 32]> = keys.all().map(|k| *k.expose()).collect();
         assert_eq!(all, [c, b, a], "current, then past newest first, each once");
     }
@@ -1045,10 +1250,123 @@ mod tests {
         let (store, id) = with_agent(dir.path());
         let aside = forgotten(&store, id, "20261106T120000000Z");
         write_secret(&aside, b"{\"current\": {").unwrap();
-        let e = store.memory_id_keys_or_create(id).unwrap_err().to_string();
+        let e = store
+            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("20261106T120000000Z"), "{e}");
         assert!(store.memory_id_keys(id).unwrap().is_none(), "nothing made");
         assert_eq!(std::fs::read(&aside).unwrap(), b"{\"current\": {");
+    }
+
+    /// A secrets tree from before the key was made: the state directory's
+    /// fingerprint says there was one, so none is minted; and a key that
+    /// isn't the recorded one is refused, not used.
+    #[test]
+    fn a_secrets_tree_without_the_recorded_key_refuses() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id-fingerprint");
+        let agent = dir.path().join("state-agent");
+        let (store, id) = with_agent(dir.path());
+        let key = *store
+            .memory_id_keys_or_create(id, &agent)
+            .unwrap()
+            .current
+            .expose();
+        let fingerprint = std::fs::read(agent.join(MEMORY_ID_FINGERPRINT_FILE)).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&fingerprint).contains(&hex::encode(key)),
+            "never the key itself"
+        );
+        // Restored from before the first sweep: no key, no forgotten files
+        let path = store.agent_dir(id).join(MEMORY_ID_KEY_FILE);
+        let kept = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let e = store
+            .memory_id_keys_or_create(id, &agent)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(MEMORY_ID_FINGERPRINT_FILE), "{e}");
+        assert!(
+            store.memory_id_keys(id).unwrap().is_none(),
+            "nothing minted"
+        );
+        // Another key in its place: refused
+        let other = serde_json::json!({
+            "current": { "key": hex::encode([9u8; 32]), "created_at": "2026-11-06T00:00:00Z" },
+        });
+        write_secret(&path, &serde_json::to_vec(&other).unwrap()).unwrap();
+        assert!(store.memory_id_keys_or_create(id, &agent).is_err());
+        // The right one back: fine
+        write_secret(&path, &kept).unwrap();
+        assert_eq!(
+            *store
+                .memory_id_keys_or_create(id, &agent)
+                .unwrap()
+                .current
+                .expose(),
+            key
+        );
+        assert_eq!(
+            std::fs::read(agent.join(MEMORY_ID_FINGERPRINT_FILE)).unwrap(),
+            fingerprint
+        );
+    }
+
+    /// Revivers racing each other all get the one forgotten key.
+    #[test]
+    fn concurrent_revivers_agree() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id-revive-threads");
+        let (store, id) = with_agent(dir.path());
+        let agent = dir.path().join("state-agent");
+        let key = *store
+            .memory_id_keys_or_create(id, &agent)
+            .unwrap()
+            .current
+            .expose();
+        std::fs::rename(
+            store.agent_dir(id).join(MEMORY_ID_KEY_FILE),
+            forgotten(&store, id, "20261106T120000000Z"),
+        )
+        .unwrap();
+        let keys: Vec<[u8; 32]> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    s.spawn(|| {
+                        *store
+                            .memory_id_keys_or_create(id, &agent)
+                            .unwrap()
+                            .current
+                            .expose()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(keys.iter().all(|k| *k == key));
+    }
+
+    /// A tmp left by a maker cut between link and removal is swept by the
+    /// next maker once stale, never a fresh one.
+    #[test]
+    fn stale_key_tmps_are_swept() {
+        let dir = crate::sealed::TestDir::new("keys-memory-id-sweep");
+        let (store, id) = with_agent(dir.path());
+        let secrets = store.agent_dir(id);
+        let stale = secrets.join(format!("memory_id_key.{}.tmp", uuid::Uuid::new_v4()));
+        let fresh = secrets.join(format!("memory_id_key.{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&stale, b"x").unwrap();
+        std::fs::write(&fresh, b"x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - 2 * STALE_TMP)
+            .unwrap();
+        store
+            .memory_id_keys_or_create(id, &dir.path().join("state-agent"))
+            .unwrap();
+        assert!(!std::fs::exists(&stale).unwrap());
+        assert!(std::fs::exists(&fresh).unwrap());
     }
 
     #[test]

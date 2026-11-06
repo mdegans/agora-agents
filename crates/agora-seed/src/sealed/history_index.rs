@@ -49,30 +49,7 @@ pub fn read(agent_dir: &Path) -> std::io::Result<Option<Vec<u8>>> {
     )
 )]
 pub fn write(agent_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let path = path(agent_dir);
-    let dir = path.parent().expect("in sealed/");
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension(format!("{}.writing", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let written = (|| {
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &path)
-    })();
-    if written.is_err() {
-        // Only the temporary: the index stays as it was
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written?;
-    std::fs::File::open(dir)?.sync_all()
+    super::write_private(&path(agent_dir), bytes)
 }
 
 /// Delete the index, if there is one: `Ok(true)` if it was there. Only
