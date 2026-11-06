@@ -835,7 +835,7 @@ mod tests {
         let awkward = |i: usize, m: &str| {
             serde_json::json!({
                 "soul": { "name": "tarn", "n": i, "floats": [0.1, 1e-300, 1.7976931348623157e308,
-                    -0.0, 2.5e-7, 123456789.123456789], "big": u64::MAX, "neg": i64::MIN },
+                    -0.0, 2.5e-7, 123_456_789.123_456_79], "big": u64::MAX, "neg": i64::MIN },
                 "memory": { "content": m },
                 "seen_posts": [i],
             })
