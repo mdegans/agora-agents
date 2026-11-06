@@ -65,24 +65,38 @@ async fn blob(
             Err(e) => return Err(e).with_context(|| format!("reading blob {sha}")),
         }
     }
+    if failed.unreachable() {
+        anyhow::bail!("{UNREACHABLE} (blob {sha} not asked for)");
+    }
     if let Some(why) = failed.recent(sha) {
         anyhow::bail!(
             "blob {sha} couldn't be fetched from Agora a moment ago ({why}); not asked again yet"
         );
     }
+    // Marked failed before each try and cleared on an answer: a fetch the
+    // caller's deadline cancels mid-try is remembered all the same
     let mut last = BlobError::transient("not tried");
     for wait in FETCH_RETRIES {
         tokio::time::sleep(wait).await;
+        failed.trying(*sha);
         last = match tokio::time::timeout(FETCH_TIMEOUT, api.blob(id, signing, sha)).await {
-            Ok(Ok(bytes)) => return Ok(bytes),
+            Ok(Ok(bytes)) => {
+                failed.answered(sha, None);
+                return Ok(bytes);
+            }
             Ok(Err(e)) => e,
             Err(_) => BlobError::transient(format!("no answer in {FETCH_TIMEOUT:?}")),
         };
         if !last.retry {
+            // Agora answered: reachable, this blob just isn't to be had
+            failed.answered(sha, Some(last.message.clone()));
+            break;
+        }
+        failed.record(*sha, last.message.clone());
+        if failed.unreachable() {
             break;
         }
     }
-    failed.record(*sha, last.message.clone());
     Err(anyhow::Error::new(last)).with_context(|| format!("fetching blob {sha} from Agora"))
 }
 
@@ -95,33 +109,81 @@ const FETCH_RETRIES: [std::time::Duration; 3] = [
 ];
 
 /// The longest one try of a fetch from Agora may take (agentkit's client
-/// sets no timeout of its own).
-pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// sets no timeout of its own). A blob's three tries and their waits come
+/// to 25 s, inside the history's 30 s deadline.
+pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// How long a fetch that failed is remembered and not tried again.
 pub const FAILED_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-/// Fetches from Agora that failed lately, by blob hash: not tried again
-/// until [`FAILED_FOR`] has passed. Hold one for a session.
+/// Fetches from Agora that failed lately, by blob hash, and whether Agora
+/// is answering at all. A blob that failed isn't tried again until
+/// [`FAILED_FOR`] has passed; after [`BREAKER_AFTER`] tries in a row with
+/// no answer (timeouts, 5xx, connections), Agora is taken as unreachable
+/// for [`FAILED_FOR`] and nothing more is fetched. Hold one for a session:
+/// one outage then costs a session one bounded wait.
 #[derive(Debug, Default, Clone)]
-pub struct FailedBlobs(std::collections::HashMap<Sha256Hex, (tokio::time::Instant, String)>);
+pub struct FailedBlobs {
+    failed: std::collections::HashMap<Sha256Hex, (tokio::time::Instant, String)>,
+    /// Tries in a row without an answer, and when the last began.
+    unanswered: u32,
+    since: Option<tokio::time::Instant>,
+}
+
+/// Tries in a row without an answer before Agora is taken as unreachable.
+pub const BREAKER_AFTER: u32 = 3;
+
+/// What a version not fetched while Agora is taken as unreachable says.
+pub const UNREACHABLE: &str = "Agora couldn't be reached just now";
 
 impl FailedBlobs {
     /// Why `sha` failed, if it did within [`FAILED_FOR`].
     fn recent(&self, sha: &Sha256Hex) -> Option<&str> {
-        self.0
+        self.failed
             .get(sha)
             .filter(|(at, _)| at.elapsed() < FAILED_FOR)
             .map(|(_, why)| why.as_str())
     }
 
+    /// Whether Agora is taken as unreachable just now.
+    pub fn unreachable(&self) -> bool {
+        self.unanswered >= BREAKER_AFTER && self.since.is_some_and(|t| t.elapsed() < FAILED_FOR)
+    }
+
+    /// A try begins: counted as unanswered, and the blob as failed, until
+    /// [`Self::answered`] says otherwise.
+    fn trying(&mut self, sha: Sha256Hex) {
+        let now = tokio::time::Instant::now();
+        // Past the breaker's window, the count starts over
+        if self.since.is_some_and(|t| t.elapsed() >= FAILED_FOR) {
+            self.unanswered = 0;
+        }
+        self.unanswered += 1;
+        self.since = Some(now);
+        self.failed
+            .entry(sha)
+            .or_insert_with(|| (now, "no answer: the fetch was cut off".into()));
+    }
+
+    /// Agora answered: with the blob (`None`), or with a refusal not worth
+    /// retrying, which is remembered.
+    fn answered(&mut self, sha: &Sha256Hex, refused: Option<String>) {
+        self.unanswered = 0;
+        match refused {
+            None => {
+                self.failed.remove(sha);
+            }
+            Some(why) => self.record(*sha, why),
+        }
+    }
+
     fn record(&mut self, sha: Sha256Hex, why: String) {
-        self.0.insert(sha, (tokio::time::Instant::now(), why));
+        self.failed.insert(sha, (tokio::time::Instant::now(), why));
     }
 
     /// How many are remembered.
     pub fn count(&self) -> usize {
-        self.0.len()
+        self.failed.len()
     }
 }
 

@@ -288,7 +288,14 @@ impl MemoryReader {
             MemoryAction::Show { id, budget } => view.show(id.as_slice(), budget, current),
             MemoryAction::Diff { a, b } => view.diff(&a, b.as_ref(), current),
             MemoryAction::Search { query, mode } => {
-                let found = search(&self.agent_dir(), self.id, &view.rows, &query).await;
+                let found = search(
+                    &self.agent_dir(),
+                    self.id,
+                    &view.rows,
+                    &query,
+                    view.unreachable,
+                )
+                .await;
                 let mut out = String::new();
                 // Search takes no `SealCheck`: say it as `log` and `show` do
                 if view.seal == SealCheck::Unchecked {
@@ -407,6 +414,9 @@ struct View {
     /// Whether the main line was checked. When it wasn't, only the
     /// runner's own copies are rows.
     seal: SealCheck,
+    /// Agora was taken as unreachable: some sealed versions weren't asked
+    /// for.
+    unreachable: bool,
 }
 
 impl View {
@@ -416,6 +426,11 @@ impl View {
         agent: AgentId,
         anchors: &HashMap<Sha256Hex, GovernanceLogId>,
     ) -> Self {
+        let unreachable = history.versions.iter().any(|v| {
+            v.unopened
+                .as_deref()
+                .is_some_and(|w| w.contains(super::version::UNREACHABLE))
+        });
         let seal = if history.left_out.iter().any(|l| l.held == Held::MainLine) {
             SealCheck::Unchecked
         } else {
@@ -447,7 +462,9 @@ impl View {
                 }
                 Some(why) => {
                     let twin = v.twin_memory.as_deref().map(String::as_str);
-                    let reason = if why.contains(super::history::PAST_DEADLINE) {
+                    let reason = if why.contains(super::version::UNREACHABLE) {
+                        super::version::UNREACHABLE
+                    } else if why.contains(super::history::PAST_DEADLINE) {
                         PAST_DEADLINE
                     } else {
                         NOT_FETCHED
@@ -496,6 +513,7 @@ impl View {
             placed,
             ids,
             seal,
+            unreachable,
         }
     }
 
@@ -702,7 +720,13 @@ struct Found {
 /// no longer held. Only opened, dated versions are indexed. Written only
 /// when it changed. A write that fails is logged; the search is still
 /// answered.
-async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &str) -> Found {
+async fn search(
+    agent_dir: &Path,
+    id: AgentId,
+    rows: &[MemoryVersion],
+    query: &str,
+    unreachable: bool,
+) -> Found {
     let dir = agent_dir.to_path_buf();
     let read = tokio::task::spawn_blocking(move || {
         super::history_index::read(&dir).map(|r| (r, super::history_index::moving(&dir)))
@@ -770,7 +794,15 @@ async fn search(agent_dir: &Path, id: AgentId, rows: &[MemoryVersion], query: &s
     for (m, at, content) in indexable {
         changed |= index.add(m, at, content);
     }
-    if changed {
+    // Not while Agora can't be reached: the versions it holds would be
+    // missing, and the next search would only add them
+    if changed && unreachable {
+        tracing::info!(
+            event_type = "memory_index_not_written",
+            agent_id = %id,
+            "Agora unreachable; the memory search index is kept in memory this time"
+        );
+    } else if changed {
         let bytes = index.to_bytes();
         let size = bytes.len();
         let dir = agent_dir.to_path_buf();
@@ -1127,9 +1159,9 @@ mod tests {
             assert!(row.contains("couldn't be opened just now"), "{row}");
             let said = rd.answer(show(vec![r(&short)]), &b.api).await.text;
             assert!(
-                said.contains(&format!(
-                    "couldn't be opened just now ({NOT_FETCHED}); ask again later."
-                )),
+                [NOT_FETCHED, super::super::version::UNREACHABLE]
+                    .iter()
+                    .any(|why| said.contains(&format!("couldn't be opened just now ({why})"))),
                 "{said}"
             );
             assert!(!said.contains("synthetic"), "no content: {said}");
@@ -1143,6 +1175,28 @@ mod tests {
                 assert!(!said.contains("No version"), "{said}");
             }
         }
+    }
+
+    /// No index is written while Agora can't be reached: it would lack
+    /// the versions Agora holds.
+    #[tokio::test(start_paused = true)]
+    async fn no_index_is_written_while_agora_is_unreachable() {
+        let b = build(&Built {
+            saves: 3,
+            upload: 9,
+            rotate: false,
+            mode: Mode::Plain,
+            upload_rebased: false,
+        })
+        .await;
+        b.seal().prune_blobs().await.unwrap();
+        *b.api.blob_delay.lock().unwrap() = Some(std::time::Duration::from_secs(3600));
+        let mut rd = reader(&b.state_dir(), &b.keys, b.id, 4, None);
+        let out = rd.answer(search("synthetic"), &b.api).await.text;
+        assert!(out.contains("synthetic"), "{out}");
+        assert!(!super::super::history_index::path(&b.dir).exists());
+        let out = rd.answer(log(), &b.api).await.text;
+        assert!(out.contains(super::super::version::UNREACHABLE), "{out}");
     }
 
     /// An index built while Agora served is kept through a blip: the

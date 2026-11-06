@@ -1658,6 +1658,71 @@ mod tests {
         assert_eq!(h.versions.len(), 4, "every version still listed");
     }
 
+    /// One outage costs a session one bounded wait: after it, Agora is
+    /// taken as unreachable, and the next call costs nothing and asks
+    /// nothing; every version is still listed.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_server_costs_a_session_one_wait() {
+        let b = build(&plain(3, 9)).await;
+        b.seal().prune_blobs().await.unwrap();
+        *b.api.blob_delay.lock().unwrap() = Some(std::time::Duration::from_secs(3600));
+        let mut cache = HistoryCache::default();
+        let start = tokio::time::Instant::now();
+        resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+            .await
+            .unwrap();
+        let first = start.elapsed();
+        assert!(first < RESOLVE_DEADLINE, "{first:?}");
+        b.api.calls.lock().unwrap().clear();
+        let start = tokio::time::Instant::now();
+        let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        assert!(
+            !b.api.calls.lock().unwrap().iter().any(|c| c == "blob"),
+            "no GET"
+        );
+        assert_eq!(h.versions.len(), 4);
+        assert!(h.versions.iter().any(|v| {
+            v.unopened
+                .as_deref()
+                .is_some_and(|w| w.contains(crate::sealed::version::UNREACHABLE))
+        }));
+    }
+
+    /// Persistent 503s on a long history: the breaker trips after a few
+    /// tries, and the rest are listed unopened at once, their local twins
+    /// merged in.
+    #[tokio::test(start_paused = true)]
+    async fn persistent_503s_on_a_long_history_cost_a_few_seconds() {
+        let b = build(&plain(110, 200)).await;
+        b.seal().prune_blobs().await.unwrap();
+        *b.api.fail.lock().unwrap() = Some("blob");
+        let mut cache = HistoryCache::default();
+        let start = tokio::time::Instant::now();
+        let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+            .await
+            .unwrap();
+        let took = start.elapsed();
+        assert!(took <= std::time::Duration::from_secs(2), "{took:?}");
+        let gets = b
+            .api
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "blob")
+            .count();
+        assert_eq!(gets as u32, crate::sealed::version::BREAKER_AFTER);
+        let unopened: Vec<&Version> = h.versions.iter().filter(|v| v.unopened.is_some()).collect();
+        assert!(unopened.len() > 50, "{}", unopened.len());
+        assert!(
+            unopened.iter().all(|v| v.twin_memory.is_some()),
+            "named by their twins"
+        );
+    }
+
     /// A 404 is the answer: asked once, never retried.
     #[tokio::test(start_paused = true)]
     async fn a_missing_blob_is_asked_for_once() {
