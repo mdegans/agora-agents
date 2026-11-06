@@ -187,6 +187,16 @@ pub trait InnerSession: Agent {
         let _ = (ask, attempt, reply);
     }
 
+    /// The SHA-256 of the archive the inner session wrote to the prompt log
+    /// at its teardown (left-out replies included): the dump that exists.
+    fn archive_sha256(&self) -> Option<String> {
+        None
+    }
+
+    /// A reply the wrapper took itself: the session has begun, so a later
+    /// failure is reported.
+    fn note_reply(&mut self) {}
+
     /// The inner session's own questions (the soul mutation, evolution, the
     /// survey) that ended without an answer, by name.
     fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {
@@ -221,6 +231,14 @@ impl InnerSession for SeedAgent {
         <SeedAgent as ask::AskHost>::left_out(self, ask, attempt, reply)
     }
 
+    fn archive_sha256(&self) -> Option<String> {
+        SeedAgent::archive_sha256(self).map(|h| h.to_string())
+    }
+
+    fn note_reply(&mut self) {
+        SeedAgent::note_reply(self)
+    }
+
     fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {
         SeedAgent::unanswered_asks(self)
     }
@@ -237,6 +255,11 @@ impl InnerSession for SeedAgent {
 /// The heading the sealed-state lines are seated under, at the intro's
 /// heading level, so they don't read as part of the section before them.
 pub const SEALED_HEADING: &str = "## Your Sealed State";
+
+/// The longest the teardown waits on a failed session's mail: every save
+/// waits on it, so an outage of the relay mustn't hold each one for the
+/// whole send timeout. A mail not sent in time isn't claimed as told.
+const FAILURE_MAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `set_model`'s refusal in a trial review session, when the ledger's own
 /// blocker says nothing (it normally names the trial).
@@ -865,11 +888,8 @@ where
         if self.writes.is_empty() {
             return;
         }
-        let prompt_sha256 = agora_agentkit::reactor::seed::prompt_sha256(self.inner.prompt())
-            .map_err(|e| {
-                tracing::warn!(agent_id = %self.inner.id(), error = %e, "prompt digest failed");
-            })
-            .ok();
+        // The dump the inner teardown wrote, left-out replies included
+        let prompt_sha256 = self.inner.archive_sha256();
         let model = self.model();
         for w in &self.writes {
             let (kind, id) = match w {
@@ -935,7 +955,7 @@ where
         };
         // Whether the mail actually goes out: only then is the agent told
         // its operator was
-        let told = self.rt.alerts.dispatch(alert).await;
+        let told = self.rt.alerts.dispatch(alert, FAILURE_MAIL_TIMEOUT).await;
         if let Some(journal) = &self.journal {
             let ended = agora_agentkit::reactor::journal::SessionEnded {
                 at: Utc::now(),
@@ -2012,6 +2032,7 @@ where
     /// the inner session's phase (which, held or acting, would refuse it or
     /// begin the memory rewrite); any other is the inner session's own.
     async fn on_pause(&mut self, response: response::Message) -> Result<Control, A::Error> {
+        self.inner.note_reply();
         if self.asks.is_active() {
             return self.inner.resume_question_pause(response);
         }
@@ -2019,6 +2040,7 @@ where
     }
 
     async fn on_truncate(&mut self, response: &response::Message) -> Result<Control, A::Error> {
+        self.inner.note_reply();
         self.inner.on_truncate(response).await
     }
 
@@ -2030,6 +2052,8 @@ where
     /// ([`close`](Self::close)), asked by agentkit's driver while one is
     /// seated, then its held epilogue — the survey, last.
     async fn handle(&mut self, response: response::Message) -> Result<Control, A::Error> {
+        // Begun, whichever of us takes the reply: a later failure is told
+        self.inner.note_reply();
         self.count_showing().await;
         let control = if self.asks.is_active() {
             ask::handle(self, response).await?
@@ -2141,11 +2165,7 @@ where
         if self.show.shown {
             // The dump that holds the recovered text: recorded, and logged
             // under its own event so `forks` never uses it as a source.
-            let prompt_sha256 = agora_agentkit::reactor::seed::prompt_sha256(self.inner.prompt())
-                .map_err(|e| {
-                    tracing::warn!(agent_id = %self.inner.id(), error = %e, "prompt digest failed");
-                })
-                .ok();
+            let prompt_sha256 = self.inner.archive_sha256();
             // Uncounted (no response came back): nothing to end, and the
             // latest entry, if any, is an earlier session's.
             if self.show.counted {
@@ -2355,6 +2375,10 @@ mod tests {
         }
         fn record_failure(&mut self, failure: SessionFailure) {
             self.failure.get_or_insert(failure);
+        }
+        /// As if it wrote its transcript to the prompt log
+        fn archive_sha256(&self) -> Option<String> {
+            agora_agentkit::reactor::seed::prompt_sha256(&self.state.prompt).ok()
         }
     }
 
@@ -8099,6 +8123,84 @@ mod tests {
                 .history
                 .iter()
                 .any(|e| matches!(e.kind, crate::consent::ledger::EventKind::Unusable { .. }))
+        );
+    }
+
+    /// A showing session records the dump its inner teardown actually
+    /// wrote: the archive, a left-out reply included, not a hash of the
+    /// prompt (which the left-out reply isn't in).
+    #[tokio::test]
+    async fn a_showing_records_the_archive_it_wrote() {
+        use agora_agentkit::reactor::ask::AskHost;
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::with_restore("restore-archive", &["tarn"]);
+        restore_answered(&h, "show", "").await;
+        let mut agent = seed_agent(
+            &h,
+            OTHER,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        assert!(agent.show.shown, "the recovered memory is shown");
+        drive(
+            &mut agent,
+            vec![reply("That's all for today."), reply(MEMORY_REPLY)],
+        )
+        .await;
+        agent.left_out("offer:role", 1, &reply("A reply the retry left out."));
+        let rehashed = agora_agentkit::reactor::seed::prompt_sha256(agent.prompt()).unwrap();
+        agent.on_teardown().await.unwrap();
+        let ledger = restore_ledger(&h).await;
+        let sha = ledger
+            .showings
+            .last()
+            .unwrap()
+            .prompt_sha256
+            .clone()
+            .unwrap();
+        assert_ne!(sha, rehashed, "the archive holds the left-out reply");
+        let path = h
+            .root
+            .join("prompts")
+            .join(&sha[..2])
+            .join(format!("{sha}.json"));
+        assert!(
+            path.exists(),
+            "names a dump that exists: {}",
+            path.display()
+        );
+        let dump = std::fs::read_to_string(path).unwrap();
+        assert!(dump.contains("A reply the retry left out."));
+    }
+
+    /// A review session whose first reply is a refusal has begun (the
+    /// wrapper took the reply, not the inner session): its failure is
+    /// reported, so it is mailed and journaled.
+    #[tokio::test]
+    async fn a_review_refused_at_its_first_reply_is_reported() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("review-refused-begun");
+        through_the_trial(&h).await;
+        let mut agent = seed_agent(&h, OLD, SeedConfig::default());
+        agent.on_init().await.unwrap();
+        let mut refusal = reply("No.");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(
+            matches!(
+                agent.inner.failure(),
+                Some(SessionFailure::Refused { during, .. }) if during == "review"
+            ),
+            "{:?}",
+            agent.inner.failure()
         );
     }
 

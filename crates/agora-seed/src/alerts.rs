@@ -1004,17 +1004,19 @@ impl Alerter {
             .lock()
             .expect("alert queue lock")
             .spawn(async move {
-                task.deliver(alert).await;
+                let timeout = task.send_timeout;
+                task.deliver(alert, timeout).await;
             });
     }
 
     /// [`Self::notify`], awaited: whether the mail actually went out
     /// (configured, outside its rate limit or unlimited, and sent within
-    /// the send timeout). For what tells an agent its operator was told
+    /// `timeout`, which may be shorter than the configured one). For what
+    /// tells an agent its operator was told
     /// ([`crate::interrupted`]): only a mail that went out does.
-    pub async fn dispatch(&self, alert: Alert) -> bool {
+    pub async fn dispatch(&self, alert: Alert, timeout: Duration) -> bool {
         match self.configured(&alert) {
-            Some(inner) => inner.deliver(alert).await,
+            Some(inner) => inner.deliver(alert, timeout.min(inner.send_timeout)).await,
             None => false,
         }
     }
@@ -1072,9 +1074,9 @@ impl Inner {
     }
 
     /// Admit `alert` and send it: whether it went out.
-    async fn deliver(&self, alert: Alert) -> bool {
+    async fn deliver(&self, alert: Alert, timeout: Duration) -> bool {
         let now = Utc::now();
-        self.admit(&alert, now).await && self.send(alert, now).await
+        self.admit(&alert, now).await && self.send(alert, now, timeout).await
     }
 
     /// Whether `alert` may be sent now: an unlimited kind always, others
@@ -1114,10 +1116,10 @@ impl Inner {
 
     /// Send an admitted alert: whether it went out. A failed send gives
     /// its slot back.
-    async fn send(&self, alert: Alert, now: DateTime<Utc>) -> bool {
+    async fn send(&self, alert: Alert, now: DateTime<Utc>, timeout: Duration) -> bool {
         let key = alert.rate_key();
         let result = match self.message(&alert) {
-            Ok(message) => tokio::time::timeout(self.send_timeout, self.mailer.send(message))
+            Ok(message) => tokio::time::timeout(timeout, self.mailer.send(message))
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out"))),
             Err(e) => Err(e),
@@ -1473,19 +1475,32 @@ mod tests {
         );
         let failing = Alerter::with_mailer(&config, Box::new(Failing), &dir, None);
         let alert = || Alert::new(AlertKind::SessionFailed, "x").model("m");
-        assert!(!failing.dispatch(alert()).await, "the send failed");
+        assert!(
+            !failing.dispatch(alert(), Duration::from_secs(10)).await,
+            "the send failed"
+        );
         let sent = Recorder::default();
         let ok = Alerter::with_mailer(&config, Box::new(sent.clone()), &dir, None);
         assert!(
-            ok.dispatch(alert()).await,
+            ok.dispatch(alert(), Duration::from_secs(10)).await,
             "the failed one's slot was given back"
         );
-        assert!(!ok.dispatch(alert()).await, "inside the rate limit");
+        assert!(
+            !ok.dispatch(alert(), Duration::from_secs(10)).await,
+            "inside the rate limit"
+        );
         let refusal = || Alert::new(AlertKind::ApiRefusal, "x").model("m");
-        assert!(ok.dispatch(refusal()).await);
-        assert!(ok.dispatch(refusal()).await, "unlimited");
+        assert!(ok.dispatch(refusal(), Duration::from_secs(10)).await);
+        assert!(
+            ok.dispatch(refusal(), Duration::from_secs(10)).await,
+            "unlimited"
+        );
         assert_eq!(sent.sent().len(), 3);
-        assert!(!Alerter::off().dispatch(alert()).await);
+        assert!(
+            !Alerter::off()
+                .dispatch(alert(), Duration::from_secs(10))
+                .await
+        );
     }
 
     #[test]

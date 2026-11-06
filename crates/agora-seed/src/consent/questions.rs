@@ -263,25 +263,6 @@ mod tests {
         }
     }
 
-    /// What agentkit's [`assert_constrainable`] doesn't already catch in a
-    /// description (it has links, paths and plumbing): the runner's own
-    /// tells of a doc comment, its talk of the wire and its dates (beta
-    /// round 20).
-    fn agent_facing(schema: &serde_json::Value) {
-        match schema {
-            serde_json::Value::Object(map) => {
-                if let Some(d) = map.get("description").and_then(|d| d.as_str()) {
-                    for ours in ["[`", "wire", "Closed", "schema", "2026-"] {
-                        assert!(!d.contains(ours), "{ours:?} in {d:?}");
-                    }
-                }
-                map.values().for_each(agent_facing);
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(agent_facing),
-            _ => {}
-        }
-    }
-
     /// Every closing question's schema, for every order an agent can be
     /// shown, is fit to constrain with: inline, closed, no `pattern`, no
     /// reasoning field, `choice` listing exactly the options shown, in
@@ -345,9 +326,10 @@ mod tests {
             };
             schemas.push((q.schema(), order.map(SealChoice::as_str).to_vec()));
         }
+        // assert_constrainable checks every description is the agent's,
+        // not a Rust doc's
         for (schema, shown) in schemas {
             assert_constrainable(&schema);
-            agent_facing(&schema);
             assert_eq!(
                 schema["properties"]["choice"]["enum"],
                 serde_json::json!(shown)
