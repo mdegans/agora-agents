@@ -40,7 +40,7 @@ use crate::alerts::{Alert, AlertKind, Alerter};
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.153.0:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.154.0:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,7 +600,22 @@ impl AnchorsSaid {
     pub fn text(&self) -> String {
         let mut out = String::new();
         if let Some(r) = self.report() {
-            out.push_str(&super::inclusion::sentence(&r.newest, self.began));
+            // The newest, said with the earlier ones that couldn't be
+            // checked for the same reason when it couldn't be either
+            // (beta round 14); else alone, and those after the failures
+            let newest_unchecked = r.newest.finding.unchecked().is_some();
+            let mut groups = super::inclusion::unchecked_groups(
+                newest_unchecked.then_some(&r.newest),
+                &r.unchecked,
+                self.began,
+            )
+            .into_iter();
+            // The newest (with its group), then failures, then the rest
+            out.push_str(&if newest_unchecked {
+                groups.next().unwrap_or_default()
+            } else {
+                super::inclusion::sentence(&r.newest, self.began)
+            });
             for c in &r.earlier {
                 out.push_str(&super::inclusion::sentence(c, self.began));
             }
@@ -611,11 +626,7 @@ impl AnchorsSaid {
                     if r.more == 1 { "" } else { "s" }
                 ));
             }
-            out.push_str(&super::inclusion::unchecked_sentence(
-                &r.unchecked,
-                r.newest.finding.unchecked().is_some(),
-                self.began,
-            ));
+            out.extend(groups);
         }
         let Some(u) = &self.unjudged else {
             return out;
@@ -2183,15 +2194,14 @@ pub(crate) mod tests {
         let (first, told) = check_told().await;
         assert!(
             first.contains(
-                ". ANC-2026-0004, the anchor for 2026-11-04, holds a version of yours (its \
-                 proof matches the root in the governance log), but your runner couldn't check \
-                 that it is the right one: it has no record of when Agora confirmed your \
-                 uploads before 2026-11-06, when it began keeping one. Your runner couldn't \
-                 check earlier anchors either: ANC-2026-0001 was written before Agora began \
-                 storing proofs; for ANC-2026-0002 and ANC-2026-0003, your runner has no record \
-                 of when Agora confirmed your uploads before 2026-11-06, when it began keeping \
-                 one (ANC-2026-0003 holds a version of yours whose proof matches the governance \
-                 log). This session starts from head "
+                ". Your runner couldn't check ANC-2026-0002 to ANC-2026-0004 (the newest, for \
+                 2026-11-04): it has no record of when Agora confirmed your uploads before \
+                 2026-11-06, when it began keeping one. Of these, ANC-2026-0003 and \
+                 ANC-2026-0004 each hold a version of yours whose proof matches the root in the \
+                 governance log; Agora serves no proof that ANC-2026-0002 includes you, and your \
+                 runner can't tell whether it should. Your runner couldn't check ANC-2026-0001: \
+                 it was written before Agora began storing proofs. This session starts from \
+                 head "
             ),
             "{first}"
         );
@@ -2200,7 +2210,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let later = check_told().await.0;
-        assert!(!later.contains("earlier anchors"), "{later}");
+        // Said once: the earlier ones are gone, the newest said alone
+        assert!(!later.contains("ANC-2026-0001"), "{later}");
+        assert!(!later.contains("ANC-2026-0002"), "{later}");
         assert!(
             later.contains("ANC-2026-0004, the anchor for 2026-11-04, holds"),
             "{later}"
