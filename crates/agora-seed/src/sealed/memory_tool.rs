@@ -292,7 +292,7 @@ impl MemoryReader {
             MemoryAction::Log { before, limit } => view.log(before.as_ref(), limit, &current),
             MemoryAction::Show { id, budget } => view.show(id.as_slice(), budget, current),
             MemoryAction::Diff { a, b } => view.diff(&a, b.as_ref(), current),
-            MemoryAction::Search { query, mode } => {
+            MemoryAction::Search { query } => {
                 let found = search(
                     &self.agent_dir(),
                     self.id,
@@ -306,7 +306,7 @@ impl MemoryReader {
                 if view.seal == SealCheck::Unchecked {
                     out.push_str(UNCHECKED);
                 }
-                push_block(&mut out, &found.result.render(mode, found.state));
+                push_block(&mut out, &found.result.render(found.state));
                 out
             }
         };
@@ -649,8 +649,9 @@ impl View {
                 },
             },
         };
-        let body = render::log(&self.rows, start, log_limit(limit), current, self.seal);
-        compose(&notes, &body)
+        let limit = log_limit(limit);
+        let body = render::log(&self.rows, start, limit.value, current, self.seal);
+        adjusted(limit.note, compose(&notes, &body))
     }
 
     fn show(&self, refs: &[HistoryRef], budget: Option<u32>, current: CurrentMemory<'_>) -> String {
@@ -668,8 +669,9 @@ impl View {
         if picked.is_empty() {
             return compose(&notes, "");
         }
-        let body = render::show(&self.rows, &picked, current, show_budget(budget), self.seal);
-        compose(&notes, &body)
+        let budget = show_budget(budget);
+        let body = render::show(&self.rows, &picked, current, budget.value, self.seal);
+        adjusted(budget.note, compose(&notes, &body))
     }
 
     fn diff(&self, a: &HistoryRef, b: Option<&HistoryRef>, current: CurrentMemory<'_>) -> String {
@@ -694,6 +696,19 @@ impl View {
         };
         let body = render::diff(&self.rows[a], b.map(|b| &self.rows[b]), current);
         compose(&notes, &body)
+    }
+}
+
+/// `out`, opened with what agentkit says of a limit or budget it
+/// adjusted, if it did.
+fn adjusted(note: Option<String>, out: String) -> String {
+    match note {
+        Some(note) => {
+            let mut said = note;
+            push_block(&mut said, &out);
+            said
+        }
+        None => out,
     }
 }
 
@@ -957,10 +972,7 @@ mod tests {
     }
 
     fn search(q: &str) -> A {
-        A::Search {
-            query: q.into(),
-            mode: None,
-        }
+        A::Search { query: q.into() }
     }
 
     /// Every file under `root`, by path, size and mode.
@@ -1004,6 +1016,19 @@ mod tests {
         let out = rd.answer(log(), &api).await;
         assert!(!out.error);
         assert!(out.text.starts_with(LOCAL_ONLY), "{}", out.text);
+        // A limit agentkit adjusted is said first
+        let lowered = rd
+            .answer(
+                A::Log {
+                    before: None,
+                    limit: Some(500),
+                },
+                &api,
+            )
+            .await
+            .text;
+        assert!(lowered.starts_with("Limit lowered to 50."), "{lowered}");
+        assert!(lowered.contains(LOCAL_ONLY), "{lowered}");
         assert!(out.text.contains(&format!("{}  memory", mem(id, 3))));
         assert!(out.text.contains("← this session"), "{}", out.text);
         assert!(!out.text.contains("head "), "{}", out.text);
@@ -1379,6 +1404,13 @@ mod tests {
         let result = tool
             .call(call(
                 serde_json::json!({"command": "view", "path": "/memories"}),
+            ))
+            .await;
+        assert!(result.is_error);
+        // An empty query is refused at parse
+        let result = tool
+            .call(call(
+                serde_json::json!({"request": {"action": "search", "query": " "}}),
             ))
             .await;
         assert!(result.is_error);
