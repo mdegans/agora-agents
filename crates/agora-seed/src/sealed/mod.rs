@@ -47,6 +47,14 @@ mod crash_tests;
 pub mod drain;
 pub mod enroll;
 pub mod forget;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the memory tool uses it; wired in the integration step"
+    )
+)]
+pub mod history;
 pub mod history_index;
 pub mod inclusion;
 pub mod keys;
