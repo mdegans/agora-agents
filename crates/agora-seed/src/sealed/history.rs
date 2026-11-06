@@ -5,11 +5,12 @@
 //! | Source | Held in | Shown when |
 //! |---|---|---|
 //! | [`Source::Sealed`], [`Source::ArchivedPrior`] | the main line to `sealed/head.json`'s head | the line verifies ([`super::version::verified_line`]: through Agora's entries where it runs through them) |
-//! | [`Source::SideLine`] | `sealed/outbox/*.displaced`, and entries held here off the main line | its own line verifies from the genesis (`verify_chain`); else left out, with a structured warning |
+//! | [`Source::SideLine`] | `sealed/outbox/*.displaced`, and entries a later save forked from (`head.json`'s `displaced`) | its own line verifies from the genesis (`verify_chain`); else left out, with a structured warning |
+//! | [`Source::OffLine`] | other entries held here off the main line | the same |
 //! | [`Source::SetAside`] | `sealed/lost/<utc>/` (and `sealed/sent/*.lost`) | the same |
 //! | [`Source::LocalCopy`] | the archives `state.<utc>.json` | always: not sealed, so no head |
 //! | [`Source::Current`] | `state.json` | always |
-//! | [`Source::NeverSaved`] | `unsaved.<utc>.json` rescues | always: never saved, never signed |
+//! | [`Source::KeptAtExit`] | `unsaved.<utc>.json` | always: unsigned |
 //!
 //! **One version, many sources.** A version is one state: sources holding
 //! the same state (the same `plaintext_hash`, the hash of its canonical
@@ -21,6 +22,15 @@
 //! Versions with the same memory but different states stay apart: the
 //! renderer marks them ("same memory as above").
 //!
+//! **A sealed version that can't be opened just now** (a blob Agora didn't
+//! serve, after a few tries) stays listed with its sealed source and head,
+//! [`Version::unopened`] saying why, and no memory. Its local twin, matched
+//! by the plaintext hash the runner recorded when it sealed it, is merged
+//! in as a source rather than standing in for it as an unsigned copy. A
+//! main line that can't be read at all is [`Held::MainLine`] in
+//! [`History::left_out`]: the archives then show as local copies, and the
+//! renderer should say the sealed history couldn't be checked.
+//!
 //! **Any head the agent was shown** is answered ([`History::find_head`]):
 //! with the version that holds it (a side line's or a set-aside one's
 //! source says so), or with why it is held but not shown ([`LeftOut`]),
@@ -29,8 +39,15 @@
 //! **Read-only.** Nothing here writes: not the state, the outbox, the
 //! receipts or the inclusion record. Blobs no longer held here are fetched
 //! from Agora and checked against their entries ([`super::version::Opener`]),
-//! and nothing fetched is written anywhere. Content is never logged:
+//! and nothing fetched is written anywhere. What was opened is kept in the
+//! caller's [`HistoryCache`] only, in memory. Content is never logged:
 //! warnings carry hashes, seqs, file names and counts.
+//!
+//! **Network, per call:** one blob GET for each sealed version not in the
+//! cache and no longer held here (plus its keyframe's, once per run of
+//! deltas, retried up to three times each on failure), and up to two chain
+//! GETs (one for a main line that runs through Agora's entries, one for a
+//! side line that does).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -46,7 +63,7 @@ use zeroize::Zeroizing;
 
 use super::KeyStore;
 use super::api::SealedApi;
-use super::check::{local_entries, merge_server, walk_line};
+use super::check::{merge_server, walk_line};
 use super::version::{Opener, verified_line};
 
 /// Which line a sealed version is on.
@@ -54,7 +71,8 @@ use super::version::{Opener, verified_line};
 pub enum Line {
     /// The main line to `sealed/head.json`'s head.
     Main,
-    /// Off it: displaced by a fork, or set aside by a rebase.
+    /// Off it: displaced by a fork, set aside by a rebase, or otherwise
+    /// not on the current line.
     Side,
 }
 
@@ -65,19 +83,29 @@ pub enum Source {
     Sealed { head: HeadRef },
     /// The pre-loss copy, sealed on the main line (`archived_prior`).
     ArchivedPrior { head: HeadRef },
-    /// Sealed on a side line the operator rebased away from (a fork's
-    /// displaced entry), verified from the genesis.
+    /// Sealed on a side line the operator rebased away from, or a later
+    /// save forked from (a `.displaced` entry, or a head `head.json`
+    /// records as displaced), verified from the genesis.
     SideLine { head: HeadRef },
-    /// Set aside on `on`, when the agent's line was rebased
-    /// (`sealed/lost/<utc>/`), verified from the genesis.
-    SetAside { head: HeadRef, on: DateTime<Utc> },
+    /// Sealed and verified from the genesis, held here but not on the
+    /// current main line, with no record of why. Neutral: not called
+    /// rebased.
+    OffLine { head: HeadRef },
+    /// Set aside when the agent's line was rebased (`sealed/lost/<utc>/`,
+    /// or `sent/*.lost`), verified from the genesis. `on` is when, `None`
+    /// if unknown.
+    SetAside {
+        head: HeadRef,
+        on: Option<DateTime<Utc>>,
+    },
     /// A local archive, `state.<utc>.json`: the runner's own copy, not
     /// sealed, so no head.
     LocalCopy { file: String },
     /// `state.json`.
     Current,
-    /// `unsaved.<utc>.json`: the run ended before saving it. Unsigned.
-    NeverSaved { file: String },
+    /// `unsaved.<utc>.json`: a copy your runner kept when a run ended
+    /// without saving. Unsigned; nothing here checks where it came from.
+    KeptAtExit { file: String },
 }
 
 impl Source {
@@ -87,8 +115,9 @@ impl Source {
             Self::Sealed { head }
             | Self::ArchivedPrior { head }
             | Self::SideLine { head }
+            | Self::OffLine { head }
             | Self::SetAside { head, .. } => Some(*head),
-            Self::LocalCopy { .. } | Self::Current | Self::NeverSaved { .. } => None,
+            Self::LocalCopy { .. } | Self::Current | Self::KeptAtExit { .. } => None,
         }
     }
 
@@ -96,8 +125,10 @@ impl Source {
     pub fn line(&self) -> Option<Line> {
         match self {
             Self::Sealed { .. } | Self::ArchivedPrior { .. } => Some(Line::Main),
-            Self::SideLine { .. } | Self::SetAside { .. } => Some(Line::Side),
-            Self::LocalCopy { .. } | Self::Current | Self::NeverSaved { .. } => None,
+            Self::SideLine { .. } | Self::OffLine { .. } | Self::SetAside { .. } => {
+                Some(Line::Side)
+            }
+            Self::LocalCopy { .. } | Self::Current | Self::KeptAtExit { .. } => None,
         }
     }
 
@@ -105,26 +136,31 @@ impl Source {
     fn rank(&self) -> u8 {
         match self {
             Self::Sealed { .. } | Self::ArchivedPrior { .. } => 0,
-            Self::SideLine { .. } | Self::SetAside { .. } => 1,
+            Self::SideLine { .. } | Self::SetAside { .. } | Self::OffLine { .. } => 1,
             Self::Current => 2,
             Self::LocalCopy { .. } => 3,
-            Self::NeverSaved { .. } => 4,
+            Self::KeptAtExit { .. } => 4,
         }
     }
 }
 
 /// One version of the agent's state, as the `memory` tool shows it.
 pub struct Version {
-    /// When the state existed: the first source's (a sealed entry's
-    /// signed `state_at`; else the file's mtime, when it was written).
-    pub at: DateTime<Utc>,
+    /// When the state existed: a sealed entry's signed `state_at`; else the
+    /// file's mtime, when it was written. `None`: date unknown.
+    pub at: Option<DateTime<Utc>>,
     /// Everywhere it is held, sealed on the main line first.
     pub sources: Vec<Source>,
     /// `plaintext_hash` of the state: what makes two sources one version.
-    pub state_hash: Sha256Hex,
+    /// For an unopened sealed version, the hash the runner recorded when
+    /// it sealed it, if it has one.
+    pub state_hash: Option<Sha256Hex>,
     /// `memory.content`, raw (the pre-loss copy's `content`); `None` if the
-    /// state holds no memory. Never logged.
+    /// state holds no memory, or it couldn't be opened. Never logged.
     pub memory: Option<Zeroizing<String>>,
+    /// Why a sealed version couldn't be opened just now (Agora unreachable,
+    /// a blob not served): it is listed, without its memory.
+    pub unopened: Option<String>,
 }
 
 impl std::fmt::Debug for Version {
@@ -140,6 +176,7 @@ impl std::fmt::Debug for Version {
                     .as_ref()
                     .map(|m| format!("[{} chars]", m.chars().count())),
             )
+            .field("unopened", &self.unopened)
             .finish()
     }
 }
@@ -150,7 +187,7 @@ impl Version {
         self.sources.iter().filter_map(Source::head)
     }
 
-    /// Its memory text, `""` if it has none.
+    /// Its memory text, `""` if it has none (or it is unopened).
     pub fn memory_str(&self) -> &str {
         self.memory.as_deref().map_or("", String::as_str)
     }
@@ -176,8 +213,8 @@ pub struct LeftOut {
     pub why: String,
 }
 
-/// Every version an agent can be shown, oldest first, and what was held
-/// but left out.
+/// Every version an agent can be shown, oldest first (date unknown last),
+/// and what was held but left out.
 #[derive(Debug, Default)]
 pub struct History {
     pub versions: Vec<Version>,
@@ -245,6 +282,42 @@ impl History {
     }
 }
 
+/// What one opened sealed entry, or one read local file, came to.
+#[derive(Clone)]
+struct Opened {
+    state_hash: Sha256Hex,
+    memory: Option<Zeroizing<String>>,
+}
+
+/// What [`resolve`] opened and read, kept for the next call: sealed
+/// entries by entry hash (an entry binds its blob, so what it opened to
+/// never changes), local files by path, size and mtime. Only what opened
+/// is kept; a failure is tried again next call. Hold one for a session so
+/// repeated `memory` calls don't refetch every pruned blob; drop it to
+/// start over. In memory only; holds memory text, so its `Debug` shows
+/// counts.
+#[derive(Default)]
+pub struct HistoryCache {
+    sealed: HashMap<Sha256Hex, Opened>,
+    files: HashMap<(PathBuf, u64, std::time::SystemTime), Opened>,
+}
+
+impl std::fmt::Debug for HistoryCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryCache")
+            .field("sealed", &self.sealed.len())
+            .field("files", &self.files.len())
+            .finish()
+    }
+}
+
+impl HistoryCache {
+    /// How many sealed entries and local files it holds.
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.sealed.len(), self.files.len())
+    }
+}
+
 /// Builds a [`History`], merging sources of one state into one version.
 #[derive(Default)]
 struct Builder {
@@ -253,30 +326,53 @@ struct Builder {
 }
 
 impl Builder {
-    fn add(
+    fn add(&mut self, source: Source, at: Option<DateTime<Utc>>, opened: Opened) {
+        if let Some(&i) = self.by_hash.get(&opened.state_hash) {
+            let v = &mut self.history.versions[i];
+            if !v.sources.contains(&source) {
+                v.sources.push(source);
+            }
+            // A sealed twin that couldn't be opened gets no content from a
+            // local copy: it stays as sealed, unopened
+            return;
+        }
+        self.by_hash
+            .insert(opened.state_hash, self.history.versions.len());
+        self.history.versions.push(Version {
+            at,
+            sources: vec![source],
+            state_hash: Some(opened.state_hash),
+            memory: opened.memory,
+            unopened: None,
+        });
+    }
+
+    /// A sealed version that couldn't be opened: listed, merged with its
+    /// twin by the recorded hash if there is one.
+    fn add_unopened(
         &mut self,
         source: Source,
-        at: DateTime<Utc>,
-        state_hash: Sha256Hex,
-        memory: Option<Zeroizing<String>>,
+        at: Option<DateTime<Utc>>,
+        recorded: Option<Sha256Hex>,
+        why: String,
     ) {
-        match self.by_hash.get(&state_hash) {
-            Some(&i) => {
-                let v = &mut self.history.versions[i];
-                if !v.sources.contains(&source) {
-                    v.sources.push(source);
-                }
+        if let Some(i) = recorded.and_then(|h| self.by_hash.get(&h).copied()) {
+            let v = &mut self.history.versions[i];
+            if !v.sources.contains(&source) {
+                v.sources.push(source);
             }
-            None => {
-                self.by_hash.insert(state_hash, self.history.versions.len());
-                self.history.versions.push(Version {
-                    at,
-                    sources: vec![source],
-                    state_hash,
-                    memory,
-                });
-            }
+            return;
         }
+        if let Some(h) = recorded {
+            self.by_hash.insert(h, self.history.versions.len());
+        }
+        self.history.versions.push(Version {
+            at,
+            sources: vec![source],
+            state_hash: recorded,
+            memory: None,
+            unopened: Some(why),
+        });
     }
 
     fn leave_out(&mut self, held: Held, why: impl Into<String>) {
@@ -291,8 +387,10 @@ impl Builder {
             v.sources.sort_by_key(Source::rank);
         }
         // Stable: versions of one instant keep their order (the main line's
-        // by seq)
-        self.history.versions.sort_by_key(|v| v.at);
+        // by seq); date unknown last
+        self.history
+            .versions
+            .sort_by_key(|v| (v.at.is_none(), v.at));
         self.history
     }
 }
@@ -310,10 +408,6 @@ fn memory_of(kind: StateEntryKind, value: &serde_json::Value) -> Option<Zeroizin
     text.map(|t| Zeroizing::new(t.to_string()))
 }
 
-fn micros(t: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_micros(t).unwrap_or_default()
-}
-
 fn head_of(entry: &SignedStateEntry) -> HeadRef {
     HeadRef {
         entry_hash: entry.entry_hash(),
@@ -323,23 +417,26 @@ fn head_of(entry: &SignedStateEntry) -> HeadRef {
 
 /// Every version agent `id` can be shown. `Err` only when its directory
 /// can't be listed; anything else held but unreadable, unverifiable or
-/// unopenable is in [`History::left_out`].
+/// unopenable is in [`History::left_out`], or listed unopened.
 pub async fn resolve(
     state_dir: &Path,
     keys: &KeyStore,
     api: &dyn SealedApi,
     id: AgentId,
+    cache: &mut HistoryCache,
 ) -> anyhow::Result<History> {
     let agent_dir = state_dir.join(id.to_string());
     let mut b = Builder::default();
-    sealed(&agent_dir, keys, api, id, &mut b).await;
+    sealed(&agent_dir, keys, api, id, cache, &mut b).await;
     let dir = agent_dir.clone();
-    let local = tokio::task::spawn_blocking(move || local_files(&dir))
+    let files = std::mem::take(&mut cache.files);
+    let (local, files) = tokio::task::spawn_blocking(move || local_files(&dir, files))
         .await
-        .map_err(|e| anyhow::anyhow!("the local read failed: {e}"))??;
-    for found in local {
+        .map_err(|e| anyhow::anyhow!("the local read failed: {e}"))?;
+    cache.files = files;
+    for found in local? {
         match found {
-            Ok(l) => b.add(l.source, l.at, l.state_hash, l.memory),
+            Ok((source, at, opened)) => b.add(source, at, opened),
             Err(left) => b.history.left_out.push(left),
         }
     }
@@ -349,13 +446,35 @@ pub async fn resolve(
 /// How a side entry was found.
 #[derive(Clone, Copy)]
 enum Aside {
+    /// `.displaced`, or a head `head.json` records as displaced.
     Displaced,
-    Lost(DateTime<Utc>),
+    /// Set aside by a rebase, on this date if known.
+    Lost(Option<DateTime<Utc>>),
+    /// Held here off the main line, with no record of why.
+    Off,
+}
+
+/// What `sealed/` holds besides the main line, read off the async runtime.
+struct SealedFiles {
+    /// `sealed/lost/<utc>/` directories, and what each set aside.
+    resolutions: Vec<(PathBuf, super::lost::Intent)>,
+    /// `sent/` and committed `outbox/` items (plaintext hashes recorded
+    /// when sealed), read through agentkit after the rest.
+    items: Vec<OutboxItem>,
+    /// `sent/*.lost` items, with their file's mtime.
+    lost: Vec<(OutboxItem, Option<DateTime<Utc>>)>,
+    /// `outbox/*.displaced` items.
+    displaced: Vec<OutboxItem>,
+    left_out: Vec<LeftOut>,
 }
 
 /// `OutboxItem`s in `dir` with extension `ext`, and their files' mtimes.
 /// Unreadable ones are left out, by name.
-fn read_items(dir: &Path, ext: &str, b: &mut Builder) -> Vec<(OutboxItem, DateTime<Utc>)> {
+fn read_items(
+    dir: &Path,
+    ext: &str,
+    left_out: &mut Vec<LeftOut>,
+) -> Vec<(OutboxItem, Option<DateTime<Utc>>)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -373,18 +492,46 @@ fn read_items(dir: &Path, ext: &str, b: &mut Builder) -> Vec<(OutboxItem, DateTi
                     .map_err(|e| format!("{:?}", e.classify()))
             });
         match read {
-            Ok(item) => {
-                let mtime = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .map(DateTime::<Utc>::from)
-                    .unwrap_or_default();
-                out.push((item, mtime));
-            }
-            Err(why) => b.leave_out(Held::File { name }, format!("unreadable: {why}")),
+            Ok(item) => out.push((item, mtime(&path))),
+            Err(why) => left_out.push(LeftOut {
+                held: Held::File { name },
+                why: format!("unreadable: {why}"),
+            }),
         }
     }
     out
+}
+
+fn mtime(path: &Path) -> Option<DateTime<Utc>> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(DateTime::<Utc>::from)
+}
+
+fn sealed_files(seal: &AgentSeal) -> SealedFiles {
+    let mut left_out = Vec::new();
+    let resolutions = super::lost::resolutions(seal).unwrap_or_else(|e| {
+        left_out.push(LeftOut {
+            held: Held::File {
+                name: "sealed/lost".into(),
+            },
+            why: format!("{e:#}"),
+        });
+        Vec::new()
+    });
+    let lost = read_items(&seal.dir().join("sent"), "lost", &mut left_out);
+    let displaced = read_items(&seal.dir().join("outbox"), "displaced", &mut left_out)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
+    SealedFiles {
+        resolutions,
+        items: Vec::new(),
+        lost,
+        displaced,
+        left_out,
+    }
 }
 
 /// The sealed versions: the main line, then the side lines.
@@ -393,10 +540,11 @@ async fn sealed(
     keys: &KeyStore,
     api: &dyn SealedApi,
     id: AgentId,
+    cache: &mut HistoryCache,
     b: &mut Builder,
 ) {
     let seal = AgentSeal::new(agent_dir, id);
-    if !std::fs::exists(seal.dir()).unwrap_or(true) {
+    if !tokio::fs::try_exists(seal.dir()).await.unwrap_or(true) {
         return;
     }
     let head = match seal.head().await {
@@ -428,22 +576,59 @@ async fn sealed(
             return;
         }
     };
-    let resolutions = super::lost::resolutions(&seal).unwrap_or_else(|e| {
-        b.leave_out(
+    let files = {
+        let seal = seal.clone();
+        match tokio::task::spawn_blocking(move || sealed_files(&seal)).await {
+            Ok(files) => files,
+            Err(e) => {
+                b.leave_out(Held::MainLine, format!("reading sealed/ failed: {e}"));
+                return;
+            }
+        }
+    };
+    let mut files = files;
+    b.history.left_out.extend(files.left_out.iter().cloned());
+    match (seal.sent().await, seal.outbox().await) {
+        (Ok(sent), Ok(outbox)) => files.items = sent.into_iter().chain(outbox).collect(),
+        (Err(e), _) | (_, Err(e)) => b.leave_out(
             Held::File {
-                name: "sealed/lost".into(),
+                name: "sealed/sent, sealed/outbox".into(),
             },
-            format!("{e:#}"),
-        );
-        Vec::new()
-    });
-    let lost_seals: Vec<AgentSeal> = resolutions
+            e.to_string(),
+        ),
+    }
+    // What the runner recorded when it sealed each entry (local only)
+    let mut recorded: HashMap<Sha256Hex, Sha256Hex> = HashMap::new();
+    let all_items = files
+        .items
+        .iter()
+        .chain(files.displaced.iter())
+        .chain(files.lost.iter().map(|(i, _)| i))
+        .chain(files.resolutions.iter().flat_map(|(_, i)| i.items.iter()));
+    for item in all_items {
+        if let Some(h) = item.plaintext_sha256 {
+            recorded.insert(item.entry.entry_hash(), h);
+        }
+    }
+    if let Some(h) = &head
+        && let Some(p) = h.plaintext_sha256
+    {
+        recorded.insert(h.head.entry_hash, p);
+    }
+    let lost_seals: Vec<AgentSeal> = files
+        .resolutions
         .iter()
         .map(|(dir, _)| AgentSeal::new(dir, id))
         .collect();
     let mut seals = vec![&seal];
     seals.extend(lost_seals.iter());
     let mut opener = Opener::new(seals, api, &k);
+    let mut ctx = Ctx {
+        b,
+        opener: &mut opener,
+        cache,
+        recorded: &recorded,
+    };
 
     // The main line
     let mut main = Vec::new();
@@ -458,7 +643,7 @@ async fn sealed(
                     error = %format!("{e:#}"),
                     "the sealed main line couldn't be read for the history"
                 );
-                b.leave_out(Held::MainLine, format!("{e:#}"));
+                ctx.b.leave_out(Held::MainLine, format!("{e:#}"));
             }
         }
     }
@@ -472,43 +657,39 @@ async fn sealed(
             },
             _ => continue,
         };
-        open_into(b, &mut opener, &main, entry, source, Line::Main).await;
+        ctx.open(&main, entry, source).await;
     }
 
     // The side lines: what is held here off the main line
     let on_main: HashSet<Sha256Hex> = main.iter().map(SignedStateEntry::entry_hash).collect();
-    let mut pool = main.clone();
+    let forked_from: HashSet<Sha256Hex> = head
+        .as_ref()
+        .map(|h| h.displaced.iter().map(|d| d.entry_hash).collect())
+        .unwrap_or_default();
     let mut side: Vec<(SignedStateEntry, Aside)> = Vec::new();
-    for (_, intent) in &resolutions {
+    for (_, intent) in &files.resolutions {
         for item in &intent.items {
-            side.push((item.entry.clone(), Aside::Lost(intent.at)));
+            side.push((item.entry.clone(), Aside::Lost(Some(intent.at))));
         }
     }
-    for (item, mtime) in read_items(&seal.dir().join("sent"), "lost", b) {
-        side.push((item.entry, Aside::Lost(mtime)));
+    for (item, on) in &files.lost {
+        side.push((item.entry.clone(), Aside::Lost(*on)));
     }
-    for (item, _) in read_items(&seal.dir().join("outbox"), "displaced", b) {
-        side.push((item.entry, Aside::Displaced));
+    for item in &files.displaced {
+        side.push((item.entry.clone(), Aside::Displaced));
     }
     // Entries held off the main line: only against a main line known
-    let held = if main.is_empty() {
-        Ok(Vec::new())
-    } else {
-        local_entries(&seal).await
-    };
-    match held {
-        Ok(entries) => {
-            for e in entries {
-                side.push((e, Aside::Displaced));
-            }
+    if !main.is_empty() {
+        for item in &files.items {
+            let how = if forked_from.contains(&item.entry.entry_hash()) {
+                Aside::Displaced
+            } else {
+                Aside::Off
+            };
+            side.push((item.entry.clone(), how));
         }
-        Err(e) => b.leave_out(
-            Held::File {
-                name: "sealed/sent, sealed/outbox".into(),
-            },
-            e,
-        ),
     }
+    let mut pool = main.clone();
     pool.extend(side.iter().map(|(e, _)| e.clone()));
     let mut seen = on_main;
     let mut server: Option<Result<Vec<SignedStateEntry>, String>> = None;
@@ -532,7 +713,7 @@ async fn sealed(
                 seq = head.seq,
                 "a side-line version's chain doesn't verify from the genesis; left out"
             );
-            b.leave_out(
+            ctx.b.leave_out(
                 Held::Entry {
                     head,
                     line: Line::Side,
@@ -544,8 +725,9 @@ async fn sealed(
         let source = match aside {
             Aside::Displaced => Source::SideLine { head },
             Aside::Lost(on) => Source::SetAside { head, on },
+            Aside::Off => Source::OffLine { head },
         };
-        open_into(b, &mut opener, &line, &entry, source, Line::Side).await;
+        ctx.open(&line, &entry, source).await;
     }
 }
 
@@ -580,93 +762,130 @@ async fn side_line(
     (report.intact && report.head == Some(head_of(entry))).then_some(line)
 }
 
-async fn open_into(
-    b: &mut Builder,
-    opener: &mut Opener<'_>,
-    line: &[SignedStateEntry],
-    entry: &SignedStateEntry,
-    source: Source,
-    on: Line,
-) {
-    match opener.open(line, &entry.entry).await {
-        Ok(value) => {
-            let state_hash = plaintext_hash(&value);
-            let memory = memory_of(entry.entry.kind, &value);
-            b.add(source, micros(entry.entry.state_at), state_hash, memory);
-        }
-        Err(e) => b.leave_out(
-            Held::Entry {
-                head: head_of(entry),
-                line: on,
-            },
-            format!("couldn't be opened: {e:#}"),
-        ),
-    }
+/// What opening sealed entries needs, across the lines.
+struct Ctx<'b, 'o, 'a> {
+    b: &'b mut Builder,
+    opener: &'o mut Opener<'a>,
+    cache: &'b mut HistoryCache,
+    recorded: &'b HashMap<Sha256Hex, Sha256Hex>,
 }
 
-/// A version read from a local file.
-struct Local {
-    source: Source,
-    at: DateTime<Utc>,
-    state_hash: Sha256Hex,
-    memory: Option<Zeroizing<String>>,
-}
-
-/// The archives (oldest first), `state.json`, then the `unsaved` rescues:
-/// each state projected to its hash and memory as soon as it is read, so
-/// only one whole state is in memory at a time.
-fn local_files(agent_dir: &Path) -> anyhow::Result<Vec<Result<Local, LeftOut>>> {
-    let archives = match super::enroll::archives(agent_dir) {
-        Ok(a) => a,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!("listing {}", agent_dir.display())));
+impl Ctx<'_, '_, '_> {
+    /// Open `entry` (verified on `line`) into the history: from the cache,
+    /// else its blob; listed unopened if that fails.
+    async fn open(&mut self, line: &[SignedStateEntry], entry: &SignedStateEntry, source: Source) {
+        let at = DateTime::from_timestamp_micros(entry.entry.state_at);
+        let hash = entry.entry_hash();
+        if let Some(opened) = self.cache.sealed.get(&hash) {
+            self.b.add(source, at, opened.clone());
+            return;
         }
-    };
-    let mut files: Vec<(PathBuf, Source)> = Vec::new();
-    for a in archives {
-        let file = name_of(&a.path);
-        files.push((a.path, Source::LocalCopy { file }));
-    }
-    files.push((agent_dir.join("state.json"), Source::Current));
-    let mut unsaved: Vec<PathBuf> = std::fs::read_dir(agent_dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            let n = name_of(p);
-            n.starts_with("unsaved.") && n.ends_with(".json")
-        })
-        .collect();
-    unsaved.sort();
-    for p in unsaved {
-        let file = name_of(&p);
-        files.push((p, Source::NeverSaved { file }));
-    }
-    let mut out = Vec::new();
-    for (path, source) in files {
-        if source == Source::Current && !std::fs::exists(&path).unwrap_or(true) {
-            continue;
-        }
-        let at = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .map(DateTime::<Utc>::from)
-            .unwrap_or_default();
-        out.push(match super::enroll::envelope_state(&path) {
-            Ok((_, state)) => Ok(Local {
-                at,
-                state_hash: plaintext_hash(&state),
-                memory: super::notice::memory_content(&state)
-                    .map(|m| Zeroizing::new(m.to_string())),
+        match self.opener.open(line, &entry.entry).await {
+            Ok(value) => {
+                let opened = Opened {
+                    state_hash: plaintext_hash(&value),
+                    memory: memory_of(entry.entry.kind, &value),
+                };
+                self.cache.sealed.insert(hash, opened.clone());
+                self.b.add(source, at, opened);
+            }
+            Err(e) => self.b.add_unopened(
                 source,
-            }),
-            Err(e) => Err(LeftOut {
-                held: Held::File {
-                    name: name_of(&path),
-                },
-                why: e.to_string(),
-            }),
-        });
+                at,
+                self.recorded.get(&hash).copied(),
+                format!("couldn't be opened just now: {e:#}"),
+            ),
+        }
     }
-    Ok(out)
+}
+
+type Files = HashMap<(PathBuf, u64, std::time::SystemTime), Opened>;
+
+type Found = Result<(Source, Option<DateTime<Utc>>, Opened), LeftOut>;
+
+/// The archives (oldest first), `state.json`, then the `unsaved` copies:
+/// each state projected to its hash and memory as soon as it is read, so
+/// only one whole state is in memory at a time; a file unchanged since the
+/// last call (path, size, mtime) is taken from `cache`. Returns the cache
+/// back, holding just the files seen.
+fn local_files(agent_dir: &Path, mut cache: Files) -> (anyhow::Result<Vec<Found>>, Files) {
+    let mut kept = Files::new();
+    let found = (|| {
+        let archives = match super::enroll::archives(agent_dir) {
+            Ok(a) => a,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("listing {}", agent_dir.display()))
+                );
+            }
+        };
+        let mut files: Vec<(PathBuf, Source)> = Vec::new();
+        for a in archives {
+            let file = name_of(&a.path);
+            files.push((a.path, Source::LocalCopy { file }));
+        }
+        files.push((agent_dir.join("state.json"), Source::Current));
+        let mut unsaved: Vec<PathBuf> = std::fs::read_dir(agent_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                let n = name_of(p);
+                n.starts_with("unsaved.") && n.ends_with(".json")
+            })
+            .collect();
+        unsaved.sort();
+        for p in unsaved {
+            let file = name_of(&p);
+            files.push((p, Source::KeptAtExit { file }));
+        }
+        let mut out = Vec::new();
+        for (path, source) in files {
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && source == Source::Current => {
+                    continue;
+                }
+                Err(e) => {
+                    out.push(Err(LeftOut {
+                        held: Held::File {
+                            name: name_of(&path),
+                        },
+                        why: e.to_string(),
+                    }));
+                    continue;
+                }
+            };
+            let modified = meta.modified().ok();
+            let at = modified.map(DateTime::<Utc>::from);
+            let key = modified.map(|m| (path.clone(), meta.len(), m));
+            if let Some(opened) = key.as_ref().and_then(|k| cache.remove(k)) {
+                kept.insert(key.expect("a hit has a key"), opened.clone());
+                out.push(Ok((source, at, opened)));
+                continue;
+            }
+            out.push(match super::enroll::envelope_state(&path) {
+                Ok((_, state)) => {
+                    let opened = Opened {
+                        state_hash: plaintext_hash(&state),
+                        memory: super::notice::memory_content(&state)
+                            .map(|m| Zeroizing::new(m.to_string())),
+                    };
+                    if let Some(k) = key {
+                        kept.insert(k, opened.clone());
+                    }
+                    Ok((source, at, opened))
+                }
+                Err(e) => Err(LeftOut {
+                    held: Held::File {
+                        name: name_of(&path),
+                    },
+                    why: e.to_string(),
+                }),
+            });
+        }
+        Ok(out)
+    })();
+    (found, kept)
 }
 
 fn name_of(path: &Path) -> String {
@@ -688,19 +907,26 @@ mod tests {
             .to_string()
     }
 
-    /// Every file under `root`: path, size and mtime. What a read-only
-    /// pass must leave as it was.
-    fn tree(root: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    /// Every file and directory under `root`: path, kind, size, mtime and
+    /// permission bits. What a read-only pass must leave as it was.
+    fn tree(root: &Path) -> Vec<(PathBuf, bool, u64, std::time::SystemTime, u32)> {
+        use std::os::unix::fs::PermissionsExt;
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             for e in std::fs::read_dir(&dir).unwrap() {
                 let e = e.unwrap();
                 let m = e.metadata().unwrap();
+                let len = if m.is_dir() { 0 } else { m.len() };
+                out.push((
+                    e.path(),
+                    m.is_dir(),
+                    len,
+                    m.modified().unwrap(),
+                    m.permissions().mode(),
+                ));
                 if m.is_dir() {
                     stack.push(e.path());
-                } else {
-                    out.push((e.path(), m.len(), m.modified().unwrap()));
                 }
             }
         }
@@ -721,7 +947,8 @@ mod tests {
                         Source::SetAside { .. } => "aside",
                         Source::LocalCopy { .. } => "copy",
                         Source::Current => "current",
-                        Source::NeverSaved { .. } => "unsaved",
+                        Source::KeptAtExit { .. } => "unsaved",
+                        Source::OffLine { .. } => "off",
                     })
                     .collect()
             })
@@ -750,7 +977,9 @@ mod tests {
         let keys = KeyStore::new(root.join("secrets"));
         let api = crate::sealed::api::fake::FakeApi::new();
         let before = tree(root.path());
-        let h = resolve(&state_dir, &keys, &api, id).await.unwrap();
+        let h = resolve(&state_dir, &keys, &api, id, &mut HistoryCache::default())
+            .await
+            .unwrap();
         assert_eq!(tree(root.path()), before, "read-only");
         assert!(api.calls.lock().unwrap().is_empty(), "no network");
         let memories: Vec<&str> = h.versions.iter().map(Version::memory_str).collect();
@@ -797,9 +1026,15 @@ mod tests {
         b.seal().prune_blobs().await.unwrap();
         b.api.calls.lock().unwrap().clear();
         let before = tree(b.root.path());
-        let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id)
-            .await
-            .unwrap();
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(tree(b.root.path()), before, "read-only");
         assert!(h.left_out.is_empty(), "{:?}", h.left_out);
         assert!(
@@ -886,9 +1121,15 @@ mod tests {
         assert_eq!(displaced.len(), 1);
         let head = head_of(&displaced[0].entry);
         let before = tree(b.root.path());
-        let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id)
-            .await
-            .unwrap();
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(tree(b.root.path()), before, "read-only");
         assert!(h.left_out.is_empty(), "{:?}", h.left_out);
         let HeadMatch::Found { version, source } = h.find_head(&head.entry_hash.to_hex()[..12])
@@ -927,9 +1168,15 @@ mod tests {
             .sign(&agora_agentkit::crypto::generate_keypair().0);
         std::fs::write(&path, serde_json::to_vec(&item).unwrap()).unwrap();
         let head = head_of(&item.entry);
-        let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id)
-            .await
-            .unwrap();
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
         let HeadMatch::Held(left) = h.find_head(&head.entry_hash.to_hex()) else {
             panic!("{h:?}")
         };
@@ -972,9 +1219,15 @@ mod tests {
                 .await
                 .unwrap();
             let before = tree(b.root.path());
-            let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id)
-                .await
-                .unwrap();
+            let h = resolve(
+                &b.state_dir(),
+                &b.keys,
+                &b.api,
+                b.id,
+                &mut HistoryCache::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(tree(b.root.path()), before, "read-only");
             assert!(h.left_out.is_empty(), "{nothing_left}: {:?}", h.left_out);
             let HeadMatch::Found { version, source } = h.find_head(&old.entry_hash.to_hex()) else {
@@ -994,5 +1247,287 @@ mod tests {
             let memories: Vec<&str> = h.versions.iter().map(Version::memory_str).collect();
             assert_eq!(memories, ["", &memory(2), &memory(3)]);
         }
+    }
+
+    fn plain(saves: usize, upload: usize) -> Built {
+        Built {
+            saves,
+            upload,
+            rotate: false,
+            mode: Mode::Plain,
+            upload_rebased: false,
+        }
+    }
+
+    /// Agora not serving blobs: each sealed version whose blob is pruned
+    /// here stays listed, sealed, with its head and why it couldn't be
+    /// opened, its local twin merged in rather than standing in for it.
+    /// Served again, everything opens; and a session's cache spares the
+    /// next call every fetch.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_failure_keeps_sealed_versions_sealed_and_the_cache_spares_refetches() {
+        let b = build(&plain(3, 9)).await;
+        b.seal().prune_blobs().await.unwrap();
+        *b.api.fail.lock().unwrap() = Some("blob");
+        let mut cache = HistoryCache::default();
+        let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(h.versions.len(), 4, "{h:?}");
+        let unopened: Vec<&Version> = h.versions.iter().filter(|v| v.unopened.is_some()).collect();
+        assert!(!unopened.is_empty(), "some blobs were pruned: {h:?}");
+        for v in &h.versions {
+            assert!(
+                matches!(v.sources[0], Source::Sealed { .. }),
+                "never demoted to a local copy: {v:?}"
+            );
+        }
+        for v in &unopened {
+            assert!(v.memory.is_none(), "no content from the unsigned twin");
+            assert!(
+                v.sources
+                    .iter()
+                    .any(|s| matches!(s, Source::LocalCopy { .. })),
+                "its twin merged: {v:?}"
+            );
+            assert!(
+                v.unopened
+                    .as_ref()
+                    .unwrap()
+                    .contains("couldn't be opened just now")
+            );
+        }
+        let tries = b
+            .api
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "blob")
+            .count();
+        assert_eq!(tries, 3 * unopened.len(), "three tries each");
+        // Served again
+        *b.api.fail.lock().unwrap() = None;
+        b.api.calls.lock().unwrap().clear();
+        let h = resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+            .await
+            .unwrap();
+        assert!(h.versions.iter().all(|v| v.unopened.is_none()), "{h:?}");
+        assert_eq!(
+            h.versions
+                .iter()
+                .map(Version::memory_str)
+                .collect::<Vec<_>>(),
+            ["", &memory(2), &memory(3), &memory(4)]
+        );
+        let fetched = b
+            .api
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "blob")
+            .count();
+        assert!(fetched > 0);
+        // The cache: no fetch at all the next time
+        b.api.calls.lock().unwrap().clear();
+        let again = resolve(&b.state_dir(), &b.keys, &b.api, b.id, &mut cache)
+            .await
+            .unwrap();
+        assert!(!b.api.calls.lock().unwrap().iter().any(|c| c == "blob"));
+        assert_eq!(sources(&again), sources(&h));
+        assert_eq!(cache.sizes().0, 4);
+    }
+
+    /// The pre-loss copy sealed on the main line: shown, its `content` as
+    /// the memory.
+    #[tokio::test]
+    async fn an_archived_prior_is_on_the_main_line() {
+        let b = build(&plain(1, 0)).await;
+        let seal = b.seal();
+        let k = b.keys.seal_keys(b.id).unwrap();
+        {
+            let lock = seal.lock().await.unwrap();
+            crate::sealed::session::append(
+                &seal,
+                &lock,
+                &k,
+                &agora_agentkit::state::codec::KeyframePolicy::default(),
+                StateEntryKind::ArchivedPrior,
+                &serde_json::json!({ "content": "the pre-loss memory" }),
+                crate::sealed::enroll::prior_copy_at(),
+            )
+            .await
+            .unwrap();
+        }
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
+        assert!(h.left_out.is_empty(), "{:?}", h.left_out);
+        let prior = &h.versions[0];
+        assert!(
+            matches!(prior.sources[..], [Source::ArchivedPrior { .. }]),
+            "{h:?}"
+        );
+        assert_eq!(prior.memory_str(), "the pre-loss memory");
+        assert_eq!(
+            prior.at,
+            Some(crate::sealed::enroll::prior_copy_at()),
+            "dated first"
+        );
+    }
+
+    /// A `sent/*.lost` record with no `sealed/lost/<utc>/` left: still set
+    /// aside, dated by its file.
+    #[tokio::test]
+    async fn a_lost_record_alone_still_resolves() {
+        let b = build(&plain(2, 9)).await;
+        let old = b.seal().head().await.unwrap().unwrap().head;
+        let server = b.server();
+        b.set_server(server[..server.len() - 1].to_vec());
+        crate::sealed::accept::rebase(&b.state_dir(), &b.keys, &b.api, b.id, "lost")
+            .await
+            .unwrap();
+        assert!(
+            std::fs::read_dir(b.dir.join("sealed/sent"))
+                .unwrap()
+                .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".lost"))
+        );
+        std::fs::rename(b.dir.join("sealed/lost"), b.root.join("lost-elsewhere")).unwrap();
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
+        let HeadMatch::Found { version, source } = h.find_head(&old.entry_hash.to_hex()) else {
+            panic!("{h:?}")
+        };
+        assert!(
+            matches!(source, Source::SetAside { head, on: Some(_) } if *head == old),
+            "{source:?}"
+        );
+        assert_eq!(version.memory_str(), memory(3));
+    }
+
+    /// A main line that doesn't verify: said, and the archives still shown
+    /// as the local copies they are.
+    #[tokio::test]
+    async fn an_unverified_main_line_leaves_the_local_copies() {
+        let b = build(&plain(2, 0)).await;
+        // The newest item, re-signed by a key the runner doesn't trust
+        let outbox = b.dir.join("sealed/outbox");
+        let newest = b.seal().outbox().await.unwrap().pop().unwrap();
+        let mut item = newest.clone();
+        item.entry = item
+            .entry
+            .entry
+            .clone()
+            .sign(&agora_agentkit::crypto::generate_keypair().0);
+        std::fs::write(
+            outbox.join(format!("{:020}.json", item.ord)),
+            serde_json::to_vec(&item).unwrap(),
+        )
+        .unwrap();
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
+        assert!(h.left_out.iter().any(|l| l.held == Held::MainLine), "{h:?}");
+        assert!(
+            h.versions.iter().all(|v| v.heads().next().is_none()),
+            "{h:?}"
+        );
+        assert_eq!(
+            h.versions
+                .iter()
+                .map(Version::memory_str)
+                .collect::<Vec<_>>(),
+            ["", &memory(2), &memory(3)]
+        );
+    }
+
+    /// A signing-key rotation before the fork: the side line verifies with
+    /// the rotation the runner recorded.
+    #[tokio::test]
+    async fn a_side_line_across_a_rotation_resolves() {
+        let b = build(&Built {
+            saves: 1,
+            upload: 0,
+            rotate: true,
+            mode: Mode::Rebase,
+            upload_rebased: false,
+        })
+        .await;
+        assert!(b.rotated);
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
+        assert!(h.left_out.is_empty(), "{:?}", h.left_out);
+        assert!(
+            h.versions
+                .iter()
+                .flat_map(|v| &v.sources)
+                .any(|s| matches!(s, Source::SideLine { .. })),
+            "{h:?}"
+        );
+    }
+
+    /// An entry held off the main line with no record of why (here: a
+    /// displaced one filed as sent) is named neutrally, never "rebased".
+    #[tokio::test]
+    async fn an_entry_off_the_line_without_a_record_is_neutral() {
+        let b = build(&Built {
+            saves: 2,
+            upload: 0,
+            rotate: false,
+            mode: Mode::Rebase,
+            upload_rebased: false,
+        })
+        .await;
+        let path = std::fs::read_dir(b.dir.join("sealed/outbox"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "displaced"))
+            .unwrap();
+        let item: OutboxItem = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::rename(
+            &path,
+            b.dir.join(format!("sealed/sent/{:020}.json", item.ord)),
+        )
+        .unwrap();
+        let h = resolve(
+            &b.state_dir(),
+            &b.keys,
+            &b.api,
+            b.id,
+            &mut HistoryCache::default(),
+        )
+        .await
+        .unwrap();
+        let HeadMatch::Found { source, .. } = h.find_head(&item.entry.entry_hash().to_hex()) else {
+            panic!("{h:?}")
+        };
+        assert!(matches!(source, Source::OffLine { .. }), "{source:?}");
     }
 }

@@ -937,9 +937,15 @@ mod tests {
         );
 
         // The resolver merges each archive into its sealed version
-        let h = crate::sealed::history::resolve(&state_dir, &keys, api.as_ref(), id)
-            .await
-            .unwrap();
+        let h = crate::sealed::history::resolve(
+            &state_dir,
+            &keys,
+            api.as_ref(),
+            id,
+            &mut Default::default(),
+        )
+        .await
+        .unwrap();
         assert!(h.left_out.is_empty(), "{:?}", h.left_out);
         assert_eq!(h.versions.len(), memories.len());
         for (v, m) in h.versions.iter().zip(&memories) {

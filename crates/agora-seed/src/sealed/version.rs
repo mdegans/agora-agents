@@ -58,11 +58,24 @@ async fn blob(
             Err(e) => return Err(e).with_context(|| format!("reading blob {sha}")),
         }
     }
-    api.blob(id, signing, sha)
-        .await
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("fetching blob {sha} from Agora"))
+    // A transient failure is retried a little; a lasting one is the caller's
+    let mut last = String::new();
+    for wait in FETCH_RETRIES {
+        tokio::time::sleep(wait).await;
+        match api.blob(id, signing, sha).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => last = e,
+        }
+    }
+    Err(anyhow::Error::msg(last)).with_context(|| format!("fetching blob {sha} from Agora"))
 }
+
+/// The waits before each try of a blob fetch: three tries in all.
+const FETCH_RETRIES: [std::time::Duration; 3] = [
+    std::time::Duration::ZERO,
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(800),
+];
 
 /// A keyframe's plaintext, the dictionary its deltas open against.
 type Dict = std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>;
@@ -169,16 +182,17 @@ impl<'a> Opener<'a> {
         line: &[SignedStateEntry],
         base: Sha256Hex,
     ) -> anyhow::Result<Dict> {
-        if let Some((hash, dict)) = &self.keyframe
-            && *hash == base
-        {
-            return Ok(dict.clone());
-        }
+        // On its line, cached or not
         let keyframe = line
             .iter()
             .map(|e| &e.entry)
             .find(|e| e.entry_hash() == base)
             .with_context(|| format!("the delta's keyframe {base} is not on its line"))?;
+        if let Some((hash, dict)) = &self.keyframe
+            && *hash == base
+        {
+            return Ok(dict.clone());
+        }
         let dict: Dict =
             std::sync::Arc::new(plaintext(&self.seals, self.api, self.keys, keyframe, None).await?);
         self.keyframe = Some((base, dict.clone()));
