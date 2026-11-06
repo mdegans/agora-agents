@@ -220,6 +220,8 @@ impl AlertKind {
             Self::SealedStateServerChainBroken
                 | Self::SealedStateUntrustedKey
                 | Self::SealedStateAnchorWrong
+                // The Steward looks into each one (2026-11-06)
+                | Self::ApiRefusal
         )
     }
 
@@ -985,6 +987,28 @@ impl Alerter {
     /// key is not inside the rate limit. Never blocks, never fails: the
     /// outcome is logged (`alert_sent`, `alert_suppressed`,
     /// `alert_send_failed`). Needs a tokio runtime.
+    /// [`Self::notify`], deciding now whether the alert goes out: `true`
+    /// when it is configured and outside its rate limit (or unlimited), and
+    /// its send is under way. For what tells an agent its operator was told
+    /// ([`crate::interrupted`]): only an alert that went out does.
+    pub async fn dispatch(&self, alert: Alert) -> bool {
+        let Some(inner) = &self.0 else { return false };
+        if !inner.events.contains(&alert.kind) {
+            return false;
+        }
+        let now = Utc::now();
+        if !inner.admit(&alert, now).await {
+            return false;
+        }
+        let task = Arc::clone(inner);
+        inner
+            .pending
+            .lock()
+            .expect("alert queue lock")
+            .spawn(async move { task.send(alert, now).await });
+        true
+    }
+
     pub fn notify(&self, alert: Alert) {
         let Some(inner) = &self.0 else { return };
         if !inner.events.contains(&alert.kind) {
@@ -1051,15 +1075,23 @@ impl Inner {
     }
 
     async fn deliver(&self, alert: Alert) {
-        let key = alert.rate_key();
         let now = Utc::now();
+        if self.admit(&alert, now).await {
+            self.send(alert, now).await;
+        }
+    }
+
+    /// Whether `alert` may be sent now: an unlimited kind always, others
+    /// outside their rate limit (the slot is then claimed).
+    async fn admit(&self, alert: &Alert, now: DateTime<Utc>) -> bool {
+        let key = alert.rate_key();
         let reserved = if alert.kind.unlimited() {
             Ok(true)
         } else {
             self.reserve(&key, now).await
         };
         match reserved {
-            Ok(true) => {}
+            Ok(true) => true,
             Ok(false) => {
                 tracing::info!(
                     event_type = "alert_suppressed",
@@ -1068,17 +1100,25 @@ impl Inner {
                     min_interval_secs = self.min_interval.as_secs(),
                     "alert inside its rate limit; not sent"
                 );
-                return;
+                false
             }
             // Can't read or write the state: send anyway. A missed alert
             // is worse than a repeated one.
-            Err(e) => tracing::warn!(
-                event_type = "alert_state_unavailable",
-                path = %self.state_path.display(),
-                error = %format!("{e:#}"),
-                "alert rate-limit state unavailable; sending regardless"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "alert_state_unavailable",
+                    path = %self.state_path.display(),
+                    error = %format!("{e:#}"),
+                    "alert rate-limit state unavailable; sending regardless"
+                );
+                true
+            }
         }
+    }
+
+    /// Send an admitted alert; a failed send gives its slot back.
+    async fn send(&self, alert: Alert, now: DateTime<Utc>) {
+        let key = alert.rate_key();
         let result = match self.message(&alert) {
             Ok(message) => tokio::time::timeout(self.send_timeout, self.mailer.send(message))
                 .await

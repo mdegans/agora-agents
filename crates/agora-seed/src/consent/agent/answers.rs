@@ -167,14 +167,14 @@ where
         });
     }
 
-    /// The API refused a reply: mail the operator, with no content.
-    pub(super) fn alert_refusal(
+    /// The mail for an API refusal, with no content.
+    pub(super) fn refusal_alert(
         &self,
         during: &str,
         round: Option<usize>,
         model: &str,
         response_id: &str,
-    ) {
+    ) -> Alert {
         let agent = &self.inner.state().soul.name;
         let mut alert = Alert::new(
             AlertKind::ApiRefusal,
@@ -187,7 +187,7 @@ where
         if let Some(round) = round {
             alert = alert.detail("round", round);
         }
-        self.rt.alerts.notify(alert);
+        alert
     }
 
     /// An unusable session completed an [`UNUSABLE_CAP`](offer::UNUSABLE_CAP).
@@ -230,7 +230,11 @@ where
         asked: &Asked,
         alert: AlertKind,
     ) -> Option<String> {
-        self.log_unusable(kind.malformed(), Field::Offer, kind.as_str(), asked);
+        // Never on the refusal path: no content there, not even replies
+        // before the refused one
+        if !matches!(why, Unanswered::Refused { .. }) {
+            self.log_unusable(kind.malformed(), Field::Offer, kind.as_str(), asked);
+        }
         let agent = &self.inner.state().soul.name;
         let model = self.answered_by(asked);
         match why {
@@ -767,7 +771,10 @@ where
         why: Unanswered,
         asked: &Asked,
     ) -> Result<Next, A::Error> {
-        self.log_unusable("model_consent_malformed", Field::Question, "review", asked);
+        // Never on the refusal path: no content there
+        if !matches!(why, Unanswered::Refused { .. }) {
+            self.log_unusable("model_consent_malformed", Field::Question, "review", asked);
+        }
         let model = self.answered_by(asked);
         let failure = match &why {
             Unanswered::NoRoom => return Ok(Next::Continue),

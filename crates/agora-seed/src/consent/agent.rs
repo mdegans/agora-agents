@@ -167,8 +167,17 @@ use agora_agentkit::reactor::seed::Gauged;
 /// What the runner needs of the inner agent's session beyond [`Agent`]:
 /// the contact request it filed, and the questions of its own closing tail
 /// that went unanswered (both alerted from the wrapper's teardown).
-pub trait ContactRequests {
+pub trait ContactRequests: Agent {
     fn contact_request(&self) -> Option<ContactRequestId>;
+
+    /// Resume a paused server-tool turn in one of the wrapper's own
+    /// questions, under the session's pause budget, without touching the
+    /// inner session's phase (`Agent::on_pause` is for its own turns: it
+    /// refuses while held, and past the budget begins the memory rewrite).
+    fn resume_question_pause(
+        &mut self,
+        response: response::Message,
+    ) -> Result<Control, Self::Error>;
 
     /// The inner session's own questions (the soul mutation, evolution, the
     /// survey) that ended without an answer, by name.
@@ -191,6 +200,13 @@ pub trait ContactRequests {
 impl ContactRequests for SeedAgent {
     fn contact_request(&self) -> Option<ContactRequestId> {
         SeedAgent::contact_request(self)
+    }
+
+    fn resume_question_pause(
+        &mut self,
+        response: response::Message,
+    ) -> Result<Control, Self::Error> {
+        SeedAgent::resume_question_pause(self, response)
     }
 
     fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {
@@ -792,10 +808,7 @@ where
                 "session journal lines unreadable; skipped"
             );
         }
-        let alerts = &self.rt.alerts;
-        let notice = crate::interrupted::notice(&leftover, |f| {
-            alerts.sends(crate::interrupted::failure_alert(f))
-        });
+        let notice = crate::interrupted::notice(&leftover);
         let header = SessionHeader {
             started_at: self.started,
             model: self.model(),
@@ -876,35 +889,46 @@ where
             return;
         };
         let agent = self.inner.state().soul.name.to_string();
-        match &failure {
+        let alert = match &failure {
             SessionFailure::Refused {
                 during,
                 round,
                 model,
                 response_id,
-            } => self.alert_refusal(during, *round, model, response_id),
+            } => self.refusal_alert(during, *round, model, response_id),
             other => {
                 let (kind, during) = match other {
                     SessionFailure::Stalled { during } => ("stalled", during.as_str()),
                     SessionFailure::NoRoom { during } => ("no_room", during.as_str()),
                     _ => ("error", ""),
                 };
-                self.rt.alerts.notify(
-                    Alert::new(
-                        AlertKind::SessionFailed,
-                        "an agent's session ended as failed",
-                    )
-                    .agent(agent.clone(), self.inner.id())
-                    .model(self.model())
-                    .detail("failure", kind)
-                    .detail("during", during),
-                );
+                let alert = Alert::new(
+                    AlertKind::SessionFailed,
+                    "an agent's session ended as failed",
+                )
+                .model(self.model())
+                .detail("failure", kind)
+                .detail("during", during);
+                // An error is most often an endpoint down for every agent on
+                // it: one mail per model an hour, the agent in the details
+                // (as `memory_id_key_refused`); a stall or no room is the
+                // agent's own
+                match other {
+                    SessionFailure::Error => {
+                        alert.detail("agent", format!("{agent} ({})", self.inner.id()))
+                    }
+                    _ => alert.agent(agent.clone(), self.inner.id()),
+                }
             }
-        }
+        };
+        // Whether the mail actually goes out: only then is the agent told
+        // its operator was
+        let told = self.rt.alerts.dispatch(alert).await;
         if let Some(journal) = &self.journal {
             let ended = agora_agentkit::reactor::journal::SessionEnded {
                 at: Utc::now(),
                 failure,
+                told,
             };
             if let Err(e) = journal.append(&ended.into()).await {
                 tracing::warn!(
@@ -1972,7 +1996,13 @@ where
         self.inner.on_turn().await
     }
 
+    /// A pause in one of this wrapper's own questions is resumed without
+    /// the inner session's phase (which, held or acting, would refuse it or
+    /// begin the memory rewrite); any other is the inner session's own.
     async fn on_pause(&mut self, response: response::Message) -> Result<Control, A::Error> {
+        if self.asks.is_active() {
+            return self.inner.resume_question_pause(response);
+        }
         self.inner.on_pause(response).await
     }
 
@@ -2299,6 +2329,13 @@ mod tests {
     impl ContactRequests for Fake {
         fn contact_request(&self) -> Option<ContactRequestId> {
             self.contact
+        }
+        fn resume_question_pause(
+            &mut self,
+            response: response::Message,
+        ) -> Result<Control, SeedError> {
+            self.state.prompt.push_message(response.inner).unwrap();
+            Ok(Control::Continue)
         }
         fn failure(&self) -> Option<&SessionFailure> {
             self.failure.as_ref()
@@ -4765,9 +4802,8 @@ mod tests {
         let ask = &h.role_ledger().await.asks[0];
         assert_eq!(ask.attempts, MAX_ATTEMPTS);
         match &ask.outcome {
-            RoleOutcome::Unusable { failure } => {
-                assert!(failure.contains("`new_role` needs"), "{failure}")
-            }
+            // Only the kind (agentkit c85ab5d: no failure's words are kept)
+            RoleOutcome::Unusable { failure } => assert!(failure.contains("rejected"), "{failure}"),
             other => panic!("{other:?}"),
         }
         assert!(asks(&h, OTHER).await, "ours, not a miss: asked again");
@@ -5852,7 +5888,7 @@ mod tests {
             "a post and its comment each"
         );
         for (id, leftover) in &expected {
-            let Some(text) = crate::interrupted::notice(leftover, |_| true) else {
+            let Some(text) = crate::interrupted::notice(leftover) else {
                 continue;
             };
             let short_ids: Vec<String> = leftover.sessions[0]
@@ -7610,7 +7646,7 @@ mod tests {
             }
             requests.push(request);
             let reply = script.pop_front().expect("script ran out");
-            if let Control::Done(outcome) = agent.handle(reply).await.ok().unwrap() {
+            if let Control::Done(outcome) = agent.handle(reply).await.unwrap() {
                 assert_eq!(outcome, Outcome::Complete);
                 assert!(script.is_empty(), "{} replies left", script.len());
                 return requests;
@@ -7855,6 +7891,159 @@ mod tests {
         assert_eq!(
             agent.state().soul.identity.as_str(),
             "A test agent that came home."
+        );
+    }
+
+    /// Drive `agent` through `script` until it is done; the session must
+    /// complete. Unlike [`drive_appending`], for sessions with a pause: a
+    /// resumed pause's continuation merges into the paused turn, which is
+    /// the one rewrite of a sent message the API asks for.
+    async fn drive<A: Agent>(agent: &mut A, script: Vec<response::Message>) {
+        let n = script.len();
+        for (i, reply) in script.into_iter().enumerate() {
+            let control = match agent.handle(reply).await {
+                Ok(control) => control,
+                Err(_) => panic!("reply {i} not handled"),
+            };
+            if let Control::Done(outcome) = control {
+                assert_eq!(outcome, Outcome::Complete);
+                assert_eq!(i + 1, n, "{} replies left", n - i - 1);
+                return;
+            }
+        }
+        panic!("the script ran out before the session ended");
+    }
+
+    /// A turn paused on a server tool (a web search still working).
+    fn paused(text: &str) -> response::Message {
+        let mut r = reply(text);
+        r.stop_reason = Some(StopReason::PauseTurn);
+        r
+    }
+
+    /// With the real `SeedAgent`: a pause in an offer is resumed (not the
+    /// inner agent's `on_pause`, which refuses while held), the answer after
+    /// it is taken, and the survey still comes last.
+    #[tokio::test]
+    async fn a_paused_offer_is_resumed_in_a_whole_session() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("whole-swap-pause");
+        let mut agent = seed_agent(
+            &h,
+            OLD,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                force_survey: true,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        drive(
+            &mut agent,
+            vec![
+                reply("That's all for today."),
+                reply(MEMORY_REPLY),
+                paused("Let me look something up."),
+                answer_call("model_swap", "no_swap", "", ""),
+                reply(ANONYMOUS),
+            ],
+        )
+        .await;
+        agent.on_teardown().await.unwrap();
+        assert_eq!(h.ledger().await.offers[0].stage, Stage::Declined);
+    }
+
+    /// With the real `SeedAgent`: a pause in the trial review is resumed,
+    /// the answer after it is taken, and the memory turn follows.
+    #[tokio::test]
+    async fn a_paused_review_is_resumed_in_a_whole_session() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("whole-review-pause");
+        through_the_trial(&h).await;
+        let mut agent = seed_agent(
+            &h,
+            OLD,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                force_survey: true,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        drive(
+            &mut agent,
+            vec![
+                paused("Let me look something up."),
+                reply(r#"{"note": "Home.", "choice": "stay"}"#),
+                reply(MEMORY_REPLY),
+                reply(ANONYMOUS),
+            ],
+        )
+        .await;
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::Chosen)
+            }
+        );
+    }
+
+    /// With the real `SeedAgent`: pauses in the review past the session's
+    /// budget (five) are failed attempts; spent, the review is an unusable
+    /// session (recorded, asked again next session), the memory turn
+    /// follows, and the session completes.
+    #[tokio::test]
+    async fn review_pauses_past_the_budget_end_it_unusable() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("whole-review-pauses");
+        through_the_trial(&h).await;
+        let mut agent = seed_agent(
+            &h,
+            OLD,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                force_survey: false,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        let mut control = Control::Continue;
+        let mut n = 0;
+        while !agent.inner.state().memory.content.contains("compilers") && n < 20 {
+            control = agent.handle(paused("Still searching.")).await.unwrap();
+            n += 1;
+            if !agent.asks.is_active() {
+                break;
+            }
+        }
+        assert!(
+            !agent.asks.is_active(),
+            "the review gave up after {n} pauses"
+        );
+        assert_eq!(
+            n,
+            5 + MAX_ATTEMPTS as usize,
+            "five resumed, then three attempts"
+        );
+        assert_ne!(control, Control::Done(Outcome::Failed));
+        let mut control = agent.handle(reply(MEMORY_REPLY)).await.unwrap();
+        while control == Control::Continue && n < 30 {
+            control = agent.handle(reply(ANONYMOUS)).await.unwrap();
+            n += 1;
+        }
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+        let ledger = h.ledger().await;
+        assert!(matches!(ledger.offers[0].stage, Stage::ReviewDue { .. }));
+        assert!(
+            ledger.offers[0]
+                .history
+                .iter()
+                .any(|e| matches!(e.kind, crate::consent::ledger::EventKind::Unusable { .. }))
         );
     }
 

@@ -905,7 +905,9 @@ impl Ledger {
     /// A session whose every reply to the review was unusable: recorded;
     /// at [`UNUSABLE_CAP`](super::offer::UNUSABLE_CAP) the review is settled
     /// as no answer (the agent stays on `from`, as its text promises).
-    /// Whether that cap was reached (loud).
+    /// Whether that cap was reached (loud). The count runs over the
+    /// record's whole history: one record has one review, so it is that
+    /// review's.
     pub fn record_unusable_review(
         &mut self,
         key: &OfferKey,
