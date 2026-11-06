@@ -31,8 +31,8 @@ use agora_agentkit::reactor::seed::memory::render;
 use agora_agentkit::reactor::seed::memory::{
     Candidate, CurrentMemory, HistoryRef, IndexError, IndexState, MEMORY_TOOL_NAME, MemoryAction,
     MemoryId, MemoryIdKey, MemoryInput, MemoryVersion, Resolution, SealCheck, SearchIndex,
-    UNCHECKED, VersionSource, VersionText, log_limit, newest_first, resolve, short_head,
-    show_budget,
+    UNCHECKED, VersionSource, VersionText, log_limit, newest_first, resolve, search_limit,
+    short_head, show_budget,
 };
 use agora_agentkit::reactor::seed::{ContextGauge, SeedAgent};
 use chrono::{DateTime, Utc};
@@ -292,12 +292,14 @@ impl MemoryReader {
             MemoryAction::Log { before, limit } => view.log(before.as_ref(), limit, &current),
             MemoryAction::Show { id, budget } => view.show(id.as_slice(), budget, current),
             MemoryAction::Diff { a, b } => view.diff(&a, b.as_ref(), current),
-            MemoryAction::Search { query } => {
+            MemoryAction::Search { query, limit } => {
+                let limit = search_limit(limit);
                 let found = search(
                     &self.agent_dir(),
                     self.id,
                     &view.rows,
                     &query,
+                    limit.value,
                     view.unreachable,
                 )
                 .await;
@@ -307,7 +309,7 @@ impl MemoryReader {
                     out.push_str(UNCHECKED);
                 }
                 push_block(&mut out, &found.result.render(found.state));
-                out
+                adjusted(limit.note, out)
             }
         };
         tracing::info!(
@@ -759,6 +761,7 @@ async fn search(
     id: AgentId,
     rows: &[MemoryVersion],
     query: &str,
+    limit: usize,
     unreachable: bool,
 ) -> Found {
     let dir = agent_dir.to_path_buf();
@@ -863,7 +866,7 @@ async fn search(
         }
     }
     Found {
-        result: index.search(query),
+        result: index.search(query, limit),
         state,
     }
 }
@@ -985,7 +988,10 @@ mod tests {
     }
 
     fn search(q: &str) -> A {
-        A::Search { query: q.into() }
+        A::Search {
+            query: q.into(),
+            limit: None,
+        }
     }
 
     /// Every file under `root`, by path, size and mode.
@@ -1041,6 +1047,18 @@ mod tests {
             .await
             .text;
         assert!(lowered.starts_with("Limit lowered to 50."), "{lowered}");
+        // So is a search limit
+        let searched = rd
+            .answer(
+                A::Search {
+                    query: "synthetic".into(),
+                    limit: Some(99),
+                },
+                &api,
+            )
+            .await
+            .text;
+        assert!(searched.starts_with("Limit lowered to 30."), "{searched}");
         assert!(lowered.contains(LOCAL_ONLY), "{lowered}");
         assert!(out.text.contains(&format!("{}  memory", mem(id, 3))));
         assert!(out.text.contains("← in your context"), "{}", out.text);
