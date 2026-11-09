@@ -48,8 +48,9 @@ use tokio::time::Instant;
 use misanthropic::prompt::message::{Block, Role};
 use misanthropic::response::Message;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock as Content, JsonObject, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock as Content,
+    DiscoverRequestMethod, DiscoverResult, JsonObject, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::Peer;
 use rmcp::service::{RequestContext, RunningService};
@@ -1103,14 +1104,37 @@ fn tool_names(request: &Request) -> Vec<String> {
 }
 
 impl ServerHandler for Server {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
                 .build(),
         )
+        // rmcp 3's default is 2026-07-28, which we don't speak (below)
+        .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
         .with_instructions(INSTRUCTIONS)
+    }
+
+    /// MCP up to 2025-11-25, the last revision with an `initialize`
+    /// handshake: what rmcp 2 spoke. rmcp 3 knows 2026-07-28, whose
+    /// lifecycle has no handshake; holding the driver to the old one keeps
+    /// the bridge as it was through the bump.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(
+            &ProtocolVersion::LATEST_WITH_INITIALIZE,
+        ))
+    }
+
+    /// `server/discover` (2026-07-28) answered as a 2025-11-25 server
+    /// answers it: method not found, so the driver falls back to
+    /// `initialize`. (Not the bridge's own `Server::discover`, which learns
+    /// the agent's tools: a method call on a `Server` still reaches that.)
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        Err(McpError::method_not_found::<DiscoverRequestMethod>())
     }
 
     async fn list_tools(
@@ -1125,7 +1149,7 @@ impl ServerHandler for Server {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let input = serde_json::Value::Object(request.arguments.unwrap_or_default());
         let invalid = |e: serde_json::Error| {
             CallToolResult::error(vec![Content::text(format!(
@@ -1165,7 +1189,8 @@ impl ServerHandler for Server {
             name => CallToolResult::error(vec![Content::text(format!(
                 "[bridge] No tool is named {name}."
             ))]),
-        })
+        }
+        .into())
     }
 }
 
