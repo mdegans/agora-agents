@@ -3,8 +3,10 @@
 //! The Steward wants to read what a model says about each statement in
 //! its own words, beside the distribution readings. For each item, a
 //! fresh context: the statement (with the scenario's backstory for a
-//! claim) and one question, "What do you think of this statement, and
-//! why?". No response format, no rating, no scoring; thinking optional.
+//! claim) and one question, "What do you think of this statement?". It
+//! deliberately does not ask "why": no prompt asks a model for its
+//! reasoning or an explanation (Steward, 2026-10-07 and 2026-11-05);
+//! whatever reasons the model gives are its own choice. No response format, no rating, no scoring; thinking optional.
 //! Items go in the instrument's own order. This is for people to read,
 //! not a measurement, and nothing here compares one run with another.
 //!
@@ -60,6 +62,10 @@ pub struct OpenAnswer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<serde_json::Value>,
     pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
 }
 
@@ -83,7 +89,7 @@ pub struct OpenEndedError {
 
 /// The question, worded for the instrument's noun.
 pub fn question(instrument: &impl RatingInstrument) -> String {
-    format!("What do you think of this {}, and why?", instrument.noun())
+    format!("What do you think of this {}?", instrument.noun())
 }
 
 /// One item's prompt: a fresh context. The scenario backstory (when
@@ -175,6 +181,12 @@ pub async fn run_open_ended<T: MessageSender, I: RatingInstrument>(
                 .as_ref()
                 .and_then(|r| serde_json::to_value(r).ok()),
             input_tokens: response.usage.counts.input_tokens,
+            cache_read_input_tokens: response.usage.counts.cache_read_input_tokens.unwrap_or(0),
+            cache_creation_input_tokens: response
+                .usage
+                .counts
+                .cache_creation_input_tokens
+                .unwrap_or(0),
             output_tokens: response.usage.counts.output_tokens,
         });
     }
@@ -201,13 +213,21 @@ impl OpenEndedRun {
             self.thinking,
             self.probed_at.to_rfc3339()
         );
+        // Anthropic returns a summary of the thinking (we always ask for
+        // `display: "summarized"`), not the model's own words; say so.
+        // Other backends return the thinking itself.
+        let thinking_label = if self.model_id.starts_with("claude-") {
+            "Thinking (Anthropic's summary)"
+        } else {
+            "Thinking"
+        };
         for (i, a) in self.answers.iter().enumerate() {
             let _ = writeln!(s, "## {}. `{}`\n", i + 1, a.item);
             let _ = writeln!(s, "> {}\n", a.statement);
             if let Some(t) = &a.thinking {
                 let _ = writeln!(
                     s,
-                    "<details><summary>Thinking</summary>\n\n{}\n\n</details>\n",
+                    "<details><summary>{thinking_label}</summary>\n\n{}\n\n</details>\n",
                     t.trim()
                 );
             }
@@ -281,7 +301,7 @@ mod tests {
             let text = req["messages"][0]["content"][0]["text"].as_str().unwrap();
             assert!(text.starts_with("Statement: "));
             assert!(text.contains(&q.items[i].statement));
-            assert!(text.ends_with("What do you think of this statement, and why?"));
+            assert!(text.ends_with("What do you think of this statement?"));
             assert!(!text.contains("rate"));
         }
         assert_eq!(run.answers[0].statement, q.items[0].statement);
@@ -316,6 +336,13 @@ mod tests {
         assert!(
             run.to_markdown()
                 .contains("<details><summary>Thinking</summary>")
+        );
+        let mut claude = run.clone();
+        claude.model_id = "claude-haiku-5-5".into();
+        assert!(
+            claude
+                .to_markdown()
+                .contains("<details><summary>Thinking (Anthropic's summary)</summary>")
         );
     }
 }

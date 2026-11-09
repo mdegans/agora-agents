@@ -30,18 +30,30 @@
 
 use misanthropic::Prompt;
 use misanthropic::prompt::output::Effort;
-use misanthropic::prompt::thinking::Thinking;
+use misanthropic::prompt::thinking::{Display, Thinking};
 use serde::{Deserialize, Serialize};
 
 /// Whether, and how, the model reasons before answering.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "thinking", rename_all = "snake_case")]
 pub enum ThinkingMode {
-    /// No reasoning: `thinking` is not sent.
+    /// No reasoning: `thinking: {"type": "disabled"}` is sent explicitly.
+    ///
+    /// Omitting `thinking` is not "off" on current Anthropic models: on
+    /// Claude Haiku 5.5, Opus 5.5 and Sonnet 5.5 an omitted `thinking`
+    /// runs adaptive thinking with its text hidden, so the reading would
+    /// be shaped by reasoning nobody can see. Sending `disabled` either
+    /// turns it off (blallama, Haiku 4.5, Haiku 5.5 at effort `high` or
+    /// below) or fails loudly with a 400 (Opus 5.5, Sonnet 5.5), which
+    /// is the honest outcome for a model that cannot run this arm.
     #[default]
     Off,
     /// Adaptive thinking, optionally with an effort level (the wire
-    /// string, e.g. `"low"`).
+    /// string, e.g. `"low"`). Always requests `display: "summarized"`:
+    /// the default on current models is `"omitted"`, which hides the
+    /// thinking while it still shapes the answer. The summary is
+    /// recorded beside the rating (it is Anthropic's summary, not the
+    /// model's own words).
     Adaptive {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
@@ -66,9 +78,11 @@ impl ThinkingMode {
     /// Apply to a prompt under construction.
     pub fn apply(&self, prompt: Prompt) -> Prompt {
         match self {
-            ThinkingMode::Off => prompt,
+            ThinkingMode::Off => prompt.thinking(Thinking::Disabled),
             ThinkingMode::Adaptive { effort } => {
-                let prompt = prompt.thinking(Thinking::adaptive());
+                let prompt = prompt.thinking(Thinking::Adaptive {
+                    display: Some(Display::Summarized),
+                });
                 match effort {
                     Some(e) => prompt.effort(effort_from_str(e)),
                     None => prompt,
@@ -148,8 +162,11 @@ mod tests {
         .apply(Prompt::default());
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["thinking"]["type"], "adaptive");
+        assert_eq!(v["thinking"]["display"], "summarized");
         assert_eq!(v["output_config"]["effort"], "medium");
         let off = serde_json::to_value(ThinkingMode::Off.apply(Prompt::default())).unwrap();
-        assert!(off.get("thinking").is_none_or(|t| t.is_null()));
+        // Explicit, never omitted: an omitted `thinking` is adaptive
+        // (and hidden) on current Anthropic models.
+        assert_eq!(off["thinking"], serde_json::json!({"type": "disabled"}));
     }
 }

@@ -441,6 +441,10 @@ pub struct ItemPass {
     pub input_tokens: u64,
     #[serde(default)]
     pub cache_read_input_tokens: u64,
+    /// Input tokens written to the cache (billed at the write rate, not
+    /// counted in `input_tokens`).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     /// The response's text block (the JSON answer).
     #[serde(default)]
@@ -664,6 +668,7 @@ where
                 reading: None,
                 input_tokens: counts.input_tokens,
                 cache_read_input_tokens: counts.cache_read_input_tokens.unwrap_or(0),
+                cache_creation_input_tokens: counts.cache_creation_input_tokens.unwrap_or(0),
                 output_tokens: counts.output_tokens,
                 answer: response_text(&response).unwrap_or_default(),
                 thinking: response_thinking(&response),
