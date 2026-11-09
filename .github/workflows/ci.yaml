@@ -88,6 +88,10 @@ jobs:
       # signing), through rsa 0.10.0-rc.19: yubikey uses rsa in software only
       # for public keys and key-parameter computation on import; decryption
       # and signing happen on the device. agentkit's rsa only verifies,
-      # except in its mock test model.
+      # except in its mock test model. No fix is reachable yet: yubikey
+      # =0.9.0-rc.0 (here) and our webauthn_rp fork (agora's server) need
+      # rsa's `sha2` feature, removed after the rc series, so rsa stays on
+      # 0.10.0-rc. Drop this when yubikey and webauthn_rp release on rsa
+      # 0.10 final.
       - name: Security audit
         run: cargo audit --ignore RUSTSEC-2023-0071
