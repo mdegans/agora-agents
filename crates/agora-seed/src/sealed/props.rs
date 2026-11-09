@@ -156,7 +156,7 @@ pub fn version(n: usize) -> serde_json::Value {
     })
 }
 
-async fn save(root: &Path, id: AgentId, value: serde_json::Value) {
+pub async fn save(root: &Path, id: AgentId, value: serde_json::Value) {
     let enrolment = Arc::new(super::SealedEnrolment::new(
         root.join("state"),
         root.join("secrets"),
@@ -166,15 +166,21 @@ async fn save(root: &Path, id: AgentId, value: serde_json::Value) {
     store.save_raw(id, value, base.as_ref()).await.unwrap();
 }
 
-/// Upload up to `n` waiting entries: sent here, on Agora, blobs too.
+/// Upload up to `n` waiting entries: sent here, on Agora, blobs too, with
+/// their upload times recorded as the drainer records them (this process
+/// committed them all).
 async fn upload(b: &Built, n: usize) {
     let seal = b.seal();
+    let before = super::receipts::before(&b.dir, b.id, 0).await.unwrap();
     let mut server = b.server();
     for item in seal.outbox().await.unwrap().into_iter().take(n) {
         seal.mark_sent(item.ord).await.unwrap();
         server.push(item.entry);
     }
     b.set_server(server);
+    super::receipts::after(&b.dir, b.id, 0, &before)
+        .await
+        .unwrap();
     copy_blobs(b);
 }
 
@@ -531,6 +537,101 @@ proptest! {
             let b = build(&h).await;
             let out = b.check().await;
             prop_assert!(meets(&out, &Expect::Intact), "{h:?}: {out:?}");
+            Ok(())
+        })?;
+    }
+
+    /// Anchors over every random history (plain saves, a rebase onto a
+    /// fork on Agora, a whole-directory restore, with or without a key
+    /// rotation and an accept): an honest anchor is never a failure; a
+    /// version older than the one owed is one whenever the runner's
+    /// records decide it; after a restore, whose upload times are lost,
+    /// nothing is said to pass.
+    #[test]
+    fn anchors_are_judged_soundly_over_every_history(h in history()) {
+        rt().block_on(async {
+            use super::anchors::{VerifiedAnchors, anchor_data_hash, check_anchors};
+            use super::inclusion::{Finding, InclusionFile};
+            use agora_agentkit::state::anchor::{anchor_leaf, inclusion_proof, merkle_root};
+            use agora_agentkit::state::{AnchorData, AnchorProof};
+            let b = build(&h).await;
+            // The anchor work runs only on an empty outbox
+            upload(&b, usize::MAX).await;
+            let line = local_entries(&b.seal()).await.unwrap();
+            let head = b.seal().head().await.unwrap().unwrap().head;
+            let line = check::main_line(
+                &{
+                    let mut all = line;
+                    all.extend(b.server());
+                    all
+                },
+                &head.entry_hash,
+            )
+            .unwrap();
+            let anchor = |n: u32, date: chrono::NaiveDate, entry: &SignedStateEntry| {
+                let leaves = vec![
+                    anchor_leaf(AgentId::new(), &Sha256Hex::from([1; 32])),
+                    anchor_leaf(b.id, &entry.entry_hash()),
+                ];
+                let data = AnchorData { date, root: merkle_root(&leaves), agents: 2 };
+                let anc: agora_agentkit::ids::GovernanceLogId =
+                    format!("ANC-2026-{n:04}").parse().unwrap();
+                (
+                    AnchorProof {
+                        anc_id: anc.clone(),
+                        date,
+                        root: data.root,
+                        entry_hash: entry.entry_hash(),
+                        seq: entry.entry.seq,
+                        leaf_index: 1,
+                        leaf_count: 2,
+                        proof: inclusion_proof(&leaves, 1).unwrap(),
+                    },
+                    (anc, anchor_data_hash(&data).unwrap(), chrono::Utc::now()),
+                )
+            };
+            let tomorrow = chrono::Utc::now().date_naive() + chrono::Days::new(1);
+            let early = chrono::Utc::now().date_naive() - chrono::Days::new(3);
+            let (honest, l2) = anchor(2, tomorrow, line.last().unwrap());
+            let (stale, l3) = anchor(3, tomorrow, &line[0]);
+            // Before the agent existed, no proof served: its data as Agora
+            // serves it, hashing to what the log attests
+            let (_, l4) = anchor(4, early, &line[0]);
+            let leaves = vec![
+                anchor_leaf(AgentId::new(), &Sha256Hex::from([1; 32])),
+                anchor_leaf(b.id, &line[0].entry_hash()),
+            ];
+            let early_anchor = AnchorData { date: early, root: merkle_root(&leaves), agents: 2 };
+            let l4 = (l4.0, anchor_data_hash(&early_anchor).unwrap(), l4.2);
+            b.api.anchor_data.lock().unwrap().insert(
+                l4.0.clone(),
+                serde_json::to_value(&early_anchor).unwrap(),
+            );
+            *b.api.proofs.lock().unwrap() = vec![honest, stale];
+            let verified = VerifiedAnchors::new([l2, l3, l4]);
+            let signing = b.keys.signing(b.id).unwrap();
+            check_anchors(&b.dir, b.id, &b.keys, &signing, &b.api, &verified, true)
+                .await
+                .unwrap();
+            let judged = InclusionFile::load(&b.dir).unwrap().checked;
+            prop_assert_eq!(judged.len(), 3);
+            let timed = h.mode != Mode::Restore;
+            // Honest
+            prop_assert!(!judged[0].finding.failed(), "{h:?}: {:?}", judged[0]);
+            if timed {
+                prop_assert!(matches!(judged[0].finding, Finding::Holds { .. }), "{h:?}: {:?}", judged[0]);
+            } else {
+                prop_assert!(matches!(judged[0].finding, Finding::HoldsUnchecked { .. }), "{h:?}: {:?}", judged[0]);
+            }
+            // The genesis, though later versions were confirmed: a failure
+            // when the records decide it, never a pass
+            if timed && line.len() > 1 {
+                prop_assert!(matches!(judged[1].finding, Finding::Older { .. }), "{h:?}: {:?}", judged[1]);
+            } else if line.len() > 1 {
+                prop_assert!(!matches!(judged[1].finding, Finding::Holds { .. }), "{h:?}: {:?}", judged[1]);
+            }
+            // Before the agent existed: nothing owed
+            prop_assert_eq!(&judged[2].finding, &Finding::NotIncluded, "{:?}", h);
             Ok(())
         })?;
     }

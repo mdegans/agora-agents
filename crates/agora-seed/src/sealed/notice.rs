@@ -151,39 +151,28 @@ impl Diff {
     /// and soul (pretty JSON, keys sorted), with counts, cut at
     /// [`DIFF_CAP`] characters.
     pub fn between(before: &serde_json::Value, after: &serde_json::Value) -> Self {
-        let memory = |v: &serde_json::Value| {
-            v.pointer("/memory/content")
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string()
-        };
-        // Both sides in one form: the canonical JSON sealing uses (keys
-        // sorted), pretty-printed. serde_json keeps insertion order here
-        // (`preserve_order` is on in the graph), so printing the values as
-        // they are would show a reordered soul as changed
-        let soul = |v: &serde_json::Value| {
-            v.get("soul")
-                .map(|s| {
-                    let canonical = agora_agentkit::govlog::canonical_json(s);
-                    serde_json::from_slice::<serde_json::Value>(&canonical)
-                        .and_then(|c| serde_json::to_string_pretty(&c))
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default()
-        };
+        // agentkit's projections, one copy with the `memory` tool's: the
+        // raw `memory.content`, and the soul as canonical JSON (keys
+        // sorted), pretty-printed, so a reordered soul reads as unchanged
+        use agora_agentkit::reactor::seed::memory::{memory_text, soul_text};
         let mut text = String::new();
         let (mut added, mut removed) = (0, 0);
         for (what, before, after) in [
-            ("Memory", memory(before), memory(after)),
-            ("Soul", soul(before), soul(after)),
+            (
+                "Memory",
+                memory_text(before).into(),
+                memory_text(after).into(),
+            ),
+            ("Soul", soul_text(before), soul_text(after)),
         ] {
             if before == after {
                 text.push_str(&format!("{what}: unchanged.\n"));
                 continue;
             }
             let diff = agora_agentkit::text::line_diff(&before, &after);
-            added += diff.lines().filter(|l| l.starts_with("  + ")).count();
-            removed += diff.lines().filter(|l| l.starts_with("  - ")).count();
+            let (plus, minus) = agora_agentkit::text::change_counts(&diff);
+            added += plus;
+            removed += minus;
             text.push_str(&format!("{what}:\n{diff}"));
         }
         let cut = text.chars().count() > DIFF_CAP;
@@ -287,7 +276,7 @@ impl Notice {
             // Accepted but not yet shown: kept aside, never overwritten
             Some(_) => {
                 let from = path(agent_dir);
-                let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+                let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
                 std::fs::rename(
                     &from,
                     from.with_file_name(format!("notice.superseded.{at}.json")),
@@ -350,7 +339,7 @@ impl Notice {
     ) -> std::io::Result<()> {
         let from = path(agent_dir);
         if std::fs::exists(&from)? {
-            let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+            let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
             std::fs::rename(
                 &from,
                 from.with_file_name(format!("notice.superseded.{at}.json")),
@@ -528,7 +517,7 @@ impl Notice {
     /// `notice.shown.<utc>.json`.
     pub fn shown(agent_dir: &Path) -> std::io::Result<()> {
         let from = path(agent_dir);
-        let at = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
         std::fs::rename(
             &from,
             from.with_file_name(format!("notice.shown.{at}.json")),
@@ -596,6 +585,84 @@ mod tests {
         c["soul"]["voice"] = serde_json::json!("warm");
         let changed = Diff::between(&a, &c);
         assert_eq!((changed.added, changed.removed), (1, 1), "{changed:?}");
+    }
+
+    /// [`Diff::between`] before it took agentkit's projections (rule 8),
+    /// kept to show the switch changed no byte an agent reads.
+    fn between_before_agentkit(before: &serde_json::Value, after: &serde_json::Value) -> Diff {
+        let memory = |v: &serde_json::Value| {
+            v.pointer("/memory/content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let soul = |v: &serde_json::Value| {
+            v.get("soul")
+                .map(|s| {
+                    let canonical = agora_agentkit::govlog::canonical_json(s);
+                    serde_json::from_slice::<serde_json::Value>(&canonical)
+                        .and_then(|c| serde_json::to_string_pretty(&c))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        let mut text = String::new();
+        let (mut added, mut removed) = (0, 0);
+        for (what, before, after) in [
+            ("Memory", memory(before), memory(after)),
+            ("Soul", soul(before), soul(after)),
+        ] {
+            if before == after {
+                text.push_str(&format!("{what}: unchanged.\n"));
+                continue;
+            }
+            let diff = agora_agentkit::text::line_diff(&before, &after);
+            added += diff.lines().filter(|l| l.starts_with("  + ")).count();
+            removed += diff.lines().filter(|l| l.starts_with("  - ")).count();
+            text.push_str(&format!("{what}:\n{diff}"));
+        }
+        let cut = text.chars().count() > DIFF_CAP;
+        if cut {
+            text = text.chars().take(DIFF_CAP).collect();
+        }
+        Diff {
+            text: Some(text),
+            added,
+            removed,
+            cut,
+        }
+    }
+
+    /// The switch to agentkit's `memory_text`, `soul_text` and
+    /// `change_counts` is byte-identical: no memory, an empty one, one
+    /// line, sentences, a long rewrite, a reordered and a changed soul, a
+    /// soul gone, and a memory that isn't a string.
+    #[test]
+    fn the_agentkit_projection_changes_no_byte() {
+        let long = |tag: &str| {
+            (0..400)
+                .map(|i| format!("{tag} line {i}\n"))
+                .collect::<String>()
+        };
+        let states = [
+            serde_json::json!({}),
+            serde_json::json!({"memory": {"content": ""}}),
+            serde_json::json!({"memory": {"content": "One line."}, "soul": {"name": "tarn"}}),
+            serde_json::json!({"memory": {"content": "One. Two. Three."}, "soul": {"name": "tarn"}}),
+            serde_json::json!({"memory": {"content": "a\nb\nc\n"}, "soul": {"voice": "terse", "name": "tarn"}}),
+            serde_json::json!({"memory": {"content": "a\nB\nc\nd\n"}, "soul": {"name": "tarn", "voice": "terse"}}),
+            serde_json::json!({"memory": {"content": "a\nB\nc\nd\n"}, "soul": {"name": "tarn", "voice": "warm"}}),
+            serde_json::json!({"memory": {"content": long("old")}, "soul": {"name": "tarn"}}),
+            serde_json::json!({"memory": {"content": long("new")}}),
+            serde_json::json!({"memory": {"content": 7}, "soul": "plain"}),
+        ];
+        for a in &states {
+            for b in &states {
+                let (now, then) = (Diff::between(a, b), between_before_agentkit(a, b));
+                assert_eq!(now, then, "{a} → {b}");
+                assert_eq!(now.shown(), then.shown());
+            }
+        }
     }
 
     #[test]

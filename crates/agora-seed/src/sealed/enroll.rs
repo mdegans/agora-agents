@@ -24,6 +24,7 @@
 //!
 //! [`StateKeyRecord`]: agora_agentkit::state::StateKeyRecord
 
+use crate::consent::offer::Stored;
 use std::path::{Path, PathBuf};
 
 use agora_agentkit::enums::StateEntryKind;
@@ -210,13 +211,45 @@ struct NameOnly {
 /// An archive's state, from its `{format, state}` envelope. `None`: not
 /// one this binary reads. Its content is never logged.
 fn archived_state(path: &Path) -> Option<serde_json::Value> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let format = envelope.get("format")?.as_u64()?;
-    if format > agora_agentkit::reactor::storage::FORMAT {
-        return None;
+    envelope_state(path)
+        .ok()
+        .filter(|(format, _)| *format <= agora_agentkit::reactor::storage::FORMAT)
+        .map(|(_, state)| state)
+}
+
+/// Why an FsStorage envelope (`state.json`, an archive, an `unsaved`
+/// rescue) couldn't be read. Never content.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvelopeError {
+    #[error("unreadable: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("not JSON ({0:?})")]
+    Json(serde_json::error::Category),
+    #[error("not an envelope: no {0}")]
+    Shape(&'static str),
+    #[error("envelope format {0} is newer than this binary reads")]
+    Newer(u64),
+}
+
+/// The `state` of an FsStorage `{format, state}` envelope at `path`, and
+/// its format: any format this binary's FsStorage loads (format 2 is a
+/// sealed agent's).
+pub fn envelope_state(path: &Path) -> Result<(u64, serde_json::Value), EnvelopeError> {
+    let bytes = zeroize::Zeroizing::new(std::fs::read(path)?);
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| EnvelopeError::Json(e.classify()))?;
+    let format = envelope
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(EnvelopeError::Shape("format"))?;
+    if format > agora_agentkit::reactor::storage::MAX_FORMAT {
+        return Err(EnvelopeError::Newer(format));
     }
-    Some(envelope.get_mut("state")?.take())
+    let state = envelope
+        .get_mut("state")
+        .ok_or(EnvelopeError::Shape("state"))?
+        .take();
+    Ok((format, state))
 }
 
 /// The sizes of a version just sealed, in the local sidecar.
@@ -662,6 +695,7 @@ mod tests {
     use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
     use crate::consent::sealed_state::prompt::SealChoice;
     use crate::sealed::api::fake::FakeApi;
+    use agora_agentkit::reactor::seed::memory::memory_text;
     use agora_agentkit::state::verify::verify_chain;
 
     fn yes(dir: &Path) {
@@ -687,6 +721,45 @@ mod tests {
 
     fn state(name: &str, memory: &str) -> serde_json::Value {
         serde_json::json!({ "soul": { "name": name }, "memory": { "content": memory } })
+    }
+
+    /// An agent keyed and searched before it enrols: `sealed-enroll
+    /// --dry-run` counts the same, the key's fingerprint and the index
+    /// beside its state are never taken for archives, and no `sealed/` is
+    /// made.
+    #[tokio::test]
+    async fn the_memory_tools_files_change_nothing_a_dry_run_counts() {
+        let api = std::sync::Arc::new(FakeApi::new());
+        let root = crate::sealed::TestDir::new("enroll-memory-files");
+        let state_dir = root.join("state");
+        let keys = KeyStore::new(root.join("secrets"));
+        let id = AgentId::new();
+        keys.ring()
+            .insert(id, &agora_agentkit::crypto::generate_keypair().0)
+            .unwrap();
+        let mut fs = FsStorage::new(&state_dir);
+        for m in ["one", "two", "three"] {
+            fs.save_raw(id, state("tarn", m), None).await.unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let dir = state_dir.join(id.to_string());
+        yes(&dir);
+        let enroller = Enroller {
+            state_dir: state_dir.clone(),
+            keys: keys.clone(),
+            api,
+            restore: None,
+        };
+        let before = enroller.enroll(id, true).await.unwrap();
+        keys.memory_id_keys_or_create(id, &dir).unwrap();
+        crate::sealed::history_index::write(&dir, b"{}").unwrap();
+        assert!(crate::sealed::history_index::unsealed_path(&dir).exists());
+        assert_eq!(enroller.enroll(id, true).await.unwrap(), before);
+        assert_eq!(enroller.opted_in().unwrap(), vec![id]);
+        assert!(
+            !dir.join(agora_agentkit::state::storage::SEALED_DIR)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -775,6 +848,153 @@ mod tests {
             Err(Skip::Enrolled)
         ));
         assert!(enroller.opted_in().unwrap().is_empty());
+    }
+
+    /// The archive ↔ sealed round trip: enrolment's backfill, then sealed
+    /// saves, and every archive's state (and the current one) is a sealed
+    /// version: equal as JSON, equal in its canonical sealed bytes, and its
+    /// `memory.content` equal byte for byte. Awkward synthetic text only.
+    #[tokio::test]
+    async fn every_archive_round_trips_through_its_sealed_version() {
+        let api = std::sync::Arc::new(FakeApi::new());
+        let root = crate::sealed::TestDir::new("enroll-round-trip");
+        let state_dir = root.join("state");
+        let keys = KeyStore::new(root.join("secrets"));
+        let id = AgentId::new();
+        keys.ring()
+            .insert(id, &agora_agentkit::crypto::generate_keypair().0)
+            .unwrap();
+        let memories = [
+            String::new(),
+            "plain\n".to_string(),
+            "crlf\r\nline\r\n  trailing spaces   \n\ttab\n".to_string(),
+            "unicode: é e\u{301} ß 漢字 🦀👩‍👩‍👧 \u{200b}zero-width \u{feff}bom".to_string(),
+            "escapes: \" \\ / \u{0} \u{7} \u{1f} </script> \\u0041".to_string(),
+            "no newline at end".to_string(),
+            "x".repeat(70_000) + "\n" + &"long line ".repeat(3_000),
+        ];
+        let awkward = |i: usize, m: &str| {
+            serde_json::json!({
+                "soul": { "name": "tarn", "n": i, "floats": [0.1, 1e-300, 1.7976931348623157e308,
+                    -0.0, 2.5e-7, 123_456_789.123_456_79], "big": u64::MAX, "neg": i64::MIN },
+                "memory": { "content": m },
+                "seen_posts": [i],
+            })
+        };
+        let mut fs = FsStorage::new(&state_dir);
+        for (i, m) in memories.iter().enumerate().take(4) {
+            fs.save_raw(id, awkward(i, m), None).await.unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let dir = state_dir.join(id.to_string());
+        yes(&dir);
+        let enroller = Enroller {
+            state_dir: state_dir.clone(),
+            keys: keys.clone(),
+            api: api.clone(),
+            restore: None,
+        };
+        enroller.enroll(id, false).await.unwrap();
+        // Sealed saves after enrolment archive the states they replace too
+        let enrolment = std::sync::Arc::new(super::super::SealedEnrolment::new(
+            &state_dir,
+            root.join("secrets"),
+        ));
+        let mut store = agora_agentkit::state::storage::Mirrored::new(
+            FsStorage::new(&state_dir),
+            (),
+            enrolment,
+        );
+        for (i, m) in memories.iter().enumerate().skip(4) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let base = store.load_raw(id).await.unwrap().base;
+            store
+                .save_raw(id, awkward(i, m), base.as_ref())
+                .await
+                .unwrap();
+        }
+
+        // Every sealed snapshot, opened
+        let seal = AgentSeal::new(&dir, id);
+        let head = seal.head().await.unwrap().unwrap();
+        let line = super::super::version::verified_line(&seal, &keys, api.as_ref(), id, &head)
+            .await
+            .unwrap();
+        let k = keys.seal_keys(id).unwrap();
+        let mut sealed = Vec::new();
+        for e in line
+            .iter()
+            .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
+        {
+            sealed.push(
+                super::super::version::open(&seal, api.as_ref(), &k, &line, &e.entry)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(sealed.len(), memories.len(), "each state sealed once");
+
+        // Every archive, and the current state, against them
+        let mut files: Vec<PathBuf> = archives(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.path)
+            .collect();
+        files.push(dir.join("state.json"));
+        assert!(
+            files.len() > memories.len(),
+            "archives from both sides of enrolment"
+        );
+        for path in &files {
+            let (_, local) = envelope_state(path).unwrap();
+            let found = sealed
+                .iter()
+                .find(|v| plaintext_hash(v) == plaintext_hash(&local))
+                .unwrap_or_else(|| panic!("{} has no sealed version", path.display()));
+            assert_eq!(found, &local, "JSON-equal");
+            assert_eq!(
+                agora_agentkit::state::codec::plaintext(found).as_slice(),
+                agora_agentkit::state::codec::plaintext(&local).as_slice(),
+                "the same canonical bytes"
+            );
+            assert_eq!(
+                memory_text(found).as_bytes(),
+                memory_text(&local).as_bytes(),
+                "memory byte for byte"
+            );
+        }
+        // And in order, each memory once
+        let opened: Vec<&str> = sealed.iter().map(memory_text).collect();
+        assert_eq!(
+            opened,
+            memories.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        // The resolver merges each archive into its sealed version
+        let h = crate::sealed::history::resolve(
+            &state_dir,
+            &keys,
+            api.as_ref(),
+            id,
+            &mut Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(h.left_out.is_empty(), "{:?}", h.left_out);
+        assert_eq!(h.versions.len(), memories.len());
+        for (v, m) in h.versions.iter().zip(&memories) {
+            assert_eq!(v.memory_str().as_bytes(), m.as_bytes());
+            assert!(matches!(
+                v.sources[0],
+                crate::sealed::history::Source::Sealed { .. }
+            ));
+        }
+        let local_sources: usize = h
+            .versions
+            .iter()
+            .map(|v| v.sources.iter().filter(|s| s.head().is_none()).count())
+            .sum();
+        assert_eq!(local_sources, files.len(), "every file merged, none apart");
     }
 
     /// The origin from the memory-restore listing and ledger: fields only.

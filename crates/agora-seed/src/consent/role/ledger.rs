@@ -9,11 +9,9 @@
 //! ends it: the agent is never asked again by this offer. Only a *missing*
 //! answer (every attempt malformed, or clipped, or not fitting — an
 //! upstream problem until shown otherwise) is re-asked, at the agent's next
-//! session, up to [`MAX_MISSES`] in all. `sleep` asks again, but that is
+//! session, up to [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) in all. `sleep` asks again, but that is
 //! the Steward's to arrange when the tools exist (a new
 //! [`super::prompt::OFFER_VERSION`] and a fresh offer), not this ledger's.
-
-use std::path::{Path, PathBuf};
 
 use agora_agentkit::reactor::seed::{ShortString, Soul};
 use chrono::{DateTime, Utc};
@@ -25,13 +23,9 @@ use super::prompt::{RoleAnswer, RoleChoice};
 /// The ledger's file name inside the agent's state directory.
 pub const LEDGER_FILE: &str = "role_consent.json";
 
-/// Bump on layout change; [`RoleLedger::load`] refuses anything newer.
-pub const FORMAT: u32 = 1;
-
-/// Unanswered asks before the runner stops asking (the model-swap
-/// ledger's rule): the first miss is re-asked next session; the second is
-/// final, and means nothing changes.
-pub const MAX_MISSES: u32 = 2;
+/// Bump on layout change (2 since 2026-11-06: answers' `note`, the
+/// `unusable` outcome); [`RoleLedger::load`] refuses anything newer.
+pub const FORMAT: u32 = 2;
 
 /// The whole per-agent file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,9 +66,10 @@ pub struct RoleAsk {
     /// The seed [`super::prompt::order_for`] turned into `order`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_seed: Option<u64>,
-    /// Whether the answer taken was grammar-constrained: `true` for a call
-    /// to the strict `answer_offer` tool (v3 on), `false` for the
-    /// plain-text fallback or no answer. Not recorded before v3.
+    /// Whether the answer taken was grammar-constrained: from v3 to v4 a
+    /// call to the strict `answer_offer` tool (`true`) or the plain-text
+    /// fallback; since v5 (2026-11-06) whether its schema went out as
+    /// `output_config`. Not recorded before v3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constrained: Option<bool>,
     pub outcome: RoleOutcome,
@@ -97,8 +92,12 @@ pub enum RoleOutcome {
     },
     /// An explicit refusal: nothing changes, and that is final.
     Refused { reason: String },
-    /// No usable answer: nothing changes this time.
+    /// No answer, the agent's doing (an API refusal, since 2026-11-06):
+    /// nothing changes this time; counts toward [`MAX_MISSES`](crate::consent::offer::MAX_MISSES).
     NoAnswer { failure: String },
+    /// Every reply unusable (since 2026-11-06): our failure, not the
+    /// agent's choice. Recorded, never counted: asked again later.
+    Unusable { failure: String },
 }
 
 /// What the runner applied for an answer.
@@ -120,73 +119,16 @@ pub enum Applied {
 }
 
 impl RoleLedger {
-    pub fn path(agent_dir: &Path) -> PathBuf {
-        agent_dir.join(LEDGER_FILE)
-    }
-
-    /// Load `agent_dir`'s ledger; a missing file is an empty ledger. An
-    /// unreadable or too-new one is an error — the caller must then neither
-    /// ask nor save over it.
-    pub async fn load(agent_dir: &Path) -> std::io::Result<Self> {
-        let bytes = match tokio::fs::read(Self::path(agent_dir)).await {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e),
-        };
-        Self::from_slice(&bytes)
-    }
-
-    /// Parse a ledger, refusing a newer [`FORMAT`].
-    pub fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
-        let ledger: Self = serde_json::from_slice(bytes)?;
-        if ledger.format > FORMAT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "role ledger format {} is newer than this binary reads ({FORMAT})",
-                    ledger.format
-                ),
-            ));
-        }
-        Ok(ledger)
-    }
-
-    /// Atomic save: tmp + fsync + rename.
-    pub async fn save(&self, agent_dir: &Path) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        tokio::fs::create_dir_all(agent_dir).await?;
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let path = Self::path(agent_dir);
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &path).await
-    }
-
     /// Whether the offer should be put this session: nothing final on file,
-    /// fewer than [`MAX_MISSES`] misses, and no sign in `soul` that an
+    /// fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no sign in `soul` that an
     /// answer was already applied — the belt to the ledger's braces, for a
     /// session whose SOUL saved but whose ledger didn't (a second `clarify`
     /// would append twice).
     pub fn due(&self, soul: &Soul) -> bool {
-        if super::applied_in(soul) {
-            return false;
-        }
-        let settled = self.asks.iter().any(|a| {
-            matches!(
-                a.outcome,
-                RoleOutcome::Answered { .. } | RoleOutcome::Refused { .. }
-            )
-        });
-        let misses = self
-            .asks
-            .iter()
-            .filter(|a| matches!(a.outcome, RoleOutcome::NoAnswer { .. }))
-            .count();
-        !settled && misses < MAX_MISSES as usize
+        crate::consent::offer::due(
+            self.asks.iter().map(|a| &a.outcome),
+            super::applied_in(soul),
+        )
     }
 
     /// Whether the agent's latest answer on file is `sleep`: the sweep
@@ -197,16 +139,6 @@ impl RoleLedger {
             RoleOutcome::Answered { applied, .. } => Some(applied == &Applied::Sleep),
             _ => None,
         }) == Some(true)
-    }
-
-    /// [`Self::load`] for one-shot startup code (the sweep planner).
-    pub fn load_blocking(agent_dir: &Path) -> std::io::Result<Self> {
-        let bytes = match std::fs::read(Self::path(agent_dir)) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e),
-        };
-        Self::from_slice(&bytes)
     }
 
     pub fn record(&mut self, ask: RoleAsk) {
@@ -234,6 +166,7 @@ impl RoleLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::offer::Stored;
     use crate::consent::role::prompt::RoleChoice;
 
     fn soul() -> Soul {
@@ -280,7 +213,7 @@ mod tests {
         assert!(!l.chose_sleep());
         l.record(ask(RoleOutcome::Answered {
             answer: RoleAnswer {
-                reason: "r".into(),
+                note: "r".into(),
                 choice: RoleChoice::Sleep,
                 soul_text: String::new(),
                 memory_note: String::new(),
@@ -322,7 +255,7 @@ mod tests {
         assert!(l.due(&soul()));
         l.record(ask(RoleOutcome::Answered {
             answer: RoleAnswer {
-                reason: "r".into(),
+                note: "r".into(),
                 choice: RoleChoice::Nothing,
                 soul_text: String::new(),
                 memory_note: String::new(),
@@ -344,11 +277,11 @@ mod tests {
     fn a_miss_is_asked_once_more() {
         let mut l = RoleLedger::default();
         l.record(ask(RoleOutcome::NoAnswer {
-            failure: "unparseable".into(),
+            failure: "refusal".into(),
         }));
         assert!(l.due(&soul()));
         l.record(ask(RoleOutcome::NoAnswer {
-            failure: "unparseable".into(),
+            failure: "refusal".into(),
         }));
         assert!(!l.due(&soul()));
     }
@@ -362,7 +295,7 @@ mod tests {
         let mut l = RoleLedger::default();
         l.record(ask(RoleOutcome::Answered {
             answer: RoleAnswer {
-                reason: "r".into(),
+                note: "r".into(),
                 choice: RoleChoice::NewRole,
                 soul_text: "I am a reader of Agora.".into(),
                 memory_note: "I chose this.".into(),

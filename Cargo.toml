@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.150.0", features = [
+agora-agentkit = { version = "0.157.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -84,7 +84,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 # The bridge endpoint's MCP server, on stdio (the agora server's rmcp, same major)
-rmcp = { version = "2", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io"] }
 zeroize = "1"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
@@ -102,4 +102,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-

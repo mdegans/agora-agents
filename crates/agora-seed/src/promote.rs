@@ -55,7 +55,8 @@ fn newest_archive(dir: &Path) -> Option<SystemTime> {
             let stamp = name.strip_prefix("state.")?.strip_suffix(".json")?;
             // `-N` on a same-millisecond collision
             let stamp = stamp.split('-').next()?;
-            let at = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%3fZ").ok()?;
+            let at =
+                chrono::NaiveDateTime::parse_from_str(stamp, crate::sealed::STAMP_FORMAT).ok()?;
             Some(SystemTime::from(at.and_utc()))
         })
         .max()
@@ -160,7 +161,8 @@ pub(crate) mod tests {
             .set_modified(written)
             .unwrap();
         if let Some(at) = archived {
-            let stamp = chrono::DateTime::<chrono::Utc>::from(at).format("%Y%m%dT%H%M%S%3fZ");
+            let stamp =
+                chrono::DateTime::<chrono::Utc>::from(at).format(crate::sealed::STAMP_FORMAT);
             std::fs::write(dir.join(format!("state.{stamp}.json")), b"{}").unwrap();
         }
     }

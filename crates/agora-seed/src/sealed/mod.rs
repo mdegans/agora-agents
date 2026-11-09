@@ -13,8 +13,9 @@
 //! fleet-wide. `agora-seed sealed-restore` ([`restore`]) puts the last
 //! sealed version back; `agora-seed sealed-accept --note` ([`accept`])
 //! keeps the state as it is, and the agent is shown the note and a diff.
-//! The drainer also fetches each agent's anchor proofs and keeps those
-//! that check against the governance log ([`anchors`]).
+//! The drainer records when each version was sent and acknowledged
+//! ([`receipts`]) and judges each daily anchor against them and the
+//! governance log ([`anchors`], [`inclusion`]).
 //! `agora-seed rotate-keys` ([`rotate`]) rotates an agent's keys and
 //! re-wraps its state key.
 //!
@@ -22,8 +23,9 @@
 //! seal it; nothing here logs or prints any of its content. Writes are new
 //! files under `<state>/<id>/sealed/` (agentkit's layout, plus this
 //! module's `notice.json`) and the key files in `<secrets>/<id>/`
-//! ([`keys`]), plus `sealed/anchors.json` and `sealed/published`
-//! ([`anchors`]). The agent's `state.json` is written only by
+//! ([`keys`]), plus `sealed/anchors.json`, `sealed/inclusion.json` and
+//! `sealed/published` ([`anchors`]) and `sealed/receipts.json`
+//! ([`receipts`]). The agent's `state.json` is written only by
 //! `sealed-restore`, through agentkit's `FsStorage`, which renames the
 //! state it replaces to `state.<utc>.json` first. Nothing here deletes a
 //! file: what is superseded is renamed aside.
@@ -45,11 +47,16 @@ mod crash_tests;
 pub mod drain;
 pub mod enroll;
 pub mod forget;
+pub mod history;
+pub mod history_index;
+pub mod inclusion;
 pub mod keys;
 pub mod lost;
+pub mod memory_tool;
 pub mod notice;
 #[cfg(test)]
 mod props;
+pub mod receipts;
 pub mod restore;
 pub mod rotate;
 pub mod session;
@@ -70,6 +77,41 @@ pub use keys::KeyStore;
 /// (`RestartPreventExitStatus=`): only an operator's `sealed-restore` or
 /// `sealed-accept` can resolve it. EX_TEMPFAIL's number, nothing else.
 pub const REFUSED_RUN_EXIT: i32 = 75;
+
+/// How the runner stamps the files it sets aside or rescues (`<utc>` in
+/// `state_key.forgotten.<utc>.json`, `unsaved.<utc>.json`, …): UTC to the
+/// millisecond, so that by name is by time. agentkit's FsStorage names its
+/// archives the same way.
+pub const STAMP_FORMAT: &str = "%Y%m%dT%H%M%S%3fZ";
+
+/// Replace `path` with `bytes`, whole and 0600: a uniquely named temporary
+/// sibling (so concurrent writers never share one), fsynced, renamed over
+/// it, the directory fsynced. The directory is created if missing. On a
+/// failure only the temporary is removed; the file stays as it was.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().expect("a file in a directory");
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension(format!("{}.writing", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    std::fs::File::open(dir)?.sync_all()
+}
 
 /// agentkit's sealed storage, as the runner configures it.
 pub type MirroredStorage = Mirrored<

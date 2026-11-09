@@ -27,6 +27,7 @@
 //! the endpoint's offered [`ModelInfo`] verbatim (same id — never a model
 //! switch) and keeps `state.prompt.model` in agreement.
 
+use crate::consent::offer::Stored;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -1424,7 +1425,9 @@ fn rescue_unsaved(
     report: &agora_agentkit::reactor::Report,
 ) -> Vec<(AgentId, std::io::Result<PathBuf>)> {
     use std::io::Write;
-    let at = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
+    let at = chrono::Utc::now()
+        .format(crate::sealed::STAMP_FORMAT)
+        .to_string();
     report
         .unsaved
         .iter()
@@ -1781,6 +1784,7 @@ async fn sealed_start_check(
     alerts: &alerts::Alerter,
     dry_run: bool,
     skipped: &mut Vec<Skipped>,
+    verified: Option<&sealed::anchors::VerifiedAnchors>,
 ) -> SealedRun {
     let mut run = SealedRun::default();
     // Stopped by the operator: not checked, not held, not alerted; told
@@ -1797,6 +1801,7 @@ async fn sealed_start_check(
                         lines: vec![stopped.line()],
                         notice: false,
                         stop_note: !stopped.shown,
+                        anchors_told: Vec::new(),
                     },
                 );
             }
@@ -1822,13 +1827,19 @@ async fn sealed_start_check(
         return run;
     }
     let mut refused = BTreeSet::new();
+    // The anchors not yet judged are judged here where they can be, so a
+    // session's verdict says what was found for the newest (beta round 12)
+    let start = verified.map(|verified| sealed::check::StartAnchors {
+        verified,
+        alerted: alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
+    });
     for (id, state) in pool.iter() {
         let Some((hash, sizes)) = enrolled.get(id) else {
             continue;
         };
         let name = state.soul.name.to_string();
         let dir = state_dir.join(id.to_string());
-        match sealed::check::check(&dir, *id, hash, *sizes, keys, api).await {
+        match sealed::check::check_with(&dir, *id, hash, *sizes, keys, api, start.as_ref()).await {
             sealed::check::Outcome::ServerFault { kind, detail } => {
                 skipped.push(Skipped::new(
                     *id,
@@ -1855,7 +1866,12 @@ async fn sealed_start_check(
                 notice,
                 hold,
                 drops,
+                told,
+                judged,
             } => {
+                if let Some(result) = &judged {
+                    sealed::anchors::alert_pass(alerts, *id, &name, result);
+                }
                 tracing::info!(
                     event_type = "sealed_state_checked",
                     agent = %name,
@@ -1902,6 +1918,7 @@ async fn sealed_start_check(
                         stop_note: false,
                         lines: seat,
                         notice,
+                        anchors_told: told,
                     },
                 );
                 run.drained.push((*id, name));
@@ -2315,6 +2332,18 @@ async fn run(held: &mut Held) -> Result<()> {
         &held.alerts,
         &mut skipped,
     );
+    // The reference client verifies the governance log every run
+    // (agora#127): signatures, chain, and the head entry's content.
+    // A log that does not verify stops the run before any agent acts.
+    // A dry run verifies too — it is read-only and worth knowing. Before
+    // the sealed-state start check, which judges the anchors it can and
+    // names the rest, the newest first, with why.
+    let verified_anchors = govlog::verify(
+        &agora_agentkit::client::Client::new(server_url.clone())?,
+        &data_dir,
+        &held.alerts,
+    )
+    .await?;
     // The sealed-state start check, for enrolled agents: before anyone is
     // built, so a refused agent is never run, saved or sealed.
     let sealed_run = sealed_start_check(
@@ -2326,6 +2355,7 @@ async fn run(held: &mut Held) -> Result<()> {
         &held.alerts,
         args.dry_run,
         &mut skipped,
+        Some(&verified_anchors),
     )
     .await;
     // Before any reactor is built. A dry run checks nothing, so refuses
@@ -2493,11 +2523,6 @@ async fn run(held: &mut Held) -> Result<()> {
         consent,
     };
 
-    // The reference client verifies the governance log every run
-    // (agora#127): signatures, chain, and the head entry's content.
-    // A log that does not verify stops the run before any agent acts.
-    // A dry run verifies too — it is read-only and worth knowing.
-    let verified_anchors = govlog::verify(&context.inner.client, &data_dir, &held.alerts).await?;
     // The constitution the agents read must be the one the server serves,
     // whole: a truncated or stale copy stops the run the same way.
     let web_tools =
@@ -2693,11 +2718,18 @@ async fn run(held: &mut Held) -> Result<()> {
 
     tracing::info!(agents = total, reactors = labels.len(), "starting run");
     let run_started = chrono::Utc::now();
+    // Before any session saves: a version committed after this is this
+    // process's own, and its upload times are recorded
+    // (sealed::receipts)
+    let drain_baselines =
+        sealed::receipts::baselines(&state_dir, sealed_run.drained.iter().map(|(id, _)| *id)).await;
     // Uploads, away from the reactors' storage lock: during the run, and
     // once more before exit
     let drainer = Arc::new(
         sealed::drain::Drainer::new(
             outbox.clone(),
+            state_dir.clone(),
+            drain_baselines,
             sealed_run.drained,
             sealed_run.held,
             held.alerts.clone(),
@@ -2967,6 +2999,7 @@ mod tests {
             &alerts::Alerter::off(),
             false,
             &mut skipped,
+            None,
         )
         .await;
         assert_eq!(pool.len(), 1);
@@ -2992,6 +3025,7 @@ mod tests {
             &alerts::Alerter::off(),
             false,
             &mut skipped,
+            None,
         )
         .await;
         assert!(!run.seats[&id].stop_note);
@@ -3033,6 +3067,7 @@ mod tests {
             &alerts::Alerter::off(),
             false,
             &mut skipped,
+            None,
         )
         .await;
         assert_eq!(pool.len(), 1);
@@ -3048,6 +3083,143 @@ mod tests {
         assert!(run.seats[&ok].lines[0].starts_with("Your sealed state: "));
         assert_eq!(run.drained.len(), 1);
         assert!(run.held.is_empty());
+    }
+
+    /// A dry run checks nothing: an anchor failure not yet told stays
+    /// untold for the next real session, and no sealed file is written.
+    #[tokio::test]
+    async fn a_dry_run_tells_no_anchor_finding_and_writes_nothing() {
+        use sealed::inclusion::{Checked, Finding, InclusionFile};
+        let root = sealed::TestDir::new("main-sealed-dry");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let file = InclusionFile {
+            through: Some("ANC-2026-0002".parse().unwrap()),
+            checked: vec![Checked {
+                anc_id: "ANC-2026-0002".parse().unwrap(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 11, 2),
+                finding: Finding::DidNotCheck,
+                at: chrono::Utc::now(),
+                told: false,
+                alerted: true,
+            }],
+        };
+        file.save(&dir).unwrap();
+        let before: Vec<_> = std::fs::read_dir(dir.join("sealed"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let mut pool = vec![(id, tarn)];
+        let mut skipped = Vec::new();
+        let api = sealed::api::fake::FakeApi::new();
+        // A newer anchor in the log: a dry run judges nothing at the start
+        // either, and asks Agora for nothing
+        let verified = sealed::anchors::VerifiedAnchors::new([(
+            "ANC-2026-0003".parse().unwrap(),
+            agora_agentkit::govlog::Sha256Hex::from([3; 32]),
+            chrono::Utc::now(),
+        )]);
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            true,
+            &mut skipped,
+            Some(&verified),
+        )
+        .await;
+        assert!(run.seats.is_empty() && run.drained.is_empty());
+        assert_eq!(InclusionFile::load(&dir).unwrap(), file, "still untold");
+        let after: Vec<_> = std::fs::read_dir(dir.join("sealed"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before.len(), after.len(), "no file added");
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// The start check judges an in-step agent's anchors before any
+    /// session (beta round 12), and a failure it finds goes to the
+    /// operator then, once; the verdict seated says it
+    #[tokio::test]
+    async fn the_start_check_judges_anchors_and_alerts_a_failure() {
+        let root = sealed::TestDir::new("main-sealed-start-anchors");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        sealed::anchors::tests::uploaded(&dir, id).await;
+        let state_dir = root.join("state");
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        let api = sealed::api::fake::FakeApi::new();
+        let entries = sealed::check::local_entries(&seal).await.unwrap();
+        // An anchor holding the genesis, though the later version was
+        // confirmed before its day ended: older than it should be
+        let genesis = &entries[0];
+        let (proof, anc, attested, _) = sealed::anchors::tests::anchor_on(
+            2,
+            sealed::anchors::tests::tomorrow(),
+            id,
+            genesis.entry_hash(),
+            genesis.entry.seq,
+        );
+        *api.chain.lock().unwrap() = Ok(entries);
+        api.proofs.lock().unwrap().push(proof);
+        let verified =
+            sealed::anchors::VerifiedAnchors::new([(anc.clone(), attested, chrono::Utc::now())]);
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let mut pool = vec![(id, tarn)];
+        let mut skipped = Vec::new();
+        let sent = alerts::testing::Recorder::default();
+        let alerter = alerts::testing::recording(&root, &sent);
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerter,
+            false,
+            &mut skipped,
+            Some(&verified),
+        )
+        .await;
+        alerter.flush(Duration::from_secs(5)).await;
+        let seat = &run.seats[&id];
+        assert!(
+            seat.lines[0].contains(&format!("{anc}, the anchor for "))
+                && seat.lines[0].contains("holds an older version of yours")
+                && seat.lines[0].contains("Your runner has alerted your operator."),
+            "{:?}",
+            seat.lines
+        );
+        assert_eq!(seat.anchors_told, vec![anc.clone()]);
+        let mails = sent.sent();
+        assert_eq!(mails.len(), 1, "{mails:?}");
+        assert!(mails[0].contains(anc.as_str()), "{}", mails[0]);
+        // Judged once: a second start alerts nothing more
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerter,
+            false,
+            &mut skipped,
+            Some(&verified),
+        )
+        .await;
+        alerter.flush(Duration::from_secs(5)).await;
+        assert_eq!(sent.sent().len(), 1);
+        assert!(run.seats[&id].lines[0].contains("holds an older version of yours"));
     }
 
     /// Fail closed: one refused agent among many refuses the whole run,
@@ -3086,6 +3258,7 @@ mod tests {
                 &alerts::Alerter::off(),
                 false,
                 &mut skipped,
+                None,
             )
             .await
         };
@@ -3187,6 +3360,7 @@ mod tests {
                 &alerts::Alerter::off(),
                 false,
                 &mut Vec::new(),
+                None,
             )
             .await
         };
@@ -3256,6 +3430,7 @@ mod tests {
                 &alerts::Alerter::off(),
                 false,
                 &mut Vec::new(),
+                None,
             )
             .await
         };
@@ -3305,6 +3480,7 @@ mod tests {
             &alerts::Alerter::off(),
             true,
             &mut Vec::new(),
+            None,
         )
         .await;
         assert!(run.refused.is_empty());

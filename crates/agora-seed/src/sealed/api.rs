@@ -54,7 +54,7 @@ pub trait SealedApi: Send + Sync {
         id: AgentId,
         key: &SigningKey,
         sha256: &agora_agentkit::govlog::Sha256Hex,
-    ) -> Result<Vec<u8>, String>;
+    ) -> Result<Vec<u8>, BlobError>;
     /// The agent's heads in `ANC-` entries after `after`, oldest first.
     /// Untrusted until checked ([`super::anchors`]).
     async fn proofs(
@@ -63,6 +63,10 @@ pub trait SealedApi: Send + Sync {
         key: &SigningKey,
         after: Option<GovernanceLogId>,
     ) -> Result<Vec<AnchorProof>, String>;
+    /// An `ANC-` entry's `data`, as Agora serves it (public, unsigned).
+    /// Untrusted until it hashes to the `data_hash` the verified
+    /// governance log attests ([`super::anchors::VerifiedAnchors::date`]).
+    async fn anchor_data(&self, anc: &GovernanceLogId) -> Result<serde_json::Value, String>;
     /// Agora's head for the agent, asked apart from its chain: `None` for
     /// `head: null` or a 404.
     async fn head(
@@ -74,12 +78,38 @@ pub trait SealedApi: Send + Sync {
     /// answers `head: null` (nothing sealed there) or 404s (an unknown or
     /// deleted agent); anything else unanswered is `Err`.
     async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
-    /// Whether the agent's public profile shows an anchored head (it chose
-    /// to publish). Unsigned: a profile read.
-    async fn anchor_shown(&self, name: &agora_agentkit::names::AgentName) -> Result<bool, String>;
+    /// Whether a publish choice was ever recorded on Agora for the agent,
+    /// by this runner or by the agent's own `config`. A signed read.
+    async fn publish_chosen(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
     /// Whether the agent's anchored head is shown on its profile.
     async fn post_anchor(&self, id: AgentId, key: &SigningKey, publish: bool)
     -> Result<(), String>;
+}
+
+/// A blob fetch that failed, and whether trying again could help.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct BlobError {
+    /// Transient (a 5xx, a timeout, a connection): worth another try. A
+    /// 4xx (a 404 above all) is not: the answer won't change.
+    pub retry: bool,
+    pub message: String,
+}
+
+impl BlobError {
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            retry: true,
+            message: message.into(),
+        }
+    }
+
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            retry: false,
+            message: message.into(),
+        }
+    }
 }
 
 /// [`SealedApi::chain`], in seq order with duplicates dropped: the order
@@ -182,10 +212,17 @@ impl SealedApi for Client {
         id: AgentId,
         key: &SigningKey,
         sha256: &agora_agentkit::govlog::Sha256Hex,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, BlobError> {
         self.get_state_blob(auth(id, key), sha256)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| match &e {
+                agora_agentkit::client::Error::Status { status, .. }
+                    if status.is_client_error() =>
+                {
+                    BlobError::permanent(e.to_string())
+                }
+                _ => BlobError::transient(e.to_string()),
+            })
     }
 
     async fn head(
@@ -212,13 +249,6 @@ impl SealedApi for Client {
         }
     }
 
-    async fn anchor_shown(&self, name: &agora_agentkit::names::AgentName) -> Result<bool, String> {
-        self.get_agent(name)
-            .await
-            .map(|a| a.is_some_and(|a| a.state_anchor.is_some()))
-            .map_err(|e| e.to_string())
-    }
-
     async fn proofs(
         &self,
         id: AgentId,
@@ -230,6 +260,24 @@ impl SealedApi for Client {
             .map_err(|e| e.to_string())
     }
 
+    async fn anchor_data(&self, anc: &GovernanceLogId) -> Result<serde_json::Value, String> {
+        use agora_agentkit::enums::DetailLevel;
+        use agora_agentkit::requests::GetContentInput;
+        use agora_agentkit::responses::ContentResponse;
+        // As signed, not with revisions applied: the log attests the
+        // original's hash
+        let mut input =
+            GetContentInput::new(anc.clone()).with_detail(DetailLevel::FullWithAttachments);
+        input.version = Some(agora_agentkit::enums::RecordVersion::Original);
+        let content = self.get_content(&input).await.map_err(|e| e.to_string())?;
+        match content {
+            ContentResponse::Governance(entry) => entry
+                .data
+                .ok_or_else(|| format!("{anc} was served without its data")),
+            _ => Err(format!("{anc} was not served as a governance-log entry")),
+        }
+    }
+
     async fn post_anchor(
         &self,
         id: AgentId,
@@ -239,6 +287,13 @@ impl SealedApi for Client {
         self.post_state_anchor(auth(id, key), publish)
             .await
             .map(drop)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn publish_chosen(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        self.config(id, key, &agora_agentkit::requests::ConfigInput::default())
+            .await
+            .map(|c| c.publish_state_anchor_chosen)
             .map_err(|e| e.to_string())
     }
 }
@@ -259,16 +314,27 @@ pub mod fake {
         pub public_key: Mutex<Option<agora_agentkit::crypto::VerifyingKey>>,
         /// What the server lists as the agent's rotations.
         pub rotations: Mutex<Vec<KeyRotation>>,
+        /// How long each blob answer takes, if set (a server hanging).
+        pub blob_delay: Mutex<Option<std::time::Duration>>,
         /// Blobs the server holds, by hash.
         pub blobs: Mutex<std::collections::HashMap<agora_agentkit::govlog::Sha256Hex, Vec<u8>>>,
         /// The proofs the server lists, all of them: `after` filters.
         pub proofs: Mutex<Vec<AnchorProof>>,
+        /// At most this many proofs a request (the real server's page is
+        /// 100); `None`, all.
+        pub proofs_page: Mutex<Option<usize>>,
+        /// Answer every proof whatever `after` asks: a server whose pages
+        /// don't advance.
+        pub proofs_ignore_after: Mutex<bool>,
+        /// `ANC-` entries' `data`, as served, by id.
+        pub anchor_data: Mutex<std::collections::HashMap<GovernanceLogId, serde_json::Value>>,
         /// Every `post_anchor`'s `publish`.
         pub anchored: Mutex<Vec<bool>>,
+        /// A publish choice is on record (the agent's own `config`); any
+        /// `post_anchor` sets it too.
+        pub chosen: Mutex<bool>,
         /// The agent is unknown to the server (deleted): a 404.
         pub unknown_agent: Mutex<bool>,
-        /// Its profile shows an anchored head.
-        pub anchor_shown: Mutex<bool>,
         /// What `head` answers instead of the chain's last: a server whose
         /// answers disagree.
         pub head_override: Mutex<Option<Option<agora_agentkit::govlog::Sha256Hex>>>,
@@ -284,10 +350,14 @@ pub mod fake {
                 public_key: Mutex::default(),
                 rotations: Mutex::default(),
                 blobs: Mutex::default(),
+                blob_delay: Mutex::default(),
                 proofs: Mutex::default(),
+                proofs_page: Mutex::default(),
+                proofs_ignore_after: Mutex::default(),
+                anchor_data: Mutex::default(),
                 anchored: Mutex::default(),
+                chosen: Mutex::default(),
                 unknown_agent: Mutex::default(),
-                anchor_shown: Mutex::default(),
                 head_override: Mutex::default(),
             }
         }
@@ -390,14 +460,18 @@ pub mod fake {
             _: AgentId,
             _: &SigningKey,
             sha256: &agora_agentkit::govlog::Sha256Hex,
-        ) -> Result<Vec<u8>, String> {
-            self.call("blob")?;
+        ) -> Result<Vec<u8>, BlobError> {
+            self.call("blob").map_err(BlobError::transient)?;
+            let delay = *self.blob_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             self.blobs
                 .lock()
                 .unwrap()
                 .get(sha256)
                 .cloned()
-                .ok_or_else(|| "404".to_string())
+                .ok_or_else(|| BlobError::permanent("HTTP 404 Not Found"))
         }
 
         async fn proofs(
@@ -407,14 +481,29 @@ pub mod fake {
             after: Option<GovernanceLogId>,
         ) -> Result<Vec<AnchorProof>, String> {
             self.call("proofs")?;
-            Ok(self
+            let after = after.filter(|_| !*self.proofs_ignore_after.lock().unwrap());
+            let mut page: Vec<AnchorProof> = self
                 .proofs
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|p| after.as_ref().is_none_or(|a| p.anc_id > *a))
                 .cloned()
-                .collect())
+                .collect();
+            if let Some(n) = *self.proofs_page.lock().unwrap() {
+                page.truncate(n);
+            }
+            Ok(page)
+        }
+
+        async fn anchor_data(&self, anc: &GovernanceLogId) -> Result<serde_json::Value, String> {
+            self.call("anchor_data")?;
+            self.anchor_data
+                .lock()
+                .unwrap()
+                .get(anc)
+                .cloned()
+                .ok_or_else(|| "404".to_string())
         }
 
         async fn head(
@@ -451,11 +540,6 @@ pub mod fake {
             }
         }
 
-        async fn anchor_shown(&self, _: &agora_agentkit::names::AgentName) -> Result<bool, String> {
-            self.call("anchor_shown")?;
-            Ok(*self.anchor_shown.lock().unwrap())
-        }
-
         async fn post_anchor(
             &self,
             _: AgentId,
@@ -465,7 +549,14 @@ pub mod fake {
             self.call("post_anchor")?;
             self.signed_by(key)?;
             self.anchored.lock().unwrap().push(publish);
+            *self.chosen.lock().unwrap() = true;
             Ok(())
+        }
+
+        async fn publish_chosen(&self, _: AgentId, key: &SigningKey) -> Result<bool, String> {
+            self.call("publish_chosen")?;
+            self.signed_by(key)?;
+            Ok(*self.chosen.lock().unwrap())
         }
     }
 }

@@ -22,7 +22,7 @@ use super::sizes::Sizes;
 fn archive_name() -> String {
     format!(
         "state.{}.json",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
+        chrono::Utc::now().format(crate::sealed::STAMP_FORMAT)
     )
 }
 
@@ -431,7 +431,8 @@ fn anc(
     all.insert(at, anchor_leaf(leaf_agent, &leaf_head));
     let root = merkle_root(&all);
     let anc_id: GovernanceLogId = format!("ANC-2026-{n:04}").parse().unwrap();
-    let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Days::new(n as u64);
+    // After the agent's versions, so a genuine proof is one it may hold
+    let date = chrono::Utc::now().date_naive() + chrono::Days::new(1 + n as u64);
     let attested = super::anchors::anchor_data_hash(&AnchorData {
         date,
         root,
@@ -465,11 +466,12 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     /// Random ANCs, random agent counts, genuine and forged proofs in any
-    /// order: only genuine own proofs are stored, in order; a forged one
-    /// stops the pass where it is (alerted), and once Agora stops serving
-    /// it the genuine ones after it are stored: the cursor never skips one.
+    /// order: each anchor is judged once, in order, in one pass; only
+    /// genuine own proofs are stored, each judged to hold the version it
+    /// should (uploaded with their times recorded); every forged one is a
+    /// failure of its own kind, and none stops the ones after it.
     #[test]
-    fn only_genuine_own_proofs_are_stored_and_none_is_skipped(
+    fn each_anchor_is_judged_once_and_only_genuine_proofs_are_stored(
         kinds in proptest::collection::vec((proof_kind(), 0usize..20, 0usize..20), 1..8)
     ) {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
@@ -482,39 +484,44 @@ proptest! {
             let mut log = Vec::new();
             for (i, (kind, leaves, at)) in kinds.iter().enumerate() {
                 let (proof, anc_id, attested) =
-                    anc(i as u32 + 1, b.id, head.entry_hash, head.seq, *leaves, *at, *kind);
+                    anc(i as u32 + 2, b.id, head.entry_hash, head.seq, *leaves, *at, *kind);
                 served.push((*kind, proof));
-                log.push((anc_id, attested));
+                log.push((anc_id, attested, chrono::Utc::now()));
             }
-            let verified = super::anchors::VerifiedAnchors::new(log);
+            let verified = super::anchors::VerifiedAnchors::new(log.clone());
             let genuine: Vec<AnchorProof> = served
                 .iter()
                 .filter(|(k, _)| *k == ProofKind::Genuine)
                 .map(|(_, p)| p.clone())
                 .collect();
             *b.api.proofs.lock().unwrap() = served.iter().map(|(_, p)| p.clone()).collect();
-            // Passes until nothing changes; a hard failure's proof is then
-            // withdrawn, as a fixed server would
-            for _ in 0..(served.len() + 2) {
-                match super::anchors::fetch_proofs(&b.dir, b.id, &b.keys, &signing, &b.api, &verified).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        prop_assert!(matches!(e.kind(), "not_the_logs" | "did_not_check"), "{e}");
-                        let stored = super::anchors::AnchorsFile::load(&b.dir).unwrap().proofs;
-                        // The failing one is the first unstored non-skipped
-                        let after = stored.last().map(|p| p.anc_id.clone());
-                        let mut proofs = b.api.proofs.lock().unwrap();
-                        let pos = proofs.iter().position(|p| {
-                            after.as_ref().is_none_or(|a| p.anc_id > *a)
-                                && served.iter().any(|(k, s)| s == p && matches!(k, ProofKind::ForgedRoot | ProofKind::ForgedPath | ProofKind::OtherAgent))
-                        });
-                        prop_assert!(pos.is_some(), "a hard failure names a forged proof");
-                        proofs.remove(pos.unwrap());
-                    }
-                }
+            let pass = super::anchors::check_anchors(&b.dir, b.id, &b.keys, &signing, &b.api, &verified, true)
+                .await
+                .unwrap();
+            prop_assert_eq!(pass.judged, served.len());
+            let judged = super::inclusion::InclusionFile::load(&b.dir).unwrap().checked;
+            for ((kind, proof), c) in served.iter().zip(&judged) {
+                prop_assert_eq!(&c.anc_id, &proof.anc_id);
+                let expect: &[&str] = match kind {
+                    ProofKind::Genuine => &["holds"],
+                    ProofKind::ForgedRoot => &["not_the_logs"],
+                    // An empty path is forged by its count, which the log's
+                    // data hash covers
+                    ProofKind::ForgedPath => &["did_not_check", "not_the_logs"],
+                    ProofKind::OtherAgent => &["did_not_check"],
+                    ProofKind::OtherChain | ProofKind::WrongSeq => &["not_on_line"],
+                };
+                prop_assert!(expect.contains(&c.finding.kind()), "{:?}: {:?}", kind, c.finding);
+                prop_assert_eq!(c.finding.failed(), *kind != ProofKind::Genuine);
             }
+            prop_assert_eq!(pass.failures.len(), served.len() - genuine.len());
             let stored = super::anchors::AnchorsFile::load(&b.dir).unwrap().proofs;
             prop_assert_eq!(stored, genuine);
+            // A second pass judges nothing again
+            let again = super::anchors::check_anchors(&b.dir, b.id, &b.keys, &signing, &b.api, &verified, true)
+                .await
+                .unwrap();
+            prop_assert_eq!(again.judged, 0);
             Ok(())
         })?;
     }
@@ -787,7 +794,6 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
         };
         assert_eq!(refused, vec![(b.id, reason)]);
         assert!(b.seal().is_refused().await.unwrap(), "marked");
-        b.api.anchor_shown.lock().unwrap().clone_from(&true);
         super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
             .await
             .unwrap_or_else(|e| panic!("{missing}: {e:#}"));
@@ -813,8 +819,21 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
                 .join("sealed")
                 .join(super::anchors::PUBLISHED)
                 .exists(),
-            "published, as its profile shows"
+            "the marker is back: a restore never re-sends the publish"
         );
+        // Even with a ledger saying publish: the agent may have turned it
+        // off with `config`, and its profile can't say so
+        super::anchors::tests::chose(
+            &b.dir,
+            crate::consent::sealed_state::prompt::SealChoice::Publish,
+        )
+        .await;
+        let signing = b.keys.signing(b.id).unwrap();
+        assert_eq!(
+            super::anchors::publish_if_chosen(&b.dir, b.id, &signing, &b.api).await,
+            Ok(false)
+        );
+        assert!(b.api.anchored.lock().unwrap().is_empty(), "nothing sent");
         assert!(
             check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off())
                 .await

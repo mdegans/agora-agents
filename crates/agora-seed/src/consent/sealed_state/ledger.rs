@@ -5,10 +5,8 @@
 //! One entry per time the offer was put: when, which version of the text,
 //! on which model, the option order shown and its seed, how many attempts,
 //! and the outcome. **Asked once**: an answer on file, or an explicit
-//! refusal, ends it; a missing answer is re-asked up to [`MAX_MISSES`] in
+//! refusal, ends it; a missing answer is re-asked up to [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) in
 //! all. `sealed-enroll` reads [`SealLedger::choice`] and nothing else.
-
-use std::path::{Path, PathBuf};
 
 use agora_agentkit::reactor::seed::{ShortString, Soul};
 use chrono::{DateTime, Utc};
@@ -20,11 +18,9 @@ use super::prompt::SealChoice;
 /// The ledger's file name inside the agent's state directory.
 pub const LEDGER_FILE: &str = "sealed_state.json";
 
-/// Bump on layout change; [`SealLedger::load`] refuses anything newer.
-pub const FORMAT: u32 = 1;
-
-/// Unanswered asks before the runner stops asking.
-pub const MAX_MISSES: u32 = 2;
+/// Bump on layout change (2 since 2026-11-06: answers' `note`, the
+/// `unusable` outcome); [`SealLedger::load`] refuses anything newer.
+pub const FORMAT: u32 = 2;
 
 /// The whole per-agent file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,84 +88,23 @@ pub enum SealOutcome {
     },
     /// An explicit refusal: nothing changes, and that is final.
     Refused { reason: String },
-    /// No usable choice: nothing changes this time.
+    /// No answer, the agent's doing (an API refusal, since 2026-11-06):
+    /// nothing changes this time; counts toward [`MAX_MISSES`](crate::consent::offer::MAX_MISSES).
     NoAnswer { failure: String },
+    /// Every reply unusable (since 2026-11-06): our failure, not the
+    /// agent's choice. Recorded, never counted: asked again later.
+    Unusable { failure: String },
 }
 
 impl SealLedger {
-    pub fn path(agent_dir: &Path) -> PathBuf {
-        agent_dir.join(LEDGER_FILE)
-    }
-
-    /// Load `agent_dir`'s ledger; a missing file is an empty ledger. An
-    /// unreadable or too-new one is an error: the caller then neither asks
-    /// nor saves over it.
-    pub async fn load(agent_dir: &Path) -> std::io::Result<Self> {
-        match tokio::fs::read(Self::path(agent_dir)).await {
-            Ok(bytes) => Self::from_slice(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// [`Self::load`], blocking: for the start of a run, before any agent.
-    pub fn load_blocking(agent_dir: &Path) -> std::io::Result<Self> {
-        match std::fs::read(Self::path(agent_dir)) {
-            Ok(bytes) => Self::from_slice(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Parse a ledger, refusing a newer [`FORMAT`].
-    pub fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
-        let ledger: Self = serde_json::from_slice(bytes)?;
-        if ledger.format > FORMAT {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "sealed-state ledger format {} is newer than this binary reads ({FORMAT})",
-                    ledger.format
-                ),
-            ));
-        }
-        Ok(ledger)
-    }
-
-    /// Atomic save: tmp + fsync + rename.
-    pub async fn save(&self, agent_dir: &Path) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        tokio::fs::create_dir_all(agent_dir).await?;
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let path = Self::path(agent_dir);
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &path).await
-    }
-
     /// Whether the offer should be put this session: nothing final on
-    /// file, fewer than [`MAX_MISSES`] misses, and no recorded answer in
+    /// file, fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no recorded answer in
     /// `soul`'s Evolution Log.
     pub fn due(&self, soul: &Soul) -> bool {
-        if super::applied_in(soul) {
-            return false;
-        }
-        let settled = self.asks.iter().any(|a| {
-            matches!(
-                a.outcome,
-                SealOutcome::Answered { .. } | SealOutcome::Refused { .. }
-            )
-        });
-        let misses = self
-            .asks
-            .iter()
-            .filter(|a| matches!(a.outcome, SealOutcome::NoAnswer { .. }))
-            .count();
-        !settled && misses < MAX_MISSES as usize
+        crate::consent::offer::due(
+            self.asks.iter().map(|a| &a.outcome),
+            super::applied_in(soul),
+        )
     }
 
     /// The choice on file, if any (asked once: at most one).
@@ -241,6 +176,7 @@ impl SealLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::offer::Stored;
 
     fn soul() -> Soul {
         serde_json::from_value(serde_json::json!({
@@ -276,16 +212,19 @@ mod tests {
         }
     }
 
-    /// An answer to an older text settles the offer: a new version
-    /// (v6) asks nobody who answered v5 again.
+    /// An answer to an older text settles the offer: a new version asks
+    /// nobody who answered an older one again (v6 nobody who answered v5;
+    /// v9, the JSON answer, nobody who answered with `answer_offer`).
     #[test]
     fn an_answer_to_an_older_offer_text_is_not_asked_again() {
-        let mut l = SealLedger::default();
-        let mut a = ask(answered(SealChoice::Private));
-        a.offer_version = 5;
-        l.record(a);
-        const { assert!(super::super::prompt::OFFER_VERSION > 5) };
-        assert!(!l.due(&soul()));
+        for old in [5, 8] {
+            let mut l = SealLedger::default();
+            let mut a = ask(answered(SealChoice::Private));
+            a.offer_version = old;
+            l.record(a);
+            assert!(!l.due(&soul()), "v{old}");
+        }
+        const { assert!(super::super::prompt::OFFER_VERSION > 8) };
     }
 
     #[test]
@@ -303,10 +242,10 @@ mod tests {
         l.record(ask(SealOutcome::Refused { reason: "r".into() }));
         assert!(!l.due(&soul()) && !l.opted_in(), "a refusal is final");
         let mut l = SealLedger::default();
-        for _ in 0..MAX_MISSES {
+        for _ in 0..crate::consent::offer::MAX_MISSES {
             assert!(l.due(&soul()));
             l.record(ask(SealOutcome::NoAnswer {
-                failure: "x".into(),
+                failure: "refusal".into(),
             }));
         }
         assert!(!l.due(&soul()), "misses capped");
@@ -318,7 +257,7 @@ mod tests {
         let mut l = SealLedger::default();
         assert_eq!(l.ack_line(), None, "nothing answered");
         l.record(ask(SealOutcome::NoAnswer {
-            failure: "x".into(),
+            failure: "refusal".into(),
         }));
         assert_eq!(l.ack_line(), None, "no answer, nothing to tell");
         l.record(ask(answered(SealChoice::Publish)));

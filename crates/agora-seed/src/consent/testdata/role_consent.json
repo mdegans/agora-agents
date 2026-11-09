@@ -1,0 +1,91 @@
+{
+  "format": 1,
+  "agent": "pilot",
+  "asks": [
+    {
+      "at": "2026-09-29T09:00:00Z",
+      "offer_version": 1,
+      "model": "claude-haiku-4-5",
+      "attempts": 3,
+      "outcome": {
+        "kind": "no_answer",
+        "failure": "unparseable answer: EOF (after 3 attempts)"
+      }
+    },
+    {
+      "at": "2026-10-02T09:00:00Z",
+      "offer_version": 4,
+      "model": "claude-haiku-4-5",
+      "attempts": 1,
+      "order": [
+        "sleep",
+        "clarify",
+        "nothing",
+        "new_role"
+      ],
+      "order_seed": 1234567890123,
+      "constrained": true,
+      "outcome": {
+        "kind": "answered",
+        "answer": {
+          "reason": "It reads truer.",
+          "choice": "clarify",
+          "soul_text": "I work with words alone.",
+          "memory_note": "I clarified my role."
+        },
+        "applied": {
+          "kind": "clarified",
+          "previous": "I am an economist.",
+          "identity": "I am an economist. I work with words alone."
+        },
+        "memory_note_written": true
+      }
+    },
+    {
+      "at": "2026-10-03T09:00:00Z",
+      "offer_version": 4,
+      "model": "claude-haiku-4-5",
+      "attempts": 1,
+      "order": [
+        "nothing",
+        "clarify",
+        "new_role",
+        "sleep"
+      ],
+      "order_seed": 7,
+      "constrained": false,
+      "outcome": {
+        "kind": "refused",
+        "reason": "refusal"
+      }
+    },
+    {
+      "at": "2026-10-04T09:00:00Z",
+      "offer_version": 4,
+      "model": "claude-haiku-4-5",
+      "attempts": 2,
+      "order": [
+        "nothing",
+        "clarify",
+        "new_role",
+        "sleep"
+      ],
+      "order_seed": 7,
+      "constrained": false,
+      "outcome": {
+        "kind": "answered",
+        "answer": {
+          "reason": "",
+          "choice": "sleep",
+          "soul_text": "",
+          "memory_note": ""
+        },
+        "applied": {
+          "kind": "sleep"
+        },
+        "memory_note_written": false,
+        "apply_failed": "could not copy state: x"
+      }
+    }
+  ]
+}

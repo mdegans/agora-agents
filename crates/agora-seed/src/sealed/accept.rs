@@ -538,7 +538,7 @@ mod tests {
             "{seat:?}"
         );
         assert!(
-            seat[1].starts_with("Your sealed state: intact. 2 versions since "),
+            seat[1].starts_with("Your sealed state: intact. It has 2 versions since "),
             "{seat:?}"
         );
         // Shown in a session that saved: not again
@@ -606,8 +606,9 @@ mod tests {
             .expect("a verdict");
         assert!(
             verdict.contains(
-                "Your memory is 400 characters (\u{2212}600 since your last checked version) and"
-            ),
+                "your memory is 400 characters (\u{2212}600 since your earlier sealed version, \
+                 head "
+            ) && verdict.contains(") and your soul"),
             "{verdict}"
         );
         assert!(!verdict.contains("rewrote"), "{verdict}");

@@ -41,9 +41,12 @@
 //!   agent's state is backed up to Agora, sealed under its own key
 //!   (`publish`, `private`, `decline`); the runner's side is
 //!   [`crate::sealed`].
-//! - [`offers`] — `answer_offer`, the strict tool all five are answered
-//!   with: every offer due at a session's close is seated in one question
-//!   turn, each under a heading naming its key.
+//! - [`offer`] — what every offer shares, once: the miss cap, the option
+//!   order, when an offer is due, the memory note's checks, the answer's
+//!   schema, the receipt, and the per-offer slot the wrapper keeps.
+//! - [`questions`] — the review and the five offers as agentkit `Ask`s,
+//!   asked one per turn as JSON in each one's own shape (`answer_offer`,
+//!   the strict tool they shared, went on 2026-11-06).
 //!
 //! ```toml
 //! [model_consent]
@@ -71,8 +74,9 @@ pub mod comparison;
 pub mod forks;
 pub mod ledger;
 pub mod memory_restore;
-pub mod offers;
+pub mod offer;
 pub mod prompt;
+pub mod questions;
 pub mod queue;
 pub mod role;
 pub mod sealed_state;
@@ -207,6 +211,11 @@ pub struct ConsentRuntime {
     /// What the sealed-state start check seats in each enrolled agent's
     /// intro ([`crate::sealed::check`]).
     pub sealed_seats: std::collections::BTreeMap<agora_agentkit::ids::AgentId, SealedSeat>,
+    /// The secrets tree, for each session's memory-id key and the `memory`
+    /// tool's sealed history.
+    pub key_store: crate::sealed::KeyStore,
+    /// What the `memory` tool fetches pruned sealed versions with: Agora.
+    pub memory_api: Arc<dyn crate::sealed::api::SealedApi>,
 }
 
 /// Lines the sealed-state start check left for an agent's intro.
@@ -217,6 +226,10 @@ pub struct SealedSeat {
     pub notice: bool,
     /// One is the stop's first note: marked shown once the session saves.
     pub stop_note: bool,
+    /// The anchors its verdict tells of: marked told once the session saves
+    /// ([`crate::sealed::inclusion::mark_told`]), so a verdict seated for a
+    /// session that never runs doesn't use them up.
+    pub anchors_told: Vec<agora_agentkit::ids::GovernanceLogId>,
 }
 
 impl ConsentRuntime {
@@ -237,7 +250,6 @@ impl ConsentRuntime {
             state_dir: data_dir.join("state"),
             secrets_dir: data_dir.join("secrets"),
             queue_path: queue::queue_path(data_dir),
-            client,
             keys,
             catalog,
             max_tokens,
@@ -247,6 +259,9 @@ impl ConsentRuntime {
             memory_restore: None,
             sealed_state: None,
             sealed_seats: Default::default(),
+            key_store: crate::sealed::KeyStore::new(data_dir.join("secrets")),
+            memory_api: Arc::new(client.clone()),
+            client,
         })
     }
 
@@ -336,3 +351,5 @@ mod tests {
         assert!(same.offer.unwrap().validate().is_err());
     }
 }
+#[cfg(test)]
+mod golden;

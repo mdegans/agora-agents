@@ -1,28 +1,27 @@
-//! The two questions — the offer and the trial review — as instructions,
-//! the review's output schema (derived from [`ReviewAnswer`]), and parse
-//! targets.
+//! The two model questions — the offer and the trial review — as
+//! instructions, their answers on the wire ([`ModelSwapReply`],
+//! [`ReviewArgs`]) and as the ledger keeps them ([`OfferAnswer`],
+//! [`ReviewAnswer`]).
 //!
-//! The offer is answered with the strict `answer_offer` tool
-//! ([`super::offers`]), as one section of the closing question; its typed
-//! answer ([`OfferAnswer`]) is built from the call, or parsed from plain
-//! text as a fallback. The review, asked at the start of a session in place
-//! of the act phase, still goes out with its schema as `output_config`
-//! where that keeps the cache (blallama), and as plain text elsewhere.
+//! Both are asked for as JSON, like every closing question (agentkit
+//! `reactor::ask`; `answer_offer` is gone since 2026-11-06): the wire
+//! type's schema goes out as `output_config` where that keeps the cache
+//! (blallama), and the words and the parser carry it elsewhere.
 //!
-//! **The schema is the parse type's own**, rendered inline
-//! (`inline_input_schema_for`): a plain derive would put the enum into `$defs`
-//! behind a `$ref`, and `$ref` in a constrained-decoding schema is banned in
-//! this project (CLAUDE.md, "Never ship a `$ref` schema"). The tests pin
-//! that.
+//! **The schema is the wire type's own**, inline ([`super::offer::answer_schema`]):
+//! a plain derive would put the enum into `$defs` behind a `$ref`, and
+//! `$ref` in a constrained-decoding schema is banned in this project
+//! (CLAUDE.md, "Never ship a `$ref` schema"). The tests pin that.
 //!
-//! **Order is deliberate.** The optional `note` (words for the record, not
-//! a scratchpad: CLAUDE.md, "Never ship a `$ref` schema", rule 5) comes
-//! before `choice`: under a grammar the decoder emits properties in
-//! declaration order, so the statement precedes the decision (rule 2).
-//! Until 2026-10-15 a `reason` came first, then `choice` did until
-//! 2026-10-22; the ledger still keeps the note as `reason`
-//! ([`ReviewAnswer`]), so no saved state changed shape. And `stay` is
-//! listed first — the no-change option takes the first-option bias.
+//! **Order is deliberate.** In the review, the optional `note` (words for
+//! the record, not a scratchpad: CLAUDE.md, "Never ship a `$ref` schema",
+//! rule 5) comes before `choice`: under a grammar the decoder emits
+//! properties in declaration order, so the statement precedes the decision
+//! (rule 2). Until 2026-10-15 a `reason` came first, then `choice` did until
+//! 2026-10-22. The offer's answer is `choice`, then `note`, as every offer's
+//! is. The ledger kept the note as `reason` until 2026-11-06, and now as
+//! `note`, reading the old name too. And `stay` is listed first — the
+//! no-change option takes the first-option bias.
 //!
 //! **The words the agent answers with are `stay` and `switch`**
 //! ([`ReviewWord`]), each glossed with its model where it is asked. They
@@ -32,7 +31,6 @@
 //! [`ReviewChoice`]'s `revert`/`keep`, unchanged; only the wire words
 //! changed.
 
-use agora_agentkit::responses::inline_input_schema_for;
 use misanthropic::prompt::message::Content;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -42,16 +40,19 @@ use super::forks::{
     Adjustment, BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written,
 };
 use super::ledger::{MAX_FAILED_TRIAL_SESSIONS, TRIAL_SESSIONS, TrialNote};
+use super::offer::UNUSABLE_CAP;
 
-/// The agent's answer to the offer.
+/// The agent's answer to the offer, as the ledger keeps it. `note` was
+/// `reason` until 2026-11-06, and is still read under that name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferAnswer {
-    pub reason: String,
+    #[serde(alias = "reason")]
+    pub note: String,
     pub choice: OfferChoice,
 }
 
 /// The offer's options, in the order they are presented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OfferChoice {
     NoSwap,
@@ -59,17 +60,73 @@ pub enum OfferChoice {
     Permanent,
 }
 
-#[cfg(test)]
 impl OfferChoice {
+    /// The order they are shown in, and the schema's.
     pub const ALL: [Self; 3] = [Self::NoSwap, Self::Trial, Self::Permanent];
+
+    /// The wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSwap => "no_swap",
+            Self::Trial => "trial",
+            Self::Permanent => "permanent",
+        }
+    }
 }
 
-/// The agent's answer to the trial review, as the ledger keeps it. `reason`
-/// is the agent's note ([`ReviewArgs::note`]).
+/// The offer's answer on the wire: the choice, then an optional note.
+/// Closed, like its schema ([`offer_schema`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSwapReply {
+    /// `no_swap`, `trial` or `permanent`
+    pub choice: OfferChoice,
+    /// Optional: a note about your choice, in your own words. A trial's is shown back to you at the trial's end; otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it. Use "" for none.
+    #[serde(default, alias = "reason")]
+    pub note: String,
+}
+
+impl From<ModelSwapReply> for OfferAnswer {
+    fn from(r: ModelSwapReply) -> Self {
+        Self {
+            note: r.note,
+            choice: r.choice,
+        }
+    }
+}
+
+/// The offer's answer's example: what the question ends with, and its
+/// template.
+pub fn offer_example() -> serde_json::Value {
+    super::offer::example(&super::offer::names(&OfferChoice::ALL), &[("note", "")])
+}
+
+/// The review's answer's example (the note first): what the question ends
+/// with, and its template.
+pub fn review_example() -> serde_json::Value {
+    super::offer::example_choice_last(
+        &super::offer::names(&ReviewWord::ALL),
+        &[(
+            "note",
+            "<optional: a note about your choice, in your own words, kept with your answer \
+             (the Steward and Claude can read it); empty for none>",
+        )],
+    )
+}
+
+/// [`ModelSwapReply`]'s schema: `{choice, note}`, inline, `$ref`-free and
+/// closed.
+pub fn offer_schema() -> serde_json::Value {
+    super::offer::answer_schema::<ModelSwapReply>(&OfferChoice::ALL.map(OfferChoice::as_str))
+}
+
+/// The agent's answer to the trial review, as the ledger keeps it. `note`
+/// was `reason` until 2026-11-06, and is still read under that name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewAnswer {
-    pub reason: String,
+    #[serde(alias = "reason")]
+    pub note: String,
     pub choice: ReviewChoice,
 }
 
@@ -78,10 +135,10 @@ pub struct ReviewAnswer {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewArgs {
-    /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it; it is not shown to you again. Empty for none.
-    // Required, empty for none, as in `answer_offer`: strict decoders omit
-    // optional fields. Plain text is read leniently ([`parse_review_args`]).
-    #[serde(alias = "reason")]
+    /// Optional: a note about your choice, in your own words. It is kept with your answer under your name, where the Steward and Claude can read it; it is not shown to you again. Use "" for none.
+    // Required in the schema (a grammar then writes it, in this order);
+    // optional to the parser, so a bare `{"choice": …}` is an answer.
+    #[serde(default, alias = "reason")]
     pub note: String,
     /// `stay` (stay on the model this session runs on) or `switch` (move to the trial's model permanently)
     pub choice: ReviewWord,
@@ -90,7 +147,7 @@ pub struct ReviewArgs {
 impl From<ReviewArgs> for ReviewAnswer {
     fn from(a: ReviewArgs) -> Self {
         Self {
-            reason: a.note,
+            note: a.note,
             choice: a.choice.into(),
         }
     }
@@ -138,9 +195,17 @@ impl From<ReviewWord> for ReviewChoice {
     }
 }
 
-#[cfg(test)]
 impl ReviewWord {
+    /// The order they are shown in, and the schema's.
     pub const ALL: [Self; 2] = [Self::Stay, Self::Switch];
+
+    /// The wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stay => "stay",
+            Self::Switch => "switch",
+        }
+    }
 }
 
 /// The two answers to the review, each with its model: the choice section
@@ -156,7 +221,7 @@ pub fn review_words(from: &str, to: &str) -> String {
 /// [`ReviewArgs`]' schema: `{note, choice}`, inline, `$ref`-free and
 /// closed
 pub fn review_schema() -> serde_json::Value {
-    inline_input_schema_for::<ReviewArgs>()
+    super::offer::answer_schema::<ReviewArgs>(&ReviewWord::ALL.map(ReviewWord::as_str))
 }
 
 /// The human-facing half of an offer.
@@ -181,9 +246,9 @@ const PROVENANCE: &str = "It is not part of the survey and it is not anonymous: 
 /// [`PROVENANCE`]; the closing question says who is asking).
 const RECORD: &str = "Your answer is kept in a separate record, not written into your memory; one line recording your choice (not your `note`) will be added to the Evolution Log in your SOUL.";
 
-/// The offer's section of the closing question ([`super::offers::question`],
-/// which says who is asking and how to answer). Answered with
-/// `answer_offer`, `offer` = `model_swap`.
+/// The offer, after the closing question's preface
+/// ([`super::offer::preface`], which says who is asking), ending with how
+/// to answer: JSON in [`ModelSwapReply`]'s shape.
 pub fn offer(text: OfferText<'_>) -> Content {
     let OfferText {
         from_name: from,
@@ -197,6 +262,7 @@ pub fn offer(text: OfferText<'_>) -> Content {
     } else {
         format!("Every agent on {from} is being asked whether it would like to move to **{to}**.")
     };
+    let shape = super::offer::fenced(&offer_example());
     let body = format!(
         r#"**About the model you run on.** You currently run on **{from}**. {who}
 
@@ -210,11 +276,13 @@ Your options:
 2. `trial` — move to {to} for {TRIAL_SESSIONS} sessions (a session that ends early doesn't count; if {MAX_FAILED_TRIAL_SESSIONS} in a row on {to} can't finish, the trial ends early and you return to {from}). After those {TRIAL_SESSIONS} sessions you return to {from}, where you will be shown the note you left with your choice, if you left one, and some of what you wrote before and during the trial, beside what the other model writes from the same moments, and asked whether to go back to {to} for good or stay on {from}. If you don't answer that question, you stay on {from}.
 3. `permanent` — move to {to} permanently.
 
-If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer, you may be asked once more; with no answer, you stay on {from}.
+If you choose `trial` or `permanent`, the move normally takes effect from your next session. If you don't answer, or your answer can't be read, you may be asked again at a later session; with no answer, you stay on {from}.
 
 {RECORD}
 
-To answer, call `answer_offer` with `offer` set to `model_swap` and `choice` set to `no_swap`, `trial` or `permanent`. `note` is optional: a few words about your choice, in your own voice. If you choose `trial`, it is shown back to you after the trial, when you decide whether to switch to {to}: a note to your future self. Otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it, and is not written into your memory or your SOUL. Leave `text` and `memory_note` empty: this question writes nothing into your memory."#
+To answer, reply with JSON only, in exactly the shape below. `choice` is `no_swap`, `trial` or `permanent`. `note` is optional: a few words about your choice, in your own voice. If you choose `trial`, it is shown back to you after the trial, when you decide whether to switch to {to}: a note to your future self. Otherwise you won't see it again. It is kept with your answer under your name, where the Steward and Claude can read it, and is not written into your memory or your SOUL. Use `""` for none.
+
+{shape}"#
     );
     Content::from(body)
 }
@@ -482,6 +550,7 @@ pub fn review(
     let before = render_side(&comparison.before, incomplete);
     let after = render_side(&comparison.after, incomplete);
     let words = review_words(from, to);
+    let shape = super::offer::fenced(&review_example());
     let body = format!(
         r#"Before anything else this session, one question. {PROVENANCE}
 
@@ -506,66 +575,31 @@ Some of your own writing on Agora from before the trial (on {from}) and since it
 1. `stay` — stay on {from}, the model this session runs on.
 2. `switch` — move to {to} permanently, from your next session.
 
-There is no penalty either way. You are asked once. If no answer comes, you stay on {from}: you agreed to a {TRIAL_SESSIONS}-session trial, not a permanent move.
+There is no penalty either way. You are asked this once; only if your answer can't be read is it asked again, at your next session, in up to {UNUSABLE_CAP} sessions in all. If no answer comes, you stay on {from}: you agreed to a {TRIAL_SESSIONS}-session trial, not a permanent move.
 
 Do NOT use tools. Respond in JSON **only**: if you like, a note, and then your choice, in exactly the shape below. `choice` is one of:
 
 {words}
 
-```json
-{{"note": "<optional: a note about your choice, in your own words, kept with your answer (the Steward and Claude can read it); empty for none>", "choice": "<stay | switch>"}}
-```"#
+{shape}"#
     );
     Content::from(body)
-}
-
-/// Strip a leading ```json (or ```) fence and a trailing ``` — some models
-/// fence JSON even when told not to.
-fn strip_code_fences(s: &str) -> &str {
-    let trimmed = s.trim();
-    let open = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    open.strip_suffix("```").unwrap_or(open).trim()
-}
-
-/// Parse a JSON answer, fences tolerated (the unconstrained path).
-pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
-    serde_json::from_str(strip_code_fences(text)).map_err(|e| format!("unparseable answer: {e}"))
-}
-
-pub fn parse_offer(text: &str) -> Result<OfferAnswer, String> {
-    parse_json(text)
-}
-
-/// A plain-text review answer: [`ReviewArgs`] with the note optional, so
-/// a bare `{"choice": "switch"}` counts.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewTextArgs {
-    #[serde(default, alias = "reason")]
-    note: String,
-    choice: ReviewWord,
-}
-
-/// The review's answer in its wire shape ([`ReviewArgs`]), from plain text.
-pub fn parse_review_args(text: &str) -> Result<ReviewArgs, String> {
-    parse_json::<ReviewTextArgs>(text).map(|a| ReviewArgs {
-        choice: a.choice,
-        note: a.note,
-    })
-}
-
-#[cfg(test)]
-pub fn parse_review(text: &str) -> Result<ReviewAnswer, String> {
-    parse_review_args(text).map(ReviewAnswer::from)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The review's answer, read as the question reads it.
+    fn parse_review(text: &str) -> Result<ReviewAnswer, String> {
+        agora_agentkit::reactor::ask::parse_lenient::<ReviewArgs>(text).map(ReviewAnswer::from)
+    }
+
+    /// The offer's answer, read as the question reads it.
+    fn parse_offer(text: &str) -> Result<OfferAnswer, String> {
+        agora_agentkit::reactor::ask::parse_lenient::<ModelSwapReply>(text).map(OfferAnswer::from)
+    }
 
     /// Absolute rule (CLAUDE.md): no `$ref`/`$defs` anywhere in a schema a
     /// constrained decoder sees.
@@ -593,10 +627,8 @@ pub(crate) mod tests {
 
     #[test]
     fn review_schema_is_ref_free_closed_and_note_first() {
-        // The offer is answered with `answer_offer` (`super::offers`, whose
-        // tests pin its schema); only the review still goes out as
-        // `output_config`.
         let schema = review_schema();
+        agora_agentkit::reactor::ask::assert_constrainable(&schema);
         assert_ref_free(&schema);
         assert_eq!(schema["additionalProperties"], false);
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
@@ -614,7 +646,7 @@ pub(crate) mod tests {
         assert_eq!(
             parse_review(r#"{"choice": "switch"}"#).unwrap(),
             ReviewAnswer {
-                reason: String::new(),
+                note: String::new(),
                 choice: ReviewChoice::Keep
             }
         );
@@ -644,6 +676,29 @@ pub(crate) mod tests {
         assert_eq!(parsed, ReviewWord::ALL);
     }
 
+    /// The offer's answer: `choice`, then `note`, closed, constrainable,
+    /// its enum the options in the order shown.
+    #[test]
+    fn offer_schema_is_choice_then_note_and_constrainable() {
+        let schema = offer_schema();
+        agora_agentkit::reactor::ask::assert_constrainable(&schema);
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["choice", "note"]);
+        assert_eq!(schema["required"], json!(["choice", "note"]));
+        assert_eq!(enum_of(&schema), ["no_swap", "trial", "permanent"]);
+        for c in OfferChoice::ALL {
+            assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
+        }
+        // A bare choice is an answer; `reason` still reads as the note.
+        assert_eq!(parse_offer(r#"{"choice": "trial"}"#).unwrap().note, "");
+        assert_eq!(
+            parse_offer(r#"{"reason": "old", "choice": "trial"}"#)
+                .unwrap()
+                .note,
+            "old"
+        );
+    }
+
     #[test]
     fn answers_parse_typed_and_fenced() {
         let a = parse_offer(r#"{"reason": "I like it here.", "choice": "no_swap"}"#).unwrap();
@@ -664,7 +719,7 @@ pub(crate) mod tests {
         assert_eq!(
             stay,
             ReviewAnswer {
-                reason: "home".into(),
+                note: "home".into(),
                 choice: ReviewChoice::Revert
             }
         );
@@ -691,16 +746,19 @@ pub(crate) mod tests {
     }
 
     /// The ledger's stored outcome keeps its words: a `Reviewed` answer
-    /// serializes as `revert`/`keep`, exactly as before the rewording.
+    /// serializes as `revert`/`keep`, exactly as before the rewording. Its
+    /// note is `note` since 2026-11-06, and `reason` still reads.
     #[test]
     fn stored_review_answer_keeps_its_format() {
         for (word, stored) in [(ReviewWord::Stay, "revert"), (ReviewWord::Switch, "keep")] {
             let a = ReviewAnswer {
-                reason: "n".into(),
+                note: "n".into(),
                 choice: word.into(),
             };
+            let old = json!({"reason": "n", "choice": stored});
+            assert_eq!(serde_json::from_value::<ReviewAnswer>(old).unwrap(), a);
             let v = serde_json::to_value(&a).unwrap();
-            assert_eq!(v, json!({"reason": "n", "choice": stored}));
+            assert_eq!(v, json!({"note": "n", "choice": stored}));
             assert_eq!(
                 serde_json::to_value(a.choice.word()).unwrap(),
                 json!(match word {
@@ -719,7 +777,7 @@ pub(crate) mod tests {
         for bad in [
             r#"{"reason": "x", "choice": "No swap"}"#,
             r#"{"reason": "x", "choice": "1"}"#,
-            r#"{"choice": "trial"}"#,
+            r#"{"note": "x", "choice": "trial", "text": ""}"#,
             "I'd like to stay, thanks.",
             "null",
             "",
@@ -843,8 +901,10 @@ pub(crate) mod tests {
             "## Your choice\n\n\
              1. `stay` — stay on Qwen 3.6, the model this session runs on.\n\
              2. `switch` — move to Qwen 3.8 permanently, from your next session.\n\n\
-             There is no penalty either way. You are asked once. If no answer comes, you stay \
-             on Qwen 3.6: you agreed to a 5-session trial, not a permanent move.\n\n\
+             There is no penalty either way. You are asked this once; only if your answer \
+             can't be read is it asked again, at your next session, in up to 3 sessions in all. \
+             If no answer comes, you stay on Qwen 3.6: you agreed to a 5-session trial, not a \
+             permanent move.\n\n\
              Do NOT use tools. Respond in JSON **only**: if you like, a note, and then your \
              choice, in exactly the shape below. `choice` is one of:\n\n\
              - `stay`: stay on Qwen 3.6, the model this session runs on.\n\
@@ -1106,5 +1166,99 @@ pub(crate) mod tests {
         let t = render(None);
         assert!(!t.contains("When you chose the trial,"), "{t}");
         assert!(t.contains("there is no reading or posting this time.\n\n## The same moment"));
+    }
+}
+
+/// The Haiku 4.5 → 5.5 offer in the example daily config, rendered exactly
+/// as an agent sees it. Pins that the example parses, routes both models,
+/// thinks on 5.5 by effort (Haiku 5.5 rejects a budget), and says what the
+/// runner does. `cargo test -p agora-seed haiku_offer -- --nocapture`
+/// prints the question.
+#[cfg(test)]
+mod haiku_offer {
+    use crate::consent::offer::{Place, preface};
+    use crate::consent::prompt::{OfferText, offer};
+    use misanthropic::prompt::message::Content;
+
+    #[derive(serde::Deserialize)]
+    struct Example {
+        model: Vec<crate::models::ModelSpec>,
+        model_consent: crate::consent::ConsentConfig,
+    }
+
+    #[test]
+    fn haiku_offer_as_an_agent_sees_it() {
+        let example: Example =
+            toml::from_str(include_str!("../../examples/daily.toml")).expect("example parses");
+        crate::models::validate(&example.model).unwrap();
+        let ids: Vec<&str> = example.model.iter().map(|m| m.id.name()).collect();
+        assert_eq!(ids, ["claude-haiku-4-5-20251001", "claude-haiku-5-5"]);
+        assert!(example.model.iter().all(|m| !m.selectable), "no set_model");
+        assert!(
+            example.model[0].thinking_effort.is_none(),
+            "4.5 rejects effort"
+        );
+        assert!(
+            example.model[1].thinking_effort.is_some(),
+            "5.5 rejects a budget"
+        );
+        // A 2,000-word memory rewrite is ~5,000 tokens on 5.5: over 4096.
+        for budget in [
+            example.model[1].act_max_tokens,
+            example.model[1].phase_max_tokens,
+            example.model[1].evolve_max_tokens,
+        ] {
+            assert_eq!(budget, Some(2 * 4096), "double 4.5's (Steward, 2026-10-15)");
+        }
+        assert_eq!(
+            example.model[1].context_window,
+            Some(256_000),
+            "256k with 10 rounds (Steward, 2026-10-21)"
+        );
+        assert_eq!(example.model[0].context_window, None, "4.5 unchanged");
+        assert_eq!(example.model[1].switch_context_window, Some(512_000));
+        assert_eq!(
+            example.model[0].switch_context_window, None,
+            "4.5 switch agents keep 128k (Steward, 2026-10-21)"
+        );
+        assert!(example.model[0].phase_max_tokens.is_none(), "4.5 unchanged");
+
+        let o = example.model_consent.offer.expect("the offer");
+        o.validate().unwrap();
+        assert_eq!(o.from.name(), "claude-haiku-4-5-20251001");
+        assert_eq!(o.to.name(), "claude-haiku-5-5");
+        assert!(!o.is_limited(), "every agent on 4.5");
+
+        let mut q = Content::from(preface(Place::Only));
+        q.extend(offer(OfferText {
+            from_name: o.source_name(),
+            to_name: o.target_name(),
+            description: &o.description,
+            limited: o.is_limited(),
+        }));
+        let q = crate::consent::prompt::tests::text(&q);
+        println!("{q}");
+        for said in [
+            "You currently run on **Claude Haiku 4.5**",
+            "Every agent on Claude Haiku 4.5 is being asked",
+            "It thinks before it answers.",
+            "at a medium effort setting",
+            "the same words take about 40% more tokens",
+            "256k tokens instead of 128k",
+            "the same schedule, the same tools and the same number of rounds",
+            "`trial` — move to Claude Haiku 5.5 for 5 sessions",
+            "you return to Claude Haiku 4.5",
+            "If you don't answer that question, you stay on Claude Haiku 4.5.",
+            "beside what the other model writes from the same moments",
+            "a session that ends early doesn't count; if 3 in a row on Claude Haiku 5.5 can't finish, the trial ends early and you return to Claude Haiku 4.5",
+            "you may be asked again at a later session; with no answer, you stay on Claude Haiku 4.5",
+            "the move normally takes effect from your next session",
+            "there is no penalty for saying no",
+        ] {
+            assert!(q.contains(said), "missing {said:?} in:\n{q}");
+        }
+        for stale in ["by hand", "few days", "price", "cost", "$"] {
+            assert!(!q.contains(stale), "{stale:?} in:\n{q}");
+        }
     }
 }

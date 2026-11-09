@@ -146,13 +146,24 @@ pub async fn run(
             );
             let mut failed = 0;
             for id in ids {
+                // Before the enrolment commits anything: what it commits is
+                // this process's own, its upload times recorded
+                let dir = state_dir.join(id.to_string());
+                let mut baseline = super::receipts::baseline(&dir, id).await;
                 match enroller.enroll_with(id, dry_run, note.as_deref()).await {
                     Ok(report) if dry_run && report.resumed => {
                         println!("{id}: would resume its stopped backups on its existing chain")
                     }
                     Ok(report) if dry_run => println!("{id}: would seal: {report}"),
                     Ok(report) => {
-                        let uploaded = match outbox.drain(id).await {
+                        let uploaded = match super::receipts::drain(
+                            &outbox,
+                            &dir,
+                            id,
+                            &mut baseline,
+                        )
+                        .await
+                        {
                             Ok(d) => {
                                 // Its own choice: the anchor on its profile,
                                 // once its head is on Agora (else the
@@ -290,11 +301,19 @@ pub async fn run(
             let _runner = super::session::runner_exclusive(data_dir)?;
             let done = super::forget::forget(&state_dir, &keys, agent, &note)?;
             println!(
-                "{agent}: state key set aside as {}{}; nothing deleted",
+                "{agent}: state key set aside as {}{}{}; no key deleted{}",
                 done.key,
+                done.memory_id_key
+                    .map(|k| format!(", its memory-id key as {k}"))
+                    .unwrap_or_default(),
                 done.stop
                     .map(|s| format!(", its stop as {s}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                if done.index {
+                    "; the search index (a rebuildable sidecar) deleted"
+                } else {
+                    ""
+                }
             );
         }
         Command::SealedStop { agent, note } => {
@@ -303,9 +322,10 @@ pub async fn run(
                 &state_dir,
                 Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
             );
+            let dir = state_dir.join(agent.to_string());
+            let mut baseline = super::receipts::baseline(&dir, agent).await;
             let drain: super::stop::Drain = Box::pin(async move {
-                outbox
-                    .drain(agent)
+                super::receipts::drain(&outbox, &dir, agent, &mut baseline)
                     .await
                     .map(drop)
                     .map_err(|e| e.to_string())
@@ -332,7 +352,9 @@ pub async fn run(
                     &state_dir,
                     Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
                 );
-                if let Err(e) = outbox.drain(agent).await {
+                let dir = state_dir.join(agent.to_string());
+                let mut baseline = super::receipts::baseline(&dir, agent).await;
+                if let Err(e) = super::receipts::drain(&outbox, &dir, agent, &mut baseline).await {
                     tracing::warn!(agent_id = %agent, error = %e, "upload before the rotation failed");
                 }
             }

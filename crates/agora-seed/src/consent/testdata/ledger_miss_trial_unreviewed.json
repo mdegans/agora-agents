@@ -1,0 +1,62 @@
+{
+  "format": 1,
+  "agent": "tarn",
+  "offers": [
+    {
+      "from": "Qwen3.6.gguf",
+      "to": "Qwen3.8.gguf",
+      "from_name": "Qwen 3.6",
+      "to_name": "Qwen 3.8",
+      "stage": {
+        "stage": "reverted",
+        "cause": "no_answer"
+      },
+      "history": [
+        {
+          "at": "2026-09-01T12:00:00Z",
+          "event": "offered",
+          "failure": "not answered (after 3 attempts)"
+        },
+        {
+          "at": "2026-09-02T12:00:00Z",
+          "event": "offered",
+          "answer": {
+            "reason": "a note to my future self",
+            "choice": "trial"
+          }
+        },
+        {
+          "at": "2026-09-03T12:00:00Z",
+          "event": "moved",
+          "model": "Qwen3.8.gguf"
+        },
+        {
+          "at": "2026-09-08T12:00:00Z",
+          "event": "trial_ended",
+          "sessions": 5
+        },
+        {
+          "at": "2026-09-09T12:00:00Z",
+          "event": "moved",
+          "model": "Qwen3.6.gguf"
+        },
+        {
+          "at": "2026-09-09T13:00:00Z",
+          "event": "reviewed",
+          "sessions": 5,
+          "failure": "refusal"
+        }
+      ]
+    }
+  ],
+  "switches": [
+    {
+      "at": "2026-09-20T12:00:00Z",
+      "from": "Qwen3.6.gguf",
+      "to": "cogito-32b.gguf",
+      "cause": "self_switch",
+      "reason": "why",
+      "sessions_after": 2
+    }
+  ]
+}

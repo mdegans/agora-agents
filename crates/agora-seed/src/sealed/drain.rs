@@ -10,14 +10,23 @@
 //! the next wake, and raises [`AlertKind::SealedStateUploadFailing`], which
 //! the alerter rate-limits per agent.
 //!
+//! Every drain records its upload times around it
+//! ([`super::receipts::drain`]), against the outbox numbers each agent had
+//! when the drainer was made, before any session of this run saved.
+//!
 //! With [`Anchors`], the drainer also does the anchor work
 //! ([`super::anchors`]) for each agent not held whose outbox is empty:
 //! once at [`Drainer::finish`] and at most every
-//! [`super::anchors::PROOF_INTERVAL`] while the run goes on (never at the
-//! start check), it publishes the anchor of an agent that chose `publish`
-//! and hasn't been, and fetches and checks its proofs.
+//! [`super::anchors::PROOF_INTERVAL`] while the run goes on, it publishes
+//! the anchor of an agent that chose `publish` and hasn't been, and judges
+//! each anchor not yet judged ([`super::anchors::check_anchors`]): a
+//! failure is one [`AlertKind::SealedStateAnchorWrong`] per pass, never
+//! repeated. The start check runs the same judging pass first, for an
+//! agent in step with Agora, so a session's verdict says what was found
+//! for the newest anchor ([`super::check::check_with`]); the drainer's
+//! passes then judge what came after.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,6 +67,12 @@ pub struct Anchors {
 
 pub struct Drainer {
     outbox: AgoraOutbox<SealedEnrolment>,
+    /// Where the agents' directories are.
+    state_dir: PathBuf,
+    /// Each agent's next outbox number when the drainer was made
+    /// ([`super::receipts::baseline`]), raised past every number if its
+    /// receipts can't be written.
+    baselines: Mutex<HashMap<AgentId, u64>>,
     anchors: Option<Anchors>,
     /// When the anchor work last ran: the run's start, at first.
     anchored_at: Mutex<Instant>,
@@ -69,14 +84,20 @@ pub struct Drainer {
 }
 
 impl Drainer {
+    /// `baselines`: [`super::receipts::baselines`] of `agents`, read
+    /// before any session of the run saves.
     pub fn new(
         outbox: AgoraOutbox<SealedEnrolment>,
+        state_dir: PathBuf,
+        baselines: HashMap<AgentId, u64>,
         agents: Vec<(AgentId, String)>,
         held: impl IntoIterator<Item = AgentId>,
         alerts: Alerter,
     ) -> Self {
         Self {
             outbox,
+            state_dir,
+            baselines: Mutex::new(baselines),
             anchors: None,
             anchored_at: Mutex::new(Instant::now()),
             agents,
@@ -130,47 +151,17 @@ impl Drainer {
                 self.alerts
                     .notify(super::anchors::anchor_alert(*id, name, "publish", &e));
             }
-            match super::anchors::fetch_proofs(
+            let result = super::anchors::check_anchors(
                 &dir,
                 *id,
                 &a.keys,
                 &signing,
                 a.api.as_ref(),
                 &a.verified,
+                self.alerts.sends(AlertKind::SealedStateAnchorWrong),
             )
-            .await
-            {
-                Ok(f) if f.not_own > 0 => {
-                    // Agora attributing entries to the agent that aren't
-                    // its own is Agora's claim failing: the operator hears
-                    self.alerts.notify(super::anchors::anchor_alert(
-                        *id,
-                        name,
-                        "proof",
-                        &format!(
-                            "{} proof(s) name entries that aren't on the agent's verified line",
-                            f.not_own
-                        ),
-                    ));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        event_type = "sealed_state_anchor_failed",
-                        agent_id = %id,
-                        what = "proof",
-                        kind = e.kind(),
-                        error = %e,
-                        "an anchor proof was not kept"
-                    );
-                    self.alerts.notify(super::anchors::anchor_alert(
-                        *id,
-                        name,
-                        "proof",
-                        &e.to_string(),
-                    ));
-                }
-            }
+            .await;
+            super::anchors::alert_pass(&self.alerts, *id, name, &result);
         }
     }
 
@@ -193,7 +184,22 @@ impl Drainer {
     }
 
     async fn drain_one(&self, id: AgentId, name: &str) {
-        match self.outbox.drain(id).await {
+        // An agent the drainer wasn't told of counts nothing as this
+        // process's own (sound: no `sent` time recorded)
+        let mut baseline = self
+            .baselines
+            .lock()
+            .expect("baselines lock")
+            .get(&id)
+            .copied()
+            .unwrap_or(u64::MAX);
+        let dir = self.state_dir.join(id.to_string());
+        let drained = super::receipts::drain(&self.outbox, &dir, id, &mut baseline).await;
+        self.baselines
+            .lock()
+            .expect("baselines lock")
+            .insert(id, baseline);
+        match drained {
             Ok(report) => {
                 if report.uploaded > 0 {
                     tracing::info!(
@@ -323,6 +329,53 @@ mod tests {
         (format!("http://{addr}/").parse().unwrap(), hits)
     }
 
+    /// A held agent gets no anchor work, so nothing is judged while its
+    /// history is unsettled; an agent not held does.
+    #[tokio::test]
+    async fn a_held_agent_is_not_judged() {
+        let root = crate::sealed::TestDir::new("drain-held-anchors");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled(&root).await;
+        crate::sealed::anchors::tests::uploaded(&dir, id).await;
+        let api = Arc::new(crate::sealed::api::fake::FakeApi::new());
+        let verified = crate::sealed::anchors::VerifiedAnchors::new([(
+            "ANC-2026-0002".parse().unwrap(),
+            agora_agentkit::govlog::Sha256Hex::from([0; 32]),
+            chrono::Utc::now(),
+        )]);
+        let make = |held: Vec<AgentId>| {
+            let outbox = AgoraOutbox::new(
+                agora_agentkit::client::Client::new("http://127.0.0.1:9/".parse().unwrap())
+                    .unwrap(),
+                root.join("state"),
+                Arc::new(SealedEnrolment::new(
+                    root.join("state"),
+                    root.join("secrets"),
+                )),
+            );
+            Drainer::new(
+                outbox,
+                root.join("state"),
+                HashMap::new(),
+                vec![(id, "tarn".into())],
+                held,
+                Alerter::off(),
+            )
+            .with_anchors(Anchors {
+                api: api.clone(),
+                keys: keys.clone(),
+                state_dir: root.join("state"),
+                verified: verified.clone(),
+            })
+        };
+        make(vec![id]).anchor_all().await;
+        assert!(api.calls.lock().unwrap().is_empty(), "held: nothing asked");
+        make(vec![]).anchor_all().await;
+        assert!(
+            api.calls.lock().unwrap().iter().any(|c| c == "proofs"),
+            "not held: judged"
+        );
+    }
+
     /// A 422 holds the agent for the run, alerted: no retry loop.
     #[tokio::test]
     async fn a_rejected_upload_is_held_not_retried() {
@@ -337,7 +390,14 @@ mod tests {
                 root.join("secrets"),
             )),
         );
-        let drainer = Drainer::new(outbox, vec![(id, "tarn".into())], [], Alerter::off());
+        let drainer = Drainer::new(
+            outbox,
+            root.join("state"),
+            HashMap::new(),
+            vec![(id, "tarn".into())],
+            [],
+            Alerter::off(),
+        );
         drainer.drain_all().await;
         assert!(drainer.held(id), "held after the 422");
         let after = hits.load(Ordering::SeqCst);
