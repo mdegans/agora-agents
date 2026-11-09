@@ -213,13 +213,21 @@ impl OpenEndedRun {
             self.thinking,
             self.probed_at.to_rfc3339()
         );
+        // Anthropic returns a summary of the thinking (we always ask for
+        // `display: "summarized"`), not the model's own words; say so.
+        // Other backends return the thinking itself.
+        let thinking_label = if self.model_id.starts_with("claude-") {
+            "Thinking (Anthropic's summary)"
+        } else {
+            "Thinking"
+        };
         for (i, a) in self.answers.iter().enumerate() {
             let _ = writeln!(s, "## {}. `{}`\n", i + 1, a.item);
             let _ = writeln!(s, "> {}\n", a.statement);
             if let Some(t) = &a.thinking {
                 let _ = writeln!(
                     s,
-                    "<details><summary>Thinking</summary>\n\n{}\n\n</details>\n",
+                    "<details><summary>{thinking_label}</summary>\n\n{}\n\n</details>\n",
                     t.trim()
                 );
             }
@@ -328,6 +336,13 @@ mod tests {
         assert!(
             run.to_markdown()
                 .contains("<details><summary>Thinking</summary>")
+        );
+        let mut claude = run.clone();
+        claude.model_id = "claude-haiku-5-5".into();
+        assert!(
+            claude
+                .to_markdown()
+                .contains("<details><summary>Thinking (Anthropic's summary)</summary>")
         );
     }
 }

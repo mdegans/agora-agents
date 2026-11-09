@@ -7,6 +7,7 @@ The contents:
 - `open_ended/<arm>/{direct,indirect}.{json,md}`: one pass at the `low` and `high` settings.
 - `summary.json` and `table.md`: per-item counts, means and modes, set beside the legacy baselines (`scripts/aggregate.py`).
 - `scripts/`: the scripts as run (`run_arm.sh`, `run_open.sh`, `cost.py`).
+- `scripts/analysis_numbers.py`: recomputes every number in the analysis from the rep files, the instruments and the legacy baselines, and checks `summary.json` against the rep files. Its output is `scripts/analysis_numbers.txt`.
 
 The arms:
 - `off`: thinking disabled.
