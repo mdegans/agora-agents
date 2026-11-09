@@ -84,7 +84,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 # The bridge endpoint's MCP server, on stdio (the agora server's rmcp, same major)
-rmcp = { version = "2", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io"] }
 zeroize = "1"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"

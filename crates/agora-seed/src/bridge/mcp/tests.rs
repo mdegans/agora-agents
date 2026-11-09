@@ -653,3 +653,74 @@ async fn a_long_result_is_paged() {
     assert_eq!(rest, "x".repeat(10));
     assert_eq!(server.paged("toolu_short", "short".into()), "short");
 }
+
+/// rmcp 3 knows MCP 2026-07-28, which has no `initialize`; the bridge is
+/// held to 2025-11-25, as with rmcp 2. `server/discover` at 2026-07-28 is
+/// refused naming the versions it speaks, at an older one it is not found
+/// (a legacy server's answer, so a driver falls back to `initialize`), and
+/// `initialize` at 2026-07-28 negotiates down
+#[tokio::test]
+async fn a_2026_07_28_driver_is_held_to_initialize() {
+    use rmcp::model::ErrorCode;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (_inference, _ending, driver) = bridge();
+    let server = Server::new(driver.events);
+    let (driver_io, server_io) = tokio::io::duplex(64 * 1024);
+    let serving = tokio::spawn(server.serve(tokio::io::split(server_io)));
+    let (driver_read, mut driver_write) = tokio::io::split(driver_io);
+    let mut lines = BufReader::new(driver_read).lines();
+    let mut send = async |message: Value| -> Option<Value> {
+        let mut line = serde_json::to_vec(&message).unwrap();
+        line.push(b'\n');
+        driver_write.write_all(&line).await.unwrap();
+        driver_write.flush().await.unwrap();
+        message.get("id")?;
+        let reply = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("a reply")
+            .unwrap()
+            .expect("a line");
+        Some(serde_json::from_str(&reply).unwrap())
+    };
+    let discover = |id: u64, version: &str| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "server/discover", "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"},
+        }}})
+    };
+
+    let modern = send(discover(1, "2026-07-28")).await.unwrap();
+    assert_eq!(
+        modern["error"]["code"],
+        json!(ErrorCode::UNSUPPORTED_PROTOCOL_VERSION.0),
+        "{modern}"
+    );
+    assert_eq!(
+        modern["error"]["data"]["supported"],
+        json!(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]),
+        "{modern}"
+    );
+    let legacy = send(discover(2, "2025-11-25")).await.unwrap();
+    assert_eq!(
+        legacy["error"]["code"],
+        json!(ErrorCode::METHOD_NOT_FOUND.0),
+        "{legacy}"
+    );
+
+    let init = send(
+        json!({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"},
+        }}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25", "{init}");
+    send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+    // `tools/list` is left out: it waits up to `LIST_WAIT` for the agent's
+    // tools, which no session here supplies; the handshake is what's pinned
+    serving.await.unwrap().expect("the handshake completed");
+}
