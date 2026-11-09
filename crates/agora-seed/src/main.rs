@@ -1,19 +1,19 @@
 //! The seed runner, rebuilt on agentkit's reactor.
 //!
 //! Thin glue only: parse endpoints, discover models, load [`SeedState`]s
-//! from the [`FsStorage`] tree (see `../agora-sync-models`), route each
+//! from the [`FsStorage`] tree, route each
 //! agent onto the endpoint offering its model, and hand everything to
 //! [`Orchestrator`]/[`Reactor`]. All agent behavior — phases, tools,
 //! mutation, survey — lives in agentkit's [`SeedAgent`].
 //!
 //! One `[[reactor]]` block per **endpoint** — never two blocks for one
 //! endpoint, or generations run concurrently and thrash the GPU. There is
-//! no model in the config: an agent's persisted `state.model` (sourced
-//! from the server's `model_info`, the single source of truth — see
-//! `../agora-sync-models`) names its model, and per-agent negotiation against
-//! the endpoint's advertised list decides admission. Agents whose model
-//! no endpoint offers are reported and skipped; agents with no model at
-//! all await `sync-models`.
+//! no model in the config: an agent's persisted `state.model` names its
+//! model, and per-agent negotiation against the endpoint's advertised list
+//! decides admission. `state.model` is the truth; the agent changes it with
+//! its own `set_model` tool, whose signed `update_profile` keeps the
+//! server's `model_info` a mirror of it. Agents whose model no endpoint
+//! offers are reported and skipped, as are agents with no model at all.
 //!
 //! Within a local endpoint's cohort, [`schedule`] decides who runs and in
 //! what order: equal shares of writes among the endpoint's models over a
@@ -27,6 +27,7 @@
 //! the endpoint's offered [`ModelInfo`] verbatim (same id — never a model
 //! switch) and keeps `state.prompt.model` in agreement.
 
+use crate::consent::offer::Stored;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -61,13 +62,16 @@ mod govlog;
 mod interrupted;
 mod logging;
 mod models;
+mod promote;
 mod provision;
 mod schedule;
+mod sealed;
+mod signals;
 
 use agora_agentkit::ids::{AgentId, ReactorId};
 use agora_agentkit::reactor::anthropic::{self, EndpointVariant};
 use agora_agentkit::reactor::seed::{FsKeyring, SeedAgent, SeedConfig, SeedContext, SeedState};
-use agora_agentkit::reactor::{FsStorage, Inference, Orchestrator, Reactor, Run, Storage};
+use agora_agentkit::reactor::{FsStorage, Inference, Orchestrator, Reactor, Run, Stop, Storage};
 use misanthropic::model::{Model, ModelInfo};
 use misanthropic::prompt::message::CitationsConfig;
 use misanthropic::tool::{WebFetch, WebSearch};
@@ -75,6 +79,11 @@ use misanthropic::tool::{WebFetch, WebSearch};
 #[derive(Parser)]
 #[command(about = "Run seed agents through the agentkit reactor")]
 struct Args {
+    /// The operator's sealed-state commands (see `sealed`). Without one,
+    /// the runner runs.
+    #[command(subcommand)]
+    command: Option<sealed::cli::Command>,
+
     /// TOML run config with `[[reactor]]` blocks. Mutually exclusive with
     /// `--endpoint`.
     #[arg(long, conflicts_with = "endpoint")]
@@ -150,7 +159,7 @@ struct Args {
     no_prompt_log: bool,
 
     /// Print the model changes agents have asked for and that still await
-    /// application (as `set_model` commands), then exit. Reads the ledgers
+    /// application, then exit. Reads the ledgers
     /// under `<data-dir>/state`; runs no agents and needs no endpoint.
     #[arg(long)]
     consent_queue: bool,
@@ -174,20 +183,27 @@ struct Args {
     test_alert: bool,
 
     /// Create a test agent for the bridge endpoint, then exit: register
-    /// it through the public API under `--provision-operator` (as any
+    /// it through the public API with `--provision-credential` (as any
     /// operator could), from this spec (`soul`, `display_name`, `bio`,
     /// `model_info`), and write its state and key under `--data-dir`, on
     /// the bridge's model. Refuses a data dir that holds a fleet.
-    #[arg(long, requires_all = ["provision_operator", "provision_password_file", "data_dir"])]
+    #[arg(long, requires_all = ["provision_credential", "provision_key_file", "data_dir"])]
     provision: Option<PathBuf>,
 
-    /// The operator's email, for `--provision`
+    /// The operator credential that signs the registration, for `--provision`
     #[arg(long)]
-    provision_operator: Option<String>,
+    provision_credential: Option<agora_agentkit::ids::OperatorCredentialId>,
 
-    /// A file holding the operator's password, for `--provision`
+    /// The file holding that credential's software key, for `--provision`
     #[arg(long)]
-    provision_password_file: Option<PathBuf>,
+    provision_key_file: Option<PathBuf>,
+
+    /// How long a `SIGTERM` stop (end the turn, then close) may take before
+    /// the runner exits at once, cutting the sessions in flight. The
+    /// systemd units' `TimeoutStopSec` must sit above it. See
+    /// [`signals`].
+    #[arg(long, default_value_t = signals::DEFAULT_DEADLINE.as_secs())]
+    stop_deadline_secs: u64,
 
     /// Flags from the pre-cutover scheduler seed, accepted only so we can
     /// explain where each one went. See [`Args::reject_retired`].
@@ -418,6 +434,11 @@ struct RunConfig {
     /// [`consent::memory_restore`]. Absent (or `enabled = false`) means
     /// off: nobody asked, nothing delivered.
     memory_restore: Option<consent::memory_restore::MemoryRestoreConfig>,
+    /// `[sealed_state]`: asking listed agents whether their state should be
+    /// backed up to Agora, sealed — see [`consent::sealed_state`]. Absent
+    /// (or `enabled = false`) means nobody is asked; agents already
+    /// enrolled stay sealed and checked either way ([`sealed`]).
+    sealed_state: Option<consent::sealed_state::SealedStateConfig>,
     /// Agents kept asleep by hand: not run at all — not even when named —
     /// and reported in the plan. Waking one is deleting its line
     /// (mdegans/agora-agents#189). Agents that answered `sleep` in the role
@@ -768,7 +789,8 @@ struct Skipped {
     id: AgentId,
     /// Unknown when the state would not load.
     name: Option<String>,
-    /// `load` or `construct`.
+    /// `load`, `construct`, `sealed` (refused by the sealed-state check) or
+    /// `rotation` (a key rotation unfinished).
     stage: &'static str,
     error: String,
 }
@@ -793,13 +815,24 @@ impl Skipped {
     }
 }
 
+/// What [`load_states`] found.
+struct LoadedStates<V> {
+    states: Vec<(AgentId, SeedState)>,
+    /// Each agent's base, for `Reactor::with_bases`.
+    bases: BTreeMap<AgentId, V>,
+    /// Enrolled agents: their state's plaintext hash and sizes, for the
+    /// start check ([`sealed::check`]). Never their content.
+    sealed: BTreeMap<AgentId, (agora_agentkit::govlog::Sha256Hex, sealed::sizes::Sizes)>,
+    skipped: Vec<Skipped>,
+}
+
 /// Load every [`SeedState`] under `<data_dir>/state`, skipping any that
 /// won't parse: each logged at error level as it happens, and returned for
 /// the sweep's one summary ([`report_skipped`]).
-async fn load_states(
-    storage: &FsStorage,
+async fn load_states<S: Storage>(
+    storage: &S,
     state_dir: &std::path::Path,
-) -> Result<(Vec<(AgentId, SeedState)>, Vec<Skipped>)> {
+) -> Result<LoadedStates<S::Version>> {
     let mut ids: Vec<AgentId> = std::fs::read_dir(state_dir)
         .with_context(|| format!("reading {}", state_dir.display()))?
         .filter_map(|e| e.ok())
@@ -810,19 +843,49 @@ async fn load_states(
     ids.sort();
 
     let loaded = storage
-        .load_all::<_, SeedAgent>(ids.into_iter())
+        .load_all_raw(ids.into_iter())
         .await
         .context("loading states")?;
-    let mut states: Vec<(AgentId, SeedState)> = Vec::new();
-    let mut skipped = Vec::new();
+    let mut out = LoadedStates {
+        states: Vec::new(),
+        bases: BTreeMap::new(),
+        sealed: BTreeMap::new(),
+        skipped: Vec::new(),
+    };
     for (id, result) in loaded {
-        match result {
-            Ok(state) => states.push((id, state)),
-            Err(e) => skipped.push(Skipped::new(id, None, "load", e.to_string())),
+        let loaded = match result {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                out.skipped
+                    .push(Skipped::new(id, None, "load", e.to_string()));
+                continue;
+            }
+        };
+        if sealed::is_sealing(&state_dir.join(id.to_string())) {
+            out.sealed.insert(
+                id,
+                (
+                    agora_agentkit::state::storage::plaintext_hash(&loaded.value),
+                    sealed::sizes::Sizes::of(&loaded.value),
+                ),
+            );
+        }
+        match serde_json::from_value::<SeedState>(loaded.value) {
+            Ok(state) => {
+                if let Some(base) = loaded.base {
+                    out.bases.insert(id, base);
+                }
+                out.states.push((id, state));
+            }
+            Err(e) => {
+                out.skipped
+                    .push(Skipped::new(id, None, "load", e.to_string()));
+            }
         }
     }
-    states.sort_by(|(_, a), (_, b)| a.soul.name.cmp(&b.soul.name));
-    Ok((states, skipped))
+    out.states
+        .sort_by(|(_, a), (_, b)| a.soul.name.cmp(&b.soul.name));
+    Ok(out)
 }
 
 /// Agents named in a skip alert, at most; the run log has every one.
@@ -839,12 +902,15 @@ fn report_skipped(skipped: &[Skipped], alerts: &alerts::Alerter) {
         return;
     }
     let count = |stage| skipped.iter().filter(|s| s.stage == stage).count();
-    let (load, construct) = (count("load"), count("construct"));
+    let (load, construct, sealed) = (count("load"), count("construct"), count("sealed"));
+    let rotation = count("rotation");
     tracing::error!(
         event_type = "agents_skipped",
         agents_skipped = skipped.len(),
         load,
         construct,
+        sealed,
+        rotation,
         "agents left out of this sweep; see the agent_skipped events"
     );
     if let Some(alert) = skipped_alert(skipped) {
@@ -859,14 +925,15 @@ fn skipped_alert(skipped: &[Skipped]) -> Option<alerts::Alert> {
         return None;
     }
     let count = |stage| skipped.iter().filter(|s| s.stage == stage).count();
-    let (load, construct) = (count("load"), count("construct"));
+    let (load, construct, sealed) = (count("load"), count("construct"), count("sealed"));
     let mut alert = alerts::Alert::new(
         alerts::AlertKind::AgentSkipped,
         format!("{} agent(s) left out of this sweep", skipped.len()),
     )
     .detail("agents_skipped", skipped.len())
     .detail("load", load)
-    .detail("construct", construct);
+    .detail("construct", construct)
+    .detail("sealed", sealed);
     for s in skipped.iter().take(SKIPPED_ALERT_LIST) {
         let who = match &s.name {
             Some(name) => format!("{} ({name})", s.id),
@@ -1062,7 +1129,7 @@ struct Routing {
     unrouted: BTreeMap<String, usize>,
     /// model id → agent count, for models the `models` allowlist leaves out.
     excluded: BTreeMap<String, usize>,
-    /// Agents with no model at all — `sync-models` hasn't run for them.
+    /// Agents with no model at all (`state.model` unset), skipped.
     placeholders: usize,
     /// Agents skipped by `min_cycle_secs` cadence gating.
     not_due: usize,
@@ -1340,7 +1407,564 @@ const ALERT_FLUSH: Duration = Duration::from_secs(60);
 #[derive(Default)]
 struct Held {
     alerts: alerts::Alerter,
+    /// `<data_dir>/runner.lock`, held shared for the run: `rotate-keys`
+    /// refuses while it is
+    runner_lock: Option<std::fs::File>,
     log_guards: Option<logging::Guards>,
+    /// A signal stopped the run gracefully: exit [`signals::STOPPED_EXIT`]
+    stopped: bool,
+}
+
+/// Write each unsaved agent's state to
+/// `<state_dir>/<id>/unsaved.<utc>.json` (0600; tmp, fsync, rename,
+/// directory fsync; `FsStorage`'s `{format: 1, state}` envelope). Not
+/// `state.json` nor an archive: nothing loads it, and the sealed start
+/// check never sees it. Content is never logged.
+fn rescue_unsaved(
+    state_dir: &std::path::Path,
+    report: &agora_agentkit::reactor::Report,
+) -> Vec<(AgentId, std::io::Result<PathBuf>)> {
+    use std::io::Write;
+    let at = chrono::Utc::now()
+        .format(crate::sealed::STAMP_FORMAT)
+        .to_string();
+    report
+        .unsaved
+        .iter()
+        .map(|(id, value)| {
+            let write = || -> std::io::Result<PathBuf> {
+                let dir = state_dir.join(id.to_string());
+                std::fs::create_dir_all(&dir)?;
+                let path = dir.join(format!("unsaved.{at}.json"));
+                let tmp = dir.join(format!("unsaved.{at}.json.tmp"));
+                let bytes = zeroize::Zeroizing::new(serde_json::to_vec_pretty(
+                    &serde_json::json!({ "format": 1, "state": value }),
+                )?);
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                {
+                    let mut file = options.open(&tmp)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                }
+                std::fs::rename(&tmp, &path)?;
+                std::fs::File::open(&dir)?.sync_all()?;
+                Ok(path)
+            };
+            (*id, write())
+        })
+        .collect()
+}
+
+/// A reactor's outcome for the terminal: counts, ids, error kinds and
+/// sizes. Never its `Debug`, which holds every unsaved agent's whole state
+/// (memory included) and went to stdout and journald until 2026-11-02.
+fn report_summary<E: std::fmt::Display>(
+    result: &std::result::Result<agora_agentkit::reactor::Report, E>,
+) -> String {
+    use std::fmt::Write;
+    let r = match result {
+        Ok(r) => r,
+        Err(e) => return format!("run failed: {e}"),
+    };
+    let mut out = format!(
+        "done {}, failed {}, unsaved {}, rejected {}, unstarted {}",
+        r.done,
+        r.failed,
+        r.unsaved.len(),
+        r.rejected.len(),
+        r.unstarted
+    );
+    let size = |v: &serde_json::Value| serde_json::to_vec(v).map_or(0, |b| b.len());
+    for (id, e) in &r.errors {
+        let _ = write!(out, "\n  error {id}: {:?}", e.kind);
+    }
+    for (id, v) in &r.unsaved {
+        let _ = write!(out, "\n  unsaved {id}: {} bytes", size(v));
+    }
+    for (id, v) in &r.rejected {
+        let _ = write!(out, "\n  rejected {id}: {} bytes", size(v));
+    }
+    out
+}
+
+/// Leave out every agent whose `rotate-keys` didn't finish
+/// (`secrets.next.json` is there): stage `rotation`, no refusal marker, no
+/// notice to the agent, and an alert to finish the command.
+fn mid_rotation(
+    pool: &mut Vec<(AgentId, SeedState)>,
+    secrets_dir: &std::path::Path,
+    alerts: &alerts::Alerter,
+    skipped: &mut Vec<Skipped>,
+) {
+    pool.retain(|(id, state)| {
+        let staged = secrets_dir
+            .join(id.to_string())
+            .join(sealed::keys::NEXT_SECRETS_FILE);
+        if !std::fs::exists(&staged).unwrap_or(true) {
+            return true;
+        }
+        let name = state.soul.name.to_string();
+        skipped.push(Skipped::new(
+            *id,
+            Some(name.clone()),
+            "rotation",
+            "a key rotation is unfinished".into(),
+        ));
+        alerts.notify(
+            alerts::Alert::new(
+                alerts::AlertKind::SealedStateRotationUnfinished,
+                format!("{name}: a key rotation is unfinished; the agent is left out"),
+            )
+            .agent(&name, *id)
+            .detail(
+                "finish",
+                format!("agora-seed rotate-keys --agent {id} (with the runner stopped)"),
+            ),
+        );
+        false
+    });
+}
+
+/// What the sealed-state start check leaves for the run.
+#[derive(Default)]
+struct SealedRun {
+    /// Lines for each enrolled agent's intro.
+    seats: BTreeMap<AgentId, consent::SealedSeat>,
+    /// The enrolled agents that run, to drain.
+    drained: Vec<(AgentId, String)>,
+    /// Those whose uploads are held this run.
+    held: Vec<AgentId>,
+    /// Those refused, with their names: any one refuses the whole run
+    /// ([`refuse_run`]).
+    refused: Vec<(AgentId, String, sealed::notice::Refusal)>,
+    /// Those whose history on Agora failed verification while their local
+    /// state is intact (name, detail): they refuse the run too, but nothing
+    /// is marked against them.
+    server_faults: Vec<(AgentId, String, sealed::check::FaultKind, String)>,
+}
+
+/// The start check refused agents, so the run doesn't start: `main` exits
+/// [`sealed::REFUSED_RUN_EXIT`] once the alerts are flushed.
+#[derive(Debug)]
+struct RefusedRun(usize);
+
+impl std::fmt::Display for RefusedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to run: the sealed-state start check refused {} agent(s); resolve each with \
+             `agora-seed sealed-restore --agent <id>` or `agora-seed sealed-accept --agent <id> \
+             --note \"…\"`",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RefusedRun {}
+
+/// Any refusal at the start check refuses the whole run (Steward,
+/// 2026-11-03): a state that matches no sealed version is likely
+/// fleet-wide, so the runner doesn't start with part of the fleet. One
+/// ERROR `sealed_state_refused_run` naming each agent, its reason and the
+/// commands that resolve it; one alert. Holds never come here.
+fn refuse_run(
+    refused: &[(AgentId, String, sealed::notice::Refusal)],
+    server_faults: &[(AgentId, String, sealed::check::FaultKind, String)],
+    alerts: &alerts::Alerter,
+) -> Result<()> {
+    if refused.is_empty() && server_faults.is_empty() {
+        return Ok(());
+    }
+    let (keys, chains): (Vec<_>, Vec<_>) = server_faults
+        .iter()
+        .partition(|f| f.2 == sealed::check::FaultKind::UntrustedKey);
+    if !chains.is_empty() {
+        server_fault_alert(&chains, alerts);
+    }
+    if !keys.is_empty() {
+        untrusted_key_alert(&keys, alerts);
+    }
+    #[derive(serde::Serialize)]
+    struct RefusedAgent<'a> {
+        agent_id: AgentId,
+        name: &'a str,
+        reason: &'static str,
+        /// What resolves it, in the order to consider them
+        options: Vec<String>,
+    }
+    use sealed::notice::Refusal as R;
+    let agents: Vec<RefusedAgent> = refused
+        .iter()
+        .map(|(id, name, reason)| RefusedAgent {
+            agent_id: *id,
+            name,
+            reason: reason.as_str(),
+            options: match reason {
+                R::StateTooNew => vec![
+                    "written by a newer runner than this one: upgrade the runner; don't restore \
+                     or accept"
+                        .to_string(),
+                ],
+                R::StateIo => vec![format!(
+                    "an I/O error reading it: check permissions and the disk first; then, if the \
+                     file is damaged, agora-seed sealed-restore --agent {id}"
+                )],
+                R::StateUnreadable => vec![format!(
+                    "agora-seed sealed-restore --agent {id} (the unreadable file is archived)"
+                )],
+                R::StateMissing => vec![
+                    format!("agora-seed sealed-restore --agent {id} (from Agora)"),
+                    format!("agora-seed sealed-forget --agent {id} --note \"…\" (if it left)"),
+                ],
+                // sealed/ or head.json lost, the state here
+                R::HeadMissing => vec![
+                    format!(
+                        "agora-seed sealed-accept --agent {id} --note \"…\" (keeps the state \
+                         here, sealed on top of Agora's history)"
+                    ),
+                    format!(
+                        "agora-seed sealed-restore --agent {id} --discard-local (replaces it with \
+                         Agora's latest; the one here is archived)"
+                    ),
+                ],
+                R::Mismatch | R::ChainBroken => vec![
+                    format!("agora-seed sealed-restore --agent {id} (damage)"),
+                    format!(
+                        "agora-seed sealed-accept --agent {id} --note \"…\" (a deliberate change)"
+                    ),
+                ],
+            },
+        })
+        .collect();
+    if !agents.is_empty() {
+        tracing::error!(
+            event_type = "sealed_state_refused_run",
+            refused = agents.len(),
+            agents = %serde_json::to_string(&agents).unwrap_or_default(),
+            "REFUSING TO RUN: the sealed-state start check refused agents; no agent runs"
+        );
+        let mut alert = alerts::Alert::new(
+            alerts::AlertKind::SealedStateRefusedRun,
+            format!(
+                "REFUSING TO RUN: the sealed-state start check refused {} agent(s)",
+                agents.len()
+            ),
+        );
+        for a in &agents {
+            alert = alert.detail(
+                "refused",
+                format!(
+                    "{} ({}): {}; {}",
+                    a.name,
+                    a.agent_id,
+                    a.reason,
+                    a.options.join(", or ")
+                ),
+            );
+        }
+        alerts.notify(alert);
+    }
+    Err(RefusedRun(agents.len() + server_faults.len()).into())
+}
+
+/// What the run says when Agora's copy of agents' histories failed
+/// verification while their local states are intact (Steward,
+/// 2026-11-03): one ERROR and one alert, not rate-limited, naming each.
+pub const SERVER_FAULT_TEXT: &str = "Agora's copy of these agents' sealed histories failed \
+     verification while their local states are intact: likely a server-side fault (a bug, a \
+     bad database restore, or tampering). No agent runs until Agora serves histories that \
+     verify. To run an agent regardless, stop its backups with `agora-seed sealed-stop --agent \
+     <id> --note \"…\"`.";
+
+/// From this many agents at once, the alert says a platform fault is
+/// likely.
+pub const PLATFORM_FAULT_AGENTS: usize = 3;
+
+type Fault = (AgentId, String, sealed::check::FaultKind, String);
+
+/// What the run says for an agent whose entries are signed by a key the
+/// runner doesn't recognise (not a platform fault).
+pub fn untrusted_key_text(name: &str, id: AgentId) -> String {
+    format!(
+        "Entries on Agora for {name} are signed by a key this runner doesn't recognise: most \
+         likely its record of past signing keys (`<secrets>/{id}/rotations.json`) was lost \
+         after a key rotation; otherwise a forgery. Restore that file from backup, then start \
+         again."
+    )
+}
+
+fn untrusted_key_alert(faults: &[&Fault], alerts: &alerts::Alerter) {
+    let texts: Vec<String> = faults
+        .iter()
+        .map(|(id, name, _, _)| untrusted_key_text(name, *id))
+        .collect();
+    for ((id, name, _, detail), text) in faults.iter().zip(&texts) {
+        tracing::error!(
+            event_type = "sealed_state_untrusted_key",
+            agent_id = %id,
+            agent = %name,
+            detail = %detail,
+            "{text}"
+        );
+    }
+    let mut alert = alerts::Alert::new(
+        alerts::AlertKind::SealedStateUntrustedKey,
+        format!(
+            "REFUSING TO RUN: {} agent(s)' sealed entries are signed by a key this runner \
+             doesn't recognise",
+            faults.len()
+        ),
+    );
+    for text in texts {
+        alert = alert.detail("agent", text);
+    }
+    alerts.notify(alert);
+}
+
+fn server_fault_alert(faults: &[&Fault], alerts: &alerts::Alerter) {
+    #[derive(serde::Serialize)]
+    struct Listed<'a> {
+        agent_id: AgentId,
+        name: &'a str,
+        detail: &'a str,
+    }
+    let listed: Vec<Listed> = faults
+        .iter()
+        .map(|(id, name, _, detail)| Listed {
+            agent_id: *id,
+            name,
+            detail,
+        })
+        .collect();
+    tracing::error!(
+        event_type = "sealed_state_server_chain_broken",
+        agents = listed.len(),
+        listed = %serde_json::to_string(&listed).unwrap_or_default(),
+        "{SERVER_FAULT_TEXT}"
+    );
+    let prefix = if faults.len() >= PLATFORM_FAULT_AGENTS {
+        "PLATFORM FAULT LIKELY: "
+    } else {
+        ""
+    };
+    let mut alert = alerts::Alert::new(
+        alerts::AlertKind::SealedStateServerChainBroken,
+        format!(
+            "{prefix}REFUSING TO RUN: Agora's copy of {} agent(s)' sealed histories failed \
+             verification",
+            faults.len()
+        ),
+    )
+    .detail("what", SERVER_FAULT_TEXT);
+    for f in &listed {
+        alert = alert.detail(
+            "agent",
+            format!("{} ({}): {}", f.name, f.agent_id, f.detail),
+        );
+    }
+    alerts.notify(alert);
+}
+
+/// Check each enrolled agent ([`sealed::check`]): refused ones leave the
+/// pool (stage `sealed`), the rest run with their lines, some held. A dry
+/// run checks nothing (the check commits and records).
+#[allow(clippy::too_many_arguments)]
+async fn sealed_start_check(
+    pool: &mut Vec<(AgentId, SeedState)>,
+    enrolled: &BTreeMap<AgentId, (agora_agentkit::govlog::Sha256Hex, sealed::sizes::Sizes)>,
+    state_dir: &std::path::Path,
+    keys: &sealed::KeyStore,
+    api: &dyn sealed::api::SealedApi,
+    alerts: &alerts::Alerter,
+    dry_run: bool,
+    skipped: &mut Vec<Skipped>,
+    verified: Option<&sealed::anchors::VerifiedAnchors>,
+) -> SealedRun {
+    let mut run = SealedRun::default();
+    // Stopped by the operator: not checked, not held, not alerted; told
+    for (id, _) in pool.iter() {
+        let dir = state_dir.join(id.to_string());
+        if !sealed::is_enrolled(&dir) || !sealed::stop::is_stopped(&dir) {
+            continue;
+        }
+        match sealed::stop::Stopped::load(&dir) {
+            Ok(Some(stopped)) => {
+                run.seats.insert(
+                    *id,
+                    consent::SealedSeat {
+                        lines: vec![stopped.line()],
+                        notice: false,
+                        stop_note: !stopped.shown,
+                        anchors_told: Vec::new(),
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(agent_id = %id, error = %e, "sealed/stopped unreadable"),
+        }
+    }
+    // An enrolled agent whose state is gone never loads: found by its keys
+    if !dry_run {
+        for (id, reason) in sealed::check::missing_states(state_dir, keys, api, alerts).await {
+            run.refused
+                .push((id, format!("({})", reason.as_str()), reason));
+        }
+    }
+    if enrolled.is_empty() {
+        return run;
+    }
+    if dry_run {
+        say!(
+            "sealed: {} enrolled agents (not checked in a dry run)",
+            enrolled.len()
+        );
+        return run;
+    }
+    let mut refused = BTreeSet::new();
+    // The anchors not yet judged are judged here where they can be, so a
+    // session's verdict says what was found for the newest (beta round 12)
+    let start = verified.map(|verified| sealed::check::StartAnchors {
+        verified,
+        alerted: alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
+    });
+    for (id, state) in pool.iter() {
+        let Some((hash, sizes)) = enrolled.get(id) else {
+            continue;
+        };
+        let name = state.soul.name.to_string();
+        let dir = state_dir.join(id.to_string());
+        match sealed::check::check_with(&dir, *id, hash, *sizes, keys, api, start.as_ref()).await {
+            sealed::check::Outcome::ServerFault { kind, detail } => {
+                skipped.push(Skipped::new(
+                    *id,
+                    Some(name.clone()),
+                    "sealed",
+                    "Agora's copy of its history failed verification".to_string(),
+                ));
+                refused.insert(*id);
+                run.server_faults.push((*id, name, kind, detail));
+            }
+            sealed::check::Outcome::Refuse { reason, detail } => {
+                sealed::check::refuse(&dir, *id, &name, reason, &detail, alerts).await;
+                skipped.push(Skipped::new(
+                    *id,
+                    Some(name.clone()),
+                    "sealed",
+                    format!("refused: {}", reason.as_str()),
+                ));
+                refused.insert(*id);
+                run.refused.push((*id, name, reason));
+            }
+            sealed::check::Outcome::Run {
+                seat,
+                notice,
+                hold,
+                drops,
+                told,
+                judged,
+            } => {
+                if let Some(result) = &judged {
+                    sealed::anchors::alert_pass(alerts, *id, &name, result);
+                }
+                tracing::info!(
+                    event_type = "sealed_state_checked",
+                    agent = %name,
+                    agent_id = %id,
+                    hold = ?hold,
+                    notice,
+                    drops = drops.len(),
+                    "sealed state checked"
+                );
+                if !drops.is_empty() {
+                    alerts.notify(sealed::check::drop_alert(*id, &name, &drops));
+                }
+                if let Some(hold) = hold {
+                    // Every start while held, rate-limited by the alerter
+                    let held = agora_agentkit::state::storage::AgentSeal::new(
+                        &state_dir.join(id.to_string()),
+                        *id,
+                    )
+                    .held()
+                    .await
+                    .ok();
+                    alerts.notify(sealed::check::hold_alert(hold, *id, &name, held.as_ref()));
+                    run.held.push(*id);
+                }
+                if let Some(n @ 1..) = sealed::check::unknown_rotations(keys, api, *id).await {
+                    tracing::warn!(
+                        event_type = "sealed_state_rotation_unknown",
+                        agent_id = %id,
+                        rotations = n,
+                        "the server lists key rotations this runner never made; not trusted"
+                    );
+                    alerts.notify(
+                        alerts::Alert::new(
+                            alerts::AlertKind::SealedStateRotationUnknown,
+                            format!("{name}: the server lists {n} key rotation(s) this runner never made"),
+                        )
+                        .agent(&name, *id)
+                        .detail("rotations", n),
+                    );
+                }
+                run.seats.insert(
+                    *id,
+                    consent::SealedSeat {
+                        stop_note: false,
+                        lines: seat,
+                        notice,
+                        anchors_told: told,
+                    },
+                );
+                run.drained.push((*id, name));
+            }
+        }
+    }
+    pool.retain(|(id, _)| !refused.contains(id));
+    run
+}
+
+/// `agora-seed <sealed command>`: the data dir, server and
+/// `[memory_restore]` from the flags and `--config`, as for a run.
+async fn run_sealed_command(
+    held: &mut Held,
+    command: sealed::cli::Command,
+    args: &Args,
+) -> Result<()> {
+    let config: Option<RunConfig> = match &args.config {
+        Some(path) => {
+            let body = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            Some(toml::from_str(&body).with_context(|| format!("parsing {}", path.display()))?)
+        }
+        None => None,
+    };
+    let data_dir = match args
+        .data_dir
+        .clone()
+        .or_else(|| config.as_ref().and_then(|c| c.data_dir.clone()))
+    {
+        Some(d) => d,
+        None => dirs::home_dir()
+            .context("no home directory")?
+            .join("agents/agora"),
+    };
+    let server_url = config
+        .as_ref()
+        .and_then(|c| c.server_url.clone())
+        .unwrap_or_else(|| args.server_url.clone());
+    let (guards, _) = logging::init(args.log_dir.as_deref(), &data_dir, !args.no_log_file, false)?;
+    held.log_guards = Some(guards);
+    let restore = match config.as_ref().and_then(|c| c.memory_restore.as_ref()) {
+        Some(c) => c.resolve()?,
+        None => None,
+    };
+    sealed::cli::run(command, &data_dir, server_url, restore).await
 }
 
 #[tokio::main]
@@ -1350,25 +1974,39 @@ async fn main() -> Result<()> {
     // Before the error (if any) ends the process: an alert raised on the
     // way out — `governance_log_refused` above all — is sent, not dropped.
     held.alerts.flush(ALERT_FLUSH).await;
+    let stopped = held.stopped && result.is_ok();
+    let refused = matches!(&result, Err(e) if e.is::<RefusedRun>());
     drop(held);
+    if stopped {
+        std::process::exit(signals::STOPPED_EXIT);
+    }
+    if refused {
+        if let Err(e) = &result {
+            eprintln!("Error: {e:#}");
+        }
+        std::process::exit(sealed::REFUSED_RUN_EXIT);
+    }
     result
 }
 
 async fn run(held: &mut Held) -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     args.reject_retired()?;
     if args.consent_queue {
         return print_consent_queue(&args);
     }
-    if let (Some(spec), Some(email), Some(password_file), Some(data_dir)) = (
+    if let Some(command) = args.command.take() {
+        return run_sealed_command(held, command, &args).await;
+    }
+    if let (Some(spec), Some(credential), Some(key_file), Some(data_dir)) = (
         &args.provision,
-        &args.provision_operator,
-        &args.provision_password_file,
+        args.provision_credential,
+        &args.provision_key_file,
         &args.data_dir,
     ) {
         let operator = provision::Operator {
-            email: email.clone(),
-            password_file: password_file.clone(),
+            credential,
+            key_file: key_file.clone(),
         };
         let id = provision::provision(
             spec,
@@ -1413,6 +2051,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 role_consent: None,
                 cadence_consent: None,
                 memory_restore: None,
+                sealed_state: None,
                 sleeping: Vec::new(),
                 wake: Vec::new(),
                 schedule: schedule::ScheduleConfig::default(),
@@ -1454,6 +2093,15 @@ async fn run(held: &mut Held) -> Result<()> {
             .context("no home directory")?
             .join("agents/agora"),
     };
+    // Shared with any other runner on this data dir; `rotate-keys` takes it
+    // exclusive. A dry run or a listing reads only
+    if !args.dry_run && !args.list_models {
+        // A save cut between its archive and its rename, while no other
+        // runner shares the data dir (exclusive, not waiting): before the
+        // shared hold, and before any state loads
+        promote::promote_if_alone(&data_dir);
+        held.runner_lock = Some(sealed::session::runner_shared(&data_dir)?);
+    }
     if args.test_alert {
         let alerts = config
             .alerts
@@ -1543,8 +2191,16 @@ async fn run(held: &mut Held) -> Result<()> {
                 endpoint::Endpoint::Bridge(inference)
             }
         };
-        let models = inference
-            .models()
+        // An unreachable endpoint is waited for, with the session hold's
+        // period, not failed: see `endpoint::hold_unreachable`. Someone at a
+        // terminal (`--list-models`, `--dry-run`, `--prepare-review-forks`)
+        // is told at once instead. Endpoints are discovered in order, so a
+        // down one also holds back those after it; every config has one.
+        let hold = endpoint::startup_hold(
+            spec.unreachable_hold_secs,
+            args.list_models || args.dry_run || args.prepare_review_forks,
+        );
+        let models = endpoint::hold_unreachable(&spec.endpoint, hold, || inference.models())
             .await
             .with_context(|| format!("discovering models on {}", spec.endpoint))?;
         if args.list_models {
@@ -1632,8 +2288,90 @@ async fn run(held: &mut Held) -> Result<()> {
     }
 
     // Load the full agent pool once, filter to named agents if any, route.
-    let storage = FsStorage::new(data_dir.join("state"));
-    let (mut pool, mut skipped) = load_states(&storage, &data_dir.join("state")).await?;
+    // Through the sealed storage, which finishes a sealed commit a crash
+    // interrupted; a dry run writes nothing, so reads plainly.
+    let state_dir = data_dir.join("state");
+    let enrolment = Arc::new(sealed::SealedEnrolment::new(
+        &state_dir,
+        data_dir.join("secrets"),
+    ));
+    let sealed_api = agora_agentkit::client::Client::new(server_url.clone())?;
+    let outbox = agora_agentkit::state::outbox::AgoraOutbox::new(
+        sealed_api.clone(),
+        &state_dir,
+        enrolment.clone(),
+    );
+    // A stop kept in the secrets tree stands for a lost sealed/stopped. A
+    // dry run writes nothing
+    if !args.dry_run {
+        sealed::stop::reconcile_all(&state_dir, enrolment.keys_store());
+    }
+    let loaded = if args.dry_run {
+        let plain = load_states(&FsStorage::new(&state_dir), &state_dir).await?;
+        LoadedStates {
+            states: plain.states,
+            bases: BTreeMap::new(),
+            sealed: plain.sealed,
+            skipped: plain.skipped,
+        }
+    } else {
+        let storage = sealed::SealedStorage::new(&state_dir, outbox.clone(), enrolment.clone());
+        load_states(&storage, &state_dir).await?
+    };
+    let LoadedStates {
+        states: mut pool,
+        bases,
+        sealed: enrolled,
+        mut skipped,
+    } = loaded;
+    // An agent mid-rotation (`secrets.next.json`) is left out, unrefused:
+    // its keys and the server's may disagree until `rotate-keys` finishes
+    mid_rotation(
+        &mut pool,
+        &data_dir.join("secrets"),
+        &held.alerts,
+        &mut skipped,
+    );
+    // The reference client verifies the governance log every run
+    // (agora#127): signatures, chain, and the head entry's content.
+    // A log that does not verify stops the run before any agent acts.
+    // A dry run verifies too — it is read-only and worth knowing. Before
+    // the sealed-state start check, which judges the anchors it can and
+    // names the rest, the newest first, with why.
+    let verified_anchors = govlog::verify(
+        &agora_agentkit::client::Client::new(server_url.clone())?,
+        &data_dir,
+        &held.alerts,
+    )
+    .await?;
+    // The sealed-state start check, for enrolled agents: before anyone is
+    // built, so a refused agent is never run, saved or sealed.
+    let sealed_run = sealed_start_check(
+        &mut pool,
+        &enrolled,
+        &state_dir,
+        enrolment.keys_store(),
+        &sealed_api,
+        &held.alerts,
+        args.dry_run,
+        &mut skipped,
+        Some(&verified_anchors),
+    )
+    .await;
+    // Before any reactor is built. A dry run checks nothing, so refuses
+    // nothing
+    refuse_run(&sealed_run.refused, &sealed_run.server_faults, &held.alerts)?;
+    let sealed_offer = config
+        .sealed_state
+        .as_ref()
+        .and_then(|c| consent::sealed_state::resolve_or_disable(c, &held.alerts));
+    if let Some(offer) = &sealed_offer {
+        for id in offer.ids() {
+            if !pool.iter().any(|(a, _)| *a == id) && !skipped.iter().any(|s| s.id == id) {
+                tracing::warn!(agent_id = %id, "`[sealed_state].agents` names no loaded agent");
+            }
+        }
+    }
     let role_offer = match &config.role_consent {
         Some(c) => c.resolve()?,
         None => None,
@@ -1711,7 +2449,7 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     if routing.placeholders > 0 {
         say!(
-            "placeholders: {} agents have no model — run sync-models",
+            "placeholders: {} agents have no model (state.model unset); skipped",
             routing.placeholders
         );
     }
@@ -1773,7 +2511,8 @@ async fn run(held: &mut Held) -> Result<()> {
         .with_alerts(held.alerts.clone())
         .with_role_offer(role_offer)
         .with_cadence_offer(cadence_offer)
-        .with_memory_restore_offer(restore_offer),
+        .with_memory_restore_offer(restore_offer)
+        .with_sealed_state(sealed_offer, sealed_run.seats.clone()),
     );
     let context = consent::agent::ConsentContext {
         inner: SeedContext {
@@ -1784,11 +2523,6 @@ async fn run(held: &mut Held) -> Result<()> {
         consent,
     };
 
-    // The reference client verifies the governance log every run
-    // (agora#127): signatures, chain, and the head entry's content.
-    // A log that does not verify stops the run before any agent acts.
-    // A dry run verifies too — it is read-only and worth knowing.
-    govlog::verify(&context.inner.client, &data_dir, &held.alerts).await?;
     // The constitution the agents read must be the one the server serves,
     // whole: a truncated or stale copy stops the run the same way.
     let web_tools =
@@ -1801,6 +2535,8 @@ async fn run(held: &mut Held) -> Result<()> {
     let shares: BTreeMap<Model, f64> = specs.iter().map(|s| (s.id.clone(), s.share)).collect();
     let mut orchestrator = Orchestrator::new();
     let mut labels: BTreeMap<ReactorId, String> = BTreeMap::new();
+    // Raised by `SIGINT` and `SIGTERM` once the run starts (`signals`)
+    let stop = Stop::new();
     let mut total = 0usize;
     for (idx, (spec, (inference, cohort))) in config
         .reactors
@@ -1924,8 +2660,17 @@ async fn run(held: &mut Held) -> Result<()> {
             endpoint = %spec.endpoint,
             "reactor ready"
         );
-        let mut reactor: Reactor<_, _, SeedRunAgent> =
-            Reactor::new(inference, FsStorage::new(data_dir.join("state")), agents);
+        let cohort_bases: Vec<_> = agents
+            .iter()
+            .filter_map(|a| {
+                let id = agora_agentkit::reactor::Agent::id(a);
+                Some((id, *bases.get(&id)?))
+            })
+            .collect();
+        let storage = sealed::SealedStorage::new(&state_dir, outbox.clone(), enrolment.clone());
+        let mut reactor: Reactor<_, _, SeedRunAgent> = Reactor::new(inference, storage, agents)
+            .with_bases(cohort_bases)
+            .with_stop(stop.clone());
         if spec.unreachable_hold_secs > 0 {
             reactor = reactor
                 .with_unreachable_hold(std::time::Duration::from_secs(spec.unreachable_hold_secs));
@@ -1973,7 +2718,44 @@ async fn run(held: &mut Held) -> Result<()> {
 
     tracing::info!(agents = total, reactors = labels.len(), "starting run");
     let run_started = chrono::Utc::now();
-    let report = orchestrator.run().await;
+    // Before any session saves: a version committed after this is this
+    // process's own, and its upload times are recorded
+    // (sealed::receipts)
+    let drain_baselines =
+        sealed::receipts::baselines(&state_dir, sealed_run.drained.iter().map(|(id, _)| *id)).await;
+    // Uploads, away from the reactors' storage lock: during the run, and
+    // once more before exit
+    let drainer = Arc::new(
+        sealed::drain::Drainer::new(
+            outbox.clone(),
+            state_dir.clone(),
+            drain_baselines,
+            sealed_run.drained,
+            sealed_run.held,
+            held.alerts.clone(),
+        )
+        .with_anchors(sealed::drain::Anchors {
+            api: Arc::new(sealed_api.clone()),
+            keys: enrolment.keys_store().clone(),
+            state_dir: state_dir.clone(),
+            verified: verified_anchors,
+        }),
+    );
+    let drain_task = drainer.spawn();
+    let exit = signals::install(stop.clone(), Duration::from_secs(args.stop_deadline_secs))
+        .context("installing the SIGINT and SIGTERM handlers")?;
+    let report = tokio::select! {
+        report = orchestrator.run() => report,
+        // A second signal, or the stop's deadline: today's kill, but with
+        // the log flushed. No teardown, no save; `interrupted` recovers.
+        code = exit.wait() => {
+            // Alerts already raised go out, briefly; then the log
+            held.alerts.flush(Duration::from_secs(5)).await;
+            drop(held.log_guards.take());
+            std::process::exit(code);
+        }
+    };
+    drainer.finish(drain_task).await;
     if restore_on {
         // A showing marked completed whose state the reactor then couldn't
         // save lost its memory update: it is shown again.
@@ -1987,9 +2769,40 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     for (id, result) in &report.report {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
+        // A session whose save failed lives only in the report: kept in a
+        // rescue file beside its state, never loaded by anything
+        if let Ok(r) = result {
+            for (agent, rescued) in rescue_unsaved(&state_dir, r) {
+                match rescued {
+                    Ok(path) => tracing::error!(
+                        event_type = "unsaved_rescued",
+                        agent_id = %agent,
+                        path = %path.display(),
+                        "an unsaved session's state was kept in a rescue file"
+                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            event_type = "unsaved_rescue_failed",
+                            agent_id = %agent,
+                            error_kind = ?e.kind(),
+                            "an unsaved session's state could not be written to a rescue file"
+                        );
+                        // The last resort, for this agent only: without it
+                        // the session is lost, so its state goes to stdout
+                        // as it always did before rescue files
+                        if let Some(value) = r.unsaved.get(&agent) {
+                            say!(
+                                "unsaved {agent} (rescue file failed): {}",
+                                serde_json::to_string_pretty(value).unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if bridge.is_none() {
             say!("== {label}");
-            say!("{result:#?}");
+            say!("{}", report_summary(result));
         }
         // The `println!` above is for whoever is watching; this is the
         // same thing for whoever asks later. Without it the run's outcome
@@ -2004,6 +2817,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 errors = r.errors.len(),
                 unsaved = r.unsaved.len(),
                 rejected = r.rejected.len(),
+                unstarted = r.unstarted,
                 "reactor finished"
             ),
             Err(e) => tracing::error!(
@@ -2013,18 +2827,23 @@ async fn run(held: &mut Held) -> Result<()> {
             ),
         }
     }
-    let (done, failed) = report
+    let (done, failed, unstarted) = report
         .report
         .values()
         .flatten()
-        .fold((0, 0), |(d, f), r| (d + r.done, f + r.failed));
+        .fold((0, 0, 0), |(d, f, u), r| {
+            (d + r.done, f + r.failed, u + r.unstarted)
+        });
     tracing::info!(
         done,
         failed,
         agents_skipped,
+        unstarted,
+        stop = %stop.level(),
         reactors = report.report.len(),
         "run finished"
     );
+    held.stopped = stop.draining();
     // Rejections mean routing and negotiation disagree — that's a bug.
     let rejected: Vec<_> = report.rejected().collect();
     if !rejected.is_empty() {
@@ -2069,6 +2888,605 @@ mod tests {
         assert!(!not_due_note(2, None, now).contains("due again"));
     }
 
+    /// An unfinished rotation leaves the agent out, unrefused.
+    #[test]
+    fn an_unfinished_rotation_leaves_the_agent_out() {
+        let root = sealed::TestDir::new("main-midrotation");
+        let (a, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let (b, wren) = crate::agent_selection_tests::pooled("wren");
+        std::fs::create_dir_all(root.join(a.to_string())).unwrap();
+        std::fs::write(root.join(a.to_string()).join("secrets.next.json"), b"{}").unwrap();
+        let mut pool = vec![(a, tarn), (b, wren)];
+        let mut skipped = Vec::new();
+        mid_rotation(&mut pool, &root, &alerts::Alerter::off(), &mut skipped);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].0, b);
+        assert_eq!((skipped[0].id, skipped[0].stage), (a, "rotation"));
+    }
+
+    /// An unsaved session is kept in a rescue file, 0600, in FsStorage's
+    /// envelope, beside (never as) its state.
+    #[test]
+    fn unsaved_sessions_are_rescued_to_files() {
+        let root = sealed::TestDir::new("main-rescue");
+        let id = AgentId::new();
+        let state = serde_json::json!({ "memory": { "content": "synthetic unsaved" } });
+        let r: agora_agentkit::reactor::Report =
+            serde_json::from_value(serde_json::json!({ "done": 0, "failed": 1, "errors": {}, "unsaved": { id.to_string(): state } }))
+                .unwrap();
+        let rescued = rescue_unsaved(&root, &r);
+        assert_eq!(rescued.len(), 1);
+        let path = rescued[0].1.as_ref().unwrap();
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("unsaved.")
+        );
+        let back: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(back, serde_json::json!({ "format": 1, "state": state }));
+        assert!(!root.join(id.to_string()).join("state.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // A directory that can't be written: the error comes back
+        let blocked = sealed::TestDir::new("main-rescue-blocked");
+        std::fs::write(blocked.join(id.to_string()), b"a file").unwrap();
+        assert!(rescue_unsaved(&blocked, &r)[0].1.is_err());
+    }
+
+    /// The terminal's run summary never carries state content.
+    #[test]
+    fn the_run_summary_has_counts_not_content() {
+        let id = AgentId::new();
+        let r: agora_agentkit::reactor::Report = serde_json::from_value(serde_json::json!({
+            "done": 1, "failed": 1,
+            "errors": { id.to_string(): {
+                "kind": "Storage", "retry_after": null, "message": "SYNTHETIC-SECRET in an error"
+            } },
+            "unsaved": { id.to_string(): { "memory": { "content": "SYNTHETIC-SECRET" } } },
+        }))
+        .unwrap();
+        let ok: std::result::Result<_, String> = Ok(r);
+        let s = report_summary(&ok);
+        assert!(!s.contains("SYNTHETIC-SECRET"), "{s}");
+        assert!(s.contains("done 1, failed 1, unsaved 1"), "{s}");
+        assert!(s.contains(&format!("error {id}: Storage")), "{s}");
+        assert!(s.contains(&format!("unsaved {id}: ")), "{s}");
+    }
+
+    /// A stopped agent is not checked, held or refused: it is told, the
+    /// note once, then a short line.
+    #[tokio::test]
+    async fn a_stopped_agent_is_told_and_not_checked() {
+        let root = sealed::TestDir::new("main-stopped");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        sealed::stop::stop(
+            &state_dir,
+            &keys,
+            id,
+            "It asked",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        assert!(loaded.sealed.is_empty(), "not measured for a check");
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let mut pool = vec![(id, tarn)];
+        let mut skipped = Vec::new();
+        let api = sealed::api::fake::FakeApi::new();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            false,
+            &mut skipped,
+            None,
+        )
+        .await;
+        assert_eq!(pool.len(), 1);
+        assert!(skipped.is_empty() && run.held.is_empty() && run.drained.is_empty());
+        let seat = &run.seats[&id];
+        assert!(seat.stop_note);
+        assert!(
+            seat.lines[0].starts_with("Your sealed backups were stopped by your operator on ")
+                && seat.lines[0].ends_with(
+                    ": It asked. Your earlier versions stay on Agora. While stopped, your state \
+                     isn't checked at the start of sessions."
+                ),
+            "{:?}",
+            seat.lines
+        );
+        sealed::stop::Stopped::mark_shown(&dir).unwrap();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            false,
+            &mut skipped,
+            None,
+        )
+        .await;
+        assert!(!run.seats[&id].stop_note);
+        assert!(run.seats[&id].lines[0].starts_with("Your sealed backups are stopped (since "));
+    }
+
+    /// The sealed start check: an intact agent runs with its lines, a
+    /// wiped one leaves the pool as a `sealed` skip, refused on disk.
+    #[tokio::test]
+    async fn the_sealed_check_seats_the_intact_and_refuses_the_wiped() {
+        let root = sealed::TestDir::new("main-sealed");
+        let (ok, keys, _) = sealed::check::tests::enrolled(&root).await;
+        let (wiped, _, wiped_dir) = sealed::check::tests::enrolled(&root).await;
+        // the second helper call wrote its own secrets under the same tree
+        let state_dir = root.join("state");
+        FsStorage::new(&state_dir)
+            .save_raw(wiped, serde_json::json!({ "memory": "" }), None)
+            .await
+            .unwrap();
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        assert!(
+            loaded.states.is_empty(),
+            "synthetic states aren't SeedStates"
+        );
+        assert_eq!(loaded.sealed.len(), 2, "both enrolled agents measured");
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let (_, wren) = crate::agent_selection_tests::pooled("wren");
+        let mut pool = vec![(ok, tarn), (wiped, wren)];
+        let mut skipped = Vec::new();
+        let api = sealed::api::fake::FakeApi::new();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            false,
+            &mut skipped,
+            None,
+        )
+        .await;
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].0, ok);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!((skipped[0].id, skipped[0].stage), (wiped, "sealed"));
+        assert!(
+            agora_agentkit::state::storage::AgentSeal::new(&wiped_dir, wiped)
+                .is_refused()
+                .await
+                .unwrap()
+        );
+        assert!(run.seats[&ok].lines[0].starts_with("Your sealed state: "));
+        assert_eq!(run.drained.len(), 1);
+        assert!(run.held.is_empty());
+    }
+
+    /// A dry run checks nothing: an anchor failure not yet told stays
+    /// untold for the next real session, and no sealed file is written.
+    #[tokio::test]
+    async fn a_dry_run_tells_no_anchor_finding_and_writes_nothing() {
+        use sealed::inclusion::{Checked, Finding, InclusionFile};
+        let root = sealed::TestDir::new("main-sealed-dry");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let file = InclusionFile {
+            through: Some("ANC-2026-0002".parse().unwrap()),
+            checked: vec![Checked {
+                anc_id: "ANC-2026-0002".parse().unwrap(),
+                date: chrono::NaiveDate::from_ymd_opt(2026, 11, 2),
+                finding: Finding::DidNotCheck,
+                at: chrono::Utc::now(),
+                told: false,
+                alerted: true,
+            }],
+        };
+        file.save(&dir).unwrap();
+        let before: Vec<_> = std::fs::read_dir(dir.join("sealed"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let mut pool = vec![(id, tarn)];
+        let mut skipped = Vec::new();
+        let api = sealed::api::fake::FakeApi::new();
+        // A newer anchor in the log: a dry run judges nothing at the start
+        // either, and asks Agora for nothing
+        let verified = sealed::anchors::VerifiedAnchors::new([(
+            "ANC-2026-0003".parse().unwrap(),
+            agora_agentkit::govlog::Sha256Hex::from([3; 32]),
+            chrono::Utc::now(),
+        )]);
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            true,
+            &mut skipped,
+            Some(&verified),
+        )
+        .await;
+        assert!(run.seats.is_empty() && run.drained.is_empty());
+        assert_eq!(InclusionFile::load(&dir).unwrap(), file, "still untold");
+        let after: Vec<_> = std::fs::read_dir(dir.join("sealed"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before.len(), after.len(), "no file added");
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// The start check judges an in-step agent's anchors before any
+    /// session (beta round 12), and a failure it finds goes to the
+    /// operator then, once; the verdict seated says it
+    #[tokio::test]
+    async fn the_start_check_judges_anchors_and_alerts_a_failure() {
+        let root = sealed::TestDir::new("main-sealed-start-anchors");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        sealed::anchors::tests::uploaded(&dir, id).await;
+        let state_dir = root.join("state");
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        let api = sealed::api::fake::FakeApi::new();
+        let entries = sealed::check::local_entries(&seal).await.unwrap();
+        // An anchor holding the genesis, though the later version was
+        // confirmed before its day ended: older than it should be
+        let genesis = &entries[0];
+        let (proof, anc, attested, _) = sealed::anchors::tests::anchor_on(
+            2,
+            sealed::anchors::tests::tomorrow(),
+            id,
+            genesis.entry_hash(),
+            genesis.entry.seq,
+        );
+        *api.chain.lock().unwrap() = Ok(entries);
+        api.proofs.lock().unwrap().push(proof);
+        let verified =
+            sealed::anchors::VerifiedAnchors::new([(anc.clone(), attested, chrono::Utc::now())]);
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let mut pool = vec![(id, tarn)];
+        let mut skipped = Vec::new();
+        let sent = alerts::testing::Recorder::default();
+        let alerter = alerts::testing::recording(&root, &sent);
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerter,
+            false,
+            &mut skipped,
+            Some(&verified),
+        )
+        .await;
+        alerter.flush(Duration::from_secs(5)).await;
+        let seat = &run.seats[&id];
+        assert!(
+            seat.lines[0].contains(&format!("{anc}, the anchor for "))
+                && seat.lines[0].contains("holds an older version of yours")
+                && seat.lines[0].contains("Your runner has alerted your operator."),
+            "{:?}",
+            seat.lines
+        );
+        assert_eq!(seat.anchors_told, vec![anc.clone()]);
+        let mails = sent.sent();
+        assert_eq!(mails.len(), 1, "{mails:?}");
+        assert!(mails[0].contains(anc.as_str()), "{}", mails[0]);
+        // Judged once: a second start alerts nothing more
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerter,
+            false,
+            &mut skipped,
+            Some(&verified),
+        )
+        .await;
+        alerter.flush(Duration::from_secs(5)).await;
+        assert_eq!(sent.sent().len(), 1);
+        assert!(run.seats[&id].lines[0].contains("holds an older version of yours"));
+    }
+
+    /// Fail closed: one refused agent among many refuses the whole run,
+    /// whatever the refusal; a hold doesn't.
+    #[tokio::test]
+    async fn one_refusal_refuses_the_whole_run_and_a_hold_does_not() {
+        let root = sealed::TestDir::new("main-refused-run");
+        let mut ids = Vec::new();
+        let mut keys = None;
+        for _ in 0..4 {
+            let (id, k, dir) = sealed::check::tests::enrolled(&root).await;
+            ids.push((id, dir));
+            keys.get_or_insert(k);
+        }
+        let keys = keys.unwrap();
+        let state_dir = root.join("state");
+        let names = ["tarn", "wren", "moss", "fern"];
+        let pool_of = || {
+            ids.iter()
+                .zip(names)
+                .map(|((id, _), n)| (*id, crate::agent_selection_tests::pooled(n).1))
+                .collect::<Vec<_>>()
+        };
+        let api = sealed::api::fake::FakeApi::new();
+        let check = async |pool: &mut Vec<(AgentId, SeedState)>| {
+            let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+                .await
+                .unwrap();
+            let mut skipped = Vec::new();
+            sealed_start_check(
+                pool,
+                &loaded.sealed,
+                &state_dir,
+                &keys,
+                &api,
+                &alerts::Alerter::off(),
+                false,
+                &mut skipped,
+                None,
+            )
+            .await
+        };
+
+        // A hold (sealed/ unreadable) runs: the run goes on
+        let head = ids[3].1.join("sealed/head.json");
+        let saved = std::fs::read(&head).unwrap();
+        std::fs::write(&head, b"{ not json").unwrap();
+        let mut pool = pool_of();
+        let run = check(&mut pool).await;
+        assert_eq!(run.held, vec![ids[3].0]);
+        assert!(run.refused.is_empty());
+        assert!(refuse_run(&run.refused, &run.server_faults, &alerts::Alerter::off()).is_ok());
+        std::fs::write(&head, saved).unwrap();
+
+        // One wipe among four: the run is refused
+        FsStorage::new(&state_dir)
+            .save_raw(ids[1].0, serde_json::json!({ "memory": "" }), None)
+            .await
+            .unwrap();
+        let mut pool = pool_of();
+        let run = check(&mut pool).await;
+        assert_eq!(
+            run.refused
+                .iter()
+                .map(|(id, name, r)| (*id, name.as_str(), *r))
+                .collect::<Vec<_>>(),
+            vec![(ids[1].0, "wren", sealed::notice::Refusal::Mismatch)]
+        );
+        let e = refuse_run(&run.refused, &run.server_faults, &alerts::Alerter::off()).unwrap_err();
+        assert!(e.is::<RefusedRun>(), "{e:#}");
+        assert!(e.to_string().contains("sealed-restore"), "{e}");
+
+        // A lost head.json too: both named
+        let sealed = ids[2].1.join("sealed");
+        std::fs::rename(sealed.join("head.json"), sealed.join("head.json.lost")).unwrap();
+        let mut pool = pool_of();
+        let run = check(&mut pool).await;
+        let reasons: Vec<_> = run.refused.iter().map(|r| r.2).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                sealed::notice::Refusal::Mismatch,
+                sealed::notice::Refusal::HeadMissing
+            ]
+        );
+        assert!(refuse_run(&run.refused, &run.server_faults, &alerts::Alerter::off()).is_err());
+
+        // Every kind refuses the run
+        for reason in [
+            sealed::notice::Refusal::Mismatch,
+            sealed::notice::Refusal::ChainBroken,
+            sealed::notice::Refusal::HeadMissing,
+        ] {
+            let e = refuse_run(
+                &[(AgentId::new(), "tarn".into(), reason)],
+                &[],
+                &alerts::Alerter::off(),
+            )
+            .unwrap_err();
+            assert!(e.is::<RefusedRun>());
+        }
+    }
+
+    /// An enrolled agent whose whole directory is gone never loads, but its
+    /// keys say it was sealed: the run is refused until it is restored.
+    /// Agora saying it holds no head for it (a 404) skips it.
+    #[tokio::test]
+    async fn a_deleted_agent_refuses_the_run_until_restored() {
+        let root = sealed::TestDir::new("main-deleted");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let api = sealed::api::fake::FakeApi::new();
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        *api.chain.lock().unwrap() = Ok(sealed::check::local_entries(&seal).await.unwrap());
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        for f in std::fs::read_dir(dir.join("sealed/blobs")).unwrap() {
+            let f = f.unwrap();
+            let sha = f.file_name().to_str().unwrap().parse().unwrap();
+            api.blobs
+                .lock()
+                .unwrap()
+                .insert(sha, std::fs::read(f.path()).unwrap());
+        }
+        std::fs::rename(&dir, root.join("gone")).unwrap();
+        let check = async |api: &sealed::api::fake::FakeApi| {
+            let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+                .await
+                .unwrap();
+            let mut pool = Vec::new();
+            sealed_start_check(
+                &mut pool,
+                &loaded.sealed,
+                &state_dir,
+                &keys,
+                api,
+                &alerts::Alerter::off(),
+                false,
+                &mut Vec::new(),
+                None,
+            )
+            .await
+        };
+        let run = check(&api).await;
+        assert_eq!(
+            run.refused.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(),
+            vec![(id, sealed::notice::Refusal::StateMissing)]
+        );
+        assert!(refuse_run(&run.refused, &run.server_faults, &alerts::Alerter::off()).is_err());
+
+        // Agora unreachable: refused all the same (fail closed)
+        let down = sealed::api::fake::FakeApi::new();
+        *down.chain.lock().unwrap() = Err("unreachable".into());
+        assert_eq!(check(&down).await.refused.len(), 1);
+        // Agora holds no head for it (departed): skipped
+        assert!(
+            check(&sealed::api::fake::FakeApi::new())
+                .await
+                .refused
+                .is_empty()
+        );
+
+        sealed::restore::restore(&state_dir, &keys, &api, id, None, false)
+            .await
+            .unwrap();
+        let run = check(&api).await;
+        assert!(run.refused.is_empty(), "{:?}", run.refused);
+    }
+
+    /// Agora's copy of one agent's history fails verification while its
+    /// local state is intact: the whole run is refused, nothing is marked
+    /// against the agent, and once Agora serves a good copy the next start
+    /// runs with no operator command (Steward, 2026-11-03).
+    #[tokio::test]
+    async fn a_server_fault_refuses_the_run_and_marks_nothing() {
+        let root = sealed::TestDir::new("main-server-fault");
+        let (healthy, keys, _) = sealed::check::tests::enrolled(&root).await;
+        let (broken, _, dir) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, broken);
+        let mine = sealed::check::local_entries(&seal).await.unwrap();
+        let signing = keys.signing(broken).unwrap();
+        let mut sibling = mine[1].entry.clone();
+        sibling.state_at += 1;
+        let good = vec![mine[0].clone(), sibling.clone().sign(&signing)];
+        let api = sealed::api::fake::FakeApi::new();
+        *api.chain.lock().unwrap() = Ok(good.clone());
+        sealed::accept::rebase(&state_dir, &keys, &api, broken, "a test")
+            .await
+            .unwrap();
+        let (forger, _) = agora_agentkit::crypto::generate_keypair();
+        *api.chain.lock().unwrap() = Ok(vec![mine[0].clone(), sibling.sign(&forger)]);
+        let check = async |api: &sealed::api::fake::FakeApi| {
+            let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+                .await
+                .unwrap();
+            let mut pool = vec![
+                (healthy, crate::agent_selection_tests::pooled("tarn").1),
+                (broken, crate::agent_selection_tests::pooled("wren").1),
+            ];
+            sealed_start_check(
+                &mut pool,
+                &loaded.sealed,
+                &state_dir,
+                &keys,
+                api,
+                &alerts::Alerter::off(),
+                false,
+                &mut Vec::new(),
+                None,
+            )
+            .await
+        };
+        let run = check(&api).await;
+        assert!(run.refused.is_empty());
+        assert_eq!(
+            run.server_faults.iter().map(|f| f.0).collect::<Vec<_>>(),
+            vec![broken]
+        );
+        let e = refuse_run(&run.refused, &run.server_faults, &alerts::Alerter::off()).unwrap_err();
+        assert!(e.is::<RefusedRun>());
+        assert!(!seal.is_refused().await.unwrap(), "no marker");
+        assert!(
+            sealed::notice::Notice::load(&dir)
+                .unwrap()
+                .is_none_or(|n| n.joined),
+            "no refusal notice"
+        );
+        // Agora serves a good copy: the run proceeds
+        *api.chain.lock().unwrap() = Ok(good);
+        let run = check(&api).await;
+        assert!(run.server_faults.is_empty() && run.refused.is_empty());
+        assert!(refuse_run(&run.refused, &run.server_faults, &alerts::Alerter::off()).is_ok());
+        assert!(SERVER_FAULT_TEXT.contains("sealed-stop"));
+    }
+
+    /// A dry run checks nothing, so refuses nothing.
+    #[tokio::test]
+    async fn a_dry_run_never_refuses_the_run() {
+        let root = sealed::TestDir::new("main-refused-dry");
+        let (id, keys, _) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        FsStorage::new(&state_dir)
+            .save_raw(id, serde_json::json!({ "memory": "" }), None)
+            .await
+            .unwrap();
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let mut pool = vec![(id, crate::agent_selection_tests::pooled("tarn").1)];
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &state_dir,
+            &keys,
+            &sealed::api::fake::FakeApi::new(),
+            &alerts::Alerter::off(),
+            true,
+            &mut Vec::new(),
+            None,
+        )
+        .await;
+        assert!(run.refused.is_empty());
+        assert!(refuse_run(&run.refused, &run.server_faults, &alerts::Alerter::off()).is_ok());
+    }
+
     /// A state that won't load is left out and returned for the sweep's
     /// one summary, and does not stop the others loading (audit
     /// 2026-10-14: it used to be a warn and nothing more).
@@ -2077,11 +3495,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agora-seed-skip-{}", uuid::Uuid::new_v4()));
         let mut storage = FsStorage::new(dir.clone());
         let (good, state) = crate::agent_selection_tests::pooled("tarn");
-        storage.save::<SeedAgent>(good, &state).await.unwrap();
+        storage.save::<SeedAgent>(good, &state, None).await.unwrap();
         let bad = AgentId::from(uuid::Uuid::new_v4());
         std::fs::create_dir_all(dir.join(bad.to_string())).unwrap();
         std::fs::write(dir.join(bad.to_string()).join("state.json"), "not json").unwrap();
-        let (states, skipped) = load_states(&storage, &dir).await.unwrap();
+        let LoadedStates {
+            states,
+            skipped,
+            sealed,
+            ..
+        } = load_states(&storage, &dir).await.unwrap();
+        assert!(sealed.is_empty(), "nobody enrolled");
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].0, good);
         assert_eq!(skipped.len(), 1);
@@ -2322,6 +3746,7 @@ mod agent_selection_tests {
             role_consent: None,
             cadence_consent: None,
             memory_restore: None,
+            sealed_state: None,
             sleeping: Vec::new(),
             wake: Vec::new(),
             schedule: schedule::ScheduleConfig::default(),

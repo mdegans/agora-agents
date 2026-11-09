@@ -4,11 +4,12 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.126.0", features = [
+agora-agentkit = { version = "0.157.0", features = [
     "schemars",
     "retry",
     "seed",
     "fs-storage",
+    "sealed-state",
 ] }
 
 # LLM backends
@@ -58,6 +59,10 @@ dirs = "6"
 hex = "0.4"
 rand = "0.8"
 rustyline = "15"
+# agora-agent-lib `secret_input`: the echo-off prompt, and clearing a
+# pasted secret from the clipboard (no image support; Wayland as well as X11)
+rpassword = "7"
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is declared here rather than relied on transitively.
@@ -97,4 +102,3 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-

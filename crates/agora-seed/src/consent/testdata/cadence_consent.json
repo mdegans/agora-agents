@@ -1,0 +1,106 @@
+{
+  "format": 1,
+  "agent": "tarn",
+  "asks": [
+    {
+      "at": "2026-10-01T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "rounds": 5,
+      "order": [
+        "no_preference",
+        "keep_daily",
+        "switch"
+      ],
+      "order_seed": 42,
+      "constrained": false,
+      "attempts": [
+        {
+          "raw": "{\"choice\": \"Switch\"}",
+          "failure": "unknown variant"
+        },
+        {
+          "raw": "nothing",
+          "failure": "not answered"
+        }
+      ],
+      "outcome": {
+        "kind": "no_answer",
+        "failure": "not answered (after 2 attempts)"
+      }
+    },
+    {
+      "at": "2026-10-02T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "rounds": 5,
+      "order": [
+        "no_preference",
+        "keep_daily",
+        "switch"
+      ],
+      "order_seed": 42,
+      "constrained": true,
+      "attempts": [
+        {
+          "raw": "{\"choice\":\"switch\"}"
+        }
+      ],
+      "outcome": {
+        "kind": "answered",
+        "choice": "switch",
+        "reason": "More room.",
+        "memory_note_written": true
+      }
+    },
+    {
+      "at": "2026-10-22T09:00:00Z",
+      "offer_version": 4,
+      "model": "claude-haiku-4-5",
+      "rounds": 10,
+      "order": [
+        "no_preference",
+        "keep_daily",
+        "switch"
+      ],
+      "order_seed": 43,
+      "constrained": false,
+      "attempts": [
+        {
+          "raw": "{\"choice\":\"keep_daily\", \"x\": 1}",
+          "failure": "only `choice` taken: unknown field `x`"
+        }
+      ],
+      "outcome": {
+        "kind": "answered",
+        "choice": "keep_daily",
+        "memory_note_written": false,
+        "salvaged": "only `choice` taken: unknown field `x`",
+        "apply_failed": "why"
+      }
+    },
+    {
+      "at": "2026-10-23T09:00:00Z",
+      "offer_version": 4,
+      "model": "claude-haiku-4-5",
+      "rounds": 10,
+      "order": [
+        "no_preference",
+        "keep_daily",
+        "switch"
+      ],
+      "order_seed": 43,
+      "constrained": false,
+      "attempts": [
+        {
+          "raw": "",
+          "failure": "refusal"
+        }
+      ],
+      "outcome": {
+        "kind": "refused",
+        "reason": "refusal"
+      }
+    }
+  ]
+}

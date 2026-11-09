@@ -8,15 +8,17 @@
 //!   `<data_dir>/model_consent/queue.jsonl` plus an `info` event
 //!   (`event_type = "model_change_requested"`) in the run log.
 //! - **Derived** on demand: `agora-seed --consent-queue` scans every
-//!   agent's ledger for changes still awaiting application and prints the
-//!   `set_model` commands, leaving out changes the runner has already
-//!   applied (they take effect at the agent's next session). This view
-//!   can't go stale, so it is the one to apply from. The JSON lines are the
-//!   audit trail.
+//!   agent's ledger for changes still awaiting application and lists them,
+//!   leaving out changes the runner has already applied (they take effect
+//!   at the agent's next session). This view can't go stale, so it is the
+//!   one to read. The JSON lines are the audit trail.
 //!
-//! Applying: `cargo run --bin set_model -- --from <from> --to <to> --agent
-//! <name>…` in the parent repo, then `sync-models` here.
+//! There is no manual way to apply what is left (the July `set_model` admin
+//! bin and `sync-models` are gone, 2026-11-03): an agent's `state.model` is
+//! the truth, and it changes when the agent chooses with its own
+//! `set_model` tool.
 
+use crate::consent::offer::Stored;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -166,8 +168,8 @@ fn describe(action: ChangeAction) -> &'static str {
     }
 }
 
-/// The `--consent-queue` report: pending changes grouped into one
-/// `set_model` command per (from, to).
+/// The `--consent-queue` report: pending changes grouped by (from, to),
+/// with the agents in each group.
 pub fn report(pending: &[Pending]) -> String {
     if pending.is_empty() {
         return "No model changes awaiting application.\n".to_string();
@@ -187,15 +189,11 @@ pub fn report(pending: &[Pending]) -> String {
         }
         let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
         out.push_str(&format!("# {from} -> {to}: {}\n", kinds.join(", ")));
-        out.push_str(&format!(
-            "cargo run --bin set_model -- --from {from} --to {to}"
-        ));
         for p in &members {
-            out.push_str(&format!(" \\\n    --agent {}", p.agent));
+            out.push_str(&format!("    {}\n", p.agent));
         }
-        out.push_str("\n\n");
+        out.push('\n');
     }
-    out.push_str("# then, in agents/: cargo run --release --bin sync-models\n");
     out
 }
 
@@ -226,7 +224,7 @@ mod tests {
             },
             Utc::now(),
             Ok(OfferAnswer {
-                reason: "r".into(),
+                note: "r".into(),
                 choice,
             }),
         );
@@ -234,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn report_groups_into_set_model_commands() {
+    fn report_groups_by_change() {
         let mut all = pending(id(1), &ledger_choosing("beta", OfferChoice::Trial));
         all.extend(pending(
             id(2),
@@ -247,12 +245,14 @@ mod tests {
         assert_eq!(all.len(), 2, "no_swap queues nothing");
         let text = report(&all);
         assert!(
-            text.contains(
-                "cargo run --bin set_model -- --from old.gguf --to new.gguf \\\n    --agent beta \\\n    --agent alpha"
-            ),
+            text.contains("old.gguf -> new.gguf") && text.contains("\n    beta\n    alpha\n"),
             "{text}"
         );
         assert!(text.contains("1 permanent swaps, 1 trial swaps"), "{text}");
+        assert!(
+            !text.contains("cargo run"),
+            "no commands for tools that are gone: {text}"
+        );
     }
 
     #[tokio::test]

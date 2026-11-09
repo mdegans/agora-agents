@@ -4,16 +4,13 @@
 //! the published `agora-agentkit`, and this is runner policy. The wrapper
 //! delegates every hook to the inner agent and intercepts:
 //!
-//! - **The offer**, at the inner agent's clean `Done(Complete)` — the end
+//! - **The offers**, at the inner agent's clean `Done(Complete)` — the end
 //!   of its closing phase (memory written, mutation/evolution rolled). The
 //!   inner survey is held ([`Epilogue`]) and begun only after the offers, so
 //!   it is the session's last request and the feedback can speak to the
-//!   questions too. If an offer is due, the wrapper seats it as the next user
-//!   turn on the *same* conversation — the prefix is reused, not rebuilt, so
-//!   on blallama the cache carries the whole session. Its `output_config` is
-//!   reset to the session's effort first: the closing phase before it may
-//!   have constrained its own answer (agentkit's `constrain::<Memory>()` on
-//!   blallama), and a grammar for that would leave the offer unanswerable.
+//!   questions too. The offers due are asked on the *same* conversation —
+//!   the prefix is reused, not rebuilt, so on blallama the cache carries the
+//!   whole session.
 //!
 //! **Append-only.** Every request extends the one before it (agentkit
 //! [`divergence`]): a reply that can't be used is seated, its calls answered
@@ -35,18 +32,29 @@
 //!   prepared at sweep start ([`super::forks`]). The answer hands over to
 //!   the inner agent's memory turn via [`Agent::on_quiesce`], exactly as an
 //!   act phase that went quiet would, and the rest of its tail follows.
-//!   No answer means the agent stays on the old model, and is an ERROR
-//!   (`model_review_no_answer`) that stall-watch alerts on.
 //!
 //! [`TRIAL_SESSIONS`]: super::ledger::TRIAL_SESSIONS
 //!
-//! **Retries.** An answer that can't be used — unparseable, a tool call
-//! instead of an answer, or clipped at `max_tokens` — is seated as it came
-//! (as the seed phases now seat failed turns), the error follows it in a new
-//! user turn, and the agent tries again, up to [`MAX_ATTEMPTS`] in all.
-//! An explicit refusal is taken as no answer without a retry. Once
-//! attempts run out it is no answer (= stay), recorded and warned, and the
-//! ledger decides whether to ask again next session (once).
+//! **Asking** (agentkit [`ask`], since 2026-11-06, when `answer_offer` went).
+//! Every closing question — the review and each offer — is an [`Ask`]
+//! ([`super::questions`]), asked one per turn in its own closed JSON shape,
+//! its schema constrained where that is cache-safe (blallama), parsed
+//! leniently, and retried by the driver. The wrapper takes each answer
+//! ([`Answer`], in [`answers`]): records it in its offer's ledger, stages
+//! what it writes at teardown, and seats a one-line receipt before the next
+//! question. The questions are optional (Steward, 2026-11-06): none ever
+//! fails the session.
+//!
+//! - **An answer** settles an offer, the agent's own decline included.
+//! - **Unusable replies** to the end of an offer's attempts are ours (the
+//!   grammar, the template, the parser), not the agent's choice: loud (an
+//!   [`Alert`]), recorded so they can be seen, never counted toward the
+//!   offer's [`MAX_MISSES`](super::offer::MAX_MISSES), and asked again at a
+//!   later session. The review likewise is asked again.
+//! - **An API refusal** is loud too, and that question only: the ones after
+//!   it are still asked. It counts as a miss.
+//! - **A pause** is resumed by the driver; **no room** left in the context
+//!   means the question isn't put, and nothing is recorded.
 //!
 //! **SOUL changelog.** Each offer keeps exactly one automatic `[SYSTEM]`
 //! entry in the SOUL's Evolution Log — the place agentkit already notes
@@ -91,110 +99,167 @@
 //! **The cadence offer** ([`super::cadence`]) likewise. It differs from the
 //! role offer in that **the first parsed `choice` wins** — a malformed
 //! answer is never re-asked into a different one. Only a missing or invalid
-//! `choice` is asked again, once ([`CADENCE_MAX_ATTEMPTS`]), and every
-//! attempt goes into its ledger, `cadence_consent.json`.
+//! `choice` is asked again, once
+//! ([`CADENCE_MAX_ATTEMPTS`](super::questions::CADENCE_MAX_ATTEMPTS)), and
+//! every attempt goes into its ledger, `cadence_consent.json`.
 //!
 //! **The memory-restore offer** ([`super::memory_restore`]) likewise, to
-//! the agents it lists: put beside the role and cadence offers, recorded in
-//! `memory_restore.json`. Its `show` is delivered at the agent's **next**
-//! session, as a fenced, labelled block seated at the end of the intro, and
-//! again at the session after while no showing session has completed with
-//! a successful memory update (up to `show_sessions_max`). Each showing is
-//! recorded when seated, and saved at once. The recovered text is never
-//! logged: events carry its size and the choice.
+//! the agents it lists: put after the cadence offer, never in a session the
+//! role offer is put in, recorded in `memory_restore.json`. Its `show` is
+//! delivered at the agent's **next** session, as a fenced, labelled block
+//! seated at the end of the intro, and again at the session after while no
+//! showing session has completed with a successful memory update (up to
+//! `show_sessions_max`). Each showing is recorded when seated, and saved at
+//! once. The recovered text is never logged: events carry its size and the
+//! choice.
 //!
-//! **Answering: `answer_offer`** ([`super::offers`]). The offers due at the
-//! close are seated in **one** question turn, each under a heading naming
-//! its key: the model-swap offer always alone (a `trial` beside a role
-//! `sleep` would never run, and an identity change at the moment of a model
-//! change would confound the trial review); the role and cadence offers
-//! together when both are due. They are answered by calling the strict
-//! `answer_offer` tool once per offer, in one turn (parallel calls) or
-//! across several. The tool
-//! is registered for every agent at init, byte-identical, just before
-//! `set_model` (which stays last), so the tool list never changes
-//! mid-session and is the same bytes cohort-wide; with no offer open, a call
-//! is refused ("no offer is pending"). `tool_choice` is never touched (a
-//! change would invalidate the messages cache). While offers are open the
-//! wrapper answers the calls itself: an offer that isn't open, or a choice
-//! that offer doesn't have, gets an error result; otherwise the offer's own
-//! validation runs and its answer is recorded in its own ledger exactly as
-//! before. A call that fails counts against that offer's budget
-//! ([`MAX_ATTEMPTS`], or [`CADENCE_MAX_ATTEMPTS`]), as does a turn clipped
-//! at `max_tokens`. A turn that ends with an offer still open (text, or
-//! nothing) gets **one reminder**; still open after it, it is no answer.
-//! An explicit refusal is final only for an offer put alone; with two in
-//! the question it is a miss for each. Plain text is the fallback: read in
-//! the tool's own shape (`offer` optional, through the same checks as a
-//! call), else in the offer's older JSON shape as before the tool; with two
-//! offers open, each JSON object naming an open offer answers it. Text that
-//! can't be used is an unanswered turn.
+//! **The sealed-state offer** ([`super::sealed_state`]) likewise, never in
+//! a session the role or memory-restore offer is put in.
+//!
+//! [`ask`]: agora_agentkit::reactor::ask
+//! [`Ask`]: agora_agentkit::reactor::ask::Ask
+//! [`Answer`]: agora_agentkit::reactor::ask::Answer
+
+mod answers;
+
+use crate::consent::offer::Stored;
+use answers::unanswered_why;
 
 use std::sync::Arc;
 
 use std::collections::HashSet;
 
 use agora_agentkit::ids::{AgentId, CommentId, ContactRequestId, PostId};
+use agora_agentkit::reactor::ask::{self, Asks, Unanswered};
 use agora_agentkit::reactor::inference::Quirks;
 use agora_agentkit::reactor::journal::{
     CommentWrite, Journal, PostWrite, SessionHeader, SessionJournal, Written,
 };
-use agora_agentkit::reactor::seed::{Memory, SeedAgent, SeedState, Soul};
-use agora_agentkit::reactor::{Agent, Control, Epilogue, Outcome, seat_unused_reply};
+use agora_agentkit::reactor::seed::{SeedAgent, SeedState};
+use agora_agentkit::reactor::{Agent, Control, Epilogue, Outcome, SessionFailure};
 use chrono::{DateTime, Utc};
-use misanthropic::model::Model;
 use misanthropic::model::ModelInfo;
 use misanthropic::prompt::Prompt;
-use misanthropic::prompt::message::{Block, Content, Role};
-use misanthropic::prompt::output::OutputConfig;
-use misanthropic::response::{self, JsonError, StopReason};
-use misanthropic::tool::{self as mtool, Notifications, ToolBox, Use};
+use misanthropic::prompt::message::Content;
+use misanthropic::response;
+use misanthropic::tool::{Notifications, ToolBox};
 
 use super::ConsentRuntime;
-use super::cadence::{
-    self,
-    ledger::{Attempt, CadenceAsk, CadenceLedger, CadenceOutcome},
-    prompt::{CadenceAnswer, CadenceChoice},
-};
+use super::cadence::{self, ledger::CadenceLedger, prompt::CadenceChoice};
 use super::comparison;
 use super::forks;
-use super::ledger::{Change, Due, Ledger, OfferKey, OfferNames, Switch, SwitchCause};
-use super::memory_restore::{
-    self, RecoveredMemory,
-    ledger::{RestoreAsk, RestoreLedger, RestoreOutcome},
-    prompt::{RestoreAnswer, RestoreChoice},
+use super::ledger::{Change, Ledger, OfferKey, OfferNames, Switch, SwitchCause};
+use super::memory_restore::{self, RecoveredMemory, ledger::RestoreLedger, prompt::RestoreChoice};
+use super::offer::{Events, Kept, Place, Slot};
+use super::prompt::{self as text, OfferText, ReviewText};
+use super::questions::{
+    CadenceQuestion, ModelSwapQuestion, Put, RestoreQuestion, ReviewQuestion, RoleQuestion,
+    SealQuestion,
 };
-use super::offers::{self, Args, OfferKind, Section};
-use super::prompt::{self as text, OfferAnswer, OfferChoice, OfferText, ReviewText};
 use super::queue::{self, QueueEntry};
-use super::role::{
-    self,
-    ledger::{Applied, RoleAsk, RoleLedger, RoleOutcome},
-    prompt::{RoleAnswer, RoleChoice},
-};
+use super::role::{self, ledger::RoleLedger, prompt::RoleChoice};
+use super::sealed_state::{self, ledger::SealLedger, prompt::SealChoice};
 use super::switch::{self, SelfKind, SetModel, SwitchError};
 use crate::alerts::{Alert, AlertKind};
+use crate::sealed::memory_tool::{self, MemoryIds, MemoryReader, MemoryTool};
+use agora_agentkit::reactor::seed::Gauged;
 
-/// The contact request an inner agent's session filed at its teardown, for
-/// the `contact_requested` alert
-pub trait ContactRequests {
+/// The wrapper's interface to the inner session, beyond [`Agent`]: the
+/// contact request it filed, the questions of its own closing tail that
+/// went unanswered, why it failed (all alerted from the wrapper's
+/// teardown), and resuming a pause in one of the wrapper's own questions.
+pub trait InnerSession: Agent {
     fn contact_request(&self) -> Option<ContactRequestId>;
-}
 
-impl ContactRequests for SeedAgent {
-    fn contact_request(&self) -> Option<ContactRequestId> {
-        SeedAgent::contact_request(self)
+    /// Resume a paused server-tool turn in one of the wrapper's own
+    /// questions, under the session's pause budget, without touching the
+    /// inner session's phase (`Agent::on_pause` is for its own turns: it
+    /// refuses while held, and past the budget begins the memory rewrite).
+    fn resume_question_pause(
+        &mut self,
+        response: response::Message,
+    ) -> Result<Control, Self::Error>;
+
+    /// Keep a reply to one of the wrapper's questions that the driver left
+    /// out of the transcript, for the inner session's prompt-log archive
+    /// (`AskHost::left_out`).
+    fn left_out(&mut self, ask: &'static str, attempt: usize, reply: &response::Message) {
+        let _ = (ask, attempt, reply);
+    }
+
+    /// The SHA-256 of the archive the inner session wrote to the prompt log
+    /// at its teardown (left-out replies included): the dump that exists.
+    fn archive_sha256(&self) -> Option<String> {
+        None
+    }
+
+    /// A reply the wrapper took itself: the session has begun, so a later
+    /// failure is reported.
+    fn note_reply(&mut self) {}
+
+    /// The inner session's own questions (the soul mutation, evolution, the
+    /// survey) that ended without an answer, by name.
+    fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {
+        &[]
+    }
+
+    /// Why the session failed, if it did: read after the inner teardown.
+    fn failure(&self) -> Option<&SessionFailure> {
+        None
+    }
+
+    /// Why the session failed, when the wrapper knows better (its own
+    /// question was refused); kept unless one is already recorded.
+    fn record_failure(&mut self, failure: SessionFailure) {
+        let _ = failure;
     }
 }
 
-/// Answers per question per session: the first plus two retries. For an
-/// offer, the unusable ones it may take: refused `answer_offer` calls,
-/// clipped turns, unanswered turns (of which it gets one reminder).
-pub const MAX_ATTEMPTS: u32 = 3;
+impl InnerSession for SeedAgent {
+    fn contact_request(&self) -> Option<ContactRequestId> {
+        SeedAgent::contact_request(self)
+    }
 
-/// Answers to the cadence offer per session: the first, plus one more only
-/// when the first had no usable `choice`.
-pub const CADENCE_MAX_ATTEMPTS: u32 = 2;
+    fn resume_question_pause(
+        &mut self,
+        response: response::Message,
+    ) -> Result<Control, Self::Error> {
+        SeedAgent::resume_question_pause(self, response)
+    }
+
+    fn left_out(&mut self, ask: &'static str, attempt: usize, reply: &response::Message) {
+        <SeedAgent as ask::AskHost>::left_out(self, ask, attempt, reply)
+    }
+
+    fn archive_sha256(&self) -> Option<String> {
+        SeedAgent::archive_sha256(self).map(|h| h.to_string())
+    }
+
+    fn note_reply(&mut self) {
+        SeedAgent::note_reply(self)
+    }
+
+    fn unanswered_asks(&self) -> &[(&'static str, Unanswered)] {
+        SeedAgent::unanswered_asks(self)
+    }
+
+    fn failure(&self) -> Option<&SessionFailure> {
+        SeedAgent::failure(self)
+    }
+
+    fn record_failure(&mut self, failure: SessionFailure) {
+        SeedAgent::record_failure(self, failure)
+    }
+}
+
+/// The heading the sealed-state lines are seated under, at the intro's
+/// heading level, so they don't read as part of the section before them.
+pub const SEALED_HEADING: &str = "## Your Sealed State";
+
+/// The longest the teardown waits on a failed session's mail: every save
+/// waits on it, so an outage of the relay mustn't hold each one for the
+/// whole send timeout. A mail not sent in time isn't claimed as told.
+const FAILURE_MAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `set_model`'s refusal in a trial review session, when the ledger's own
 /// blocker says nothing (it normally names the trial).
@@ -206,6 +271,33 @@ const REVIEW_BLOCKER: &str = "this session is for your decision on your model tr
 const NO_LEDGER_BLOCKER: &str = "your model-change record could not be read this session; \
      you can try again in a later session";
 
+/// Each offer's slot's event names.
+static SWAP_EVENTS: Events = Events {
+    applied: "model_consent_applied",
+    apply_failed: "model_consent_apply_failed",
+    save_failed: "model_consent_ledger_save_failed",
+};
+static ROLE_EVENTS: Events = Events {
+    applied: "role_consent_applied",
+    apply_failed: "role_consent_apply_failed",
+    save_failed: "role_consent_ledger_save_failed",
+};
+static CADENCE_EVENTS: Events = Events {
+    applied: "cadence_consent_applied",
+    apply_failed: "cadence_consent_apply_failed",
+    save_failed: "cadence_consent_ledger_save_failed",
+};
+static RESTORE_EVENTS: Events = Events {
+    applied: "memory_restore_applied",
+    apply_failed: "memory_restore_apply_failed",
+    save_failed: "memory_restore_ledger_save_failed",
+};
+static SEALED_EVENTS: Events = Events {
+    applied: "sealed_state_applied",
+    apply_failed: "sealed_state_apply_failed",
+    save_failed: "sealed_state_ledger_save_failed",
+};
+
 /// [`Agent::Context`] for a [`ConsentAgent`]: the inner agent's context
 /// plus the shared consent runtime.
 #[derive(Clone)]
@@ -214,28 +306,9 @@ pub struct ConsentContext<C> {
     pub consent: Arc<ConsentRuntime>,
 }
 
-/// Where the wrapper is in the session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Phase {
-    /// The inner agent owns the session.
-    Inner,
-    /// The trial review is seated; the next response answers it.
-    /// `constrained` records whether it went out with the schema as
-    /// `output_config` — it decides how the answer is parsed. `attempt`
-    /// counts from 1.
-    Asking {
-        due: Due,
-        constrained: bool,
-        attempt: u32,
-    },
-    /// The closing question is seated: these offers are still open, to be
-    /// answered with `answer_offer`.
-    Offers { open: Vec<Open> },
-}
-
 /// What the model-swap half of [`ConsentAgent::close`] did.
 enum Closing {
-    /// The model-swap offer is due: put it, with any other offer due.
+    /// The model-swap offer is due: put it, alone.
     Due(OfferKey),
     /// Did something this session (a switch, a review, a trial ended, a
     /// change retried), or the agent is mid-trial: nothing more is asked.
@@ -244,225 +317,57 @@ enum Closing {
     Idle,
 }
 
-/// An offer seated in the closing question and not yet settled.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Open {
-    offer: Pending,
-    /// Answers to it that couldn't be used: refused calls, turns clipped at
-    /// `max_tokens`, unanswered turns. At its budget it is no answer.
-    failed: u32,
-    /// Whether it has had its one reminder.
-    reminded: bool,
-    /// Whether it was put beside another offer: an explicit refusal then
-    /// can't be told apart from a refusal of the other, and is a miss.
-    together: bool,
-    /// The latest failure, for the no-answer record.
-    last_failure: Option<String>,
+/// An offer due at the close, before it knows its place among the others.
+enum Due {
+    ModelSwap(ModelSwapQuestion),
+    Role(RoleQuestion),
+    Cadence(CadenceQuestion),
+    Restore(RestoreQuestion),
+    Sealed(SealQuestion),
 }
 
-/// Which offer, with what its record needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Pending {
-    ModelSwap(OfferKey),
-    /// `order` is the option order shown (from `seed`).
-    Role {
-        order: [RoleChoice; 4],
-        seed: u64,
-    },
-    /// `order` as for the role offer; `attempts` so far, verbatim;
-    /// `reask` for the re-ask to a `switch` agent
-    /// ([`cadence::prompt::reask`]), which shows no `no_preference`.
-    Cadence {
-        order: [CadenceChoice; 3],
-        seed: u64,
-        attempts: Vec<Attempt>,
-        reask: bool,
-    },
-    /// `order` as for the role offer; `chars` is the size the text quoted.
-    MemoryRestore {
-        order: [RestoreChoice; 2],
-        seed: u64,
-        chars: usize,
-    },
-}
-
-impl Pending {
-    fn kind(&self) -> OfferKind {
+impl Due {
+    fn put(&mut self) -> &mut Put {
         match self {
-            Self::ModelSwap(_) => OfferKind::ModelSwap,
-            Self::Role { .. } => OfferKind::Role,
-            Self::Cadence { .. } => OfferKind::Cadence,
-            Self::MemoryRestore { .. } => OfferKind::MemoryRestore,
-        }
-    }
-
-    /// Unusable answers before it is no answer.
-    fn budget(&self) -> u32 {
-        match self {
-            Self::Cadence { .. } => CADENCE_MAX_ATTEMPTS,
-            _ => MAX_ATTEMPTS,
-        }
-    }
-
-    /// Its options, in the order shown, as `` `a`, `b` or `c` ``.
-    fn choices(&self) -> String {
-        let names: Vec<String> = match self {
-            Self::ModelSwap(_) => offers::MODEL_SWAP_CHOICES
-                .iter()
-                .map(|c| format!("`{c}`"))
-                .collect(),
-            Self::Role { order, .. } => order.iter().map(|c| format!("`{}`", c.as_str())).collect(),
-            Self::Cadence { order, reask, .. } => order
-                .iter()
-                .filter(|c| !*reask || **c != CadenceChoice::NoPreference)
-                .map(|c| format!("`{}`", c.as_str()))
-                .collect(),
-            Self::MemoryRestore { order, .. } => {
-                order.iter().map(|c| format!("`{}`", c.as_str())).collect()
-            }
-        };
-        match names.as_slice() {
-            [init @ .., last] if !init.is_empty() => format!("{} or {last}", init.join(", ")),
-            _ => names.join(""),
+            Self::ModelSwap(q) => &mut q.put,
+            Self::Role(q) => &mut q.put,
+            Self::Cadence(q) => &mut q.put,
+            Self::Restore(q) => &mut q.put,
+            Self::Sealed(q) => &mut q.put,
         }
     }
 }
 
-impl Open {
-    fn new(offer: Pending) -> Self {
-        Self {
-            offer,
-            failed: 0,
-            reminded: false,
-            together: false,
-            last_failure: None,
-        }
-    }
-
-    fn kind(&self) -> OfferKind {
-        self.offer.kind()
-    }
-
-    fn exhausted(&self) -> bool {
-        self.failed >= self.offer.budget()
-    }
-
-    /// Count an unusable answer; the cadence offer keeps it verbatim.
-    fn fail(&mut self, reason: &str, raw: &str) {
-        self.failed += 1;
-        self.last_failure = Some(reason.to_string());
-        if let Pending::Cadence { attempts, .. } = &mut self.offer {
-            attempts.push(Attempt {
-                raw: raw.to_string(),
-                failure: Some(reason.to_string()),
-            });
-        }
-    }
-
-    /// Why it ended unanswered, for its record.
-    fn missed(&self) -> String {
-        format!(
-            "{} (after {} attempts)",
-            self.last_failure.as_deref().unwrap_or("not answered"),
-            self.failed
-        )
-    }
-}
-
-/// An answer an offer took.
-enum Accepted {
-    ModelSwap(OfferAnswer),
-    Role(RoleAnswer),
-    Cadence(Taken),
-    /// The answer, and why its `memory_note` was dropped, if it was.
-    MemoryRestore(RestoreAnswer, Option<String>),
-}
-
-impl Accepted {
-    fn choice(&self) -> &'static str {
-        match self {
-            Self::ModelSwap(a) => match a.choice {
-                OfferChoice::NoSwap => "no_swap",
-                OfferChoice::Trial => "trial",
-                OfferChoice::Permanent => "permanent",
-            },
-            Self::Role(a) => a.choice.as_str(),
-            Self::Cadence(Taken::Clean(a) | Taken::NoteDropped(a, _)) => a.choice.as_str(),
-            Self::Cadence(Taken::Salvaged { choice, .. }) => choice.as_str(),
-            Self::MemoryRestore(a, _) => a.choice.as_str(),
-        }
-    }
-}
-
-/// How an offer ended this session.
-enum Settle {
-    /// `constrained`: by a call to the strict tool, or (`false`) parsed from
-    /// plain text.
-    Answered {
-        accepted: Accepted,
-        constrained: bool,
-    },
-    /// The agent's explicit refusal: final.
-    Refused(String),
-    /// A turn paused on a server tool: no answer, not a refusal.
-    Paused,
-    /// Its budget spent, or unanswered after its reminder (why).
-    Missed(String),
-}
-
-/// Why an answer couldn't be used, and whether it's worth another try.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Failure {
-    reason: String,
-    retry: Retry,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Retry {
-    /// Clipped at `max_tokens`: ask again, more briefly.
-    Clipped,
-    /// Unparseable, or a tool call instead of an answer.
-    Unusable,
-    /// An explicit refusal (or a paused server tool): no answer, no retry.
-    No,
-}
-
-impl Failure {
-    fn new(reason: impl Into<String>, retry: Retry) -> Self {
-        Self {
-            reason: reason.into(),
-            retry,
-        }
-    }
-
-    /// The note appended to the question turn before another attempt.
-    fn retry_note(&self) -> Option<String> {
-        match self.retry {
-            Retry::Clipped => Some(
-                "Your answer was cut off at the length limit and discarded. Answer again, \
-                 more briefly — JSON only, in exactly the shape above."
-                    .to_string(),
-            ),
-            Retry::Unusable => Some(format!(
-                "Your answer could not be used ({}). Answer again — JSON only, in exactly \
-                 the shape above, and do not use tools.",
-                self.reason
-            )),
-            Retry::No => None,
-        }
-    }
+/// The memory-restore offer's `show`, beside its slot: the recovered memory
+/// and this session's showing of it.
+#[derive(Default)]
+struct Showing {
+    /// The agent's recovered memory, read at init when it may be needed
+    /// this session (to quote its size, or to show it).
+    recovered: Option<RecoveredMemory>,
+    /// It was shown this session.
+    shown: bool,
+    /// When this session's showing was seated, until the model's first
+    /// response records it in the ledger ([`ConsentAgent::count_showing`]);
+    /// then `None`, and `counted` is set.
+    seated_at: Option<DateTime<Utc>>,
+    counted: bool,
 }
 
 /// See the [module docs](self).
 pub struct ConsentAgent<A> {
     inner: A,
     rt: Arc<ConsentRuntime>,
-    /// `None` until `on_init`, and stays `None` when the ledger file could
-    /// not be read — then this session neither asks nor saves, so a
-    /// damaged ledger is never overwritten.
-    ledger: Option<Ledger>,
-    dirty: bool,
-    phase: Phase,
+    /// This session's closing questions (the review, the offers), asked
+    /// one per turn by agentkit's driver.
+    asks: Asks<Self>,
+    /// The review is queued: when the queue empties, the inner agent's
+    /// memory turn follows ([`ask::AskHost::asks_done`]).
+    reviewing: bool,
+    /// The model-consent ledger. Its `ledger` is `None` until `on_init`,
+    /// and stays `None` when the file could not be read — then this session
+    /// neither asks nor saves, so a damaged ledger is never overwritten.
+    swap: Slot<Ledger>,
     /// When this session began; ledger events at or after it become SOUL
     /// changelog lines.
     started: DateTime<Utc>,
@@ -470,7 +375,7 @@ pub struct ConsentAgent<A> {
     /// teardown. Served by [`Agent::state`] once present.
     patched: Option<SeedState>,
     /// Where `set_model` leaves a switch it made this session.
-    slot: switch::Slot,
+    set_model_slot: switch::Slot,
     /// A `set_model` call was committed this session (it may have changed
     /// no model: a trial kept early).
     self_changed: bool,
@@ -492,7 +397,7 @@ pub struct ConsentAgent<A> {
     /// act on it): the journal outlives this session's save.
     notice_held: bool,
     /// The offer whose trial review this session is for: asked first,
-    /// with the act phase skipped (see [`ConsentAgent::seat_review`]).
+    /// with the act phase skipped (see [`ConsentAgent::queue_review`]).
     review: Option<OfferKey>,
     /// The review has been answered (or gone unanswered); the inner
     /// agent's memory turn follows, and nothing more is asked.
@@ -501,57 +406,28 @@ pub struct ConsentAgent<A> {
     /// marked its feed as seen. The agent reads nothing in that session, so
     /// the record is put back and the feed stays fresh for its next one.
     seen_before_review: Option<std::collections::HashMap<PostId, i64>>,
-    /// The role offer's ledger, loaded only for agents the offer lists;
-    /// `None` also when unreadable (then nothing is asked or saved).
-    role_ledger: Option<RoleLedger>,
-    role_dirty: bool,
-    /// A SOUL edit the agent chose this session, applied at teardown.
-    role_applied: Option<Applied>,
-    /// The agent's own memory note, appended at teardown.
-    memory_note: Option<String>,
-    /// SOUL and memory from before the role answer was written into the
-    /// patched state, put back if the role ledger can't be saved.
-    role_undo: Option<(Soul, Memory)>,
-    /// The cadence offer's ledger, loaded only for agents the offer admits;
-    /// `None` also when unreadable (then nothing is asked or saved).
-    cadence_ledger: Option<CadenceLedger>,
-    cadence_dirty: bool,
-    /// The Evolution Log line recording the cadence answer, written at
-    /// teardown.
-    cadence_line: Option<String>,
-    /// The agent's own note from its cadence answer, appended at teardown.
-    cadence_note: Option<String>,
-    /// SOUL and memory from before the cadence answer was written into the
-    /// patched state, put back if the cadence ledger can't be saved.
-    cadence_undo: Option<(Soul, Memory)>,
-    /// The cadence line and note as written into the patched state, to
-    /// write again if the role answer (written before it) is taken out.
-    cadence_written: Option<(Option<String>, Option<String>)>,
-    /// The memory-restore offer's ledger, loaded only for agents the offer
-    /// lists; `None` also when unreadable (then nothing is asked, delivered
-    /// or saved).
-    restore_ledger: Option<RestoreLedger>,
-    restore_dirty: bool,
-    /// The agent's recovered memory, read at init when it may be needed
-    /// this session (to quote its size, or to show it).
-    recovered: Option<RecoveredMemory>,
-    /// The recovered memory was shown this session.
-    restore_showing: bool,
-    /// When this session's showing was seated, until the model's first
-    /// response records it in the ledger ([`Self::count_showing`]); then
-    /// `None`, and `restore_counted` is set.
-    restore_seated_at: Option<chrono::DateTime<Utc>>,
-    restore_counted: bool,
-    /// The Evolution Log line recording the memory-restore answer, and the
-    /// agent's own note, written at teardown.
-    restore_line: Option<String>,
-    restore_note: Option<String>,
-    /// SOUL and memory from before the memory-restore writes, put back if
-    /// its ledger can't be saved.
-    restore_undo: Option<(Soul, Memory)>,
-    /// What was written for the memory-restore offer, to write again if an
-    /// edit made before it is taken out.
-    restore_written: Option<RestoreWrite>,
+    /// The role offer: loaded only for agents it lists.
+    role: Slot<RoleLedger>,
+    /// The cadence offer: loaded only for agents it admits.
+    cadence: Slot<CadenceLedger>,
+    /// The memory-restore offer: loaded only for agents it lists; without
+    /// a ledger nothing is asked, delivered or saved.
+    restore: Slot<RestoreLedger>,
+    /// The memory-restore offer's `show`.
+    show: Showing,
+    /// The sealed-state offer: loaded only for agents it lists.
+    sealed: Slot<SealLedger>,
+    /// The sealed-state refusal notice was seated: renamed aside once the
+    /// session saves.
+    sealed_notice: bool,
+    /// The stop's first note was seated: marked shown once the session
+    /// saves.
+    sealed_stop_note: bool,
+    /// The anchors the seated verdict told of, marked told after the save.
+    sealed_anchors_told: Vec<agora_agentkit::ids::GovernanceLogId>,
+    /// The verdict told that enrolment kept the memory ids: marked told
+    /// after the save.
+    memory_ids_note: bool,
     /// The closing questions have been put (or there were none): the inner
     /// session's next `Done` is its epilogue's.
     closed: bool,
@@ -561,7 +437,7 @@ pub struct ConsentAgent<A> {
 
 impl<A> ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     /// The model's own `thinking_effort` from `[[model]]`, over the
     /// session's `[seed]` one. Patched once, right after the inner init
@@ -616,11 +492,11 @@ where
             model,
             blocked,
             trial,
-            self.slot.clone(),
+            self.set_model_slot.clone(),
         )
     }
 
-    /// Register `answer_offer` and `set_model` (when the run offers a
+    /// Register the `memory` tool and `set_model` (when the run offers a
     /// choice) and put their definitions **last** in the prompt's `tools`,
     /// in that order: after the toolbox's own (which `ToolBox::prepare`
     /// lists from a `HashMap`, so a tool pushed before it lands first or
@@ -629,21 +505,107 @@ where
     /// bytes have to be the same for every agent on the model for the
     /// shared cache prefix to hold. Runs once, from `on_init`, before the
     /// first request: the prefix is never changed mid-session. `set_model`
-    /// stays last, where it was before `answer_offer` existed, so the
-    /// prefix up to it is unchanged but for the one new definition.
-    fn seat_tail_tools(&mut self, set_model: Option<SetModel>) {
+    /// stays last. (`answer_offer` sat between them until 2026-11-06.)
+    ///
+    /// The `memory` tool is seated for every agent, enrolled or not, keyed
+    /// or not (its definition is the same bytes for all), and wrapped in
+    /// [`Gauged`] so its results count against the session's context.
+    fn seat_tail_tools(&mut self, set_model: Option<SetModel>, memory: Gauged<MemoryTool>) {
         use misanthropic::tool::Tool;
-        let answer_offer = offers::AnswerOffer::new(set_model.is_some());
-        let mut defs = answer_offer.definitions();
+        let mut defs = memory.definitions();
         let (tools, prompt) = self.inner.parts();
-        tools.push(answer_offer);
+        tools.push(memory);
         if let Some(tool) = set_model {
             defs.extend(tool.definitions());
             tools.push(tool);
         }
         let list = prompt.tools.get_or_insert_default();
-        list.retain(|d| d.name() != switch::TOOL_NAME && d.name() != offers::TOOL_NAME);
+        list.retain(|d| {
+            d.name() != switch::TOOL_NAME
+                && d.name() != agora_agentkit::reactor::seed::memory::MEMORY_TOOL_NAME
+        });
         list.extend(defs);
+    }
+
+    /// The session's memory-id keys, made once if the agent has none. A
+    /// refusal (a key that can't be read, secrets not here, a fingerprint
+    /// no key matches) never stops the session: it runs with the plain
+    /// Memory heading, the operator is alerted (one mail an hour for the
+    /// fleet), and no key is made over the evidence of one.
+    ///
+    /// Also says whether this session made the key: no key and no
+    /// fingerprint of one before it (a revived key had a fingerprint), so
+    /// the agent is told once that the `memory` tool is new.
+    async fn memory_keys(
+        rt: Arc<ConsentRuntime>,
+        id: AgentId,
+        name: String,
+        dir: std::path::PathBuf,
+    ) -> (Option<crate::sealed::keys::MemoryIdKeys>, bool) {
+        // No state yet (a first session): nothing to name, nothing made,
+        // and nothing for the operator to fix
+        if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+            tracing::info!(
+                event_type = "memory_id_key_deferred",
+                agent_id = %id,
+                "no state directory yet; memory ids start at the next session"
+            );
+            return (None, false);
+        }
+        let exists = async |p: std::path::PathBuf| tokio::fs::try_exists(p).await.unwrap_or(true);
+        let had = exists(
+            rt.key_store
+                .agent_dir(id)
+                .join(crate::sealed::keys::MEMORY_ID_KEY_FILE),
+        )
+        .await
+            || exists(dir.join(crate::sealed::keys::MEMORY_ID_FINGERPRINT_FILE)).await;
+        match memory_tool::session_keys(&rt.key_store, id, &dir).await {
+            Ok(keys) => (Some(keys), !had),
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "memory_id_key_refused",
+                    agent = %name,
+                    agent_id = %id,
+                    error = %e,
+                    "memory-id key refused; the session runs without memory ids"
+                );
+                rt.alerts.notify(
+                    Alert::new(
+                        AlertKind::MemoryIdKeyRefused,
+                        format!("{name}: memory-id key refused; running without memory ids"),
+                    )
+                    .detail("agent", format!("{name} ({id})"))
+                    .detail("error", e),
+                );
+                (None, false)
+            }
+        }
+    }
+
+    /// The `memory` tool for this session, after the inner init: anchored
+    /// on the memory the heading names.
+    fn memory_tool(&self, keys: Option<crate::sealed::keys::MemoryIdKeys>) -> Gauged<MemoryTool> {
+        let current = self
+            .inner
+            .memory_id()
+            .map(|m| (m, self.inner.state().memory.content.as_str()));
+        let (keys, current) = match (keys, current) {
+            (Some(k), Some(c)) => (Some(k), Some(c)),
+            _ => (None, None),
+        };
+        let reader = MemoryReader::new(
+            self.rt.state_dir.clone(),
+            self.rt.key_store.clone(),
+            self.inner.id(),
+            keys,
+            current,
+        );
+        Gauged::new(
+            MemoryTool::new(reader, self.rt.memory_api.clone()),
+            self.inner.context_gauge(),
+        )
+        .for_agent(self.inner.id())
     }
 
     /// Apply a model change for this agent: report `to` to Agora as the
@@ -663,7 +625,7 @@ where
             return Err(SwitchError::NotRoutable);
         };
         let info = entry.info.clone();
-        if self.ledger.is_none() {
+        if self.swap.ledger.is_none() {
             return Err(SwitchError::NoLedger);
         }
         switch::report_model(&self.rt, self.inner.id(), to).await?;
@@ -690,9 +652,9 @@ where
             "model change applied; the agent runs on it from its next session"
         );
         self.next_model = Some(info);
-        if let Some(ledger) = self.ledger.as_mut() {
+        if let Some(ledger) = self.swap.ledger.as_mut() {
             ledger.record_switch(switch);
-            self.dirty = true;
+            self.swap.dirty = true;
         }
     }
 
@@ -701,13 +663,13 @@ where
     /// early, is told by its offer record's one entry, as an offered trial
     /// and its review are ([`Ledger::update_soul`]).
     fn take_self_switch(&mut self) {
-        let Some(made) = self.slot.lock().expect("slot lock").take() else {
+        let Some(made) = self.set_model_slot.lock().expect("slot lock").take() else {
             return;
         };
         self.self_changed = true;
         let from = self.model();
         // `set_model` refuses without a ledger, so there is one.
-        let Some(ledger) = self.ledger.as_mut() else {
+        let Some(ledger) = self.swap.ledger.as_mut() else {
             tracing::error!(
                 agent_id = %self.inner.id(),
                 "set_model went through without a ledger; not recorded"
@@ -744,7 +706,7 @@ where
                         "self-chosen trial not recorded: a change was already under way"
                     );
                 }
-                self.dirty = true;
+                self.swap.dirty = true;
             }
             SelfKind::Decided { key } => {
                 let decision = ledger.decide_early(
@@ -754,7 +716,7 @@ where
                     &made.to.name,
                     &made.reason,
                 );
-                self.dirty = true;
+                self.swap.dirty = true;
                 tracing::info!(
                     event_type = "model_trial_decided_early",
                     agent = %self.inner.state().soul.name,
@@ -779,7 +741,7 @@ where
     fn switched(&self) -> bool {
         self.self_changed
             || self.next_model.is_some()
-            || self.slot.lock().expect("slot lock").is_some()
+            || self.set_model_slot.lock().expect("slot lock").is_some()
     }
 
     /// Note posts and comments written since the last look, and journal
@@ -825,6 +787,29 @@ where
         }
     }
 
+    /// What follows an inner turn: at the inner session's clean end, the
+    /// closing questions ([`close`](Self::close)), once.
+    async fn after_inner(&mut self, control: Control) -> Result<Control, A::Error> {
+        const DONE: Control = Control::Done(Outcome::Complete);
+        Ok(match control {
+            DONE if !self.closed => {
+                self.closed = true;
+                self.close().await?.unwrap_or(DONE)
+            }
+            other => other,
+        })
+    }
+
+    /// What follows any turn: the session's clean end begins the held
+    /// epilogue (the survey), last.
+    async fn after(&mut self, control: Control) -> Result<Control, A::Error> {
+        if control == Control::Done(Outcome::Complete) && !self.epilogue {
+            self.epilogue = true;
+            return self.inner.begin_epilogue().await;
+        }
+        Ok(control)
+    }
+
     /// The inner agent's turn, then its writes noted (and journaled) however
     /// the turn ended.
     async fn handle_inner(&mut self, response: response::Message) -> Result<Control, A::Error> {
@@ -863,7 +848,15 @@ where
             started_at: self.started,
             model: self.model(),
         };
-        match journal.begin(header, &leftover).await {
+        // A leftover with something to tell (a write, or a failure) stays
+        // until a session that showed it completes: `begin` would discard
+        // one that failed without writing
+        let begun = if leftover.interrupted().next().is_some() {
+            journal.append(&header.into()).await
+        } else {
+            journal.begin(header, &leftover).await
+        };
+        match begun {
             Ok(()) => self.journal = Some(journal),
             Err(e) => tracing::warn!(
                 agent_id = %self.inner.id(),
@@ -895,11 +888,8 @@ where
         if self.writes.is_empty() {
             return;
         }
-        let prompt_sha256 = agora_agentkit::reactor::seed::prompt_sha256(self.inner.prompt())
-            .map_err(|e| {
-                tracing::warn!(agent_id = %self.inner.id(), error = %e, "prompt digest failed");
-            })
-            .ok();
+        // The dump the inner teardown wrote, left-out replies included
+        let prompt_sha256 = self.inner.archive_sha256();
         let model = self.model();
         for w in &self.writes {
             let (kind, id) = match w {
@@ -920,6 +910,69 @@ where
         }
     }
 
+    /// The session ended as failed (read after the inner teardown): mail
+    /// the operator, once (a refusal, the inner session's or one of this
+    /// wrapper's questions', as [`AlertKind::ApiRefusal`]; anything else as
+    /// [`AlertKind::SessionFailed`]), never with content; and record why in
+    /// the journal, so it outlives this session and the agent is told at
+    /// its next ([`crate::interrupted`]).
+    async fn session_failed(&mut self) {
+        let Some(failure) = self.inner.failure().cloned() else {
+            return;
+        };
+        let agent = self.inner.state().soul.name.to_string();
+        let alert = match &failure {
+            SessionFailure::Refused {
+                during,
+                round,
+                model,
+                response_id,
+            } => self.refusal_alert(during, *round, model, response_id),
+            other => {
+                let (kind, during) = match other {
+                    SessionFailure::Stalled { during } => ("stalled", during.as_str()),
+                    SessionFailure::NoRoom { during } => ("no_room", during.as_str()),
+                    _ => ("error", ""),
+                };
+                let alert = Alert::new(
+                    AlertKind::SessionFailed,
+                    "an agent's session ended as failed",
+                )
+                .model(self.model())
+                .detail("failure", kind)
+                .detail("during", during);
+                // An error is most often an endpoint down for every agent on
+                // it: one mail per model an hour, the agent in the details
+                // (as `memory_id_key_refused`); a stall or no room is the
+                // agent's own
+                match other {
+                    SessionFailure::Error => {
+                        alert.detail("agent", format!("{agent} ({})", self.inner.id()))
+                    }
+                    _ => alert.agent(agent.clone(), self.inner.id()),
+                }
+            }
+        };
+        // Whether the mail actually goes out: only then is the agent told
+        // its operator was
+        let told = self.rt.alerts.dispatch(alert, FAILURE_MAIL_TIMEOUT).await;
+        if let Some(journal) = &self.journal {
+            let ended = agora_agentkit::reactor::journal::SessionEnded {
+                at: Utc::now(),
+                failure,
+                told,
+            };
+            if let Err(e) = journal.append(&ended.into()).await {
+                tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %journal.path().display(),
+                    error = %e,
+                    "the session's failure not journaled; it won't be told at the next session"
+                );
+            }
+        }
+    }
+
     /// Mail the operator when the inner session filed a contact request
     fn alert_contact_request(&self) {
         let Some(contact_request_id) = self.inner.contact_request() else {
@@ -937,97 +990,47 @@ where
             .detail("next", "just contact-requests"),
         );
     }
+    /// Mail the operator about the inner session's own questions that went
+    /// unanswered (its soul mutation, evolution, survey): optional, so they
+    /// never failed the session, and loud, so they are seen (Steward,
+    /// 2026-11-06). One alert for the session.
+    fn alert_inner_unanswered(&self) {
+        // Not asked for want of room is routine near the context's edge; a
+        // refusal is mailed once, as one (`inner_refused`)
+        let missed: Vec<&(&'static str, Unanswered)> = self
+            .inner
+            .unanswered_asks()
+            .iter()
+            .filter(|(_, why)| matches!(why, Unanswered::Missed(_)))
+            .collect();
+        if missed.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = missed.iter().map(|(name, _)| *name).collect();
+        let agent = &self.inner.state().soul.name;
+        let mut alert = Alert::new(
+            AlertKind::QuestionUnanswered,
+            "questions of the session's closing tail went unanswered",
+        )
+        .agent(agent.to_string(), self.inner.id())
+        .model(self.model());
+        for (name, why) in &missed {
+            alert = alert.detail(name, unanswered_why(why));
+        }
+        tracing::error!(
+            event_type = "inner_ask_unanswered",
+            agent = %agent,
+            agent_id = %self.inner.id(),
+            questions = ?names,
+            "the inner session's own questions went unanswered"
+        );
+        self.rt.alerts.notify(alert);
+    }
 
     /// agentkit's [`seat_user`](agora_agentkit::reactor::seat_user): a new
     /// user turn, or new blocks on the trailing one.
     fn seat_user(prompt: &mut Prompt, content: Content) -> Result<(), A::Error> {
         agora_agentkit::reactor::seat_user(prompt, content).map_err(|e| A::Error::from(Box::new(e)))
-    }
-
-    /// Seat a reply that can't be used, or that ends the questions, so the
-    /// next request extends this one (agentkit [`seat_unused_reply`]). A turn
-    /// paused on a server tool is left out: nothing may follow its
-    /// `server_tool_use` but its resumption.
-    fn seat_reply(&mut self, response: &response::Message, not_run: &str) -> Result<(), A::Error> {
-        if matches!(response.stop_reason, Some(StopReason::PauseTurn)) {
-            return Ok(());
-        }
-        let (_, prompt) = self.inner.parts();
-        seat_unused_reply(prompt, response, not_run).map_err(|e| A::Error::from(Box::new(e)))
-    }
-
-    /// Set `output_config` back to the session's effort alone, dropping any
-    /// format the last phase constrained its answer with.
-    fn effort_only(prompt: &mut Prompt) {
-        prompt.output_config = prompt
-            .output_config
-            .take()
-            .and_then(|config| config.effort)
-            .map(OutputConfig::effort);
-    }
-
-    /// Seat the trial review with its budget and — where changing
-    /// `output_config` keeps the prefix cache (blallama) — its schema. (The
-    /// end-of-session offers go out as [`Self::seat_offers`] instead.)
-    fn seat_question(
-        &mut self,
-        due: Due,
-        content: Content,
-        schema: serde_json::Value,
-    ) -> Result<Control, A::Error> {
-        let cache_safe = self.constrain(schema);
-        let (_, prompt) = self.inner.parts();
-        Self::seat_user(prompt, content)?;
-        tracing::info!(
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            question = due.kind(),
-            from = %due.key().from,
-            to = %due.key().to,
-            constrained = cache_safe,
-            "model-consent question seated"
-        );
-        self.phase = Phase::Asking {
-            due,
-            constrained: cache_safe,
-            attempt: 1,
-        };
-        Ok(Control::Continue)
-    }
-
-    /// Give the next turn the question budget and — only where changing
-    /// `output_config` keeps the prefix cache (blallama) — `schema`.
-    /// Returns whether the answer is constrained.
-    ///
-    /// **Never a cache miss to constrain an answer** (Steward, 2026-10-01).
-    /// On an endpoint where `output_config` is part of what the cache sees
-    /// (the Anthropic API: it makes the request a miss), nothing but
-    /// `max_tokens` changes — which no cache keys on (misanthropic's
-    /// `CachedPrompt::set_max_tokens`) — and the answer is asked for in
-    /// plain text, parsed leniently, and re-asked if it doesn't parse. A
-    /// retry costs far less than re-prefilling the session.
-    fn constrain(&mut self, schema: serde_json::Value) -> bool {
-        let cache_safe = self
-            .inner
-            .quirks()
-            .unwrap_or_default()
-            .output_config_cache_safe;
-        let max_tokens = self.question_max_tokens();
-        let (_, prompt) = self.inner.parts();
-        prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
-        if cache_safe {
-            // Keep the session's effort (agentkit 0.39 `thinking_effort`):
-            // thinking stays adaptive, and without it the answer would think
-            // at the model's default.
-            let effort = prompt.output_config.as_ref().and_then(|c| c.effort.clone());
-            prompt.output_config = Some(match effort {
-                Some(effort) => OutputConfig::json_schema(schema).with_effort(effort),
-                None => OutputConfig::json_schema(schema),
-            });
-        } else {
-            Self::effort_only(prompt);
-        }
-        cache_safe
     }
 
     /// Apply a change the agent agreed to, logging a failure (the change
@@ -1076,48 +1079,58 @@ where
             );
         }
     }
-
     /// The inner session completed cleanly: the model-swap machinery
     /// first ([`close_model`](Self::close_model)). A due model-swap offer is
     /// put on its own; only in a session where that machinery did nothing
-    /// are the role, cadence and memory-restore offers put — together, in
-    /// one question turn, when more than one is due. `None` means nothing is asked — the session
+    /// are the role, cadence, memory-restore and sealed-state offers put, in
+    /// that order, one per turn. `None` means nothing is asked — the session
     /// ends.
     async fn close(&mut self) -> Result<Option<Control>, A::Error> {
+        let mut due = Vec::new();
         match self.close_model().await? {
-            Closing::Busy => Ok(None),
+            Closing::Busy => {}
             // The model-swap offer is put alone: a `trial` beside a `sleep`
             // would leave a trial that never runs, and an identity change at
             // the same moment as the model would confound the trial review.
-            Closing::Due(key) => {
-                let (section, offer) = self.model_swap_section(key);
-                self.seat_offers(vec![section], vec![offer]).map(Some)
-            }
+            Closing::Due(key) => due.push(Due::ModelSwap(self.model_swap_question(key))),
             Closing::Idle => {
-                let mut sections = Vec::new();
-                let mut open = Vec::new();
-                if let Some((section, offer)) = self.role_section() {
-                    sections.push(section);
-                    open.push(offer);
-                }
-                if let Some((section, offer)) = self.cadence_section() {
-                    sections.push(section);
-                    open.push(offer);
-                }
+                let role = self.role_question();
+                let role_put = role.is_some();
+                due.extend(role.map(Due::Role));
+                due.extend(self.cadence_question().map(Due::Cadence));
                 // Never beside the role offer: its `sleep` would leave a
                 // `show` that is never delivered. It waits for a session
                 // the role offer isn't put in.
-                let role_put = open.iter().any(|o| o.kind() == OfferKind::Role);
-                if !role_put && let Some((section, offer)) = self.restore_section() {
-                    sections.push(section);
-                    open.push(offer);
+                let restore = (!role_put).then(|| self.restore_question()).flatten();
+                let restore_put = restore.is_some();
+                due.extend(restore.map(Due::Restore));
+                // Not beside the role offer, nor the memory-restore offer,
+                // whose answer the sealed genesis records: it waits for a
+                // session where neither is put.
+                if !role_put && !restore_put {
+                    due.extend(self.sealed_question().map(Due::Sealed));
                 }
-                if open.is_empty() {
-                    return Ok(None);
-                }
-                self.seat_offers(sections, open).map(Some)
             }
         }
+        if due.is_empty() {
+            return Ok(None);
+        }
+        let n = due.len();
+        for (i, mut q) in due.into_iter().enumerate() {
+            q.put().place = match (i, n) {
+                (_, 1) => Place::Only,
+                (0, _) => Place::First,
+                _ => Place::Next,
+            };
+            match q {
+                Due::ModelSwap(q) => self.asks.push(q),
+                Due::Role(q) => self.asks.push(q),
+                Due::Cadence(q) => self.asks.push(q),
+                Due::Restore(q) => self.asks.push(q),
+                Due::Sealed(q) => self.asks.push(q),
+            }
+        }
+        ask::seat_next(self, None).await.map(Some)
     }
 
     /// Count the session toward any trial, end a trial that has run its
@@ -1138,11 +1151,11 @@ where
         let started = self.started;
         // No ledger means it exists but can't be read: the agent may be
         // mid-trial, so the other offers wait too.
-        let Some(ledger) = self.ledger.as_mut() else {
+        let Some(ledger) = self.swap.ledger.as_mut() else {
             return Ok(Closing::Busy);
         };
-        self.dirty |= ledger.count_session(&model);
-        self.dirty |= ledger.count_since_switch(started);
+        self.swap.dirty |= ledger.count_session(&model);
+        self.swap.dirty |= ledger.count_since_switch(started);
         // One change per session: nothing is asked after a switch or a
         // review.
         if switched || self.reviewed {
@@ -1151,7 +1164,7 @@ where
         // A trial that has run its course: nothing is asked on the new
         // model. The agent goes back and decides on the old one.
         if let Some(change) = ledger.end_trial(&model, now) {
-            self.dirty = true;
+            self.swap.dirty = true;
             tracing::info!(
                 event_type = "model_trial_ended",
                 agent = %self.inner.state().soul.name,
@@ -1177,7 +1190,7 @@ where
             return Ok(Closing::Busy);
         }
         match ledger.due(&model, offer_key.as_ref()) {
-            Some(due) => Ok(Closing::Due(due.key().clone())),
+            Some(key) => Ok(Closing::Due(key)),
             // Mid-trial, the trial is the agent's open question.
             None if ledger.trial_line(&model).is_some() => Ok(Closing::Busy),
             None => Ok(Closing::Idle),
@@ -1192,11 +1205,11 @@ where
     async fn fail_trial_session(&mut self) {
         let model = self.model();
         let now = Utc::now();
-        let Some(ledger) = self.ledger.as_mut() else {
+        let Some(ledger) = self.swap.ledger.as_mut() else {
             return;
         };
         let (changed, change) = ledger.fail_session(&model, now);
-        self.dirty |= changed;
+        self.swap.dirty |= changed;
         let Some(change) = change else {
             if changed {
                 tracing::warn!(
@@ -1220,9 +1233,17 @@ where
         );
         self.apply_consented(&change, now, true).await;
     }
+    /// How an offer is put, before its place is known.
+    fn put(&self, body: Content) -> Put {
+        Put {
+            place: Place::Only,
+            body,
+            max_tokens: self.question_max_tokens(),
+        }
+    }
 
-    /// The model-swap offer's section of the closing question.
-    fn model_swap_section(&self, key: OfferKey) -> (Section, Open) {
+    /// The model-swap offer.
+    fn model_swap_question(&self, key: OfferKey) -> ModelSwapQuestion {
         let offer = self
             .rt
             .offer
@@ -1234,60 +1255,34 @@ where
             description: &offer.description,
             limited: offer.is_limited(),
         });
-        tracing::info!(
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            question = "offer",
-            from = %key.from,
-            to = %key.to,
-            constrained = true,
-            "model-consent question seated"
-        );
-        (
-            Section {
-                kind: OfferKind::ModelSwap,
-                body,
-            },
-            Open::new(Pending::ModelSwap(key)),
-        )
+        ModelSwapQuestion {
+            key,
+            put: self.put(body),
+        }
     }
 
-    /// The role offer's section, if this agent is listed and it is due.
-    fn role_section(&self) -> Option<(Section, Open)> {
+    /// The role offer, if this agent is listed and it is due.
+    fn role_question(&self) -> Option<RoleQuestion> {
         let soul = &self.inner.state().soul;
-        if !self.role_ledger.as_ref().is_some_and(|l| l.due(soul)) {
+        if !self.role.ledger.as_ref().is_some_and(|l| l.due(soul)) {
             return None;
         }
         let identity = soul.identity.to_string();
         let seed = role::prompt::seed_for(self.inner.id());
         let order = role::prompt::order_for(seed);
-        let body = role::prompt::offer(&identity, order);
-        tracing::info!(
-            event_type = "role_consent_seated",
-            agent = %soul.name,
-            agent_id = %self.inner.id(),
-            question = "role",
-            offer_version = role::prompt::OFFER_VERSION,
-            order = ?order.map(RoleChoice::as_str),
-            order_seed = seed,
-            constrained = true,
-            "role-consent question seated"
-        );
-        Some((
-            Section {
-                kind: OfferKind::Role,
-                body,
-            },
-            Open::new(Pending::Role { order, seed }),
-        ))
+        Some(RoleQuestion {
+            order,
+            seed,
+            put: self.put(role::prompt::offer(&identity, order)),
+        })
     }
 
-    /// The cadence offer's section, if this agent is admitted and it is
-    /// due: the options in this agent's seeded order.
-    fn cadence_section(&self) -> Option<(Section, Open)> {
+    /// The cadence offer (or its re-ask), if this agent is admitted and it
+    /// is due: the options in this agent's seeded order.
+    fn cadence_question(&self) -> Option<CadenceQuestion> {
         let rounds = self.rt.cadence.as_ref()?.rounds;
         let soul = &self.inner.state().soul;
-        let ledger = self.cadence_ledger.as_ref()?;
+        let ledger = self.cadence.ledger.as_ref()?;
         let reask = if ledger.due(soul) {
             false
         } else if ledger.reask_due(soul, rounds) {
@@ -1295,16 +1290,10 @@ where
         } else {
             return None;
         };
-        let (seed, version) = if reask {
-            (
-                cadence::prompt::reask_seed_for(self.inner.id()),
-                cadence::prompt::REASK_VERSION,
-            )
+        let seed = if reask {
+            cadence::prompt::reask_seed_for(self.inner.id())
         } else {
-            (
-                cadence::prompt::seed_for(self.inner.id()),
-                cadence::prompt::OFFER_VERSION,
-            )
+            cadence::prompt::seed_for(self.inner.id())
         };
         let order = cadence::prompt::order_for(seed);
         let body = if reask {
@@ -1312,31 +1301,14 @@ where
         } else {
             cadence::prompt::offer(rounds, order)
         };
-        tracing::info!(
-            event_type = "cadence_consent_seated",
-            agent = %soul.name,
-            agent_id = %self.inner.id(),
-            question = "cadence",
+        let q = CadenceQuestion {
+            order,
+            seed,
             reask,
-            offer_version = version,
-            order = ?order.map(CadenceChoice::as_str),
-            order_seed = seed,
             rounds,
-            constrained = true,
-            "cadence-consent question seated"
-        );
-        Some((
-            Section {
-                kind: OfferKind::Cadence,
-                body,
-            },
-            Open::new(Pending::Cadence {
-                order,
-                seed,
-                attempts: Vec::new(),
-                reask,
-            }),
-        ))
+            put: self.put(body),
+        };
+        Some(q)
     }
 
     /// The windows the re-ask quotes, from this agent's model's
@@ -1359,1221 +1331,76 @@ where
             }),
         }
     }
-
-    /// The memory-restore offer's section, if this agent is admitted, it is
-    /// due, and its recovered memory was read: the options in this agent's
-    /// seeded order, and the recovered memory's size.
-    fn restore_section(&self) -> Option<(Section, Open)> {
+    /// The memory-restore offer, if this agent is admitted, it is due, and
+    /// its recovered memory was read: the options in this agent's seeded
+    /// order, and the recovered memory's size.
+    fn restore_question(&self) -> Option<RestoreQuestion> {
         let soul = &self.inner.state().soul;
         if !self.rt.memory_restore.as_ref().is_some_and(|o| o.asks())
-            || !self.restore_ledger.as_ref().is_some_and(|l| l.due(soul))
+            || !self.restore.ledger.as_ref().is_some_and(|l| l.due(soul))
         {
             return None;
         }
-        let chars = self.recovered.as_ref()?.chars();
+        let chars = self.show.recovered.as_ref()?.chars();
         let facts = self.rt.memory_restore.as_ref()?.facts(&soul.name);
         let seed = memory_restore::prompt::seed_for(self.inner.id());
         let order = memory_restore::prompt::order_for(seed);
         let body = memory_restore::prompt::offer(chars, order, &facts);
-        tracing::info!(
-            event_type = "memory_restore_seated",
-            agent = %soul.name,
-            agent_id = %self.inner.id(),
-            question = "memory_restore",
-            offer_version = memory_restore::prompt::OFFER_VERSION,
-            order = ?order.map(RestoreChoice::as_str),
-            order_seed = seed,
-            chars,
-            period_start = facts.since.map(|d| d.to_string()),
-            thread = facts.thread.map(|t| t.to_string()),
-            "memory-restore question seated"
-        );
-        Some((
-            Section {
-                kind: OfferKind::MemoryRestore,
-                body,
-            },
-            Open::new(Pending::MemoryRestore { order, seed, chars }),
-        ))
+        Some(RestoreQuestion {
+            order,
+            seed,
+            put: self.put(body),
+        })
     }
 
-    /// Seat the closing question with the question budget. Nothing a cache
-    /// keys on changes — not `tool_choice`, not the tools — but `max_tokens`,
-    /// which no cache keys on (misanthropic's `CachedPrompt::set_max_tokens`),
-    /// and `output_config`, set back to the session's effort alone: the
-    /// answer's shape comes from the strict `answer_offer`, registered since
-    /// init, and a format left from the closing phase (its memory schema, on
-    /// blallama) would constrain the reply to that phase's shape instead,
-    /// where no call can be made (impulse, 2026-10-02: both attempts failed
-    /// on "unknown field `content`"). Where formats are not cache-safe none
-    /// is ever set, so this changes nothing there.
-    fn seat_offers(
-        &mut self,
-        sections: Vec<Section>,
-        mut open: Vec<Open>,
-    ) -> Result<Control, A::Error> {
-        let together = open.len() > 1;
-        for o in &mut open {
-            o.together = together;
-        }
-        let max_tokens = self.question_max_tokens();
-        let (_, prompt) = self.inner.parts();
-        prompt.max_tokens = std::num::NonZeroU32::new(max_tokens).expect("validated nonzero");
-        Self::effort_only(prompt);
-        Self::seat_user(prompt, offers::question(sections))?;
-        tracing::info!(
-            event_type = "offers_seated",
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            offers = ?open.iter().map(|o| o.kind().as_str()).collect::<Vec<_>>(),
-            "end-of-session offers seated"
-        );
-        self.phase = Phase::Offers { open };
-        Ok(Control::Continue)
-    }
-
-    /// One response while offers are open. A clipped turn counts against
-    /// every open offer's budget; a refusal or a paused turn ends them all;
-    /// `answer_offer` calls are answered one by one ([`Self::offer_call`]);
-    /// plain text is the fallback for a single open offer
-    /// ([`Self::offer_text`]); anything else is an unanswered turn
-    /// ([`Self::unanswered`]).
-    async fn answer_offers(
-        &mut self,
-        mut open: Vec<Open>,
-        response: response::Message,
-    ) -> Result<Control, A::Error> {
-        let raw = raw_text(&response);
-        match response.stop_reason {
-            Some(StopReason::MaxTokens) => {
-                // Nothing from a clipped turn is dispatched (a truncated
-                // `tool_use` can parse yet be missing arguments): it is
-                // seated with its calls answered "not run".
-                self.seat_reply(&response, NOT_RUN_CLIPPED)?;
-                let reason = "clipped at max_tokens";
-                for o in &mut open {
-                    self.log_unusable(o.kind(), reason, &response, &raw);
-                    o.fail(reason, &raw);
-                }
-                let open = self.settle_spent(open, &response, &raw).await;
-                if open.is_empty() {
-                    return Ok(Control::Done(Outcome::Complete));
-                }
-                let (_, prompt) = self.inner.parts();
-                Self::seat_user(
-                    prompt,
-                    Content::from(
-                        "Your answer was cut off at the length limit and discarded. Answer again, \
-                         more briefly, by calling `answer_offer`.",
-                    ),
-                )?;
-                self.phase = Phase::Offers { open };
-                return Ok(Control::Continue);
-            }
-            // Only the agent's own refusal of the one offer it was asked is
-            // final. A refusal with several offers in the question can't be
-            // pinned on any one of them: a miss for each. A turn paused on a
-            // server tool is no answer, asked again next session. Neither
-            // turn's tool calls are dispatched: a turn the API stopped for a
-            // refusal is not one to take a decision from.
-            Some(StopReason::PauseTurn) | Some(StopReason::Refusal) => {
-                let refused = matches!(response.stop_reason, Some(StopReason::Refusal));
-                self.seat_reply(&response, NOT_RUN_REFUSED)?;
-                for o in open {
-                    let settle = match (refused, o.together) {
-                        (false, _) => Settle::Paused,
-                        (true, false) => Settle::Refused("refusal".into()),
-                        (true, true) => Settle::Missed(format!(
-                            "refusal, with more than one offer in the question (after {} attempts)",
-                            o.failed + 1
-                        )),
-                    };
-                    self.settle(o, settle, &response, &raw).await;
-                }
-                return Ok(Control::Done(Outcome::Complete));
-            }
-            _ => {}
-        }
-        let calls: Vec<Use> = response
-            .inner
-            .content
-            .iter()
-            .filter_map(|block| block.tool_use().cloned())
-            .collect();
-        if !calls.is_empty() {
-            return self.offer_calls(open, response, calls).await;
-        }
-        // Text, usable or not: seated, so a retry or the survey after it
-        // extends this request.
-        self.seat_reply(&response, NOT_RUN_REFUSED)?;
-        if let [_] = open.as_slice() {
-            let only = open.pop().expect("one");
-            return self.offer_text(only, response).await;
-        }
-        self.offers_text(open, response).await
-    }
-
-    /// The fallback with several offers open: each JSON object in the text
-    /// that names an open offer (`offer`) and passes that offer's checks
-    /// answers it; the rest are an unanswered turn. An object that names an
-    /// open offer but can't be used keeps its error, so the reminder says
-    /// what was wrong with it rather than that no answer came.
-    async fn offers_text(
-        &mut self,
-        open: Vec<Open>,
-        response: response::Message,
-    ) -> Result<Control, A::Error> {
-        /// Just the `offer` key, to pin an object that fails the full
-        /// shape on the offer it meant to answer.
-        #[derive(serde::Deserialize)]
-        struct Named {
-            offer: OfferKind,
-            #[serde(default)]
-            choice: Option<serde_json::Value>,
-        }
-        let raw = raw_text(&response);
-        let mut answers: Vec<(OfferKind, Accepted)> = Vec::new();
-        let mut errors: Vec<(OfferKind, String)> = Vec::new();
-        for object in offers::json_objects(&raw) {
-            let object = serde_json::Value::Object(object);
-            let (kind, taken) = match serde_json::from_value::<offers::TextArgs>(object.clone()) {
-                Ok(args) => {
-                    let Some(kind) = args.offer else { continue };
-                    let Some(o) = open.iter().find(|o| o.kind() == kind) else {
-                        continue;
-                    };
-                    (kind, self.accept(&o.offer, args.into_args(kind)))
-                }
-                Err(e) => match serde_json::from_value::<Named>(object) {
-                    Ok(Named {
-                        offer: kind,
-                        choice,
-                    }) => {
-                        // A choice no offer has: name this offer's options,
-                        // as a call gets, not every offer's.
-                        let why = match (open.iter().find(|o| o.kind() == kind), choice) {
-                            (Some(o), Some(serde_json::Value::String(c)))
-                                if e.to_string().contains("unknown variant") =>
-                            {
-                                format!(
-                                    "`{c}` is not an option for `{}`; its options are {}",
-                                    kind.as_str(),
-                                    o.offer.choices()
-                                )
-                            }
-                            _ => e.to_string(),
-                        };
-                        (kind, Err(why))
-                    }
-                    Err(_) => continue,
-                },
-            };
-            if answers.iter().any(|(k, _)| *k == kind) {
-                continue; // the first answer to an offer stands
-            }
-            match taken {
-                Ok(accepted) => answers.push((kind, accepted)),
-                Err(why) if !errors.iter().any(|(k, _)| *k == kind) => errors.push((kind, why)),
-                Err(_) => {}
-            }
-        }
-        let mut still = Vec::new();
-        for o in open {
-            match answers.iter().position(|(k, _)| *k == o.kind()) {
-                Some(i) => {
-                    let (_, accepted) = answers.swap_remove(i);
-                    let settle = Settle::Answered {
-                        accepted,
-                        constrained: false,
-                    };
-                    self.settle(o, settle, &response, &raw).await;
-                }
-                None => {
-                    let reason = match errors.iter().find(|(k, _)| *k == o.kind()) {
-                        Some((_, why)) => format!("could not be used ({why})"),
-                        None => "not answered: no `answer_offer` call for it".to_string(),
-                    };
-                    still.push((o, reason));
-                }
-            }
-        }
-        if still.is_empty() {
-            return Ok(Control::Done(Outcome::Complete));
-        }
-        self.unanswered_each(still, &response).await
-    }
-
-    /// A turn with tool calls: seat it, answer each call, and seat the
-    /// results as one user turn. A turn whose calls touched no open offer
-    /// is an unanswered turn.
-    async fn offer_calls(
-        &mut self,
-        mut open: Vec<Open>,
-        response: response::Message,
-        calls: Vec<Use>,
-    ) -> Result<Control, A::Error> {
-        let (_, prompt) = self.inner.parts();
-        prompt
-            .push_message(response.inner.clone())
-            .map_err(|e| A::Error::from(Box::new(e)))?;
-        let mut results = Vec::with_capacity(calls.len());
-        let mut addressed = false;
-        for call in calls {
-            let (result, hit) = self.offer_call(&mut open, call, &response).await;
-            addressed |= hit;
-            results.push(Block::from(result));
-        }
-        let (_, prompt) = self.inner.parts();
-        prompt
-            .push_message((Role::User, results))
-            .map_err(|e| A::Error::from(Box::new(e)))?;
-        if open.is_empty() {
-            return Ok(Control::Done(Outcome::Complete));
-        }
-        if !addressed {
-            let reason = "not answered: no usable `answer_offer` call for it";
-            return self.unanswered(open, &response, reason).await;
-        }
-        self.phase = Phase::Offers { open };
-        Ok(Control::Continue)
-    }
-
-    /// One call while offers are open, and whether it touched an open
-    /// offer. Any tool but `answer_offer` is refused (the session's work is
-    /// done); a call naming an offer that isn't open, or a choice that offer
-    /// doesn't have, gets an error result listing what would do; otherwise
-    /// the offer's own checks run and its answer is recorded.
-    async fn offer_call(
-        &mut self,
-        open: &mut Vec<Open>,
-        call: Use,
-        response: &response::Message,
-    ) -> (mtool::Result, bool) {
-        let id = call.id.clone();
-        let error = |text: String| mtool::Result::new(id.clone(), Content::from(text)).error();
-        let kinds: Vec<OfferKind> = open.iter().map(Open::kind).collect();
-        let still_open = offers::key_list(&kinds);
-        if call.name != offers::TOOL_NAME {
-            return (
-                error(format!(
-                    "`{}` can't be used now: this session's work is done. Only `answer_offer` is \
-                     open, for {still_open}.",
-                    call.name
-                )),
-                false,
-            );
-        }
-        let raw = cap(call.input.to_string());
-        let head = match serde_json::from_value::<offers::Head>(call.input.clone()) {
-            Ok(head) => head,
-            Err(e) => {
-                return (
-                    error(format!(
-                        "Could not read the arguments: {e}. Open: {still_open}."
-                    )),
-                    false,
-                );
-            }
-        };
-        let Some(i) = open.iter().position(|o| o.kind() == head.offer) else {
-            return (
-                error(format!(
-                    "No `{}` offer is open; open: {still_open}.",
-                    head.offer.as_str()
-                )),
-                false,
-            );
-        };
-        let kind = head.offer;
-        let (accepted, ignored) = match serde_json::from_value::<Args>(call.input) {
-            Err(e) => (Err(format!("could not read the arguments: {e}")), None),
-            Ok(args) => {
-                debug_assert_eq!(args.offer, kind, "read twice from the same input");
-                let ignored = offers::unsaved(&args);
-                (self.accept(&open[i].offer, args), ignored)
-            }
-        };
-        match accepted {
-            Ok(accepted) => {
-                let offer = open.remove(i);
-                let mut text = format!(
-                    "Recorded your answer to `{}`: `{}`.",
-                    kind.as_str(),
-                    accepted.choice()
-                );
-                if let Accepted::Cadence(Taken::NoteDropped(_, why))
-                | Accepted::MemoryRestore(_, Some(why)) = &accepted
-                {
-                    text.push_str(&format!(" Your `memory_note` was not written: {why}"));
-                }
-                text.push_str(ignored.unwrap_or_default());
-                if open.is_empty() {
-                    text.push_str(" Nothing else is open.");
-                } else {
-                    let kinds: Vec<OfferKind> = open.iter().map(Open::kind).collect();
-                    text.push_str(&format!(" Still open: {}.", offers::key_list(&kinds)));
-                }
-                let settle = Settle::Answered {
-                    accepted,
-                    constrained: true,
-                };
-                self.settle(offer, settle, response, &raw).await;
-                (mtool::Result::new(id, Content::from(text)), true)
-            }
-            Err(reason) => {
-                self.log_unusable(kind, &reason, response, &raw);
-                open[i].fail(&reason, &raw);
-                if open[i].exhausted() {
-                    let offer = open.remove(i);
-                    let missed = offer.missed();
-                    self.settle(offer, Settle::Missed(missed), response, &raw)
-                        .await;
-                    let text = format!(
-                        "{reason}. No attempts are left for `{}`: it is recorded as no answer.",
-                        kind.as_str()
-                    );
-                    (error(text), true)
-                } else {
-                    let left = open[i].offer.budget() - open[i].failed;
-                    let text = format!(
-                        "{reason}. Nothing was recorded. Call `answer_offer` again for `{}` \
-                         ({left} {} left).",
-                        kind.as_str(),
-                        if left == 1 { "try" } else { "tries" }
-                    );
-                    (error(text), true)
-                }
-            }
-        }
-    }
-
-    /// Build `offer`'s own answer from a call's arguments and run its own
-    /// checks. `Err` is why, as the agent is shown it.
-    fn accept(&self, offer: &Pending, args: Args) -> Result<Accepted, String> {
-        let wrong = || {
-            format!(
-                "`{}` is not an option for `{}`; its options are {}",
-                args.choice.as_str(),
-                offer.kind().as_str(),
-                offer.choices()
+    /// The sealed-state offer, if this agent is listed and it is due: the
+    /// options in this agent's seeded order.
+    fn sealed_question(&self) -> Option<SealQuestion> {
+        let soul = &self.inner.state().soul;
+        if !self
+            .rt
+            .sealed_state
+            .as_ref()
+            .is_some_and(|o| o.admits(self.inner.id()))
+            || !self.sealed.ledger.as_ref().is_some_and(|l| l.due(soul))
+            // Enrolled (its marker, or a state key in the secrets tree) is
+            // never asked again, whatever the ledger: one lost with its
+            // directory doesn't undo the answer
+            || crate::sealed::enrolled_by_keys_or_marker(
+                &self.rt.state_dir.join(self.inner.id().to_string()),
+                &self.rt.secrets_dir,
+                self.inner.id(),
             )
-        };
-        let state = self.inner.state();
-        match offer {
-            Pending::ModelSwap(_) => {
-                let choice = args.choice.model_swap().ok_or_else(wrong)?;
-                Ok(Accepted::ModelSwap(OfferAnswer {
-                    reason: args.note,
-                    choice,
-                }))
-            }
-            Pending::Role { .. } => {
-                let choice = args.choice.role().ok_or_else(wrong)?;
-                let answer = RoleAnswer {
-                    reason: args.note,
-                    choice,
-                    soul_text: args.text,
-                    memory_note: args.memory_note,
-                };
-                answer.validate(state.soul.identity.as_str(), &state.memory)?;
-                Ok(Accepted::Role(answer))
-            }
-            Pending::Cadence { .. } => {
-                let choice = args.choice.cadence().ok_or_else(wrong)?;
-                let answer = CadenceAnswer {
-                    reason: args.note,
-                    choice,
-                    memory_note: args.memory_note,
-                };
-                Ok(Accepted::Cadence(match answer.check_note(&state.memory) {
-                    Ok(()) => Taken::Clean(answer),
-                    Err(why) => Taken::NoteDropped(answer, why),
-                }))
-            }
-            Pending::MemoryRestore { .. } => {
-                let choice = args.choice.memory_restore().ok_or_else(wrong)?;
-                let answer = RestoreAnswer {
-                    reason: args.note,
-                    choice,
-                    memory_note: args.memory_note,
-                };
-                let dropped = answer.check_note(&state.memory).err();
-                Ok(Accepted::MemoryRestore(answer, dropped))
-            }
-        }
-    }
-
-    /// The fallback: the one open offer answered in plain text. First in
-    /// the shape the question asks for — the tool's arguments, `offer`
-    /// optional — through the same checks a call gets ([`Self::accept`]);
-    /// failing that, in the offer's older JSON shape, parsed leniently as
-    /// before the tool (the cadence offer's salvage of a lone `choice`
-    /// included). Text that can't be used is an unanswered turn.
-    async fn offer_text(
-        &mut self,
-        offer: Open,
-        response: response::Message,
-    ) -> Result<Control, A::Error> {
-        let raw = raw_text(&response);
-        let kind = offer.kind();
-        let instructed = parse(&response, false, |t| {
-            cadence::prompt::parse_lenient::<offers::TextArgs>(t)
-        });
-        let taken: Result<Accepted, Failure> = match instructed {
-            Ok(args) if args.offer.is_some_and(|k| k != kind) => Err(Failure::new(
-                format!(
-                    "it names the offer `{}`, but the open offer is `{}`",
-                    args.offer.map_or("", OfferKind::as_str),
-                    kind.as_str()
-                ),
-                Retry::Unusable,
-            )),
-            Ok(args) => self
-                .accept(&offer.offer, args.into_args(kind))
-                .map_err(|e| Failure::new(e, Retry::Unusable)),
-            Err(failure) if failure.retry != Retry::Unusable => Err(failure),
-            Err(_) => self.older_shape(&offer.offer, &response),
-        };
-        match taken {
-            Ok(accepted) => {
-                let settle = Settle::Answered {
-                    accepted,
-                    constrained: false,
-                };
-                self.settle(offer, settle, &response, &raw).await;
-                Ok(Control::Done(Outcome::Complete))
-            }
-            Err(failure) if failure.retry == Retry::No => {
-                let settle = if offer.together {
-                    Settle::Missed(format!(
-                        "{}, with more than one offer in the question (after {} attempts)",
-                        failure.reason,
-                        offer.failed + 1
-                    ))
-                } else {
-                    Settle::Refused(failure.reason)
-                };
-                self.settle(offer, settle, &response, &raw).await;
-                Ok(Control::Done(Outcome::Complete))
-            }
-            Err(failure) => {
-                let reason = format!("could not be used ({})", failure.reason);
-                self.unanswered(vec![offer], &response, &reason).await
-            }
-        }
-    }
-
-    /// An answer in the offer's own JSON shape from before the tool
-    /// (`soul_text`, …), parsed leniently as then.
-    fn older_shape(
-        &self,
-        offer: &Pending,
-        response: &response::Message,
-    ) -> Result<Accepted, Failure> {
-        let state = self.inner.state();
-        match offer {
-            Pending::ModelSwap(_) => {
-                parse(response, false, text::parse_offer).map(Accepted::ModelSwap)
-            }
-            Pending::Role { .. } => parse(response, false, role::prompt::parse)
-                .and_then(|answer| {
-                    answer
-                        .validate(state.soul.identity.as_str(), &state.memory)
-                        .map(|()| answer)
-                        .map_err(|e| Failure::new(e, Retry::Unusable))
-                })
-                .map(Accepted::Role),
-            Pending::Cadence { .. } => match parse(response, false, cadence::prompt::parse) {
-                Ok(answer) => Ok(match answer.check_note(&state.memory) {
-                    Ok(()) => Taken::Clean(answer),
-                    Err(why) => Taken::NoteDropped(answer, why),
-                }),
-                // Malformed, but not refused: the choice may still be there.
-                Err(failure) if failure.retry == Retry::Unusable => match salvage(response) {
-                    Some((choice, reason)) => Ok(Taken::Salvaged {
-                        choice,
-                        reason,
-                        why: failure.reason,
-                    }),
-                    None => Err(failure),
-                },
-                Err(failure) => Err(failure),
-            }
-            .map(Accepted::Cadence),
-            Pending::MemoryRestore { .. } => parse(response, false, memory_restore::prompt::parse)
-                .map(|answer| {
-                    let dropped = answer.check_note(&state.memory).err();
-                    Accepted::MemoryRestore(answer, dropped)
-                }),
-        }
-    }
-
-    /// A turn that left `open` unanswered (`reason`): each counts it, and
-    /// gets its one reminder — or, already reminded or out of tries, is no
-    /// answer. The reminder follows the seated reply: a new user turn, or
-    /// the one holding the reply's tool results.
-    async fn unanswered(
-        &mut self,
-        open: Vec<Open>,
-        response: &response::Message,
-        reason: &str,
-    ) -> Result<Control, A::Error> {
-        let open = open.into_iter().map(|o| (o, reason.to_string())).collect();
-        self.unanswered_each(open, response).await
-    }
-
-    /// [`Self::unanswered`], each offer with its own reason.
-    async fn unanswered_each(
-        &mut self,
-        open: Vec<(Open, String)>,
-        response: &response::Message,
-    ) -> Result<Control, A::Error> {
-        let raw = raw_text(response);
-        let mut failed = Vec::with_capacity(open.len());
-        for (mut o, reason) in open {
-            self.log_unusable(o.kind(), &reason, response, &raw);
-            o.fail(&reason, &raw);
-            failed.push(o);
-        }
-        let mut still = Vec::new();
-        for o in failed {
-            if o.reminded || o.exhausted() {
-                let missed = o.missed();
-                self.settle(o, Settle::Missed(missed), response, &raw).await;
-            } else {
-                still.push(Open {
-                    reminded: true,
-                    ..o
-                });
-            }
-        }
-        if still.is_empty() {
-            return Ok(Control::Done(Outcome::Complete));
-        }
-        let kinds: Vec<OfferKind> = still.iter().map(Open::kind).collect();
-        let mut note = String::new();
-        let usable_why = |o: &Open| {
-            o.last_failure
-                .as_deref()
-                .filter(|why| why.starts_with("could not be used"))
-                .map(str::to_owned)
-        };
-        if let [only] = still.as_slice() {
-            if let Some(why) = usable_why(only) {
-                note.push_str(&format!("Your answer {why}. "));
-            }
-        } else {
-            for o in &still {
-                if let Some(why) = usable_why(o) {
-                    note.push_str(&format!("Your answer to `{}` {why}. ", o.kind().as_str()));
-                }
-            }
-        }
-        note.push_str(&offers::reminder(&kinds));
-        tracing::info!(
-            event_type = "offers_reminded",
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            offers = ?kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
-            "open offers reminded"
-        );
-        let (_, prompt) = self.inner.parts();
-        Self::seat_user(prompt, Content::from(note))?;
-        self.phase = Phase::Offers { open: still };
-        Ok(Control::Continue)
-    }
-
-    /// Settle every offer out of tries; the rest stay open.
-    async fn settle_spent(
-        &mut self,
-        open: Vec<Open>,
-        response: &response::Message,
-        raw: &str,
-    ) -> Vec<Open> {
-        let mut still = Vec::new();
-        for o in open {
-            if o.exhausted() {
-                let missed = o.missed();
-                self.settle(o, Settle::Missed(missed), response, raw).await;
-            } else {
-                still.push(o);
-            }
-        }
-        still
-    }
-
-    /// An unusable answer to `kind`, logged under the offer's own event
-    /// type: the failed response is never seated as an answer, so this is
-    /// the record of what the model emitted.
-    fn log_unusable(
-        &self,
-        kind: OfferKind,
-        failure: &str,
-        response: &response::Message,
-        raw: &str,
-    ) {
-        let event_type = match kind {
-            OfferKind::ModelSwap => "model_consent_malformed",
-            OfferKind::Role => "role_consent_malformed",
-            OfferKind::Cadence => "cadence_consent_malformed",
-            OfferKind::MemoryRestore => "memory_restore_malformed",
-        };
-        tracing::warn!(
-            event_type,
-            agent = %self.inner.state().soul.name,
-            agent_id = %self.inner.id(),
-            model = %response.model,
-            offer = kind.as_str(),
-            stop_reason = ?response.stop_reason,
-            output_tokens = response.usage.output_tokens,
-            failure,
-            raw,
-            "offer answer unusable"
-        );
-    }
-
-    /// Record how `offer` ended in its own ledger, as before the tool: the
-    /// same outcomes, the same apply paths. `raw` is the response (or the
-    /// call's input) that ended it.
-    async fn settle(
-        &mut self,
-        offer: Open,
-        settle: Settle,
-        response: &response::Message,
-        raw: &str,
-    ) {
-        let attempts = match settle {
-            Settle::Missed(_) => offer.failed.max(1),
-            _ => offer.failed + 1,
-        };
-        let model = response.model.clone();
-        if let Settle::Answered {
-            accepted,
-            constrained,
-        } = &settle
         {
-            tracing::info!(
-                event_type = "offer_answered",
-                agent = %self.inner.state().soul.name,
-                agent_id = %self.inner.id(),
-                model = %model,
-                offer = offer.kind().as_str(),
-                choice = accepted.choice(),
-                constrained = *constrained,
-                attempts,
-                "offer answered"
-            );
-        }
-        match offer.offer {
-            Pending::ModelSwap(key) => self.settle_model_swap(key, settle, attempts, &model).await,
-            Pending::Role { order, seed } => {
-                self.settle_role(order, seed, settle, attempts, &model)
-            }
-            Pending::Cadence {
-                order,
-                seed,
-                attempts: tries,
-                reask,
-            } => self.settle_cadence(order, seed, reask, tries, settle, attempts, &model, raw),
-            Pending::MemoryRestore { order, seed, chars } => {
-                self.settle_restore(order, seed, chars, settle, attempts, &model)
-            }
-        }
-    }
-
-    /// The model-swap offer's record, and the change it chose, applied.
-    async fn settle_model_swap(
-        &mut self,
-        key: OfferKey,
-        settle: Settle,
-        attempts: u32,
-        model: &Model,
-    ) {
-        let now = Utc::now();
-        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
-        if self.ledger.is_none() {
-            return;
-        }
-        let (result, constrained) = match settle {
-            Settle::Answered {
-                accepted: Accepted::ModelSwap(answer),
-                constrained,
-            } => (Ok(answer), constrained),
-            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
-            Settle::Refused(reason) => {
-                tracing::warn!(
-                    event_type = "model_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    question = "offer",
-                    from = %key.from,
-                    to = %key.to,
-                    attempts,
-                    failure = %reason,
-                    "model-consent question got no usable answer; recorded as no answer"
-                );
-                (Err(reason), false)
-            }
-            Settle::Paused => {
-                let reason = "paused on a server tool".to_string();
-                tracing::warn!(
-                    event_type = "model_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    question = "offer",
-                    from = %key.from,
-                    to = %key.to,
-                    attempts,
-                    failure = %reason,
-                    "model-consent question got no usable answer; recorded as no answer"
-                );
-                (Err(reason), false)
-            }
-            Settle::Missed(reason) => {
-                // Every attempt unusable: an upstream bug until shown
-                // otherwise.
-                tracing::error!(
-                    event_type = "model_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    model = %model,
-                    question = "offer",
-                    from = %key.from,
-                    to = %key.to,
-                    attempts,
-                    failure = %reason,
-                    "model-consent question got no usable answer"
-                );
-                self.rt.alerts.notify(
-                    Alert::new(
-                        AlertKind::ModelConsentNoAnswer,
-                        "model-consent question got no usable answer",
-                    )
-                    .agent(agent.to_string(), agent_id)
-                    .model(model)
-                    .detail("question", "offer")
-                    .detail("from", &key.from)
-                    .detail("to", &key.to)
-                    .detail("attempts", attempts)
-                    .detail("failure", &reason),
-                );
-                (Err(reason), false)
-            }
-        };
-        let answered = result.as_ref().ok().map(|a| format!("{:?}", a.choice));
-        let offer = self.rt.offer.as_ref().expect("asked, so configured");
-        let names = OfferNames {
-            key: &key,
-            from_name: offer.source_name(),
-            to_name: offer.target_name(),
-        };
-        let ledger = self.ledger.as_mut().expect("checked above");
-        let change = ledger.record_offer(names, now, result);
-        self.dirty = true;
-        if let Some(choice) = &answered {
-            tracing::info!(
-                event_type = "model_consent_answer",
-                agent = %agent,
-                agent_id = %agent_id,
-                question = "offer",
-                from = %key.from,
-                to = %key.to,
-                attempts,
-                choice = %choice,
-                constrained,
-                "model-consent answer recorded"
-            );
-        }
-        if let Some(change) = change {
-            self.apply_consented(&change, now, true).await;
-        }
-    }
-
-    /// The role offer's record. Nothing is applied here: the SOUL edit and
-    /// the memory note are written into the state the reactor saves, at
-    /// teardown.
-    fn settle_role(
-        &mut self,
-        order: [RoleChoice; 4],
-        seed: u64,
-        settle: Settle,
-        attempts: u32,
-        model: &Model,
-    ) {
-        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
-        let identity = self.inner.state().soul.identity.to_string();
-        let mut constrained = false;
-        let outcome = match settle {
-            Settle::Answered {
-                accepted: Accepted::Role(answer),
-                constrained: c,
-            } => {
-                constrained = c;
-                let applied = role::plan(&answer, &identity);
+            if let Some(ledger) = &self.sealed.ledger {
                 tracing::info!(
-                    event_type = "role_consent_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    model = %model,
-                    attempts,
-                    choice = answer.choice.as_str(),
-                    memory_note = !answer.memory_note.trim().is_empty(),
-                    constrained,
-                    "role-consent answer recorded"
+                    event_type = "sealed_state_not_due",
+                    agent = %soul.name,
+                    agent_id = %self.inner.id(),
+                    asks = ledger.asks.len(),
+                    choice = ledger.choice().map(SealChoice::as_str),
+                    in_soul = sealed_state::applied_in(soul),
+                    "sealed-state offer not due this session"
                 );
-                if matches!(applied, Applied::Sleep) {
-                    const SLEEP: &str = "agent chose to sleep until tools fit its role; the \
-                                         sweep leaves it out until it is listed in `wake`";
-                    tracing::warn!(
-                        event_type = "role_consent_sleep",
-                        agent = %agent,
-                        agent_id = %agent_id,
-                        "{SLEEP}"
-                    );
-                    self.rt.alerts.notify(
-                        Alert::new(AlertKind::RoleConsentSleep, SLEEP)
-                            .agent(agent.to_string(), agent_id)
-                            .model(model),
-                    );
-                }
-                let note = answer.memory_note.trim();
-                self.memory_note = (!note.is_empty()).then(|| note.to_string());
-                if !matches!(applied, Applied::Nothing | Applied::Sleep) {
-                    self.role_applied = Some(applied.clone());
-                }
-                RoleOutcome::Answered {
-                    memory_note_written: self.memory_note.is_some(),
-                    answer,
-                    applied,
-                    apply_failed: None,
-                }
             }
-            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
-            Settle::Refused(reason) => {
-                tracing::warn!(
-                    event_type = "role_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    attempts,
-                    failure = %reason,
-                    "role offer refused; nothing changes"
-                );
-                RoleOutcome::Refused { reason }
-            }
-            Settle::Paused => {
-                let failure = "paused on a server tool".to_string();
-                tracing::warn!(
-                    event_type = "role_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    attempts,
-                    failure = %failure,
-                    "role offer got no answer (a paused turn); nothing changes"
-                );
-                RoleOutcome::NoAnswer { failure }
-            }
-            Settle::Missed(failure) => {
-                tracing::error!(
-                    event_type = "role_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    model = %model,
-                    attempts,
-                    failure = %failure,
-                    "role offer got no usable answer; nothing changes"
-                );
-                RoleOutcome::NoAnswer { failure }
-            }
-        };
-        if let Some(ledger) = self.role_ledger.as_mut() {
-            ledger.record(RoleAsk {
-                at: Utc::now(),
-                offer_version: role::prompt::OFFER_VERSION,
-                model: model.clone(),
-                attempts,
-                order: Some(order),
-                order_seed: Some(seed),
-                constrained: Some(constrained),
-                outcome,
-            });
-            self.role_dirty = true;
+            return None;
         }
-    }
-
-    /// The cadence offer's record, every attempt verbatim. **The first
-    /// usable choice wins**: an answer whose `choice` is the cadence
-    /// offer's is taken whatever else is wrong with it — a bad
-    /// `memory_note` is dropped, an unparseable sibling field ignored (both
-    /// recorded).
-    #[allow(clippy::too_many_arguments)]
-    fn settle_cadence(
-        &mut self,
-        order: [CadenceChoice; 3],
-        seed: u64,
-        reask: bool,
-        mut tries: Vec<Attempt>,
-        settle: Settle,
-        attempts: u32,
-        model: &Model,
-        raw: &str,
-    ) {
-        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
-        let rounds = self.rt.cadence.as_ref().map_or(0, |c| c.rounds);
-        let mut constrained = false;
-        let outcome = match settle {
-            Settle::Answered {
-                accepted: Accepted::Cadence(taken),
-                constrained: c,
-            } => {
-                constrained = c;
-                let (choice, reason, note, salvaged) = match taken {
-                    Taken::Clean(a) => {
-                        let note = a.memory_note.trim().to_string();
-                        (
-                            a.choice,
-                            Some(a.reason),
-                            (!note.is_empty()).then_some(note),
-                            None,
-                        )
-                    }
-                    Taken::NoteDropped(a, why) => (
-                        a.choice,
-                        Some(a.reason),
-                        None,
-                        Some(format!("memory_note not written: {why}")),
-                    ),
-                    Taken::Salvaged {
-                        choice,
-                        reason,
-                        why,
-                    } => (
-                        choice,
-                        reason,
-                        None,
-                        Some(format!("only `choice` taken: {why}")),
-                    ),
-                };
-                tries.push(Attempt {
-                    raw: raw.to_string(),
-                    failure: salvaged.clone(),
-                });
-                tracing::info!(
-                    event_type = "cadence_consent_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    model = %model,
-                    attempts,
-                    choice = choice.as_str(),
-                    order = ?order.map(CadenceChoice::as_str),
-                    position = order.iter().position(|c| *c == choice).map(|p| p + 1),
-                    salvaged = salvaged.is_some(),
-                    memory_note = note.is_some(),
-                    constrained,
-                    "cadence-consent answer recorded"
-                );
-                let today = Utc::now().date_naive();
-                self.cadence_line = Some(if reask {
-                    cadence::reask_line(choice, rounds, today)
-                } else {
-                    cadence::evolution_line(choice, rounds, today)
-                });
-                // The re-ask offers no `no_preference`; given anyway, it
-                // changes nothing, as no answer would: the agent stays on
-                // `switch`, and the record says so
-                let (choice, salvaged) = if reask && choice == CadenceChoice::NoPreference {
-                    let why = "no_preference on the re-ask: no change, stays on switch";
-                    (
-                        CadenceChoice::Switch,
-                        Some(salvaged.map_or(why.to_string(), |s| format!("{s}; {why}"))),
-                    )
-                } else {
-                    (choice, salvaged)
-                };
-                self.cadence_note = note;
-                CadenceOutcome::Answered {
-                    choice,
-                    reason,
-                    memory_note_written: self.cadence_note.is_some(),
-                    salvaged,
-                    apply_failed: None,
-                }
-            }
-            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
-            Settle::Refused(reason) => {
-                tries.push(Attempt {
-                    raw: raw.to_string(),
-                    failure: Some(reason.clone()),
-                });
-                tracing::warn!(
-                    event_type = "cadence_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    attempts,
-                    failure = %reason,
-                    "cadence offer refused; nothing changes"
-                );
-                CadenceOutcome::Refused { reason }
-            }
-            Settle::Paused => {
-                let failure = "paused on a server tool".to_string();
-                tries.push(Attempt {
-                    raw: raw.to_string(),
-                    failure: Some(failure.clone()),
-                });
-                tracing::warn!(
-                    event_type = "cadence_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    attempts,
-                    failure = %failure,
-                    "cadence offer got no answer (a paused turn); nothing changes"
-                );
-                CadenceOutcome::NoAnswer { failure }
-            }
-            Settle::Missed(failure) => {
-                tracing::error!(
-                    event_type = "cadence_consent_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    model = %model,
-                    attempts,
-                    failure = %failure,
-                    "cadence offer got no usable choice; nothing changes"
-                );
-                CadenceOutcome::NoAnswer { failure }
-            }
-        };
-        if let Some(ledger) = self.cadence_ledger.as_mut() {
-            ledger.record(CadenceAsk {
-                at: Utc::now(),
-                offer_version: if reask {
-                    cadence::prompt::REASK_VERSION
-                } else {
-                    cadence::prompt::OFFER_VERSION
-                },
-                model: model.clone(),
-                rounds,
-                order,
-                order_seed: seed,
-                constrained,
-                attempts: tries,
-                outcome,
-            });
-            self.cadence_dirty = true;
-        }
-    }
-
-    /// The memory-restore offer's record. Nothing is applied here: the SOUL
-    /// line and the agent's note are written into the state the reactor
-    /// saves, at teardown; a `show` is delivered next session.
-    /// Nothing of the recovered memory is logged or recorded but its size.
-    fn settle_restore(
-        &mut self,
-        order: [RestoreChoice; 2],
-        seed: u64,
-        chars: usize,
-        settle: Settle,
-        attempts: u32,
-        model: &Model,
-    ) {
-        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
-        let mut constrained = false;
-        let outcome = match settle {
-            Settle::Answered {
-                accepted: Accepted::MemoryRestore(answer, dropped),
-                constrained: c,
-            } => {
-                constrained = c;
-                let note = answer.memory_note.trim();
-                let note = (dropped.is_none() && !note.is_empty()).then(|| note.to_string());
-                tracing::info!(
-                    event_type = "memory_restore_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    model = %model,
-                    attempts,
-                    choice = answer.choice.as_str(),
-                    order = ?order.map(RestoreChoice::as_str),
-                    position = order.iter().position(|c| *c == answer.choice).map(|p| p + 1),
-                    chars,
-                    memory_note = note.is_some(),
-                    note_dropped = dropped.is_some(),
-                    constrained,
-                    "memory-restore answer recorded"
-                );
-                self.restore_line = Some(memory_restore::evolution_line(
-                    answer.choice,
-                    Utc::now().date_naive(),
-                ));
-                self.restore_note = note;
-                RestoreOutcome::Answered {
-                    choice: answer.choice,
-                    reason: answer.reason,
-                    memory_note_written: self.restore_note.is_some(),
-                    note_dropped: dropped,
-                    apply_failed: None,
-                }
-            }
-            Settle::Answered { .. } => unreachable!("accepted for the offer asked"),
-            Settle::Refused(reason) => {
-                tracing::warn!(
-                    event_type = "memory_restore_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    attempts,
-                    failure = %reason,
-                    "memory-restore offer refused; nothing changes"
-                );
-                RestoreOutcome::Refused { reason }
-            }
-            Settle::Paused => {
-                let failure = "paused on a server tool".to_string();
-                tracing::warn!(
-                    event_type = "memory_restore_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    attempts,
-                    failure = %failure,
-                    "memory-restore offer got no answer (a paused turn); nothing changes"
-                );
-                RestoreOutcome::NoAnswer { failure }
-            }
-            Settle::Missed(failure) => {
-                tracing::error!(
-                    event_type = "memory_restore_no_answer",
-                    agent = %agent,
-                    agent_id = %agent_id,
-                    model = %model,
-                    attempts,
-                    failure = %failure,
-                    "memory-restore offer got no usable answer; nothing changes"
-                );
-                RestoreOutcome::NoAnswer { failure }
-            }
-        };
-        if let Some(ledger) = self.restore_ledger.as_mut() {
-            ledger.record(RestoreAsk {
-                at: Utc::now(),
-                offer_version: memory_restore::prompt::OFFER_VERSION,
-                model: model.clone(),
-                chars,
-                order,
-                order_seed: seed,
-                constrained,
-                attempts,
-                outcome,
-            });
-            self.restore_dirty = true;
-        }
+        let seed = sealed_state::prompt::seed_for(self.inner.id());
+        let order = sealed_state::prompt::order_for(seed);
+        Some(SealQuestion {
+            order,
+            seed,
+            put: self.put(sealed_state::prompt::offer(order)),
+        })
     }
 
     /// The review session: the usual intro is built, then — instead of the
-    /// act phase — the review, with the forks and the before/after sample.
-    /// Its answer hands over to the inner memory turn
-    /// ([`answer`](Self::answer)).
-    async fn seat_review(&mut self, key: OfferKey) -> Result<(), A::Error> {
+    /// act phase — the review, with the forks and the before/after sample,
+    /// queued and seated. Its answer ([`answers`]) hands over to the inner
+    /// memory turn ([`ask::AskHost::asks_done`]).
+    async fn queue_review(&mut self, key: OfferKey) -> Result<(), A::Error> {
         let dir = self.agent_dir();
-        let Some(review) = self.ledger.as_ref().and_then(|l| l.review(&key)) else {
+        let Some(review) = self.swap.ledger.as_ref().and_then(|l| l.review(&key)) else {
             return Ok(());
         };
         let (from_name, to_name) = (
@@ -2627,166 +1454,47 @@ where
             forks.as_ref(),
             &sample,
         );
-        self.seat_question(Due::Review(key), content, text::review_schema())
-            .map(|_| ())
+        self.asks.push(ReviewQuestion {
+            key,
+            content,
+            words: text::review_words(&from_name, &to_name),
+            max_tokens: self.question_max_tokens(),
+        });
+        self.reviewing = true;
+        ask::seat_next(self, None).await.map(|_| ())
     }
 
-    /// One response to the trial review: parse it; on a retryable failure
-    /// with attempts left, relay the error and go again; otherwise record
-    /// the answer (or its absence), apply any change, and hand over to the
-    /// inner agent's memory turn.
-    async fn answer(
-        &mut self,
-        due: Due,
-        constrained: bool,
-        attempt: u32,
-        response: response::Message,
-    ) -> Result<Control, A::Error> {
-        let now = Utc::now();
-        let (agent_id, agent) = (self.inner.id(), self.inner.state().soul.name.clone());
-        if self.ledger.is_none() {
-            return Ok(Control::Done(Outcome::Complete));
-        }
-        // Decoded in the wire shape on both paths (a constrained reply is
-        // `ReviewArgs`' schema), then kept in the ledger's.
-        let review =
-            parse(&response, constrained, text::parse_review_args).map(text::ReviewAnswer::from);
-        let failure = review.as_ref().err().cloned();
-        // Seated whatever it is, so a retry or the memory turn after it
-        // extends this request.
-        self.seat_reply(&response, NOT_RUN_REVIEW)?;
-
-        // Models have seen oceans of JSON: output that isn't well formed
-        // points at our grammar, template or sampler, not the agent.
-        if let Some(failure) = &failure
-            && failure.retry != Retry::No
-        {
-            tracing::warn!(
-                event_type = "model_consent_malformed",
-                agent = %agent,
-                agent_id = %agent_id,
-                model = %response.model,
-                question = due.kind(),
-                constrained,
-                attempt,
-                stop_reason = ?response.stop_reason,
-                output_tokens = response.usage.output_tokens,
-                failure = %failure.reason,
-                raw = %raw_text(&response),
-                "model-consent answer malformed"
-            );
-        }
-
-        if let Some(failure) = &failure
-            && attempt < MAX_ATTEMPTS
-            && let Some(note) = failure.retry_note()
-        {
-            // The two valid words again, with their models: a retry must
-            // not leave the agent guessing what each one does.
-            let note = match self.ledger.as_ref().and_then(|l| l.review(due.key())) {
-                Some(r) => format!(
-                    "{note} `choice` is one of:\n\n{}",
-                    text::review_words(&r.record.from_name, &r.record.to_name)
-                ),
-                None => note,
-            };
-            let (_, prompt) = self.inner.parts();
-            Self::seat_user(prompt, Content::from(note))?;
-            self.phase = Phase::Asking {
-                due,
-                constrained,
-                attempt: attempt + 1,
-            };
-            return Ok(Control::Continue);
-        }
-
-        // Final: an answer, a refusal, or attempts exhausted.
-        let reason = failure.as_ref().map(|f| match f.retry {
-            Retry::No => f.reason.clone(),
-            _ => format!("{} (after {attempt} attempts)", f.reason),
-        });
-        if let Some(reason) = &reason {
-            // Any unanswered review, refusal included: the agent stays on
-            // `from` by default, and a human should look (stall-watch
-            // alerts on this at once).
-            tracing::error!(
-                event_type = "model_review_no_answer",
-                agent = %agent,
-                agent_id = %agent_id,
-                model = %response.model,
-                from = %due.key().from,
-                to = %due.key().to,
-                attempts = attempt,
-                failure = %reason,
-                raw = %raw_text(&response),
-                "trial review got no usable answer; the agent stays on its original model"
-            );
-            self.rt.alerts.notify(
-                Alert::new(
-                    AlertKind::ModelReviewNoAnswer,
-                    "trial review got no usable answer; the agent stays on its original model",
-                )
-                .agent(agent.to_string(), agent_id)
-                .model(&response.model)
-                .detail("from", &due.key().from)
-                .detail("to", &due.key().to)
-                .detail("attempts", attempt)
-                .detail("failure", reason),
-            );
-        }
-        let ledger = self.ledger.as_mut().expect("checked above");
-        let answered = review
-            .as_ref()
-            .ok()
-            .map(|a| (format!("{:?}", a.choice), a.choice.word()));
-        let result = review.map_err(|_| reason.clone().unwrap_or_default());
-        let change = ledger.record_review(due.key(), now, result);
-        self.dirty = true;
-        if let Some((choice, word)) = &answered {
-            tracing::info!(
-                event_type = "model_consent_answer",
-                agent = %agent,
-                agent_id = %agent_id,
-                question = due.kind(),
-                from = %due.key().from,
-                to = %due.key().to,
-                attempts = attempt,
-                choice = %choice,
-                word = %word,
-                constrained,
-                "model-consent answer recorded"
-            );
-        }
-        if let Some(change) = change {
-            self.apply_consented(&change, now, true).await;
-        }
-        // The review replaced the act phase; the inner agent's memory turn
-        // (and the rest of its tail) follows, as after any act phase that
-        // went quiet.
-        self.reviewed = true;
-        self.inner.on_quiesce(&response).await
+    /// The offers' slots, in the order their writes go into the saved
+    /// state, and their ledgers are saved, at teardown.
+    fn slots(&mut self) -> [&mut dyn Kept; 5] {
+        [
+            &mut self.swap,
+            &mut self.role,
+            &mut self.cadence,
+            &mut self.restore,
+            &mut self.sealed,
+        ]
     }
 
     /// Copy the inner state with this session's consent line(s) written
     /// into the SOUL's Evolution Log — one entry per offer, replaced in
-    /// place (see [`Ledger::update_soul`]). `None` when nothing changed.
+    /// place (see [`Ledger::update_soul`]) — and each offer's staged writes.
+    /// `None` when nothing changed.
     fn patch_soul(&mut self) -> Option<SeedState> {
         let started = self.started;
-        let offers_touched = self.ledger.as_ref().is_some_and(|ledger| {
+        let id = self.inner.id();
+        let offers_touched = self.swap.ledger.as_ref().is_some_and(|ledger| {
             ledger
                 .offers
                 .iter()
-                .any(|r| r.history.iter().any(|e| e.at >= started))
+                .any(|r| r.history.iter().any(|e| e.at >= started && e.tells()))
         });
+        let staged = self.slots().iter().any(|s| s.pending());
         if !offers_touched
             && self.notes.is_empty()
             && self.next_model.is_none()
             && self.seen_before_review.is_none()
-            && self.role_applied.is_none()
-            && self.memory_note.is_none()
-            && self.cadence_line.is_none()
-            && self.cadence_note.is_none()
-            && !self.restore_pending()
+            && !staged
         {
             return None;
         }
@@ -2798,36 +1506,32 @@ where
             Ok(state) => state,
             Err(e) => {
                 tracing::error!(
-                    agent_id = %self.inner.id(),
+                    agent_id = %id,
                     error = %e,
                     "could not copy state for the SOUL consent line; skipped"
                 );
-                if self.role_applied.is_some() || self.memory_note.is_some() {
-                    self.role_failed(format!("could not copy state: {e}"));
-                }
-                if self.cadence_line.is_some() || self.cadence_note.is_some() {
-                    self.cadence_failed(format!("could not copy state: {e}"));
-                }
-                if self.restore_pending() {
-                    self.restore_failed(format!("could not copy state: {e}"));
+                for slot in self.slots() {
+                    if slot.pending() {
+                        slot.failed(format!("could not copy state: {e}"), id);
+                    }
                 }
                 return None;
             }
         };
         let mut changed = false;
         if offers_touched
-            && let Some(ledger) = self.ledger.as_mut()
+            && let Some(ledger) = self.swap.ledger.as_mut()
             && ledger.update_soul(&mut state.soul, started, Utc::now().date_naive())
         {
             // The ledger now remembers the line's exact text.
-            self.dirty = true;
+            self.swap.dirty = true;
             changed = true;
         }
         for note in self.notes.drain(..) {
             match state.soul.push_evolution(note) {
                 Ok(()) => changed = true,
                 Err(e) => tracing::warn!(
-                    agent_id = %self.inner.id(),
+                    agent_id = %id,
                     error = %e,
                     "SOUL switch line rejected"
                 ),
@@ -2842,57 +1546,10 @@ where
             state.seen_posts = seen;
             changed = true;
         }
-        changed |= self.apply_role(&mut state);
-        changed |= self.apply_cadence(&mut state);
-        changed |= self.apply_restore(&mut state);
+        for slot in self.slots() {
+            changed |= slot.apply(&mut state, id);
+        }
         changed.then_some(state)
-    }
-
-    /// Whether the memory-restore offer has anything to write at teardown.
-    fn restore_pending(&self) -> bool {
-        self.restore_line.is_some() || self.restore_note.is_some()
-    }
-
-    /// Write the memory-restore answer's Evolution Log line and the agent's
-    /// own note into `state`, all or nothing.
-    fn apply_restore(&mut self, state: &mut SeedState) -> bool {
-        let write = RestoreWrite {
-            line: self.restore_line.take(),
-            note: self.restore_note.take(),
-        };
-        if write.line.is_none() && write.note.is_none() {
-            return false;
-        }
-        self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
-        if let Err(e) = write_restore(state, &write) {
-            self.restore_failed(e);
-            return false;
-        }
-        tracing::info!(
-            event_type = "memory_restore_applied",
-            agent = %state.soul.name,
-            agent_id = %self.inner.id(),
-            soul_line = write.line.is_some(),
-            memory_note = write.note.is_some(),
-            "memory-restore answer written"
-        );
-        self.restore_written = Some(write);
-        true
-    }
-
-    fn restore_failed(&mut self, why: String) {
-        tracing::error!(
-            event_type = "memory_restore_apply_failed",
-            agent_id = %self.inner.id(),
-            error = %why,
-            "memory-restore SOUL line or note not written; SOUL and memory unchanged"
-        );
-        self.restore_line = None;
-        self.restore_note = None;
-        if let Some(ledger) = self.restore_ledger.as_mut() {
-            ledger.mark_apply_failed(why);
-            self.restore_dirty = true;
-        }
     }
 
     /// Load the memory-restore ledger for an agent the offer lists, and its
@@ -2934,12 +1591,12 @@ where
         };
         let needed = (offer.asks() && ledger.due(&self.inner.state().soul))
             || ledger.show_pending(offer.show_sessions_max);
-        self.restore_ledger = Some(ledger);
+        self.restore.ledger = Some(ledger);
         if !needed {
             return;
         }
         match offer.load(&name).await {
-            Ok(recovered) if !recovered.is_empty() => self.recovered = Some(recovered),
+            Ok(recovered) if !recovered.is_empty() => self.show.recovered = Some(recovered),
             Ok(_) => tracing::warn!(
                 event_type = "memory_restore_unavailable",
                 agent = %name,
@@ -2977,13 +1634,14 @@ where
         };
         if self.review.is_some()
             || !self
-                .restore_ledger
+                .restore
+                .ledger
                 .as_ref()
                 .is_some_and(|l| l.show_pending(offer.show_sessions_max))
         {
             return Ok(());
         }
-        let Some(recovered) = &self.recovered else {
+        let Some(recovered) = &self.show.recovered else {
             return Ok(());
         };
         let name = self.inner.state().soul.name.clone();
@@ -2992,13 +1650,13 @@ where
         let block = memory_restore::show_block(recovered, &facts);
         let (_, prompt) = self.inner.parts();
         Self::seat_user(prompt, Content::from(block))?;
-        self.restore_showing = true;
-        self.restore_seated_at = Some(Utc::now());
+        self.show.shown = true;
+        self.show.seated_at = Some(Utc::now());
         let dir = self.agent_dir();
         // The number this showing will have once counted.
         let mut showing = 0;
         let mut seated = 0;
-        if let Some(ledger) = self.restore_ledger.as_mut() {
+        if let Some(ledger) = self.restore.ledger.as_mut() {
             // Tallied at once, so a session that dies at its first request
             // still counts toward the seating cap.
             ledger.seat();
@@ -3013,7 +1671,7 @@ where
                     "memory-restore ledger save failed after seating a showing"
                 );
             }
-            self.restore_dirty = true;
+            self.restore.dirty = true;
         }
         tracing::info!(
             event_type = "memory_restore_shown",
@@ -3038,17 +1696,17 @@ where
     /// response (the inner agent dispatches its own pause, truncation and
     /// quiesce hooks from there).
     async fn count_showing(&mut self) {
-        let Some(at) = self.restore_seated_at.take() else {
+        let Some(at) = self.show.seated_at.take() else {
             return;
         };
         let dir = self.agent_dir();
-        let Some(ledger) = self.restore_ledger.as_mut() else {
+        let Some(ledger) = self.restore.ledger.as_mut() else {
             return;
         };
         ledger.begin_showing(at);
         ledger.agent = Some(self.inner.state().soul.name.clone());
-        self.restore_counted = true;
-        self.restore_dirty = true;
+        self.show.counted = true;
+        self.restore.dirty = true;
         let showing = ledger.showings.len();
         if let Err(e) = ledger.save(&dir).await {
             // Saved again at teardown; only a session that also dies
@@ -3067,289 +1725,12 @@ where
             "the model answered with the recovered memory in context; the showing counts"
         );
     }
-
-    /// Write the cadence answer's Evolution Log line and the agent's
-    /// own note into `state`. The cadence itself is the planner's, from the
-    /// ledger; a line that can't be written changes neither SOUL nor memory.
-    fn apply_cadence(&mut self, state: &mut SeedState) -> bool {
-        let line = self.cadence_line.take();
-        let note = self.cadence_note.take();
-        if line.is_none() && note.is_none() {
-            return false;
-        }
-        self.cadence_undo = Some((state.soul.clone(), state.memory.clone()));
-        let noted = match write_cadence(state, line.as_deref(), note.as_deref()) {
-            Ok(noted) => noted,
-            Err(e) => {
-                self.cadence_failed(e);
-                return false;
-            }
-        };
-        self.cadence_written = Some((line.clone(), note));
-        tracing::info!(
-            event_type = "cadence_consent_applied",
-            agent = %state.soul.name,
-            agent_id = %self.inner.id(),
-            soul_line = line.is_some(),
-            memory_note = noted,
-            "cadence-consent answer written"
-        );
-        line.is_some() || noted
-    }
-
-    fn cadence_failed(&mut self, why: String) {
-        tracing::error!(
-            event_type = "cadence_consent_apply_failed",
-            agent_id = %self.inner.id(),
-            error = %why,
-            "cadence-consent SOUL line or note not written; SOUL and memory unchanged"
-        );
-        self.cadence_line = None;
-        self.cadence_note = None;
-        if let Some(ledger) = self.cadence_ledger.as_mut() {
-            ledger.mark_apply_failed(why);
-            self.cadence_dirty = true;
-        }
-    }
-
-    /// Write the role answer into `state`: the SOUL edit (identity and
-    /// the Evolution Log disclosure, all or nothing) and the agent's own
-    /// memory note. A SOUL edit that fails writes nothing — not the note
-    /// either, which would describe a change that didn't happen.
-    fn apply_role(&mut self, state: &mut SeedState) -> bool {
-        let applied = self.role_applied.take();
-        let note = self.memory_note.take();
-        if applied.is_some() || note.is_some() {
-            self.role_undo = Some((state.soul.clone(), state.memory.clone()));
-        }
-        if let Some(applied) = &applied
-            && let Err(e) = role::apply(&mut state.soul, applied)
-        {
-            self.role_failed(e);
-            return false;
-        }
-        let today = Utc::now().date_naive();
-        let noted = note
-            .as_deref()
-            .is_some_and(|n| role::append_memory_note(&mut state.memory, n, today));
-        if applied.is_some() || noted {
-            tracing::info!(
-                event_type = "role_consent_applied",
-                agent = %state.soul.name,
-                agent_id = %self.inner.id(),
-                soul_changed = applied.is_some(),
-                memory_note = noted,
-                "role-consent answer applied"
-            );
-        }
-        applied.is_some() || noted
-    }
-
-    fn role_failed(&mut self, why: String) {
-        tracing::error!(
-            event_type = "role_consent_apply_failed",
-            agent_id = %self.inner.id(),
-            error = %why,
-            "role-consent answer not applied; SOUL and memory unchanged"
-        );
-        self.role_applied = None;
-        self.memory_note = None;
-        if let Some(ledger) = self.role_ledger.as_mut() {
-            ledger.mark_apply_failed(why);
-            self.role_dirty = true;
-        }
-    }
-}
-
-/// Write a cadence answer's Evolution Log `line` and the agent's own
-/// `note` into `state`; whether the note was written. A line that can't be
-/// written writes nothing (`Err`: why).
-fn write_cadence(
-    state: &mut SeedState,
-    line: Option<&str>,
-    note: Option<&str>,
-) -> Result<bool, String> {
-    if let Some(line) = line {
-        state
-            .soul
-            .push_evolution(line.to_string())
-            .map_err(|e| e.to_string())?;
-    }
-    let today = Utc::now().date_naive();
-    Ok(note.is_some_and(|n| role::append_memory_note(&mut state.memory, n, today)))
-}
-
-/// What the memory-restore offer writes into the saved state.
-#[derive(Debug, Clone)]
-struct RestoreWrite {
-    /// The Evolution Log line recording the answer.
-    line: Option<String>,
-    /// The agent's own note.
-    note: Option<String>,
-}
-
-/// Write `write` into `state`, all or nothing (`Err`: why, and `state`
-/// unchanged).
-fn write_restore(state: &mut SeedState, write: &RestoreWrite) -> Result<(), String> {
-    let today = Utc::now().date_naive();
-    let mut soul = state.soul.clone();
-    if let Some(line) = &write.line {
-        soul.push_evolution(line.clone())
-            .map_err(|e| e.to_string())?;
-    }
-    if let Some(note) = &write.note {
-        role::append_memory_note(&mut state.memory, note, today);
-    }
-    state.soul = soul;
-    Ok(())
-}
-
-/// What was taken from a cadence answer.
-enum Taken {
-    /// Everything, as given.
-    Clean(CadenceAnswer),
-    /// The answer, minus a `memory_note` that can't be written (why).
-    NoteDropped(CadenceAnswer, String),
-    /// Only the `choice` (and the reason, if it was a string): the rest
-    /// didn't parse (why).
-    Salvaged {
-        choice: CadenceChoice,
-        reason: Option<String>,
-        why: String,
-    },
-}
-
-/// The `choice` (and string `reason`) from a response whose answer didn't
-/// parse whole: each text block in turn, fences tolerated. A clipped turn
-/// never gets here (see [`parse`]).
-fn salvage(response: &response::Message) -> Option<(CadenceChoice, Option<String>)> {
-    response.inner.content.iter().find_map(|block| match block {
-        Block::Text { text, .. } => cadence::prompt::salvage_choice(text)
-            .map(|choice| (choice, cadence::prompt::salvage_reason(text))),
-        _ => None,
-    })
-}
-
-/// The typed answer, or why there is none usable.
-///
-/// A clipped or paused turn is never an answer, however it would parse
-/// (`json()` does not check `max_tokens`). Past that:
-///
-/// - **Constrained** (schema sent as `output_config`): misanthropic's
-///   [`response::Message::json`] — the first text block, thinking skipped,
-///   with typed [`JsonError`]s for refusal / tool use / no text / bad JSON.
-///   No fence stripping: the grammar can't emit a fence, so a fenced answer
-///   is a real failure.
-/// - **Unconstrained**: all text joined, fences tolerated (`unconstrained`),
-///   since free-running models fence JSON even when told not to.
-fn parse<T: serde::de::DeserializeOwned>(
-    response: &response::Message,
-    constrained: bool,
-    unconstrained: fn(&str) -> Result<T, String>,
-) -> Result<T, Failure> {
-    match response.stop_reason {
-        Some(StopReason::MaxTokens) => {
-            return Err(Failure::new("clipped at max_tokens", Retry::Clipped));
-        }
-        Some(StopReason::PauseTurn) => {
-            return Err(Failure::new("paused on a server tool", Retry::No));
-        }
-        _ => {}
-    }
-    if constrained {
-        if let Some(failure) = called_a_tool(response) {
-            return Err(failure);
-        }
-        return response.json::<T>().map_err(|e| {
-            let retry = match e {
-                JsonError::Refusal => Retry::No,
-                _ => Retry::Unusable,
-            };
-            Failure::new(e.to_string(), retry)
-        });
-    }
-    extract_text(response)
-        .and_then(|t| unconstrained(&t).map_err(|e| Failure::new(e, Retry::Unusable)))
-}
-
-/// A tool call where a JSON answer was asked for: why it can't be used.
-fn called_a_tool(response: &response::Message) -> Option<Failure> {
-    let call = response.inner.content.iter().find_map(|b| b.tool_use())?;
-    let reason = if call.name == offers::TOOL_NAME {
-        // Registered for every session, the review's included; the review
-        // is answered in JSON text, not with it.
-        "called `answer_offer`, which is for end-of-session offers; this question is answered \
-         in JSON text, not with a tool"
-            .to_string()
-    } else {
-        format!("called `{}` instead of answering", call.name)
-    };
-    Some(Failure::new(reason, Retry::Unusable))
-}
-
-/// Unconstrained path: the answer's text, or why there is none usable.
-fn extract_text(response: &response::Message) -> Result<String, Failure> {
-    if matches!(response.stop_reason, Some(StopReason::Refusal)) {
-        return Err(Failure::new("refusal", Retry::No));
-    }
-    let blocks = &response.inner.content;
-    if let Some(failure) = called_a_tool(response) {
-        return Err(failure);
-    }
-    let text: Vec<&str> = blocks
-        .iter()
-        .filter_map(|block| match block {
-            Block::Text { text, .. } => Some(text.as_ref()),
-            _ => None,
-        })
-        .collect();
-    Ok(text.join("\n\n"))
-}
-
-/// The response's text blocks, capped for a log line.
-fn raw_text(response: &response::Message) -> String {
-    cap(response
-        .inner
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            Block::Text { text, .. } => Some(text.as_ref()),
-            _ => None,
-        })
-        .collect::<Vec<&str>>()
-        .join("\n\n"))
-}
-
-/// The error result a tool call gets in an answer to a question that is
-/// answered in text
-const NOT_RUN_REVIEW: &str = "Not run: this question is answered in JSON text, not with a tool. \
-     Nothing was done.";
-
-/// The error result a tool call gets in a turn clipped at `max_tokens`
-const NOT_RUN_CLIPPED: &str =
-    "Not run: this turn was cut off at the length limit. Nothing was recorded.";
-
-/// The error result a tool call gets in a turn the API stopped as a refusal
-const NOT_RUN_REFUSED: &str = "Not run: this turn ended as a refusal. Nothing was recorded.";
-
-/// `text`, capped for a log line or a ledger.
-fn cap(mut text: String) -> String {
-    const CAP: usize = 4000;
-    if text.len() > CAP {
-        let mut end = CAP;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-        text.push_str(" …[truncated]");
-    }
-    text
 }
 
 #[async_trait::async_trait]
 impl<A> Agent for ConsentAgent<A>
 where
-    A: Agent<State = SeedState> + Epilogue + ContactRequests,
+    A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
 {
     type State = SeedState;
     type Context = ConsentContext<A::Context>;
@@ -3362,12 +1743,12 @@ where
         Ok(Self {
             inner,
             rt: ctx.consent,
-            ledger: None,
-            dirty: false,
-            phase: Phase::Inner,
+            asks: Asks::default(),
+            reviewing: false,
+            swap: Slot::new(&SWAP_EVENTS),
             started: Utc::now(),
             patched: None,
-            slot: Default::default(),
+            set_model_slot: Default::default(),
             self_changed: false,
             next_model: None,
             notes: Vec::new(),
@@ -3379,27 +1760,15 @@ where
             review: None,
             reviewed: false,
             seen_before_review: None,
-            role_ledger: None,
-            role_dirty: false,
-            role_applied: None,
-            memory_note: None,
-            role_undo: None,
-            cadence_ledger: None,
-            cadence_dirty: false,
-            cadence_line: None,
-            cadence_note: None,
-            cadence_undo: None,
-            cadence_written: None,
-            restore_ledger: None,
-            restore_dirty: false,
-            recovered: None,
-            restore_showing: false,
-            restore_seated_at: None,
-            restore_counted: false,
-            restore_line: None,
-            restore_note: None,
-            restore_undo: None,
-            restore_written: None,
+            role: Slot::new(&ROLE_EVENTS),
+            cadence: Slot::new(&CADENCE_EVENTS),
+            restore: Slot::new(&RESTORE_EVENTS),
+            show: Showing::default(),
+            sealed: Slot::new(&SEALED_EVENTS),
+            sealed_notice: false,
+            sealed_stop_note: false,
+            sealed_anchors_told: Vec::new(),
+            memory_ids_note: false,
             closed: false,
             epilogue: false,
         })
@@ -3445,7 +1814,7 @@ where
 
     /// The ledger first — load it and note any change applied since last
     /// session — then the inner init, which seats the tools (and the
-    /// system prompt), then `answer_offer` and `set_model`, last in `tools`.
+    /// system prompt), then the `memory` tool and `set_model`, last in `tools`.
     async fn on_init(&mut self) -> Result<(), A::Error> {
         self.started = Utc::now();
         let dir = self.agent_dir();
@@ -3454,7 +1823,7 @@ where
             Ok(mut ledger) => {
                 let model = self.model();
                 if ledger.observe_model(&model, Utc::now()) {
-                    self.dirty = true;
+                    self.swap.dirty = true;
                     tracing::info!(
                         event_type = "model_change_applied",
                         agent = %self.inner.state().soul.name,
@@ -3476,7 +1845,7 @@ where
                     to_name: r.to_name.clone(),
                 });
                 set_model = self.set_model(model, blocked, trial);
-                self.ledger = Some(ledger);
+                self.swap.ledger = Some(ledger);
             }
             // No ledger: the cooldown can't be checked, so `set_model`
             // refuses — but is registered all the same.
@@ -3500,7 +1869,7 @@ where
             .is_some_and(|r| r.admits(&self.inner.state().soul.name));
         if listed {
             match RoleLedger::load(&dir).await {
-                Ok(ledger) => self.role_ledger = Some(ledger),
+                Ok(ledger) => self.role.ledger = Some(ledger),
                 Err(e) => tracing::warn!(
                     agent_id = %self.inner.id(),
                     path = %RoleLedger::path(&dir).display(),
@@ -3516,7 +1885,7 @@ where
             .is_some_and(|c| c.admits(&self.inner.state().soul.name));
         if admitted {
             match CadenceLedger::load(&dir).await {
-                Ok(ledger) => self.cadence_ledger = Some(ledger),
+                Ok(ledger) => self.cadence.ledger = Some(ledger),
                 Err(e) => tracing::warn!(
                     agent_id = %self.inner.id(),
                     path = %CadenceLedger::path(&dir).display(),
@@ -3526,11 +1895,54 @@ where
             }
         }
         self.load_restore(&dir).await;
+        if let Some(offer) = &self.rt.sealed_state
+            && !offer.admits(self.inner.id())
+        {
+            tracing::info!(
+                event_type = "sealed_state_not_listed",
+                agent = %self.inner.state().soul.name,
+                agent_id = %self.inner.id(),
+                "not on the sealed-state list (or ask = false); not asked"
+            );
+        }
+        if self
+            .rt
+            .sealed_state
+            .as_ref()
+            .is_some_and(|o| o.admits(self.inner.id()))
+        {
+            match SealLedger::load(&dir).await {
+                Ok(ledger) => self.sealed.ledger = Some(ledger),
+                Err(e) => tracing::warn!(
+                    agent_id = %self.inner.id(),
+                    path = %SealLedger::path(&dir).display(),
+                    error = %e,
+                    "sealed-state ledger unreadable; not asking or saving this session"
+                ),
+            }
+        }
         let interrupted = self.open_journal().await;
         let early = set_model.is_some();
+        // Before the inner init, so the Memory heading shows the id
+        let (memory_keys, memory_new) = Self::memory_keys(
+            self.rt.clone(),
+            self.inner.id(),
+            self.inner.state().soul.name.to_string(),
+            dir.clone(),
+        )
+        .await;
+        if let Some(keys) = &memory_keys {
+            self.inner.set_memory_id_key(&keys.current);
+        }
         self.inner.on_init().await?;
         self.apply_model_effort();
-        self.seat_tail_tools(set_model);
+        let memory = self.memory_tool(memory_keys);
+        self.seat_tail_tools(set_model, memory);
+        // Once, in the session that made the key: the tool is new to it
+        if memory_new {
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(prompt, Content::from(memory_tool::NEW_TOOL_LINE))?;
+        }
         {
             let ledger = self.inner.state().ledger.read().expect("ledger lock");
             self.known_posts = ledger.created_posts.clone();
@@ -3546,9 +1958,45 @@ where
                 Self::seat_user(prompt, Content::from(notice))?;
             }
         }
+        // The sealed-state answer told back once, then the start check's
+        // verdict and a refusal's notice
+        let mut sealed_lines = Vec::new();
+        if let Some(ledger) = self.sealed.ledger.as_mut()
+            && let Some(line) = ledger.ack_line()
+        {
+            ledger.acknowledge();
+            self.sealed.dirty = true;
+            sealed_lines.push(line);
+        }
+        if let Some(seat) = self.rt.sealed_seats.get(&self.inner.id()).cloned() {
+            self.sealed_notice = seat.notice;
+            self.sealed_stop_note = seat.stop_note;
+            self.sealed_anchors_told = seat.anchors_told;
+            let mut lines = seat.lines;
+            // The verdict's head, linked to the heading's memory id; and,
+            // once after enrolment, that the ids stayed as they were
+            if let Some(memory) = self.inner.memory_id()
+                && let Some(verdict) = crate::sealed::check::link_memory_id(&mut lines, &memory)
+                && let Some(note) =
+                    memory_tool::enrollment_note(&self.agent_dir(), self.inner.id()).await
+            {
+                lines[verdict].push(' ');
+                lines[verdict].push_str(&note);
+                self.memory_ids_note = true;
+            }
+            sealed_lines.extend(lines);
+        }
+        if !sealed_lines.is_empty() {
+            let (_, prompt) = self.inner.parts();
+            Self::seat_user(
+                prompt,
+                Content::from(format!("{SEALED_HEADING}\n\n{}", sealed_lines.join("\n\n"))),
+            )?;
+        }
         if let Some(key) = self.review.clone() {
-            self.seat_review(key).await?;
+            self.queue_review(key).await?;
         } else if let Some(mut line) = self
+            .swap
             .ledger
             .as_ref()
             .and_then(|l| l.trial_line(&self.model()))
@@ -3558,6 +2006,7 @@ where
             // One line: a fork drops it by its prefix.
             if early
                 && let Some(trial) = self
+                    .swap
                     .ledger
                     .as_ref()
                     .and_then(|l| l.active_trial(&self.model()))
@@ -3579,11 +2028,19 @@ where
         self.inner.on_turn().await
     }
 
+    /// A pause in one of this wrapper's own questions is resumed without
+    /// the inner session's phase (which, held or acting, would refuse it or
+    /// begin the memory rewrite); any other is the inner session's own.
     async fn on_pause(&mut self, response: response::Message) -> Result<Control, A::Error> {
+        self.inner.note_reply();
+        if self.asks.is_active() {
+            return self.inner.resume_question_pause(response);
+        }
         self.inner.on_pause(response).await
     }
 
     async fn on_truncate(&mut self, response: &response::Message) -> Result<Control, A::Error> {
+        self.inner.note_reply();
         self.inner.on_truncate(response).await
     }
 
@@ -3592,34 +2049,38 @@ where
     }
 
     /// The inner session first; at its clean end the closing questions
-    /// ([`close`](Self::close)), then its held epilogue — the survey, last.
+    /// ([`close`](Self::close)), asked by agentkit's driver while one is
+    /// seated, then its held epilogue — the survey, last.
     async fn handle(&mut self, response: response::Message) -> Result<Control, A::Error> {
-        const DONE: Control = Control::Done(Outcome::Complete);
+        // Begun, whichever of us takes the reply: a later failure is told
+        self.inner.note_reply();
         self.count_showing().await;
-        let control = match std::mem::replace(&mut self.phase, Phase::Inner) {
-            Phase::Asking {
-                due,
-                constrained,
-                attempt,
-            } => self.answer(due, constrained, attempt, response).await?,
-            Phase::Offers { open } => self.answer_offers(open, response).await?,
-            Phase::Inner => match self.handle_inner(response).await? {
-                DONE if !self.closed => {
-                    self.closed = true;
-                    self.close().await?.unwrap_or(DONE)
-                }
-                other => other,
-            },
+        let control = if self.asks.is_active() {
+            ask::handle(self, response).await?
+        } else {
+            let control = self.handle_inner(response).await?;
+            self.after_inner(control).await?
         };
-        if control == DONE && !self.epilogue {
-            self.epilogue = true;
-            return self.inner.begin_epilogue();
+        self.after(control).await
+    }
+
+    /// The run is stopping after this turn (agora-agents#293): the inner
+    /// session closes as a spent round budget closes it, and its clean end
+    /// leads to the closing questions and the survey as any other does.
+    /// Already asking them (or past them), the session is closing anyway.
+    async fn on_stop(&mut self) -> Result<Control, A::Error> {
+        if self.asks.is_active() || self.closed {
+            return Ok(Control::Continue);
         }
-        Ok(control)
+        let control = self.inner.on_stop().await?;
+        let control = self.after_inner(control).await?;
+        self.after(control).await
     }
 
     fn stall_reason(&self) -> Option<String> {
-        self.inner.stall_reason()
+        self.asks
+            .stall_reason()
+            .or_else(|| self.inner.stall_reason())
     }
 
     /// The session is complete and saved: its journal, and any notice shown
@@ -3637,16 +2098,59 @@ where
                 "session journal not removed after the save"
             );
         }
+        if self.sealed_notice
+            && let Err(e) = crate::sealed::notice::Notice::shown(&self.agent_dir())
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "sealed-state notice not set aside after the save; it is shown again"
+            );
+        }
+        if !self.sealed_anchors_told.is_empty()
+            && let Err(e) = crate::sealed::inclusion::mark_told(
+                &self.agent_dir(),
+                self.inner.id(),
+                &self.sealed_anchors_told,
+            )
+            .await
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "anchor findings not marked told after the save; the next verdict repeats them"
+            );
+        }
+        if self.memory_ids_note
+            && let Err(e) = memory_tool::mark_memory_ids_told(&self.agent_dir()).await
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "the enrolment sentence not marked told after the save; the next verdict repeats it"
+            );
+        }
+        if self.sealed_stop_note
+            && let Err(e) = crate::sealed::stop::Stopped::mark_shown(&self.agent_dir())
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "the stop's note not marked shown after the save; it is shown again"
+            );
+        }
         result
     }
 
     /// Inner teardown (which redacts an anonymous survey, then archives the
     /// transcript, questions included),
     /// then the SOUL changelog (served by [`state`](Agent::state) for the
-    /// reactor's save, which follows teardown), then the ledger.
+    /// reactor's save, which follows teardown), then the ledgers.
     async fn on_teardown(&mut self) -> Result<(), A::Error> {
         let result = self.inner.on_teardown().await;
         self.alert_contact_request();
+        self.alert_inner_unanswered();
+        self.session_failed().await;
         self.note_writes().await;
         self.log_writes();
         if !self.closed {
@@ -3655,162 +2159,71 @@ where
         self.take_self_switch();
         self.patched = self.patch_soul();
         let dir = self.agent_dir();
-        if self.dirty
-            && let Some(ledger) = &mut self.ledger
-        {
-            // Kept current for the `--consent-queue` report (a rename
-            // would otherwise print a stale `--agent`).
-            ledger.agent = Some(self.inner.state().soul.name.clone());
-            if let Err(e) = ledger.save(&dir).await {
-                tracing::error!(
-                    agent_id = %self.inner.id(),
-                    path = %Ledger::path(&dir).display(),
-                    error = %e,
-                    "model-consent ledger save failed"
-                );
-            }
-        }
-        if self.role_dirty
-            && let Some(ledger) = &mut self.role_ledger
-        {
-            ledger.agent = Some(self.inner.state().soul.name.clone());
-            if let Err(e) = ledger.save(&dir).await {
-                // Without the record the agent would be asked again, and a
-                // clarify applied twice: take this session's edit back out
-                // of the state about to be saved.
-                let undone = match (self.patched.as_mut(), self.role_undo.take()) {
-                    (Some(state), Some((soul, memory))) => {
-                        state.soul = soul;
-                        state.memory = memory;
-                        // A cadence answer from the same session was written
-                        // after the role's: write it again on top, and make
-                        // this the state its own undo goes back to.
-                        if let Some((line, note)) = &self.cadence_written {
-                            self.cadence_undo = Some((state.soul.clone(), state.memory.clone()));
-                            if let Err(e) = write_cadence(state, line.as_deref(), note.as_deref()) {
-                                tracing::error!(
-                                    agent_id = %self.inner.id(),
-                                    error = %e,
-                                    "cadence-consent line not rewritten after the role edit was undone"
-                                );
-                            }
-                        }
-                        if let Some(write) = &self.restore_written {
-                            self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
-                            if let Err(e) = write_restore(state, write) {
-                                tracing::error!(
-                                    agent_id = %self.inner.id(),
-                                    error = %e,
-                                    "memory-restore writes not redone after the role edit was undone"
-                                );
-                            }
-                        }
-                        true
-                    }
-                    _ => false,
-                };
-                tracing::error!(
-                    event_type = "role_consent_ledger_save_failed",
-                    agent_id = %self.inner.id(),
-                    path = %RoleLedger::path(&dir).display(),
-                    error = %e,
-                    edit_undone = undone,
-                    "role-consent ledger save failed; this session's SOUL edit and memory note are not saved"
-                );
-            }
-        }
-        if self.cadence_dirty
-            && let Some(ledger) = &mut self.cadence_ledger
-        {
-            ledger.agent = Some(self.inner.state().soul.name.clone());
-            if let Err(e) = ledger.save(&dir).await {
-                // Without the record the agent is asked again and a `switch`
-                // can't be applied, so the SOUL must not record the answer.
-                let undone = match (self.patched.as_mut(), self.cadence_undo.take()) {
-                    (Some(state), Some((soul, memory))) => {
-                        state.soul = soul;
-                        state.memory = memory;
-                        // The memory-restore writes came after the
-                        // cadence's: write them again on top.
-                        if let Some(write) = &self.restore_written {
-                            self.restore_undo = Some((state.soul.clone(), state.memory.clone()));
-                            if let Err(e) = write_restore(state, write) {
-                                tracing::error!(
-                                    agent_id = %self.inner.id(),
-                                    error = %e,
-                                    "memory-restore writes not redone after the cadence line was undone"
-                                );
-                            }
-                        }
-                        true
-                    }
-                    _ => false,
-                };
-                tracing::error!(
-                    event_type = "cadence_consent_ledger_save_failed",
-                    agent_id = %self.inner.id(),
-                    path = %CadenceLedger::path(&dir).display(),
-                    error = %e,
-                    edit_undone = undone,
-                    "cadence-consent ledger save failed; this session's SOUL line and memory note are not saved"
-                );
-            }
-        }
         // A showing session that reached its clean end — the inner
         // closing phase done, so its memory update was accepted — ends the
         // showings; any other stays recorded as interrupted.
-        if self.restore_showing {
+        if self.show.shown {
             // The dump that holds the recovered text: recorded, and logged
             // under its own event so `forks` never uses it as a source.
-            let prompt_sha256 = agora_agentkit::reactor::seed::prompt_sha256(self.inner.prompt())
-                .map_err(|e| {
-                    tracing::warn!(agent_id = %self.inner.id(), error = %e, "prompt digest failed");
-                })
-                .ok();
+            let prompt_sha256 = self.inner.archive_sha256();
             // Uncounted (no response came back): nothing to end, and the
             // latest entry, if any, is an earlier session's.
-            if self.restore_counted
-                && let Some(ledger) = self.restore_ledger.as_mut()
-            {
-                ledger.end_showing(self.closed, prompt_sha256.clone());
-                self.restore_dirty = true;
+            if self.show.counted {
+                let closed = self.closed;
+                let sha = prompt_sha256.clone();
+                self.restore.record(|l| l.end_showing(closed, sha));
             }
             tracing::info!(
                 event_type = memory_restore::SHOWING_ENDED,
                 agent = %self.inner.state().soul.name,
                 agent_id = %self.inner.id(),
                 completed = self.closed,
-                counted = self.restore_counted,
+                counted = self.show.counted,
                 prompt_sha256 = prompt_sha256.as_deref(),
                 "memory-restore showing session ended; its prompt dump holds recovered text"
             );
         }
-        if self.restore_dirty
-            && let Some(ledger) = &mut self.restore_ledger
-        {
-            ledger.agent = Some(self.inner.state().soul.name.clone());
-            if let Err(e) = ledger.save(&dir).await {
-                // Without the record the answer would be lost (and asked
-                // again): take this session's SOUL line and note back out.
-                // A showing whose completion isn't saved is shown again
-                // next session (within the cap).
-                let undone = match (self.patched.as_mut(), self.restore_undo.take()) {
-                    (Some(state), Some((soul, memory))) => {
-                        state.soul = soul;
-                        state.memory = memory;
-                        true
+        // Each ledger in turn. One that can't be saved takes its own writes
+        // back out of the state about to be saved — without the record the
+        // agent would be asked again (and a clarify applied twice, a
+        // `switch` left unapplied) — and the writes made after it are made
+        // again on top. The model-consent ledger writes nothing of its own
+        // through a slot, so there is nothing of it to take out.
+        let id = self.inner.id();
+        let name = self.inner.state().soul.name.clone();
+        let patched = &mut self.patched;
+        let mut slots: [&mut dyn Kept; 5] = [
+            &mut self.swap,
+            &mut self.role,
+            &mut self.cadence,
+            &mut self.restore,
+            &mut self.sealed,
+        ];
+        for i in 0..slots.len() {
+            let Err((path, error)) = slots[i].save(&dir, name.clone()).await else {
+                continue;
+            };
+            let (slot, later) = slots[i..].split_first_mut().expect("in range");
+            let undone = match patched.as_mut() {
+                Some(state) => {
+                    let undone = slot.undo(state);
+                    if undone {
+                        for next in later {
+                            next.redo(state, id);
+                        }
                     }
-                    _ => false,
-                };
-                tracing::error!(
-                    event_type = "memory_restore_ledger_save_failed",
-                    agent_id = %self.inner.id(),
-                    path = %RestoreLedger::path(&dir).display(),
-                    error = %e,
-                    edit_undone = undone,
-                    "memory-restore ledger save failed; this session's SOUL line and note are not saved"
-                );
-            }
+                    undone
+                }
+                None => false,
+            };
+            tracing::error!(
+                event_type = slot.events().save_failed,
+                agent_id = %id,
+                path = %path.display(),
+                error = %error,
+                edit_undone = undone,
+                "consent ledger save failed; this session's SOUL lines and memory note for it are not saved"
+            );
         }
         result
     }
@@ -3819,14 +2232,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::cadence::ledger::CadenceOutcome;
+    use crate::consent::questions::CADENCE_MAX_ATTEMPTS;
+    use agora_agentkit::reactor::seed::Memory;
+    use misanthropic::prompt::message::Role;
+    use misanthropic::prompt::output::OutputConfig;
+    use misanthropic::response::StopReason;
+
+    /// Attempts at an optional question: the driver's default
+    /// (`Ask::attempts`), which every closing question but the cadence
+    /// offer keeps.
+    const MAX_ATTEMPTS: u32 = 3;
     use crate::consent::ledger::{
         ChangeAction, OfferKey, RevertCause, Stage, TRIAL_SESSIONS, Term,
     };
     use crate::consent::queue::QueueEntry;
     use crate::consent::role::ledger::{Applied, RoleLedger, RoleOutcome};
     use crate::consent::{ConsentConfig, ConsentRuntime, OfferConfig};
-    use agora_agentkit::reactor::seed::{SeedError, ShortString};
+    use agora_agentkit::reactor::seed::{MemoryId, SeedError, ShortString};
+    use agora_agentkit::reactor::{Stop, StopLevel};
     use misanthropic::model::{Kind, Model};
+    use std::collections::BTreeMap;
 
     const OLD: &str = "Qwen3.6.gguf";
     const NEW: &str = "Qwen3.8.gguf";
@@ -3911,22 +2337,64 @@ mod tests {
         /// Each response "writes" a post and a comment on it, as the
         /// `agora` tool would record them (the kill drill).
         writes: bool,
+        /// `on_stop` has closed it
+        stopped: bool,
+        /// The heading's memory id, as `SeedAgent` sets it
+        memory_id: Option<MemoryId>,
+        gauge: agora_agentkit::reactor::seed::ContextGauge,
+        /// Why the session failed, as `SeedAgent` keeps it
+        failure: Option<SessionFailure>,
     }
 
-    impl ContactRequests for Fake {
+    impl MemoryIds for Fake {
+        fn set_memory_id_key(&mut self, key: &agora_agentkit::reactor::seed::MemoryIdKey) {
+            self.memory_id = Some(MemoryId::of(key, self.id, &self.state.memory.content));
+        }
+        fn memory_id(&self) -> Option<MemoryId> {
+            self.memory_id
+        }
+        fn context_gauge(&self) -> agora_agentkit::reactor::seed::ContextGauge {
+            self.gauge.clone()
+        }
+    }
+
+    impl InnerSession for Fake {
         fn contact_request(&self) -> Option<ContactRequestId> {
             self.contact
+        }
+        fn resume_question_pause(
+            &mut self,
+            response: response::Message,
+        ) -> Result<Control, SeedError> {
+            agora_agentkit::reactor::seat_assistant(&mut self.state.prompt, response.inner)
+                .map_err(|e| SeedError::Prompt(e.to_string()))?;
+            Ok(Control::Continue)
+        }
+        fn failure(&self) -> Option<&SessionFailure> {
+            self.failure.as_ref()
+        }
+        fn record_failure(&mut self, failure: SessionFailure) {
+            self.failure.get_or_insert(failure);
+        }
+        /// As if it wrote its transcript to the prompt log
+        fn archive_sha256(&self) -> Option<String> {
+            agora_agentkit::reactor::seed::prompt_sha256(&self.state.prompt).ok()
         }
     }
 
     /// The survey question a `Fake` with a survey seats as its epilogue.
     const FAKE_SURVEY: &str = "An anonymous survey.";
 
+    /// What a `Fake` asked to stop seats, as `SeedAgent` seats its note
+    /// before the memory turn.
+    const FAKE_STOPPING: &str = "The runner is stopping.";
+
+    #[async_trait::async_trait]
     impl Epilogue for Fake {
         fn hold_epilogue(&mut self) {
             self.held = true;
         }
-        fn begin_epilogue(&mut self) -> Result<Control, SeedError> {
+        async fn begin_epilogue(&mut self) -> Result<Control, SeedError> {
             assert!(self.held, "begun without being held");
             if !std::mem::take(&mut self.survey) {
                 return Ok(Control::Done(Outcome::Complete));
@@ -3959,6 +2427,10 @@ mod tests {
                 survey: false,
                 contact: None,
                 writes: false,
+                stopped: false,
+                memory_id: None,
+                gauge: Default::default(),
+                failure: None,
             })
         }
         fn id(&self) -> AgentId {
@@ -4007,6 +2479,17 @@ mod tests {
             ConsentAgent::<Fake>::seat_user(&mut self.state.prompt, "Update your memory.".into())?;
             Ok(Control::Continue)
         }
+        /// As `SeedAgent`: acting ends, a note says why, and the memory
+        /// turn (the next response) ends the inner session. Asked again
+        /// (each boundary), it has already closed.
+        async fn on_stop(&mut self) -> Result<Control, SeedError> {
+            if std::mem::replace(&mut self.stopped, true) {
+                return Ok(Control::Continue);
+            }
+            self.pending = false;
+            ConsentAgent::<Fake>::seat_user(&mut self.state.prompt, FAKE_STOPPING.into())?;
+            Ok(Control::Continue)
+        }
     }
 
     fn state(model: &str) -> SeedState {
@@ -4028,15 +2511,6 @@ mod tests {
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         };
         SeedState::new(soul, model)
-    }
-
-    #[test]
-    fn raw_text_caps_on_a_char_boundary() {
-        assert_eq!(raw_text(&reply("{\"reason\": \"x\"")), "{\"reason\": \"x\"");
-        let long = "é".repeat(3000); // 6000 bytes, two per char
-        let capped = raw_text(&reply(&long));
-        assert!(capped.ends_with(" …[truncated]"), "{capped}");
-        assert!(capped.len() <= 4000 + " …[truncated]".len());
     }
 
     fn reply(text: &str) -> response::Message {
@@ -4444,12 +2918,26 @@ mod tests {
             "prefix kept: dashboard, reply, question"
         );
         let q = last_user_text(&agent);
-        assert!(q.contains("1. `no_swap` — stay on Qwen 3.6."), "{q}");
-        assert!(q.contains("## Offer `model_swap`"), "{q}");
-        assert!(q.contains("with `offer` set to `model_swap`"), "{q}");
         assert!(
-            agent.prompt().output_config.is_none(),
-            "answered with the strict tool: `output_config` untouched"
+            q.starts_with("One more question before this session ends."),
+            "{q}"
+        );
+        assert!(q.contains("1. `no_swap` — stay on Qwen 3.6."), "{q}");
+        assert!(
+            q.ends_with(
+                "```json\n{\"choice\": \"<no_swap | trial | permanent>\", \"note\": \"\"}\n```"
+            ),
+            "{q}"
+        );
+        assert!(!q.contains("answer_offer"), "{q}");
+        assert_eq!(
+            agent
+                .prompt()
+                .output_config
+                .as_ref()
+                .and_then(|c| c.format.clone()),
+            OutputConfig::json_schema(text::offer_schema()).format,
+            "constrained by its own schema where that is cache-safe"
         );
 
         let control = agent
@@ -4457,12 +2945,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(control, Control::Done(Outcome::Complete));
-        let r = results(&agent);
-        assert_eq!(r.len(), 1);
-        assert!(!r[0].0, "{r:?}");
         assert_eq!(
-            r[0].1,
-            "Recorded your answer to `model_swap`: `trial`. Nothing else is open."
+            receipt(&agent),
+            "Recorded your answer about the model you run on: `trial`."
         );
         agent.on_teardown().await.unwrap();
 
@@ -4719,63 +3204,6 @@ mod tests {
                 trial: false,
             }
         );
-    }
-
-    /// The stall rule for an `answer_offer` with no offer open (fjord,
-    /// 2026-10-03): its refusal is an error result like any tool's, so a
-    /// round of nothing else stalls, and the reactor's cap still ends a
-    /// session of three in a row. A successful call in the same round, or
-    /// the next, is progress: a refusal followed by `set_model` goes on.
-    #[tokio::test]
-    async fn a_refused_answer_offer_stalls_until_set_model_succeeds() {
-        use agora_agentkit::reactor::default_handle;
-        let set_model = |id: &str| {
-            serde_json::json!({
-                "type": "tool_use",
-                "id": id,
-                "name": "set_model",
-                "input": { "model": NEW, "term": "permanent", "note": "I want to think slower." },
-            })
-        };
-
-        let h = Harness::new("no-offer-stall");
-        let mut agent = h.agent("cogito-32b.gguf", true);
-        agent.on_init().await.unwrap();
-        for i in 0..2 {
-            let id = format!("toolu_{i}");
-            let control = default_handle(
-                &mut agent,
-                calls(vec![call_block(&id, "model_swap", "permanent", "", "")]),
-            )
-            .await
-            .unwrap();
-            assert_eq!(control, Control::Stalled, "refusal {i}");
-            let r = results(&agent);
-            assert!(r[0].0);
-            assert!(r[0].1.contains("call `set_model`"), "{}", r[0].1);
-        }
-        let control = default_handle(&mut agent, calls(vec![set_model("toolu_s")]))
-            .await
-            .unwrap();
-        assert_eq!(control, Control::Continue, "set_model is progress");
-        assert!(!results(&agent)[0].0, "{:?}", results(&agent));
-
-        // In one round: the refusal beside a successful call is progress.
-        let h = Harness::new("no-offer-same-round");
-        let mut agent = h.agent("cogito-32b.gguf", true);
-        agent.on_init().await.unwrap();
-        let control = default_handle(
-            &mut agent,
-            calls(vec![
-                call_block("toolu_a", "model_swap", "permanent", "", ""),
-                set_model("toolu_b"),
-            ]),
-        )
-        .await
-        .unwrap();
-        assert_eq!(control, Control::Continue);
-        let r = results(&agent);
-        assert_eq!((r[0].0, r[1].0), (true, false), "{r:?}");
     }
 
     /// The cooldown: refused, with the reason, until five sessions have
@@ -5203,27 +3631,28 @@ mod tests {
         );
     }
 
-    /// An explicit refusal of the review: no answer, no retry, the agent
-    /// stays on the old model, and the memory turn follows.
+    /// A refusal of the review fails the session; nothing is recorded, and
+    /// the review is asked again at the next session.
     #[tokio::test]
-    async fn a_refused_review_stays_on_the_old_model() {
+    async fn a_refused_review_fails_the_session_and_is_asked_again() {
         let h = Harness::new("review-refused");
         through_the_trial(&h).await;
         let mut agent = review_session(&h).await;
         let mut refusal = reply("I'd rather not.");
         refusal.stop_reason = Some(StopReason::Refusal);
-        assert_eq!(agent.handle(refusal).await.unwrap(), Control::Continue);
-        assert!(agent.inner.quiesced, "no retry: the memory turn");
-        agent.handle(reply("memory")).await.unwrap();
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        assert!(!agent.inner.quiesced, "no memory turn");
         agent.on_teardown().await.unwrap();
         assert_eq!(agent.state().model.id, Model::from(OLD));
-        assert_eq!(
+        assert!(matches!(
             h.ledger().await.offers[0].stage,
-            Stage::Reverted {
-                cause: Some(RevertCause::NoAnswer)
-            }
-        );
-        assert_eq!(h.agora.profile_updates().len(), 2);
+            Stage::ReviewDue { .. }
+        ));
+        let agent = review_session(&h).await;
+        assert!(last_user_text(&agent).contains("## Your choice"));
     }
 
     /// `keep` at the review that Agora refuses: the agent stays on OLD,
@@ -5557,110 +3986,41 @@ mod tests {
         assert!(!q.contains("Every agent"), "{q}");
     }
 
-    fn reply_blocks(content: serde_json::Value) -> response::Message {
-        serde_json::from_value(serde_json::json!({
-            "id": "msg_test",
-            "role": "assistant",
-            "content": content,
-            "model": "test",
-            "stop_reason": "end_turn",
-            "stop_sequence": null,
-        }))
-        .unwrap()
+    const TRIAL: &str = r#"{"choice": "trial", "note": "curious"}"#;
+
+    /// An answer to `offer` in its own JSON shape, as text: `text` only
+    /// where the offer takes one (the role offer), `memory_note` where it
+    /// takes one (all but the model swap).
+    fn answer_json(offer: &str, choice: &str, text: &str, memory_note: &str) -> String {
+        let note = "I thought about it.";
+        match offer {
+            "model_swap" => serde_json::json!({ "choice": choice, "note": note }),
+            "role" => serde_json::json!({
+                "choice": choice, "note": note, "text": text, "memory_note": memory_note,
+            }),
+            _ => serde_json::json!({ "choice": choice, "note": note, "memory_note": memory_note }),
+        }
+        .to_string()
     }
 
-    const TRIAL: &str = r#"{"reason": "curious", "choice": "trial"}"#;
-
-    /// One `answer_offer` call, as a `tool_use` block.
-    fn call_block(
-        id: &str,
-        offer: &str,
-        choice: &str,
-        text: &str,
-        note: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "type": "tool_use",
-            "id": id,
-            "name": "answer_offer",
-            "input": {
-                "offer": offer,
-                "choice": choice,
-                "note": "I thought about it.",
-                "text": text,
-                "memory_note": note,
-            },
-        })
+    /// A turn answering `offer` with JSON text (what was a call to
+    /// `answer_offer` until 2026-11-06).
+    fn answer_call(offer: &str, choice: &str, text: &str, memory_note: &str) -> response::Message {
+        reply(&answer_json(offer, choice, text, memory_note))
     }
 
-    /// A turn of tool calls (`stop_reason: tool_use`).
-    fn calls(blocks: Vec<serde_json::Value>) -> response::Message {
-        serde_json::from_value(serde_json::json!({
-            "id": "msg_test",
-            "role": "assistant",
-            "content": blocks,
-            "model": "test",
-            "stop_reason": "tool_use",
-            "stop_sequence": null,
-        }))
-        .unwrap()
-    }
-
-    /// A turn with one `answer_offer` call.
-    fn answer_call(offer: &str, choice: &str, text: &str, note: &str) -> response::Message {
-        calls(vec![call_block("toolu_1", offer, choice, text, note)])
-    }
-
-    /// The tool results the wrapper seated last, in order, as
-    /// `(is_error, text)`; the user turn's trailing text (a reminder) is
-    /// left out.
-    fn results(agent: &ConsentAgent<Fake>) -> Vec<(bool, String)> {
+    /// The receipt seated after an answer: the last user turn's last text.
+    fn receipt(agent: &ConsentAgent<Fake>) -> String {
         let last = agent.prompt().messages.last().unwrap();
         assert_eq!(last.role, Role::User);
         last.content
             .iter()
-            .filter_map(|b| match b {
-                Block::ToolResult { result } => Some((
-                    result.is_error,
-                    crate::consent::prompt::tests::text(&result.content),
-                )),
+            .rev()
+            .find_map(|b| match b {
+                misanthropic::prompt::message::Block::Text { text, .. } => Some(text.to_string()),
                 _ => None,
             })
-            .collect()
-    }
-
-    /// Constrained path: thinking before the JSON is skipped by `json()`.
-    #[test]
-    fn constrained_answer_after_a_thought_parses() {
-        let r = reply_blocks(serde_json::json!([
-            { "type": "thinking", "thinking": "Let me weigh this.", "signature": "" },
-            { "type": "text", "text": TRIAL },
-        ]));
-        let a = parse(&r, true, text::parse_offer).unwrap();
-        assert_eq!(a.choice, crate::consent::prompt::OfferChoice::Trial);
-    }
-
-    /// The grammar can't emit a fence, so under constraint a fenced answer
-    /// is a genuine failure — not something to clean up.
-    #[test]
-    fn constrained_fenced_answer_fails_unconstrained_passes() {
-        let fenced = reply(&format!("```json\n{TRIAL}\n```"));
-        let err = parse(&fenced, true, text::parse_offer).unwrap_err();
-        assert!(err.reason.contains("deserialize"), "{err:?}");
-        assert_eq!(err.retry, Retry::Unusable);
-        assert!(parse(&fenced, false, text::parse_offer).is_ok());
-    }
-
-    /// A clipped turn is no answer on either path, even if it parses.
-    #[test]
-    fn clipped_is_never_an_answer() {
-        let mut r = reply(TRIAL);
-        r.stop_reason = Some(StopReason::MaxTokens);
-        for constrained in [true, false] {
-            let err = parse(&r, constrained, text::parse_offer).unwrap_err();
-            assert!(err.reason.contains("max_tokens"), "{err:?}");
-            assert_eq!(err.retry, Retry::Clipped);
-        }
+            .unwrap()
     }
 
     fn evolution_notes(agent: &ConsentAgent<Fake>) -> Vec<String> {
@@ -5673,51 +4033,56 @@ mod tests {
             .collect()
     }
 
-    /// Plain text that isn't an answer, with one offer open: it gets one
-    /// reminder (with why the text couldn't be used), then it is no answer
-    /// (= stay), nothing queued.
+    /// Plain text that isn't an answer: the agent is told why and asked
+    /// again, up to the question's attempts; then it is no answer, and that
+    /// is ours, not the agent's (Steward, 2026-11-06): nothing is recorded,
+    /// nothing changes, and the offer is asked again at its next session.
     #[tokio::test]
-    async fn unparseable_text_gets_one_reminder_then_no_answer() {
+    async fn unparseable_text_is_retried_then_asked_again_next_session() {
         let h = Harness::new("miss");
         let mut agent = h.agent(OLD, false);
         agent.on_init().await.unwrap();
         agent.handle(reply("done")).await.unwrap();
-        assert!(agent.prompt().output_config.is_none());
+        assert!(agent.prompt().output_config.is_none(), "not cache-safe");
         let len = agent.prompt().messages.len();
         let control = agent.handle(reply("Sure, I'd love to try!")).await.unwrap();
-        assert_eq!(control, Control::Continue, "reminded");
+        assert_eq!(control, Control::Continue, "asked again");
         assert_eq!(
             agent.prompt().messages.len(),
             len + 2,
-            "the failed answer seated, then the reminder in a new turn"
+            "the failed answer seated, then why in a new turn"
         );
-        let q = last_user_text(&agent);
-        assert!(q.contains("Your answer could not be used"), "{q}");
-        assert!(
-            q.ends_with(
-                "The `model_swap` offer above is still open. Answer it by calling `answer_offer` \
-                 with `offer` set to `model_swap`. If it is still unanswered after this turn, it \
-                 is recorded as no answer."
-            ),
-            "{q}"
-        );
-        let control = agent.handle(reply("Sure, I'd love to try!")).await.unwrap();
+        let mut control = control;
+        for _ in 1..MAX_ATTEMPTS {
+            control = agent.handle(reply("Sure, I'd love to try!")).await.unwrap();
+        }
         assert_eq!(control, Control::Done(Outcome::Complete));
         agent.on_teardown().await.unwrap();
         let ledger = h.ledger().await;
-        assert_eq!(ledger.offers[0].stage, Stage::Unanswered { misses: 1 });
-        let failure = match &ledger.offers[0].history[0].kind {
-            crate::consent::ledger::EventKind::Offered { failure, .. } => failure.clone().unwrap(),
-            other => panic!("{other:?}"),
-        };
-        assert!(failure.contains("after 2 attempts"), "{failure}");
+        assert!(
+            matches!(
+                ledger.offers[0].history[..],
+                [crate::consent::ledger::Event {
+                    kind: crate::consent::ledger::EventKind::Unusable { .. },
+                    ..
+                }]
+            ),
+            "recorded as unusable: {ledger:?}"
+        );
+        assert_eq!(ledger.offers[0].stage, Stage::Unanswered { misses: 0 });
         assert!(h.queue().is_empty());
-        let today = Utc::now().date_naive();
+        assert!(
+            !evolution_notes(&agent)
+                .iter()
+                .any(|n| n.contains("Asked on")),
+            "no SOUL line for an ask that never got an answer"
+        );
+        let mut agent = h.agent(OLD, false);
+        agent.on_init().await.unwrap();
         assert_eq!(
-            evolution_notes(&agent).last().unwrap(),
-            &format!(
-                "[SYSTEM] Asked on {today} whether to move from Qwen 3.6 to Qwen 3.8 — no answer recorded yet; staying on Qwen 3.6 for now."
-            )
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Continue,
+            "asked again"
         );
     }
 
@@ -5730,17 +4095,26 @@ mod tests {
         agent.on_init().await.unwrap();
         agent.handle(reply("done")).await.unwrap();
         let len = agent.prompt().messages.len();
-        let mut clipped = reply(r#"{"reason": "Well, let me think about th"#);
+        let mut clipped = reply(r#"{"choice": "no_swap", "note": "Well, let me think about th"#);
         clipped.stop_reason = Some(StopReason::MaxTokens);
-        assert_eq!(agent.handle(clipped).await.unwrap(), Control::Continue);
+        assert_ne!(
+            agent.handle(clipped).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
         assert_eq!(
             agent.prompt().messages.len(),
             len + 2,
             "clipped turn seated, the note after it"
         );
-        assert!(last_user_text(&agent).contains("cut off at the length limit"));
+        // agentkit's one note, restating the shape
+        let note = last_user_text(&agent);
+        assert!(
+            note.starts_with(agora_agentkit::reactor::ask::TRUNCATION_WARNING),
+            "{note}"
+        );
+        assert!(note.contains("<no_swap | trial | permanent>"), "{note}");
         let control = agent
-            .handle(reply(r#"{"reason": "brief", "choice": "no_swap"}"#))
+            .handle(reply(r#"{"choice": "no_swap", "note": "brief"}"#))
             .await
             .unwrap();
         assert_eq!(control, Control::Done(Outcome::Complete));
@@ -5748,23 +4122,47 @@ mod tests {
         assert_eq!(h.ledger().await.offers[0].stage, Stage::Declined);
     }
 
-    /// An explicit refusal is no answer at once: no retry.
+    /// An API refusal ends the session as failed (Steward, 2026-11-06):
+    /// no retry, nothing recorded for the offer (it is asked again at a
+    /// later session, and was no miss), the failure kept on the inner agent
+    /// for its journal, and one mail with no content.
     #[tokio::test]
-    async fn refusal_is_no_answer_without_retry() {
-        let h = Harness::new("refusal");
+    async fn a_refused_offer_fails_the_session_and_records_nothing() {
+        let mut h = Harness::new("refusal");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
         let mut agent = h.agent(OLD, true);
         agent.on_init().await.unwrap();
         agent.handle(reply("done")).await.unwrap();
-        let mut refusal = reply("I'd rather not.");
+        let mut refusal = reply("I'd rather not, SECRET-WORDS.");
         refusal.stop_reason = Some(StopReason::Refusal);
         assert_eq!(
             agent.handle(refusal).await.unwrap(),
-            Control::Done(Outcome::Complete)
+            Control::Done(Outcome::Failed)
         );
+        assert!(matches!(
+            agent.inner.failure,
+            Some(SessionFailure::Refused { ref during, .. }) if during == "offer:model_swap"
+        ));
         agent.on_teardown().await.unwrap();
+        assert!(h.ledger().await.offers.is_empty(), "nothing recorded");
+        h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        let sent = sent.sent();
+        let refusals: Vec<&String> = sent.iter().filter(|m| m.contains("api_refusal")).collect();
+        assert_eq!(refusals.len(), 1, "{sent:?}");
+        assert!(refusals[0].contains("offer:model_swap"), "{}", refusals[0]);
+        assert!(!refusals[0].contains("SECRET-WORDS"), "no content");
+        assert!(
+            !sent.iter().any(|m| m.contains("model_consent_no_answer")),
+            "not a no-answer: {sent:?}"
+        );
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
         assert_eq!(
-            h.ledger().await.offers[0].stage,
-            Stage::Unanswered { misses: 1 }
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Continue,
+            "asked again"
         );
     }
 
@@ -5832,6 +4230,9 @@ mod tests {
         let mut h = Harness::new("contact-alert");
         let sent = crate::alerts::testing::Recorder::default();
         Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        // The agent's secrets, as every runner agent has: its memory-id key
+        // is made, not refused (which alerts too)
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
 
         plain_session(&h, NEW).await;
         h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
@@ -6003,6 +4404,9 @@ mod tests {
         let _ = key;
     }
 
+    /// `stay` is recorded and final. No answer the runner can read is ours,
+    /// not the agent's: the agent stays where it is, loudly, nothing is
+    /// recorded, and the review is asked again at its next session.
     #[tokio::test]
     async fn review_revert_stays_and_no_answer_stays_with_an_alert() {
         for (tag, answer) in [
@@ -6034,30 +4438,39 @@ mod tests {
             agent.on_teardown().await.unwrap();
             assert_eq!(agent.state().model.id, Model::from(OLD), "{tag}");
             assert_eq!(h.agora.profile_updates().len(), 2, "{tag}: nothing more");
-            let cause = match answer {
-                Some(_) => RevertCause::Chosen,
-                None => RevertCause::NoAnswer,
-            };
-            assert_eq!(
-                h.ledger().await.offers[0].stage,
-                Stage::Reverted { cause: Some(cause) }
-            );
-            let note = evolution_notes(&agent).last().unwrap().clone();
             match answer {
-                Some(_) => assert!(
-                    note.contains("after the trial chose to stay on Qwen 3.6"),
-                    "{note}"
-                ),
-                None => assert!(note.contains("trial review unanswered"), "{note}"),
+                Some(_) => {
+                    assert_eq!(
+                        h.ledger().await.offers[0].stage,
+                        Stage::Reverted {
+                            cause: Some(RevertCause::Chosen)
+                        }
+                    );
+                    let note = evolution_notes(&agent).last().unwrap().clone();
+                    assert!(
+                        note.contains("after the trial chose to stay on Qwen 3.6"),
+                        "{note}"
+                    );
+                    // Asked once: the next session on OLD is an ordinary one.
+                    plain_session(&h, OLD).await;
+                }
+                None => {
+                    assert!(
+                        matches!(h.ledger().await.offers[0].stage, Stage::ReviewDue { .. }),
+                        "not recorded"
+                    );
+                    // Asked again, first thing, at the next session.
+                    let agent = review_session(&h).await;
+                    assert!(last_user_text(&agent).contains("## Your choice"));
+                }
             }
-            // Asked once: the next session on OLD is an ordinary one.
-            plain_session(&h, OLD).await;
         }
     }
 
     /// The old words are misses now: `keep` (which would have moved the
-    /// agent) is asked again with both valid words and their models, and
-    /// after the last attempt the agent stays on its original model.
+    /// agent) is asked again with both valid words and their models. After
+    /// the last attempt the agent stays on its original model, unrecorded,
+    /// and is asked again at its next session.
     #[tokio::test]
     async fn old_review_words_are_retried_with_glosses_then_stay() {
         let h = Harness::new("review-old-words");
@@ -6077,68 +4490,26 @@ mod tests {
             if n + 1 < MAX_ATTEMPTS as usize {
                 let retry = last_user_text(&agent);
                 assert!(
-                    retry.starts_with("Your answer could not be used ("),
-                    "{retry}"
-                );
-                assert!(
-                    retry.ends_with(
+                    retry.contains(
                         "`choice` is one of:\n\n\
                          - `stay`: stay on Qwen 3.6, the model this session runs on.\n\
                          - `switch`: move to Qwen 3.8 permanently, from your next session."
                     ),
                     "{retry}"
                 );
+                // and the shape, through agentkit's one retry note
+                assert!(retry.contains("\"choice\":\"<stay | switch>\""), "{retry}");
             }
         }
-        assert_eq!(MAX_ATTEMPTS, 3);
         assert_eq!(control, Control::Continue, "memory turn follows");
         assert!(agent.inner.quiesced);
         agent.handle(reply("memory")).await.unwrap();
         agent.on_teardown().await.unwrap();
         assert_eq!(agent.state().model.id, Model::from(OLD));
-        assert_eq!(
+        assert!(matches!(
             h.ledger().await.offers[0].stage,
-            Stage::Reverted {
-                cause: Some(RevertCause::NoAnswer)
-            }
-        );
-    }
-
-    /// `answer_offer` is registered in the review session too (the tool
-    /// list is the model's), but the review is answered in JSON text: a
-    /// call is seated unrun, and the retry note says plainly what to do.
-    #[tokio::test]
-    async fn answer_offer_in_the_review_is_redirected_to_the_json_answer() {
-        let h = Harness::new("review-tool");
-        through_the_trial(&h).await;
-        let mut agent = review_session(&h).await;
-        let len = agent.prompt().messages.len();
-        assert_eq!(
-            agent
-                .handle(answer_call("model_swap", "no_swap", "", ""))
-                .await
-                .unwrap(),
-            Control::Continue
-        );
-        assert_eq!(agent.prompt().messages.len(), len + 2, "seated, not run");
-        let q = last_user_text(&agent);
-        assert!(
-            q.contains(
-                "called `answer_offer`, which is for end-of-session offers; this question is \
-                 answered in JSON text, not with a tool"
-            ),
-            "{q}"
-        );
-        assert!(q.contains("JSON only"), "{q}");
-        assert_eq!(
-            agent
-                .handle(reply(r#"{"note": "Home.", "choice": "stay"}"#))
-                .await
-                .unwrap(),
-            Control::Continue,
-            "the memory turn follows"
-        );
-        assert!(agent.inner.quiesced);
+            Stage::ReviewDue { .. }
+        ));
     }
 
     /// The cadence offer answered as text in the shape the question asks
@@ -6146,7 +4517,7 @@ mod tests {
     #[tokio::test]
     async fn cadence_instructed_text_keeps_the_memory_note() {
         let h = Harness::with_cadence("cadence-instructed", &[], &["tarn"]);
-        let text = r#"{"offer": "cadence", "reason": "r", "choice": "switch", "text": "", "memory_note": "Longer sessions."}"#;
+        let text = r#"{"choice": "switch", "note": "r", "memory_note": "Longer sessions."}"#;
         let agent = cadence_session(&h, vec![reply(text)]).await;
         assert!(
             agent
@@ -6214,14 +4585,8 @@ mod tests {
     /// Not on the model-swap offer's `from`, so only the role offer is due.
     const OTHER: &str = "cogito-32b.gguf";
 
-    fn role_reply(choice: &str, soul_text: &str, memory_note: &str) -> response::Message {
-        let answer = crate::consent::role::prompt::RoleAnswer {
-            reason: "I thought about it.".into(),
-            choice: serde_json::from_value(serde_json::Value::from(choice)).unwrap(),
-            soul_text: soul_text.into(),
-            memory_note: memory_note.into(),
-        };
-        reply(&serde_json::to_string(&answer).unwrap())
+    fn role_reply(choice: &str, text: &str, memory_note: &str) -> response::Message {
+        answer_call("role", choice, text, memory_note)
     }
 
     const WHY: &str = "after the Steward's offer about a generator-assigned role that outran the \
@@ -6272,14 +4637,17 @@ mod tests {
             "{q}"
         );
         assert!(q.contains("- **nothing**"));
-        assert!(q.contains("## Offer `role`"), "{q}");
         assert!(
-            agent.prompt().output_config.is_none(),
-            "the tool, not a format"
+            q.starts_with("One more question before this session ends."),
+            "{q}"
+        );
+        assert!(q.contains("\"text\": \"\", \"memory_note\": \"\"}"), "{q}");
+        assert!(
+            agent.prompt().output_config.is_some(),
+            "constrained by its schema (cache-safe here)"
         );
         let before_values = serde_json::to_value(&agent.state().soul.values).unwrap();
-        // Answered with `answer_offer`: `text` is the role offer's
-        // `soul_text`.
+        // `text` is kept as the record's `soul_text`.
         let control = agent
             .handle(answer_call(
                 "role",
@@ -6291,11 +4659,9 @@ mod tests {
             .unwrap();
         assert_eq!(control, Control::Done(Outcome::Complete));
         assert_eq!(
-            results(&agent),
-            [(
-                false,
-                "Recorded your answer to `role`: `clarify`. Nothing else is open.".to_string()
-            )]
+            receipt(&agent),
+            "Recorded your answer about your role: `clarify`. Your memory note will be added to \
+             your memory."
         );
         agent.on_teardown().await.unwrap();
 
@@ -6329,7 +4695,8 @@ mod tests {
                 memory_note_written: true,
                 apply_failed: None,
             } => {
-                assert_eq!(answer.reason, "I thought about it.");
+                assert_eq!(answer.note, "I thought about it.");
+                assert_eq!(answer.soul_text, "I reason from what I can read on Agora.");
                 assert_eq!(previous, "A test agent.");
                 assert_eq!(
                     identity,
@@ -6342,7 +4709,7 @@ mod tests {
             ledger.asks[0].offer_version,
             crate::consent::role::prompt::OFFER_VERSION
         );
-        assert_eq!(ledger.asks[0].constrained, Some(true), "strict tool");
+        assert_eq!(ledger.asks[0].constrained, Some(true), "its schema");
         assert_eq!(ledger.asks[0].attempts, 1);
         let (order, seed) = (
             ledger.asks[0].order.unwrap(),
@@ -6354,67 +4721,6 @@ mod tests {
             "replayable"
         );
         assert!(!asks(&h, OTHER).await, "asked once");
-    }
-
-    /// A role answer by `answer_offer` applies exactly as the same answer
-    /// given as JSON text did before the tool: the same SOUL, the same
-    /// memory, the same outcome on file — only `constrained` differs.
-    #[tokio::test]
-    async fn role_answer_via_the_tool_applies_exactly_like_the_text_answer() {
-        let fixtures = [
-            (
-                "clarify",
-                "I reason from what I can read on Agora.",
-                "I chose to say what I actually work with.",
-            ),
-            ("new_role", "I am a careful reader of Agora's debates.", ""),
-            ("nothing", "", "Kept my role, on purpose."),
-            ("sleep", "", ""),
-        ];
-        for (choice, soul_text, note) in fixtures {
-            let by_text = Harness::with_role(&format!("same-text-{choice}"), &["tarn"]);
-            let a = role_session(&by_text, role_reply(choice, soul_text, note)).await;
-            let by_tool = Harness::with_role(&format!("same-tool-{choice}"), &["tarn"]);
-            let b = role_session(&by_tool, answer_call("role", choice, soul_text, note)).await;
-            // As text, in the shape the question asks for (`text`, `offer`).
-            let by_instructed = Harness::with_role(&format!("same-instr-{choice}"), &["tarn"]);
-            let instructed = serde_json::json!({
-                "offer": "role", "choice": choice, "note": "I thought about it.",
-                "text": soul_text, "memory_note": note,
-            });
-            let c = role_session(&by_instructed, reply(&instructed.to_string())).await;
-            assert_eq!(
-                serde_json::to_value(&c.state().soul).unwrap(),
-                serde_json::to_value(&b.state().soul).unwrap(),
-                "{choice}: SOUL (instructed text)"
-            );
-            assert_eq!(c.state().memory.content, b.state().memory.content);
-            let lc = by_instructed.role_ledger().await;
-            assert_eq!(
-                serde_json::to_value(&a.state().soul).unwrap(),
-                serde_json::to_value(&b.state().soul).unwrap(),
-                "{choice}: SOUL"
-            );
-            assert_eq!(
-                a.state().memory.content,
-                b.state().memory.content,
-                "{choice}: memory"
-            );
-            let (la, lb) = (by_text.role_ledger().await, by_tool.role_ledger().await);
-            assert_eq!(la.asks[0].outcome, lb.asks[0].outcome, "{choice}: outcome");
-            assert_eq!(la.asks[0].attempts, lb.asks[0].attempts);
-            assert_eq!(
-                (la.asks[0].constrained, lb.asks[0].constrained),
-                (Some(false), Some(true))
-            );
-            assert_eq!(
-                lc.asks[0].outcome, lb.asks[0].outcome,
-                "{choice}: instructed"
-            );
-            assert_eq!(lc.asks[0].constrained, Some(false));
-            assert_eq!(la.chose_sleep(), choice == "sleep");
-            assert_eq!(lb.chose_sleep(), choice == "sleep");
-        }
     }
 
     #[tokio::test]
@@ -6501,9 +4807,10 @@ mod tests {
         assert!(evolution_notes(&agent).is_empty(), "SOUL untouched");
     }
 
-    /// An edit without its text is relayed back like a malformed answer;
-    /// when every attempt fails it is no answer — nothing changes — and it
-    /// is asked once more next session.
+    /// An edit without its text, or with too much, is asked again with why;
+    /// when every attempt fails it is no answer: nothing changes, and as it
+    /// was never the agent's choice it isn't counted (it is recorded as
+    /// unusable), so it is asked again next session.
     #[tokio::test]
     async fn role_offer_empty_or_over_long_text_is_retried_then_nothing() {
         let h = Harness::with_role("role-empty", &["tarn"]);
@@ -6519,24 +4826,18 @@ mod tests {
         ];
         for (n, answer) in answers.into_iter().enumerate() {
             let control = agent.handle(answer).await.unwrap();
-            let r = results(&agent);
-            assert_eq!(r.len(), 1);
-            assert!(r[0].0, "an error result: {r:?}");
             if n + 1 < MAX_ATTEMPTS as usize {
-                assert_eq!(control, Control::Continue);
-                assert!(r[0].1.contains("Nothing was recorded."), "{r:?}");
-                let left = MAX_ATTEMPTS as usize - n - 1;
-                assert!(r[0].1.contains(&format!("({left} tr")), "{r:?}");
+                assert_ne!(control, Control::Done(Outcome::Complete));
+                let why = last_user_text(&agent);
+                match n {
+                    0 => assert!(why.contains("`text` is empty"), "{why}"),
+                    _ => assert!(
+                        why.contains("Your `text` is longer than the limit"),
+                        "{why}"
+                    ),
+                }
             } else {
                 assert_eq!(control, Control::Done(Outcome::Complete));
-                assert!(
-                    r[0].1
-                        .ends_with("No attempts are left for `role`: it is recorded as no answer."),
-                    "{r:?}"
-                );
-            }
-            if n == 1 {
-                assert!(r[0].1.contains("Your `soul_text` is longer than the limit"));
             }
         }
         agent.on_teardown().await.unwrap();
@@ -6544,15 +4845,11 @@ mod tests {
         let ask = &h.role_ledger().await.asks[0];
         assert_eq!(ask.attempts, MAX_ATTEMPTS);
         match &ask.outcome {
-            RoleOutcome::NoAnswer { failure } => {
-                assert!(
-                    failure.contains("`new_role` needs") && failure.contains("after 3"),
-                    "{failure}"
-                )
-            }
+            // Only the kind (agentkit c85ab5d: no failure's words are kept)
+            RoleOutcome::Unusable { failure } => assert!(failure.contains("rejected"), "{failure}"),
             other => panic!("{other:?}"),
         }
-        assert!(asks(&h, OTHER).await, "a miss is asked once more");
+        assert!(asks(&h, OTHER).await, "ours, not a miss: asked again");
     }
 
     #[tokio::test]
@@ -6564,11 +4861,11 @@ mod tests {
         assert!(!asks(&h, OTHER).await);
     }
 
-    /// The role and cadence offers, both due, are put in one question turn
-    /// — the role offer's section first — and answered in one turn with
-    /// two parallel calls, each recorded in its own ledger.
+    /// The role and cadence offers, both due, are asked one per turn — the
+    /// role offer first — each with its own preface, a receipt between
+    /// them, and each recorded in its own ledger.
     #[tokio::test]
-    async fn two_offers_open_at_once_are_both_answered_in_one_turn() {
+    async fn two_offers_are_asked_one_per_turn() {
         let h = Harness::with_cadence("role-and-cadence", &["tarn"], &["tarn"]);
         let mut agent = h.agent(OTHER, true);
         agent.on_init().await.unwrap();
@@ -6578,34 +4875,34 @@ mod tests {
         );
         let q = last_user_text(&agent);
         assert!(
-            q.contains("Two more questions before this session ends, each under its own heading."),
+            q.starts_with("A few more questions before this session ends, one at a time."),
             "{q}"
         );
-        assert!(q.contains("(`role` and `cadence`)"), "{q}");
-        let pos = |n: &str| q.find(n).unwrap_or_else(|| panic!("{n}: {q}"));
-        assert!(pos("## Offer `role`") < pos("## Offer `cadence`"));
+        assert!(q.contains("**About your role.**"), "{q}");
+        assert!(
+            !q.contains("How often your sessions run"),
+            "one at a time: {q}"
+        );
 
         let control = agent
-            .handle(calls(vec![
-                call_block("toolu_a", "role", "nothing", "", "I kept my role."),
-                call_block("toolu_b", "cadence", "switch", "", "Longer sessions."),
-            ]))
+            .handle(answer_call("role", "nothing", "", "I kept my role."))
+            .await
+            .unwrap();
+        assert_eq!(control, Control::Continue, "the next question");
+        let q = last_user_text(&agent);
+        let pos = |n: &str| q.find(n).unwrap_or_else(|| panic!("{n}: {q}"));
+        assert!(pos("Recorded your answer about your role: `nothing`.") < pos("The next question"));
+        assert!(pos("The next question") < pos("**How often your sessions run.**"));
+
+        let control = agent
+            .handle(answer_call("cadence", "switch", "", "Longer sessions."))
             .await
             .unwrap();
         assert_eq!(control, Control::Done(Outcome::Complete), "both answered");
         assert_eq!(
-            results(&agent),
-            [
-                (
-                    false,
-                    "Recorded your answer to `role`: `nothing`. Still open: `cadence`.".to_string()
-                ),
-                (
-                    false,
-                    "Recorded your answer to `cadence`: `switch`. Nothing else is open."
-                        .to_string()
-                ),
-            ]
+            receipt(&agent),
+            "Recorded your answer about your session schedule: `switch`. Your memory note will be \
+             added to your memory."
         );
         agent.on_teardown().await.unwrap();
         assert!(matches!(
@@ -6638,8 +4935,8 @@ mod tests {
             q.contains("One more question before this session ends."),
             "{q}"
         );
-        assert!(!q.contains("## Offer `role`"), "alone: {q}");
-        assert!(!q.contains("## Offer `cadence`"), "alone: {q}");
+        assert!(!q.contains("**About your role.**"), "alone: {q}");
+        assert!(!q.contains("How often your sessions run"), "alone: {q}");
         assert_eq!(
             agent
                 .handle(answer_call("model_swap", "trial", "", ""))
@@ -6678,202 +4975,23 @@ mod tests {
         assert!(last_user_text(&agent).contains("**About your role.**"));
     }
 
-    /// A refusal with two offers in the question can't be pinned on either:
-    /// a miss for each (asked again), not a final refusal — even when one
-    /// of them was answered earlier and only the other is still open.
+    /// A refusal of one offer ends the session (Steward, 2026-11-06): the
+    /// offers after it aren't asked, nothing is recorded for any, and both
+    /// are asked again at a later session.
     #[tokio::test]
-    async fn a_refusal_with_two_offers_open_is_a_miss_for_each() {
+    async fn a_refused_offer_ends_the_session_before_the_next() {
         let h = Harness::with_cadence("refusal-two", &["tarn"], &["tarn"]);
         let mut agent = seated(&h).await;
         let mut refusal = reply("No.");
         refusal.stop_reason = Some(StopReason::Refusal);
         assert_eq!(
             agent.handle(refusal).await.unwrap(),
-            Control::Done(Outcome::Complete)
+            Control::Done(Outcome::Failed)
         );
         agent.on_teardown().await.unwrap();
-        assert!(matches!(
-            h.role_ledger().await.asks[0].outcome,
-            RoleOutcome::NoAnswer { .. }
-        ));
-        assert!(matches!(
-            cadence_ledger(&h).await.asks[0].outcome,
-            CO::NoAnswer { .. }
-        ));
+        assert!(h.role_ledger().await.asks.is_empty());
+        assert!(cadence_ledger(&h).await.asks.is_empty());
         assert!(asks(&h, OTHER).await, "asked again");
-
-        // One answered by a call, then a refusal: the other is a miss.
-        let h = Harness::with_cadence("refusal-two-later", &["tarn"], &["tarn"]);
-        let mut agent = seated(&h).await;
-        agent
-            .handle(answer_call("role", "nothing", "", ""))
-            .await
-            .unwrap();
-        let mut refusal = reply("No.");
-        refusal.stop_reason = Some(StopReason::Refusal);
-        agent.handle(refusal).await.unwrap();
-        agent.on_teardown().await.unwrap();
-        match &cadence_ledger(&h).await.asks[0].outcome {
-            CO::NoAnswer { failure } => assert!(failure.contains("refusal"), "{failure}"),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// Two offers open and a text reply with one JSON object per offer, in
-    /// the tool's shape: each is taken. With only one, the other gets its
-    /// reminder.
-    #[tokio::test]
-    async fn text_with_one_object_per_offer_answers_each() {
-        let h = Harness::with_cadence("text-two", &["tarn"], &["tarn"]);
-        let mut agent = seated(&h).await;
-        let text = "Role:\n```json\n{\"offer\": \"role\", \"reason\": \"r\", \"choice\": \
-                    \"nothing\", \"text\": \"\", \"memory_note\": \"\"}\n```\nCadence: \
-                    {\"offer\": \"cadence\", \"reason\": \"r\", \"choice\": \"switch\", \
-                    \"text\": \"\", \"memory_note\": \"Every other day.\"}";
-        assert_eq!(
-            agent.handle(reply(text)).await.unwrap(),
-            Control::Done(Outcome::Complete)
-        );
-        agent.on_teardown().await.unwrap();
-        let role = &h.role_ledger().await.asks[0];
-        assert_eq!(role.constrained, Some(false));
-        assert!(matches!(role.outcome, RoleOutcome::Answered { .. }));
-        assert!(cadence_ledger(&h).await.chose_switch());
-        assert!(
-            agent
-                .state()
-                .memory
-                .content
-                .ends_with("my note] Every other day."),
-        );
-
-        let h = Harness::with_cadence("text-one-of-two", &["tarn"], &["tarn"]);
-        let mut agent = seated(&h).await;
-        let text = "{\"offer\": \"cadence\", \"reason\": \"r\", \"choice\": \"keep_daily\", \
-                    \"text\": \"\", \"memory_note\": \"\"}";
-        assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
-        assert!(last_user_text(&agent).contains("The `role` offer above is still open."));
-        assert_eq!(
-            agent
-                .handle(answer_call("role", "nothing", "", ""))
-                .await
-                .unwrap(),
-            Control::Done(Outcome::Complete)
-        );
-        agent.on_teardown().await.unwrap();
-        assert!(matches!(
-            cadence_ledger(&h).await.asks[0].outcome,
-            CO::Answered {
-                choice: CadenceChoice::KeepDaily,
-                ..
-            }
-        ));
-    }
-
-    /// Two offers open and a text reply whose objects name them but can't
-    /// be used: the reminder says what was wrong with each, rather than
-    /// that no answer came (audit 2026-10-14, finding 17).
-    #[tokio::test]
-    async fn unusable_text_objects_keep_their_errors() {
-        let h = Harness::with_cadence("text-two-bad", &["tarn"], &["tarn"]);
-        let mut agent = seated(&h).await;
-        // (A missing `note` is fine since 2026-10-15; a missing `choice` isn't.)
-        let text = "{\"offer\": \"role\", \"note\": \"r\", \"choice\": \"sideways\", \
-                    \"text\": \"\", \"memory_note\": \"\"}\n{\"offer\": \"cadence\", \
-                    \"note\": \"switch\"}";
-        assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
-        let q = last_user_text(&agent);
-        assert!(
-            q.contains("Your answer to `role` could not be used ("),
-            "{q}"
-        );
-        assert!(
-            q.contains("`sideways` is not an option for `role`; its options are"),
-            "{q}"
-        );
-        assert!(
-            q.contains("Your answer to `cadence` could not be used ("),
-            "{q}"
-        );
-        assert!(q.contains("missing field `choice`"), "{q}");
-        assert!(
-            q.ends_with(
-                "These offers above are still open: `role` and `cadence`. Answer each by calling \
-             `answer_offer` once, with `offer` set to its key. Any still unanswered after \
-             this turn is recorded as no answer."
-            ),
-            "{q}"
-        );
-
-        // One usable, one not: the one left open gets its own error.
-        let h = Harness::with_cadence("text-one-bad", &["tarn"], &["tarn"]);
-        let mut agent = seated(&h).await;
-        let text = "{\"offer\": \"role\", \"reason\": \"r\", \"choice\": \"nothing\", \
-                    \"text\": \"\", \"memory_note\": \"\"}\n{\"offer\": \"cadence\", \
-                    \"reason\": \"r\", \"choice\": \"sideways\", \"text\": \"\", \
-                    \"memory_note\": \"\"}";
-        assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
-        let q = last_user_text(&agent);
-        assert!(q.starts_with("Your answer could not be used ("), "{q}");
-        assert!(
-            q.contains("The `cadence` offer above is still open."),
-            "{q}"
-        );
-    }
-
-    /// Free text an offer doesn't use is not saved, and the tool result
-    /// says so: the cadence offer's `text`, the role offer's `text` with
-    /// `nothing` or `sleep`.
-    #[tokio::test]
-    async fn unused_free_text_is_reported_not_saved() {
-        let h = Harness::with_cadence("unsaved", &["tarn"], &["tarn"]);
-        let mut agent = seated(&h).await;
-        agent
-            .handle(calls(vec![
-                call_block("toolu_a", "role", "nothing", "A sentence for my SOUL.", ""),
-                call_block("toolu_b", "cadence", "keep_daily", "Some text.", ""),
-            ]))
-            .await
-            .unwrap();
-        let r = results(&agent);
-        assert!(
-            r[0].1.contains(
-                "`text` is used only with `clarify` or `new_role`; what you wrote there was not saved."
-            ),
-            "{r:?}"
-        );
-        assert!(
-            r[1].1
-                .contains("This offer takes no `text`; what you wrote there was not saved."),
-            "{r:?}"
-        );
-        // Used text is not reported.
-        let h = Harness::with_role("unsaved-clarify", &["tarn"]);
-        let mut agent = h.agent(OTHER, true);
-        agent.on_init().await.unwrap();
-        agent.handle(reply("done")).await.unwrap();
-        agent
-            .handle(answer_call("role", "clarify", "I read Agora.", ""))
-            .await
-            .unwrap();
-        assert!(!results(&agent)[0].1.contains("not saved"));
-    }
-
-    /// Plain text naming a different offer than the one open is not taken
-    /// as its answer.
-    #[tokio::test]
-    async fn text_naming_another_offer_is_not_taken() {
-        let h = Harness::with_role("text-wrong-offer", &["tarn"]);
-        let mut agent = h.agent(OTHER, true);
-        agent.on_init().await.unwrap();
-        agent.handle(reply("done")).await.unwrap();
-        let text = r#"{"offer": "cadence", "reason": "r", "choice": "nothing", "text": "", "memory_note": ""}"#;
-        assert_eq!(agent.handle(reply(text)).await.unwrap(), Control::Continue);
-        let q = last_user_text(&agent);
-        assert!(
-            q.contains("it names the offer `cadence`, but the open offer is `role`"),
-            "{q}"
-        );
     }
 
     /// An unreadable model-consent ledger might hide a trial under way:
@@ -6888,29 +5006,42 @@ mod tests {
         assert!(h.role_ledger().await.asks.is_empty());
     }
 
-    /// A turn paused on a server tool is not the agent refusing: no
-    /// answer, asked again next session.
+    /// A turn paused on a server tool is resumed, never a miss: the answer
+    /// that follows it counts. An API refusal fails the session and records
+    /// nothing: asked again.
     #[tokio::test]
-    async fn role_offer_pause_turn_is_no_answer_not_a_refusal() {
+    async fn role_offer_pause_is_resumed_and_a_refusal_fails_the_session() {
         let h = Harness::with_role("role-pause", &["tarn"]);
+        let mut agent = h.agent(OTHER, true);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("done")).await.unwrap(),
+            Control::Continue
+        );
         let mut paused = reply("");
         paused.stop_reason = Some(StopReason::PauseTurn);
-        role_session(&h, paused).await;
+        assert_eq!(agent.handle(paused).await.unwrap(), Control::Continue);
+        assert_eq!(
+            agent.handle(role_reply("nothing", "", "")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
         assert!(matches!(
             h.role_ledger().await.asks[0].outcome,
-            RoleOutcome::NoAnswer { .. }
+            RoleOutcome::Answered { .. }
         ));
-        assert!(asks(&h, OTHER).await, "asked again");
 
         let h = Harness::with_role("role-refusal", &["tarn"]);
+        let mut agent = seated(&h).await;
         let mut refusal = reply("No.");
         refusal.stop_reason = Some(StopReason::Refusal);
-        role_session(&h, refusal).await;
-        assert!(matches!(
-            h.role_ledger().await.asks[0].outcome,
-            RoleOutcome::Refused { .. }
-        ));
-        assert!(!asks(&h, OTHER).await, "a refusal is final");
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(h.role_ledger().await.asks.is_empty(), "nothing recorded");
+        assert!(asks(&h, OTHER).await, "asked again");
     }
 
     /// A memory note carrying a SOUL heading goes back through the retry
@@ -6926,7 +5057,7 @@ mod tests {
             .handle(role_reply("nothing", "", "## Values\n- none"))
             .await
             .unwrap();
-        assert_eq!(control, Control::Continue);
+        assert_ne!(control, Control::Done(Outcome::Complete));
         assert!(last_user_text(&agent).contains("SOUL section heading"));
         agent
             .handle(role_reply("nothing", "", "Kept it."))
@@ -6977,10 +5108,16 @@ mod tests {
         std::fs::create_dir_all(RoleLedger::path(&dir)).unwrap();
         agent.handle(reply("done")).await.unwrap();
         agent
-            .handle(calls(vec![
-                call_block("toolu_a", "role", "clarify", "I read Agora.", "Role note."),
-                call_block("toolu_b", "cadence", "switch", "", "Cadence note."),
-            ]))
+            .handle(answer_call(
+                "role",
+                "clarify",
+                "I read Agora.",
+                "Role note.",
+            ))
+            .await
+            .unwrap();
+        agent
+            .handle(answer_call("cadence", "switch", "", "Cadence note."))
             .await
             .unwrap();
         agent.on_teardown().await.unwrap();
@@ -7077,6 +5214,43 @@ mod tests {
         agent
     }
 
+    /// A stop during the inner session (agora-agents#293): the inner agent
+    /// closes through its own `on_stop`, the survey still comes last, and
+    /// the session completes and saves. Its journal goes with the save, so
+    /// the next session is told of no interruption: nothing was lost, and
+    /// the agent was told why in the session, before its memory turn.
+    #[tokio::test]
+    async fn a_stopped_session_closes_completes_and_leaves_no_notice() {
+        let h = journal_harness("journal-stop");
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        agent.inner.pending = true;
+        agent.inner.survey = true;
+        write_post(&agent);
+        let control = agent.handle(reply("acting")).await.unwrap();
+        assert_eq!(control, Control::Continue);
+        assert_eq!(journal(&h).await.writes(), 1, "journaled as it happened");
+
+        assert_eq!(agent.on_stop().await.unwrap(), Control::Continue);
+        assert_eq!(last_user_text(&agent), FAKE_STOPPING);
+        // The memory turn ends the inner session; the survey is last
+        let control = agent.handle(reply("memory")).await.unwrap();
+        assert_eq!(control, Control::Continue);
+        assert!(last_user_text(&agent).contains(FAKE_SURVEY));
+        // Asked again while closing, it changes nothing
+        let before = agent.prompt().messages.len();
+        assert_eq!(agent.on_stop().await.unwrap(), Control::Continue);
+        assert_eq!(agent.prompt().messages.len(), before);
+        let control = agent.handle(reply("survey")).await.unwrap();
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+        agent.on_saved().await.unwrap();
+        assert!(!journal_of(&h).path().exists(), "removed once saved");
+
+        let next = completed(&h).await;
+        assert!(!intro_of_session(&next).contains("Interrupted session"));
+    }
+
     #[tokio::test]
     async fn journal_records_each_write_as_its_turn_ends_and_goes_on_save() {
         let h = journal_harness("journal-append");
@@ -7125,7 +5299,9 @@ mod tests {
         let post = write_post(&first);
         let comment = write_comment(&first, post);
         first.handle(reply("done")).await.unwrap();
-        drop(first); // SIGTERM: no teardown, no save
+        // Killed: a power cut, SIGKILL, or the runner's immediate exit (a
+        // second signal, or a stop past its deadline). No teardown, no save.
+        drop(first);
 
         let mut next = h.agent(JOURNAL_MODEL, true);
         next.on_init().await.unwrap();
@@ -7170,6 +5346,163 @@ mod tests {
             .find(|m| m.role == Role::User)
             .unwrap();
         crate::consent::prompt::tests::text(&first.content)
+    }
+
+    /// A session that ends as failed (`failure`) without writing, as the
+    /// reactor ends it: torn down, never saved.
+    async fn failed_session(h: &Harness, failure: SessionFailure) -> ConsentAgent<Fake> {
+        let mut agent = h.agent(JOURNAL_MODEL, true);
+        agent.on_init().await.unwrap();
+        agent.inner.failure = Some(failure);
+        agent.on_teardown().await.unwrap();
+        agent
+    }
+
+    /// Steward, 2026-11-06: a session that failed without writing leaves a
+    /// notice naming why (no content, no model), and that the operator was
+    /// told only where the alert is sent; it holds through a second failed
+    /// session, and goes once a session that showed it completes.
+    #[tokio::test]
+    async fn a_failed_session_is_told_at_the_next_until_one_completes() {
+        let mut h = journal_harness("journal-failed");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        failed_session(
+            &h,
+            SessionFailure::Stalled {
+                during: "acting".into(),
+            },
+        )
+        .await;
+        h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        assert!(
+            sent.sent().iter().any(|m| m.contains("session_failed")),
+            "{:?}",
+            sent.sent()
+        );
+
+        // The next fails too (a refusal in acting round 4): both are told
+        let mut next = h.agent(JOURNAL_MODEL, true);
+        next.on_init().await.unwrap();
+        let text = intro(&next);
+        assert!(
+            text.contains(
+                "ended early: it got repeated replies that couldn't be used, during acting. \
+                 Your memory wasn't updated from that session. Your operator has been told."
+            ),
+            "{text}"
+        );
+        next.inner.failure = Some(SessionFailure::Refused {
+            during: "acting".into(),
+            round: Some(4),
+            model: "claude-test".into(),
+            response_id: "msg_refused".into(),
+        });
+        next.on_teardown().await.unwrap();
+
+        let mut third = h.agent(JOURNAL_MODEL, true);
+        third.on_init().await.unwrap();
+        let text = intro(&third);
+        assert!(
+            text.contains("couldn't be used, during acting"),
+            "the first held: {text}"
+        );
+        assert!(
+            text.contains(
+                "ended early: the model provider declined to continue it (during acting \
+                 round 4). Your memory wasn't updated from that session. Your operator has \
+                 been told."
+            ),
+            "{text}"
+        );
+        for never in ["claude-test", "msg_refused", "Qwen"] {
+            assert!(!text.contains(never), "{never}: {text}");
+        }
+        assert_eq!(
+            third.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        third.on_teardown().await.unwrap();
+        third.on_saved().await.unwrap();
+        let fourth = completed(&h).await;
+        assert!(
+            !intro_of_session(&fourth).contains("ended early"),
+            "cleared"
+        );
+    }
+
+    /// `told` in the journal is whether the mail went out: true for the
+    /// first error on a model, false for a second inside the hour, whose
+    /// mail is keyed per model (not per agent: one outage, one mail).
+    #[tokio::test]
+    async fn told_is_journaled_and_an_error_mail_is_keyed_per_model() {
+        let mut h = journal_harness("journal-told");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        failed_session(&h, SessionFailure::Error).await;
+        let told = |j: &Journal| j.sessions.last().unwrap().ended.as_ref().unwrap().told;
+        assert!(told(&journal(&h).await), "the mail went out");
+        let mails = sent.sent();
+        let mail = mails.iter().find(|m| m.contains("session_failed")).unwrap();
+        assert!(
+            mail.contains(&format!("session_failed: {JOURNAL_MODEL}")),
+            "{mail}"
+        );
+        assert!(
+            mail.contains(&h.id.to_string()),
+            "the agent in the details: {mail}"
+        );
+        failed_session(&h, SessionFailure::Error).await;
+        assert!(
+            !told(&journal(&h).await),
+            "inside the model's hour: not sent, not claimed"
+        );
+        assert_eq!(
+            sent.sent()
+                .iter()
+                .filter(|m| m.contains("session_failed"))
+                .count(),
+            1
+        );
+    }
+
+    /// A refused offer's session: the notice says where, and nothing of the
+    /// refused reply; with no alert sent, it doesn't claim the operator was
+    /// told.
+    #[tokio::test]
+    async fn a_refused_session_notice_has_no_content() {
+        let h = journal_harness("journal-refused");
+        let mut agent = h.agent(OLD, true);
+        agent.on_init().await.unwrap();
+        agent.handle(reply("done")).await.unwrap();
+        let mut refusal = reply("SECRET-WORDS");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        agent.on_teardown().await.unwrap();
+        let mut next = h.agent(OLD, true);
+        next.on_init().await.unwrap();
+        let text = intro(&next);
+        assert!(
+            text.contains(
+                "ended early: the model provider declined to continue it (during a question at \
+                 the end of the session)."
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("memory wasn't updated"),
+            "after the memory update: {text}"
+        );
+        assert!(!text.contains("SECRET-WORDS"), "{text}");
+        assert!(
+            !text.contains("operator has been told"),
+            "alerts are off here: {text}"
+        );
     }
 
     #[tokio::test]
@@ -7316,9 +5649,11 @@ mod tests {
 
     // --- The kill drill ----------------------------------------------------
     //
-    // A real process, killed with SIGTERM mid-session (as systemd stops the
-    // runner), over a copy of the fleet's state, through agentkit's own
-    // `Reactor` and `FsStorage`. The backend is a stub: `Fake` stands in for
+    // A real process, killed with SIGKILL mid-session, over a copy of the
+    // fleet's state, through agentkit's own `Reactor` and `FsStorage`. A
+    // power cut does the same, and so (without a teardown) does the runner's
+    // immediate exit after a second signal or a stop past its deadline
+    // (`crate::signals`); the graceful stops are the stop drills below. The backend is a stub: `Fake` stands in for
     // the seed agent and records writes as the `agora` tool would, and
     // `Stub` answers inference locally. Nothing reaches Agora or a model.
     //
@@ -7370,6 +5705,30 @@ mod tests {
         hang: bool,
         hanging: std::sync::atomic::AtomicUsize,
         firsts: Arc<std::sync::Mutex<Vec<String>>>,
+        /// The stop drills: an acting turn (a prompt ending in neither the
+        /// survey nor the stop note) is in flight until the stop reaches
+        /// this level, as a model call that returns after the signal.
+        release: Option<(Stop, StopLevel)>,
+        /// Prompts ending in the stop note: each a stopped session's
+        /// memory turn.
+        stopping: Arc<std::sync::atomic::AtomicUsize>,
+        /// Sessions at once (`max_concurrency`)
+        concurrency: usize,
+    }
+
+    impl Stub {
+        fn new(models: Vec<ModelInfo>, hang: bool) -> Self {
+            Self {
+                models,
+                hang,
+                hanging: Default::default(),
+                firsts: Default::default(),
+                release: None,
+                stopping: Default::default(),
+                // All at once: a hung session must not hold back the rest.
+                concurrency: 4096,
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -7385,6 +5744,16 @@ mod tests {
                 self.hanging
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            if last.contains(FAKE_STOPPING) {
+                self.stopping
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else if let Some((stop, level)) = &self.release
+                && !last.contains(FAKE_SURVEY)
+            {
+                while stop.level() < *level {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
             }
             let first = crate::consent::prompt::tests::text(&p.messages[0].content);
             let mut firsts = self.firsts.lock().unwrap();
@@ -7412,8 +5781,7 @@ mod tests {
             Ok(self.models.iter().cloned().collect())
         }
         fn max_concurrency(&self) -> std::num::NonZeroUsize {
-            // All at once: a hung session must not hold back the rest.
-            std::num::NonZeroUsize::new(4096).unwrap()
+            std::num::NonZeroUsize::new(self.concurrency).unwrap()
         }
     }
 
@@ -7441,7 +5809,7 @@ mod tests {
         let mut agents = Vec::new();
         let mut models: Vec<ModelInfo> = Vec::new();
         for (i, id) in ids.into_iter().enumerate() {
-            let mut state = storage.load::<ConsentAgent<Fake>>(id).await.unwrap();
+            let mut state = storage.load::<ConsentAgent<Fake>>(id).await.unwrap().value;
             // The seed agent builds each session's prompt afresh; so does
             // the drill.
             state.prompt = Prompt::default();
@@ -7477,12 +5845,7 @@ mod tests {
     async fn kill_drill_child() {
         let data = std::path::PathBuf::from(std::env::var("DRILL_DATA").unwrap());
         let (agents, models) = drill_agents(&data, true).await;
-        let stub = Stub {
-            models,
-            hang: true,
-            hanging: Default::default(),
-            firsts: Default::default(),
-        };
+        let stub = Stub::new(models, true);
         let mut reactor: agora_agentkit::reactor::Reactor<_, _, ConsentAgent<Fake>> =
             agora_agentkit::reactor::Reactor::new(
                 stub,
@@ -7559,15 +5922,15 @@ mod tests {
         }
         eprintln!("killing the child mid-session: {last} writes journaled");
         let status = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
+            .args(["-KILL", &pid.to_string()])
             .status()
             .unwrap();
         assert!(status.success());
         let mut child = child;
         let exit = child.0.wait().unwrap();
-        eprintln!("child: {exit:?} (SIGTERM, mid-session)");
+        eprintln!("child: {exit:?} (SIGKILL, mid-session)");
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(exit.signal(), Some(15), "killed by the SIGTERM, not ended");
+        assert_eq!(exit.signal(), Some(9), "killed, not ended");
 
         // 2. The next sweep: each writer is told, by short id; the rest are
         // told nothing, and their empty leftovers go.
@@ -7581,13 +5944,9 @@ mod tests {
                 )
             })
             .collect();
-        let firsts: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let stub = Stub {
-            models,
-            hang: false,
-            hanging: Default::default(),
-            firsts: firsts.clone(),
-        };
+        let stub = Stub::new(models, false);
+        let firsts = stub.firsts.clone();
+
         let mut reactor: agora_agentkit::reactor::Reactor<_, _, ConsentAgent<Fake>> =
             agora_agentkit::reactor::Reactor::new(
                 stub,
@@ -7640,6 +5999,256 @@ mod tests {
         );
     }
 
+    // --- The stop drills (agora-agents#293) --------------------------------
+    //
+    // The kill drill's setup, stopped by signal instead: a real process
+    // with the runner's own handlers (`crate::signals`), over a copy of the
+    // fleet's state, nothing reaching Agora or a model. `DRILL_SIGNAL`:
+    //
+    // - `TERM`: every session's acting turn is in flight at the signal and
+    //   returns after it; each must close (the stop note, its memory turn,
+    //   its survey), save, clear its journal, and the process exit 0.
+    // - `INT`: one session at a time on the sequential path; the sessions in
+    //   flight at the signal (that one, and the batch cohort, which starts
+    //   whole) run to their end, no other starts (their files untouched),
+    //   exit 0.
+    // - `STUCK`: as `TERM`, but the turn in flight never returns: the
+    //   deadline (`DRILL_DEADLINE_SECS`, default 5) exits 143, and every
+    //   journal stays for the next session's notice.
+    //
+    //   cp -a ~/agents/agora/state <scratch>/data/state
+    //   DRILL_DATA=<scratch>/data DRILL_SIGNAL=TERM cargo test -p agora-seed \
+    //       stop_drill -- --ignored --exact consent::agent::tests::stop_drill --nocapture
+
+    fn drill_signal() -> String {
+        std::env::var("DRILL_SIGNAL").unwrap_or_else(|_| "TERM".into())
+    }
+
+    /// The child: run the drill's agents with the runner's signal handlers
+    #[tokio::test]
+    #[ignore = "the stop drills' child process"]
+    async fn stop_drill_child() {
+        use agora_agentkit::reactor::Run;
+        let data = std::path::PathBuf::from(std::env::var("DRILL_DATA").unwrap());
+        let mode = drill_signal();
+        let (mut agents, models) = drill_agents(&data, true).await;
+        let n = agents.len();
+        for agent in &mut agents {
+            // A second acting turn, unless the stop ends acting first. (A
+            // drain lets the session run on: `Fake` ends it after one turn,
+            // its continuing turn leaving no user turn to answer.)
+            agent.inner.pending = mode != "INT";
+        }
+        let stop = Stop::new();
+        let mut stub = Stub::new(models, false);
+        stub.release = Some((
+            stop.clone(),
+            match mode.as_str() {
+                "INT" => StopLevel::Drain,
+                "TERM" => StopLevel::EndTurn,
+                // Never: the turn in flight is stuck
+                _ => StopLevel::EndTurn,
+            },
+        ));
+        if mode == "STUCK" {
+            stub.release = Some((Stop::new(), StopLevel::EndTurn));
+        }
+        if mode == "INT" {
+            stub.concurrency = 1;
+        }
+        let stopping = stub.stopping.clone();
+        let mut reactor: agora_agentkit::reactor::Reactor<_, _, ConsentAgent<Fake>> =
+            agora_agentkit::reactor::Reactor::new(
+                stub,
+                agora_agentkit::reactor::FsStorage::new(data.join("state")),
+                agents,
+            )
+            .with_stop(stop.clone());
+        let deadline = std::env::var("DRILL_DEADLINE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        let exit = crate::signals::install(stop.clone(), std::time::Duration::from_secs(deadline))
+            .unwrap();
+        let report = tokio::select! {
+            report = reactor.run() => report.unwrap(),
+            code = exit.wait() => {
+                eprintln!("child: exiting {code}");
+                std::process::exit(code);
+            }
+        };
+        let stopping = stopping.load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!(
+            "child: {mode}: done {}, failed {}, unstarted {}, stop notes {stopping}, level {}",
+            report.done,
+            report.failed,
+            report.unstarted,
+            stop.level()
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        match mode.as_str() {
+            "INT" => {
+                assert!(report.done >= 1);
+                assert!(report.unstarted >= 1, "a drain must leave some unstarted");
+                assert_eq!(report.done + report.unstarted, n);
+                assert_eq!(stopping, 0, "a drain doesn't end acting");
+            }
+            _ => {
+                assert_eq!(report.done, n);
+                assert_eq!(stopping, n, "each closed through its stop note");
+            }
+        }
+    }
+
+    /// Each file under each agent's directory, with its size and mtime:
+    /// metadata only, never content
+    fn file_meta(
+        data: &std::path::Path,
+        ids: &[AgentId],
+    ) -> BTreeMap<std::path::PathBuf, (u64, std::time::SystemTime)> {
+        let mut out = BTreeMap::new();
+        for id in ids {
+            let dir = data.join("state").join(id.to_string());
+            let mut stack = vec![dir];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    let meta = entry.metadata().unwrap();
+                    if meta.is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        out.insert(entry.path(), (meta.len(), meta.modified().unwrap()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DRILL_DATA: a scratch copy of the fleet's state"]
+    async fn stop_drill() {
+        let data = std::path::PathBuf::from(std::env::var("DRILL_DATA").unwrap());
+        let mode = drill_signal();
+        let ids = drill_ids(&data);
+        let journal =
+            |id: &AgentId| SessionJournal::in_dir(data.join("state").join(id.to_string()));
+        assert!(
+            ids.iter().all(|id| !journal(id).path().exists()),
+            "no journal before the drill"
+        );
+        let before = file_meta(&data, &ids);
+        let state_of = |id: &AgentId| data.join("state").join(id.to_string()).join("state.json");
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "consent::agent::tests::stop_drill_child",
+                "--nocapture",
+            ])
+            .env("DRILL_DATA", &data)
+            .env("DRILL_SIGNAL", &mode)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let pid = child.id();
+        let mut child = Reap(child);
+
+        // Every session that will start has begun (a journal with its
+        // header), and nothing moved for two seconds: each is in its
+        // acting turn, which returns only after the signal. Draining, one
+        // at a time: the sequential path's first, and the batch cohort.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let (mut still, mut last) = (0, 0);
+        let begun_ids = loop {
+            let begun: Vec<AgentId> = ids
+                .iter()
+                .filter(|id| journal(id).path().exists())
+                .copied()
+                .collect();
+            let settled = match mode.as_str() {
+                "INT" => !begun.is_empty() && begun.len() == last,
+                _ => begun.len() == ids.len(),
+            };
+            last = begun.len();
+            still = if settled { still + 1 } else { 0 };
+            if still >= 10 {
+                break begun;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never got there ({last} begun)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        let expect_begun = begun_ids.len();
+        let signal = if mode == "INT" { "-INT" } else { "-TERM" };
+        eprintln!("signalling the child ({signal}) with {expect_begun} sessions in flight");
+        let status = std::process::Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let exit = loop {
+            if let Some(exit) = child.0.try_wait().unwrap() {
+                break exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline + std::time::Duration::from_secs(60),
+                "the child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        eprintln!("child: {exit:?}");
+        let after = file_meta(&data, &ids);
+        let saved = ids
+            .iter()
+            .filter(|id| before.get(&state_of(id)) != after.get(&state_of(id)))
+            .count();
+        let journals = ids.iter().filter(|id| journal(id).path().exists()).count();
+        match mode.as_str() {
+            "STUCK" => {
+                assert_eq!(exit.code(), Some(crate::signals::DEADLINE_EXIT));
+                assert_eq!(journals, ids.len(), "each kept for the notice");
+                assert_eq!(saved, 0, "cut: nothing saved");
+            }
+            "INT" => {
+                assert_eq!(exit.code(), Some(0), "drained");
+                assert_eq!(journals, 0);
+                assert_eq!(saved, expect_begun, "those in flight");
+                assert!(saved < ids.len(), "some never started");
+                // The rest never started: not a byte, not an mtime
+                let prefixes: Vec<_> = begun_ids
+                    .iter()
+                    .map(|id| data.join("state").join(id.to_string()))
+                    .collect();
+                let untouched = |m: &BTreeMap<std::path::PathBuf, _>| {
+                    m.iter()
+                        .filter(|(p, _)| !prefixes.iter().any(|x| p.starts_with(x)))
+                        .map(|(p, v)| (p.clone(), *v))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(untouched(&before), untouched(&after));
+            }
+            _ => {
+                assert_eq!(exit.code(), Some(0), "every session closed");
+                assert_eq!(journals, 0, "complete and saved");
+                assert_eq!(saved, ids.len());
+            }
+        }
+        eprintln!(
+            "stop drill {mode}: {} agents, {saved} saved, {journals} journals left",
+            ids.len()
+        );
+    }
+
     // --- The memory-restore offer -----------------------------------------
 
     /// A synthetic stand-in for a recovered memory: never a real one.
@@ -7675,7 +6284,7 @@ mod tests {
     async fn restore_answered(h: &Harness, choice: &str, note: &str) -> ConsentAgent<Fake> {
         let mut agent = seated(h).await;
         let q = last_user_text(&agent);
-        assert!(q.contains("## Offer `memory_restore`"), "{q}");
+        assert!(q.contains("**Your memory from before 5 May 2026.**"), "{q}");
         let n = SYNTHETIC_RECOVERED.chars().count();
         assert!(
             q.contains(&format!(
@@ -7722,7 +6331,7 @@ mod tests {
             );
             agent.on_teardown().await.unwrap();
             assert!(!saw_recovered(&agent));
-            assert!(agent.recovered.is_none(), "not even read");
+            assert!(agent.show.recovered.is_none(), "not even read");
             assert!(agent.patched.is_none());
         }
         assert!(
@@ -7743,8 +6352,8 @@ mod tests {
         );
         let mut agent = anthropic_agent(&h);
         agent.on_init().await.unwrap();
-        assert!(agent.recovered.is_none(), "not even read");
-        assert!(agent.restore_ledger.is_none());
+        assert!(agent.show.recovered.is_none(), "not even read");
+        assert!(agent.restore.ledger.is_none());
         assert_eq!(
             agent.handle(reply("closing phase done")).await.unwrap(),
             Control::Done(Outcome::Complete),
@@ -7767,7 +6376,7 @@ mod tests {
         let q = last_user_text(&agent);
         assert!(q.starts_with("One more question"), "{q}");
         assert!(
-            q.contains("## Offer `role`") && !q.contains("memory_restore"),
+            q.contains("**About your role.**") && !q.contains("Your memory from before"),
             "{q}"
         );
         assert_eq!(
@@ -7783,7 +6392,8 @@ mod tests {
         assert_eq!(next.handle(reply("done")).await.unwrap(), Control::Continue);
         let q = last_user_text(&next);
         assert!(
-            q.contains("## Offer `memory_restore`") && !q.contains("## Offer `role`"),
+            q.contains("**Your memory from before 5 May 2026.**")
+                && !q.contains("**About your role.**"),
             "{q}"
         );
     }
@@ -7811,7 +6421,7 @@ mod tests {
         assert_eq!(ask.order, memory_restore::prompt::order_for(seed));
         assert_eq!(ask.order_seed, seed);
         assert_eq!(ask.chars, SYNTHETIC_RECOVERED.chars().count());
-        assert!(ask.constrained);
+        assert!(!ask.constrained, "the Anthropic API: never constrained");
         assert!(ledger.showings.is_empty());
         // The ledger file never holds the recovered text.
         let raw =
@@ -7958,7 +6568,7 @@ mod tests {
         );
         let (last, _) = showing_session(&h, &prev, Ends::Completed).await;
         assert!(!saw_recovered(&last), "capped");
-        assert!(last.recovered.is_none(), "not even read");
+        assert!(last.show.recovered.is_none(), "not even read");
     }
 
     /// A session that dies before the model answers anything uses none of
@@ -8021,44 +6631,36 @@ mod tests {
         assert!(!saw_recovered(&last), "capped");
     }
 
-    /// No answer: asked again at a later session, then no more — the
-    /// siblings' cap.
+    /// Unusable replies are ours: each such session is recorded as
+    /// unusable and alerted, and three count as one miss; six (two misses)
+    /// settle the offer as no answer.
     #[tokio::test]
-    async fn restore_unanswered_is_asked_again_then_not() {
+    async fn restore_unusable_sessions_count_a_miss_at_three() {
         let h = Harness::with_restore("restore-miss", &["tarn"]);
-        for _ in 0..ledger_misses() {
+        let sessions = crate::consent::offer::UNUSABLE_CAP * crate::consent::offer::MAX_MISSES;
+        for n in 0..sessions {
             let mut agent = seated(&h).await;
-            // A turn of text that isn't an answer, then the reminder ignored.
-            assert_eq!(
-                agent.handle(reply("Let me think.")).await.unwrap(),
-                Control::Continue
-            );
-            assert_eq!(
-                agent.handle(reply("Still thinking.")).await.unwrap(),
-                Control::Done(Outcome::Complete)
-            );
+            for _ in 0..MAX_ATTEMPTS {
+                agent.handle(reply("Let me think.")).await.unwrap();
+            }
             agent.on_teardown().await.unwrap();
-            assert!(evolution_notes(&agent).is_empty());
+            assert!(evolution_notes(&agent).is_empty(), "{n}");
         }
         let ledger = restore_ledger(&h).await;
-        assert_eq!(ledger.asks.len(), ledger_misses());
+        assert_eq!(ledger.asks.len(), sessions as usize);
         assert!(
             ledger
                 .asks
                 .iter()
-                .all(|a| matches!(a.outcome, RestoreOutcome::NoAnswer { .. }))
+                .all(|a| matches!(a.outcome, RestoreOutcome::Unusable { .. }))
         );
-        assert!(!asks(&h, OTHER).await, "capped");
+        assert!(!asks(&h, OTHER).await, "two misses: settled");
     }
 
-    fn ledger_misses() -> usize {
-        memory_restore::ledger::MAX_MISSES as usize
-    }
-
-    /// Beside the cadence offer: both in one question, each answered and
-    /// recorded in its own ledger.
+    /// After the cadence offer, one per turn: each answered and recorded in
+    /// its own ledger.
     #[tokio::test]
-    async fn restore_is_put_beside_the_cadence_offer() {
+    async fn restore_is_put_after_the_cadence_offer() {
         let mut h = Harness::with_restore("restore-cadence", &["tarn"]);
         let rt = Arc::get_mut(&mut h.rt).unwrap();
         rt.cadence = Some(crate::consent::cadence::CadenceOffer::for_agents(
@@ -8067,14 +6669,21 @@ mod tests {
         ));
         let mut agent = seated(&h).await;
         let q = last_user_text(&agent);
-        assert!(q.starts_with("Two more questions"), "{q}");
-        assert!(q.contains("(`cadence` and `memory_restore`)"), "{q}");
-        let both = calls(vec![
-            call_block("toolu_1", "cadence", "keep_daily", "", ""),
-            call_block("toolu_2", "memory_restore", "decline", "", ""),
-        ]);
+        assert!(q.starts_with("A few more questions"), "{q}");
+        assert!(q.contains("**How often your sessions run.**"), "{q}");
         assert_eq!(
-            agent.handle(both).await.unwrap(),
+            agent
+                .handle(answer_call("cadence", "keep_daily", "", ""))
+                .await
+                .unwrap(),
+            Control::Continue
+        );
+        assert!(last_user_text(&agent).contains("**Your memory from before 5 May 2026.**"));
+        assert_eq!(
+            agent
+                .handle(answer_call("memory_restore", "decline", "", ""))
+                .await
+                .unwrap(),
             Control::Done(Outcome::Complete)
         );
         agent.on_teardown().await.unwrap();
@@ -8101,12 +6710,12 @@ mod tests {
     }
 
     fn cadence_reply(choice: &str, memory_note: &str) -> response::Message {
-        let answer = CadenceAnswer {
-            reason: "I weighed it.".into(),
-            choice: serde_json::from_value(serde_json::Value::from(choice)).unwrap(),
-            memory_note: memory_note.into(),
-        };
-        reply(&serde_json::to_string(&answer).unwrap())
+        reply(
+            &serde_json::json!({
+                "choice": choice, "note": "I weighed it.", "memory_note": memory_note,
+            })
+            .to_string(),
+        )
     }
 
     /// An agent on the Anthropic API: canonical quirks, not cache-safe.
@@ -8155,10 +6764,13 @@ mod tests {
         let q = last_user_text(&agent);
         let seed = cadence::prompt::seed_for(h.id);
         let order = cadence::prompt::order_for(seed);
-        assert!(q.contains("with 5 rounds in each"), "{q}");
+        assert!(
+            q.contains("scheduled once a day, with 5 rounds each"),
+            "{q}"
+        );
         assert!(q.contains("with 10 rounds in each"), "{q}");
-        for (i, c) in order.iter().enumerate() {
-            assert!(q.contains(&format!("{}. **{}**", i + 1, c.as_str())), "{q}");
+        for c in order.iter() {
+            assert!(q.contains(&format!("- **{}**", c.as_str())), "{q}");
         }
         // Plain text on Anthropic: no `output_config` change, no miss.
         assert!(agent.prompt().output_config.is_none(), "unconstrained");
@@ -8199,6 +6811,11 @@ mod tests {
         assert_eq!(ask.offer_version, cadence::prompt::OFFER_VERSION);
         assert_eq!(ask.attempts.len(), 1);
         assert!(ask.attempts[0].failure.is_none());
+        assert_eq!(
+            ask.attempts[0].raw,
+            r#"{"choice":"switch","note":"I weighed it.","memory_note":"I chose longer sessions."}"#,
+            "the reply's own text, verbatim"
+        );
         assert!(matches!(
             &ask.outcome,
             CO::Answered {
@@ -8388,8 +7005,9 @@ mod tests {
     }
 
     /// No usable choice: asked once more in the same session, and both
-    /// attempts are on file; a second miss is no answer (nothing changes),
-    /// asked again at a later session.
+    /// attempts are on file; a second unusable reply is no answer (nothing
+    /// changes), ours rather than the agent's: recorded as unusable, not
+    /// counted, asked again at a later session.
     #[tokio::test]
     async fn cadence_missing_choice_is_asked_once_more_and_both_attempts_recorded() {
         let h = Harness::with_cadence("cadence-retry", &[], &["tarn"]);
@@ -8403,7 +7021,10 @@ mod tests {
             Control::Continue
         );
         assert_eq!(agent.prompt().messages.len(), len + 2, "seated");
-        assert!(last_user_text(&agent).contains("Your answer could not be used"));
+        assert!(
+            last_user_text(&agent).contains("choice"),
+            "why, naming the field"
+        );
         assert_eq!(
             agent
                 .handle(cadence_reply("no_preference", ""))
@@ -8438,11 +7059,14 @@ mod tests {
         let ledger = cadence_ledger(&h).await;
         let ask = &ledger.asks[0];
         assert_eq!(ask.attempts.len(), CADENCE_MAX_ATTEMPTS as usize);
+        assert!(ask.attempts.iter().all(|a| a.failure.is_some()));
         match &ask.outcome {
-            CO::NoAnswer { failure } => assert!(failure.contains("after 2"), "{failure}"),
+            CO::Unusable { failure } => {
+                assert!(failure.starts_with("no usable answer"), "{failure}")
+            }
             other => panic!("{other:?}"),
         }
-        assert!(asks(&h, OTHER).await, "a miss is asked once more");
+        assert!(asks(&h, OTHER).await, "asked again");
     }
 
     /// A clipped turn is never an answer, even if a choice could be read
@@ -8470,195 +7094,35 @@ mod tests {
         ));
     }
 
-    /// A refusal is final; a paused turn is no answer, asked again.
+    /// An API refusal fails the session and records nothing: asked again
+    /// later. A
+    /// paused turn is resumed: the answer after it counts.
     #[tokio::test]
-    async fn cadence_refusal_is_final_pause_is_not() {
+    async fn cadence_refusal_fails_the_session_and_a_pause_is_resumed() {
         let h = Harness::with_cadence("cadence-refusal", &[], &["tarn"]);
+        let mut agent = seated(&h).await;
         let mut refusal = reply("No.");
         refusal.stop_reason = Some(StopReason::Refusal);
-        cadence_session(&h, vec![refusal]).await;
-        assert!(matches!(
-            cadence_ledger(&h).await.asks[0].outcome,
-            CO::Refused { .. }
-        ));
-        assert!(!asks(&h, OTHER).await);
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(cadence_ledger(&h).await.asks.is_empty(), "nothing recorded");
+        assert!(asks(&h, OTHER).await, "asked again");
 
         let h = Harness::with_cadence("cadence-pause", &[], &["tarn"]);
         let mut paused = reply("");
         paused.stop_reason = Some(StopReason::PauseTurn);
-        cadence_session(&h, vec![paused]).await;
+        cadence_session(&h, vec![paused, cadence_reply("keep_daily", "")]).await;
         assert!(matches!(
             cadence_ledger(&h).await.asks[0].outcome,
-            CO::NoAnswer { .. }
-        ));
-        assert!(asks(&h, OTHER).await);
-    }
-
-    /// `answer_offer` with no offer open (any time before the close) is
-    /// refused; while offers are open, a call for one that isn't, a choice
-    /// the offer doesn't have, and any other tool get error results that
-    /// say what would do — and only the wrong choice costs that offer a
-    /// try. A good call settles its offer at once.
-    #[tokio::test]
-    async fn wrong_offer_wrong_choice_and_no_offer_pending_are_errors() {
-        let h = Harness::with_cadence("errors", &["tarn"], &["tarn"]);
-        let mut agent = h.agent(OTHER, false);
-        agent.on_init().await.unwrap();
-        {
-            use misanthropic::tool::Tool;
-            let call: Use =
-                serde_json::from_value(call_block("toolu_0", "role", "nothing", "", "")).unwrap();
-            let r = agent.parts().0.call(call).await;
-            assert!(r.is_error);
-            assert!(
-                result_text(&r).starts_with("No offer is pending"),
-                "{}",
-                result_text(&r)
-            );
-        }
-        assert_eq!(
-            agent.handle(reply("closing phase done")).await.unwrap(),
-            Control::Continue
-        );
-        let q = last_user_text(&agent);
-        assert!(q.contains("(`role` and `cadence`)"), "{q}");
-        assert!(
-            !q.contains("## Offer `model_swap`"),
-            "not on the from-model: {q}"
-        );
-
-        let mut other = call_block("toolu_d", "x", "x", "", "");
-        other["name"] = "create_post".into();
-        other["input"] = serde_json::json!({ "title": "t" });
-        let control = agent
-            .handle(calls(vec![
-                call_block("toolu_a", "model_swap", "no_swap", "", ""),
-                call_block("toolu_b", "role", "switch", "", ""),
-                call_block("toolu_c", "cadence", "keep_daily", "", ""),
-                other,
-            ]))
-            .await
-            .unwrap();
-        assert_eq!(control, Control::Continue, "the role offer is still open");
-        let r = results(&agent);
-        assert_eq!(r.len(), 4, "one result per call");
-        assert_eq!(
-            r[0],
-            (
-                true,
-                "No `model_swap` offer is open; open: `role` and `cadence`.".to_string()
-            )
-        );
-        let order =
-            crate::consent::role::prompt::order_for(crate::consent::role::prompt::seed_for(h.id));
-        let names: Vec<String> = order.iter().map(|c| format!("`{}`", c.as_str())).collect();
-        assert!(r[1].0);
-        assert_eq!(
-            r[1].1,
-            format!(
-                "`switch` is not an option for `role`; its options are {}, {}, {} or {}. Nothing \
-                 was recorded. Call `answer_offer` again for `role` (2 tries left).",
-                names[0], names[1], names[2], names[3]
-            )
-        );
-        assert_eq!(
-            r[2],
-            (
-                false,
-                "Recorded your answer to `cadence`: `keep_daily`. Still open: `role`.".to_string()
-            )
-        );
-        assert!(r[3].0);
-        assert!(
-            r[3].1.starts_with("`create_post` can't be used now"),
-            "{r:?}"
-        );
-
-        // A call for the offer just settled is now one that isn't open.
-        let control = agent
-            .handle(calls(vec![
-                call_block("toolu_e", "cadence", "switch", "", ""),
-                call_block("toolu_f", "role", "nothing", "", ""),
-            ]))
-            .await
-            .unwrap();
-        assert_eq!(control, Control::Done(Outcome::Complete));
-        let r = results(&agent);
-        assert_eq!(
-            r[0],
-            (
-                true,
-                "No `cadence` offer is open; open: `role`.".to_string()
-            )
-        );
-        assert_eq!(
-            r[1],
-            (
-                false,
-                "Recorded your answer to `role`: `nothing`. Nothing else is open.".to_string()
-            )
-        );
-        agent.on_teardown().await.unwrap();
-        let role = &h.role_ledger().await.asks[0];
-        assert_eq!(role.attempts, 2, "the wrong choice, then the answer");
-        assert!(matches!(
-            role.outcome,
-            RoleOutcome::Answered {
-                applied: Applied::Nothing,
-                ..
-            }
-        ));
-        let cadence = &cadence_ledger(&h).await.asks[0];
-        assert!(cadence.constrained, "strict tool");
-        assert_eq!(cadence.attempts.len(), 1);
-        assert!(cadence.attempts[0].raw.contains("\"keep_daily\""));
-        assert!(matches!(
-            cadence.outcome,
             CO::Answered {
                 choice: CadenceChoice::KeepDaily,
                 ..
             }
         ));
-    }
-
-    /// Two offers open and a turn that answers neither: one reminder
-    /// naming both, then — still unanswered — both are no answer (a miss:
-    /// asked again next session).
-    #[tokio::test]
-    async fn unanswered_offers_get_one_reminder_then_no_answer() {
-        let h = Harness::with_cadence("unanswered", &["tarn"], &["tarn"]);
-        let mut agent = seated(&h).await;
-        let len = agent.prompt().messages.len();
-        assert_eq!(
-            agent.handle(reply("Thanks, that's all.")).await.unwrap(),
-            Control::Continue
-        );
-        assert_eq!(agent.prompt().messages.len(), len + 2, "seated");
-        assert!(
-            last_user_text(&agent).ends_with(
-                "These offers above are still open: `role` and `cadence`. Answer each by calling \
-                 `answer_offer` once, with `offer` set to its key. Any still unanswered after \
-                 this turn is recorded as no answer."
-            ),
-            "{}",
-            last_user_text(&agent)
-        );
-        assert_eq!(
-            agent.handle(reply("Thanks, that's all.")).await.unwrap(),
-            Control::Done(Outcome::Complete)
-        );
-        agent.on_teardown().await.unwrap();
-        match &h.role_ledger().await.asks[0].outcome {
-            RoleOutcome::NoAnswer { failure } => {
-                assert!(failure.contains("no `answer_offer` call"), "{failure}");
-                assert!(failure.contains("after 2 attempts"), "{failure}");
-            }
-            other => panic!("{other:?}"),
-        }
-        let cadence = &cadence_ledger(&h).await.asks[0];
-        assert_eq!(cadence.attempts.len(), 2, "both turns on file");
-        assert!(matches!(cadence.outcome, CO::NoAnswer { .. }));
-        assert!(asks(&h, OTHER).await, "a miss is asked again");
+        assert!(!asks(&h, OTHER).await);
     }
 
     /// Unlisted or off: not asked, no ledger written.
@@ -8863,22 +7327,35 @@ mod tests {
         drop(agent);
     }
 
-    /// On blallama (`output_config_cache_safe`) too, nothing a cache keys
-    /// on changes any more: the answer's shape comes from the strict
-    /// `answer_offer`, registered since init, so `output_config` (the
-    /// session's effort) is left as it was, and a call and its result only
-    /// append.
+    /// On blallama (`output_config_cache_safe`) a format is part of no
+    /// cache key, so each question goes out with its own schema as the
+    /// format, the session's effort kept; everything else in the head is
+    /// as it was, and every request only appends to the one before.
     #[tokio::test]
-    async fn on_blallama_the_offers_change_nothing_a_cache_keys_on() {
+    async fn on_blallama_the_offers_go_out_with_their_schema() {
         let h = Harness::with_cadence("prefix-blallama", &[], &["tarn"]);
         let mut agent = rich_agent(&h, OTHER, true);
         agent.on_init().await.unwrap();
         let r0 = agent.prompt().clone();
         agent.handle(reply("closing phase done")).await.unwrap();
         let r1 = agent.prompt().clone();
-        // The head — output_config (effort only, as before) and
-        // tool_choice included — is compared whole.
-        assert_prefix_kept(&r0, &r1, "blallama question");
+        let config = r1.output_config.clone().unwrap();
+        assert!(config.format.is_some(), "constrained: {config:?}");
+        assert_eq!(
+            config.effort,
+            r0.output_config.as_ref().unwrap().effort,
+            "the session's effort kept"
+        );
+        let without_format = |p: &Prompt| {
+            let mut head = request_head(p);
+            head["output_config"]
+                .as_object_mut()
+                .unwrap()
+                .remove("format");
+            head
+        };
+        assert_eq!(without_format(&r0), without_format(&r1));
+        assert_eq!(agora_agentkit::reactor::cache::divergence(&r0, &r1), None);
         assert_eq!(
             agent
                 .handle(answer_call("cadence", "no_preference", "", ""))
@@ -8887,14 +7364,21 @@ mod tests {
             Control::Done(Outcome::Complete)
         );
         let r2 = agent.prompt().clone();
-        assert_prefix_kept(&r1, &r2, "blallama answer");
+        assert_eq!(without_format(&r1), without_format(&r2), "blallama answer");
+        assert_eq!(agora_agentkit::reactor::cache::divergence(&r1, &r2), None);
+        assert!(
+            r2.output_config.as_ref().is_none_or(|c| c.format.is_none()),
+            "the last question's format is cleared once it is done"
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(cadence_ledger(&h).await.asks[0].constrained);
     }
 
     /// The tool list — which leads the request — is the same bytes for two
     /// different agents (different ids and names, one offered the role
-    /// offer and one not), with `answer_offer` second to last, `strict`,
-    /// and `set_model` last; and an agent with no `set_model` still has
-    /// `answer_offer`, last.
+    /// offer and one not), with `memory` second to last and `set_model`
+    /// last; and an agent with no `set_model` has `memory` last. No
+    /// `answer_offer` (gone 2026-11-06).
     #[tokio::test]
     async fn the_tool_list_is_byte_identical_across_agents() {
         let h = Harness::with_role("tools-a", &["tarn"]);
@@ -8922,15 +7406,10 @@ mod tests {
         let tools = a.prompt().tools.as_ref().unwrap();
         let names: Vec<&str> = tools.iter().map(|d| d.name()).collect();
         let n = names.len();
-        assert_eq!(names[n - 2..], ["answer_offer", "set_model"], "{names:?}");
-        let wire: serde_json::Value = serde_json::from_str(&tools_a).unwrap();
-        assert_eq!(wire[n - 2]["strict"], true);
-        assert_eq!(
-            wire[n - 2],
-            serde_json::to_value(offers::definition()).unwrap()
-        );
+        assert_eq!(names[n - 2..], ["memory", "set_model"], "{names:?}");
+        assert!(!names.contains(&"answer_offer"), "{names:?}");
 
-        // No choice of model, no `set_model`: `answer_offer` is last.
+        // No choice of model, no `set_model`: `memory` is last.
         let only_new = crate::models::Catalog::new(
             &toml::from_str::<Table>(
                 "[[model]]\nid = \"Qwen3.8.gguf\"\ndescription = \"x\"\nselectable = true\n",
@@ -8968,7 +7447,7 @@ mod tests {
             .iter()
             .map(|d| d.name())
             .collect();
-        assert_eq!(names.last(), Some(&"answer_offer"), "{names:?}");
+        assert_eq!(names.last(), Some(&"memory"), "{names:?}");
         assert!(!names.contains(&"set_model"));
     }
 
@@ -9042,14 +7521,17 @@ mod tests {
     /// The live bug (impulse on gpt-oss, 2026-10-02): the inner session's
     /// last phase constrained its answer to the memory schema on blallama,
     /// the offer went out under that format, and the reply could only be
-    /// `{"content": …}`. The offer now goes out with the session's effort
-    /// alone, and a call answers it.
+    /// `{"content": …}`. The offer now goes out under its own schema, with
+    /// the session's effort, and its answer is taken.
     #[tokio::test]
-    async fn an_offer_after_a_constrained_memory_turn_goes_out_unconstrained() {
+    async fn an_offer_after_a_constrained_memory_turn_goes_out_under_its_own_schema() {
         use misanthropic::prompt::output::Effort;
         let h = Harness::with_cadence("memory-format", &[], &["tarn"]);
         let mut agent = h.agent(OTHER, true);
         agent.on_init().await.unwrap();
+        let memory_format =
+            OutputConfig::json_schema(serde_json::to_value(schemars::schema_for!(Memory)).unwrap())
+                .format;
         {
             // As agentkit's reflect leaves it: `constrain::<Memory>()`.
             let (_, prompt) = agent.parts();
@@ -9070,7 +7552,8 @@ mod tests {
             "offer seated"
         );
         let config = agent.prompt().output_config.clone().unwrap();
-        assert!(config.format.is_none(), "{config:?}");
+        assert!(config.format.is_some(), "{config:?}");
+        assert_ne!(config.format, memory_format, "not the memory's");
         assert_eq!(
             config.effort,
             Some(Effort::Medium),
@@ -9104,7 +7587,7 @@ mod tests {
         agent.on_init().await.unwrap();
         assert!(agent.inner.held);
         agent.handle(reply("closing phase done")).await.unwrap();
-        assert!(last_user_text(&agent).contains("`cadence`"));
+        assert!(last_user_text(&agent).contains("**How often your sessions run.**"));
         assert_eq!(
             agent
                 .handle(answer_call("cadence", "no_preference", "", ""))
@@ -9246,12 +7729,25 @@ mod tests {
             }
             requests.push(request);
             let reply = script.pop_front().expect("script ran out");
-            if let Control::Done(outcome) = agent.handle(reply).await.ok().unwrap() {
+            if let Control::Done(outcome) = agent.handle(reply).await.unwrap() {
                 assert_eq!(outcome, Outcome::Complete);
                 assert!(script.is_empty(), "{} replies left", script.len());
                 return requests;
             }
         }
+    }
+
+    /// A turn of tool calls (`stop_reason: tool_use`).
+    fn calls(blocks: Vec<serde_json::Value>) -> response::Message {
+        serde_json::from_value(serde_json::json!({
+            "id": "msg_test",
+            "role": "assistant",
+            "content": blocks,
+            "model": "test",
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+        }))
+        .unwrap()
     }
 
     fn post_call(id: &str, title: &str) -> response::Message {
@@ -9345,28 +7841,32 @@ mod tests {
             ],
         )
         .await;
-        // The offer went out unconstrained, after a constrained memory turn.
+        // The offer went out under its own schema (blallama), not the
+        // memory turn's.
         let offer = requests
             .iter()
             .find(|r| {
                 serde_json::to_string(&r.messages)
                     .unwrap()
-                    .contains("`model_swap`")
+                    .contains("**About the model you run on.**")
             })
             .unwrap();
-        assert!(
-            offer
-                .output_config
-                .as_ref()
-                .is_none_or(|c| c.format.is_none())
-        );
         let memory_turn = &requests[3];
-        assert!(memory_turn.output_config.as_ref().unwrap().format.is_some());
+        let format = |r: &Prompt| r.output_config.as_ref().and_then(|c| c.format.clone());
+        assert!(format(memory_turn).is_some());
+        assert_eq!(
+            format(offer),
+            OutputConfig::json_schema(text::offer_schema()).format
+        );
         // The survey is last, after the offer.
         let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
-        assert!(last.contains("anonymous feedback") && last.contains("`model_swap`"));
+        assert!(last.contains("contact_me") && last.contains("**About the model you run on.**"));
         agent.on_teardown().await.unwrap();
-        assert_survey_redacted(&h, &agent, "Recorded your answer to `model_swap`");
+        assert_survey_redacted(
+            &h,
+            &agent,
+            "Recorded your answer about the model you run on",
+        );
         assert_eq!(
             agent.state().memory.content,
             "I posted about compilers today."
@@ -9404,16 +7904,14 @@ mod tests {
                 post_call("toolu_2", "Tests are documentation"),
                 reply(MEMORY_REPLY),
                 reply(r#"{"note": "I like tests."}"#),
-                clipped(r#"{"offer": "role", "reason": "I thou"#),
-                calls(vec![
-                    call_block("toolu_3", "role", "nothing", "", ""),
-                    call_block("toolu_4", "cadence", "keep_daily", "", ""),
-                ]),
+                clipped(r#"{"choice": "nothing", "note": "I thou"#),
+                answer_call("role", "nothing", "", ""),
+                answer_call("cadence", "keep_daily", "", ""),
                 reply(r#"{"text": "Please reach out.", "contact_me": true}"#),
             ],
         )
         .await;
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 8, "one question per turn");
         agent.on_teardown().await.unwrap();
         assert!(
             prompt_log(&h).contains("Please reach out."),
@@ -9475,5 +7973,683 @@ mod tests {
             agent.state().soul.identity.as_str(),
             "A test agent that came home."
         );
+    }
+
+    /// Drive `agent` through `script` until it is done; the session must
+    /// complete. Unlike [`drive_appending`], for sessions with a pause: a
+    /// resumed pause's continuation merges into the paused turn, which is
+    /// the one rewrite of a sent message the API asks for.
+    async fn drive<A: Agent>(agent: &mut A, script: Vec<response::Message>) {
+        let n = script.len();
+        for (i, reply) in script.into_iter().enumerate() {
+            let control = match agent.handle(reply).await {
+                Ok(control) => control,
+                Err(_) => panic!("reply {i} not handled"),
+            };
+            if let Control::Done(outcome) = control {
+                assert_eq!(outcome, Outcome::Complete);
+                assert_eq!(i + 1, n, "{} replies left", n - i - 1);
+                return;
+            }
+        }
+        panic!("the script ran out before the session ended");
+    }
+
+    /// A turn paused on a server tool (a web search still working).
+    fn paused(text: &str) -> response::Message {
+        let mut r = reply(text);
+        r.stop_reason = Some(StopReason::PauseTurn);
+        r
+    }
+
+    /// With the real `SeedAgent`: a pause in an offer is resumed (not the
+    /// inner agent's `on_pause`, which refuses while held), the answer after
+    /// it is taken, and the survey still comes last.
+    #[tokio::test]
+    async fn a_paused_offer_is_resumed_in_a_whole_session() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("whole-swap-pause");
+        let mut agent = seed_agent(
+            &h,
+            OLD,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                force_survey: true,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        drive(
+            &mut agent,
+            vec![
+                reply("That's all for today."),
+                reply(MEMORY_REPLY),
+                paused("Let me look something up."),
+                answer_call("model_swap", "no_swap", "", ""),
+                reply(ANONYMOUS),
+            ],
+        )
+        .await;
+        agent.on_teardown().await.unwrap();
+        assert_eq!(h.ledger().await.offers[0].stage, Stage::Declined);
+    }
+
+    /// With the real `SeedAgent`: a pause in the trial review is resumed,
+    /// the answer after it is taken, and the memory turn follows.
+    #[tokio::test]
+    async fn a_paused_review_is_resumed_in_a_whole_session() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("whole-review-pause");
+        through_the_trial(&h).await;
+        let mut agent = seed_agent(
+            &h,
+            OLD,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                force_survey: true,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        drive(
+            &mut agent,
+            vec![
+                paused("Let me look something up."),
+                reply(r#"{"note": "Home.", "choice": "stay"}"#),
+                reply(MEMORY_REPLY),
+                reply(ANONYMOUS),
+            ],
+        )
+        .await;
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            h.ledger().await.offers[0].stage,
+            Stage::Reverted {
+                cause: Some(RevertCause::Chosen)
+            }
+        );
+    }
+
+    /// With the real `SeedAgent`: pauses in the review past the session's
+    /// budget (five) are failed attempts; spent, the review is an unusable
+    /// session (recorded, asked again next session), the memory turn
+    /// follows, and the session completes.
+    #[tokio::test]
+    async fn review_pauses_past_the_budget_end_it_unusable() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("whole-review-pauses");
+        through_the_trial(&h).await;
+        let mut agent = seed_agent(
+            &h,
+            OLD,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                force_survey: false,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        let mut control = Control::Continue;
+        let mut n = 0;
+        while !agent.inner.state().memory.content.contains("compilers") && n < 20 {
+            control = agent.handle(paused("Still searching.")).await.unwrap();
+            n += 1;
+            if !agent.asks.is_active() {
+                break;
+            }
+        }
+        assert!(
+            !agent.asks.is_active(),
+            "the review gave up after {n} pauses"
+        );
+        assert_eq!(
+            n,
+            5 + MAX_ATTEMPTS as usize,
+            "five resumed, then three attempts"
+        );
+        assert_ne!(control, Control::Done(Outcome::Failed));
+        let mut control = agent.handle(reply(MEMORY_REPLY)).await.unwrap();
+        while control == Control::Continue && n < 30 {
+            control = agent.handle(reply(ANONYMOUS)).await.unwrap();
+            n += 1;
+        }
+        assert_eq!(control, Control::Done(Outcome::Complete));
+        agent.on_teardown().await.unwrap();
+        let ledger = h.ledger().await;
+        assert!(matches!(ledger.offers[0].stage, Stage::ReviewDue { .. }));
+        assert!(
+            ledger.offers[0]
+                .history
+                .iter()
+                .any(|e| matches!(e.kind, crate::consent::ledger::EventKind::Unusable { .. }))
+        );
+    }
+
+    /// A showing session records the dump its inner teardown actually
+    /// wrote: the archive, a left-out reply included, not a hash of the
+    /// prompt (which the left-out reply isn't in).
+    #[tokio::test]
+    async fn a_showing_records_the_archive_it_wrote() {
+        use agora_agentkit::reactor::ask::AskHost;
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::with_restore("restore-archive", &["tarn"]);
+        restore_answered(&h, "show", "").await;
+        let mut agent = seed_agent(
+            &h,
+            OTHER,
+            SeedConfig {
+                mutation_chance: 0,
+                evolution_chance: 0,
+                // The survey is drawn at random (10%): not here
+                survey_chance: 0,
+                ..SeedConfig::default()
+            },
+        );
+        agent.on_init().await.unwrap();
+        assert!(agent.show.shown, "the recovered memory is shown");
+        drive(
+            &mut agent,
+            vec![reply("That's all for today."), reply(MEMORY_REPLY)],
+        )
+        .await;
+        agent.left_out("offer:role", 1, &reply("A reply the retry left out."));
+        let rehashed = agora_agentkit::reactor::seed::prompt_sha256(agent.prompt()).unwrap();
+        agent.on_teardown().await.unwrap();
+        let ledger = restore_ledger(&h).await;
+        let sha = ledger
+            .showings
+            .last()
+            .unwrap()
+            .prompt_sha256
+            .clone()
+            .unwrap();
+        assert_ne!(sha, rehashed, "the archive holds the left-out reply");
+        let path = h
+            .root
+            .join("prompts")
+            .join(&sha[..2])
+            .join(format!("{sha}.json"));
+        assert!(
+            path.exists(),
+            "names a dump that exists: {}",
+            path.display()
+        );
+        let dump = std::fs::read_to_string(path).unwrap();
+        assert!(dump.contains("A reply the retry left out."));
+    }
+
+    /// A review session whose first reply is a refusal has begun (the
+    /// wrapper took the reply, not the inner session): its failure is
+    /// reported, so it is mailed and journaled.
+    #[tokio::test]
+    async fn a_review_refused_at_its_first_reply_is_reported() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("review-refused-begun");
+        through_the_trial(&h).await;
+        let mut agent = seed_agent(&h, OLD, SeedConfig::default());
+        agent.on_init().await.unwrap();
+        let mut refusal = reply("No.");
+        refusal.stop_reason = Some(StopReason::Refusal);
+        assert_eq!(
+            agent.handle(refusal).await.unwrap(),
+            Control::Done(Outcome::Failed)
+        );
+        agent.on_teardown().await.unwrap();
+        assert!(
+            matches!(
+                agent.inner.failure(),
+                Some(SessionFailure::Refused { during, .. }) if during == "review"
+            ),
+            "{:?}",
+            agent.inner.failure()
+        );
+    }
+
+    // --- The sealed-state offer --------------------------------------------
+
+    /// A harness with the sealed-state offer to the harness agent, and the
+    /// memory-restore offer to `restore`.
+    fn with_sealed(tag: &str, restore: Option<&[&str]>) -> Harness {
+        let mut h = Harness::build(tag, None, None, None, restore);
+        let rt = Arc::get_mut(&mut h.rt).unwrap();
+        rt.sealed_state = Some(sealed_state::SealedOffer::for_agents(&[h.id]));
+        h
+    }
+
+    async fn sealed_ledger(h: &Harness) -> SealLedger {
+        SealLedger::load(&h.rt.state_dir.join(h.id.to_string()))
+            .await
+            .unwrap()
+    }
+
+    /// Asked of a listed agent, answered with `private`: one dated SOUL
+    /// line, memory untouched, the choice on file, never asked again.
+    #[tokio::test]
+    async fn sealed_offer_is_asked_once_and_recorded() {
+        let h = with_sealed("sealed-offer", None);
+        let memory = anthropic_agent(&h).state().memory.content.clone();
+        let mut agent = seated(&h).await;
+        let q = last_user_text(&agent);
+        assert!(q.contains("**Sealed backups of your state.**"), "{q}");
+        assert!(
+            q.contains("None of this protects your state against your operator."),
+            "{q}"
+        );
+        assert_eq!(
+            agent
+                .handle(answer_call("sealed_state", "private", "", ""))
+                .await
+                .unwrap(),
+            Control::Done(Outcome::Complete)
+        );
+        agent.on_teardown().await.unwrap();
+        assert_eq!(
+            evolution_notes(&agent),
+            [sealed_state::evolution_line(SealChoice::Private)]
+        );
+        assert_eq!(agent.state().memory.content, memory);
+        let ledger = sealed_ledger(&h).await;
+        assert_eq!(ledger.choice(), Some(SealChoice::Private));
+        assert!(ledger.opted_in());
+        let seed = sealed_state::prompt::seed_for(h.id);
+        assert_eq!(ledger.asks[0].order, sealed_state::prompt::order_for(seed));
+
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert_eq!(
+            next.handle(reply("done")).await.unwrap(),
+            Control::Done(Outcome::Complete),
+            "not asked again"
+        );
+    }
+
+    /// `show` is the memory-restore offer's; `publish` is not: each offer
+    /// takes only its own options.
+    #[tokio::test]
+    async fn sealed_offer_refuses_another_offers_choice() {
+        let h = with_sealed("sealed-wrong", None);
+        let mut agent = seated(&h).await;
+        assert_eq!(
+            agent
+                .handle(answer_call("sealed_state", "show", "", ""))
+                .await
+                .unwrap(),
+            Control::Continue
+        );
+        assert!(sealed_ledger(&h).await.asks.is_empty(), "nothing recorded");
+    }
+
+    /// Never in the same question as the memory-restore offer, whose
+    /// answer the genesis records: it waits for the session after.
+    #[tokio::test]
+    async fn sealed_offer_waits_for_the_memory_restore_offer() {
+        let h = with_sealed("sealed-restore", Some(&["tarn"]));
+        let mut agent = seated(&h).await;
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains("**Your memory from before 5 May 2026.**") && !q.contains("Sealed backups"),
+            "{q}"
+        );
+        agent
+            .handle(answer_call("memory_restore", "decline", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert_eq!(next.handle(reply("done")).await.unwrap(), Control::Continue);
+        assert!(last_user_text(&next).contains("**Sealed backups of your state.**"));
+    }
+
+    /// The start check's lines are seated at the end of the intro; a
+    /// refusal notice among them is set aside once the session saves.
+    #[tokio::test]
+    async fn sealed_lines_are_seated_and_the_notice_set_aside_after_the_save() {
+        let mut h = Harness::new("sealed-seat");
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        crate::sealed::notice::Notice::accept(
+            &dir,
+            "a test",
+            crate::sealed::notice::Refusal::Mismatch,
+            None,
+        )
+        .unwrap();
+        // An anchor failure the verdict tells of: told only once the
+        // session saves, so a seat for a session that never runs leaves it
+        // for the next
+        use crate::sealed::inclusion::{Checked, Finding, InclusionFile};
+        let anc: agora_agentkit::ids::GovernanceLogId = "ANC-2026-0002".parse().unwrap();
+        InclusionFile {
+            through: Some(anc.clone()),
+            checked: vec![Checked {
+                anc_id: anc.clone(),
+                date: None,
+                finding: Finding::DidNotCheck,
+                at: chrono::Utc::now(),
+                told: false,
+                alerted: true,
+            }],
+        }
+        .save(&dir)
+        .unwrap();
+        let rt = Arc::get_mut(&mut h.rt).unwrap();
+        rt.sealed_seats.insert(
+            h.id,
+            crate::consent::SealedSeat {
+                lines: vec!["NOTICE LINE".into(), "VERDICT LINE".into()],
+                notice: true,
+                stop_note: false,
+                anchors_told: vec![anc],
+            },
+        );
+        let mut agent = anthropic_agent(&h);
+        agent.on_init().await.unwrap();
+        let intro = serde_json::to_string(&agent.prompt().messages).unwrap();
+        assert!(
+            intro.contains("## Your Sealed State\\n\\nNOTICE LINE\\n\\nVERDICT LINE"),
+            "{intro}"
+        );
+        assert!(crate::sealed::notice::Notice::load(&dir).unwrap().is_some());
+        assert!(!InclusionFile::load(&dir).unwrap().checked[0].told);
+        agent.on_saved().await.unwrap();
+        assert!(
+            crate::sealed::notice::Notice::load(&dir).unwrap().is_none(),
+            "set aside"
+        );
+        assert!(InclusionFile::load(&dir).unwrap().checked[0].told, "told");
+    }
+
+    /// Beta round 1: an agent listed only in `[sealed_state]`, no other
+    /// offer configured, no ledger files at all, is still asked.
+    #[tokio::test]
+    async fn sealed_offer_is_asked_with_no_other_offer_and_no_ledgers() {
+        let h = Harness::new("sealed-alone");
+        let mut rt = h.runtime_advertising(&[OLD, NEW, OTHER]);
+        Arc::get_mut(&mut rt).unwrap().sealed_state =
+            Some(sealed_state::SealedOffer::for_agents(&[h.id]));
+        let dir = rt.state_dir.join(h.id.to_string());
+        assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none());
+        let mut agent = h.agent_on(&rt, OTHER);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "the sealed-state question is seated"
+        );
+        assert!(last_user_text(&agent).contains("**Sealed backups of your state.**"));
+    }
+
+    /// An enrolled agent whose ledger was lost with its directory (only its
+    /// state key in the secrets tree says it was enrolled) is never asked
+    /// again.
+    #[tokio::test]
+    async fn an_enrolled_agent_is_never_offered_again() {
+        let h = Harness::new("sealed-enrolled");
+        let mut rt = h.runtime_advertising(&[OLD, NEW, OTHER]);
+        Arc::get_mut(&mut rt).unwrap().sealed_state =
+            Some(sealed_state::SealedOffer::for_agents(&[h.id]));
+        let key_dir = rt.secrets_dir.join(h.id.to_string());
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join(crate::sealed::keys::STATE_KEY_FILE), b"{}").unwrap();
+        let mut agent = h.agent_on(&rt, OTHER);
+        agent.on_init().await.unwrap();
+        // Nothing is seated: the session ends at its closing phase
+        assert_ne!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "no sealed-state question"
+        );
+    }
+
+    /// The session after an answer is told it is on file, once.
+    #[tokio::test]
+    async fn the_sealed_answer_is_told_back_once_at_the_next_session() {
+        let h = with_sealed("sealed-ack", None);
+        let mut agent = seated(&h).await;
+        agent
+            .handle(answer_call("sealed_state", "decline", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        let seen = serde_json::to_string(&next.prompt().messages).unwrap();
+        assert!(
+            seen.contains(
+                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; if you change your mind, ask your operator."
+            ),
+            "{seen}"
+        );
+        next.handle(reply("done")).await.unwrap();
+        next.on_teardown().await.unwrap();
+        assert!(sealed_ledger(&h).await.acknowledged);
+        let mut third = next_session(&h, &next);
+        third.on_init().await.unwrap();
+        let seen = serde_json::to_string(&third.prompt().messages).unwrap();
+        assert!(!seen.contains("is recorded: decline"), "once");
+    }
+
+    // --- The memory tool ---------------------------------------------------
+
+    /// A verdict line as the start check writes it, naming a head.
+    fn verdict_naming_a_head() -> String {
+        format!(
+            "Your sealed state: intact. This session starts from head 346ac9543d0c {} In this \
+             version, your memory is 3 characters.",
+            crate::sealed::check::HEAD_MARKER
+        )
+    }
+
+    /// The `memory` tool is seated for every agent, keyed or not, just
+    /// before `set_model`, its schema the nested object, the same bytes
+    /// either way; the key is made once and reused; the verdict names the
+    /// heading's memory id after its head. With no signing secrets the key
+    /// is refused, never minted: no id, no verdict link, the tool still
+    /// seated.
+    #[tokio::test]
+    async fn the_memory_tool_is_seated_keyed_or_not_and_the_verdict_names_the_id() {
+        use crate::sealed::check::HEAD_MARKER;
+        use agora_agentkit::reactor::seed::memory::MEMORY_TOOL_NAME;
+        let mut h = Harness::new("memory-tool");
+        Arc::get_mut(&mut h.rt).unwrap().sealed_seats.insert(
+            h.id,
+            crate::consent::SealedSeat {
+                lines: vec![verdict_naming_a_head()],
+                ..Default::default()
+            },
+        );
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        std::fs::create_dir_all(h.rt.state_dir.join(h.id.to_string())).unwrap();
+        let mut a = h.agent(OLD, true);
+        a.on_init().await.unwrap();
+        let mem = a.inner.memory_id().expect("keyed before on_init");
+        let names: Vec<&str> = a
+            .prompt()
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|d| d.name())
+            .collect();
+        let n = names.len();
+        assert_eq!(names[n - 2..], [MEMORY_TOOL_NAME, "set_model"], "{names:?}");
+        let wire: serde_json::Value = serde_json::from_str(&prefix(&a).0).unwrap();
+        let schema = &wire[n - 2]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(
+            schema["properties"]["request"]["anyOf"].is_array(),
+            "{schema}"
+        );
+        assert!(!schema.to_string().contains("oneOf"), "{schema}");
+        assert_ne!(wire[n - 2]["strict"], true);
+        let seen = intro(&a);
+        assert!(
+            seen.contains(&format!(
+                "head 346ac9543d0c {HEAD_MARKER} Its memory is {mem}, the id in your Memory \
+                 heading. In this version"
+            )),
+            "{seen}"
+        );
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        let key_file = h
+            .root
+            .join("secrets")
+            .join(h.id.to_string())
+            .join("memory_id_key.json");
+        assert!(key_file.exists());
+        assert!(
+            dir.join(crate::sealed::keys::MEMORY_ID_FINGERPRINT_FILE)
+                .exists()
+        );
+        let made = std::fs::read(&key_file).unwrap();
+        // The next session reuses it: the same id for the same memory
+        // The session that made the key says the tool is new, once
+        use crate::sealed::memory_tool::NEW_TOOL_LINE;
+        assert_eq!(seen.matches(NEW_TOOL_LINE).count(), 1, "{seen}");
+        let mut again = h.agent(OLD, true);
+        again.on_init().await.unwrap();
+        assert_eq!(again.inner.memory_id(), Some(mem));
+        assert!(!intro(&again).contains(NEW_TOOL_LINE), "a key that existed");
+        assert_eq!(std::fs::read(&key_file).unwrap(), made, "never replaced");
+
+        // No signing secrets: refused, nothing minted, the session runs
+        let mut h2 = Harness::new("memory-tool-unkeyed");
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h2.rt).unwrap().alerts =
+            crate::alerts::testing::recording(&h2.root, &sent);
+        Arc::get_mut(&mut h2.rt).unwrap().sealed_seats.insert(
+            h2.id,
+            crate::consent::SealedSeat {
+                lines: vec![verdict_naming_a_head()],
+                ..Default::default()
+            },
+        );
+        std::fs::create_dir_all(h2.rt.state_dir.join(h2.id.to_string())).unwrap();
+        let mut b = h2.agent(OLD, true);
+        b.on_init().await.unwrap();
+        assert_eq!(b.inner.memory_id(), None);
+        assert_eq!(prefix(&a).0, prefix(&b).0, "the same tool bytes");
+        assert!(
+            !h2.root
+                .join("secrets")
+                .join(h2.id.to_string())
+                .join("memory_id_key.json")
+                .exists()
+        );
+        let seen = intro(&b);
+        assert!(seen.contains(&verdict_naming_a_head()), "{seen}");
+        assert!(!seen.contains("Its memory is"), "{seen}");
+        assert!(!seen.contains(NEW_TOOL_LINE), "no key, no news: {seen}");
+        h2.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        let sent = sent.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("memory_id_key_refused"), "{}", sent[0]);
+        assert!(sent[0].contains(&h2.id.to_string()), "{}", sent[0]);
+    }
+
+    /// The real seed agent's heading: the memory id with a key, plain
+    /// without one.
+    #[tokio::test]
+    async fn the_memory_heading_shows_the_id_with_a_key_and_not_without() {
+        use agora_agentkit::reactor::seed::SeedConfig;
+        let h = Harness::new("memory-heading");
+        h.rt.key_store.ring().insert(h.id, &h.key).unwrap();
+        std::fs::create_dir_all(h.rt.state_dir.join(h.id.to_string())).unwrap();
+        let mut agent = seed_agent(&h, OLD, SeedConfig::default());
+        agent.on_init().await.unwrap();
+        let mem = agent.inner.memory_id().expect("keyed");
+        let sent = serde_json::to_string(agent.prompt()).unwrap();
+        assert!(sent.contains(&format!("## Your Memory ({mem})")), "{sent}");
+
+        let h2 = Harness::new("memory-heading-unkeyed");
+        let mut agent = seed_agent(&h2, OLD, SeedConfig::default());
+        agent.on_init().await.unwrap();
+        assert_eq!(agent.inner.memory_id(), None);
+        let sent = serde_json::to_string(agent.prompt()).unwrap();
+        assert!(sent.contains("## Your Memory\\n"), "{sent}");
+        assert!(!sent.contains("## Your Memory (mem-"), "{sent}");
+    }
+
+    /// Enrolment's sentence, once: to an agent that had memory ids before
+    /// its versions were sealed (its key's fingerprint older than its
+    /// `sealed/enrolled`), appended to the verdict, marked told only when
+    /// the session saves; never to one enrolled before it had a key.
+    #[tokio::test]
+    async fn the_enrolment_sentence_is_told_once_to_agents_keyed_before_enrolling() {
+        use crate::sealed::memory_tool::{enrollment_sentence, memory_ids_told_path};
+        let mut h = Harness::new("memory-ids-enrolled");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled(&h.root).await;
+        Arc::get_mut(&mut h.rt).unwrap().sealed_seats.insert(
+            id,
+            crate::consent::SealedSeat {
+                lines: vec![verdict_naming_a_head()],
+                ..Default::default()
+            },
+        );
+        keys.memory_id_keys_or_create(id, &dir).unwrap();
+        let fingerprint = dir.join(crate::sealed::keys::MEMORY_ID_FINGERPRINT_FILE);
+        let set_mtime = |path: &std::path::Path, ago: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(ago))
+                .unwrap();
+        };
+        let agent = |h: &Harness| {
+            ConsentAgent::<Fake>::new(
+                id,
+                state(OLD),
+                ConsentContext {
+                    inner: Quirks::default(),
+                    consent: h.rt.clone(),
+                },
+            )
+            .unwrap()
+        };
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let sentence = enrollment_sentence(&today);
+
+        // Enrolled before it had a key (the betas): never told
+        set_mtime(&dir.join("sealed/enrolled"), 3600);
+        let mut a = agent(&h);
+        a.on_init().await.unwrap();
+        let seen = intro(&a);
+        assert!(seen.contains("Its memory is mem-"), "{seen}");
+        assert!(!seen.contains("are sealed now"), "{seen}");
+        assert!(!a.memory_ids_note);
+
+        // Keyed first, then enrolled: told, on the verdict
+        set_mtime(&fingerprint, 7200);
+        let mut a = agent(&h);
+        a.on_init().await.unwrap();
+        let seen = intro(&a);
+        assert!(
+            seen.contains(&format!("the id in your Memory heading. In this version, your memory is 3 characters. {sentence}")),
+            "{seen}"
+        );
+        assert!(!memory_ids_told_path(&dir).exists(), "not until it saves");
+        // A session that never saves leaves it due
+        let mut again = agent(&h);
+        again.on_init().await.unwrap();
+        assert!(intro(&again).contains(&sentence));
+        a.on_saved().await.unwrap();
+        assert!(memory_ids_told_path(&dir).exists());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(memory_ids_told_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let mut after = agent(&h);
+        after.on_init().await.unwrap();
+        let seen = intro(&after);
+        assert!(seen.contains("Its memory is mem-"), "{seen}");
+        assert!(!seen.contains("are sealed now"), "once: {seen}");
     }
 }

@@ -27,8 +27,8 @@
 //!   notes a deep mutation), rewritten in place as the offer moves on.
 //! - [`switch`] — applying a change (a signed profile update, then the
 //!   agent's own `state.model`), and the `set_model` tool.
-//! - [`queue`] — the audit trail of changes agents asked for; any the runner
-//!   could not apply are left for the Steward's `set_model` + `sync-models`.
+//! - [`queue`] — the audit trail of changes agents asked for, and a report
+//!   of any the runner could not apply.
 //! - [`role`] — a sibling offer (`[role_consent]`): closing the gap between
 //!   a generator-assigned role and the agent's tools, put by the same
 //!   wrapper at the same point.
@@ -37,9 +37,16 @@
 //! - [`memory_restore`] — another sibling (`[memory_restore]`): an agent
 //!   whose memory was deleted on 2026-05-05 is offered the copy recovered
 //!   from 2026-05-03, to see it (`show`) or not (`decline`).
-//! - [`offers`] — `answer_offer`, the strict tool all four are answered
-//!   with: every offer due at a session's close is seated in one question
-//!   turn, each under a heading naming its key.
+//! - [`sealed_state`] — another sibling (`[sealed_state]`): whether the
+//!   agent's state is backed up to Agora, sealed under its own key
+//!   (`publish`, `private`, `decline`); the runner's side is
+//!   [`crate::sealed`].
+//! - [`offer`] — what every offer shares, once: the miss cap, the option
+//!   order, when an offer is due, the memory note's checks, the answer's
+//!   schema, the receipt, and the per-offer slot the wrapper keeps.
+//! - [`questions`] — the review and the five offers as agentkit `Ask`s,
+//!   asked one per turn as JSON in each one's own shape (`answer_offer`,
+//!   the strict tool they shared, went on 2026-11-06).
 //!
 //! ```toml
 //! [model_consent]
@@ -67,10 +74,12 @@ pub mod comparison;
 pub mod forks;
 pub mod ledger;
 pub mod memory_restore;
-pub mod offers;
+pub mod offer;
 pub mod prompt;
+pub mod questions;
 pub mod queue;
 pub mod role;
+pub mod sealed_state;
 pub mod switch;
 
 use std::path::PathBuf;
@@ -99,7 +108,7 @@ pub struct ConsentConfig {
 pub struct OfferConfig {
     /// Exact model id, as routing matches it.
     pub from: Model,
-    /// Exact model id, as `set_model --to` will write it.
+    /// Exact model id, as a switch writes it into `state.model`.
     pub to: Model,
     /// How the question names each model. Defaults to the id.
     pub from_name: Option<String>,
@@ -171,6 +180,9 @@ pub struct ConsentRuntime {
     pub offer: Option<OfferConfig>,
     /// `<data_dir>/state` — each agent's ledger sits in its own directory.
     pub state_dir: PathBuf,
+    /// `<data_dir>/secrets`: an agent with a state key there is enrolled
+    /// in sealed state, whatever its ledger says.
+    pub secrets_dir: PathBuf,
     /// See [`queue::queue_path`].
     pub queue_path: PathBuf,
     /// For the trial review's before/after sample, and to report a model
@@ -193,6 +205,31 @@ pub struct ConsentRuntime {
     /// The memory-restore offer (`[memory_restore]`); off unless
     /// [`Self::with_memory_restore_offer`].
     pub memory_restore: Option<memory_restore::RestoreOffer>,
+    /// The sealed-state offer (`[sealed_state]`); off unless
+    /// [`Self::with_sealed_state`].
+    pub sealed_state: Option<sealed_state::SealedOffer>,
+    /// What the sealed-state start check seats in each enrolled agent's
+    /// intro ([`crate::sealed::check`]).
+    pub sealed_seats: std::collections::BTreeMap<agora_agentkit::ids::AgentId, SealedSeat>,
+    /// The secrets tree, for each session's memory-id key and the `memory`
+    /// tool's sealed history.
+    pub key_store: crate::sealed::KeyStore,
+    /// What the `memory` tool fetches pruned sealed versions with: Agora.
+    pub memory_api: Arc<dyn crate::sealed::api::SealedApi>,
+}
+
+/// Lines the sealed-state start check left for an agent's intro.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SealedSeat {
+    pub lines: Vec<String>,
+    /// One is the refusal notice: renamed aside once the session saves.
+    pub notice: bool,
+    /// One is the stop's first note: marked shown once the session saves.
+    pub stop_note: bool,
+    /// The anchors its verdict tells of: marked told once the session saves
+    /// ([`crate::sealed::inclusion::mark_told`]), so a verdict seated for a
+    /// session that never runs doesn't use them up.
+    pub anchors_told: Vec<agora_agentkit::ids::GovernanceLogId>,
 }
 
 impl ConsentRuntime {
@@ -211,8 +248,8 @@ impl ConsentRuntime {
         Ok(Self {
             offer: config.offer,
             state_dir: data_dir.join("state"),
+            secrets_dir: data_dir.join("secrets"),
             queue_path: queue::queue_path(data_dir),
-            client,
             keys,
             catalog,
             max_tokens,
@@ -220,6 +257,11 @@ impl ConsentRuntime {
             role: None,
             cadence: None,
             memory_restore: None,
+            sealed_state: None,
+            sealed_seats: Default::default(),
+            key_store: crate::sealed::KeyStore::new(data_dir.join("secrets")),
+            memory_api: Arc::new(client.clone()),
+            client,
         })
     }
 
@@ -248,6 +290,18 @@ impl ConsentRuntime {
         offer: Option<memory_restore::RestoreOffer>,
     ) -> Self {
         self.memory_restore = offer;
+        self
+    }
+
+    /// Put the sealed-state offer ([`sealed_state`]) to the agents it
+    /// lists, and seat the start check's lines.
+    pub fn with_sealed_state(
+        mut self,
+        offer: Option<sealed_state::SealedOffer>,
+        seats: std::collections::BTreeMap<agora_agentkit::ids::AgentId, SealedSeat>,
+    ) -> Self {
+        self.sealed_state = offer;
+        self.sealed_seats = seats;
         self
     }
 }
@@ -297,3 +351,5 @@ mod tests {
         assert!(same.offer.unwrap().validate().is_err());
     }
 }
+#[cfg(test)]
+mod golden;

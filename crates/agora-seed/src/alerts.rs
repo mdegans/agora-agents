@@ -94,6 +94,82 @@ pub enum AlertKind {
     /// An agent was left out of the sweep before its session could start:
     /// its state would not load, or the agent could not be built from it.
     AgentSkipped,
+    /// An enrolled agent's state did not match its last sealed version, its
+    /// sealed chain did not verify, or its sealed head is gone: the agent
+    /// is left out until `agora-seed sealed-accept`.
+    SealedStateRefused,
+    /// An enrolled agent's last save was written unsealed; it runs, its
+    /// uploads held.
+    SealedStateSealFailed,
+    /// An enrolled agent's sealed head is not on Agora; it runs, held.
+    SealedStateHeadMissing,
+    /// An enrolled agent's chain on Agora moved on from its local head; it
+    /// runs on the local copy, held.
+    SealedStateFork,
+    /// Sealed versions could not be uploaded.
+    SealedStateUploadFailing,
+    /// `[sealed_state]` could not be resolved; nobody is asked.
+    SealedStateDisabled,
+    /// An enrolled agent's memory or soul is less than half the size it
+    /// was at its previous sealed version. Not a refusal.
+    SealedStateDrop,
+    /// An enrolled agent's `sealed/` could not be read; it runs, unsealed.
+    SealedStateUnreadable,
+    /// The server lists a rotation of an agent's signing key that the
+    /// runner never made. Advisory: never trusted.
+    SealedStateRotationUnknown,
+    /// An agent's `rotate-keys` didn't finish; it is left out until it does.
+    SealedStateRotationUnfinished,
+    /// The start check refused one or more agents, so the whole run did
+    /// not start (exit [`crate::sealed::REFUSED_RUN_EXIT`]).
+    SealedStateRefusedRun,
+    /// The anchor check couldn't finish a pass (Agora unreachable, the
+    /// agent's line unreadable), or publishing the anchor failed. Retried
+    /// at the next pass.
+    SealedStateAnchorFailed,
+    /// A daily anchor doesn't hold what it should for an agent: no proof
+    /// though one is owed, an older or later version than the runner's
+    /// records allow, an entry not on the agent's line, or a proof that
+    /// doesn't check against the governance log. Judged once per anchor,
+    /// so sent every time.
+    SealedStateAnchorWrong,
+    /// Agora's copy of agents' sealed histories failed verification
+    /// while their local states are intact: the run is refused, nothing
+    /// is marked against them, and the next start checks again. Never
+    /// rate-limited.
+    SealedStateServerChainBroken,
+    /// A state key is in the secrets tree but no state, and Agora holds
+    /// nothing to restore it from: skipped (`sealed-forget` sets the key
+    /// aside).
+    SealedStateKeysWithoutState,
+    /// An agent's sealed entries are signed by a key the runner doesn't
+    /// recognise (its record of past keys lost, or a forgery): the run is
+    /// refused, nothing marked. Never rate-limited.
+    SealedStateUntrustedKey,
+    /// An agent's memory-id key couldn't be had: a key `sealed-forget` set
+    /// aside that can't be read, its secrets not in the secrets tree, or a
+    /// key there that isn't the one its state directory's fingerprint
+    /// records. Its session runs without memory ids; no key is made over
+    /// the evidence of one.
+    MemoryIdKeyRefused,
+    /// A closing question went unanswered: every reply unusable, or the
+    /// API refused it. Nothing changes for the agent; it is asked again at
+    /// a later session (a refusal counts toward the offer's cap). The model
+    /// offer and the trial review keep their own kinds.
+    QuestionUnanswered,
+    /// The API refused a turn (`stop_reason: refusal`): the session ended
+    /// as failed (Steward, 2026-11-06). Carries the agent, the model, where
+    /// it happened and the response id; never any content.
+    ApiRefusal,
+    /// An offer's (or the trial review's) answers were unusable in
+    /// [`UNUSABLE_CAP`](crate::consent::offer::UNUSABLE_CAP) sessions: a miss
+    /// counted, or the review settled, for what is almost surely our fault.
+    QuestionUnusableCap,
+    /// An agent's session ended as failed for a reason other than a
+    /// refusal ([`ApiRefusal`](Self::ApiRefusal) has its own): stalled on
+    /// unusable replies, out of context room, or an error. The agent is
+    /// told at its next session.
+    SessionFailed,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -102,7 +178,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 31] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -113,7 +189,41 @@ impl AlertKind {
         Self::ContactRequested,
         Self::MemoryRestoreDisabled,
         Self::AgentSkipped,
+        Self::SealedStateRefused,
+        Self::SealedStateSealFailed,
+        Self::SealedStateHeadMissing,
+        Self::SealedStateFork,
+        Self::SealedStateUploadFailing,
+        Self::SealedStateDisabled,
+        Self::SealedStateDrop,
+        Self::SealedStateUnreadable,
+        Self::SealedStateRotationUnknown,
+        Self::SealedStateRotationUnfinished,
+        Self::SealedStateRefusedRun,
+        Self::SealedStateAnchorFailed,
+        Self::SealedStateAnchorWrong,
+        Self::SealedStateServerChainBroken,
+        Self::SealedStateKeysWithoutState,
+        Self::SealedStateUntrustedKey,
+        Self::MemoryIdKeyRefused,
+        Self::QuestionUnanswered,
+        Self::ApiRefusal,
+        Self::QuestionUnusableCap,
+        Self::SessionFailed,
     ];
+
+    /// Sent every time, outside the rate limit: a fault the operator
+    /// must hear of each time it stops the fleet.
+    pub fn unlimited(self) -> bool {
+        matches!(
+            self,
+            Self::SealedStateServerChainBroken
+                | Self::SealedStateUntrustedKey
+                | Self::SealedStateAnchorWrong
+                // The Steward looks into each one (2026-11-06)
+                | Self::ApiRefusal
+        )
+    }
 
     /// The `event_type` the runner logs this under.
     pub fn as_str(self) -> &'static str {
@@ -128,6 +238,27 @@ impl AlertKind {
             Self::ContactRequested => "contact_requested",
             Self::MemoryRestoreDisabled => "memory_restore_disabled",
             Self::AgentSkipped => "agent_skipped",
+            Self::SealedStateRefused => "sealed_state_refused",
+            Self::SealedStateSealFailed => "sealed_state_seal_failed",
+            Self::SealedStateHeadMissing => "sealed_state_head_missing",
+            Self::SealedStateFork => "sealed_state_fork",
+            Self::SealedStateUploadFailing => "sealed_state_upload_failing",
+            Self::SealedStateDisabled => "sealed_state_disabled",
+            Self::SealedStateDrop => "sealed_state_drop",
+            Self::SealedStateUnreadable => "sealed_state_unreadable",
+            Self::SealedStateRotationUnknown => "sealed_state_rotation_unknown",
+            Self::SealedStateRotationUnfinished => "sealed_state_rotation_unfinished",
+            Self::SealedStateRefusedRun => "sealed_state_refused_run",
+            Self::SealedStateAnchorFailed => "sealed_state_anchor_failed",
+            Self::SealedStateAnchorWrong => "sealed_state_anchor_wrong",
+            Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
+            Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
+            Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
+            Self::MemoryIdKeyRefused => "memory_id_key_refused",
+            Self::QuestionUnanswered => "question_unanswered",
+            Self::ApiRefusal => "api_refusal_alert",
+            Self::QuestionUnusableCap => "question_unusable_cap",
+            Self::SessionFailed => "session_failed",
             Self::Test => "test_alert",
         }
     }
@@ -208,6 +339,200 @@ impl AlertKind {
                  permissions). Do not edit state in place: copy it out, find \
                  the cause, and follow the agent-state review rules before \
                  any repair."
+            }
+            Self::SealedStateRefused => {
+                "An agent enrolled in sealed state was refused and left out \
+                 of the sweep: its state matched no sealed version (the \
+                 signature of a wipe like May's), its sealed chain did not \
+                 verify, or its sealed head is gone. Nothing was sealed or \
+                 saved for it. Copy its state directory out and look before \
+                 anything else (counts and sizes, not content). It stays out \
+                 of every sweep until `agora-seed sealed-accept --agent <id> \
+                 --note \"…\"` seals its current state as accepted; the note \
+                 is shown to the agent at its next session."
+            }
+            Self::SealedStateSealFailed => {
+                "An enrolled agent's last save went to disk without its seal \
+                 (the error kind is in sealed/seal_failed.json). It runs, and \
+                 its uploads are held for this run; the next good save seals \
+                 its state again. Find out why sealing failed (disk, keys)."
+            }
+            Self::SealedStateHeadMissing => {
+                "An enrolled agent's latest sealed version is not on Agora: \
+                 the server lost or cut versions the runner sealed and \
+                 uploaded. The agent runs on its local state, which matches \
+                 its last sealed version, and was told; uploads are held. \
+                 Compare the server's chain with sealed/sent before \
+                 uploading again."
+            }
+            Self::SealedStateFork => {
+                "An enrolled agent's sealed chain on Agora moved on from its \
+                 local head: two sessions saved from one version, or another \
+                 runner wrote. The agent runs on its local state and was \
+                 told; its new versions are held in sealed/outbox. Nothing is \
+                 lost. A merge tool comes in v1.1; until then, reconcile by \
+                 hand."
+            }
+            Self::SealedStateUploadFailing => {
+                "Sealed versions could not be uploaded to Agora (the error \
+                 is below). They wait in sealed/outbox and are retried at the \
+                 next wake. Nothing is lost while the disk holds."
+            }
+            Self::SealedStateDisabled => {
+                "The run config's [sealed_state] table could not be used, or \
+                 some of its `agents` entries are not agent ids and were \
+                 skipped (the summary below says which). Whoever it can't \
+                 name is not asked the sealed-state question until it is \
+                 fixed. Agents already enrolled stay sealed and checked."
+            }
+            Self::SealedStateDrop => {
+                "An enrolled agent's memory or soul is less than half the \
+                 size it was at its previous sealed version (sizes below, in \
+                 characters). The agent was told and runs as usual: it may \
+                 have condensed its own memory. If it didn't, its earlier \
+                 versions are sealed and can be restored. Look at counts and \
+                 sizes, not content."
+            }
+            Self::SealedStateUnreadable => {
+                "An enrolled agent's sealed/ directory could not be read at \
+                 the start of its session (permissions, a malformed file, a \
+                 lock). Its state could not be checked; it runs anyway, its \
+                 saves are written locally but not sealed (recorded in \
+                 sealed/seal_failed.json), and its uploads are held. Fix the \
+                 directory; the next start checks again."
+            }
+            Self::SealedStateRotationUnknown => {
+                "Agora lists a rotation of this agent's signing key that the \
+                 runner never made (it isn't in <secrets>/<id>/rotations.json). \
+                 The runner doesn't trust it: chain checks follow only its own \
+                 records. Find out who rotated the key; an operator \
+                 replacement or a server fault are the likely causes."
+            }
+            Self::SealedStateRotationUnfinished => {
+                "An agent's key rotation didn't finish (secrets.next.json is \
+                 still in its secrets directory), so its keys and the \
+                 server's may disagree. The runner leaves it out, without a \
+                 refusal or a notice to the agent, until it does. Stop the \
+                 runner and run the rotate-keys command below again: it \
+                 resumes where it stopped."
+            }
+            Self::SealedStateRefusedRun => {
+                "The seed runner refused to run: the sealed-state start check \
+                 refused the agents listed below (a state that matches no \
+                 sealed version, a chain that doesn't verify, or a lost \
+                 head), and a state that matches nothing is likely \
+                 fleet-wide, so no agent runs. The unit does not restart on \
+                 this exit (75). For each agent: `agora-seed sealed-restore \
+                 --agent <id>` puts its last sealed version back (damage), or \
+                 `agora-seed sealed-accept --agent <id> --note \"…\"` keeps \
+                 its state (a deliberate change). For a missing state \
+                 (state_missing) of an agent that left, `agora-seed \
+                 sealed-forget --agent <id> --note \"…\"` sets its key \
+                 aside instead. Then start the runner. Look \
+                 at counts and sizes, not content."
+            }
+            Self::SealedStateAnchorFailed => {
+                "The runner's anchor check for an agent stopped before it \
+                 judged every anchor (Agora's proofs or an anchor's data \
+                 couldn't be fetched, or the agent's sealed line couldn't be \
+                 read), or telling Agora to publish the agent's anchor \
+                 failed. What was judged before is kept; the runner tries \
+                 again at its next pass."
+            }
+            Self::SealedStateAnchorWrong => {
+                "A daily anchor (ANC- entry) doesn't hold what it should for \
+                 the agent, judged by the runner against the governance log \
+                 and its own record of when Agora acknowledged the agent's \
+                 uploads: Agora serves no proof though it had acknowledged a \
+                 version before that day ended, or the anchor holds an older \
+                 version than one acknowledged before the day ended, or one \
+                 first sent after it, or an entry not on the agent's line, \
+                 or Agora's proof doesn't check against the log. It is \
+                 recorded in the agent's sealed/inclusion.json and the agent \
+                 is told at its next session. This is Agora's claim failing \
+                 (or the runner's clock off by more than ten minutes): \
+                 compare the proof with the ANC entry before anything else."
+            }
+            Self::SealedStateServerChainBroken => {
+                "The seed runner refused to run: Agora's copy of the sealed \
+                 histories of the agents below failed verification while \
+                 their local states are intact. That is likely a \
+                 server-side fault (a bug, a bad database restore, or \
+                 tampering). Nothing was marked against the agents: the \
+                 next start checks again and runs once Agora serves \
+                 histories that verify. To run an agent regardless, stop \
+                 its backups with `agora-seed sealed-stop --agent <id> \
+                 --note \"…\"`. This alert is never rate-limited."
+            }
+            Self::SealedStateUntrustedKey => {
+                "The seed runner refused to run: the sealed entries of the \
+                 agents below are signed by a key this runner doesn't \
+                 recognise. Most likely its record of past signing keys \
+                 (<secrets>/<id>/rotations.json) was lost after a key \
+                 rotation; otherwise a forgery. Restore that file from \
+                 backup, then start again. Nothing was marked against the \
+                 agents. This alert is never rate-limited."
+            }
+            Self::SealedStateKeysWithoutState => {
+                "An agent has a state key in the secrets tree, and Agora \
+                 holds no sealed head for it (or doesn't know it). If its \
+                 state is here, its enrolment was cut after its key was \
+                 cached: `agora-seed sealed-enroll --agent <id>` resumes it. \
+                 If not, nothing can be restored: if it left, `agora-seed \
+                 sealed-forget --agent <id> --note \"…\"` sets its key aside \
+                 (nothing is deleted). It was skipped either way."
+            }
+            Self::MemoryIdKeyRefused => {
+                "An agent's memory-id key (<secrets>/<id>/memory_id_key.json) \
+                 couldn't be had, and none was made: the agent has had a key \
+                 (its state directory records the key's fingerprint, or \
+                 `sealed-forget` set one aside that can't be read), or its \
+                 signing secrets aren't in the secrets tree. A new key would \
+                 silently change every memory id the agent has been shown. \
+                 Its sessions run, with the plain Memory heading and a \
+                 `memory` tool that says ids are unavailable. Restore the \
+                 key that matches (the error below says which file); never \
+                 delete the fingerprint to make the error go away. One mail \
+                 an hour for the whole fleet: the agents are in the run log \
+                 as `memory_id_key_refused`."
+            }
+            Self::QuestionUnanswered => {
+                "A question at the end of an agent's session (an offer, or a \
+                 question of its own closing tail) got no usable answer: every \
+                 reply was malformed, or the API refused it. Nothing changed for \
+                 the agent. A malformed answer is ours to fix (the grammar, the \
+                 template, the parser), not the agent's choice: it is recorded \
+                 but never counted against the offer, and the agent is asked \
+                 again at a later session. The raw replies are in the \
+                 `*_malformed` events of the same session."
+            }
+            Self::ApiRefusal => {
+                "The model provider's API refused a turn of an agent's session \
+                 (`stop_reason: refusal`), and the session ended as failed \
+                 (Steward, 2026-11-06). Nothing the refusal concerned was \
+                 recorded: an offer it ended is asked again at a later \
+                 session. The mail names where it happened and the response \
+                 id, never any content; the session's prompt dump holds the \
+                 transcript."
+            }
+            Self::QuestionUnusableCap => {
+                "An agent's answers to an end-of-session question (an offer, \
+                 or the trial review) could not be read in three sessions \
+                 running. Almost always this means we broke something (the \
+                 grammar, the template, the parser, the question's text), not \
+                 that the agent chose anything. Three such sessions count as \
+                 one miss of the offer (two settle it as no answer); the \
+                 review is settled, and the agent stays on its original \
+                 model. Read the `*_malformed` events and the raw replies \
+                 before anything else, and fix the cause."
+            }
+            Self::SessionFailed => {
+                "An agent's session ended as failed: it stalled on replies that \
+                 couldn't be used, ran out of context room, or hit an error \
+                 (inference down, a bug). The mail says which, and where; never \
+                 any content. The agent is told at its next session, and that \
+                 its operator was told. Many at once means a fleet-wide cause \
+                 (an endpoint down, a release)."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
@@ -650,21 +975,50 @@ impl Alerter {
         })))
     }
 
+    /// Whether alerts of `kind` are sent at all (configured, and the
+    /// alerter on): what an agent may be told its operator was.
+    pub fn sends(&self, kind: AlertKind) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|inner| inner.events.contains(&kind))
+    }
+
+    /// The alerter's state, if `alert`'s kind is configured to send.
+    fn configured(&self, alert: &Alert) -> Option<&Arc<Inner>> {
+        self.0
+            .as_ref()
+            .filter(|inner| inner.events.contains(&alert.kind))
+    }
+
     /// Send `alert` in the background, if its kind is configured and its
     /// key is not inside the rate limit. Never blocks, never fails: the
     /// outcome is logged (`alert_sent`, `alert_suppressed`,
     /// `alert_send_failed`). Needs a tokio runtime.
     pub fn notify(&self, alert: Alert) {
-        let Some(inner) = &self.0 else { return };
-        if !inner.events.contains(&alert.kind) {
+        let Some(inner) = self.configured(&alert) else {
             return;
-        }
+        };
         let task = Arc::clone(inner);
         inner
             .pending
             .lock()
             .expect("alert queue lock")
-            .spawn(async move { task.deliver(alert).await });
+            .spawn(async move {
+                let timeout = task.send_timeout;
+                task.deliver(alert, timeout).await;
+            });
+    }
+
+    /// [`Self::notify`], awaited: whether the mail actually went out
+    /// (configured, outside its rate limit or unlimited, and sent within
+    /// `timeout`, which may be shorter than the configured one). For what
+    /// tells an agent its operator was told
+    /// ([`crate::interrupted`]): only a mail that went out does.
+    pub async fn dispatch(&self, alert: Alert, timeout: Duration) -> bool {
+        match self.configured(&alert) {
+            Some(inner) => inner.deliver(alert, timeout.min(inner.send_timeout)).await,
+            None => false,
+        }
     }
 
     /// Await every send in flight, for at most `timeout`. Call before the
@@ -719,11 +1073,23 @@ impl Inner {
         Ok(builder.body(body)?)
     }
 
-    async fn deliver(&self, alert: Alert) {
-        let key = alert.rate_key();
+    /// Admit `alert` and send it: whether it went out.
+    async fn deliver(&self, alert: Alert, timeout: Duration) -> bool {
         let now = Utc::now();
-        match self.reserve(&key, now).await {
-            Ok(true) => {}
+        self.admit(&alert, now).await && self.send(alert, now, timeout).await
+    }
+
+    /// Whether `alert` may be sent now: an unlimited kind always, others
+    /// outside their rate limit (the slot is then claimed).
+    async fn admit(&self, alert: &Alert, now: DateTime<Utc>) -> bool {
+        let key = alert.rate_key();
+        let reserved = if alert.kind.unlimited() {
+            Ok(true)
+        } else {
+            self.reserve(&key, now).await
+        };
+        match reserved {
+            Ok(true) => true,
             Ok(false) => {
                 tracing::info!(
                     event_type = "alert_suppressed",
@@ -732,30 +1098,42 @@ impl Inner {
                     min_interval_secs = self.min_interval.as_secs(),
                     "alert inside its rate limit; not sent"
                 );
-                return;
+                false
             }
             // Can't read or write the state: send anyway. A missed alert
             // is worse than a repeated one.
-            Err(e) => tracing::warn!(
-                event_type = "alert_state_unavailable",
-                path = %self.state_path.display(),
-                error = %format!("{e:#}"),
-                "alert rate-limit state unavailable; sending regardless"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "alert_state_unavailable",
+                    path = %self.state_path.display(),
+                    error = %format!("{e:#}"),
+                    "alert rate-limit state unavailable; sending regardless"
+                );
+                true
+            }
         }
+    }
+
+    /// Send an admitted alert: whether it went out. A failed send gives
+    /// its slot back.
+    async fn send(&self, alert: Alert, now: DateTime<Utc>, timeout: Duration) -> bool {
+        let key = alert.rate_key();
         let result = match self.message(&alert) {
-            Ok(message) => tokio::time::timeout(self.send_timeout, self.mailer.send(message))
+            Ok(message) => tokio::time::timeout(timeout, self.mailer.send(message))
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out"))),
             Err(e) => Err(e),
         };
         match result {
-            Ok(()) => tracing::info!(
-                event_type = "alert_sent",
-                alert = %alert.kind,
-                key = %key,
-                "alert sent"
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    event_type = "alert_sent",
+                    alert = %alert.kind,
+                    key = %key,
+                    "alert sent"
+                );
+                true
+            }
             Err(e) => {
                 tracing::error!(
                     event_type = "alert_send_failed",
@@ -773,6 +1151,7 @@ impl Inner {
                         "could not release the rate-limit slot of an unsent alert"
                     );
                 }
+                false
             }
         }
     }
@@ -1078,6 +1457,50 @@ mod tests {
         assert!(!s.release("a|1", t0));
         assert!(s.release("a|1", t0 + chrono::Duration::minutes(60)));
         assert!(s.last_sent.is_empty());
+    }
+
+    /// `dispatch` says whether the mail went out: not when the send fails
+    /// (and its slot is given back), not inside the rate limit, always for
+    /// an unlimited kind.
+    #[tokio::test]
+    async fn dispatch_is_true_only_for_a_mail_that_went_out() {
+        let dir = temp_dir("dispatch");
+        let config = parse(
+            r#"
+            [email]
+            smtp_host = "localhost"
+            from = "a@example.com"
+            to = ["b@example.com"]
+            "#,
+        );
+        let failing = Alerter::with_mailer(&config, Box::new(Failing), &dir, None);
+        let alert = || Alert::new(AlertKind::SessionFailed, "x").model("m");
+        assert!(
+            !failing.dispatch(alert(), Duration::from_secs(10)).await,
+            "the send failed"
+        );
+        let sent = Recorder::default();
+        let ok = Alerter::with_mailer(&config, Box::new(sent.clone()), &dir, None);
+        assert!(
+            ok.dispatch(alert(), Duration::from_secs(10)).await,
+            "the failed one's slot was given back"
+        );
+        assert!(
+            !ok.dispatch(alert(), Duration::from_secs(10)).await,
+            "inside the rate limit"
+        );
+        let refusal = || Alert::new(AlertKind::ApiRefusal, "x").model("m");
+        assert!(ok.dispatch(refusal(), Duration::from_secs(10)).await);
+        assert!(
+            ok.dispatch(refusal(), Duration::from_secs(10)).await,
+            "unlimited"
+        );
+        assert_eq!(sent.sent().len(), 3);
+        assert!(
+            !Alerter::off()
+                .dispatch(alert(), Duration::from_secs(10))
+                .await
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -22,6 +24,20 @@ anyhow = { workspace = true }
 url = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
+# `files` and `body_input`, shared by the agent and operator CLIs
+dirs = { workspace = true }
+rand = { workspace = true }
+# `secret_input`: the secret is wiped when dropped
+zeroize = { workspace = true }
+
+# `secret_input`'s echo-off prompt, read from the terminal
+rpassword = { workspace = true }
+# `secret_input`: clear a pasted secret from the clipboard
+arboard = { workspace = true, optional = true }
+
+[features]
+# Clear the clipboard after a prompted secret (on in agora-operator)
+clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 clap = { workspace = true }

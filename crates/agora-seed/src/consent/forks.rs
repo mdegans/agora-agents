@@ -31,6 +31,7 @@
 //! The review session reads the file back ([`load`]). A pair that can't be
 //! built is kept as `skipped`, with the reason, and the review says so.
 
+use crate::consent::offer::Stored;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -1735,7 +1736,7 @@ mod tests {
                 },
                 at(20),
                 Ok(OfferAnswer {
-                    reason: "r".into(),
+                    note: "r".into(),
                     choice: OfferChoice::Trial,
                 }),
             );

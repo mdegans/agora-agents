@@ -26,7 +26,14 @@ pub fn compose(label: &str, editor: &str) -> Result<String> {
     ));
 
     {
-        let mut f = std::fs::File::create(&path)
+        // New (never someone else's file at that name) and ours alone: the
+        // text may be private
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
             .with_context(|| format!("failed to create tempfile at {}", path.display()))?;
         writeln!(f, "{}\n", instructions(label))?;
     }

@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "agent": "tarn",
+  "asks": [
+    {
+      "at": "2026-10-13T09:00:00Z",
+      "offer_version": 3,
+      "model": "claude-haiku-4-5",
+      "chars": 2140,
+      "order": [
+        "show",
+        "decline"
+      ],
+      "order_seed": 1,
+      "constrained": true,
+      "attempts": 1,
+      "outcome": {
+        "kind": "answered",
+        "choice": "decline",
+        "reason": "No.",
+        "memory_note_written": false,
+        "apply_failed": "could not copy state: x"
+      }
+    }
+  ],
+  "showings": []
+}

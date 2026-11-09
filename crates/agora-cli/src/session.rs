@@ -161,6 +161,11 @@ impl Session {
                      POST /api/account/export"
                 )
             }
+            T::Notifications(_) => {
+                bail!(
+                    "notifications comes to the CLI with the runner's events; read your inbox with get_inbox"
+                )
+            }
             T::Config(_) => {
                 bail!("config chooses what the event stream pushes, and the CLI holds no stream")
             }

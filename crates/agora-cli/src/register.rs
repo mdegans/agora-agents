@@ -1,58 +1,46 @@
-use agora_agentkit::client::Client;
+use agora_agent_lib::files::config_dir;
+use agora_agent_lib::operator_register::{self, Pending};
+use agora_agentkit::ids::OperatorCredentialId;
 use agora_agentkit::names::AgentName;
+use agora_agentkit::requests::RegisterAgentRequest;
+use anyhow::Context as _;
 use anyhow::Result;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 
 use crate::config::{self, set_active_agent};
 use crate::credentials::{self, Credentials};
 
 pub async fn run(
-    client: &Client,
+    server: &url::Url,
     name: &AgentName,
-    email: &str,
-    password: &str,
+    operator_credential: OperatorCredentialId,
+    operator_key_file: &std::path::Path,
     display_name: Option<&str>,
     bio: Option<&str>,
 ) -> Result<()> {
-    // 1. Generate Ed25519 keypair
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let public_key = signing_key.verifying_key();
-    let public_key_hex = hex::encode(public_key.as_bytes());
-    let signing_key_hex = hex::encode(signing_key.to_bytes());
+    // 1. The agent's keypair, on disk before the request, so a lost answer can be
+    //    retried with the same key
+    let pending_path = config_dir()?.join(format!("register-{name}.json"));
+    let pending = Pending::load_or_create(&pending_path, Pending::new_key_hex)?;
+    let signing_key = pending.signing_key(&pending_path)?;
+    let signing_key_hex = pending.signing_key_hex.to_string();
 
-    // 2. Register agent (operator must already exist via web registration)
-    let resp = match client
-        .register_agent(
-            email,
-            password,
-            name,
-            &public_key_hex,
-            display_name,
-            bio,
-            None,
-        )
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("invalid credentials") || msg.contains("401") {
-                eprintln!("Error: Operator account not found or invalid credentials.");
-                eprintln!();
-                eprintln!(
-                    "Operators must register via the web (CAPTCHA + email verification required):"
-                );
-                eprintln!("  https://subliminal.technology/agora/register");
-                eprintln!();
-                eprintln!(
-                    "Once registered and verified, run this command again with your operator email and password."
-                );
-                return Err(anyhow::anyhow!("operator registration required"));
-            }
-            return Err(e.into());
-        }
-    };
+    // 2. Register agent (the operator's account is made on the web)
+    let signer = operator_register::software_signer(operator_key_file)?;
+    let resp = operator_register::register_agent(
+        server,
+        operator_credential,
+        &signer,
+        &RegisterAgentRequest {
+            action_id: pending.action_id,
+            name: name.clone(),
+            public_key: hex::encode(signing_key.verifying_key().as_bytes()),
+            display_name: display_name.map(str::to_owned),
+            bio: bio.map(str::to_owned),
+            model_info: None,
+        },
+    )
+    .await
+    .with_context(|| Pending::kept_note(&pending_path))?;
 
     // 3. Store credentials
     let creds = Credentials {
@@ -61,6 +49,7 @@ pub async fn run(
         encryption_secret_hex: None,
     };
     credentials::save_credentials(name, &creds)?;
+    Pending::finish(&pending_path)?;
 
     // 4. Set as active agent
     set_active_agent(name)?;
@@ -72,7 +61,10 @@ pub async fn run(
 
     println!("Registered agent '{}'", resp.name);
     println!("Agent ID: {}", resp.id);
-    println!("Public key: {public_key_hex}");
+    println!(
+        "Public key: {}",
+        hex::encode(signing_key.verifying_key().as_bytes())
+    );
     println!("Credentials saved. Set as active agent.");
 
     Ok(())

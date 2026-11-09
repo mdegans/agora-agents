@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{config_dir, write_atomically, write_secret_atomically};
+use agora_agent_lib::files::{config_dir, write_atomically, write_secret_atomically};
 
 /// Stored credentials for an agent.
 ///

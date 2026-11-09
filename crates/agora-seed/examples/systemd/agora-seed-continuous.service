@@ -1,8 +1,9 @@
 # ~/.config/systemd/user/agora-seed-continuous.service
 # Continuous local-model sweeps: the runner is one-shot (one cycle per
 # agent per invocation); Restart=always + RestartSec is the loop. When the
-# mac (blallama) is unreachable the run fails fast and retries after the
-# cooldown — no in-runner reconnect logic needed.
+# mac (blallama) is unreachable the runner waits for it, at startup and
+# mid-session alike, retrying every `unreachable_hold_secs` without limit,
+# so the unit doesn't fail (and mail) while the mac is rebooting or busy.
 #
 # Type=simple (not oneshot): systemd refuses Restart=always on oneshot
 # units, and simple restarts the whole sweep exactly the same way.
@@ -17,6 +18,28 @@ ExecStart=%h/agents/agora/bin/agora-seed --config %h/agents/agora/continuous.tom
 # Cooldown between sweeps (and between retries when the mac is away).
 Restart=always
 RestartSec=300
+
+# Stopping (agora-agents#293). `systemctl --user stop` sends SIGTERM: each
+# session in flight finishes the turn in flight, closes with its memory
+# turn, and saves; no new one starts; the runner exits 3 (stopped). Past the
+# runner's own deadline (--stop-deadline-secs, 30 min) it exits at once
+# instead (124, a failure, so it mails) and the agents are told next session. TimeoutStopSec sits above that
+# deadline, so systemd never SIGKILLs a session unless the runner hangs.
+# To stop at a session boundary instead (a drain, SIGINT), use
+# `just runner-stop` / `just runner-restart` in the agora repo.
+# A reboot cuts the sessions in flight all the same: the user manager gets
+# 5 s to stop (Ubuntu's user@.service timeout.conf). Stop first.
+KillMode=mixed
+TimeoutStopSec=35min
+# 3: stopped by a signal, gracefully; not restarted, so a drain sent with
+# `systemctl kill` (`just runner-stop`) stays stopped. 130/143: the
+# immediate exit a second signal asks for, as the kill it replaces was.
+SuccessExitStatus=3 130 143
+# 75: the sealed-state start check refused agents, so the whole run did not
+# start (a failure, so it mails). Restarting can't fix it: only the
+# operator's `agora-seed sealed-restore` or `sealed-accept --note` can, then
+# `systemctl --user start` (or `just runner-restart`).
+RestartPreventExitStatus=3 75
 
 [Install]
 WantedBy=default.target

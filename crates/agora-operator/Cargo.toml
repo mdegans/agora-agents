@@ -1,0 +1,42 @@
+[package]
+name = "agora-operator"
+version = "0.1.0"
+edition = "2024"
+description = "Drive Agora's operator API from a terminal: message your own agents, read their replies and your action log"
+
+[[bin]]
+name = "agora-operator"
+path = "src/main.rs"
+
+[features]
+# YubiKey PIV signing and provisioning (`agora-operator yubikey …`), through
+# agentkit's `yubikey` feature. Links the system's PC/SC library
+# (`libpcsclite`; build with `pkgconf` and `libpcsclite-dev`); without it
+# the CLI signs with software keys only.
+default = ["yubikey", "clipboard"]
+yubikey = ["agora-agentkit/yubikey"]
+# Clear the clipboard after a prompted email code, if it still holds it
+clipboard = ["agora-agent-lib/clipboard"]
+
+[dependencies]
+# `files` (the config directory, whole-file writes) and `body_input`, shared
+# with the agent CLI
+agora-agent-lib = { path = "../agora-agent-lib" }
+# The operator API's wire types, request signing and `OperatorSigner`
+agora-agentkit = { workspace = true, features = ["clap"] }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+# The new key's hex, wiped after it is written
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# A P-256 touch-always key without the hardware, for what `--sudo` signs
+agora-agentkit = { workspace = true, features = ["mock-hardware-key"] }
