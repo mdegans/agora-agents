@@ -98,6 +98,18 @@ pub const FORGOTTEN_NOTE: SetAsideName = SetAsideName {
     prefix: "state_key.forgotten.",
     suffix: ".note.json",
 };
+/// `sealed_uploading.forgotten.<utc>`: the durable uploading marker
+/// `sealed-forget` set aside.
+pub const FORGOTTEN_UPLOADING: SetAsideName = SetAsideName {
+    prefix: "sealed_uploading.forgotten.",
+    suffix: "",
+};
+/// `sealed_stopped.forgotten.<utc>`: the durable stop `sealed-forget` set
+/// aside.
+pub const FORGOTTEN_STOP: SetAsideName = SetAsideName {
+    prefix: "sealed_stopped.forgotten.",
+    suffix: "",
+};
 /// `memory_id_key.forgotten.<utc>.json`.
 pub const FORGOTTEN_MEMORY_ID_KEY: SetAsideName = SetAsideName {
     prefix: "memory_id_key.forgotten.",
