@@ -127,6 +127,11 @@ pub enum Command {
     RotateKeys {
         #[arg(long)]
         agent: AgentId,
+        // B4/5
+        /// Say where an unfinished rotation stands and what blocks it;
+        /// nothing written, nothing sent.
+        #[arg(long, conflicts_with_all = ["signing", "encryption"])]
+        status: bool,
         /// The Ed25519 signing key.
         #[arg(long)]
         signing: bool,
@@ -504,8 +509,17 @@ pub async fn run(
         }
         Command::RotateKeys {
             agent,
+            status: true,
+            ..
+        } => {
+            let status = super::rotate::status(&state_dir, &keys, api.as_ref(), agent).await?;
+            println!("{agent}: {status}");
+        }
+        Command::RotateKeys {
+            agent,
             signing,
             encryption,
+            ..
         } => {
             // Only while no runner runs: held until the command ends
             let _runner = super::session::runner_exclusive(data_dir)?;

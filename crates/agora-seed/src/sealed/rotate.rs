@@ -2,6 +2,13 @@
 //!
 //! In this order, so no step can lose a key:
 //!
+//! 0. **pre-flight**, nothing written and nothing sent: every entry that
+//!    will be re-signed is read and must be signed by one of the agent's
+//!    keys, and the chain to the head must verify as it will after the
+//!    rotation (the new key generated in memory, the rotation simulated).
+//!    For an agent Agora holds a chain of, Agora's entries complete the
+//!    line (`sent/` may be partial after a restore). Anything that would
+//!    stop the command midway stops it here instead;
 //! 1. the new secrets are written to `secrets.next.json` (or, on a retry,
 //!    the ones already there are reused), and the old keys are appended to
 //!    `past_keys.json`;
@@ -15,15 +22,21 @@
 //!    `state_key.wrap.json` **before** it is posted, so a rerun posts the
 //!    same bytes (the server refuses a different record at the same
 //!    `(key_gen, wrap_seq)`), then `state_key.json` names its `wrap_seq`;
-//! 4. an agent that doesn't upload has its local chain re-signed with the
-//!    new key ([`resign_local`]);
+//! 4. every entry kept here that Agora doesn't hold is re-signed with the
+//!    new key ([`resign_local`]): an agent that doesn't upload, and an
+//!    uploader's unsent `.tmp`/`.displaced`/`.abandoned` items alike;
 //! 5. only then `secrets.next.json` becomes `secrets.json`; the replaced
 //!    file is kept as `secrets.<utc>.json`.
 //!
 //! A failure at 2 to 4 leaves `secrets.json` as it was, and a rerun picks
-//! up `secrets.next.json`. Old keys are never deleted. Until step 5 the
-//! runner leaves the agent out of every run (`main.rs`'s `mid_rotation`):
-//! that is what makes a chain half re-signed safe.
+//! up `secrets.next.json`: the pre-flight runs again, so once its cause is
+//! fixed the rerun completes. `rotate-keys --status` says which step an
+//! unfinished rotation is at and what blocks it ([`status`]).
+//! `secrets.next.json` may hold the only copy of the key Agora takes for
+//! the agent: nothing here ever suggests removing it. Old keys are never
+//! deleted. Until step 5 the runner leaves the agent out of every run
+//! (`main.rs`'s `mid_rotation`): that is what makes a chain half re-signed
+//! safe.
 //!
 //! **Three kinds of agent** ([`Reach`]):
 //!
@@ -52,13 +65,15 @@
 //! current key). Entries Agora acknowledged (`sent/*.json`) keep the old
 //! key's signature, which Agora's copy carries.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use agora_agentkit::crypto::{SigningKey, VerifyingKey};
+use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::KeyRotation;
 use agora_agentkit::state::storage::{AgentSeal, OutboxItem};
-use agora_agentkit::state::verify::verify_chain;
+use agora_agentkit::state::verify::{HeadRef, TrustedKeys, verify_chain};
+use agora_agentkit::state::{KeyRotation, SignedStateEntry};
 use anyhow::Context;
 use chrono::Utc;
 
@@ -66,61 +81,6 @@ use super::KeyStore;
 use super::api::SealedApi;
 use super::keys::{SecretsFile, StateKeyFile};
 use super::version::Reach;
-
-/// The head the old key's trust ends at. Uploading: the local head,
-/// which must be Agora's head with nothing waiting to upload (the server
-/// takes a rotation only at its current head). Stopped after uploading:
-/// Agora's head, which must be the newest version Agora acknowledged
-/// (`sent/`); what was sealed here since is re-signed. `None` for an agent
-/// not enrolled, or one that never uploaded: nothing of its chain is on
-/// Agora, and its entries are re-signed instead.
-async fn confirmed_head(
-    agent_dir: &Path,
-    api: &dyn SealedApi,
-    id: AgentId,
-    signing: &SigningKey,
-    reach: Reach,
-) -> anyhow::Result<Option<agora_agentkit::state::verify::HeadRef>> {
-    if !super::is_enrolled(agent_dir) || reach == Reach::Local {
-        return Ok(None);
-    }
-    let seal = AgentSeal::new(agent_dir, id);
-    let local = match reach {
-        Reach::Uploads => {
-            let waiting = seal.outbox().await?.len();
-            anyhow::ensure!(
-                waiting == 0,
-                "pending uploads: {waiting} sealed version(s) wait in sealed/outbox. Let the \
-                 runner upload them, or run this with the runner stopped after a drain"
-            );
-            seal.head().await?.map(|h| h.head)
-        }
-        // What Agora acknowledged last; the outbox stays local
-        _ => seal
-            .sent()
-            .await?
-            .last()
-            .map(|i| agora_agentkit::state::verify::HeadRef {
-                entry_hash: i.entry.entry_hash(),
-                seq: i.entry.entry.seq,
-            }),
-    };
-    let server = super::api::chain(api, id, signing)
-        .await
-        .map_err(anyhow::Error::msg)
-        .context("reading the agent's chain on Agora")?;
-    let server_head = server
-        .last()
-        .map(|e| agora_agentkit::state::verify::HeadRef {
-            entry_hash: e.entry_hash(),
-            seq: e.entry.seq,
-        });
-    anyhow::ensure!(
-        local == server_head,
-        "the sealed head here and Agora's differ: resolve that first (the start check says how)"
-    );
-    Ok(server_head)
-}
 
 /// What changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -132,11 +92,255 @@ pub struct Rotated {
     /// `secrets.next.json` from an earlier attempt was used.
     pub resumed: bool,
     /// The re-wrap was kept locally only (`state_key.wrap.json`): the
-    /// agent doesn't upload, and its opt-in posts it.
+    /// agent never uploaded, and its opt-in posts it.
     pub wrap_kept_local: bool,
-    /// Signed entries re-signed with the new key (an agent that doesn't
-    /// upload); files already re-signed by an earlier attempt not counted.
+    /// Signed entries re-signed with the new key; ones already re-signed
+    /// by an earlier attempt not counted.
     pub resigned: usize,
+}
+
+/// What the pre-flight established, for the steps after it.
+struct Plan {
+    /// The head the old key's trust ends at (`old_key_last`).
+    last: Option<HeadRef>,
+    /// Entries Agora holds: never re-signed (its copy carries the old
+    /// key's signature).
+    on_agora: HashSet<Sha256Hex>,
+    /// Agora's entries, to complete a local line.
+    server: Vec<SignedStateEntry>,
+}
+
+/// A file holding signed entries that a rotation may rewrite.
+struct Held {
+    path: PathBuf,
+    entries: Vec<SignedStateEntry>,
+}
+
+/// Every signed entry kept in `seal`'s directory, by file: outbox items of
+/// any kind (`.json`, `.tmp`, `.displaced`, `.abandoned`), `sent/` items
+/// (`.json`, `.lost`), and the copies a resolution kept under
+/// `sealed/lost/<utc>/` (its `items/` and its `INTENT`/`DONE` record).
+/// Read-only. Oldest first, by the ord the item names begin with.
+async fn held_entries(seal: &AgentSeal) -> anyhow::Result<Vec<Held>> {
+    let mut files = item_files(&seal.dir().join("outbox"))?;
+    files.extend(item_files(&seal.dir().join("sent"))?);
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    for (dir, _) in super::lost::resolutions(seal)? {
+        files.extend(item_files(&dir.join("items"))?);
+    }
+    let mut out = Vec::new();
+    for path in files {
+        let item: OutboxItem = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{} isn't an outbox item ({:?})",
+                path.display(),
+                e.classify()
+            )
+        })?;
+        out.push(Held {
+            path,
+            entries: vec![item.entry],
+        });
+    }
+    for (dir, _) in super::lost::resolutions(seal)? {
+        for (path, entries) in super::lost::record_entries(&dir)? {
+            out.push(Held { path, entries });
+        }
+    }
+    Ok(out)
+}
+
+/// The main line to `head`: from the entries here, completed by Agora's
+/// (`server`) where it runs through them. `Err` names the missing link.
+async fn line_to(
+    seal: &AgentSeal,
+    head: &HeadRef,
+    server: &[SignedStateEntry],
+) -> anyhow::Result<Vec<SignedStateEntry>> {
+    let local = super::check::local_entries(seal)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    if let Some(line) = super::check::main_line(&local, &head.entry_hash) {
+        return Ok(line);
+    }
+    let all = super::check::merge_server(&local, server).map_err(|hash| {
+        anyhow::anyhow!("Agora's copy of entry {hash} differs from the one held here")
+    })?;
+    super::check::main_line(&all, &head.entry_hash).with_context(|| {
+        format!(
+            "the main line to head {} (seq {}) has a missing link{}. Put the missing \
+             sealed/sent or sealed/outbox files back from a backup of the agent's directory, \
+             then run this again",
+            head.entry_hash,
+            head.seq,
+            if server.is_empty() {
+                " here, and nothing of the agent is on Agora to complete it"
+            } else {
+                ", here and on Agora"
+            }
+        )
+    })
+}
+
+/// Step 0: everything that could stop the command after the server took
+/// the rotation, checked before anything is written or sent (see the
+/// module's docs). `rotate`: the signing key changes; `new`: the key it
+/// changes to (generated in memory, or `secrets.next.json`'s).
+#[allow(clippy::too_many_arguments)]
+async fn preflight(
+    agent_dir: &Path,
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    id: AgentId,
+    reach: Reach,
+    old: &SigningKey,
+    new: &SigningKey,
+    rotate: bool,
+) -> anyhow::Result<Plan> {
+    let mut plan = Plan {
+        last: None,
+        on_agora: HashSet::new(),
+        server: Vec::new(),
+    };
+    if !super::is_enrolled(agent_dir) || !rotate {
+        return Ok(plan);
+    }
+    let seal = AgentSeal::new(agent_dir, id);
+    if reach.on_agora() {
+        plan.server = super::api::chain(api, id, old)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("reading the agent's chain on Agora")?;
+    }
+    plan.on_agora
+        .extend(plan.server.iter().map(|e| e.entry_hash()));
+    plan.on_agora
+        .extend(seal.sent().await?.iter().map(|i| i.entry.entry_hash()));
+    let server_head = plan.server.last().map(|e| HeadRef {
+        entry_hash: e.entry_hash(),
+        seq: e.entry.seq,
+    });
+    let head = seal.head().await?.map(|h| h.head);
+    match reach {
+        Reach::Local => {}
+        Reach::Uploads => {
+            let waiting = seal.outbox().await?.len();
+            anyhow::ensure!(
+                waiting == 0,
+                "pending uploads: {waiting} sealed version(s) wait in sealed/outbox. Let the \
+                 runner upload them, or run this with the runner stopped after a drain"
+            );
+            anyhow::ensure!(
+                head == server_head,
+                "the sealed head here and Agora's differ: resolve that first (the start check \
+                 says how)"
+            );
+            plan.last = server_head;
+        }
+        Reach::Stopped => plan.last = server_head,
+    }
+    let Some(head) = head else {
+        anyhow::bail!(
+            "agent {id}'s sealed/head.json is missing: `sealed-accept` rebuilds it first"
+        );
+    };
+    let line = line_to(&seal, &head, &plan.server).await?;
+    if let Some(last) = plan.last {
+        // Stopped: Agora's head must be on the line here, and what follows
+        // it unsent
+        anyhow::ensure!(
+            line.iter().any(|e| e.entry_hash() == last.entry_hash),
+            "Agora's head for agent {id} ({} at seq {}) is not on the sealed line here: \
+             resolve that first (the start check says how)",
+            last.entry_hash,
+            last.seq
+        );
+    }
+    // Every entry to be re-signed is the agent's own
+    let new_vk = new.verifying_key();
+    let mut signers = vec![old.verifying_key(), new_vk];
+    signers.extend(keys.past_keys(id)?.signing_public());
+    for held in held_entries(&seal).await? {
+        for e in &held.entries {
+            if !plan.on_agora.contains(&e.entry_hash()) {
+                anyhow::ensure!(
+                    signers.iter().any(|k| e.verify(k)),
+                    "{} holds an entry (seq {}, {}) signed by none of the agent's keys: it \
+                     would not be re-signed, and the chain would not verify after the \
+                     rotation. Nothing was written. Set that file aside (or put back the right \
+                     one from a backup), then run this again",
+                    held.path.display(),
+                    e.entry.seq,
+                    e.entry_hash()
+                );
+            }
+        }
+    }
+    // The line as it will be, under the trust as it will be
+    let trusted = trusted_after(keys, id, old, new, plan.last)?;
+    let simulated: Vec<SignedStateEntry> = line
+        .iter()
+        .map(|e| {
+            if plan.on_agora.contains(&e.entry_hash()) || e.verify(&new_vk) {
+                e.clone()
+            } else {
+                e.entry.clone().sign(new)
+            }
+        })
+        .collect();
+    let report = verify_chain(id, &simulated, &trusted);
+    anyhow::ensure!(
+        report.intact && report.head == Some(head),
+        "agent {id}'s chain would not verify after the rotation ({:?}). Nothing was written",
+        report.problems
+    );
+    Ok(plan)
+}
+
+/// The keys the runner will trust once the rotation to `new` is recorded:
+/// `rotations.json` as it is if it already ends at `new`, else with the
+/// rotation simulated (naming `last`).
+fn trusted_after(
+    keys: &KeyStore,
+    id: AgentId,
+    old: &SigningKey,
+    new: &SigningKey,
+    last: Option<HeadRef>,
+) -> anyhow::Result<TrustedKeys> {
+    let new_vk = new.verifying_key();
+    let mut rotations = keys.rotations(id)?;
+    let recorded = rotations
+        .iter()
+        .max_by_key(|r| r.seq)
+        .is_some_and(|r| r.new_public_key == agora_agentkit::govlog::PublicKeyHex::from(&new_vk));
+    if !recorded && old.verifying_key() != new_vk {
+        let seq = rotations.iter().map(|r| r.seq + 1).max().unwrap_or(0);
+        rotations.push(KeyRotation::agent_signed(
+            id,
+            seq,
+            old,
+            new,
+            last,
+            Utc::now(),
+        ));
+    }
+    let first = match rotations.iter().min_by_key(|r| r.seq) {
+        Some(r) => r
+            .old_public_key
+            .to_verifying_key()
+            .map_err(|e| anyhow::anyhow!("rotations.json: {e}"))?,
+        None => new_vk,
+    };
+    let trusted = TrustedKeys::new(first).with_rotations(&rotations);
+    anyhow::ensure!(
+        trusted.current() == new_vk,
+        "the recorded rotations don't lead to the new key ({:?})",
+        trusted.notices()
+    );
+    Ok(trusted)
 }
 
 pub async fn rotate_keys(
@@ -167,7 +371,9 @@ pub async fn rotate_keys(
         .with_context(|| format!("agent {id} has no secrets.json"))?;
     let old_signing = current.signing()?;
     let old_encryption = current.encryption()?;
-    // 1. The new keys, on disk before anything else
+
+    // The new keys: an earlier attempt's, or made now, in memory until the
+    // pre-flight passes
     let (next, resumed) = match keys.next_secrets(id)? {
         Some(next) => (next, true),
         None => {
@@ -181,10 +387,10 @@ pub async fn rotate_keys(
             } else {
                 old_encryption.clone()
             };
-            let next = SecretsFile::new(&new_signing, new_encryption.as_ref());
-            keys.write_next_secrets(id, &next)
-                .context("writing secrets.next.json")?;
-            (next, false)
+            (
+                SecretsFile::new(&new_signing, new_encryption.as_ref()),
+                false,
+            )
         }
     };
     let new_signing = next.signing()?;
@@ -196,6 +402,25 @@ pub async fn rotate_keys(
         resumed,
         ..Rotated::default()
     };
+
+    // 0. Pre-flight: nothing written, nothing sent
+    let plan = preflight(
+        &agent_dir,
+        keys,
+        api,
+        id,
+        reach,
+        &old_signing,
+        &new_signing,
+        done.signing,
+    )
+    .await?;
+
+    // 1. The new keys, on disk before anything else
+    if !resumed {
+        keys.write_next_secrets(id, &next)
+            .context("writing secrets.next.json")?;
+    }
     keys.retire(
         id,
         done.signing.then_some(&old_signing),
@@ -228,13 +453,12 @@ pub async fn rotate_keys(
             Some(r) if r.new_public_key == new_public && r.seq == seq => r,
             _ => {
                 // The old key signs nothing past the head Agora confirms
-                let last = confirmed_head(&agent_dir, api, id, &old_signing, reach).await?;
                 let r = KeyRotation::agent_signed(
                     id,
                     seq,
                     &old_signing,
                     &new_signing,
-                    last,
+                    plan.last,
                     Utc::now(),
                 );
                 keys.write_pending_rotation(id, &r)
@@ -257,19 +481,17 @@ pub async fn rotate_keys(
                 seq,
                 "the server already holds the new signing key: an earlier attempt's answer was lost"
             );
-        } else {
-            if let Err(e) = api.rotate_key(id, &old_signing, &rotation).await {
-                if e.starts_with(super::api::CONFLICT) {
-                    anyhow::bail!(
-                        "Agora's sealed head moved on from the one this rotation names ({e}): \
-                         secrets.json is unchanged. Let the runner upload what waits, stop it, \
-                         and run this again"
-                    );
-                }
-                return Err(anyhow::Error::msg(e).context(
-                    "the server refused the signing-key rotation; secrets.json is unchanged",
-                ));
+        } else if let Err(e) = api.rotate_key(id, &old_signing, &rotation).await {
+            if e.starts_with(super::api::CONFLICT) {
+                anyhow::bail!(
+                    "Agora's sealed head moved on from the one this rotation names ({e}): \
+                     secrets.json is unchanged. Let the runner upload what waits, stop it, \
+                     and run this again"
+                );
             }
+            return Err(anyhow::Error::msg(e).context(
+                "the server refused the signing-key rotation; secrets.json is unchanged",
+            ));
         }
         // Ours to verify the chain by, never the server's
         keys.record_rotation(id, &rotation)
@@ -292,32 +514,28 @@ pub async fn rotate_keys(
         && let Some(secret) = &new_encryption
         && let Some(file) = keys.state_key_file(id)?
     {
-        let local_only = !reach.on_agora();
-        done.wrap_kept_local =
-            !rewrap(keys, api, id, &file, secret, &new_signing, local_only).await?;
+        done.wrap_kept_local = !rewrap(keys, api, id, &file, secret, &new_signing, reach).await?;
         done.rewrapped = true;
     }
 
-    // 4. The local chain, re-signed: what Agora doesn't hold
-    if enrolled && reach != Reach::Uploads && done.signing {
+    // 4. Everything here Agora doesn't hold, re-signed
+    if enrolled && done.signing {
         let seal = AgentSeal::new(&agent_dir, id);
         let mut signers = vec![old_signing.verifying_key()];
         signers.extend(keys.past_keys(id)?.signing_public());
-        done.resigned = resign_local(&seal, &new_signing, &signers).await?;
+        done.resigned = resign_local(&seal, &new_signing, &signers, &plan.on_agora).await?;
         let trusted = keys
             .trusted_ending_at(id, &new_signing.verifying_key())
             .context("the recorded rotations")?;
         if let Some(head) = seal.head().await? {
-            let entries = super::check::local_entries(&seal)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let line = super::check::main_line(&entries, &head.head.entry_hash)
-                .context("the local main line has a missing link: not promoting the new keys")?;
+            let line = line_to(&seal, &head.head, &plan.server).await?;
             let report = verify_chain(id, &line, &trusted);
             anyhow::ensure!(
                 report.intact && report.head == Some(head.head),
                 "the re-signed chain doesn't verify under the new key ({:?}): secrets.json is \
-                 unchanged and the agent stays out of runs; run this again",
+                 unchanged, secrets.next.json holds the new key Agora takes, and the agent \
+                 stays out of runs. `rotate-keys --agent {id} --status` says what blocks it; \
+                 run this again once that is fixed",
                 report.problems
             );
         }
@@ -341,11 +559,143 @@ pub async fn rotate_keys(
     Ok(done)
 }
 
+/// Where an unfinished rotation stands (`rotate-keys --status`): read-only,
+/// no server write (a stopped or uploading agent's chain is read, to say
+/// whether the line would verify).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    /// `secrets.next.json` is there: a rotation is unfinished.
+    pub unfinished: bool,
+    /// The signing rotation: not begun, sent with no answer recorded
+    /// (`rotation.pending.json`), or recorded in `rotations.json`.
+    pub signing: &'static str,
+    /// The re-wrap: kept in `state_key.wrap.json` for the new X25519 key,
+    /// and whether `state_key.json` names it.
+    pub wrap: &'static str,
+    /// Entries here, not held by Agora, still signed by the old key.
+    pub to_resign: usize,
+    /// What stops a rerun from finishing, if anything.
+    pub blocked: Option<String>,
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.unfinished {
+            return f.write_str("no rotation is unfinished (no secrets.next.json)");
+        }
+        write!(
+            f,
+            "a rotation is unfinished; secrets.next.json holds the new keys (keep it). signing \
+             rotation: {}; re-wrap: {}; entries still to re-sign: {}; {}",
+            self.signing,
+            self.wrap,
+            self.to_resign,
+            match &self.blocked {
+                Some(why) => format!("blocked: {why}"),
+                None => "nothing blocks it: run `rotate-keys` again with the same flags".into(),
+            }
+        )
+    }
+}
+
+pub async fn status(
+    state_dir: &Path,
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    id: AgentId,
+) -> anyhow::Result<Status> {
+    let Some(next) = keys.next_secrets(id)? else {
+        return Ok(Status {
+            unfinished: false,
+            signing: "",
+            wrap: "",
+            to_resign: 0,
+            blocked: None,
+        });
+    };
+    let agent_dir = state_dir.join(id.to_string());
+    let reach = super::version::reach(&agent_dir, keys, id);
+    let old = keys
+        .secrets(id)?
+        .with_context(|| format!("agent {id} has no secrets.json"))?;
+    let (old_signing, new_signing) = (old.signing()?, next.signing()?);
+    let new_public = agora_agentkit::govlog::PublicKeyHex::from(&new_signing.verifying_key());
+    let rotate = old_signing.to_bytes() != new_signing.to_bytes();
+    let signing = if !rotate {
+        "not rotated"
+    } else if keys
+        .rotations(id)?
+        .iter()
+        .max_by_key(|r| r.seq)
+        .is_some_and(|r| r.new_public_key == new_public)
+    {
+        "recorded (Agora took it)"
+    } else if keys.pending_rotation(id)?.is_some() {
+        "sent, no answer recorded (the rerun asks Agora which key it holds)"
+    } else {
+        "not sent yet"
+    };
+    let wrap = match (
+        next.encryption()?,
+        keys.wrap_record(id)?,
+        keys.state_key_file(id)?,
+    ) {
+        (Some(secret), Some(r), Some(file))
+            if r.wrapped_to_pub == super::keys::x25519_public_hex(&secret) =>
+        {
+            if file.wrap_seq == r.wrap_seq {
+                "kept, and named by state_key.json"
+            } else {
+                "kept, not yet posted or named"
+            }
+        }
+        _ => "not made yet (or no encryption rotation)",
+    };
+    let new_vk = new_signing.verifying_key();
+    let mut to_resign = 0;
+    let mut blocked = None;
+    match preflight(
+        &agent_dir,
+        keys,
+        api,
+        id,
+        reach,
+        &old_signing,
+        &new_signing,
+        rotate,
+    )
+    .await
+    {
+        Ok(plan) => {
+            if super::is_enrolled(&agent_dir) && rotate {
+                let seal = AgentSeal::new(&agent_dir, id);
+                for held in held_entries(&seal).await? {
+                    to_resign += held
+                        .entries
+                        .iter()
+                        .filter(|e| !plan.on_agora.contains(&e.entry_hash()) && !e.verify(&new_vk))
+                        .count();
+                }
+            }
+        }
+        Err(e) => blocked = Some(format!("{e:#}")),
+    }
+    Ok(Status {
+        unfinished: true,
+        signing,
+        wrap,
+        to_resign,
+        blocked,
+    })
+}
+
 /// Re-wrap the state key in `file` to `secret`'s public key, signed by
 /// `signing`: the record kept in `state_key.wrap.json` first (or the one an
-/// earlier attempt kept, reused), then posted unless `local_only`, then
-/// `state_key.json` names its `wrap_seq`. `Ok(true)`: posted (or already
-/// on Agora); `Ok(false)`: kept locally for the opt-in.
+/// earlier attempt kept, reused), then posted unless the agent never
+/// uploaded, then `state_key.json` names its `wrap_seq`. The seq is the
+/// one after the highest Agora holds when Agora may be read (it may be
+/// ahead of `state_key.json`), else after `state_key.json`'s. `Ok(true)`:
+/// posted (or already on Agora); `Ok(false)`: kept locally for the opt-in.
 async fn rewrap(
     keys: &KeyStore,
     api: &dyn SealedApi,
@@ -353,9 +703,10 @@ async fn rewrap(
     file: &StateKeyFile,
     secret: &agora_agentkit::envelope::EncryptionSecretKey,
     signing: &SigningKey,
-    local_only: bool,
+    reach: Reach,
 ) -> anyhow::Result<bool> {
     use agora_agentkit::state::crypto::StateKey;
+    let local_only = !reach.on_agora();
     let state_key = file.state_key()?;
     let to = super::keys::x25519_public_hex(secret);
     let public = agora_agentkit::envelope::EncryptionPublicKey::from(secret);
@@ -372,8 +723,25 @@ async fn rewrap(
     let record = match kept {
         Some(r) => r,
         None => {
+            // Past whatever Agora holds of this generation
+            let held = if local_only {
+                Vec::new()
+            } else {
+                api.state_keys(id, signing)
+                    .await
+                    .map_err(anyhow::Error::msg)
+                    .context("reading the agent's state key records on Agora")?
+            };
+            let seq = held
+                .iter()
+                .filter(|r| r.agent_id == id && r.key_gen == file.key_gen)
+                .map(|r| r.wrap_seq)
+                .chain([file.wrap_seq])
+                .max()
+                .unwrap_or(file.wrap_seq)
+                + 1;
             let r = state_key
-                .wrap(id, file.key_gen, file.wrap_seq + 1, &public, signing)
+                .wrap(id, file.key_gen, seq, &public, signing)
                 .context("re-wrapping the state key")?;
             keys.write_wrap_record(id, &r)
                 .context("keeping the re-wrap before posting it")?;
@@ -414,25 +782,24 @@ async fn rewrap(
     Ok(!local_only)
 }
 
-/// Every signed entry kept in `seal`'s directory that Agora didn't
-/// acknowledge, re-signed with `new`, in order (oldest first): outbox
-/// items of any kind (`.json`, `.tmp`, `.displaced`, `.abandoned`), the
-/// `sent/*.lost` items Agora lost, and the
-/// copies a resolution kept under `sealed/lost/<utc>/` (its `items/` and
-/// its `INTENT`/`DONE` record). Each file is rewritten whole (a unique
+/// Every signed entry kept in `seal`'s directory that Agora doesn't hold
+/// (`on_agora`), re-signed with `new`, in order (oldest first): see
+/// [`held_entries`] for the files. Each file is rewritten whole (a unique
 /// temporary, fsync, rename over it, fsync of its directory), so there is
 /// never a moment without it. An entry already signed by `new` is left as
 /// it is, so a rerun after a cut finishes the rest; one signed by none of
-/// `signers` (the agent's old keys) is refused, never signed over. Returns
-/// how many entries were re-signed.
+/// `signers` (the agent's old keys) is refused, never signed over (the
+/// pre-flight refuses it before anything is written). Returns how many
+/// entries were re-signed.
 pub async fn resign_local(
     seal: &AgentSeal,
     new: &SigningKey,
     signers: &[VerifyingKey],
+    on_agora: &HashSet<Sha256Hex>,
 ) -> anyhow::Result<usize> {
     let new_vk = new.verifying_key();
-    let resign = |path: &Path, entry: &mut agora_agentkit::state::SignedStateEntry| {
-        if entry.verify(&new_vk) {
+    let resign = |path: &Path, entry: &mut SignedStateEntry| {
+        if entry.verify(&new_vk) || on_agora.contains(&entry.entry_hash()) {
             return Ok(false);
         }
         anyhow::ensure!(
@@ -446,50 +813,24 @@ pub async fn resign_local(
         *entry = entry.entry.clone().sign(new);
         Ok(true)
     };
-    let mut files = Vec::new();
-    files.extend(item_files(&seal.dir().join("outbox"))?);
-    // Not `sent/*.json`: Agora holds those, signed as they are
-    files.extend(
-        item_files(&seal.dir().join("sent"))?
-            .into_iter()
-            .filter(|p| p.extension().and_then(|x| x.to_str()) != Some("json")),
-    );
-    // The oldest first, by the ord their names begin with
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     let mut count = 0;
-    for path in files {
-        let mut item: OutboxItem = serde_json::from_slice(
-            &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "{} isn't an outbox item ({:?})",
-                path.display(),
-                e.classify()
-            )
-        })?;
-        if resign(&path, &mut item.entry)? {
-            super::write_private(&path, &serde_json::to_vec_pretty(&item)?)
-                .with_context(|| format!("rewriting {}", path.display()))?;
+    for held in held_entries(seal).await? {
+        // A resolution's record: rewritten by its own module
+        if matches!(
+            held.path.file_name().and_then(|n| n.to_str()),
+            Some("INTENT" | "DONE")
+        ) {
+            continue;
+        }
+        let mut item: OutboxItem = serde_json::from_slice(&std::fs::read(&held.path)?)?;
+        if resign(&held.path, &mut item.entry)? {
+            super::write_private(&held.path, &serde_json::to_vec_pretty(&item)?)
+                .with_context(|| format!("rewriting {}", held.path.display()))?;
             count += 1;
             super::crash::point("rotate:resigned_one")?;
         }
     }
     for (dir, _) in super::lost::resolutions(seal)? {
-        for path in item_files(&dir.join("items"))? {
-            let mut item: OutboxItem =
-                serde_json::from_slice(&std::fs::read(&path)?).map_err(|e| {
-                    anyhow::anyhow!(
-                        "{} isn't an outbox item ({:?})",
-                        path.display(),
-                        e.classify()
-                    )
-                })?;
-            if resign(&path, &mut item.entry)? {
-                super::write_private(&path, &serde_json::to_vec_pretty(&item)?)?;
-                count += 1;
-            }
-        }
         count += super::lost::resign_record(&dir, |path, entry| resign(path, entry))?;
     }
     Ok(count)
@@ -497,7 +838,7 @@ pub async fn resign_local(
 
 /// The files under `dir` that hold one outbox item each, sorted by name:
 /// every regular file but a writer's temporary (`*.writing`).
-fn item_files(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+fn item_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -590,9 +931,12 @@ mod tests {
         assert_eq!(
             *api.calls.lock().unwrap(),
             [
+                // B4: the pre-flight's read, and the re-wrap's seq from Agora
+                "chain",
                 "signer_registered",
                 "rotate_key",
                 "register_encryption_key",
+                "state_keys",
                 "post_state_key"
             ],
             "rotation, then the X25519 key under the new signer, then the re-wrap"
@@ -669,8 +1013,8 @@ mod tests {
         assert!(done.signing && done.resumed);
         assert_eq!(
             *api.calls.lock().unwrap(),
-            ["signer_registered"],
-            "no second rotation"
+            ["chain", "signer_registered"],
+            "no second rotation (the pre-flight reads the chain)"
         );
         assert_eq!(
             keys.rotations(id).unwrap(),
@@ -729,8 +1073,13 @@ mod tests {
         assert!(done.signing && done.encryption && done.rewrapped);
         assert_eq!(
             *api.calls.lock().unwrap(),
-            ["register_encryption_key", "post_state_key"],
-            "no second rotation"
+            [
+                "chain",
+                "register_encryption_key",
+                "state_keys",
+                "post_state_key"
+            ],
+            "no second rotation (the pre-flight's read, the re-wrap's seq)"
         );
         let rotations = keys.rotations(id).unwrap();
         assert_eq!(rotations.len(), 1);
@@ -969,7 +1318,12 @@ mod tests {
             format!("{e:#}").contains("signed by none of the agent's keys"),
             "{e:#}"
         );
-        assert!(keys.next_secrets(id).unwrap().is_some(), "left out");
+        assert!(
+            keys.next_secrets(id).unwrap().is_none(),
+            "the pre-flight: nothing written"
+        );
+        assert!(keys.past_keys(id).unwrap().signing.is_empty());
+        assert!(api.calls.lock().unwrap().is_empty(), "nothing sent");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             serde_json::to_vec(&forged).unwrap(),
@@ -1236,5 +1590,208 @@ mod tests {
             &keys.trusted(id).unwrap().unwrap(),
         );
         assert!(report.intact, "{:?}", report.problems);
+    }
+
+    /// Every file under `dir`, with its bytes.
+    fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .file_name()
+                    .is_some_and(|n| n != "lock" && !n.to_string_lossy().ends_with(".lock"))
+                {
+                    out.insert(p.clone(), std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    /// A stopped agent whose `sent/` is partial or empty (as after a past
+    /// restore from Agora): Agora's entries complete the line, and the
+    /// rotation finishes.
+    #[tokio::test]
+    async fn a_stopped_agent_with_a_partial_sent_dir_rotates() {
+        for keep in [1usize, 0] {
+            let root = crate::sealed::TestDir::new("rotate-stopped-partial");
+            let (id, keys, dir) = enrolled(&root).await;
+            let api = crate::sealed::api::fake::guarded(&root);
+            *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
+            uploaded(&dir, id, &api).await;
+            crate::sealed::stop::stop(
+                &root.join("state"),
+                &keys,
+                id,
+                "It asked",
+                Box::pin(async { Ok(()) }),
+            )
+            .await
+            .unwrap();
+            saves(&dir, id, &keys, 2).await;
+            let mut sent: Vec<_> = std::fs::read_dir(dir.join("sealed/sent"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            sent.sort();
+            for p in sent.iter().skip(keep) {
+                std::fs::remove_file(p).unwrap();
+            }
+            let done = rotate_keys(&root.join("state"), &keys, &api, id, true, false)
+                .await
+                .unwrap_or_else(|e| panic!("sent kept {keep}: {e:#}"));
+            assert_eq!(done.resigned, 2, "sent kept {keep}");
+            assert!(keys.next_secrets(id).unwrap().is_none());
+        }
+    }
+
+    /// A missing link in a chain kept here (a never-uploaded agent), and
+    /// an empty `sent/` with nothing on Agora to complete it: refused by the
+    /// pre-flight, with no write and no server call.
+    #[tokio::test]
+    async fn a_broken_local_line_is_refused_before_anything() {
+        let root = crate::sealed::TestDir::new("rotate-broken-line");
+        let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+        saves(&dir, id, &keys, 2).await;
+        let seal = AgentSeal::new(&dir, id);
+        let item = &seal.outbox().await.unwrap()[1];
+        let path = dir
+            .join("sealed/outbox")
+            .join(format!("{:020}.json", item.ord));
+        std::fs::rename(&path, root.join("moved")).unwrap();
+        let before = (tree(&root.join("state")), tree(&root.join("secrets")));
+        let api = crate::sealed::api::fake::guarded(&root);
+        let e = format!(
+            "{:#}",
+            rotate_keys(&root.join("state"), &keys, &api, id, true, true)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            e.contains("missing link") && e.contains("from a backup"),
+            "{e}"
+        );
+        assert!(!e.contains("secrets.next.json"), "{e}");
+        assert_eq!(
+            (tree(&root.join("state")), tree(&root.join("secrets"))),
+            before,
+            "nothing written"
+        );
+        assert!(api.calls.lock().unwrap().is_empty(), "nothing sent");
+    }
+
+    /// Already stuck mid-rotation (the server took it; then a file went
+    /// missing): `--status` says where it is and what blocks it, and once
+    /// the file is back the rerun finishes. The new key is never lost.
+    #[tokio::test]
+    async fn a_stuck_rotation_is_shown_and_finishes_once_fixed() {
+        let root = crate::sealed::TestDir::new("rotate-stuck");
+        let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+        saves(&dir, id, &keys, 2).await;
+        let api = crate::sealed::api::fake::guarded(&root);
+        let state_dir = root.join("state");
+        assert!(
+            !status(&state_dir, &keys, &api, id)
+                .await
+                .unwrap()
+                .unfinished
+        );
+        crate::sealed::crash::at("rotate:recorded");
+        assert!(
+            rotate_keys(&state_dir, &keys, &api, id, true, false)
+                .await
+                .is_err()
+        );
+        let seal = AgentSeal::new(&dir, id);
+        let item = &seal.outbox().await.unwrap()[1];
+        let path = dir
+            .join("sealed/outbox")
+            .join(format!("{:020}.json", item.ord));
+        std::fs::rename(&path, root.join("moved")).unwrap();
+        let st = status(&state_dir, &keys, &api, id).await.unwrap();
+        assert!(st.unfinished);
+        assert_eq!(st.signing, "recorded (Agora took it)");
+        let why = st.blocked.clone().expect("blocked");
+        assert!(why.contains("missing link"), "{why}");
+        assert!(st.to_string().contains("keep it"), "{st}");
+        assert!(
+            rotate_keys(&state_dir, &keys, &api, id, true, false)
+                .await
+                .is_err()
+        );
+        let next = keys.next_secrets(id).unwrap().unwrap().signing().unwrap();
+        // Fixed: the rerun finishes, with the key Agora took
+        std::fs::rename(root.join("moved"), &path).unwrap();
+        let st = status(&state_dir, &keys, &api, id).await.unwrap();
+        assert!(st.blocked.is_none(), "{st}");
+        assert!(st.to_resign > 0);
+        rotate_keys(&state_dir, &keys, &api, id, true, false)
+            .await
+            .unwrap();
+        assert_eq!(keys.signing(id).unwrap().to_bytes(), next.to_bytes());
+        verifies(&dir, id, &keys).await;
+    }
+
+    /// An uploader's unsent items (a prepared `.tmp`) are re-signed too: a
+    /// later commit of an old-key item would not verify.
+    #[tokio::test]
+    async fn an_uploaders_unsent_items_are_resigned() {
+        let root = crate::sealed::TestDir::new("rotate-uploader-tmp");
+        let (id, keys, dir) = enrolled(&root).await;
+        let api = FakeApi::new();
+        *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
+        uploaded(&dir, id, &api).await;
+        let seal = AgentSeal::new(&dir, id);
+        let sent = seal.sent().await.unwrap();
+        // A prepared item Agora doesn't hold, signed by the old key
+        let mut tmp = sent.last().unwrap().clone();
+        tmp.ord = 99;
+        tmp.entry.entry.seq += 100;
+        let path = dir.join("sealed/outbox/00000000000000000099.tmp");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        tmp.entry = tmp.entry.entry.clone().sign(&keys.signing(id).unwrap());
+        std::fs::write(&path, serde_json::to_vec(&tmp).unwrap()).unwrap();
+        let done = rotate_keys(&root.join("state"), &keys, &api, id, true, false)
+            .await
+            .unwrap();
+        assert_eq!(done.resigned, 1);
+        let back: OutboxItem = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            back.entry
+                .verify(&keys.signing(id).unwrap().verifying_key())
+        );
+        assert!(seal.sent().await.unwrap().iter().all(|i| sent.contains(i)));
+    }
+
+    /// Agora already holds a record at the next seq (state_key.json behind
+    /// it, the wrap file gone): the re-wrap takes the seq after Agora's.
+    #[tokio::test]
+    async fn the_rewrap_seq_follows_agora() {
+        let root = crate::sealed::TestDir::new("rotate-rewrap-seq");
+        let (id, keys, dir) = enrolled(&root).await;
+        let enc = keys.ring().ensure_encryption_key(id).unwrap();
+        let api = FakeApi::new();
+        let signing = keys.signing(id).unwrap();
+        *api.public_key.lock().unwrap() = Some(signing.verifying_key());
+        uploaded(&dir, id, &api).await;
+        let key = keys
+            .state_key_file(id)
+            .unwrap()
+            .unwrap()
+            .state_key()
+            .unwrap();
+        let other = agora_agentkit::envelope::EncryptionPublicKey::from(&enc);
+        api.keys
+            .lock()
+            .unwrap()
+            .push(key.wrap(id, 0, 1, &other, &signing).unwrap());
+        rotate_keys(&root.join("state"), &keys, &api, id, false, true)
+            .await
+            .unwrap();
+        assert_eq!(keys.state_key_file(id).unwrap().unwrap().wrap_seq, 2);
     }
 }

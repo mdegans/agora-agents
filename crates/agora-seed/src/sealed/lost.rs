@@ -468,6 +468,24 @@ pub fn done(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The entries a resolution's record (`INTENT` or `DONE` in `dir`)
+/// holds, by file. Read-only.
+pub fn record_entries(dir: &Path) -> anyhow::Result<Vec<(PathBuf, Vec<SignedStateEntry>)>> {
+    let mut out = Vec::new();
+    for marker in [INTENT, DONE] {
+        let path = dir.join(marker);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let intent: Intent = serde_json::from_slice(&bytes)
+            .with_context(|| format!("{} unreadable", path.display()))?;
+        out.push((path, intent.items.into_iter().map(|i| i.entry).collect()));
+    }
+    Ok(out)
+}
+
 /// Re-sign the entries a resolution's record (`INTENT` or `DONE` in
 /// `dir`) holds, with `resign` (`rotate-keys`, for an agent that doesn't
 /// upload): the record rewritten whole if any changed. Returns how many.
