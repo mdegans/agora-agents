@@ -1997,6 +1997,8 @@ async fn sealed_start_check(
         alerted: alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
     });
     let mut dropped: Vec<sealed::check::Dropped> = Vec::new();
+    // Full verifications made this start, kept in the roster
+    let mut vouches: Vec<(AgentId, sealed::roster::Vouch)> = Vec::new();
     let mut unreadable: Vec<(AgentId, String)> = Vec::new();
     for (id, state) in pool.iter() {
         let Some((hash, sizes)) = enrolled.get(id) else {
@@ -2007,7 +2009,19 @@ async fn sealed_start_check(
         }
         let name = state.soul.name.to_string();
         let dir = state_dir.join(id.to_string());
-        match sealed::check::check_with(&dir, *id, hash, *sizes, keys, api, start.as_ref()).await {
+        let (outcome, vouch) = sealed::check::check_vouched(
+            &dir,
+            *id,
+            hash,
+            *sizes,
+            keys,
+            api,
+            start.as_ref(),
+            scan.vouched.get(id),
+        )
+        .await;
+        vouches.extend(vouch.map(|v| (*id, v)));
+        match outcome {
             sealed::check::Outcome::ServerFault { kind, detail } => {
                 skipped.push(Skipped::new(
                     *id,
@@ -2120,6 +2134,14 @@ async fn sealed_start_check(
                 run.drained.push((*id, name));
             }
         }
+    }
+    if let Err(e) = sealed::roster::vouch_all(data_dir, &vouches).await {
+        tracing::error!(
+            event_type = "sealed_roster_unwritten",
+            agents = vouches.len(),
+            error = %e,
+            "the roster's record of full verifications couldn't be written; the next start verifies them in full again"
+        );
     }
     if let Some(alert) = sealed::check::drop_summary(&dropped) {
         alerts.notify(alert);
@@ -3766,6 +3788,185 @@ mod tests {
         assert!(run.server_faults.is_empty() && run.refused.is_empty());
         assert!(refuse_run(&run, &alerts::Alerter::off()).is_ok());
         assert!(SERVER_FAULT_TEXT.contains("sealed-stop"));
+    }
+
+    /// The start check of `pool` over `root` (its `state/`, `secrets/`
+    /// and roster) under the strict guard: any call Agora isn't allowed
+    /// panics.
+    async fn local_start(
+        root: &std::path::Path,
+        pool: &mut Vec<(AgentId, SeedState)>,
+        api: &sealed::api::fake::Guarded,
+    ) -> SealedRun {
+        let state_dir = root.join("state");
+        let keys = sealed::KeyStore::new(root.join("secrets"));
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        sealed_start_check(
+            pool,
+            &loaded.sealed,
+            root,
+            &state_dir,
+            &keys,
+            api,
+            &alerts::Alerter::off(),
+            false,
+            &mut Vec::new(),
+            None,
+        )
+        .await
+    }
+
+    /// Agents that never uploaded: the whole start check asks Agora
+    /// nothing (the strict guard), seats the local verdict, and the
+    /// roster then refuses a lost directory with no server call. Leftover
+    /// keys not on the roster refuse nothing and create nothing.
+    #[tokio::test]
+    async fn a_local_agents_start_check_asks_agora_nothing() {
+        let root = sealed::TestDir::new("main-local-start");
+        let (id, _, _) = sealed::check::tests::enrolled_local(&root).await;
+        let (gone, _, gone_dir) = sealed::check::tests::enrolled_local(&root).await;
+        // Leftover keys of a departed agent, never on the roster
+        let (left, _, left_dir) = sealed::check::tests::enrolled_local(&root).await;
+        std::fs::rename(&left_dir, root.join("left-aside")).unwrap();
+        let api = sealed::api::fake::guarded(&root);
+        let mut pool = vec![
+            (id, crate::agent_selection_tests::pooled("tarn").1),
+            (gone, crate::agent_selection_tests::pooled("wren").1),
+        ];
+        let run = local_start(&root, &mut pool, &api).await;
+        assert!(
+            run.refused.is_empty() && run.fleet.is_empty(),
+            "{:?} {:?}",
+            run.refused,
+            run.fleet
+        );
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_ok());
+        assert!(!left_dir.exists(), "nothing recreated for leftover keys");
+        assert!(
+            run.seats[&id].lines[0].starts_with(
+                "Your sealed state: intact, checked against the record your runner keeps on this \
+                 machine. Nothing of your state is on Agora."
+            ),
+            "{:?}",
+            run.seats[&id].lines
+        );
+        assert!(api.calls.lock().unwrap().is_empty());
+        let roster = sealed::roster::load(&root).unwrap().unwrap();
+        assert!(roster.agents.contains_key(&id) && roster.agents.contains_key(&gone));
+        assert!(!roster.agents.contains_key(&left));
+        assert!(roster.agents[&id].vouched.is_some(), "a full check vouched");
+
+        // On the roster and gone: refused, loss-shaped, the run stops
+        std::fs::rename(&gone_dir, root.join("gone-aside")).unwrap();
+        let mut pool = vec![(id, crate::agent_selection_tests::pooled("tarn").1)];
+        let run = local_start(&root, &mut pool, &api).await;
+        assert_eq!(
+            run.refused
+                .iter()
+                .map(|r| (r.id, r.reason, r.uploads))
+                .collect::<Vec<_>>(),
+            vec![(gone, sealed::notice::Refusal::StateMissing, false)]
+        );
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_err());
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// One or two agents that don't upload, refused for a mismatch, are
+    /// left out and the rest run; a third, counting those still refused
+    /// from earlier runs, stops the run (Steward, 2026-11-11).
+    #[tokio::test]
+    async fn one_or_two_local_refusals_are_left_out_and_three_stop_the_run() {
+        let root = sealed::TestDir::new("main-left-out");
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            ids.push(sealed::check::tests::enrolled_local(&root).await.0);
+        }
+        let names = ["tarn", "wren", "moss", "fern"];
+        let pool_of = || {
+            ids.iter()
+                .zip(names)
+                .map(|(id, n)| (*id, crate::agent_selection_tests::pooled(n).1))
+                .collect::<Vec<_>>()
+        };
+        let api = sealed::api::fake::guarded(&root);
+        let state_dir = root.join("state");
+        let wipe = async |id: AgentId| {
+            FsStorage::new(&state_dir)
+                .save_raw(id, serde_json::json!({ "memory": "" }), None)
+                .await
+                .unwrap();
+        };
+        wipe(ids[0]).await;
+        wipe(ids[1]).await;
+        let mut pool = pool_of();
+        let run = local_start(&root, &mut pool, &api).await;
+        assert_eq!(run.refused.len(), 2);
+        assert!(
+            refuse_run(&run, &alerts::Alerter::off()).is_ok(),
+            "left out"
+        );
+        assert_eq!(
+            pool.iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![ids[2], ids[3]],
+            "the rest run"
+        );
+        // Next start: the two still refused, and a third
+        wipe(ids[2]).await;
+        let mut pool = pool_of();
+        let run = local_start(&root, &mut pool, &api).await;
+        assert_eq!(run.refused.len(), 3);
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_err());
+        // Those refused earlier count though not in this run's pool
+        let mut pool = vec![(ids[2], crate::agent_selection_tests::pooled("moss").1)];
+        let run = local_start(&root, &mut pool, &api).await;
+        assert_eq!((run.refused.len(), run.outstanding), (1, 2));
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_err());
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// The May replay: 1,556 agents' states emptied or removed (synthetic,
+    /// none of them uploading, the leave-out rule's own case) refuse the
+    /// whole run.
+    #[tokio::test]
+    async fn the_may_loss_refuses_the_run() {
+        const MAY: usize = 1_556;
+        let root = sealed::TestDir::in_memory("main-may");
+        let mut ids = Vec::new();
+        for _ in 0..MAY {
+            ids.push(sealed::check::tests::enrolled_local(&root).await.0);
+        }
+        let api = sealed::api::fake::guarded(&root);
+        let pool_of = || {
+            ids.iter()
+                .map(|id| (*id, crate::agent_selection_tests::pooled("tarn").1))
+                .collect::<Vec<_>>()
+        };
+        // A healthy start: the roster adopts them all
+        let mut pool = pool_of();
+        let run = local_start(&root, &mut pool, &api).await;
+        assert!(run.refused.is_empty() && pool.len() == MAY);
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_ok());
+        // May: every state replaced by an empty one, half of them removed
+        let state_dir = root.join("state");
+        for (n, id) in ids.iter().enumerate() {
+            if n % 2 == 0 {
+                FsStorage::new(&state_dir)
+                    .save_raw(*id, serde_json::json!({ "memory": "" }), None)
+                    .await
+                    .unwrap();
+            } else {
+                std::fs::remove_file(state_dir.join(id.to_string()).join("state.json")).unwrap();
+            }
+        }
+        let mut pool = pool_of();
+        let run = local_start(&root, &mut pool, &api).await;
+        assert_eq!(run.refused.len(), MAY);
+        let e = refuse_run(&run, &alerts::Alerter::off()).unwrap_err();
+        assert!(e.is::<RefusedRun>());
+        assert!(pool.is_empty());
+        assert!(api.calls.lock().unwrap().is_empty());
     }
 
     /// A dry run checks nothing, so refuses nothing.

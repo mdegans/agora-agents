@@ -85,10 +85,9 @@ impl SizeLog {
             return Ok(());
         }
         log.versions.push(r);
-        let path = path(agent_dir);
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&log)?)?;
-        std::fs::rename(&tmp, &path)
+        // Atomic and durable, a unique temporary per writer: two runners
+        // checking at once never share one
+        super::write_private(&path(agent_dir), &serde_json::to_vec_pretty(&log)?)
     }
 
     /// The newest version on record among `ancestors` (hashes on the main

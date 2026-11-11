@@ -62,6 +62,10 @@ pub struct Entry {
     pub seq: u64,
     pub entry_hash: Sha256Hex,
     pub updated_at: DateTime<Utc>,
+    /// The last full verification of its local chain, for an agent that
+    /// doesn't upload ([`Vouch`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vouched: Option<Vouch>,
 }
 
 impl Entry {
@@ -70,7 +74,37 @@ impl Entry {
             seq: head.seq,
             entry_hash: head.entry_hash,
             updated_at: Utc::now(),
+            vouched: None,
         }
+    }
+}
+
+/// A full verification of an agent's local main line that passed: the
+/// head it reached, the next outbox number then, when, the newest
+/// keyframe on it, and what the verdict says of it. Until it is
+/// [`FULL_VERIFY_EVERY`] old (spread per agent), the start check of an
+/// agent that doesn't upload verifies only the line from this head on
+/// ([`super::check`]), and falls back to the full check on anything off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Vouch {
+    pub head: HeadRef,
+    pub next_ord: u64,
+    pub at: DateTime<Utc>,
+    pub keyframe: Option<Sha256Hex>,
+    pub summary: super::check::LineSummary,
+}
+
+/// How often an agent's whole local chain is verified again, at least:
+/// each agent's period is between this and twice it, spread by its id so
+/// the fleet doesn't come due at one start.
+pub const FULL_VERIFY_EVERY: chrono::TimeDelta = chrono::TimeDelta::days(7);
+
+impl Vouch {
+    /// Still good for `id` at `now`.
+    pub fn fresh(&self, id: AgentId, now: DateTime<Utc>) -> bool {
+        let spread = (id.as_uuid().as_u128() % 1_000) as i32;
+        let period = FULL_VERIFY_EVERY + FULL_VERIFY_EVERY * spread / 1_000;
+        now >= self.at && now - self.at < period
     }
 }
 
@@ -96,9 +130,16 @@ impl Roster {
     /// "Higher seq wins": `head` replaces the entry only if it is ahead.
     /// Whether it did.
     fn merge(&mut self, id: AgentId, head: HeadRef) -> bool {
-        match self.agents.get(&id) {
+        match self.agents.get_mut(&id) {
             Some(e) if e.seq >= head.seq => false,
-            _ => {
+            Some(e) => {
+                *e = Entry {
+                    vouched: e.vouched,
+                    ..Entry::of(head)
+                };
+                true
+            }
+            None => {
                 self.agents.insert(id, Entry::of(head));
                 true
             }
@@ -178,6 +219,8 @@ pub struct Scan {
     pub refused: BTreeSet<AgentId>,
     /// The roster's agents after the scan.
     pub on_roster: BTreeSet<AgentId>,
+    /// Each agent's last full verification, where there is one.
+    pub vouched: BTreeMap<AgentId, Vouch>,
 }
 
 fn path(data_dir: &Path) -> PathBuf {
@@ -286,6 +329,29 @@ pub async fn record_all(
     let mut changed = first;
     for (id, head) in heads {
         changed |= roster.merge(id, head);
+    }
+    if changed {
+        save(data_dir, &mut roster)?;
+    }
+    Ok(())
+}
+
+/// Keep each agent's newest full verification; written only if one is
+/// newer. An agent not on the roster is left off it.
+pub async fn vouch_all(data_dir: &Path, vouches: &[(AgentId, Vouch)]) -> Result<(), RosterError> {
+    if vouches.is_empty() {
+        return Ok(());
+    }
+    let _lock = lock(data_dir).await?;
+    let (mut roster, _) = load_or_begin(data_dir)?;
+    let mut changed = false;
+    for (id, v) in vouches {
+        if let Some(e) = roster.agents.get_mut(id)
+            && e.vouched.is_none_or(|old| old.at < v.at)
+        {
+            e.vouched = Some(*v);
+            changed = true;
+        }
     }
     if changed {
         save(data_dir, &mut roster)?;
@@ -465,6 +531,11 @@ pub async fn check(data_dir: &Path, state_dir: &Path) -> Result<Scan, RosterErro
         );
     }
     scan.on_roster = roster.agents.keys().copied().collect();
+    scan.vouched = roster
+        .agents
+        .iter()
+        .filter_map(|(id, e)| Some((*id, e.vouched?)))
+        .collect();
     Ok(scan)
 }
 
@@ -540,5 +611,221 @@ impl Keeper {
             tracing::error!(error = %e, "sealed roster task failed");
         }
         self.keep().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sealed::check::tests::{enrolled_local, state};
+
+    /// A data dir with `n` agents chained locally; their ids and dirs.
+    async fn fleet(root: &Path, n: usize) -> Vec<(AgentId, PathBuf)> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let (id, _, dir) = enrolled_local(root).await;
+            out.push((id, dir));
+        }
+        out
+    }
+
+    async fn head(dir: &Path, id: AgentId) -> HeadRef {
+        AgentSeal::new(dir, id).head().await.unwrap().unwrap().head
+    }
+
+    /// The first run adopts every chained directory and nothing else;
+    /// writes the roster and `began`.
+    #[tokio::test]
+    async fn the_first_run_adopts_chained_directories_only() {
+        let root = crate::sealed::TestDir::new("roster-first");
+        let agents = fleet(&root, 2).await;
+        // A state never chained, and leftover keys with no directory
+        let plain = AgentId::new();
+        let mut fs = agora_agentkit::reactor::FsStorage::new(root.join("state"));
+        use agora_agentkit::reactor::Storage as _;
+        fs.save_raw(plain, state(1), None).await.unwrap();
+        std::fs::create_dir_all(root.join("secrets").join(AgentId::new().to_string())).unwrap();
+        let scan = check(&root, &root.join("state")).await.unwrap();
+        assert!(scan.losses.is_empty(), "{:?}", scan.losses);
+        let mut added = scan.added.clone();
+        added.sort();
+        let mut want: Vec<_> = agents.iter().map(|a| a.0).collect();
+        want.sort();
+        assert_eq!(added, want);
+        assert_eq!(scan.unchained, vec![plain]);
+        assert!(root.join(ROSTER).exists() && root.join(BEGAN).exists());
+        let roster = load(&root).unwrap().unwrap();
+        assert_eq!(roster.agents.len(), 2);
+        for (id, dir) in &agents {
+            assert_eq!(roster.agents[id].seq, head(dir, *id).await.seq);
+        }
+        // Again: nothing new
+        let scan = check(&root, &root.join("state")).await.unwrap();
+        assert!(scan.added.is_empty() && scan.losses.is_empty());
+    }
+
+    /// A directory put back to an older consistent copy reads as fine to
+    /// its chain; the roster catches it.
+    #[tokio::test]
+    async fn a_rollback_is_caught() {
+        let root = crate::sealed::TestDir::new("roster-rollback");
+        let (id, dir) = fleet(&root, 1).await.remove(0);
+        let backup = root.join("backup");
+        std::process::Command::new("cp")
+            .args(["-a"])
+            .arg(&dir)
+            .arg(&backup)
+            .status()
+            .unwrap();
+        check(&root, &root.join("state")).await.unwrap();
+        crate::sealed::props::save(&root, id, state(2)).await;
+        record_all(&root, [(id, head(&dir, id).await)])
+            .await
+            .unwrap();
+        // The older copy back in place
+        std::fs::rename(&dir, root.join("newer")).unwrap();
+        std::fs::rename(&backup, &dir).unwrap();
+        let scan = check(&root, &root.join("state")).await.unwrap();
+        assert!(
+            matches!(scan.losses[&id], Loss::Behind { .. }),
+            "{:?}",
+            scan.losses
+        );
+        assert_eq!(scan.losses[&id].refusal(), Refusal::RolledBack);
+        // The roster keeps the newer head
+        assert_eq!(
+            load(&root).unwrap().unwrap().agents[&id].seq,
+            head(&root.join("newer"), id).await.seq
+        );
+    }
+
+    /// A directory removed whole, a lost chain, a lost head, a lost state.
+    #[tokio::test]
+    async fn removals_are_caught() {
+        let root = crate::sealed::TestDir::new("roster-removal");
+        let agents = fleet(&root, 4).await;
+        check(&root, &root.join("state")).await.unwrap();
+        let sealed = |d: &Path| d.join(agora_agentkit::state::storage::SEALED_DIR);
+        std::fs::rename(&agents[0].1, root.join("gone")).unwrap();
+        std::fs::rename(sealed(&agents[1].1), root.join("gone-sealed")).unwrap();
+        std::fs::rename(
+            sealed(&agents[2].1).join("head.json"),
+            root.join("gone-head"),
+        )
+        .unwrap();
+        std::fs::rename(agents[3].1.join("state.json"), root.join("gone-state")).unwrap();
+        let scan = check(&root, &root.join("state")).await.unwrap();
+        let found: Vec<Loss> = agents.iter().map(|a| scan.losses[&a.0]).collect();
+        assert_eq!(
+            found,
+            [
+                Loss::DirMissing,
+                Loss::ChainMissing,
+                Loss::HeadMissing,
+                Loss::StateMissing
+            ]
+        );
+        assert!(found.iter().all(|l| l.refusal().loss_shaped()));
+    }
+
+    /// A head ahead of the roster (a crash before its write) is accepted
+    /// and recorded.
+    #[tokio::test]
+    async fn a_head_ahead_is_accepted() {
+        let root = crate::sealed::TestDir::new("roster-ahead");
+        let (id, dir) = fleet(&root, 1).await.remove(0);
+        check(&root, &root.join("state")).await.unwrap();
+        crate::sealed::props::save(&root, id, state(2)).await;
+        let scan = check(&root, &root.join("state")).await.unwrap();
+        assert!(scan.losses.is_empty());
+        assert_eq!(
+            load(&root).unwrap().unwrap().agents[&id].seq,
+            head(&dir, id).await.seq
+        );
+    }
+
+    /// Two writers at once (the continuous unit and the timer): each
+    /// agent's higher seq wins, nothing lost.
+    #[tokio::test]
+    async fn concurrent_updates_merge() {
+        let root = crate::sealed::TestDir::new("roster-concurrent");
+        let ids: Vec<AgentId> = (0..40).map(|_| AgentId::new()).collect();
+        let at = |seq| HeadRef {
+            entry_hash: Sha256Hex::from([seq as u8; 32]),
+            seq,
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for (n, id) in ids.iter().enumerate() {
+            for seq in [1, 5, 3] {
+                let (root, id) = (root.to_path_buf(), *id);
+                tasks.spawn(async move { record_all(&root, [(id, at(seq + n as u64))]).await });
+            }
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.unwrap().unwrap();
+        }
+        let roster = load(&root).unwrap().unwrap();
+        for (n, id) in ids.iter().enumerate() {
+            assert_eq!(roster.agents[id].seq, 5 + n as u64);
+        }
+    }
+
+    /// The roster unreadable, newer, or missing after it began: refused.
+    #[tokio::test]
+    async fn an_unreadable_or_lost_roster_is_refused() {
+        let root = crate::sealed::TestDir::new("roster-unreadable");
+        fleet(&root, 1).await;
+        check(&root, &root.join("state")).await.unwrap();
+        let good = std::fs::read(root.join(ROSTER)).unwrap();
+        std::fs::write(root.join(ROSTER), b"{ torn").unwrap();
+        assert!(matches!(
+            check(&root, &root.join("state")).await,
+            Err(RosterError::Unreadable { .. })
+        ));
+        std::fs::write(root.join(ROSTER), br#"{"format": 99}"#).unwrap();
+        assert!(matches!(
+            check(&root, &root.join("state")).await,
+            Err(RosterError::Newer { format: 99, .. })
+        ));
+        std::fs::rename(root.join(ROSTER), root.join("roster.aside")).unwrap();
+        assert!(matches!(
+            check(&root, &root.join("state")).await,
+            Err(RosterError::Missing { .. })
+        ));
+        // Recording never re-creates a roster that began
+        assert!(
+            record_all(
+                &root,
+                [(
+                    AgentId::new(),
+                    HeadRef {
+                        entry_hash: Sha256Hex::from([1; 32]),
+                        seq: 1
+                    }
+                )]
+            )
+            .await
+            .is_err()
+        );
+        assert!(!root.join(ROSTER).exists());
+        std::fs::write(root.join(ROSTER), good).unwrap();
+        assert!(check(&root, &root.join("state")).await.is_ok());
+    }
+
+    /// An operator's command sets a head back on purpose; the vouch goes
+    /// with the head it was for.
+    #[tokio::test]
+    async fn replace_sets_a_head_back() {
+        let root = crate::sealed::TestDir::new("roster-replace");
+        let id = AgentId::new();
+        let at = |seq| HeadRef {
+            entry_hash: Sha256Hex::from([seq as u8; 32]),
+            seq,
+        };
+        record(&root, id, at(9)).await.unwrap();
+        replace(&root, id, Some(at(4))).await.unwrap();
+        assert_eq!(load(&root).unwrap().unwrap().agents[&id].seq, 4);
+        replace(&root, id, None).await.unwrap();
+        assert!(load(&root).unwrap().unwrap().agents.is_empty());
     }
 }
