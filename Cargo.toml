@@ -102,3 +102,8 @@ lettre = { version = "0.11", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# TEMPORARY: agentkit's local-chain change (mdegans/agora-agentkit#294,
+# branch state/uploads-gate), built from its worktree. Drop at release.
+[patch.crates-io]
+agora-agentkit = { path = "../agentkit-local-chain" }
