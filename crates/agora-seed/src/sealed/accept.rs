@@ -543,13 +543,17 @@ pub struct Kept {
 
 /// Resolve a fork in a chain kept here (an agent that doesn't upload): two
 /// saves from one version, recorded in `head.json`'s `displaced`. `keep`
-/// names the line that goes on; every outbox item off it is kept under
-/// `sealed/lost/<utc>/` and set aside as `.displaced` ([`super::lost`]),
-/// `head.json` names the kept tip, and when that isn't the head, its state
-/// (opened from the blobs here, checked against its recorded hash) becomes
-/// the agent's, the state here archived by FsStorage. The agent is told,
-/// with `note`. A cut run is finished by the next, as it began. No call to
-/// Agora.
+/// names the line that goes on, by its tip: the head, or a displaced line's
+/// tip (never an ancestor of another line: that would roll a line back).
+/// Before anything moves, the kept line is verified and, when its tip isn't
+/// the head, its state opened and checked against its recorded hash. Then
+/// every outbox item off it is kept under `sealed/lost/<utc>/` and set
+/// aside as `.displaced` ([`super::lost`]), the kept line's items set aside
+/// before are put back, `head.json` names the kept tip, and when that isn't
+/// the head, its state becomes the agent's, the state here archived by
+/// FsStorage. The agent is told, with `note`. A cut run is finished by the
+/// next, as it began; one that moved nothing and can't go on is abandoned
+/// (its `INTENT` kept as `ABANDONED.<utc>`). No call to Agora.
 pub async fn keep_line(
     state_dir: &Path,
     keys: &KeyStore,
@@ -562,6 +566,11 @@ pub async fn keep_line(
     let note = note.trim();
     anyhow::ensure!(!note.is_empty(), "--note is required: the agent reads it");
     let agent_dir = state_dir.join(id.to_string());
+    anyhow::ensure!(
+        std::fs::exists(&agent_dir)?,
+        "no agent {id} here ({}): nothing was written",
+        agent_dir.display()
+    );
     let seal = AgentSeal::new(&agent_dir, id);
     let reach = super::version::reach(&agent_dir, keys, id);
     anyhow::ensure!(
@@ -575,12 +584,60 @@ pub async fn keep_line(
     let trusted = keys
         .trusted(id)?
         .context("no signing key to verify the chain kept here with")?;
-    let entries_now = async || -> anyhow::Result<(Vec<OutboxItem>, Vec<OutboxItem>)> {
-        Ok((seal.sent().await?, seal.outbox().await?))
+    // Every entry here: sent, committed, and set aside as `.displaced`
+    let all_items = async || -> anyhow::Result<Vec<OutboxItem>> {
+        let mut all = seal.sent().await?;
+        all.extend(seal.outbox().await?);
+        all.extend(super::lost::displaced_items(&seal)?);
+        Ok(all)
     };
-    let (dir, intent) = match super::lost::pending(&seal)? {
+    // The kept line verified, and its state opened and checked: before
+    // anything moves
+    let prove = async |tip: &HeadRef,
+                       tip_is_head: bool|
+           -> anyhow::Result<(
+        Vec<agora_agentkit::state::SignedStateEntry>,
+        Option<agora_agentkit::govlog::Sha256Hex>,
+        Option<serde_json::Value>,
+    )> {
+        let items = all_items().await?;
+        let entries: Vec<_> = items.iter().map(|i| i.entry.clone()).collect();
+        let line = super::check::main_line(&entries, &tip.entry_hash)
+            .context("the kept line has a missing link here")?;
+        let report = verify_chain(id, &line, &trusted);
+        anyhow::ensure!(
+            report.intact && report.head == Some(*tip),
+            "the kept line doesn't verify ({:?}): nothing was changed",
+            report.problems
+        );
+        let snapshot = line
+            .iter()
+            .rev()
+            .find(|e| e.entry.kind == StateEntryKind::Snapshot)
+            .cloned()
+            .context("the kept line holds no snapshot")?;
+        let recorded = items
+            .iter()
+            .find(|i| i.entry.entry_hash() == snapshot.entry_hash())
+            .and_then(|i| i.plaintext_sha256);
+        if tip_is_head {
+            return Ok((line, recorded, None));
+        }
+        let state = super::version::open_reach(&seal, api, &k, &line, &snapshot.entry, reach)
+            .await
+            .context("opening the kept line's latest version: nothing was changed")?;
+        let state = as_reloaded(&state).context("the kept state won't serialize")?;
+        let hash = plaintext_hash(&state);
+        anyhow::ensure!(
+            Some(hash) == recorded,
+            "the kept line's latest version hashes to {hash}, not its recorded {recorded:?}: \
+             nothing was changed"
+        );
+        Ok((line, recorded, Some(state)))
+    };
+    let (dir, intent, state) = match super::lost::pending(&seal)? {
         Some((dir, intent)) => {
-            let fork = intent.local_fork.as_ref().with_context(|| {
+            let fork = intent.local_fork.clone().with_context(|| {
                 format!(
                     "a resolution of versions Agora lost is unfinished under {}: \
                      `sealed-accept --rebase` finishes it",
@@ -599,7 +656,24 @@ pub async fn keep_line(
                 fork.keep_ord
                     .map_or("the head".to_string(), |o| format!("ord {o}"))
             );
-            (dir, intent)
+            match prove(&fork.keep, fork.keep_ord.is_none()).await {
+                Ok((_, _, state)) => (dir, intent, state),
+                Err(e) => {
+                    if super::lost::abandon_if_untouched(&seal, &dir, &intent).await? {
+                        anyhow::bail!(
+                            "the unfinished fork resolution under {} can't go on ({e:#}), and \
+                             had moved nothing: it is abandoned (its INTENT kept as \
+                             ABANDONED.<utc>). Nothing was changed",
+                            dir.display()
+                        );
+                    }
+                    return Err(e.context(format!(
+                        "the fork resolution under {} has begun and can't finish: put back \
+                         what the message names from a backup, then run this again",
+                        dir.display()
+                    )));
+                }
+            }
         }
         None => {
             let head = seal
@@ -610,123 +684,97 @@ pub async fn keep_line(
                 !head.displaced.is_empty(),
                 "agent {id}'s chain here has no fork to resolve"
             );
-            let (sent, outbox) = entries_now().await?;
+            let items = all_items().await?;
+            // A displaced head another entry was saved on is an ancestor,
+            // not a line's tip
+            let parents: std::collections::HashSet<_> = items
+                .iter()
+                .filter_map(|i| i.entry.entry.prev_hash)
+                .collect();
+            let tips: Vec<&OutboxItem> = head
+                .displaced
+                .iter()
+                .filter(|d| !parents.contains(&d.entry_hash))
+                .filter_map(|d| items.iter().find(|i| i.entry.entry_hash() == d.entry_hash))
+                .collect();
             let choices = || {
                 let mut out = format!("head (seq {}, {})", head.head.seq, head.head.entry_hash);
-                for d in &head.displaced {
-                    if let Some(i) = outbox.iter().find(|i| i.entry.entry_hash() == d.entry_hash) {
-                        out.push_str(&format!(", {} (seq {}, {})", i.ord, d.seq, d.entry_hash));
-                    }
+                for i in &tips {
+                    out.push_str(&format!(
+                        ", {} (seq {}, {})",
+                        i.ord,
+                        i.entry.entry.seq,
+                        i.entry.entry_hash()
+                    ));
                 }
                 out
             };
-            let (tip, keep_ord) = match keep {
+            let (tip, tip_item) = match keep {
                 Keep::Head => (head.head, None),
                 Keep::Ord(o) => {
-                    let item = outbox
-                        .iter()
-                        .find(|i| i.ord == o)
-                        .filter(|i| {
-                            head.displaced
-                                .iter()
-                                .any(|d| d.entry_hash == i.entry.entry_hash())
-                        })
-                        .with_context(|| {
-                            format!(
-                                "outbox item {o} is not the tip of a line a later save forked \
-                                 from. The choices: {}",
-                                choices()
-                            )
-                        })?;
+                    let item = items.iter().find(|i| i.ord == o).with_context(|| {
+                        format!("no outbox item {o} here. The choices: {}", choices())
+                    })?;
+                    let hash = item.entry.entry_hash();
+                    anyhow::ensure!(
+                        !parents.contains(&hash),
+                        "outbox item {o} is an ancestor of a later save, not a line's tip: \
+                         keeping it would roll that line back. The choices: {}",
+                        choices()
+                    );
+                    anyhow::ensure!(
+                        tips.iter().any(|t| t.entry.entry_hash() == hash),
+                        "outbox item {o} is not the tip of a line a later save forked from. \
+                         The choices: {}",
+                        choices()
+                    );
                     (
                         HeadRef {
-                            entry_hash: item.entry.entry_hash(),
+                            entry_hash: hash,
                             seq: item.entry.entry.seq,
                         },
-                        Some(o),
+                        Some(item.clone()),
                     )
                 }
             };
-            let entries: Vec<_> = sent
-                .iter()
-                .chain(&outbox)
-                .map(|i| i.entry.clone())
-                .collect();
-            let line = super::check::main_line(&entries, &tip.entry_hash)
-                .context("the kept line has a missing link here")?;
-            let report = verify_chain(id, &line, &trusted);
-            anyhow::ensure!(
-                report.intact,
-                "the kept line doesn't verify ({:?}): nothing was changed",
-                report.problems
-            );
+            let (line, recorded, state) = prove(&tip, tip_item.is_none()).await?;
             let on_line: std::collections::HashSet<_> =
                 line.iter().map(|e| e.entry_hash()).collect();
-            let aside: Vec<OutboxItem> = outbox
+            let aside: Vec<OutboxItem> = seal
+                .outbox()
+                .await?
                 .into_iter()
                 .filter(|i| !on_line.contains(&i.entry.entry_hash()))
                 .collect();
-            super::lost::begin_fork(
+            let back: Vec<OutboxItem> = super::lost::displaced_items(&seal)?
+                .into_iter()
+                .filter(|i| on_line.contains(&i.entry.entry_hash()))
+                .collect();
+            let (dir, intent) = super::lost::begin_fork(
                 &seal,
                 super::lost::LocalFork {
                     keep: tip,
-                    keep_ord,
+                    keep_ord: tip_item.as_ref().map(|i| i.ord),
+                    tip: tip_item,
+                    plaintext_sha256: recorded,
+                    back,
                 },
                 &aside,
                 note,
             )
-            .await?
+            .await?;
+            (dir, intent, state)
         }
     };
     let fork = intent
         .local_fork
         .clone()
         .context("not a fork's resolution")?;
-    // The kept line, from what stays (the items off it may be aside already)
-    let (sent, outbox) = entries_now().await?;
-    let all: Vec<&OutboxItem> = sent.iter().chain(&outbox).collect();
-    let entries: Vec<_> = all.iter().map(|i| i.entry.clone()).collect();
-    let line = super::check::main_line(&entries, &fork.keep.entry_hash)
-        .context("the kept line has a missing link here")?;
-    let report = verify_chain(id, &line, &trusted);
-    anyhow::ensure!(
-        report.intact && report.head == Some(fork.keep),
-        "the kept line doesn't verify ({:?})",
-        report.problems
-    );
-    let snapshot = line
-        .iter()
-        .rev()
-        .find(|e| e.entry.kind == StateEntryKind::Snapshot)
-        .cloned()
-        .context("the kept line holds no snapshot")?;
-    let recorded = all
-        .iter()
-        .find(|i| i.entry.entry_hash() == snapshot.entry_hash())
-        .and_then(|i| i.plaintext_sha256);
-    let tip = match fork.keep_ord {
-        Some(o) => Some(
-            outbox
-                .iter()
-                .find(|i| i.ord == o)
-                .with_context(|| format!("the kept tip, outbox item {o}, is gone"))?,
-        ),
-        None => None,
-    };
-    super::lost::finish_fork(&seal, &dir, &intent, tip, recorded).await?;
+    super::lost::finish_fork(&seal, &dir, &intent).await?;
     // The state: the kept tip's, when it isn't the head the agent ran on
-    let mut state_changed = false;
-    if tip.is_some() {
-        let state = super::version::open_reach(&seal, api, &k, &line, &snapshot.entry, reach)
-            .await
-            .context("opening the kept line's latest version")?;
-        let state = as_reloaded(&state).context("the kept state won't serialize")?;
+    let state_changed = state.is_some();
+    if let Some(state) = state {
         let hash = plaintext_hash(&state);
-        anyhow::ensure!(
-            Some(hash) == recorded,
-            "the kept line's latest version hashes to {hash}, not its recorded {recorded:?}: \
-             not writing it (head.json names it; the agent stays as it is until this is fixed)"
-        );
         let here = FsStorage::new(state_dir)
             .load_raw(id)
             .await
@@ -740,21 +788,27 @@ pub async fn keep_line(
                 .await
                 .context("writing the kept state")?;
         }
-        state_changed = true;
     }
     super::crash::point("fork:state")?;
     if seal.is_refused().await? {
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
+    let chain = match reach {
+        super::version::Reach::Local => super::notice::ChainKept::Local,
+        super::version::Reach::Stopped => super::notice::ChainKept::Stopped,
+        super::version::Reach::Uploads => super::notice::ChainKept::Uploading,
+    };
     Notice::fork_kept(
         &agent_dir,
         note,
         intent.items.len(),
         state_changed,
         &super::lost::kept_text(&intent),
+        chain,
     )
     .context("writing the notice")?;
     super::lost::done(&dir)?;
+    // B2: roster::replace(data_dir, id, Some(head)) once the roster lands
     drop(lock);
     tracing::warn!(
         event_type = "sealed_state_fork_kept",
@@ -762,6 +816,7 @@ pub async fn keep_line(
         head = %fork.keep.entry_hash,
         seq = fork.keep.seq,
         set_aside = intent.items.len(),
+        put_back = fork.back.len(),
         state_changed,
         kept = %dir.display(),
         "the operator resolved a fork in a chain kept here; the other line is kept"
@@ -1611,5 +1666,218 @@ mod tests {
             );
         }
         assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// A, B from one version; then A2 saved on A: A is an ancestor, not a
+    /// line's tip. Never offered, and refused when named.
+    #[tokio::test]
+    async fn an_ancestor_is_never_kept_as_a_tip() {
+        use agora_agentkit::state::storage::Mirrored;
+        let root = crate::sealed::TestDir::new("accept-keep-ancestor");
+        let (id, keys, dir, a, b) = forked(&root).await;
+        let state_dir = root.join("state");
+        // A2 on A: a save whose base is A
+        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
+            state_dir.clone(),
+            root.join("secrets"),
+        ));
+        let mut store = Mirrored::new(FsStorage::new(&state_dir), (), enrolment);
+        let a2 = store
+            .save_raw(id, check::tests::state(22), Some(&a))
+            .await
+            .unwrap()
+            .unwrap();
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap();
+        assert_eq!(head.head, a2);
+        assert!(head.displaced.contains(&a) && head.displaced.contains(&b));
+        let api = crate::sealed::api::fake::guarded(&root);
+        let e = keep_line(&state_dir, &keys, &api, id, Keep::Ord(ord_of(&dir, a)), "n")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is an ancestor"), "{e}");
+        assert!(e.contains(&b.entry_hash.to_string()), "B is a choice: {e}");
+        assert!(
+            !e.contains(&format!(", {} (seq", ord_of(&dir, a))),
+            "A is not: {e}"
+        );
+        assert!(
+            !std::fs::exists(dir.join("sealed/lost")).unwrap(),
+            "nothing moved"
+        );
+        // B is: kept, A2's line (and A) set aside
+        let done = keep_line(&state_dir, &keys, &api, id, Keep::Ord(ord_of(&dir, b)), "n")
+            .await
+            .unwrap();
+        assert_eq!(done.head, b);
+        assert_eq!(done.set_aside, 2);
+    }
+
+    /// The kept tip's state can't be opened (its blob gone): refused
+    /// before anything moves, and the next try with the blob back works.
+    #[tokio::test]
+    async fn a_kept_tip_that_wont_open_moves_nothing() {
+        let root = crate::sealed::TestDir::new("accept-keep-blob");
+        let (id, keys, dir, a, _) = forked(&root).await;
+        let item = AgentSeal::new(&dir, id)
+            .outbox()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.entry.entry_hash() == a.entry_hash)
+            .unwrap();
+        let sha = item.entry.entry.blob.unwrap().sha256.to_hex();
+        let blob = dir.join("sealed/blobs").join(&sha);
+        std::fs::rename(&blob, root.join("blob")).unwrap();
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap();
+        let api = crate::sealed::api::fake::guarded(&root);
+        let keep = Keep::Ord(item.ord);
+        assert!(
+            keep_line(&root.join("state"), &keys, &api, id, keep, "n")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            AgentSeal::new(&dir, id).head().await.unwrap().unwrap(),
+            head
+        );
+        assert!(
+            !std::fs::exists(dir.join("sealed/lost")).unwrap(),
+            "no INTENT"
+        );
+        assert!(api.calls.lock().unwrap().is_empty());
+        std::fs::rename(root.join("blob"), &blob).unwrap();
+        let done = keep_line(&root.join("state"), &keys, &api, id, keep, "n")
+            .await
+            .unwrap();
+        assert_eq!(done.head, a);
+    }
+
+    /// An INTENT left by an older run whose tip won't open, nothing moved:
+    /// abandoned (kept as ABANDONED.<utc>), and `--keep` works again.
+    #[tokio::test]
+    async fn an_untouched_intent_that_cant_finish_is_abandoned() {
+        let root = crate::sealed::TestDir::new("accept-keep-abandon");
+        let (id, keys, dir, a, _) = forked(&root).await;
+        let api = crate::sealed::api::fake::guarded(&root);
+        let keep = Keep::Ord(ord_of(&dir, a));
+        crate::sealed::crash::at("fork:intent");
+        assert!(
+            keep_line(&root.join("state"), &keys, &api, id, keep, "n")
+                .await
+                .is_err()
+        );
+        let seal = AgentSeal::new(&dir, id);
+        let item = seal
+            .outbox()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.entry.entry_hash() == a.entry_hash)
+            .unwrap();
+        let blob = dir
+            .join("sealed/blobs")
+            .join(item.entry.entry.blob.unwrap().sha256.to_hex());
+        std::fs::rename(&blob, root.join("blob")).unwrap();
+        let e = keep_line(&root.join("state"), &keys, &api, id, keep, "n")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("abandoned"), "{e}");
+        assert!(crate::sealed::lost::pending(&seal).unwrap().is_none());
+        std::fs::rename(root.join("blob"), &blob).unwrap();
+        keep_line(&root.join("state"), &keys, &api, id, Keep::Head, "n")
+            .await
+            .unwrap();
+    }
+
+    /// head.json lost with a fork in the chain here: rebuilt with the fork
+    /// recorded (the other line set aside), so `--keep` sees it; and an
+    /// opt-in then uploads the main line only.
+    #[tokio::test]
+    async fn a_rebuilt_head_keeps_the_fork_and_an_opt_in_uploads_the_main_line() {
+        use agora_agentkit::state::outbox::{AgoraOutbox, Drained};
+        for keep_other in [false, true] {
+            let root = crate::sealed::TestDir::new("accept-adopt-fork");
+            let (id, keys, dir, a, b) = forked(&root).await;
+            let ord_a = ord_of(&dir, a);
+            std::fs::rename(dir.join("sealed/head.json"), root.join("head.lost")).unwrap();
+            AgentSeal::new(&dir, id)
+                .refuse("head_missing")
+                .await
+                .unwrap();
+            let api = crate::sealed::api::fake::guarded(&root);
+            let state_dir = root.join("state");
+            let done = accept(&state_dir, &keys, &api, id, None).await.unwrap();
+            assert_eq!(done.head, b);
+            let seal = AgentSeal::new(&dir, id);
+            assert_eq!(seal.head().await.unwrap().unwrap().displaced, vec![a]);
+            assert!(
+                seal.outbox()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|i| i.entry.entry_hash() != a.entry_hash),
+                "set aside"
+            );
+            let (keep, kept) = if keep_other {
+                (Keep::Ord(ord_a), a)
+            } else {
+                (Keep::Head, b)
+            };
+            keep_line(&state_dir, &keys, &api, id, keep, "a fork found")
+                .await
+                .unwrap();
+            // Opted in: the main line uploads, and nothing else
+            let main = check::main_line(
+                &check::local_entries(&seal).await.unwrap(),
+                &kept.entry_hash,
+            )
+            .unwrap();
+            let (url, took) =
+                crate::sealed::rotate::tests::accepting(keys.signing(id).unwrap().verifying_key())
+                    .await;
+            crate::sealed::uploading::set(
+                &dir,
+                &keys,
+                id,
+                crate::sealed::uploading::UploadingBy::OptIn,
+            )
+            .unwrap();
+            let outbox = AgoraOutbox::new(
+                agora_agentkit::client::Client::new(url).unwrap(),
+                &state_dir,
+                std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
+                    &state_dir,
+                    root.join("secrets"),
+                )),
+            );
+            let Drained::Ran(_) = outbox.drain(id).await.unwrap() else {
+                panic!("not drained")
+            };
+            assert_eq!(*took.lock().unwrap(), main, "keep other {keep_other}");
+        }
+    }
+
+    /// The fork notice says where the chain is, by its kind.
+    #[test]
+    fn the_fork_notice_follows_where_the_chain_is() {
+        use crate::sealed::notice::ChainKept;
+        for (chain, words) in [
+            (ChainKept::Local, "(nothing of it is on Agora)"),
+            (
+                ChainKept::Stopped,
+                "(your uploads are stopped, and the versions on Agora are not changed)",
+            ),
+            (
+                ChainKept::Uploading,
+                "(the versions already on Agora are not changed)",
+            ),
+        ] {
+            let root = crate::sealed::TestDir::new("accept-fork-notice");
+            Notice::fork_kept(&root, "n", 1, false, "kept", chain).unwrap();
+            let line = Notice::load(&root).unwrap().unwrap().line().unwrap();
+            assert!(line.contains(words), "{line}");
+        }
     }
 }

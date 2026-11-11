@@ -68,6 +68,71 @@ pub struct LocalFork {
     pub keep: HeadRef,
     /// The tip's outbox item, when it isn't the head `head.json` named.
     pub keep_ord: Option<u64>,
+    /// That item itself, and its line's newest recorded state hash: what
+    /// `head.json` will name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<OutboxItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_sha256: Option<agora_agentkit::govlog::Sha256Hex>,
+    /// Items on the kept line set aside before (`.displaced`), put back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub back: Vec<OutboxItem>,
+}
+
+/// The outbox's `.displaced` items: lines a fork set aside, or a rebase.
+pub fn displaced_items(seal: &AgentSeal) -> anyhow::Result<Vec<OutboxItem>> {
+    let dir = seal.dir().join("outbox");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).context("reading sealed/outbox"),
+    };
+    let mut out = Vec::new();
+    for e in entries {
+        let path = e?.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("displaced") {
+            continue;
+        }
+        out.push(
+            serde_json::from_slice(&std::fs::read(&path)?)
+                .with_context(|| format!("{} isn't an outbox item", path.display()))?,
+        );
+    }
+    out.sort_by_key(|i: &OutboxItem| i.ord);
+    Ok(out)
+}
+
+/// An unfinished local fork resolution that moved nothing yet (every item
+/// to set aside still committed, nothing put back, `head.json` not yet the
+/// kept tip's) is abandoned: `INTENT` renamed `ABANDONED.<utc>`, kept.
+/// `Ok(false)`: something moved; it must be finished.
+pub async fn abandon_if_untouched(
+    seal: &AgentSeal,
+    dir: &Path,
+    intent: &Intent,
+) -> anyhow::Result<bool> {
+    let Some(fork) = &intent.local_fork else {
+        return Ok(false);
+    };
+    let outbox = seal.dir().join("outbox");
+    let committed = |i: &OutboxItem| std::fs::exists(outbox.join(format!("{:020}.json", i.ord)));
+    for i in &intent.items {
+        if !committed(i)? {
+            return Ok(false);
+        }
+    }
+    for i in &fork.back {
+        if committed(i)? {
+            return Ok(false);
+        }
+    }
+    if fork.keep_ord.is_some() && seal.head().await?.is_some_and(|h| h.head == fork.keep) {
+        return Ok(false);
+    }
+    let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
+    std::fs::rename(dir.join(INTENT), dir.join(format!("ABANDONED.{at}")))?;
+    sync(dir)?;
+    Ok(true)
 }
 
 /// The pending resolution, if one was cut short.
@@ -394,21 +459,15 @@ pub async fn begin_fork(
 
 /// Steps 1 to 3 of the local fork resolution `intent` describes, each
 /// skipped once done, so a rerun after a cut finishes it: copies, the
-/// items off the kept line set aside, `head.json` naming the kept tip.
-/// `tip`: the kept tip's outbox item, when it isn't the head `head.json`
-/// named (`plaintext_sha256`: its line's last snapshot's). The caller
-/// then writes the tip's state, the notice, and calls [`done`].
-pub async fn finish_fork(
-    seal: &AgentSeal,
-    dir: &Path,
-    intent: &Intent,
-    tip: Option<&OutboxItem>,
-    plaintext_sha256: Option<agora_agentkit::govlog::Sha256Hex>,
-) -> anyhow::Result<()> {
+/// items off the kept line set aside (and the kept line's back),
+/// `head.json` naming the kept tip. The caller then writes the tip's
+/// state, the notice, and calls [`done`].
+pub async fn finish_fork(seal: &AgentSeal, dir: &Path, intent: &Intent) -> anyhow::Result<()> {
     let keep = intent
         .local_fork
         .as_ref()
         .context("not a local fork's resolution")?;
+    let (tip, plaintext_sha256) = (keep.tip.as_ref(), keep.plaintext_sha256);
     // 1. Copies
     copy_aside(seal, dir, intent).await?;
     super::crash::point("fork:copied")?;
@@ -429,6 +488,18 @@ pub async fn finish_fork(
                     item.entry.entry_hash()
                 )),
             )?;
+        }
+    }
+    // The kept line's items set aside before: back
+    for item in &keep.back {
+        let from = outbox.join(format!(
+            "{:020}-{}.displaced",
+            item.ord,
+            item.entry.entry_hash()
+        ));
+        let to = outbox.join(format!("{:020}.json", item.ord));
+        if std::fs::exists(&from)? && !std::fs::exists(&to)? {
+            std::fs::rename(&from, &to)?;
         }
     }
     if std::fs::exists(&outbox)? {

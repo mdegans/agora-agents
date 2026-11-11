@@ -138,6 +138,39 @@ pub struct ForkKept {
     pub state_changed: bool,
     /// What the runner keeps, in the agent's words.
     pub kept: String,
+    /// Where the agent's chain is, which the line says.
+    #[serde(default)]
+    pub chain: ChainKept,
+}
+
+// B4/5: the fork notice follows where the chain is.
+/// Where a resolved fork's chain is, for [`ForkKept`]'s line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainKept {
+    /// Never uploaded: nothing of it is on Agora.
+    #[default]
+    Local,
+    /// Uploaded, now stopped: what is on Agora is unchanged.
+    Stopped,
+    /// Uploading.
+    Uploading,
+}
+
+impl ChainKept {
+    /// The words after "your sealed history,".
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Local => "which your runner keeps here (nothing of it is on Agora)",
+            Self::Stopped => {
+                "which your runner keeps here (your uploads are stopped, and the versions on \
+                 Agora are not changed)"
+            }
+            Self::Uploading => {
+                "which your runner keeps here (the versions already on Agora are not changed)"
+            }
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -360,6 +393,7 @@ impl Notice {
         versions: usize,
         state_changed: bool,
         kept: &str,
+        chain: ChainKept,
     ) -> std::io::Result<()> {
         Self::operator_note(agent_dir, note, false, false)?;
         let mut n = Self::load(agent_dir)?.expect("just written");
@@ -367,6 +401,7 @@ impl Notice {
             versions,
             state_changed,
             kept: kept.to_string(),
+            chain,
         });
         write(agent_dir, &n)
     }
@@ -609,11 +644,12 @@ impl Notice {
                 ""
             };
             return Some(format!(
-                "On {}, your operator resolved a fork in your sealed history, which your runner \
-                 keeps here (nothing of it is on Agora): two saves had gone separate ways from \
-                 one version, and your operator chose the line that goes on. {state}The {versions} \
-                 that went the other way are kept by your runner: {}. Your operator's note: {}",
+                "On {}, your operator resolved a fork in your sealed history, {}: two saves had \
+                 gone separate ways from one version, and your operator chose the line that goes \
+                 on. {state}The {versions} that went the other way are kept by your runner: {}. \
+                 Your operator's note: {}",
                 accepted.at.format("%-d %B %Y"),
+                fork.chain.words(),
                 fork.kept,
                 accepted.note
             ));

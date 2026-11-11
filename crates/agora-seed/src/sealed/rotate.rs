@@ -863,7 +863,7 @@ fn item_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sealed::api::fake::FakeApi;
     use crate::sealed::check::{self, Outcome, tests::enrolled};
@@ -1433,7 +1433,7 @@ mod tests {
     /// An Agora that takes blobs and entries as the real one checks them:
     /// each entry signed by the agent's current key and linked to the one
     /// before. What it took, in order.
-    async fn accepting(
+    pub(crate) async fn accepting(
         key: agora_agentkit::crypto::VerifyingKey,
     ) -> (
         url::Url,

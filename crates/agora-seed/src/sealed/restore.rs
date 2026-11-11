@@ -395,6 +395,12 @@ async fn local_is_newest(seal: &AgentSeal, state_dir: &Path, id: AgentId) -> any
 /// blobs, by agentkit's `adopt_server_head` fed the local chain. For an
 /// agent that never uploaded; never a genesis. `current`: the state here,
 /// to say whether it is the head's.
+///
+/// A fork the lost `head.json` recorded is rebuilt too: committed items
+/// off the head's line are set aside as `.displaced` first (so no opt-in
+/// ever uploads them as the main line), and the tips of those lines (and
+/// of any line set aside so but in no resolution) become `head.json`'s
+/// `displaced`, which `sealed-accept --keep` resolves.
 pub async fn adopt_local(
     seal: &AgentSeal,
     lock: &agora_agentkit::state::storage::SealLock,
@@ -405,20 +411,15 @@ pub async fn adopt_local(
     let id = seal.agent_id();
     let mut items = committed_items(seal).await?;
     items.sort_by_key(|i| i.ord);
-    let tip = items.last().with_context(|| {
+    let tip = items.last().cloned().with_context(|| {
         format!(
             "agent {id}'s sealed/head.json is missing and its outbox holds no committed version \
              to rebuild it from; nothing of it is on Agora. Restore `state/{id}/` and \
              `secrets/{id}/` from a backup"
         )
     })?;
-    let mut entries: Vec<SignedStateEntry> = seal
-        .sent()
-        .await
-        .context("reading sealed/sent")?
-        .into_iter()
-        .map(|i| i.entry)
-        .collect();
+    let sent: Vec<OutboxItem> = seal.sent().await.context("reading sealed/sent")?;
+    let mut entries: Vec<SignedStateEntry> = sent.iter().map(|i| i.entry.clone()).collect();
     entries.extend(items.iter().map(|i| i.entry.clone()));
     let line = super::check::main_line(&entries, &tip.entry.entry_hash()).with_context(|| {
         format!(
@@ -426,6 +427,24 @@ pub async fn adopt_local(
             tip.entry.entry.seq
         )
     })?;
+    let on_line: std::collections::HashSet<Sha256Hex> =
+        line.iter().map(|e| e.entry_hash()).collect();
+    // Off the head's line: set aside before head.json names anything
+    let outbox = seal.dir().join("outbox");
+    for item in items
+        .iter()
+        .filter(|i| !on_line.contains(&i.entry.entry_hash()))
+    {
+        std::fs::rename(
+            outbox.join(format!("{:020}.json", item.ord)),
+            outbox.join(format!(
+                "{:020}-{}.displaced",
+                item.ord,
+                item.entry.entry_hash()
+            )),
+        )?;
+    }
+    std::fs::File::open(&outbox)?.sync_all()?;
     let fetch = |sha: Sha256Hex| async move {
         seal.read_blob(&sha).await.map_err(|e| {
             Box::<dyn std::error::Error + Send + Sync>::from(format!(
@@ -433,9 +452,47 @@ pub async fn adopt_local(
             ))
         })
     };
-    seal.adopt_server_head(lock, &line, trusted, k, current, fetch)
+    let adopted = seal
+        .adopt_server_head(lock, &line, trusted, k, current, fetch)
         .await
-        .context("rebuilding head.json from the local chain")
+        .context("rebuilding head.json from the local chain")?;
+    // The fork record: tips of the lines set aside, not resolved
+    let resolved: std::collections::HashSet<Sha256Hex> = super::lost::resolutions(seal)?
+        .iter()
+        .flat_map(|(_, i)| i.items.iter().map(|i| i.entry.entry_hash()))
+        .collect();
+    let aside: Vec<OutboxItem> = super::lost::displaced_items(seal)?
+        .into_iter()
+        .filter(|i| !resolved.contains(&i.entry.entry_hash()))
+        .collect();
+    let parents: std::collections::HashSet<Sha256Hex> = aside
+        .iter()
+        .chain(&items)
+        .filter_map(|i| i.entry.entry.prev_hash)
+        .collect();
+    let displaced: Vec<HeadRef> = aside
+        .iter()
+        .filter(|i| !parents.contains(&i.entry.entry_hash()))
+        .map(|i| HeadRef {
+            entry_hash: i.entry.entry_hash(),
+            seq: i.entry.entry.seq,
+        })
+        .collect();
+    if !displaced.is_empty() {
+        let mut head = seal.head().await?.context("head.json vanished")?;
+        head.displaced = displaced;
+        super::write_private(
+            &seal.dir().join("head.json"),
+            &serde_json::to_vec_pretty(&head)?,
+        )?;
+        tracing::warn!(
+            event_type = "sealed_state_fork_rebuilt",
+            agent_id = %id,
+            forks = head.displaced.len(),
+            "a fork the lost head.json recorded is recorded again; sealed-accept --keep resolves it"
+        );
+    }
+    Ok(adopted)
 }
 
 /// The outbox's committed items (`*.json`), read directly: agentkit's
