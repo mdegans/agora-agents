@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 
 use super::KeyStore;
 use super::api::{SealedApi, UploadGuard};
-use super::keys::{StateKeyFile, x25519_public_hex};
+use super::keys::StateKeyFile;
 use crate::consent::memory_restore::{
     self, RestoreOffer, ledger::RestoreLedger, prompt::RestoreChoice,
 };
@@ -1197,16 +1197,11 @@ impl Enroller {
             .state_key_file(id)
             .context("the state key cache")?
             .context("chained, but no state key is cached")?;
-        let state_key = state_file.state_key().context("the state key cache")?;
         let vk = signing.verifying_key();
-        let wrapped_to = x25519_public_hex(&encryption);
+        // One rule with `rotate-keys` (`keys::wrap_usable`): at state_key.json's
+        // wrap or past it
         let valid = |r: &agora_agentkit::state::StateKeyRecord| {
-            r.agent_id == id
-                && r.key_gen == state_file.key_gen
-                && r.wrap_seq == state_file.wrap_seq
-                && r.wrapped_to_pub == wrapped_to
-                && r.verify(&vk)
-                && StateKey::unwrap(r, &encryption).is_ok_and(|k| k.expose() == state_key.expose())
+            super::keys::wrap_usable(r, id, &state_file, state_file.wrap_seq, &encryption, &vk)
         };
         let held = guard
             .state_keys(id, &signing)
@@ -1215,30 +1210,56 @@ impl Enroller {
             .context("reading the server's state keys")?;
         // An earlier attempt's record on Agora; one wrapped to a retired key,
         // or signed by one, doesn't count: Agora takes only the current key's
-        let posted = held.iter().any(&valid);
-        if !posted {
-            // A rotation's own record, if it is still valid; else wrapped afresh
-            let record = match self
-                .wrap_record(id)
+        let posted = held.iter().find(|r| valid(r)).cloned();
+        let record = match posted {
+            Some(r) => r,
+            None => {
+                // A rotation's own record, or an earlier attempt's, if it is
+                // still valid; else wrapped afresh past what Agora holds
+                let record = match super::keys::kept_wrap(
+                    &self.keys,
+                    id,
+                    &state_file,
+                    state_file.wrap_seq,
+                    &encryption,
+                    &vk,
+                )
                 .context("reading state_key.wrap.json")?
-            {
-                Some(r) if valid(&r) => r,
-                _ => state_key
-                    .wrap(
+                {
+                    Some(r) => r,
+                    None => super::keys::new_wrap(
+                        &self.keys,
                         id,
-                        state_file.key_gen,
+                        &state_file,
                         state_file.wrap_seq,
-                        &agora_agentkit::envelope::EncryptionPublicKey::from(&encryption),
+                        &encryption,
                         &signing,
-                    )
-                    .context("wrapping the state key")?,
-            };
-            guard
-                .post_state_key(id, &signing, &record)
-                .await
-                .map_err(anyhow::Error::msg)
-                .context("posting the state key record")?;
+                        &held,
+                    )?,
+                };
+                guard
+                    .post_state_key(id, &signing, &record)
+                    .await
+                    .map_err(anyhow::Error::msg)
+                    .context("posting the state key record")?;
+                record
+            }
+        };
+        // state_key.json names the wrap on Agora
+        if record.wrap_seq != state_file.wrap_seq {
+            self.keys
+                .write_state_key(
+                    id,
+                    &super::keys::StateKeyFile::new(
+                        &state_file.state_key().context("the state key cache")?,
+                        state_file.key_gen,
+                        record.wrap_seq,
+                    ),
+                )
+                .context("naming the posted wrap in state_key.json")?;
         }
+        // Already on Agora before this run
+        let posted = held.contains(&record);
         super::crash::point("opt_in:posted")?;
         // The agent's notice before the marker: a cut between them is
         // finished by a rerun, which writes it again
@@ -1271,22 +1292,6 @@ impl Enroller {
             posted: !posted,
             held_by_agora,
         })
-    }
-
-    // B4: the rotation's file name; B4's constant replaces this one
-    /// The signed state-key record a rotation of a never-uploaded agent
-    /// leaves in `<secrets>/<id>/state_key.wrap.json`, if any.
-    fn wrap_record(
-        &self,
-        id: AgentId,
-    ) -> anyhow::Result<Option<agora_agentkit::state::StateKeyRecord>> {
-        match std::fs::read(self.keys.agent_dir(id).join("state_key.wrap.json")) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
-                anyhow::anyhow!("state_key.wrap.json isn't a record ({:?})", e.classify())
-            })?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
     }
 
     /// The outbox entries Agora already holds (the same entry hash), filed
@@ -2355,6 +2360,45 @@ pub(crate) mod tests {
                 .unwrap()
                 .expose()
         );
+    }
+
+    /// A never-uploaded agent whose encryption key was rotated keeps its
+    /// re-wrap here (`state_key.wrap.json`, named by `state_key.json`); its
+    /// opt-in posts those bytes, not a wrap made afresh. One rule
+    /// (`keys::wrap_usable`) says which wrap may stand, for both.
+    #[tokio::test]
+    async fn opt_in_posts_the_wrap_a_local_rotation_kept() {
+        let root = crate::sealed::TestDir::new("opt-in-rotated");
+        let api = fake::guarded(&root);
+        let (id, keys, dir) = agent(&root, &["a", "b"]).await;
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        let rotated =
+            crate::sealed::rotate::rotate_keys(&root.join("state"), &keys, &api, id, false, true)
+                .await
+                .unwrap();
+        assert!(rotated.wrap_kept_local);
+        let kept = keys.wrap_record(id).unwrap().unwrap();
+        assert_eq!(
+            keys.state_key_file(id).unwrap().unwrap().wrap_seq,
+            kept.wrap_seq
+        );
+        let calls = api.calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("post") || c == "rotate_key"),
+            "nothing sent while local: {calls:?}"
+        );
+        answer(&dir, SealChoice::Private);
+        let done = e.opt_in(&api, id, None).await.unwrap();
+        assert!(done.posted);
+        assert_eq!(
+            *api.keys.lock().unwrap(),
+            vec![kept.clone()],
+            "the kept bytes"
+        );
+        assert_eq!(keys.wrap_record(id).unwrap().unwrap(), kept);
     }
 
     /// An opt-in against a latest `decline` needs the override with a note,

@@ -705,25 +705,23 @@ async fn rewrap(
     signing: &SigningKey,
     reach: Reach,
 ) -> anyhow::Result<bool> {
-    use agora_agentkit::state::crypto::StateKey;
     let local_only = !reach.on_agora();
     let state_key = file.state_key()?;
-    let to = super::keys::x25519_public_hex(secret);
-    let public = agora_agentkit::envelope::EncryptionPublicKey::from(secret);
     // An earlier attempt's: the same key, to this X25519 key, signed by
     // this signing key, at or past the current wrap
-    let kept = keys.wrap_record(id)?.filter(|r| {
-        r.agent_id == id
-            && r.key_gen == file.key_gen
-            && r.wrap_seq >= file.wrap_seq
-            && r.wrapped_to_pub == to
-            && r.verify(&signing.verifying_key())
-            && StateKey::unwrap(r, secret).is_ok_and(|k| k.expose() == state_key.expose())
-    });
+    let kept = super::keys::kept_wrap(
+        keys,
+        id,
+        file,
+        file.wrap_seq,
+        secret,
+        &signing.verifying_key(),
+    )?;
     let record = match kept {
         Some(r) => r,
         None => {
-            // Past whatever Agora holds of this generation
+            // Past the current wrap and whatever Agora holds of this
+            // generation
             let held = if local_only {
                 Vec::new()
             } else {
@@ -732,20 +730,8 @@ async fn rewrap(
                     .map_err(anyhow::Error::msg)
                     .context("reading the agent's state key records on Agora")?
             };
-            let seq = held
-                .iter()
-                .filter(|r| r.agent_id == id && r.key_gen == file.key_gen)
-                .map(|r| r.wrap_seq)
-                .chain([file.wrap_seq])
-                .max()
-                .unwrap_or(file.wrap_seq)
-                + 1;
-            let r = state_key
-                .wrap(id, file.key_gen, seq, &public, signing)
-                .context("re-wrapping the state key")?;
-            keys.write_wrap_record(id, &r)
-                .context("keeping the re-wrap before posting it")?;
-            r
+            super::keys::new_wrap(keys, id, file, file.wrap_seq + 1, secret, signing, &held)
+                .context("re-wrapping the state key")?
         }
     };
     super::crash::point("rotate:wrap_kept")?;

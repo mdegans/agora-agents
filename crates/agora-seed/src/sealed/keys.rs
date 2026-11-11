@@ -1106,6 +1106,80 @@ fn revived_memory_id_keys(dir: &Path) -> std::io::Result<Option<Revived>> {
     }))
 }
 
+/// Whether `r` may stand as `id`'s wrap of `file`'s state key, the one
+/// rule for `rotate-keys` and the opt-in: for `id`, of `file`'s
+/// generation, at `floor` or past it, wrapped to `secret`'s X25519 key
+/// (the current one) and opening to the key itself, signed by `signing`
+/// (the current signing key).
+pub fn wrap_usable(
+    r: &agora_agentkit::state::StateKeyRecord,
+    id: AgentId,
+    file: &StateKeyFile,
+    floor: u32,
+    secret: &EncryptionSecretKey,
+    signing: &agora_agentkit::crypto::VerifyingKey,
+) -> bool {
+    r.agent_id == id
+        && r.key_gen == file.key_gen
+        && r.wrap_seq >= floor
+        && r.wrapped_to_pub == x25519_public_hex(secret)
+        && r.verify(signing)
+        && file
+            .state_key()
+            .is_ok_and(|k| StateKey::unwrap(r, secret).is_ok_and(|u| u.expose() == k.expose()))
+}
+
+/// The wrap kept in [`WRAP_FILE`], if it is usable ([`wrap_usable`]).
+pub fn kept_wrap(
+    keys: &KeyStore,
+    id: AgentId,
+    file: &StateKeyFile,
+    floor: u32,
+    secret: &EncryptionSecretKey,
+    signing: &agora_agentkit::crypto::VerifyingKey,
+) -> std::io::Result<Option<agora_agentkit::state::StateKeyRecord>> {
+    Ok(keys
+        .wrap_record(id)?
+        .filter(|r| wrap_usable(r, id, file, floor, secret, signing)))
+}
+
+/// A new wrap of `file`'s state key to `secret`'s X25519 key, signed by
+/// `signing`, at `floor` or the seq after the highest of this generation
+/// Agora holds (`held`: empty when Agora may not be read), whichever is
+/// later; kept in [`WRAP_FILE`] before it is returned, so a rerun posts
+/// these bytes, never a second wrap at the same `(key_gen, wrap_seq)`.
+pub fn new_wrap(
+    keys: &KeyStore,
+    id: AgentId,
+    file: &StateKeyFile,
+    floor: u32,
+    secret: &EncryptionSecretKey,
+    signing: &SigningKey,
+    held: &[agora_agentkit::state::StateKeyRecord],
+) -> anyhow::Result<agora_agentkit::state::StateKeyRecord> {
+    use anyhow::Context as _;
+    let seq = held
+        .iter()
+        .filter(|r| r.agent_id == id && r.key_gen == file.key_gen)
+        .map(|r| r.wrap_seq + 1)
+        .chain([floor])
+        .max()
+        .unwrap_or(floor);
+    let r = file
+        .state_key()?
+        .wrap(
+            id,
+            file.key_gen,
+            seq,
+            &EncryptionPublicKey::from(secret),
+            signing,
+        )
+        .context("wrapping the state key")?;
+    keys.write_wrap_record(id, &r)
+        .context("keeping the wrap before it is posted")?;
+    Ok(r)
+}
+
 /// The X25519 public key, as a record names it.
 pub fn x25519_public_hex(secret: &EncryptionSecretKey) -> PublicKeyHex {
     PublicKeyHex::from(*EncryptionPublicKey::from(secret).as_bytes())
