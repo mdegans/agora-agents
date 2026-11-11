@@ -1572,17 +1572,26 @@ struct RefusedAgent {
 /// The start check refused agents, so the run doesn't start: `main` exits
 /// [`sealed::REFUSED_RUN_EXIT`] once the alerts are flushed.
 #[derive(Debug)]
-struct RefusedRun(usize);
+struct RefusedRun {
+    count: usize,
+    /// The runner's own records that refused it (the roster, strays),
+    /// each saying what resolves it.
+    records: Vec<String>,
+}
 
 impl std::fmt::Display for RefusedRun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "refusing to run: the sealed-state start check refused {} agent(s) or record(s); \
-             resolve each with `agora-seed sealed-restore --agent <id>` or `agora-seed \
+             resolve each agent with `agora-seed sealed-restore --agent <id>` or `agora-seed \
              sealed-accept --agent <id> --note \"…\"`",
-            self.0
-        )
+            self.count
+        )?;
+        for r in &self.records {
+            write!(f, "; {r}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1764,7 +1773,11 @@ fn refuse_run(run: &SealedRun, alerts: &alerts::Alerter) -> Result<()> {
         }
         alerts.notify(alert);
     }
-    Err(RefusedRun(agents.len() + run.server_faults.len() + run.fleet.len()).into())
+    Err(RefusedRun {
+        count: agents.len() + run.server_faults.len() + run.fleet.len(),
+        records: run.fleet.clone(),
+    }
+    .into())
 }
 
 /// What the run says when Agora's copy of agents' histories failed
@@ -2081,7 +2094,10 @@ async fn sealed_start_check(
         );
         run.fleet.push(format!(
             "{} agent(s) with a state key but no chained state, and {} with a state but no \
-             chain, though a roster was kept before: their sealed/ may be gone with it",
+             chain, though a roster was kept before: if they were never chained (the first \
+             start of this runner, before the fleet's enrolment), chain them with `agora-seed \
+             sealed-enroll` (the runner stopped), then start again; otherwise their sealed/ \
+             may be gone with the roster: put it back from a backup",
             leftover.len(),
             scan.unchained.len()
         ));
@@ -3659,6 +3675,90 @@ mod tests {
                 "nothing asked of Agora"
             );
         }
+    }
+
+    /// The deploy order: once a roster has been kept, three or more agents
+    /// with a state but no chain refuse the run, and the refusal names
+    /// `sealed-enroll`, which is not blocked by it: the fleet's enrolment
+    /// chains them, and the next start runs.
+    #[tokio::test]
+    async fn unchained_agents_beside_a_kept_roster_refuse_until_sealed_enroll() {
+        let root = sealed::TestDir::new("main-deploy-order");
+        let state_dir = root.join("state");
+        let (chained, keys, _) = sealed::enroll::tests::agent(&root, &["a"]).await;
+        sealed::enroll::tests::enroller(&root, &keys)
+            .chain(chained, false)
+            .await
+            .unwrap();
+        let api = sealed::api::fake::guarded(&root);
+        let start = async |ids: &[AgentId]| {
+            let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+                .await
+                .unwrap();
+            let mut pool: Vec<_> = ids
+                .iter()
+                .map(|id| (*id, crate::agent_selection_tests::pooled("tarn").1))
+                .collect();
+            let run = sealed_start_check(
+                &mut pool,
+                &loaded.sealed,
+                &root,
+                &state_dir,
+                &keys,
+                &api,
+                &alerts::Alerter::off(),
+                false,
+                &mut Vec::new(),
+                None,
+                None,
+            )
+            .await;
+            refuse_run(&run, &alerts::Alerter::off())
+        };
+        // The first start on this build: the roster begins
+        start(&[chained]).await.unwrap();
+        assert!(std::fs::exists(root.join(sealed::roster::ROSTER)).unwrap());
+        // Three agents with a state and no chain
+        let mut unchained = Vec::new();
+        for _ in 0..3 {
+            unchained.push(sealed::enroll::tests::agent(&root, &["b"]).await.0);
+        }
+        let all: Vec<AgentId> = std::iter::once(chained).chain(unchained.clone()).collect();
+        let e = start(&all).await.unwrap_err();
+        assert!(e.is::<RefusedRun>());
+        let text = e.to_string();
+        assert!(
+            text.contains("3 with a state but no chain")
+                && text.contains("chain them with `agora-seed sealed-enroll`"),
+            "{text}"
+        );
+        // The fleet's enrolment is not blocked by the refusal it cures
+        sealed::cli::run(
+            sealed::cli::Command::SealedEnroll {
+                agents: Vec::new(),
+                opt_in: false,
+                dry_run: false,
+                jobs: Some(2),
+                note: None,
+                resume: false,
+                against_answer: false,
+            },
+            &root,
+            url::Url::parse("http://127.0.0.1:9").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        for id in &unchained {
+            assert!(sealed::is_enrolled(&state_dir.join(id.to_string())));
+        }
+        start(&all).await.unwrap();
+        let roster = sealed::roster::load(&root).unwrap().unwrap();
+        assert_eq!(roster.agents.len(), 4);
+        assert!(
+            api.calls.lock().unwrap().is_empty(),
+            "nothing asked of Agora"
+        );
     }
 
     /// The sealed start check: an intact agent runs with its lines, a
