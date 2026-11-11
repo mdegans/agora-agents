@@ -28,8 +28,10 @@
 //! refuses the run.
 //!
 //! **First run.** With neither file, every directory that is chained
-//! (agentkit's `AgentSeal::is_enrolled`) and has a readable head is
-//! adopted; nothing else is. A directory with a `state.json` that is
+//! (agentkit's `AgentSeal::is_enrolled`) and has a readable head and a
+//! `state.json` is adopted; nothing else is (a chained directory without a
+//! state is a forgotten agent's, or a loss `missing_states` finds by its
+//! keys). A directory with a `state.json` that is
 //! neither chained nor on the roster is counted for one alert a run
 //! ([`Scan::unchained`]), never enrolled from here.
 //!
@@ -492,22 +494,44 @@ pub async fn vouch_all(data_dir: &Path, vouches: &[(AgentId, Vouch)]) -> Result<
 /// inside the roster's lock ([`record_heads`]), so once `head.json` is
 /// lowered it can't raise the roster again, and this sets it.
 ///
-/// B5 calls it: `sealed-accept` (`accept` and `rebase`) and
-/// `sealed-restore` with `Some(<the head written>)` after `head.json` is
-/// written; `sealed-forget` with `None` after the state key is set aside.
-#[allow(dead_code)] // B5: accept, restore and forget call it once they act
+/// Called by `sealed-accept` (`accept`, `rebase`, a loss resolved,
+/// `--keep`) and `sealed-restore` (a version, or a cut save) with the head
+/// written, after `head.json` is; by `sealed-forget` with `None`.
 pub async fn replace(
     data_dir: &Path,
     id: AgentId,
     head: Option<HeadRef>,
 ) -> Result<(), RosterError> {
     let _lock = lock(data_dir).await?;
-    let (mut roster, _) = load_or_begin(data_dir)?;
+    let (mut roster, first) = load_or_begin(data_dir)?;
     match head {
         Some(head) => roster.agents.insert(id, Entry::of(head)),
+        // No roster yet: nothing to take it off, and none begun for it (a
+        // first start still adopts every chained agent)
+        None if first => return Ok(()),
         None => roster.agents.remove(&id),
     };
     save(data_dir, &mut roster)
+}
+
+/// [`replace`] for an operator's command, which knows the state directory
+/// (`<data_dir>/state`): the roster is beside it. A failure is the
+/// command's: the head is written, and the next start would refuse it.
+pub async fn replace_for(
+    state_dir: &Path,
+    id: AgentId,
+    head: Option<HeadRef>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let data_dir = state_dir
+        .parent()
+        .context("the state directory has no parent data directory")?;
+    replace(data_dir, id, head).await.with_context(|| {
+        format!(
+            "recording agent {id}'s head in the sealed roster (its head is written; run the \
+             command again, or the next start refuses it as rolled back)"
+        )
+    })
 }
 
 /// The agent directories under `state_dir`, by id.
@@ -632,7 +656,12 @@ pub async fn check(data_dir: &Path, state_dir: &Path) -> Result<Scan, RosterErro
         }
         let Some(entry) = roster.agents.get(&id).copied() else {
             match found {
-                Found::Head { head, .. } => {
+                // Adopted only with its state: a chained directory left
+                // without one is a forgotten agent's (`sealed-forget` took
+                // it off) or a loss the start check finds by its keys
+                // (`missing_states`); adopted, the next start would refuse
+                // it as missing
+                Found::Head { head, state: true } => {
                     roster.merge(id, head);
                     scan.added.push(id);
                     changed = true;

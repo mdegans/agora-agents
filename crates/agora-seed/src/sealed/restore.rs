@@ -310,8 +310,7 @@ async fn restore_cut_save(
     }
     super::crash::point("restore:cut_sealed")?;
     let head = seal.head().await?.context("head.json vanished")?.head;
-    // B2/B5: roster::replace(data_dir, id, Some(head)) here, once the roster
-    // merges
+    super::roster::replace_for(state_dir, id, Some(head)).await?;
     drop(lock);
     tracing::warn!(
         event_type = "sealed_state_cut_save_restored",
@@ -942,9 +941,9 @@ pub async fn restore_with(
     if refused && seal.is_refused().await? {
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
-    // B2/B5: roster::replace(data_dir, id, Some(last.head.head)) here, and the
-    // notice's RestoredFrom::Local for a local restore, once the roster
-    // merges
+    // The roster takes the head restored, whatever it held (head.json is
+    // written above)
+    super::roster::replace_for(state_dir, id, Some(last.head.head)).await?;
     drop(lock);
     let head = last.head.head;
     tracing::warn!(

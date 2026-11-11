@@ -262,8 +262,10 @@ pub async fn accept(
             .await
             .context("writing the enrolment marker")?;
     }
-    // B2/B5: roster::replace(data_dir, id, Some(head)) here, once the roster
-    // merges (also for a RolledBack refusal accepted with nothing changed)
+    // The roster takes the head written, whatever it held: an accept of a
+    // rolled-back agent sets it lower on purpose (head.json first, then
+    // the roster: the runner's keeper reads heads from disk)
+    super::roster::replace_for(state_dir, id, Some(head)).await?;
     drop(lock);
     tracing::warn!(
         event_type = "sealed_state_accepted",
@@ -293,6 +295,25 @@ pub struct Rebased {
     pub set_aside: usize,
 }
 
+/// Tests: [`rebase_locked`] as `sealed-accept --rebase` runs it, under
+/// the runner lock held to its end.
+#[cfg(test)]
+pub async fn rebase(
+    state_dir: &Path,
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    id: AgentId,
+    note: &str,
+) -> anyhow::Result<Rebased> {
+    // Before anything is read or written: no runner on this data dir (it
+    // could be saving), held to the end
+    let data_dir = state_dir
+        .parent()
+        .context("the state directory has no parent data directory")?;
+    let _runner = super::session::runner_exclusive(data_dir)?;
+    rebase_locked(state_dir, keys, api, id, note).await
+}
+
 /// Resolve a held fork (v1 has no merges), or versions Agora lost (a held
 /// LocalMissing): the current state is sealed as a keyframe child of
 /// Agora's head, which is first verified with the runner's own trust. For
@@ -300,7 +321,10 @@ pub struct Rebased {
 /// `.displaced`; for a loss, see [`super::lost`] (and, Agora holding
 /// nothing, a new chain whose genesis records the break). A refusal is
 /// cleared first. The agent's next session is told, with `note`.
-pub async fn rebase(
+///
+/// The runner lock (`runner.lock`, exclusive) is the caller's:
+/// `sealed-accept` takes it before the start pass, held to its end.
+pub async fn rebase_locked(
     state_dir: &Path,
     keys: &KeyStore,
     api: &dyn SealedApi,
@@ -316,14 +340,8 @@ pub async fn rebase(
          to join it to. A fork in the chain kept here is resolved with `sealed-accept --agent \
          {id} --keep <head|ord> --note \"…\"`; nothing was changed"
     );
-    // Before anything is read or written: no runner on this data dir (it
-    // could be saving), held to the end, and no session in progress. The
-    // start check below takes the agent's sealed/lock itself, so that lock
-    // is taken after it
-    let data_dir = state_dir
-        .parent()
-        .context("the state directory has no parent data directory")?;
-    let _runner = super::session::runner_exclusive(data_dir)?;
+    // No session in progress. The start check below takes the agent's
+    // sealed/lock itself, so that lock is taken after it
     super::session::no_session(state_dir, id, true)?;
     let agent_dir = state_dir.join(id.to_string());
     anyhow::ensure!(
@@ -457,8 +475,7 @@ pub async fn rebase(
         .context("sealing the current state on top of Agora's head")?;
     super::enroll::record_sizes(&agent_dir, head, Utc::now(), &current);
     Notice::joined(&agent_dir, note).context("writing the notice")?;
-    // B2/B5: roster::replace(data_dir, id, Some(head)) here, once the roster
-    // merges
+    super::roster::replace_for(state_dir, id, Some(head)).await?;
     drop(lock);
     let onto = HeadRef {
         entry_hash: server_head.entry_hash(),
@@ -497,8 +514,10 @@ async fn finish_lost(
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
     super::enroll::record_sizes(agent_dir, head, Utc::now(), current);
-    // B2/B5: roster::replace(data_dir, id, Some(head)) here, once the roster
-    // merges
+    let state_dir = agent_dir
+        .parent()
+        .context("the agent directory has no parent state directory")?;
+    super::roster::replace_for(state_dir, id, Some(head)).await?;
     Notice::agora_lost(
         agent_dir,
         note,
@@ -826,8 +845,7 @@ pub async fn keep_line(
     )
     .context("writing the notice")?;
     super::lost::done(&dir)?;
-    // B2/B5: roster::replace(data_dir, id, Some(fork.keep)) here, once the
-    // roster merges
+    super::roster::replace_for(state_dir, id, Some(fork.keep)).await?;
     drop(lock);
     tracing::warn!(
         event_type = "sealed_state_fork_kept",
@@ -943,16 +961,6 @@ impl ManyOutcome {
     }
 }
 
-/// Why a refusal reason is never accepted wholesale: the state is missing,
-/// unreadable or from elsewhere, which `sealed-restore` answers.
-// B2: a rolled-back refusal joins these once it lands.
-fn loss_shaped(reason: Refusal) -> bool {
-    matches!(
-        reason,
-        Refusal::StateMissing | Refusal::StateUnreadable | Refusal::StateIo | Refusal::StateTooNew
-    )
-}
-
 /// One agent, measured: its refusal, and the memory and soul sizes of its
 /// last sealed version against the state here.
 async fn preview(state_dir: &Path, keys: &KeyStore, api: &dyn SealedApi, id: AgentId) -> Preview {
@@ -1028,9 +1036,12 @@ pub async fn accept_many(
         let p = preview(state_dir, keys, api, id).await;
         let hold = match p.reason {
             None => None,
-            Some(r) if loss_shaped(r) => {
-                Some("loss-shaped refusal: restore it (sealed-restore), never accept it")
-            }
+            // Never wholesale: the state or its head's record gone,
+            // unreadable or put back (the start check's own classification)
+            Some(r) if r.loss_shaped() => Some(
+                "loss-shaped refusal: resolve it on its own (sealed-restore, or sealed-accept \
+                 --agent), never in a wide accept",
+            ),
             Some(_) if p.shrunk() && !options.accept_shrunk => Some(
                 "its memory shrank by more than half since its last sealed version (or can't \
                  be measured): --accept-shrunk accepts it",
@@ -1809,6 +1820,71 @@ mod tests {
             let res = crate::sealed::lost::resolutions(&AgentSeal::new(&dir, id)).unwrap();
             assert_eq!(res.len(), 1, "{point}: one resolution");
         }
+    }
+
+    /// An older copy of an agent's directory put back: the roster refuses
+    /// it as rolled back. `sealed-accept --note` keeps the older state on
+    /// purpose, its new head below the roster's: the roster takes that
+    /// head, so the next start finds no loss. A wide accept holds a
+    /// rolled-back refusal back, as every loss-shaped one.
+    #[tokio::test]
+    async fn an_accept_that_lowers_the_head_is_not_refused_at_the_next_start() {
+        let root = crate::sealed::TestDir::new("accept-rolled-back");
+        let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+        let state_dir = root.join("state");
+        let seal = AgentSeal::new(&dir, id);
+        let head = seal.head().await.unwrap().unwrap().head;
+        // The roster saw five more versions than the copy put back holds
+        let ahead = HeadRef {
+            seq: head.seq + 5,
+            ..head
+        };
+        crate::sealed::roster::record(&root, id, ahead)
+            .await
+            .unwrap();
+        let scan = crate::sealed::roster::check(&root, &state_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            scan.losses.get(&id).map(|l| l.refusal()),
+            Some(Refusal::RolledBack)
+        );
+        seal.refuse(Refusal::RolledBack.as_str()).await.unwrap();
+        // A wide accept holds it back, dry or not
+        let api = crate::sealed::api::fake::guarded(&root);
+        let many = accept_many(
+            &state_dir,
+            &keys,
+            &api,
+            &[id],
+            ManyOptions {
+                note: "n",
+                expect: Some(1),
+                dry_run: false,
+                accept_shrunk: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(many[0].2, ManyOutcome::Held(_)), "{:?}", many[0]);
+        assert!(seal.is_refused().await.unwrap());
+        // Accepted on its own: a head below the roster's
+        let done = accept(&state_dir, &keys, &api, id, Some("the older copy is kept"))
+            .await
+            .unwrap();
+        assert!(done.head.seq < ahead.seq, "{:?}", done.head);
+        let roster = crate::sealed::roster::load(&root).unwrap().unwrap();
+        assert_eq!(roster.agents[&id].seq, done.head.seq);
+        assert_eq!(roster.agents[&id].entry_hash, done.head.entry_hash);
+        let scan = crate::sealed::roster::check(&root, &state_dir)
+            .await
+            .unwrap();
+        assert!(scan.losses.is_empty(), "{:?}", scan.losses);
+        assert!(!scan.refused.contains(&id));
+        assert!(
+            api.calls.lock().unwrap().is_empty(),
+            "nothing asked of Agora"
+        );
     }
 
     /// `--agents-file`: a dry run touches nothing and says what it would

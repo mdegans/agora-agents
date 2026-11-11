@@ -104,8 +104,9 @@ fn finish(keys: &KeyStore, id: AgentId, dir: &Path, plan: &Forgotten) -> anyhow:
     Ok(())
 }
 
-/// The newest committed forget whose planned moves aren't all done.
-fn cut_forget(dir: &Path) -> anyhow::Result<Option<(String, Forgotten)>> {
+/// The newest committed forget whose planned moves aren't all done, or
+/// (`on_roster`) whose agent the roster still holds.
+fn cut_forget(dir: &Path, on_roster: bool) -> anyhow::Result<Option<(String, Forgotten)>> {
     let Some(stamp) = FORGOTTEN_STATE_KEY.stamps(dir)?.pop() else {
         return Ok(None);
     };
@@ -122,13 +123,22 @@ fn cut_forget(dir: &Path) -> anyhow::Result<Option<(String, Forgotten)>> {
             None => false,
         })
     };
-    let unfinished = pending(MEMORY_ID_KEY_FILE, &plan.memory_id_key)?
+    let unfinished = on_roster
+        || pending(MEMORY_ID_KEY_FILE, &plan.memory_id_key)?
         || pending(super::stop::DURABLE, &plan.stop)?
         || pending(super::uploading::DURABLE, &plan.uploading)?;
     Ok(unfinished.then_some((stamp, plan)))
 }
 
-pub fn forget(
+/// Whether the sealed roster beside `state_dir` holds `id`.
+fn on_roster(state_dir: &Path, id: AgentId) -> anyhow::Result<bool> {
+    let data_dir = state_dir
+        .parent()
+        .context("the state directory has no parent data directory")?;
+    Ok(super::roster::load(data_dir)?.is_some_and(|r| r.agents.contains_key(&id)))
+}
+
+pub async fn forget(
     state_dir: &Path,
     keys: &KeyStore,
     id: AgentId,
@@ -144,13 +154,14 @@ pub fn forget(
     let key = dir.join(STATE_KEY_FILE);
     if !std::fs::exists(&key)? {
         // A forget cut after its commit: finished under its own stamp
-        let Some((stamp, plan)) = cut_forget(&dir)? else {
+        let Some((stamp, plan)) = cut_forget(&dir, on_roster(state_dir, id)?)? else {
             anyhow::bail!(
                 "agent {id} has no state key in the secrets directory; nothing to forget"
             );
         };
         let index = super::history_index::remove(&state_dir.join(id.to_string()))
             .context("deleting the search index")?;
+        super::roster::replace_for(state_dir, id, None).await?;
         finish(keys, id, &dir, &plan)?;
         tracing::warn!(
             event_type = "sealed_state_forgotten",
@@ -196,7 +207,9 @@ pub fn forget(
     let key_to = FORGOTTEN_STATE_KEY.name(&stamp);
     std::fs::rename(&key, dir.join(&key_to)).context("setting the state key aside")?;
     super::crash::point("forget:committed")?;
-    // B2/B5: roster::replace(data_dir, id, None) here, once the roster merges
+    // Off the roster, which lowers its witness's count first: the one way
+    // an agent leaves it
+    super::roster::replace_for(state_dir, id, None).await?;
     finish(keys, id, &dir, &plan)?;
     tracing::warn!(
         event_type = "sealed_state_forgotten",
@@ -226,13 +239,14 @@ mod tests {
         let (id, keys, dir) = enrolled(&root).await;
         let state_dir = root.join("state");
         let e = forget(&state_dir, &keys, id, "it left")
+            .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("sealed-stop"), "{e}");
         std::fs::rename(&dir, root.join("gone")).unwrap();
-        assert!(forget(&state_dir, &keys, id, " ").is_err(), "a note");
+        assert!(forget(&state_dir, &keys, id, " ").await.is_err(), "a note");
         assert_eq!(keys.with_state_keys().unwrap(), vec![id]);
-        let done = forget(&state_dir, &keys, id, "it left").unwrap();
+        let done = forget(&state_dir, &keys, id, "it left").await.unwrap();
         assert!(keys.with_state_keys().unwrap().is_empty());
         let kept: Vec<String> = std::fs::read_dir(keys.agent_dir(id))
             .unwrap()
@@ -262,6 +276,86 @@ mod tests {
         );
     }
 
+    /// An agent on the roster whose state is gone is refused at the start
+    /// (marked `sealed/refused`). Forgotten, it leaves the roster, the
+    /// witness's count follows, and its leftover marker no longer counts
+    /// toward the refusal threshold: the next start finds nothing. A rerun
+    /// cut after the commit but before the roster takes it off too.
+    #[tokio::test]
+    async fn forget_takes_the_agent_off_the_roster_and_its_marker_stops_counting() {
+        for cut in [false, true] {
+            let root = crate::sealed::TestDir::new("forget-roster");
+            let (id, keys, dir) = enrolled(&root).await;
+            let (other, _, _) = enrolled(&root).await;
+            let state_dir = root.join("state");
+            let scan = crate::sealed::roster::check(&root, &state_dir)
+                .await
+                .unwrap();
+            assert!(scan.first && scan.on_roster.contains(&id) && scan.on_roster.contains(&other));
+            let witness = || {
+                crate::sealed::roster::Witness::load(&root)
+                    .unwrap()
+                    .unwrap()
+                    .agents
+            };
+            assert_eq!(witness(), 2);
+            // The state lost: refused, marked, at the next start
+            std::fs::rename(dir.join("state.json"), root.join("gone.json")).unwrap();
+            let scan = crate::sealed::roster::check(&root, &state_dir)
+                .await
+                .unwrap();
+            assert_eq!(
+                scan.losses.get(&id).map(|l| l.refusal()),
+                Some(crate::sealed::notice::Refusal::StateMissing)
+            );
+            crate::sealed::check::mark(
+                &dir,
+                id,
+                "x",
+                crate::sealed::notice::Refusal::StateMissing,
+                "d",
+            )
+            .await;
+            assert!(std::fs::exists(dir.join("sealed/refused")).unwrap());
+            let scan = crate::sealed::roster::check(&root, &state_dir)
+                .await
+                .unwrap();
+            assert!(scan.refused.contains(&id));
+            if cut {
+                // Cut after the commit, before the roster: the rerun finishes
+                let roster = crate::sealed::roster::load(&root).unwrap().unwrap();
+                crate::sealed::crash::at("forget:committed");
+                assert!(forget(&state_dir, &keys, id, "it left").await.is_err());
+                assert_eq!(crate::sealed::roster::load(&root).unwrap().unwrap(), roster);
+            }
+            let done = forget(&state_dir, &keys, id, "it left").await.unwrap();
+            assert_eq!(done.finished_cut, cut);
+            let roster = crate::sealed::roster::load(&root).unwrap().unwrap();
+            assert!(!roster.agents.contains_key(&id) && roster.agents.contains_key(&other));
+            assert_eq!(witness(), 1, "the witness follows");
+            let scan = crate::sealed::roster::check(&root, &state_dir)
+                .await
+                .unwrap();
+            assert!(scan.losses.is_empty(), "{:?}", scan.losses);
+            assert!(
+                !scan.refused.contains(&id),
+                "the marker left behind doesn't count"
+            );
+            assert!(
+                !scan.on_roster.contains(&id),
+                "its sealed/ left behind is not adopted again"
+            );
+            let scan = crate::sealed::roster::check(&root, &state_dir)
+                .await
+                .unwrap();
+            assert!(scan.losses.is_empty() && !scan.on_roster.contains(&id));
+            assert!(std::fs::exists(dir.join("sealed/refused")).unwrap(), "kept");
+            // Nothing more to forget
+            let again = forget(&state_dir, &keys, id, "again").await;
+            assert!(again.is_err(), "cut {cut}: {again:?}");
+        }
+    }
+
     /// Forgetting deletes the search index, the one sidecar it deletes, and
     /// sets the memory-id key aside with the state key, under one stamp.
     #[tokio::test]
@@ -273,7 +367,7 @@ mod tests {
         std::fs::rename(dir.join("state.json"), root.join("gone.json")).unwrap();
         crate::sealed::history_index::write(&dir, b"{}").unwrap();
         let key = keys.memory_id_keys_or_create(id, &dir).unwrap();
-        let done = forget(&state_dir, &keys, id, "it left").unwrap();
+        let done = forget(&state_dir, &keys, id, "it left").await.unwrap();
         assert!(done.index);
         assert_eq!(crate::sealed::history_index::read(&dir).unwrap(), None);
         assert!(
@@ -309,7 +403,7 @@ mod tests {
         let secrets = keys.agent_dir(id);
         std::fs::write(secrets.join(super::super::stop::DURABLE), b"{}").unwrap();
         crate::sealed::crash::at("forget:committed");
-        let e = forget(&state_dir, &keys, id, "first").unwrap_err();
+        let e = forget(&state_dir, &keys, id, "first").await.unwrap_err();
         assert!(format!("{e:#}").contains("simulated crash"), "{e:#}");
         assert!(
             std::fs::exists(secrets.join(MEMORY_ID_KEY_FILE)).unwrap(),
@@ -317,7 +411,7 @@ mod tests {
         );
         let stamp = FORGOTTEN_STATE_KEY.stamps(&secrets).unwrap().pop().unwrap();
         let note = std::fs::read(secrets.join(FORGOTTEN_NOTE.name(&stamp))).unwrap();
-        let done = forget(&state_dir, &keys, id, "second").unwrap();
+        let done = forget(&state_dir, &keys, id, "second").await.unwrap();
         assert!(done.finished_cut);
         assert_eq!(done.key, FORGOTTEN_STATE_KEY.name(&stamp));
         assert_eq!(
@@ -332,7 +426,7 @@ mod tests {
             "the first note kept"
         );
         // Finished: nothing more to forget
-        assert!(forget(&state_dir, &keys, id, "third").is_err());
+        assert!(forget(&state_dir, &keys, id, "third").await.is_err());
     }
 
     /// Forget, the agent put back and its key revived, forget again: a new
@@ -350,7 +444,7 @@ mod tests {
             .expose();
         let secrets = keys.agent_dir(id);
         std::fs::write(secrets.join(super::super::stop::DURABLE), b"{\"n\":1}").unwrap();
-        let first = forget(&state_dir, &keys, id, "first").unwrap();
+        let first = forget(&state_dir, &keys, id, "first").await.unwrap();
         let s1 = FORGOTTEN_STATE_KEY.stamp(&first.key).unwrap().to_string();
         let record = |s: &str| {
             [
@@ -372,7 +466,7 @@ mod tests {
         assert_eq!(*revived.current.expose(), key);
         std::fs::write(secrets.join(super::super::stop::DURABLE), b"{\"n\":2}").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let second = forget(&state_dir, &keys, id, "second").unwrap();
+        let second = forget(&state_dir, &keys, id, "second").await.unwrap();
         assert!(!second.finished_cut);
         let s2 = FORGOTTEN_STATE_KEY.stamp(&second.key).unwrap().to_string();
         assert_ne!(s1, s2, "a new stamp");
@@ -415,7 +509,7 @@ mod tests {
                 }
                 let kept = root.join("kept");
                 std::fs::rename(&dir, &kept).unwrap();
-                let done = forget(&state_dir, &keys, id, "it left").unwrap();
+                let done = forget(&state_dir, &keys, id, "it left").await.unwrap();
                 let secrets = keys.agent_dir(id);
                 assert!(done.uploading.is_some(), "{case}");
                 assert_eq!(done.stop.is_some(), stopped, "{case}");

@@ -70,8 +70,6 @@ pub enum Command {
     /// (or, for a lost head.json, rebuild it from Agora's verified chain),
     /// clear the refusal, and leave the note for its next session.
     SealedAccept {
-        // B4/5: `--keep`, `--agents-file`, `--expect` (the local paths and
-        // the wide accept)
         #[arg(
             long,
             required_unless_present = "agents_file",
@@ -129,7 +127,6 @@ pub enum Command {
         /// this the restore refuses; `sealed-accept --note` keeps it.
         #[arg(long)]
         discard_local: bool,
-        // B4/5
         /// Put back the newest save cut short (a complete state.json.tmp,
         /// or one set aside as state.json.tmp.<utc>.aside, newer than the
         /// sealed head) instead of the head's version. A restore that finds
@@ -168,7 +165,6 @@ pub enum Command {
     RotateKeys {
         #[arg(long)]
         agent: AgentId,
-        // B4/5
         /// Say where an unfinished rotation stands and what blocks it;
         /// nothing written, nothing sent.
         #[arg(long, conflicts_with_all = ["signing", "encryption"])]
@@ -198,15 +194,24 @@ pub async fn run(
     // an agent that doesn't upload is sent or asked
     let api = Arc::new(super::api::guarded(client.clone(), enrolment.clone()));
     let dry_run = matches!(command, Command::SealedEnroll { dry_run: true, .. });
-    // The whole of `sealed-enroll` runs only while no runner does, taken
-    // before anything is read: a runner holding an agent's state from
-    // before its chain would save it unsealed over the chain (and be
-    // alerted). Not waited for. A dry run writes nothing and needs none.
+    // Every command that writes an agent's chain, keys or ledger runs only
+    // while no runner does, held to its end and taken before anything is
+    // read, the start pass included: a runner holding an agent's state from
+    // before its chain would save it unsealed over the chain, sign with a
+    // key retired under it, or save over a restored state. Not waited for.
+    // A dry run of `sealed-enroll` writes nothing and needs none;
+    // `sealed-stop` runs beside a runner (it only stops uploads);
+    // `rotate-keys --status` only reads.
     let _runner = match &command {
-        Command::SealedEnroll { dry_run: false, .. } | Command::SealedReoffer { .. } => {
-            Some(super::session::runner_exclusive(data_dir)?)
-        }
-        _ => None,
+        Command::SealedEnroll { dry_run: true, .. }
+        | Command::SealedStop { .. }
+        | Command::RotateKeys { status: true, .. } => None,
+        Command::SealedEnroll { .. }
+        | Command::SealedReoffer { .. }
+        | Command::SealedAccept { .. }
+        | Command::SealedRestore { .. }
+        | Command::SealedForget { .. }
+        | Command::RotateKeys { .. } => Some(super::session::runner_exclusive(data_dir)?),
     };
     if !dry_run {
         // As at a run's start, before any command reads a marker: the
@@ -277,7 +282,6 @@ pub async fn run(
                     "; a dry run, nothing is touched (--yes --expect N does it)"
                 }
             );
-            let _runner = super::session::runner_exclusive(data_dir)?;
             let done = super::accept::accept_many(
                 &state_dir,
                 &keys,
@@ -301,7 +305,6 @@ pub async fn run(
             keep: Some(keep),
             ..
         } => {
-            let _runner = super::session::runner_exclusive(data_dir)?;
             let done = super::accept::keep_line(
                 &state_dir,
                 &keys,
@@ -330,8 +333,8 @@ pub async fn run(
             rebase: true,
             ..
         } => {
-            // `rebase` takes the runner lock itself, before it reads anything
-            let done = super::accept::rebase(
+            // Under the runner lock taken above
+            let done = super::accept::rebase_locked(
                 &state_dir,
                 &keys,
                 api.as_ref(),
@@ -360,7 +363,6 @@ pub async fn run(
             note,
             ..
         } => {
-            let _runner = super::session::runner_exclusive(data_dir)?;
             let done =
                 super::accept::accept(&state_dir, &keys, api.as_ref(), agent, note.as_deref())
                     .await?;
@@ -382,7 +384,6 @@ pub async fn run(
             discard_local,
             from_cut_save,
         } => {
-            let _runner = super::session::runner_exclusive(data_dir)?;
             let done = super::restore::restore_with(
                 &state_dir,
                 &keys,
@@ -421,8 +422,7 @@ pub async fn run(
             );
         }
         Command::SealedForget { agent, note } => {
-            let _runner = super::session::runner_exclusive(data_dir)?;
-            let done = super::forget::forget(&state_dir, &keys, agent, &note)?;
+            let done = super::forget::forget(&state_dir, &keys, agent, &note).await?;
             println!(
                 "{agent}: state key set aside as {}{}{}{}; no key deleted{}",
                 done.key,
@@ -432,7 +432,6 @@ pub async fn run(
                 done.stop
                     .map(|s| format!(", its stop as {s}"))
                     .unwrap_or_default(),
-                // B4/5
                 done.uploading
                     .map(|u| format!(", its uploading marker as {u}"))
                     .unwrap_or_default(),
@@ -542,8 +541,6 @@ pub async fn run(
             encryption,
             ..
         } => {
-            // Only while no runner runs: held until the command ends
-            let _runner = super::session::runner_exclusive(data_dir)?;
             // The server takes a rotation only at its current head: upload
             // what waits first (rotate_keys refuses if anything still does)
             if super::is_enrolled(&state_dir.join(agent.to_string())) {
@@ -568,7 +565,6 @@ pub async fn run(
                 done.signing,
                 done.encryption,
                 done.rewrapped,
-                // B4/5
                 if done.wrap_kept_local {
                     " (kept here for its opt-in: nothing of it is on Agora)"
                 } else {
