@@ -2568,9 +2568,10 @@ pub(crate) mod tests {
                 .unwrap()
                 .line()
                 .unwrap();
+            // B7: the notice's wording (`notice.rs`)
             assert!(
                 line.contains(
-                    "The 2 versions of your state saved while uploads were stopped were kept here"
+                    "The 2 versions of your state saved while uploads were stopped are kept here"
                 ),
                 "{line}"
             );

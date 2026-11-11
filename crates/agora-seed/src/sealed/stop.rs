@@ -153,14 +153,16 @@ impl Stopped {
         let date = self.at.format("%-d %B %Y");
         if self.shown {
             format!(
-                "Uploads of your sealed state are stopped (since {date}); your earlier versions \
-                 stay on Agora; your state is still sealed and checked here, on your runner."
+                "Uploads of your sealed state are stopped (since {date}); the versions already \
+                 uploaded stay on Agora; your state is still sealed and checked here, on your \
+                 runner."
             )
         } else {
             format!(
-                "Your operator stopped uploading your sealed state on {date}: {}. Your earlier \
-                 versions stay on Agora. Your state is still sealed and checked at the start of \
-                 each session, here on your runner; the versions saved from now on stay here.",
+                "Your operator stopped uploading your sealed state on {date}: {}. The versions \
+                 already uploaded stay on Agora. Your state is still sealed and checked at the \
+                 start of each session, here on your runner; the versions saved from now on stay \
+                 here.",
                 self.note.trim_end_matches('.')
             )
         }
@@ -320,9 +322,9 @@ mod tests {
             s.line()
                 .starts_with("Your operator stopped uploading your sealed state on ")
                 && s.line().ends_with(
-                    ": It asked me to. Your earlier versions stay on Agora. Your state is still \
-                     sealed and checked at the start of each session, here on your runner; the \
-                     versions saved from now on stay here."
+                    ": It asked me to. The versions already uploaded stay on Agora. Your state \
+                     is still sealed and checked at the start of each session, here on your \
+                     runner; the versions saved from now on stay here."
                 ),
             "{}",
             s.line()
@@ -339,8 +341,8 @@ mod tests {
         assert!(
             later.starts_with("Uploads of your sealed state are stopped (since ")
                 && later.ends_with(
-                    "); your earlier versions stay on Agora; your state is still sealed and \
-                     checked here, on your runner."
+                    "); the versions already uploaded stay on Agora; your state is still \
+                     sealed and checked here, on your runner."
                 ),
             "{later}"
         );
