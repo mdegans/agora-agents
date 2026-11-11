@@ -12,7 +12,6 @@ use agora_agentkit::state::storage::{AgentSeal, plaintext_hash};
 use agora_agentkit::state::{AnchorData, AnchorProof};
 use proptest::prelude::*;
 
-use super::api::fake::FakeApi;
 use super::check::{self, Outcome};
 use super::notice::Refusal;
 use super::props::{History, Mode, build, version};
@@ -330,7 +329,7 @@ async fn an_accept_cut_at_any_step_is_consistent() {
             .await
             .unwrap();
         let edited = hash_of(&state_dir, b.id).await.unwrap();
-        let api = FakeApi::new();
+        let api = super::api::fake::guarded(&b.root);
         let refuse = async || {
             let out = check_at(&state_dir, &b).await;
             if let Outcome::Refuse { reason, detail } = &out {
@@ -570,9 +569,15 @@ async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
         &crate::alerts::Alerter::off(),
     )
     .await;
-    super::accept::accept(&state_dir, &b.keys, &FakeApi::new(), b.id, Some("by hand"))
-        .await
-        .unwrap();
+    super::accept::accept(
+        &state_dir,
+        &b.keys,
+        &super::api::fake::guarded(&b.root),
+        b.id,
+        Some("by hand"),
+    )
+    .await
+    .unwrap();
     let entries = check::local_entries(&b.seal()).await.unwrap();
     let mut line = entries.clone();
     line.sort_by_key(|e| e.entry.seq);

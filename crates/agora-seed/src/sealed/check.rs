@@ -1533,10 +1533,14 @@ async fn check_chain(
             (HeadStatus::Pending, Server::Unchecked)
         }
     };
-    // The drainer does the anchor work only for an agent not held, still
-    // sealing ([`super::drain::Drainer::anchor_all`])
-    let checks_later =
-        matches!(status, HeadStatus::Same | HeadStatus::Pending) && super::is_sealing(agent_dir);
+    // The drainer does the anchor work only for an agent not held that
+    // uploads ([`super::drain::Drainer::anchor_all`])
+    // B2: a non-uploader gets here only after its `chain` call was refused
+    // unsent (`api::UploadGuard`), so it reads as "Agora unchecked" and
+    // `NotJudged::Held`; the verdict must instead say nothing of it is on
+    // Agora, and make no server call at all for it.
+    let checks_later = matches!(status, HeadStatus::Same | HeadStatus::Pending)
+        && super::uploads(agent_dir, keys, id);
     // Every version on Agora (in step, nothing waiting): what the drainer
     // would judge after this session, judged before it, so the verdict
     // says what was found for the newest anchor whenever it can
@@ -1914,7 +1918,22 @@ pub(crate) mod tests {
 
     /// A synthetic enrolled agent: keys, a state, genesis and that state
     /// sealed, enrolled.
+    /// An enrolled agent that uploads (marked `uploading`, as one that said
+    /// yes and was enrolled is): genesis and one state, nothing uploaded.
     pub async fn enrolled(root: &Path) -> (AgentId, KeyStore, std::path::PathBuf) {
+        let (id, keys, dir) = enrolled_local(root).await;
+        crate::sealed::uploading::set(
+            &dir,
+            &keys,
+            id,
+            crate::sealed::uploading::UploadingBy::OptIn,
+        )
+        .unwrap();
+        (id, keys, dir)
+    }
+
+    /// An enrolled agent that doesn't upload: chained locally only.
+    pub async fn enrolled_local(root: &Path) -> (AgentId, KeyStore, std::path::PathBuf) {
         let id = AgentId::new();
         let keys = KeyStore::new(root.join("secrets"));
         keys.ring()

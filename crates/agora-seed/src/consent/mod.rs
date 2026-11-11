@@ -214,7 +214,8 @@ pub struct ConsentRuntime {
     /// The secrets tree, for each session's memory-id key and the `memory`
     /// tool's sealed history.
     pub key_store: crate::sealed::KeyStore,
-    /// What the `memory` tool fetches pruned sealed versions with: Agora.
+    /// What the `memory` tool fetches pruned sealed versions with: Agora,
+    /// behind [`crate::sealed::api::UploadGuard`].
     pub memory_api: Arc<dyn crate::sealed::api::SealedApi>,
 }
 
@@ -260,7 +261,14 @@ impl ConsentRuntime {
             sealed_state: None,
             sealed_seats: Default::default(),
             key_store: crate::sealed::KeyStore::new(data_dir.join("secrets")),
-            memory_api: Arc::new(client.clone()),
+            // Guarded: no fetch for an agent that doesn't upload
+            memory_api: Arc::new(crate::sealed::api::guarded(
+                client.clone(),
+                Arc::new(crate::sealed::SealedEnrolment::new(
+                    data_dir.join("state"),
+                    data_dir.join("secrets"),
+                )),
+            )),
             client,
         })
     }

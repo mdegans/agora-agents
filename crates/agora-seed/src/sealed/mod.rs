@@ -1,11 +1,15 @@
 //! Sealed state, the runner's side (agentkit 0.147 `state`; agora
 //! `docs/design-sealed-state.md`; the plan of 2026-11-02, "PR C").
 //!
-//! An agent that said yes to the sealed-state offer
-//! ([`crate::consent::sealed_state`]) and was enrolled by its operator
-//! (`agora-seed sealed-enroll`, [`enroll`]) has every save sealed, chained
-//! and queued for upload by agentkit's `Mirrored` storage; the [`drain`]er
-//! uploads it, away from the reactor's storage lock. Before any session,
+//! Every enrolled agent (`agora-seed sealed-enroll`, [`enroll`]) has every
+//! save sealed and chained, locally, by agentkit's `Mirrored` storage;
+//! whether the chain is also **uploaded** is a separate fact, the agent's
+//! yes to the sealed-state offer ([`crate::consent::sealed_state`]) acted
+//! on: [`uploading`], unless its operator stopped it ([`stop`]), together
+//! [`uploads`]. The [`drain`]er uploads an uploading agent's outbox, away
+//! from the reactor's storage lock; nothing of an agent that doesn't
+//! upload leaves the machine (agentkit's drain gate, and
+//! [`api::UploadGuard`] behind it). Before any session,
 //! the [`check`] compares each enrolled agent's state with its last sealed
 //! version: a state that matches nothing is **refused** (a notice kept for
 //! the agent, the operator mailed), and the **whole run** with it (exit
@@ -24,17 +28,19 @@
 //! files under `<state>/<id>/sealed/` (agentkit's layout, plus this
 //! module's `notice.json`) and the key files in `<secrets>/<id>/`
 //! ([`keys`]), plus `sealed/anchors.json`, `sealed/inclusion.json` and
-//! `sealed/published` ([`anchors`]) and `sealed/receipts.json`
-//! ([`receipts`]). The agent's `state.json` is written only by
+//! `sealed/published` ([`anchors`]), `sealed/receipts.json`
+//! ([`receipts`]), and `sealed/uploading` with its copy
+//! `<secrets>/<id>/sealed_uploading` ([`uploading`]). The agent's `state.json` is written only by
 //! `sealed-restore`, through agentkit's `FsStorage`, which renames the
 //! state it replaces to `state.<utc>.json` first. Nothing here deletes a
 //! file: what is superseded is renamed aside.
 //!
-//! **Who is sealed.** An agent is sealed exactly when its
-//! `sealed/enrolled` marker exists ([`SealedEnrolment`]); the
-//! `[sealed_state]` table only decides who is asked. Turning it off must
-//! not stop the seal, or an enrolled agent's next session would start from
-//! a state the seal never saw, and be refused.
+//! **Who is sealed.** An agent is sealed (chained) exactly when its
+//! `sealed/enrolled` marker exists, stopped or not; it uploads exactly
+//! when [`uploads`] says so. The `[sealed_state]` table only decides who is
+//! asked. Turning it off must not stop the seal, or an enrolled agent's
+//! next session would start from a state the seal never saw, and be
+//! refused.
 
 pub mod accept;
 pub mod anchors;
@@ -62,6 +68,7 @@ pub mod rotate;
 pub mod session;
 pub mod sizes;
 pub mod stop;
+pub mod uploading;
 pub mod version;
 
 use std::path::{Path, PathBuf};
@@ -121,87 +128,34 @@ pub type MirroredStorage = Mirrored<
 >;
 
 /// The storage every reactor of a run saves through: agentkit's
-/// [`Mirrored`] for every agent but one whose backups its operator stopped
-/// ([`stop`]), which is loaded and saved plainly (FsStorage, format 1): no
-/// seal, no failed seal recorded, no base.
-pub struct SealedStorage {
-    mirrored: MirroredStorage,
-    plain: agora_agentkit::reactor::FsStorage,
+/// [`Mirrored`], for every agent. An enrolled agent is chained whether or
+/// not it uploads, stopped or not; [`SealedEnrolment::uploads`] decides
+/// only whether its outbox is drained.
+pub fn storage(
+    state_dir: impl Into<PathBuf>,
+    outbox: AgoraOutbox<SealedEnrolment>,
+    enrolment: std::sync::Arc<SealedEnrolment>,
+) -> MirroredStorage {
+    Mirrored::new(
+        agora_agentkit::reactor::FsStorage::new(state_dir.into()),
+        outbox,
+        enrolment,
+    )
 }
 
-impl SealedStorage {
-    pub fn new(
-        state_dir: impl Into<PathBuf>,
-        outbox: AgoraOutbox<SealedEnrolment>,
-        enrolment: std::sync::Arc<SealedEnrolment>,
-    ) -> Self {
-        let state_dir = state_dir.into();
-        Self {
-            mirrored: Mirrored::new(
-                agora_agentkit::reactor::FsStorage::new(&state_dir),
-                outbox,
-                enrolment,
-            ),
-            plain: agora_agentkit::reactor::FsStorage::new(&state_dir),
-        }
-    }
-
-    fn stopped(&self, id: AgentId) -> bool {
-        stop::is_stopped(&self.plain.agent_dir(id))
-    }
+/// Whether the agent's chain is uploaded to Agora: marked uploading
+/// ([`uploading`], which fails closed) and not stopped by its operator
+/// ([`stop`], in either copy). Nothing of an agent for which this is false
+/// may leave the machine: the drain ([`SealedEnrolment`]) and the API
+/// ([`api::UploadGuard`]) both ask it.
+pub fn uploads(agent_dir: &Path, keys: &KeyStore, id: AgentId) -> bool {
+    !stop::is_stopped(agent_dir)
+        && !stop::durable(keys, id).map_or(true, |d| d.is_some())
+        && uploading::is_uploading(agent_dir, keys, id)
 }
 
-#[async_trait::async_trait]
-impl agora_agentkit::reactor::Storage for SealedStorage {
-    type Error = agora_agentkit::state::storage::MirroredError<
-        agora_agentkit::reactor::storage::FsStorageError,
-    >;
-    type Version = agora_agentkit::state::verify::HeadRef;
-
-    async fn save_raw(
-        &mut self,
-        id: AgentId,
-        value: serde_json::Value,
-        base: Option<&Self::Version>,
-    ) -> Result<Option<Self::Version>, Self::Error> {
-        if self.stopped(id) {
-            self.plain
-                .save_raw(id, value, None)
-                .await
-                .map_err(agora_agentkit::state::storage::MirroredError::Local)?;
-            return Ok(None);
-        }
-        self.mirrored.save_raw(id, value, base).await
-    }
-
-    async fn load_raw(
-        &self,
-        id: AgentId,
-    ) -> Result<agora_agentkit::reactor::Loaded<serde_json::Value, Self::Version>, Self::Error>
-    {
-        if self.stopped(id) {
-            let loaded = self
-                .plain
-                .load_raw(id)
-                .await
-                .map_err(agora_agentkit::state::storage::MirroredError::Local)?;
-            return Ok(agora_agentkit::reactor::Loaded {
-                value: loaded.value,
-                base: None,
-            });
-        }
-        self.mirrored.load_raw(id).await
-    }
-}
-
-/// Whether new versions of the agent in `agent_dir` are sealed: enrolled
-/// and not stopped.
-pub fn is_sealing(agent_dir: &Path) -> bool {
-    is_enrolled(agent_dir) && !stop::is_stopped(agent_dir)
-}
-
-/// The runner's say on who is sealed: enrolled agents, with the keys in
-/// its own secrets tree.
+/// The runner's say on who uploads ([`uploads`]), with the keys in its
+/// own secrets tree. Who is chained is `sealed/enrolled`'s alone.
 #[derive(Debug, Clone)]
 pub struct SealedEnrolment {
     state_dir: PathBuf,
@@ -255,12 +209,13 @@ pub fn enrolled_by_keys_or_marker(agent_dir: &Path, secrets_dir: &Path, id: Agen
 }
 
 impl Enrolment for SealedEnrolment {
-    /// Enrolled. `sealed-enroll` enrols only agents whose sealed-state
-    /// ledger says yes, so this is the opt-in, as acted on.
-    fn opted_in(&self, id: AgentId) -> bool {
-        is_sealing(&self.state_dir.join(id.to_string()))
+    /// [`uploads`]: gates agentkit's outbox wake and drain only.
+    fn uploads(&self, id: AgentId) -> bool {
+        uploads(&self.state_dir.join(id.to_string()), &self.keys, id)
     }
 
+    /// For every chained agent, uploading or not: the local chain is
+    /// signed and sealed with them.
     fn keys(&self, id: AgentId) -> Option<SealKeys> {
         self.keys.seal_keys(id)
     }

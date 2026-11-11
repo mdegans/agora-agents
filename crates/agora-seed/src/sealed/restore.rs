@@ -735,32 +735,36 @@ mod tests {
             .unwrap();
         assert!(done.stopped);
         assert!(crate::sealed::stop::is_stopped(&dir));
-        assert!(!crate::sealed::is_sealing(&dir));
+        // Still marked uploading (by the secrets copy), but stopped
+        assert!(crate::sealed::uploading::is_uploading(&dir, &keys, id));
+        assert!(!crate::sealed::uploads(&dir, &keys, id));
         let stopped = crate::sealed::stop::Stopped::load(&dir).unwrap().unwrap();
         assert_eq!(stopped.note, "It asked");
-        // A save goes plainly: nothing sealed, nothing to upload
-        let mut storage = crate::sealed::SealedStorage::new(
+        // A save is chained, locally: it waits in the outbox, and the
+        // drain sends nothing of it
+        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
             &state_dir,
-            agora_agentkit::state::outbox::AgoraOutbox::new(
-                agora_agentkit::client::Client::new("http://127.0.0.1:9".parse().unwrap()).unwrap(),
-                &state_dir,
-                std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
-                    &state_dir,
-                    root.join("secrets"),
-                )),
-            ),
-            std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
-                &state_dir,
-                root.join("secrets"),
-            )),
+            root.join("secrets"),
+        ));
+        let outbox = agora_agentkit::state::outbox::AgoraOutbox::new(
+            agora_agentkit::client::Client::new("http://127.0.0.1:9".parse().unwrap()).unwrap(),
+            &state_dir,
+            enrolment.clone(),
         );
-        storage
-            .save_raw(id, serde_json::json!({ "memory": "after" }), None)
+        let mut storage = crate::sealed::storage(&state_dir, outbox.clone(), enrolment);
+        let base = storage.load_raw(id).await.unwrap().base;
+        let saved = storage
+            .save_raw(id, serde_json::json!({ "memory": "after" }), base.as_ref())
             .await
+            .unwrap()
             .unwrap();
         let seal = AgentSeal::new(&dir, id);
-        assert!(seal.outbox().await.unwrap().is_empty(), "nothing sealed");
-        assert_eq!(seal.head().await.unwrap().unwrap().head, done.head);
+        assert_eq!(seal.outbox().await.unwrap().len(), 1, "chained locally");
+        assert_eq!(seal.head().await.unwrap().unwrap().head, saved);
+        assert_eq!(
+            outbox.drain(id).await.unwrap(),
+            agora_agentkit::state::outbox::Drained::LocalOnly
+        );
 
         // The start of a run puts a lost sealed/stopped back too
         std::fs::rename(dir.join("sealed/stopped"), root.join("stopped.lost")).unwrap();

@@ -3,6 +3,12 @@
 //! before the runner exits. Never inside a save: agentkit's `Mirrored`
 //! only queues, under the reactor's storage lock.
 //!
+//! An agent that doesn't upload ([`super::uploads`]: never said yes, or
+//! stopped) is chained but never drained: agentkit's drain answers
+//! [`Drained::LocalOnly`] without reading or sending anything, and the
+//! drainer records [`DrainOutcome::LocalOnly`] for it: no receipts, no
+//! anchor work, no hold, no alert, however long its outbox grows.
+//!
 //! An agent the start check held (a fork, a missing head, a failed seal)
 //! is not drained. One the server answers with a head that moved on is
 //! held for the rest of the run ([`AlertKind::SealedStateFork`] or
@@ -32,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::outbox::AgoraOutbox;
+use agora_agentkit::state::outbox::{AgoraOutbox, Drained};
 use agora_agentkit::state::storage::AgentSeal;
 use agora_agentkit::state::verify::HeadStatus;
 
@@ -65,6 +71,27 @@ pub struct Anchors {
     pub verified: VerifiedAnchors,
 }
 
+/// What the drainer's last pass came to for one agent ([`Drainer::last`]).
+/// Typed so a verdict can say which: [`Self::LocalOnly`] is "nothing of
+/// this agent is on Agora from this run", never "in step with Agora".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The agent doesn't upload: nothing read, sent or recorded.
+    LocalOnly,
+    /// No `sealed/enrolled`: no chain to send.
+    NotEnrolled,
+    /// Uploaded `uploaded`; Agora's head then `status`, `waiting` left.
+    Ran {
+        uploaded: usize,
+        status: HeadStatus,
+        waiting: usize,
+    },
+    /// Uploading was switched off mid-drain, after `uploaded`.
+    Withdrawn { uploaded: usize },
+    /// The upload failed (retried at the next wake, or held after a 422).
+    Failed,
+}
+
 pub struct Drainer {
     outbox: AgoraOutbox<SealedEnrolment>,
     /// Where the agents' directories are.
@@ -79,6 +106,8 @@ pub struct Drainer {
     /// The enrolled agents of this run, with their names.
     agents: Vec<(AgentId, String)>,
     held: Mutex<BTreeSet<AgentId>>,
+    /// Each agent's last drain, as it came out.
+    last: Mutex<HashMap<AgentId, DrainOutcome>>,
     alerts: Alerter,
     stop: tokio::sync::Notify,
 }
@@ -102,6 +131,7 @@ impl Drainer {
             anchored_at: Mutex::new(Instant::now()),
             agents,
             held: Mutex::new(held.into_iter().collect()),
+            last: Mutex::new(HashMap::new()),
             alerts,
             stop: tokio::sync::Notify::new(),
         }
@@ -124,7 +154,9 @@ impl Drainer {
                 continue;
             }
             let dir = a.state_dir.join(id.to_string());
-            if !super::is_sealing(&dir) {
+            // Nothing of a local-only agent is on Agora to judge, and no
+            // publish choice of it may be read or sent
+            if !super::uploads(&dir, &a.keys, *id) {
                 continue;
             }
             match AgentSeal::new(&dir, *id).outbox().await {
@@ -174,6 +206,18 @@ impl Drainer {
         self.held.lock().expect("held lock").contains(&id)
     }
 
+    /// What `id`'s last drain this run came to; `None` before its first,
+    /// or while it is held. For the verdict (step B2), which must say
+    /// "nothing of this is on Agora" for [`DrainOutcome::LocalOnly`].
+    #[allow(dead_code)]
+    pub fn last(&self, id: AgentId) -> Option<DrainOutcome> {
+        self.last.lock().expect("last lock").get(&id).copied()
+    }
+
+    fn record(&self, id: AgentId, outcome: DrainOutcome) {
+        self.last.lock().expect("last lock").insert(id, outcome);
+    }
+
     /// One pass over every agent not held.
     pub async fn drain_all(&self) {
         for (id, name) in &self.agents {
@@ -199,71 +243,98 @@ impl Drainer {
             .lock()
             .expect("baselines lock")
             .insert(id, baseline);
-        match drained {
-            Ok(report) => {
-                if report.uploaded > 0 {
-                    tracing::info!(
-                        event_type = "sealed_state_uploaded",
-                        agent_id = %id,
-                        uploaded = report.uploaded,
-                        waiting = report.waiting,
-                        "sealed versions uploaded"
-                    );
-                }
-                let hold = match report.status {
-                    HeadStatus::Same | HeadStatus::Pending => return,
-                    HeadStatus::LocalMissing => Hold::HeadMissing,
-                    HeadStatus::ServerAhead | HeadStatus::Diverged => Hold::Fork,
-                };
-                self.held.lock().expect("held lock").insert(id);
-                tracing::warn!(
-                    event_type = "sealed_state_held",
-                    agent_id = %id,
-                    status = ?report.status,
-                    waiting = report.waiting,
-                    "sealed uploads held for the rest of the run"
-                );
-                self.alerts
-                    .notify(hold_alert(hold, id, name, Some(&report.held)));
+        let report = match drained {
+            Ok(Drained::Ran(report)) => report,
+            Ok(Drained::LocalOnly) => {
+                tracing::debug!(agent_id = %id, "local-only: not drained");
+                return self.record(id, DrainOutcome::LocalOnly);
             }
-            // Agora refused the entry itself (e.g. `time_went_back`): a
-            // bug, never fixed by retrying. Held for the run, told
-            Err(e) if rejected(&e) => {
-                self.held.lock().expect("held lock").insert(id);
-                tracing::error!(
-                    event_type = "sealed_state_upload_rejected",
+            Ok(Drained::NotEnrolled) => return self.record(id, DrainOutcome::NotEnrolled),
+            Ok(Drained::Withdrawn { uploaded }) => {
+                tracing::info!(
+                    event_type = "sealed_state_upload_withdrawn",
                     agent_id = %id,
-                    error = %e,
-                    "Agora rejected a sealed version (422); uploads held for the rest of the run"
+                    uploaded,
+                    "uploading was switched off mid-drain; the rest stays local"
                 );
-                self.alerts.notify(
-                    Alert::new(
-                        AlertKind::SealedStateUploadFailing,
-                        format!(
-                            "{name}: Agora rejected a sealed version as malformed (422): a bug; \
+                return self.record(id, DrainOutcome::Withdrawn { uploaded });
+            }
+            Err(e) => return self.failed(id, name, e),
+        };
+        self.record(
+            id,
+            DrainOutcome::Ran {
+                uploaded: report.uploaded,
+                status: report.status,
+                waiting: report.waiting,
+            },
+        );
+        if report.uploaded > 0 {
+            tracing::info!(
+                event_type = "sealed_state_uploaded",
+                agent_id = %id,
+                uploaded = report.uploaded,
+                waiting = report.waiting,
+                "sealed versions uploaded"
+            );
+        }
+        let hold = match report.status {
+            HeadStatus::Same | HeadStatus::Pending => return,
+            HeadStatus::LocalMissing => Hold::HeadMissing,
+            HeadStatus::ServerAhead | HeadStatus::Diverged => Hold::Fork,
+        };
+        self.held.lock().expect("held lock").insert(id);
+        tracing::warn!(
+            event_type = "sealed_state_held",
+            agent_id = %id,
+            status = ?report.status,
+            waiting = report.waiting,
+            "sealed uploads held for the rest of the run"
+        );
+        self.alerts
+            .notify(hold_alert(hold, id, name, Some(&report.held)));
+    }
+
+    /// A drain that failed: held for the run after a 422, else retried at
+    /// the next wake; alerted either way.
+    fn failed(&self, id: AgentId, name: &str, e: agora_agentkit::state::outbox::DrainError) {
+        self.record(id, DrainOutcome::Failed);
+        // Agora refused the entry itself (e.g. `time_went_back`): a bug,
+        // never fixed by retrying. Held for the run, told
+        if rejected(&e) {
+            self.held.lock().expect("held lock").insert(id);
+            tracing::error!(
+                event_type = "sealed_state_upload_rejected",
+                agent_id = %id,
+                error = %e,
+                "Agora rejected a sealed version (422); uploads held for the rest of the run"
+            );
+            self.alerts.notify(
+                Alert::new(
+                    AlertKind::SealedStateUploadFailing,
+                    format!(
+                        "{name}: Agora rejected a sealed version as malformed (422): a bug; \
                              uploads held for this run"
-                        ),
-                    )
-                    .agent(name, id)
-                    .detail("error", e),
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    event_type = "sealed_state_upload_failing",
-                    agent_id = %id,
-                    error = %e,
-                    "sealed upload failed; retried at the next wake"
-                );
-                self.alerts.notify(
-                    Alert::new(
-                        AlertKind::SealedStateUploadFailing,
-                        format!("{name}: sealed versions could not be uploaded"),
-                    )
-                    .agent(name, id)
-                    .detail("error", e),
-                );
-            }
+                    ),
+                )
+                .agent(name, id)
+                .detail("error", e),
+            );
+        } else {
+            tracing::warn!(
+                event_type = "sealed_state_upload_failing",
+                agent_id = %id,
+                error = %e,
+                "sealed upload failed; retried at the next wake"
+            );
+            self.alerts.notify(
+                Alert::new(
+                    AlertKind::SealedStateUploadFailing,
+                    format!("{name}: sealed versions could not be uploaded"),
+                )
+                .agent(name, id)
+                .detail("error", e),
+            );
         }
     }
 

@@ -1,20 +1,31 @@
 //! `agora-seed sealed-stop --agent <id> --note "<why>"`: an operator stops
-//! an agent's sealed backups, at the agent's request (the offer tells it to
-//! ask its operator).
+//! uploading an agent's sealed state, at the agent's request (the offer
+//! tells it to ask its operator).
+//!
+//! **Stop means stop uploading** (agora
+//! `memory/project_local_chain_for_all.md`, 2026-11-11). The chain and the
+//! start check go on: every save is still sealed and chained locally
+//! (agentkit's `Mirrored`, as for any enrolled agent), and checked before
+//! each session; only the upload stops ([`super::uploads`] is false while
+//! stopped, so nothing of it is drained or asked of Agora).
 //!
 //! Under the session guard and the agent's `sealed/lock`, after a drain so
 //! nothing waiting is lost (refused if anything still waits): writes
-//! `sealed/stopped` (`{at, note, shown}`, local; the note is shown to the
-//! agent, not uploaded in v1). `enrolled`, `head.json`, the outbox and the
-//! whole history stay. From then on nothing is sealed for the agent and no
-//! failed seal is recorded ([`super::SealedStorage`] saves it plainly, as
-//! FsStorage format 1), and the start check leaves it alone but for a line
-//! under "## Your Sealed State".
+//! `sealed/stopped` (`{at, note, shown, chained}`, local; the note is shown
+//! to the agent, not uploaded in v1), and its durable copy in the secrets
+//! tree first. `enrolled`, `uploading`, `head.json`, the outbox and the
+//! whole history stay.
 //!
-//! `sealed-enroll --agent` on a stopped agent resumes the same chain
-//! ([`super::enroll`]): the current state sealed as the next snapshot,
-//! `stopped` set aside, the state marked format 2 again. Never a new
-//! genesis.
+//! `sealed-enroll --agent` on a stopped agent resumes the uploads on the
+//! same chain ([`super::enroll`]). The versions saved while stopped are
+//! the agent's and stay local, set aside from the uploaded line, unless
+//! the agent asks for them to go up: until that is built (steps B3/B5 of
+//! the plan), a resume is refused while any of them waits.
+//!
+//! **A stop from before the chain went on while stopped** (`chained:
+//! false`): its saves were written plainly, unsealed. [`catch_up`] seals
+//! the state it left as the next local version, once, at the next start,
+//! so the start check finds it intact.
 
 use std::path::{Path, PathBuf};
 
@@ -40,15 +51,19 @@ pub struct Stopped {
     /// The first session after the stop has shown the note.
     #[serde(default)]
     pub shown: bool,
+    /// The chain goes on while stopped. `false`: a stop written before it
+    /// did, whose saves went plainly until [`catch_up`].
+    #[serde(default)]
+    pub chained: bool,
 }
 
 fn path(agent_dir: &Path) -> PathBuf {
     agent_dir.join(SEALED_DIR).join(STOPPED)
 }
 
-/// Whether the agent's backups are stopped. A marker that can't be checked
-/// counts as stopped: sealing an agent that asked to stop is the worse
-/// mistake.
+/// Whether the agent's uploads are stopped. A marker that can't be checked
+/// counts as stopped: uploading for an agent that asked to stop is the
+/// worse mistake.
 pub fn is_stopped(agent_dir: &Path) -> bool {
     std::fs::exists(path(agent_dir)).unwrap_or(true)
 }
@@ -58,13 +73,7 @@ fn write(agent_dir: &Path, stopped: &Stopped) -> std::io::Result<()> {
 }
 
 fn write_at(path: &Path, stopped: &Stopped) -> std::io::Result<()> {
-    let dir = path.parent().expect("in a directory");
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(stopped)?)?;
-    std::fs::File::open(&tmp)?.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    std::fs::File::open(dir)?.sync_all()
+    super::write_private(path, &serde_json::to_vec_pretty(stopped)?)
 }
 
 /// The stop as kept in the secrets tree, if any.
@@ -144,14 +153,14 @@ impl Stopped {
         let date = self.at.format("%-d %B %Y");
         if self.shown {
             format!(
-                "Your sealed backups are stopped (since {date}); your earlier versions stay on \
-                 Agora; your state isn't checked while stopped."
+                "Uploads of your sealed state are stopped (since {date}); your earlier versions \
+                 stay on Agora; your state is still sealed and checked here, on your runner."
             )
         } else {
             format!(
-                "Your sealed backups were stopped by your operator on {date}: {}. Your earlier \
-                 versions stay on Agora. While stopped, your state isn't checked at the start of \
-                 sessions.",
+                "Your operator stopped uploading your sealed state on {date}: {}. Your earlier \
+                 versions stay on Agora. Your state is still sealed and checked at the start of \
+                 each session, here on your runner; the versions saved from now on stay here.",
                 self.note.trim_end_matches('.')
             )
         }
@@ -179,11 +188,118 @@ impl Stopped {
     }
 }
 
+/// What [`catch_up`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaughtUp {
+    /// Not a stop from before the chain went on while stopped.
+    NotNeeded,
+    /// The state was its head's: only the stop marked `chained`.
+    Marked,
+    /// The state left by the plain saves sealed as the next local version.
+    Sealed(agora_agentkit::state::verify::HeadRef),
+}
+
+/// A stop from before the chain went on while stopped (`chained: false`):
+/// its saves were plain, so the state may be one the chain never saw, which
+/// the start check would refuse as a mismatch. Under the session guard and
+/// the agent's lock, the state is sealed as the next version on the head
+/// (local: the agent is stopped, so nothing of it uploads), then the stop
+/// marked `chained` (the secrets copy first). Once per agent. The agent was
+/// told its state wasn't checked while stopped; from here it is. A refused
+/// agent, or one with no head, is left as it is, for the start check.
+pub async fn catch_up(
+    state_dir: &Path,
+    keys: &super::KeyStore,
+    id: AgentId,
+) -> anyhow::Result<CaughtUp> {
+    let agent_dir = state_dir.join(id.to_string());
+    let Some(mut stopped) = Stopped::load(&agent_dir)? else {
+        return Ok(CaughtUp::NotNeeded);
+    };
+    if stopped.chained || !super::is_enrolled(&agent_dir) {
+        return Ok(CaughtUp::NotNeeded);
+    }
+    let seal = AgentSeal::new(&agent_dir, id);
+    let lock = super::session::take(state_dir, id, false).await?;
+    anyhow::ensure!(
+        !seal.is_refused().await?,
+        "agent {id} is refused; the start check and sealed-accept resolve it"
+    );
+    let head = seal
+        .head()
+        .await?
+        .context("sealed/head.json is missing; the start check refuses it")?;
+    let current = agora_agentkit::reactor::FsStorage::new(state_dir)
+        .load_raw(id)
+        .await
+        .context("the agent's state won't load")?
+        .value;
+    let done = if head.plaintext_sha256
+        == Some(agora_agentkit::state::storage::plaintext_hash(&current))
+    {
+        CaughtUp::Marked
+    } else {
+        let sealing = keys.seal_keys(id).context("sealing keys for the agent")?;
+        let new = super::session::append(
+            &seal,
+            &lock,
+            &sealing,
+            &agora_agentkit::state::codec::KeyframePolicy::default(),
+            agora_agentkit::enums::StateEntryKind::Snapshot,
+            &current,
+            Utc::now(),
+        )
+        .await
+        .context("sealing the state left by the plain saves")?;
+        CaughtUp::Sealed(new)
+    };
+    stopped.chained = true;
+    // The durable copy first, as for the stop itself
+    if durable(keys, id)?.is_some() {
+        write_at(&keys.agent_dir(id).join(DURABLE), &stopped)?;
+    }
+    write(&agent_dir, &stopped)?;
+    drop(lock);
+    tracing::warn!(
+        event_type = "sealed_state_stop_caught_up",
+        agent_id = %id,
+        sealed = matches!(done, CaughtUp::Sealed(_)),
+        "a stop from before the chain went on while stopped: its state sealed locally; the chain \
+         goes on from here"
+    );
+    Ok(done)
+}
+
+/// [`catch_up`] for every stopped agent here: at the start of a run,
+/// before states load. One that can't be caught up now (a session in
+/// progress, a refusal) is logged and tried again at the next start.
+pub async fn catch_up_all(state_dir: &Path, keys: &super::KeyStore) {
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return;
+    };
+    let mut ids: Vec<AgentId> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str()?.parse::<AgentId>().ok())
+        .filter(|id| std::fs::exists(path(&state_dir.join(id.to_string()))).unwrap_or(false))
+        .collect();
+    ids.sort();
+    for id in ids {
+        if let Err(e) = catch_up(state_dir, keys, id).await {
+            tracing::error!(
+                event_type = "sealed_state_stop_catch_up_failed",
+                agent_id = %id,
+                error = %e,
+                "a stop from before the local chain couldn't be caught up; tried again next start"
+            );
+        }
+    }
+}
+
 /// Upload what waits, under no lock (the drain takes the agent's lock
 /// itself). The command then checks, under the lock, that nothing waits.
 pub type Drain = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
 
-/// Stop `id`'s sealed backups. `drain` uploads what waits first.
+/// Stop uploading `id`'s sealed state. `drain` uploads what waits first.
 pub async fn stop(
     state_dir: &Path,
     keys: &super::KeyStore,
@@ -201,7 +317,12 @@ pub async fn stop(
     );
     anyhow::ensure!(
         !is_stopped(&agent_dir),
-        "agent {id}'s backups are already stopped"
+        "agent {id}'s uploads are already stopped"
+    );
+    anyhow::ensure!(
+        super::uploading::is_uploading(&agent_dir, keys, id),
+        "agent {id} doesn't upload its sealed state (no uploading marker, or one in doubt): \
+         nothing to stop; its chain is kept locally either way"
     );
     super::session::no_session(state_dir, id, false)?;
     // Never a way around sealed-accept: a refused agent, a save that went
@@ -245,6 +366,7 @@ pub async fn stop(
         at: Utc::now(),
         note: note.to_string(),
         shown: false,
+        chained: true,
     };
     // The durable copy first: a stop must never be lost with sealed/
     write_at(&keys.agent_dir(id).join(DURABLE), &stopped)
@@ -254,7 +376,7 @@ pub async fn stop(
     tracing::warn!(
         event_type = "sealed_state_stopped",
         agent_id = %id,
-        "the operator stopped an agent's sealed backups; its history stays"
+        "the operator stopped an agent's sealed uploads; its history stays, and its chain goes on locally"
     );
     Ok(stopped)
 }
@@ -302,12 +424,19 @@ mod tests {
         assert!(is_stopped(&dir));
         assert!(seal.is_enrolled().await.unwrap() && seal.head().await.unwrap().is_some());
         assert!(!seal.sent().await.unwrap().is_empty());
+        assert!(s.chained, "the chain goes on while stopped");
         assert!(
             s.line()
-                .contains(": It asked me to. Your earlier versions stay on Agora. While stopped, your state isn't checked at the start of sessions."),
+                .starts_with("Your operator stopped uploading your sealed state on ")
+                && s.line().ends_with(
+                    ": It asked me to. Your earlier versions stay on Agora. Your state is still \
+                     sealed and checked at the start of each session, here on your runner; the \
+                     versions saved from now on stay here."
+                ),
             "{}",
             s.line()
         );
+        assert!(!super::super::uploads(&dir, &keys, id), "no longer uploads");
         assert!(
             stop(&state_dir, &keys, id, "again", drained())
                 .await
@@ -317,10 +446,10 @@ mod tests {
         Stopped::mark_shown(&dir).unwrap();
         let later = Stopped::load(&dir).unwrap().unwrap().line();
         assert!(
-            later.starts_with("Your sealed backups are stopped (since ")
+            later.starts_with("Uploads of your sealed state are stopped (since ")
                 && later.ends_with(
-                    "); your earlier versions stay on Agora; your state isn't checked while \
-                     stopped."
+                    "); your earlier versions stay on Agora; your state is still sealed and \
+                     checked here, on your runner."
                 ),
             "{later}"
         );

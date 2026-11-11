@@ -328,6 +328,17 @@ impl Enroller {
             seal.head().await?.is_some(),
             "agent {id} is stopped but its sealed/head.json is missing: nothing to resume onto"
         );
+        // B3/B5: the versions saved while stopped are chained locally and
+        // wait in the outbox. They stay local, set aside from the uploaded
+        // line (`rebase_onto`), unless the agent asks; until that is built,
+        // a resume that would upload them is refused.
+        let waiting = seal.outbox().await?.len();
+        anyhow::ensure!(
+            waiting == 0,
+            "agent {id} has {waiting} version(s) saved while its uploads were stopped; resuming \
+             now would upload them, and they stay local unless the agent asks. Resuming over \
+             them is not built yet (steps B3/B5 of the local-chain plan); nothing was changed"
+        );
         let keys = self
             .keys
             .seal_keys(id)
@@ -1173,10 +1184,85 @@ mod tests {
         assert!(keys.state_key_file(id).unwrap().is_none());
     }
 
-    /// A stopped agent: saved plainly, nothing sealed, no failed seal; then
-    /// resumed on the same chain, with no second genesis.
+    /// A stopped agent: still chained locally, nothing uploaded; a resume
+    /// that would upload what was saved while stopped is refused (B3/B5).
     #[tokio::test]
-    async fn a_stopped_agent_is_saved_plainly_then_resumed_on_its_chain() {
+    async fn a_stopped_agent_is_chained_and_a_resume_over_its_saves_is_refused() {
+        let root = crate::sealed::TestDir::new("stop-chained");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        let before = super::super::check::local_entries(&seal).await.unwrap();
+        crate::sealed::stop::stop(
+            &state_dir,
+            &keys,
+            id,
+            "asked to",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        // The run's storage: sealed and chained, nothing to upload
+        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::with_keys(
+            &state_dir,
+            keys.clone(),
+        ));
+        let outbox = agora_agentkit::state::outbox::AgoraOutbox::new(
+            agora_agentkit::client::Client::new(url::Url::parse("http://127.0.0.1:9").unwrap())
+                .unwrap(),
+            &state_dir,
+            enrolment.clone(),
+        );
+        let mut storage = crate::sealed::storage(&state_dir, outbox.clone(), enrolment);
+        let base = storage.load_raw(id).await.unwrap().base;
+        assert!(base.is_some(), "loaded on its head");
+        let saved = storage
+            .save_raw(id, state("tarn", "while stopped"), base.as_ref())
+            .await
+            .unwrap();
+        assert!(saved.is_some(), "sealed");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            raw["format"],
+            agora_agentkit::reactor::storage::SEALED_FORMAT
+        );
+        let after = super::super::check::local_entries(&seal).await.unwrap();
+        assert_eq!(after.len(), before.len() + 1, "chained");
+        assert_eq!(&after[..before.len()], &before[..]);
+        assert!(seal.seal_failed().await.unwrap().is_none());
+        assert_eq!(seal.outbox().await.unwrap().len(), 1);
+        assert_eq!(
+            outbox.drain(id).await.unwrap(),
+            agora_agentkit::state::outbox::Drained::LocalOnly
+        );
+
+        let enroller = Enroller {
+            state_dir: state_dir.clone(),
+            keys: keys.clone(),
+            api: std::sync::Arc::new(FakeApi::new()),
+            restore: None,
+        };
+        assert!(enroller.enroll(id, true).await.unwrap().resumed);
+        let e = enroller
+            .enroll_with(id, false, Some("n"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("saved while its uploads were stopped"), "{e}");
+        assert!(e.contains("B3/B5"), "{e}");
+        assert!(crate::sealed::stop::is_stopped(&dir), "still stopped");
+        assert_eq!(seal.outbox().await.unwrap().len(), 1, "nothing changed");
+    }
+
+    /// A stopped agent with nothing saved while stopped, its state changed
+    /// outside the store: resumed on the same chain with a note, no second
+    /// genesis.
+    #[tokio::test]
+    async fn a_stopped_agent_is_resumed_on_its_chain() {
         let root = crate::sealed::TestDir::new("stop-resume");
         let (id, keys, dir) = crate::sealed::check::tests::enrolled(&root).await;
         let state_dir = root.join("state");
@@ -1194,40 +1280,11 @@ mod tests {
         )
         .await
         .unwrap();
-        // The run's storage: a plain save, format 1, nothing sealed
-        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::with_keys(
-            &state_dir,
-            keys.clone(),
-        ));
-        let outbox = agora_agentkit::state::outbox::AgoraOutbox::new(
-            agora_agentkit::client::Client::new(url::Url::parse("http://127.0.0.1:9").unwrap())
-                .unwrap(),
-            &state_dir,
-            enrolment.clone(),
-        );
-        let mut storage = crate::sealed::SealedStorage::new(&state_dir, outbox, enrolment);
-        let loaded = storage.load_raw(id).await.unwrap();
-        assert_eq!(loaded.base, None);
-        assert_eq!(
-            storage
-                .save_raw(id, state("tarn", "while stopped"), None)
-                .await
-                .unwrap(),
-            None
-        );
-        let raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
-        assert_eq!(raw["format"], 1);
-        assert_eq!(
-            super::super::check::local_entries(&seal).await.unwrap(),
-            before
-        );
-        assert!(
-            seal.seal_failed().await.unwrap().is_none(),
-            "no failed seal recorded"
-        );
-
-        // Resumed: the next snapshot on the same chain, marked again
+        // Changed outside the store (by hand): nothing chained
+        FsStorage::new(&state_dir)
+            .save_raw(id, state("tarn", "edited"), None)
+            .await
+            .unwrap();
         let enroller = Enroller {
             state_dir: state_dir.clone(),
             keys: keys.clone(),

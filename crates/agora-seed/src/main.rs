@@ -820,8 +820,9 @@ struct LoadedStates<V> {
     states: Vec<(AgentId, SeedState)>,
     /// Each agent's base, for `Reactor::with_bases`.
     bases: BTreeMap<AgentId, V>,
-    /// Enrolled agents: their state's plaintext hash and sizes, for the
-    /// start check ([`sealed::check`]). Never their content.
+    /// Enrolled agents (stopped ones too): their state's plaintext hash
+    /// and sizes, for the start check ([`sealed::check`]). Never their
+    /// content.
     sealed: BTreeMap<AgentId, (agora_agentkit::govlog::Sha256Hex, sealed::sizes::Sizes)>,
     skipped: Vec<Skipped>,
 }
@@ -861,7 +862,8 @@ async fn load_states<S: Storage>(
                 continue;
             }
         };
-        if sealed::is_sealing(&state_dir.join(id.to_string())) {
+        // Every enrolled agent is checked, uploading or not, stopped or not
+        if sealed::is_enrolled(&state_dir.join(id.to_string())) {
             out.sealed.insert(
                 id,
                 (
@@ -1787,7 +1789,9 @@ async fn sealed_start_check(
     verified: Option<&sealed::anchors::VerifiedAnchors>,
 ) -> SealedRun {
     let mut run = SealedRun::default();
-    // Stopped by the operator: not checked, not held, not alerted; told
+    // Stopped by the operator: uploads stopped, but checked like any other
+    // enrolled agent below; the stop's line is seated before the verdict
+    let mut stop_lines: BTreeMap<AgentId, (String, bool)> = BTreeMap::new();
     for (id, _) in pool.iter() {
         let dir = state_dir.join(id.to_string());
         if !sealed::is_enrolled(&dir) || !sealed::stop::is_stopped(&dir) {
@@ -1795,6 +1799,8 @@ async fn sealed_start_check(
         }
         match sealed::stop::Stopped::load(&dir) {
             Ok(Some(stopped)) => {
+                stop_lines.insert(*id, (stopped.line(), !stopped.shown));
+                // A dry run checks nothing: the line alone, as before
                 run.seats.insert(
                     *id,
                     consent::SealedSeat {
@@ -1912,11 +1918,18 @@ async fn sealed_start_check(
                         .detail("rotations", n),
                     );
                 }
+                // B2: the verdict of an agent that doesn't upload says
+                // "Agora unchecked" (its calls are refused unsent); it must
+                // say nothing of it is on Agora instead.
+                let (lines, stop_note) = match stop_lines.remove(id) {
+                    Some((line, first)) => (std::iter::once(line).chain(seat).collect(), first),
+                    None => (seat, false),
+                };
                 run.seats.insert(
                     *id,
                     consent::SealedSeat {
-                        stop_note: false,
-                        lines: seat,
+                        stop_note,
+                        lines,
                         notice,
                         anchors_told: told,
                     },
@@ -2295,16 +2308,24 @@ async fn run(held: &mut Held) -> Result<()> {
         &state_dir,
         data_dir.join("secrets"),
     ));
-    let sealed_api = agora_agentkit::client::Client::new(server_url.clone())?;
+    let sealed_client = agora_agentkit::client::Client::new(server_url.clone())?;
     let outbox = agora_agentkit::state::outbox::AgoraOutbox::new(
-        sealed_api.clone(),
+        sealed_client.clone(),
         &state_dir,
         enrolment.clone(),
     );
-    // A stop kept in the secrets tree stands for a lost sealed/stopped. A
-    // dry run writes nothing
+    // Every per-agent sealed-state call of the run: nothing of an agent
+    // that doesn't upload is sent or asked (`sealed::api::UploadGuard`)
+    let sealed_api = Arc::new(sealed::api::guarded(sealed_client, enrolment.clone()));
+    // A stop or an uploading marker kept in the secrets tree stands for a
+    // lost local copy; the agents that uploaded before the uploading
+    // marker existed are marked (once); a stop from before the chain went
+    // on while stopped is caught up. A dry run writes nothing
     if !args.dry_run {
         sealed::stop::reconcile_all(&state_dir, enrolment.keys_store());
+        sealed::uploading::reconcile_all(&state_dir, enrolment.keys_store());
+        sealed::uploading::migrate_all(&state_dir, enrolment.keys_store());
+        sealed::stop::catch_up_all(&state_dir, enrolment.keys_store()).await;
     }
     let loaded = if args.dry_run {
         let plain = load_states(&FsStorage::new(&state_dir), &state_dir).await?;
@@ -2315,7 +2336,7 @@ async fn run(held: &mut Held) -> Result<()> {
             skipped: plain.skipped,
         }
     } else {
-        let storage = sealed::SealedStorage::new(&state_dir, outbox.clone(), enrolment.clone());
+        let storage = sealed::storage(&state_dir, outbox.clone(), enrolment.clone());
         load_states(&storage, &state_dir).await?
     };
     let LoadedStates {
@@ -2351,7 +2372,7 @@ async fn run(held: &mut Held) -> Result<()> {
         &enrolled,
         &state_dir,
         enrolment.keys_store(),
-        &sealed_api,
+        sealed_api.as_ref(),
         &held.alerts,
         args.dry_run,
         &mut skipped,
@@ -2667,7 +2688,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 Some((id, *bases.get(&id)?))
             })
             .collect();
-        let storage = sealed::SealedStorage::new(&state_dir, outbox.clone(), enrolment.clone());
+        let storage = sealed::storage(&state_dir, outbox.clone(), enrolment.clone());
         let mut reactor: Reactor<_, _, SeedRunAgent> = Reactor::new(inference, storage, agents)
             .with_bases(cohort_bases)
             .with_stop(stop.clone());
@@ -2721,8 +2742,14 @@ async fn run(held: &mut Held) -> Result<()> {
     // Before any session saves: a version committed after this is this
     // process's own, and its upload times are recorded
     // (sealed::receipts)
-    let drain_baselines =
-        sealed::receipts::baselines(&state_dir, sealed_run.drained.iter().map(|(id, _)| *id)).await;
+    // Only for agents that upload: a local-only agent gets no receipts
+    let drain_baselines = sealed::receipts::baselines(
+        &state_dir,
+        sealed_run.drained.iter().map(|(id, _)| *id).filter(|id| {
+            sealed::uploads(&state_dir.join(id.to_string()), enrolment.keys_store(), *id)
+        }),
+    )
+    .await;
     // Uploads, away from the reactors' storage lock: during the run, and
     // once more before exit
     let drainer = Arc::new(
@@ -2735,7 +2762,7 @@ async fn run(held: &mut Held) -> Result<()> {
             held.alerts.clone(),
         )
         .with_anchors(sealed::drain::Anchors {
-            api: Arc::new(sealed_api.clone()),
+            api: sealed_api.clone(),
             keys: enrolment.keys_store().clone(),
             state_dir: state_dir.clone(),
             verified: verified_anchors,
@@ -2962,10 +2989,11 @@ mod tests {
         assert!(s.contains(&format!("unsaved {id}: ")), "{s}");
     }
 
-    /// A stopped agent is not checked, held or refused: it is told, the
-    /// note once, then a short line.
+    /// A stopped agent is checked like any enrolled agent (its chain goes
+    /// on locally), never asked of Agora, and told: the note once, then a
+    /// short line, before its verdict.
     #[tokio::test]
-    async fn a_stopped_agent_is_told_and_not_checked() {
+    async fn a_stopped_agent_is_told_and_still_checked() {
         let root = sealed::TestDir::new("main-stopped");
         let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
         let state_dir = root.join("state");
@@ -2985,11 +3013,14 @@ mod tests {
         let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
             .await
             .unwrap();
-        assert!(loaded.sealed.is_empty(), "not measured for a check");
+        assert!(loaded.sealed.contains_key(&id), "measured for the check");
         let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
         let mut pool = vec![(id, tarn)];
         let mut skipped = Vec::new();
-        let api = sealed::api::fake::FakeApi::new();
+        let api = sealed::api::UploadGuard::new(
+            sealed::api::fake::FakeApi::new(),
+            Arc::new(sealed::SealedEnrolment::with_keys(&state_dir, keys.clone())),
+        );
         let run = sealed_start_check(
             &mut pool,
             &loaded.sealed,
@@ -3002,15 +3033,27 @@ mod tests {
             None,
         )
         .await;
+        assert!(
+            api.inner().calls.lock().unwrap().is_empty(),
+            "nothing asked of Agora"
+        );
         assert_eq!(pool.len(), 1);
-        assert!(skipped.is_empty() && run.held.is_empty() && run.drained.is_empty());
+        assert!(skipped.is_empty() && run.held.is_empty() && run.refused.is_empty());
+        assert_eq!(run.drained, vec![(id, "tarn".to_string())], "checked");
         let seat = &run.seats[&id];
         assert!(seat.stop_note);
+        assert_eq!(
+            seat.lines.len(),
+            2,
+            "the stop, then the verdict: {:?}",
+            seat.lines
+        );
         assert!(
-            seat.lines[0].starts_with("Your sealed backups were stopped by your operator on ")
+            seat.lines[0].starts_with("Your operator stopped uploading your sealed state on ")
                 && seat.lines[0].ends_with(
-                    ": It asked. Your earlier versions stay on Agora. While stopped, your state \
-                     isn't checked at the start of sessions."
+                    ": It asked. Your earlier versions stay on Agora. Your state is still sealed \
+                     and checked at the start of each session, here on your runner; the \
+                     versions saved from now on stay here."
                 ),
             "{:?}",
             seat.lines
@@ -3029,7 +3072,35 @@ mod tests {
         )
         .await;
         assert!(!run.seats[&id].stop_note);
-        assert!(run.seats[&id].lines[0].starts_with("Your sealed backups are stopped (since "));
+        assert!(
+            run.seats[&id].lines[0].starts_with("Uploads of your sealed state are stopped (since ")
+        );
+        // A state changed by hand while stopped is refused, as anyone's
+        FsStorage::new(&state_dir)
+            .save_raw(id, serde_json::json!({ "memory": "by hand" }), None)
+            .await
+            .unwrap();
+        let changed = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let run = sealed_start_check(
+            &mut pool,
+            &changed.sealed,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            false,
+            &mut skipped,
+            None,
+        )
+        .await;
+        assert_eq!(
+            run.refused.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(),
+            vec![(id, sealed::notice::Refusal::Mismatch)]
+        );
+        assert!(pool.is_empty());
+        assert!(api.inner().calls.lock().unwrap().is_empty());
     }
 
     /// The sealed start check: an intact agent runs with its lines, a

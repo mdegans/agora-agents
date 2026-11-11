@@ -298,6 +298,336 @@ impl SealedApi for Client {
     }
 }
 
+/// How an error string from [`UploadGuard`] begins: the call was for an
+/// agent that doesn't upload, and was never sent ([`LocalOnly`]).
+pub const LOCAL_ONLY: &str = "local only: ";
+
+/// Whether an error string from a [`SealedApi`] call is [`UploadGuard`]'s
+/// refusal: nothing was sent. For the local paths of the steps after B1
+/// (check, accept, restore), which tell a refusal from a server's error.
+#[allow(dead_code)]
+pub fn is_local_only(error: &str) -> bool {
+    error.starts_with(LOCAL_ONLY)
+}
+
+/// A per-agent [`SealedApi`] call, as [`UploadGuard`] judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Call {
+    Chain,
+    StateKeys,
+    PostStateKey,
+    /// A rotation that names a head of the agent's chain (`old_key_last`).
+    /// One that names none carries nothing of the chain, and is not
+    /// guarded: every agent's signing key can be rotated.
+    RotateKeyAtHead,
+    Rotations,
+    Blob,
+    Proofs,
+    Head,
+    HeadKnown,
+    PublishChosen,
+    PostAnchor,
+}
+
+impl Call {
+    /// What the opt-in step ([`UploadGuard::opting_in`]) needs before the
+    /// agent is marked uploading: whether Agora holds a chain or a state
+    /// key record of it, and posting the record. Nothing of the chain.
+    pub const OPT_IN: [Self; 5] = [
+        Self::Chain,
+        Self::Head,
+        Self::HeadKnown,
+        Self::StateKeys,
+        Self::PostStateKey,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chain => "chain",
+            Self::StateKeys => "state_keys",
+            Self::PostStateKey => "post_state_key",
+            Self::RotateKeyAtHead => "rotate_key",
+            Self::Rotations => "rotations",
+            Self::Blob => "blob",
+            Self::Proofs => "proofs",
+            Self::Head => "head",
+            Self::HeadKnown => "head_known",
+            Self::PublishChosen => "publish_chosen",
+            Self::PostAnchor => "post_anchor",
+        }
+    }
+}
+
+impl std::fmt::Display for Call {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`UploadGuard`]'s refusal: `call` was for `id`, which doesn't upload,
+/// and nothing was sent. Crosses the [`SealedApi`] boundary as a string
+/// beginning [`LOCAL_ONLY`] ([`is_local_only`]); a [`BlobError`] that is
+/// not worth a retry for [`SealedApi::blob`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("local only: agent {id} doesn't upload its sealed state; `{call}` was not sent to Agora")]
+pub struct LocalOnly {
+    pub id: AgentId,
+    pub call: Call,
+}
+
+impl From<LocalOnly> for String {
+    fn from(e: LocalOnly) -> Self {
+        e.to_string()
+    }
+}
+
+impl From<LocalOnly> for BlobError {
+    fn from(e: LocalOnly) -> Self {
+        BlobError::permanent(e.to_string())
+    }
+}
+
+/// The per-agent server client, guarded: every per-agent call for an
+/// agent that doesn't [`upload`](agora_agentkit::state::storage::Enrolment::uploads)
+/// returns [`LocalOnly`] without touching the network. The backstop behind
+/// agentkit's drain gate: code that forgets to ask can't leak an agent's
+/// chain, keys record, blobs, reads or publish choice. Calls that aren't
+/// about one agent's sealed state pass: [`SealedApi::anchor_data`] (the
+/// public governance log), and the agent's identity on Agora, which every
+/// agent has whether or not it uploads ([`SealedApi::register_encryption_key`],
+/// [`SealedApi::signer_registered`], and a [`SealedApi::rotate_key`] that
+/// names no head).
+///
+/// **Opting in.** The opt-in step posts the agent's state key record
+/// before the agent is marked uploading, so no entry ever reaches Agora
+/// ahead of the record that opens it. It holds [`Self::opting_in`] for
+/// that: while held, the [`Call::OPT_IN`] calls pass for that one agent,
+/// nothing else. Then it marks the agent uploading
+/// ([`super::uploading::set`]), drops the hold, and drains.
+pub struct UploadGuard<A, E> {
+    inner: A,
+    enrolment: E,
+    opting_in: std::sync::Mutex<std::collections::HashSet<AgentId>>,
+    /// Tests: a refused call panics, failing the test that made it.
+    #[cfg(test)]
+    strict: bool,
+}
+
+impl<A, E: agora_agentkit::state::storage::Enrolment> UploadGuard<A, E> {
+    pub fn new(inner: A, enrolment: E) -> Self {
+        Self {
+            inner,
+            enrolment,
+            opting_in: Default::default(),
+            #[cfg(test)]
+            strict: false,
+        }
+    }
+
+    /// What it guards.
+    #[cfg(test)]
+    pub fn inner(&self) -> &A {
+        &self.inner
+    }
+
+    /// Any refused call panics: for tests where none may be made.
+    #[cfg(test)]
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    /// Whether `call` for `id` may go to Agora.
+    pub fn check(&self, id: AgentId, call: Call) -> Result<(), LocalOnly> {
+        if self.enrolment.uploads(id) {
+            return Ok(());
+        }
+        if Call::OPT_IN.contains(&call)
+            && self
+                .opting_in
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&id)
+        {
+            return Ok(());
+        }
+        let refused = LocalOnly { id, call };
+        #[cfg(test)]
+        if self.strict {
+            panic!("{refused}");
+        }
+        tracing::warn!(
+            event_type = "sealed_state_call_local_only",
+            agent_id = %id,
+            call = call.as_str(),
+            "a sealed-state call for an agent that doesn't upload was refused, unsent"
+        );
+        Err(refused)
+    }
+
+    /// Let the [`Call::OPT_IN`] calls for `id` through until the returned
+    /// hold is dropped (see the type's docs).
+    pub fn opting_in(&self, id: AgentId) -> OptingIn<'_> {
+        self.opting_in
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id);
+        OptingIn {
+            set: &self.opting_in,
+            id,
+        }
+    }
+}
+
+/// Tests read the fake behind the guard as the fake.
+#[cfg(test)]
+impl<A, E> std::ops::Deref for UploadGuard<A, E> {
+    type Target = A;
+    fn deref(&self) -> &A {
+        &self.inner
+    }
+}
+
+/// [`UploadGuard::opting_in`]'s hold.
+#[must_use = "the opt-in calls pass only while this is held"]
+pub struct OptingIn<'a> {
+    set: &'a std::sync::Mutex<std::collections::HashSet<AgentId>>,
+    id: AgentId,
+}
+
+impl Drop for OptingIn<'_> {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+#[async_trait::async_trait]
+impl<A, E> SealedApi for UploadGuard<A, E>
+where
+    A: SealedApi,
+    E: agora_agentkit::state::storage::Enrolment,
+{
+    async fn chain(&self, id: AgentId, key: &SigningKey) -> Result<Vec<SignedStateEntry>, String> {
+        self.check(id, Call::Chain)?;
+        self.inner.chain(id, key).await
+    }
+
+    async fn state_keys(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+    ) -> Result<Vec<StateKeyRecord>, String> {
+        self.check(id, Call::StateKeys)?;
+        self.inner.state_keys(id, key).await
+    }
+
+    async fn post_state_key(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        record: &StateKeyRecord,
+    ) -> Result<(), String> {
+        self.check(id, Call::PostStateKey)?;
+        self.inner.post_state_key(id, key, record).await
+    }
+
+    async fn rotate_key(
+        &self,
+        id: AgentId,
+        old: &SigningKey,
+        rotation: &KeyRotation,
+    ) -> Result<(), String> {
+        if rotation.old_key_last.is_some() {
+            self.check(id, Call::RotateKeyAtHead)?;
+        }
+        self.inner.rotate_key(id, old, rotation).await
+    }
+
+    async fn register_encryption_key(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        public: &EncryptionPublicKey,
+    ) -> Result<(), String> {
+        self.inner.register_encryption_key(id, key, public).await
+    }
+
+    async fn signer_registered(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        self.inner.signer_registered(id, key).await
+    }
+
+    async fn rotations(&self, id: AgentId, key: &SigningKey) -> Result<Vec<KeyRotation>, String> {
+        self.check(id, Call::Rotations)?;
+        self.inner.rotations(id, key).await
+    }
+
+    async fn blob(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        sha256: &agora_agentkit::govlog::Sha256Hex,
+    ) -> Result<Vec<u8>, BlobError> {
+        self.check(id, Call::Blob)?;
+        self.inner.blob(id, key, sha256).await
+    }
+
+    async fn proofs(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        after: Option<GovernanceLogId>,
+    ) -> Result<Vec<AnchorProof>, String> {
+        self.check(id, Call::Proofs)?;
+        self.inner.proofs(id, key, after).await
+    }
+
+    async fn anchor_data(&self, anc: &GovernanceLogId) -> Result<serde_json::Value, String> {
+        self.inner.anchor_data(anc).await
+    }
+
+    async fn head(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+    ) -> Result<Option<agora_agentkit::govlog::Sha256Hex>, String> {
+        self.check(id, Call::Head)?;
+        self.inner.head(id, key).await
+    }
+
+    async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        self.check(id, Call::HeadKnown)?;
+        self.inner.head_known(id, key).await
+    }
+
+    async fn publish_chosen(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        self.check(id, Call::PublishChosen)?;
+        self.inner.publish_chosen(id, key).await
+    }
+
+    async fn post_anchor(
+        &self,
+        id: AgentId,
+        key: &SigningKey,
+        publish: bool,
+    ) -> Result<(), String> {
+        self.check(id, Call::PostAnchor)?;
+        self.inner.post_anchor(id, key, publish).await
+    }
+}
+
+/// The runner's guarded client: [`Client`] behind [`UploadGuard`], asking
+/// [`super::SealedEnrolment`]. Every per-agent sealed-state call goes
+/// through one of these.
+pub type GuardedClient = UploadGuard<Client, std::sync::Arc<super::SealedEnrolment>>;
+
+/// [`GuardedClient`] over `client`.
+pub fn guarded(client: Client, enrolment: std::sync::Arc<super::SealedEnrolment>) -> GuardedClient {
+    UploadGuard::new(client, enrolment)
+}
+
 #[cfg(test)]
 pub mod fake {
     use super::*;
@@ -377,6 +707,23 @@ pub mod fake {
                 _ => Ok(()),
             }
         }
+    }
+
+    /// [`FakeApi`] behind a strict [`UploadGuard`] asking the runner's
+    /// own [`super::super::SealedEnrolment`]: any per-agent call for an
+    /// agent that doesn't upload fails the test.
+    pub type Guarded = UploadGuard<FakeApi, std::sync::Arc<super::super::SealedEnrolment>>;
+
+    /// [`Guarded`] over the agents of `root` (`state/`, `secrets/`).
+    pub fn guarded(root: &std::path::Path) -> Guarded {
+        UploadGuard::new(
+            FakeApi::new(),
+            std::sync::Arc::new(super::super::SealedEnrolment::new(
+                root.join("state"),
+                root.join("secrets"),
+            )),
+        )
+        .strict()
     }
 
     #[async_trait::async_trait]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use agora_agentkit::client::Client;
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::outbox::AgoraOutbox;
+use agora_agentkit::state::outbox::{AgoraOutbox, Drained};
 use anyhow::Context;
 
 use super::{KeyStore, SealedEnrolment};
@@ -82,9 +82,10 @@ pub enum Command {
         #[arg(long)]
         note: String,
     },
-    /// Stop an agent's sealed backups, at its request: what waits is
-    /// uploaded first, the history stays, and the agent is shown the note.
-    /// `sealed-enroll --agent` resumes them.
+    /// Stop uploading an agent's sealed state, at its request: what waits
+    /// is uploaded first, what is on Agora stays, and the agent is shown
+    /// the note. Its state is still sealed, chained and checked locally.
+    /// `sealed-enroll --agent` resumes the uploads.
     SealedStop {
         #[arg(long)]
         agent: AgentId,
@@ -118,6 +119,17 @@ pub async fn run(
     let secrets_dir = data_dir.join("secrets");
     let keys = KeyStore::new(&secrets_dir);
     let client = Client::new(server_url).context("building the Agora client")?;
+    let enrolment = Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir));
+    // Every per-agent sealed-state call goes through the guard: nothing of
+    // an agent that doesn't upload is sent or asked
+    let api = Arc::new(super::api::guarded(client.clone(), enrolment.clone()));
+    let dry_run = matches!(command, Command::SealedEnroll { dry_run: true, .. });
+    if !dry_run {
+        // As at a run's start: a lost local marker put back, and the agents
+        // that uploaded before the marker existed marked (idempotent)
+        super::uploading::reconcile_all(&state_dir, &keys);
+        super::uploading::migrate_all(&state_dir, &keys);
+    }
     match command {
         Command::SealedEnroll {
             agent,
@@ -128,7 +140,7 @@ pub async fn run(
             let enroller = super::enroll::Enroller {
                 state_dir: state_dir.clone(),
                 keys: keys.clone(),
-                api: Arc::new(client.clone()),
+                api: api.clone(),
                 restore,
             };
             let ids = match agent {
@@ -139,18 +151,43 @@ pub async fn run(
             if ids.is_empty() {
                 println!("nobody to enrol");
             }
-            let outbox = AgoraOutbox::new(
-                client.clone(),
-                &state_dir,
-                Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
-            );
+            let outbox = AgoraOutbox::new(client.clone(), &state_dir, enrolment.clone());
             let mut failed = 0;
             for id in ids {
                 // Before the enrolment commits anything: what it commits is
                 // this process's own, its upload times recorded
                 let dir = state_dir.join(id.to_string());
                 let mut baseline = super::receipts::baseline(&dir, id).await;
-                match enroller.enroll_with(id, dry_run, note.as_deref()).await {
+                // B3: the opt-in step proper (local enrolment for everyone,
+                // opt-in apart). Until then `sealed-enroll` enrols only an
+                // agent whose ledger says yes, so enrolling is opting in:
+                // its state key record is posted under the opt-in hold
+                // (`UploadGuard::opting_in`), and it is marked uploading
+                // only once its chain is sealed, before the first drain. A
+                // stopped agent resumed is not opted in again here.
+                let resuming_stop = super::stop::is_stopped(&dir);
+                let enrolled = {
+                    let _opting_in = api.opting_in(id);
+                    enroller.enroll_with(id, dry_run, note.as_deref()).await
+                };
+                let enrolled = match enrolled {
+                    Ok(report) if !dry_run && !resuming_stop => {
+                        match super::uploading::set(
+                            &dir,
+                            &keys,
+                            id,
+                            super::uploading::UploadingBy::OptIn,
+                        ) {
+                            Ok(_) => Ok(report),
+                            Err(e) => Err(super::enroll::Skip::Failed(
+                                anyhow::Error::new(e)
+                                    .context("enrolled, but marking it uploading failed"),
+                            )),
+                        }
+                    }
+                    other => other,
+                };
+                match enrolled {
                     Ok(report) if dry_run && report.resumed => {
                         println!("{id}: would resume its stopped backups on its existing chain")
                     }
@@ -164,7 +201,7 @@ pub async fn run(
                         )
                         .await
                         {
-                            Ok(d) => {
+                            Ok(Drained::Ran(d)) => {
                                 // Its own choice: the anchor on its profile,
                                 // once its head is on Agora (else the
                                 // runner's drainer does it)
@@ -174,7 +211,7 @@ pub async fn run(
                                             &state_dir.join(id.to_string()),
                                             id,
                                             &signing,
-                                            &client,
+                                            api.as_ref(),
                                         )
                                         .await
                                         {
@@ -196,6 +233,15 @@ pub async fn run(
                                 };
                                 format!("uploaded {}, {:?}{published}", d.uploaded, d.status)
                             }
+                            Ok(Drained::LocalOnly) => {
+                                "chained locally; nothing uploaded (it doesn't upload)".to_string()
+                            }
+                            Ok(Drained::NotEnrolled) => {
+                                "nothing uploaded (not enrolled)".to_string()
+                            }
+                            Ok(Drained::Withdrawn { uploaded }) => format!(
+                                "uploaded {uploaded}, then uploading was switched off; the rest stays local"
+                            ),
                             Err(e) => {
                                 tracing::warn!(
                                     event_type = "sealed_enroll_upload_failed",
@@ -229,7 +275,7 @@ pub async fn run(
             let done = super::accept::rebase(
                 &state_dir,
                 &keys,
-                &client,
+                api.as_ref(),
                 agent,
                 note.as_deref().unwrap_or_default(),
             )
@@ -250,7 +296,8 @@ pub async fn run(
         Command::SealedAccept { agent, note, .. } => {
             let _runner = super::session::runner_exclusive(data_dir)?;
             let done =
-                super::accept::accept(&state_dir, &keys, &client, agent, note.as_deref()).await?;
+                super::accept::accept(&state_dir, &keys, api.as_ref(), agent, note.as_deref())
+                    .await?;
             println!(
                 "{agent}: accepted ({}); head {} at seq {}{}",
                 done.reason.as_str(),
@@ -272,7 +319,7 @@ pub async fn run(
             let done = super::restore::restore(
                 &state_dir,
                 &keys,
-                &client,
+                api.as_ref(),
                 agent,
                 note.as_deref(),
                 discard_local,
@@ -317,11 +364,7 @@ pub async fn run(
             );
         }
         Command::SealedStop { agent, note } => {
-            let outbox = AgoraOutbox::new(
-                client.clone(),
-                &state_dir,
-                Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
-            );
+            let outbox = AgoraOutbox::new(client.clone(), &state_dir, enrolment.clone());
             let dir = state_dir.join(agent.to_string());
             let mut baseline = super::receipts::baseline(&dir, agent).await;
             let drain: super::stop::Drain = Box::pin(async move {
@@ -332,8 +375,9 @@ pub async fn run(
             });
             let stopped = super::stop::stop(&state_dir, &keys, agent, &note, drain).await?;
             println!(
-                "{agent}: sealed backups stopped at {}; its history stays. `sealed-enroll \
-                 --agent {agent}` resumes them",
+                "{agent}: uploads stopped at {}; what is on Agora stays, and its state is still \
+                 sealed and checked here, locally. `sealed-enroll --agent {agent}` resumes the \
+                 uploads",
                 stopped.at
             );
         }
@@ -347,20 +391,22 @@ pub async fn run(
             // The server takes a rotation only at its current head: upload
             // what waits first (rotate_keys refuses if anything still does)
             if super::is_enrolled(&state_dir.join(agent.to_string())) {
-                let outbox = AgoraOutbox::new(
-                    client.clone(),
-                    &state_dir,
-                    Arc::new(SealedEnrolment::new(&state_dir, &secrets_dir)),
-                );
+                let outbox = AgoraOutbox::new(client.clone(), &state_dir, enrolment.clone());
                 let dir = state_dir.join(agent.to_string());
                 let mut baseline = super::receipts::baseline(&dir, agent).await;
                 if let Err(e) = super::receipts::drain(&outbox, &dir, agent, &mut baseline).await {
                     tracing::warn!(agent_id = %agent, error = %e, "upload before the rotation failed");
                 }
             }
-            let done =
-                super::rotate::rotate_keys(&state_dir, &keys, &client, agent, signing, encryption)
-                    .await?;
+            let done = super::rotate::rotate_keys(
+                &state_dir,
+                &keys,
+                api.as_ref(),
+                agent,
+                signing,
+                encryption,
+            )
+            .await?;
             println!(
                 "{agent}: rotated signing {}, encryption {}, state key re-wrapped {}{}",
                 done.signing,
