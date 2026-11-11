@@ -146,6 +146,9 @@ pub enum AlertKind {
     /// recognise (its record of past keys lost, or a forgery): the run is
     /// refused, nothing marked. Never rate-limited.
     SealedStateUntrustedKey,
+    /// Agent directories with a state but no local chain, and not on the
+    /// roster: never enrolled. One alert a run, with the count.
+    SealedStateUnchainedAgents,
     /// An agent's memory-id key couldn't be had: a key `sealed-forget` set
     /// aside that can't be read, its secrets not in the secrets tree, or a
     /// key there that isn't the one its state directory's fingerprint
@@ -178,7 +181,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -205,6 +208,7 @@ impl AlertKind {
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
         Self::SealedStateUntrustedKey,
+        Self::SealedStateUnchainedAgents,
         Self::MemoryIdKeyRefused,
         Self::QuestionUnanswered,
         Self::ApiRefusal,
@@ -254,6 +258,7 @@ impl AlertKind {
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
+            Self::SealedStateUnchainedAgents => "sealed_state_unchained_agents",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
             Self::QuestionUnanswered => "question_unanswered",
             Self::ApiRefusal => "api_refusal_alert",
@@ -386,20 +391,25 @@ impl AlertKind {
                  fixed. Agents already enrolled stay sealed and checked."
             }
             Self::SealedStateDrop => {
-                "An enrolled agent's memory or soul is less than half the \
-                 size it was at its previous sealed version (sizes below, in \
-                 characters). The agent was told and runs as usual: it may \
-                 have condensed its own memory. If it didn't, its earlier \
-                 versions are sealed and can be restored. Look at counts and \
-                 sizes, not content."
+                "Chained agents' memories or souls are less than half the \
+                 size they were at their previous sealed versions (the first \
+                 few below, by how much; one mail for the run, each one a \
+                 `sealed_state_drop` event in the run log). Each agent was \
+                 told and runs as usual: most condensed their own memory. If \
+                 one didn't, its earlier versions are sealed and can be \
+                 restored. Many at once that didn't run a session is \
+                 fleet-shaped. Look at counts and sizes, not content."
             }
             Self::SealedStateUnreadable => {
-                "An enrolled agent's sealed/ directory could not be read at \
-                 the start of its session (permissions, a malformed file, a \
-                 lock). Its state could not be checked; it runs anyway, its \
-                 saves are written locally but not sealed (recorded in \
-                 sealed/seal_failed.json), and its uploads are held. Fix the \
-                 directory; the next start checks again."
+                "Chained agents' sealed/ directories or keys could not be read \
+                 at the start (permissions, a malformed file, a lock): one \
+                 mail for the run, the first few agents below; many at once \
+                 points at the secrets tree or a disk. (Sent per agent when \
+                 an uploading agent's chain runs through Agora, which \
+                 couldn't be reached.) Their states could not be checked; \
+                 they run anyway, their saves are written locally but not \
+                 sealed (recorded in sealed/seal_failed.json), and uploads \
+                 are held. Fix the directory; the next start checks again."
             }
             Self::SealedStateRotationUnknown => {
                 "Agora lists a rotation of this agent's signing key that the \
@@ -418,18 +428,23 @@ impl AlertKind {
             }
             Self::SealedStateRefusedRun => {
                 "The seed runner refused to run: the sealed-state start check \
-                 refused the agents listed below (a state that matches no \
-                 sealed version, a chain that doesn't verify, or a lost \
-                 head), and a state that matches nothing is likely \
-                 fleet-wide, so no agent runs. The unit does not restart on \
-                 this exit (75). For each agent: `agora-seed sealed-restore \
-                 --agent <id>` puts its last sealed version back (damage), or \
-                 `agora-seed sealed-accept --agent <id> --note \"…\"` keeps \
-                 its state (a deliberate change). For a missing state \
-                 (state_missing) of an agent that left, `agora-seed \
-                 sealed-forget --agent <id> --note \"…\"` sets its key \
-                 aside instead. Then start the runner. Look \
-                 at counts and sizes, not content."
+                 refused the agents listed below, or the runner's own records \
+                 failed (the sealed roster missing or unreadable, the secrets \
+                 tree unlistable). The whole run stops for a loss (a state, \
+                 its directory or its head gone, unreadable, or older than \
+                 the roster's record), any refused agent that uploads, or \
+                 three or more refused agents, counting those still refused \
+                 from earlier runs; one or two agents that don't upload, \
+                 refused for a mismatch or a broken chain, are left out \
+                 alone instead (`sealed_state_refused`). The unit does not \
+                 restart on this exit (75). For each agent: `agora-seed \
+                 sealed-restore --agent <id>` puts its last sealed version \
+                 back (damage), or `agora-seed sealed-accept --agent <id> \
+                 --note \"…\"` keeps its state (a deliberate change). For a \
+                 missing state (state_missing) of an agent that left, \
+                 `agora-seed sealed-forget --agent <id> --note \"…\"` sets its \
+                 key aside instead. Then start the runner. Look at counts \
+                 and sizes, not content."
             }
             Self::SealedStateAnchorFailed => {
                 "The runner's anchor check for an agent stopped before it \
@@ -473,14 +488,25 @@ impl AlertKind {
                  backup, then start again. Nothing was marked against the \
                  agents. This alert is never rate-limited."
             }
+            Self::SealedStateUnchainedAgents => {
+                "Agent directories hold a state.json but no local chain, and \
+                 the sealed roster doesn't list them: they were never \
+                 enrolled (every agent is chained since the local chain), so \
+                 their state is not checked at the start. The count and the \
+                 first few ids are below; one mail a run. Enrol them with \
+                 `agora-seed sealed-enroll`; the runner never enrols them on \
+                 its own."
+            }
             Self::SealedStateKeysWithoutState => {
-                "An agent has a state key in the secrets tree, and Agora \
-                 holds no sealed head for it (or doesn't know it). If its \
+                "Agents have a state key in the secrets tree but no chained \
+                 state, and neither the sealed roster nor Agora holds a head \
+                 for them (Agora is asked only of an agent that uploaded). \
+                 One mail for the run, the first few below. If an agent's \
                  state is here, its enrolment was cut after its key was \
                  cached: `agora-seed sealed-enroll --agent <id>` resumes it. \
                  If not, nothing can be restored: if it left, `agora-seed \
                  sealed-forget --agent <id> --note \"…\"` sets its key aside \
-                 (nothing is deleted). It was skipped either way."
+                 (nothing is deleted). They were skipped either way."
             }
             Self::MemoryIdKeyRefused => {
                 "An agent's memory-id key (<secrets>/<id>/memory_id_key.json) \

@@ -41,6 +41,10 @@ pub enum Refusal {
     /// Its `state.json` couldn't be read from the disk (an I/O error):
     /// check permissions and the disk first.
     StateIo,
+    /// Its head is behind the runner's roster of heads (or at the same
+    /// seq under another hash): an older copy of its directory put back
+    /// ([`super::roster`]).
+    RolledBack,
 }
 
 impl Refusal {
@@ -53,6 +57,24 @@ impl Refusal {
             Self::StateUnreadable => "state_unreadable",
             Self::StateTooNew => "state_too_new",
             Self::StateIo => "state_io",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+
+    /// The shape of a loss (the May loss's, or a disk's): the state or the
+    /// record of its head gone, unreadable or put back. One of these, for
+    /// any agent, stops the whole run ([`super::check::stops_run`]); a
+    /// mismatch or a broken chain of an agent that doesn't upload may
+    /// leave that agent out alone.
+    pub fn loss_shaped(self) -> bool {
+        match self {
+            Self::Mismatch | Self::ChainBroken => false,
+            Self::HeadMissing
+            | Self::StateMissing
+            | Self::StateUnreadable
+            | Self::StateTooNew
+            | Self::StateIo
+            | Self::RolledBack => true,
         }
     }
 
@@ -66,6 +88,9 @@ impl Refusal {
             Self::StateUnreadable => "your state here couldn't be read",
             Self::StateTooNew => "your state here was written by a newer runner than this one",
             Self::StateIo => "your state here couldn't be read from the disk",
+            Self::RolledBack => {
+                "your state here was older than your runner's record of your latest sealed version"
+            }
         }
     }
 
@@ -79,6 +104,7 @@ impl Refusal {
             "state_unreadable" => Self::StateUnreadable,
             "state_too_new" => Self::StateTooNew,
             "state_io" => Self::StateIo,
+            "rolled_back" => Self::RolledBack,
             _ => Self::Mismatch,
         }
     }
@@ -117,7 +143,24 @@ pub struct Restored {
     /// The agent was refused (`sealed/refused`) when it was restored.
     #[serde(default = "yes")]
     pub refused: bool,
+    /// Where the version restored came from; older notices: Agora.
+    #[serde(default)]
+    pub source: RestoredFrom,
 }
+
+/// Where a restored version came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoredFrom {
+    #[default]
+    Agora,
+    /// The chain the runner keeps on this machine.
+    Local,
+}
+
+/// How a local restore names its source, closing the sentence: "...from
+/// your sealed version of {date}{this}".
+pub const RESTORED_LOCALLY: &str = ", from the record your runner keeps on this machine";
 
 fn yes() -> bool {
     true
@@ -391,6 +434,7 @@ impl Notice {
         fallback: Refusal,
         found: bool,
         refused: bool,
+        source: RestoredFrom,
     ) -> std::io::Result<()> {
         let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
         // A rerun of a restore cut short: what the first run found stands
@@ -409,6 +453,7 @@ impl Notice {
                 .map(String::from),
             found,
             refused,
+            source,
         });
         write(agent_dir, &n)
     }
@@ -431,6 +476,10 @@ impl Notice {
     pub fn line(&self) -> Option<String> {
         if let Some(r) = &self.restored {
             let (at, from) = (r.at.format("%-d %B %Y"), r.from.format("%-d %B %Y"));
+            let copy = match r.source {
+                RestoredFrom::Agora => ", the copy on Agora",
+                RestoredFrom::Local => RESTORED_LOCALLY,
+            };
             // Nothing found here: told as lost, whatever refused it
             let mut line = match (r.refused && r.found, r.found) {
                 (true, true) => format!(
@@ -442,8 +491,7 @@ impl Notice {
                 ),
                 (true, false) => format!(
                     "Your session on {} did not run: {}. Your state here was then lost, and on \
-                     {at} your operator restored it from your sealed version of {from}, the \
-                     copy on Agora.",
+                     {at} your operator restored it from your sealed version of {from}{copy}.",
                     self.refused_at.format("%-d %B %Y"),
                     self.reason.plain(),
                 ),
@@ -454,7 +502,7 @@ impl Notice {
                 ),
                 (false, false) => format!(
                     "Your state was lost here. On {at}, your operator restored it from your \
-                     sealed version of {from}, the copy on Agora."
+                     sealed version of {from}{copy}."
                 ),
             };
             if let Some(note) = &r.note {
