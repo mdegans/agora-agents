@@ -235,6 +235,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .refused
             .is_empty()
         );
     }

@@ -92,6 +92,9 @@ pub struct Vouch {
     pub at: DateTime<Utc>,
     pub keyframe: Option<Sha256Hex>,
     pub summary: super::check::LineSummary,
+    /// Versions that couldn't be opened here at that check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unopenable: Option<super::check::Unopenable>,
 }
 
 /// How often an agent's whole local chain is verified again, at least:
@@ -150,8 +153,14 @@ impl Roster {
 /// Why the roster couldn't be used: each refuses the whole run.
 #[derive(Debug, thiserror::Error)]
 pub enum RosterError {
-    #[error("{} is missing, but {BEGAN} says it was written before", path.display())]
+    #[error("{} is missing, but {BEGAN} or the secrets root's {WITNESS} says it was written before", path.display())]
     Missing { path: PathBuf },
+    #[error("{} holds {roster} agents, but the secrets root's {WITNESS} says {witness}: agents left it other than by sealed-forget", path.display())]
+    Shrunk {
+        path: PathBuf,
+        roster: usize,
+        witness: usize,
+    },
     #[error("{} is unreadable: {error}", path.display())]
     Unreadable { path: PathBuf, error: String },
     #[error("{} is format {format}, newer than this runner's {FORMAT}", path.display())]
@@ -179,6 +188,9 @@ pub enum Loss {
     /// The head is behind the roster's, or at its seq under another hash:
     /// an older copy put back.
     Behind { roster: u64, found: u64 },
+    /// `sealed/head.json` is there but can't be read or parsed: the
+    /// roster knows a head should be, so it is a loss, not a hold.
+    HeadUnreadable,
     /// The directory couldn't be looked at (an I/O error).
     Io,
 }
@@ -188,7 +200,7 @@ impl Loss {
     pub fn refusal(self) -> Refusal {
         match self {
             Self::DirMissing | Self::StateMissing => Refusal::StateMissing,
-            Self::ChainMissing | Self::HeadMissing => Refusal::HeadMissing,
+            Self::ChainMissing | Self::HeadMissing | Self::HeadUnreadable => Refusal::HeadMissing,
             Self::Behind { .. } => Refusal::RolledBack,
             Self::Io => Refusal::StateIo,
         }
@@ -199,6 +211,7 @@ impl Loss {
             Self::DirMissing => "dir_missing",
             Self::ChainMissing => "chain_missing",
             Self::HeadMissing => "head_missing",
+            Self::HeadUnreadable => "head_unreadable",
             Self::StateMissing => "state_missing",
             Self::Behind { .. } => "behind",
             Self::Io => "io",
@@ -221,7 +234,20 @@ pub struct Scan {
     pub on_roster: BTreeSet<AgentId>,
     /// Each agent's last full verification, where there is one.
     pub vouched: BTreeMap<AgentId, Vouch>,
+    /// No witness of an earlier roster existed: this start began it.
+    pub first: bool,
+    /// The roster was last written this long before the newest chained
+    /// agent's `state.json` (past [`ROSTER_STALE`]): when, and that mtime.
+    pub stale: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
+
+/// A roster written this long before the newest chained state is alerted
+/// ([`Scan::stale`]): a data directory restored from an older backup
+/// without its files' times would show it. The stated limit: a whole data
+/// directory restored with its times kept passes every witness inside it;
+/// only a count and digest kept outside that backup set (on Agora, for an
+/// agent that uploads) would close it.
+pub const ROSTER_STALE: chrono::TimeDelta = chrono::TimeDelta::days(1);
 
 fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(ROSTER)
@@ -290,18 +316,88 @@ pub fn load(data_dir: &Path) -> Result<Option<Roster>, RosterError> {
 /// Read under the lock: the roster, or a new one when neither it nor
 /// `began` exists (`true`: a first one).
 fn load_or_begin(data_dir: &Path) -> Result<(Roster, bool), RosterError> {
+    let witness = Witness::load(data_dir)?;
     match load(data_dir)? {
-        Some(r) => Ok((r, false)),
-        None if std::fs::exists(data_dir.join(BEGAN))? => Err(RosterError::Missing {
-            path: path(data_dir),
-        }),
+        Some(r) => match witness {
+            // Agents leave the roster only through `replace(.., None)`,
+            // which lowers the witness's count first
+            Some(w) if w.agents > r.agents.len() => Err(RosterError::Shrunk {
+                path: path(data_dir),
+                roster: r.agents.len(),
+                witness: w.agents,
+            }),
+            _ => Ok((r, false)),
+        },
+        None if witness.is_some() || std::fs::exists(data_dir.join(BEGAN))? => {
+            Err(RosterError::Missing {
+                path: path(data_dir),
+            })
+        }
         None => Ok((Roster::default(), true)),
     }
 }
 
-/// Write it, then `began` if it isn't there.
+/// The roster's second witness, in the secrets root (a tree the start
+/// already lists, and backed up apart from `state/`): when the roster
+/// began and how many agents it holds. Either witness present without the
+/// roster, or a roster holding fewer agents than this says, refuses the
+/// run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Witness {
+    pub began: DateTime<Utc>,
+    pub agents: usize,
+}
+
+/// The witness's file, in `<data_dir>/secrets/`.
+pub const WITNESS: &str = "sealed-roster.witness.json";
+
+impl Witness {
+    fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join("secrets").join(WITNESS)
+    }
+
+    pub fn load(data_dir: &Path) -> Result<Option<Self>, RosterError> {
+        let path = Self::path(data_dir);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes)
+                    .map(Some)
+                    .map_err(|e| RosterError::Unreadable {
+                        path,
+                        error: e.to_string(),
+                    })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(RosterError::Unreadable {
+                path,
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    fn save(data_dir: &Path, w: &Self) -> std::io::Result<()> {
+        super::write_private(
+            &Self::path(data_dir),
+            &serde_json::to_vec_pretty(w).map_err(std::io::Error::other)?,
+        )
+    }
+}
+
+/// Write it, then `began` if it isn't there, with the secrets root's
+/// witness: written before the roster when the count goes down (a crash
+/// between leaves a roster above its witness, which is fine), after it
+/// otherwise.
 fn save(data_dir: &Path, roster: &mut Roster) -> Result<(), RosterError> {
     roster.updated_at = Utc::now();
+    let old = Witness::load(data_dir).ok().flatten();
+    let witness = Witness {
+        began: old.map_or(roster.updated_at, |w| w.began),
+        agents: roster.agents.len(),
+    };
+    let down = old.is_some_and(|w| w.agents > witness.agents);
+    if down {
+        Witness::save(data_dir, &witness)?;
+    }
     super::write_private(
         &path(data_dir),
         &serde_json::to_vec_pretty(roster).map_err(std::io::Error::other)?,
@@ -309,6 +405,9 @@ fn save(data_dir: &Path, roster: &mut Roster) -> Result<(), RosterError> {
     let began = data_dir.join(BEGAN);
     if !std::fs::exists(&began)? {
         super::write_private(&began, Utc::now().to_rfc3339().as_bytes())?;
+    }
+    if !down && old != Some(witness) {
+        Witness::save(data_dir, &witness)?;
     }
     Ok(())
 }
@@ -336,6 +435,31 @@ pub async fn record_all(
     Ok(())
 }
 
+/// Record the heads of `ids` as `head.json` says them, read inside the
+/// roster's lock, "higher seq wins": the runner's own updates, which can
+/// then never undo a [`replace`] that came after `head.json` was lowered.
+pub async fn record_heads(
+    data_dir: &Path,
+    state_dir: &Path,
+    ids: &[AgentId],
+) -> Result<Vec<(AgentId, HeadRef)>, RosterError> {
+    let _lock = lock(data_dir).await?;
+    let (mut roster, first) = load_or_begin(data_dir)?;
+    let mut changed = first;
+    let mut read = Vec::new();
+    for id in ids {
+        let seal = AgentSeal::new(&state_dir.join(id.to_string()), *id);
+        if let Ok(Some(h)) = seal.head().await {
+            changed |= roster.merge(*id, h.head);
+            read.push((*id, h.head));
+        }
+    }
+    if changed {
+        save(data_dir, &mut roster)?;
+    }
+    Ok(read)
+}
+
 /// Keep each agent's newest full verification; written only if one is
 /// newer. An agent not on the roster is left off it.
 pub async fn vouch_all(data_dir: &Path, vouches: &[(AgentId, Vouch)]) -> Result<(), RosterError> {
@@ -361,7 +485,17 @@ pub async fn vouch_all(data_dir: &Path, vouches: &[(AgentId, Vouch)]) -> Result<
 
 /// Set `id`'s head to `head` whatever the roster held: for an operator's
 /// command that sets the head back on purpose (`sealed-accept --rebase`
-/// onto a shorter chain, a restore). `None` takes the agent off.
+/// onto a shorter chain, a restore). `None` takes the agent off: the one
+/// way an agent leaves the roster (`sealed-forget`).
+///
+/// **Order, for a command that lowers a head:** rewrite `head.json`
+/// first, then call this. The runner's [`Keeper`] reads heads from disk
+/// inside the roster's lock ([`record_heads`]), so once `head.json` is
+/// lowered it can't raise the roster again, and this sets it.
+///
+/// B5 calls it: `sealed-accept` (`accept` and `rebase`) and
+/// `sealed-restore` with `Some(<the head written>)` after `head.json` is
+/// written; `sealed-forget` with `None` after the state key is set aside.
 #[allow(dead_code)] // B5: accept, restore and forget call it once they act
 pub async fn replace(
     data_dir: &Path,
@@ -415,7 +549,9 @@ enum Found {
         state: bool,
     },
     /// Chained, no `head.json`.
-    NoHead,
+    NoHead {
+        state: bool,
+    },
     /// Chained, `head.json` unreadable: the start check's own reading
     /// says so (a hold); no comparison here.
     HeadUnreadable {
@@ -441,7 +577,7 @@ async fn look(dir: &Path, id: AgentId) -> std::io::Result<Found> {
             head: h.head,
             state,
         },
-        Ok(None) => Found::NoHead,
+        Ok(None) => Found::NoHead { state },
         Err(e) => {
             tracing::warn!(agent_id = %id, error = %e, "sealed/head.json unreadable for the roster");
             Found::HeadUnreadable { state }
@@ -457,8 +593,13 @@ pub async fn check(data_dir: &Path, state_dir: &Path) -> Result<Scan, RosterErro
     let _lock = lock(data_dir).await?;
     let (mut roster, first) = load_or_begin(data_dir)?;
     let dirs = agent_dirs(state_dir)?;
-    let mut scan = Scan::default();
+    let mut scan = Scan {
+        first,
+        ..Scan::default()
+    };
     let mut changed = first;
+    let written = roster.updated_at;
+    let mut newest: Option<DateTime<Utc>> = None;
     let ids: BTreeSet<AgentId> = dirs.iter().chain(roster.agents.keys()).copied().collect();
     for id in ids {
         let dir = state_dir.join(id.to_string());
@@ -472,11 +613,21 @@ pub async fn check(data_dir: &Path, state_dir: &Path) -> Result<Scan, RosterErro
                 continue;
             }
         };
-        if std::fs::exists(
-            dir.join(agora_agentkit::state::storage::SEALED_DIR)
-                .join("refused"),
-        )
-        .unwrap_or(false)
+        // A refused marker counts while the agent is on the roster or has
+        // a state: one `sealed-forget` left behind doesn't count forever
+        let has_state = matches!(
+            found,
+            Found::Unchained { state: true }
+                | Found::NoHead { state: true }
+                | Found::HeadUnreadable { state: true }
+                | Found::Head { state: true, .. }
+        );
+        if (has_state || roster.agents.contains_key(&id))
+            && std::fs::exists(
+                dir.join(agora_agentkit::state::storage::SEALED_DIR)
+                    .join("refused"),
+            )
+            .unwrap_or(false)
         {
             scan.refused.insert(id);
         }
@@ -497,8 +648,8 @@ pub async fn check(data_dir: &Path, state_dir: &Path) -> Result<Scan, RosterErro
         let loss = match found {
             Found::Gone => Some(Loss::DirMissing),
             Found::Unchained { .. } => Some(Loss::ChainMissing),
-            Found::NoHead => Some(Loss::HeadMissing),
-            Found::HeadUnreadable { state } => (!state).then_some(Loss::StateMissing),
+            Found::NoHead { .. } => Some(Loss::HeadMissing),
+            Found::HeadUnreadable { .. } => Some(Loss::HeadUnreadable),
             Found::Head { head, state } => {
                 if head.seq < entry.seq
                     || (head.seq == entry.seq && head.entry_hash != entry.entry_hash)
@@ -511,6 +662,12 @@ pub async fn check(data_dir: &Path, state_dir: &Path) -> Result<Scan, RosterErro
                     Some(Loss::StateMissing)
                 } else {
                     changed |= roster.merge(id, head);
+                    if let Ok(at) =
+                        std::fs::metadata(dir.join("state.json")).and_then(|m| m.modified())
+                    {
+                        let at = DateTime::<Utc>::from(at);
+                        newest = Some(newest.map_or(at, |n| n.max(at)));
+                    }
                     None
                 }
             }
@@ -518,6 +675,12 @@ pub async fn check(data_dir: &Path, state_dir: &Path) -> Result<Scan, RosterErro
         if let Some(loss) = loss {
             scan.losses.insert(id, loss);
         }
+    }
+    if !first
+        && let Some(newest) = newest
+        && newest - written > ROSTER_STALE
+    {
+        scan.stale = Some((written, newest));
     }
     if changed {
         save(data_dir, &mut roster)?;
@@ -569,20 +732,22 @@ impl Keeper {
     /// One pass: the heads that moved since the last, recorded.
     pub async fn keep(&self) {
         let mut seen = self.seen.lock().await;
+        // Which moved, read outside the lock only to decide whether to
+        // take it: what is recorded is read again inside it
         let mut moved = Vec::new();
         for id in &self.agents {
             let seal = AgentSeal::new(&self.state_dir.join(id.to_string()), *id);
             if let Ok(Some(h)) = seal.head().await
                 && seen.get(id) != Some(&h.head)
             {
-                moved.push((*id, h.head));
+                moved.push(*id);
             }
         }
         if moved.is_empty() {
             return;
         }
-        match record_all(&self.data_dir, moved.iter().copied()).await {
-            Ok(()) => seen.extend(moved),
+        match record_heads(&self.data_dir, &self.state_dir, &moved).await {
+            Ok(read) => seen.extend(read),
             Err(e) => tracing::error!(
                 event_type = "sealed_roster_unwritten",
                 agents = moved.len(),
@@ -810,6 +975,50 @@ mod tests {
         assert!(!root.join(ROSTER).exists());
         std::fs::write(root.join(ROSTER), good).unwrap();
         assert!(check(&root, &root.join("state")).await.is_ok());
+    }
+
+    /// A command that lowers a head (rewrites `head.json`, then
+    /// `replace`) can't be undone by the runner's Keeper: it reads heads
+    /// inside the roster's lock (review of B2, 6). And the witness in the
+    /// secrets root alone is enough to refuse a lost roster.
+    #[tokio::test]
+    async fn the_keeper_never_undoes_a_replace() {
+        let root = crate::sealed::TestDir::new("roster-keeper");
+        let (id, dir) = fleet(&root, 1).await.remove(0);
+        crate::sealed::props::save(&root, id, state(2)).await;
+        let keeper = Keeper::new(&root, &root.join("state"), vec![id]);
+        keeper.keep().await;
+        let high = head(&dir, id).await;
+        assert_eq!(load(&root).unwrap().unwrap().agents[&id].seq, high.seq);
+        // The command: head.json lowered to the genesis, then replace
+        let genesis = crate::sealed::check::local_entries(&AgentSeal::new(&dir, id))
+            .await
+            .unwrap()[0]
+            .clone();
+        let low = HeadRef {
+            entry_hash: genesis.entry_hash(),
+            seq: genesis.entry.seq,
+        };
+        let path = dir
+            .join(agora_agentkit::state::storage::SEALED_DIR)
+            .join("head.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["head"] = serde_json::to_value(low).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        replace(&root, id, Some(low)).await.unwrap();
+        // The Keeper's cache still has the high head; it reads again
+        keeper.keep().await;
+        keeper.keep().await;
+        assert_eq!(load(&root).unwrap().unwrap().agents[&id].seq, low.seq);
+
+        // Only the witness left: refused
+        std::fs::rename(root.join(ROSTER), root.join("r.aside")).unwrap();
+        std::fs::rename(root.join(BEGAN), root.join("b.aside")).unwrap();
+        assert!(matches!(
+            check(&root, &root.join("state")).await,
+            Err(RosterError::Missing { .. })
+        ));
     }
 
     /// An operator's command sets a head back on purpose; the vouch goes

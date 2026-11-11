@@ -651,7 +651,7 @@ proptest! {
                     &Default::default(),
                 )
                 .await
-                .unwrap();
+                .unwrap().refused;
                 let want: Vec<_> = reason.map(|r| (b.id, r)).into_iter().collect();
                 prop_assert_eq!(missing, want, "{:?} {:?}", h, f);
                 return Ok(());

@@ -1565,6 +1565,8 @@ struct RefusedAgent {
     reason: sealed::notice::Refusal,
     /// It uploads, or its uploading marker is in doubt.
     uploads: bool,
+    /// For the operator: hashes and counts only.
+    detail: String,
 }
 
 /// The start check refused agents, so the run doesn't start: `main` exits
@@ -1601,7 +1603,9 @@ fn refusal_options(id: AgentId, reason: sealed::notice::Refusal) -> Vec<String> 
         R::StateUnreadable => vec![format!(
             "agora-seed sealed-restore --agent {id} (the unreadable file is archived)"
         )],
+        // Its state or whole directory gone: only what can put one back
         R::StateMissing => vec![
+            format!("put state/{id}/ back from a backup"),
             format!("agora-seed sealed-restore --agent {id}"),
             format!("agora-seed sealed-forget --agent {id} --note \"…\" (if it left)"),
         ],
@@ -1616,12 +1620,23 @@ fn refusal_options(id: AgentId, reason: sealed::notice::Refusal) -> Vec<String> 
                  Agora's latest; the one here is archived)"
             ),
         ],
+        // `sealed-accept` and `sealed-restore` record the head they write
+        // in the roster (`sealed::roster::replace`, step B5)
         R::RolledBack => vec![
+            "an older copy of its directory is in place: put the newer one back from a backup \
+             (the roster then matches it)"
+                .to_string(),
             format!(
-                "an older copy of its directory is in place: put the newer one back from a \
-                 backup, or agora-seed sealed-restore --agent {id}"
+                "agora-seed sealed-accept --agent {id} --note \"…\" (keeps the older state as a \
+                 deliberate rollback; the roster takes the new head)"
             ),
-            format!("agora-seed sealed-accept --agent {id} --note \"…\" (a deliberate rollback)"),
+        ],
+        R::SealUnreadable => vec![
+            format!(
+                "check permissions and the disk under state/{id}/sealed/ and secrets/{id}/ first; \
+                 the next start checks again"
+            ),
+            format!("agora-seed sealed-restore --agent {id} (if sealed/ is damaged)"),
         ],
         R::Mismatch | R::ChainBroken => vec![
             format!("agora-seed sealed-restore --agent {id} (damage)"),
@@ -1641,7 +1656,13 @@ fn refusal_options(id: AgentId, reason: sealed::notice::Refusal) -> Vec<String> 
 /// one by one ([`sealed::check::refuse`]), and the rest run. Holds never
 /// come here.
 fn refuse_run(run: &SealedRun, alerts: &alerts::Alerter) -> Result<()> {
-    if run.refused.is_empty() && run.server_faults.is_empty() && run.fleet.is_empty() {
+    // Agents still refused from earlier runs stop every run until each
+    // is resolved, not only the one that reached the threshold
+    if run.refused.is_empty()
+        && run.server_faults.is_empty()
+        && run.fleet.is_empty()
+        && run.outstanding == 0
+    {
         return Ok(());
     }
     use sealed::check::Refused;
@@ -1683,6 +1704,12 @@ fn refuse_run(run: &SealedRun, alerts: &alerts::Alerter) -> Result<()> {
             agents = %serde_json::to_string(&agents).unwrap_or_default(),
             "agents refused by the sealed-state start check are left out; the rest run"
         );
+        // Each one's alert, now it is known the run goes on
+        for r in &run.refused {
+            alerts.notify(sealed::check::refused_alert(
+                r.id, &r.name, r.reason, &r.detail,
+            ));
+        }
         return Ok(());
     }
     let (keys, chains): (Vec<_>, Vec<_>) = run
@@ -1695,7 +1722,7 @@ fn refuse_run(run: &SealedRun, alerts: &alerts::Alerter) -> Result<()> {
     if !keys.is_empty() {
         untrusted_key_alert(&keys, alerts);
     }
-    if !agents.is_empty() || !run.fleet.is_empty() {
+    if !agents.is_empty() || !run.fleet.is_empty() || run.outstanding > 0 {
         tracing::error!(
             event_type = "sealed_state_refused_run",
             refused = agents.len(),
@@ -1715,7 +1742,8 @@ fn refuse_run(run: &SealedRun, alerts: &alerts::Alerter) -> Result<()> {
                     format!(" and {} of the runner's own record(s)", run.fleet.len())
                 }
             ),
-        );
+        )
+        .count(agents.len() + run.outstanding + run.fleet.len());
         for what in &run.fleet {
             alert = alert.detail("record", what);
         }
@@ -1906,8 +1934,10 @@ async fn sealed_start_check(
         sealed::check::Upload::counts_as_uploading(&state_dir.join(id.to_string()), keys, id)
     };
     let mut refused = BTreeSet::new();
-    // The witness outside state/: losses refused first, before anything
-    // reads the directories it vouches for
+    // The witness outside state/, before any agent is checked. Runs after
+    // the uploading start pass, the stop reconcile and `load_states`
+    // (which only reads, and finishes a sealed commit a crash cut short:
+    // a head only ever moves forward there), so it sees what they leave
     let scan = match sealed::roster::check(data_dir, state_dir).await {
         Ok(scan) => scan,
         Err(e) => {
@@ -1920,34 +1950,28 @@ async fn sealed_start_check(
             sealed::roster::Scan::default()
         }
     };
-    if !scan.unchained.is_empty() {
-        let first: Vec<String> = scan
-            .unchained
-            .iter()
-            .take(sealed::check::SUMMARY_LIST)
-            .map(ToString::to_string)
-            .collect();
+    if let Some((written, newest)) = scan.stale {
         tracing::warn!(
-            event_type = "sealed_state_unchained_agents",
-            agents = scan.unchained.len(),
-            first = %first.join(","),
-            "agent directories with a state but no local chain, not on the roster; never enrolled"
+            event_type = "sealed_roster_stale",
+            roster_written = %written,
+            newest_state = %newest,
+            "the sealed roster was last written long before the newest chained state"
         );
         alerts.notify(
             alerts::Alert::new(
-                alerts::AlertKind::SealedStateUnchainedAgents,
-                format!(
-                    "{} agent(s) have a state but no local chain; enrol them with agora-seed \
-                     sealed-enroll",
-                    scan.unchained.len()
-                ),
+                alerts::AlertKind::SealedStateRosterStale,
+                "the sealed roster is older than the agents' states: a data directory restored \
+                 from an older backup?",
             )
-            .detail("agents", scan.unchained.len())
-            .detail("first", first.join(", ")),
+            .detail("roster_written", written)
+            .detail("newest_state", newest),
         );
     }
     for (id, loss) in &scan.losses {
-        let reason = loss.refusal();
+        let dir = state_dir.join(id.to_string());
+        // A directory recreated to hold an earlier start's marker keeps
+        // that start's reason
+        let reason = sealed::check::marked_reason(&dir).unwrap_or_else(|| loss.refusal());
         let name = name_of(*id, reason);
         tracing::error!(
             event_type = "sealed_roster_loss",
@@ -1955,40 +1979,95 @@ async fn sealed_start_check(
             loss = loss.as_str(),
             "an agent on the sealed roster shows a loss"
         );
-        sealed::check::refuse(
-            &state_dir.join(id.to_string()),
-            *id,
-            &name,
-            reason,
-            &format!("the sealed roster vouches for this agent; found: {loss:?}"),
-            alerts,
-        )
-        .await;
+        let detail = format!("the sealed roster vouches for this agent; found: {loss:?}");
+        sealed::check::mark(&dir, *id, &name, reason, &detail).await;
         refused.insert(*id);
         run.refused.push(RefusedAgent {
             id: *id,
             name,
             reason,
             uploads: uploads_of(*id),
+            detail,
         });
     }
     // An enrolled agent whose state is gone never loads: found by its keys
-    match sealed::check::missing_states(state_dir, keys, api, alerts, &scan.on_roster).await {
+    let leftover = match sealed::check::missing_states(
+        state_dir,
+        keys,
+        api,
+        &alerts::Alerter::off(),
+        &scan.on_roster,
+    )
+    .await
+    {
         Ok(missing) => {
-            for (id, reason) in missing {
+            for (id, reason) in missing.refused {
                 if refused.insert(id) {
                     run.refused.push(RefusedAgent {
                         id,
                         name: name_of(id, reason),
                         reason,
                         uploads: uploads_of(id),
+                        detail: "an enrolled agent's state or sealed/ is missing".to_string(),
                     });
                 }
             }
+            missing.leftover
         }
-        Err(e) => run
-            .fleet
-            .push(format!("the secrets tree couldn't be listed: {e}")),
+        Err(e) => {
+            run.fleet
+                .push(format!("the secrets tree couldn't be listed: {e}"));
+            Vec::new()
+        }
+    };
+    // Leftover keys and unchained states: alerted, or, once a roster has
+    // been kept, three or more at once is fleet-shaped (a roster lost with
+    // the agents' sealed/ would read as a first run)
+    let strays = leftover.len() + scan.unchained.len();
+    if !scan.first && strays >= sealed::check::REFUSED_AGENTS_STOP_RUN {
+        tracing::error!(
+            event_type = "sealed_state_strays_refused",
+            leftover = leftover.len(),
+            unchained = scan.unchained.len(),
+            "agents with keys or states but no chain, beside a roster kept before; the run is refused"
+        );
+        run.fleet.push(format!(
+            "{} agent(s) with a state key but no chained state, and {} with a state but no \
+             chain, though a roster was kept before: their sealed/ may be gone with it",
+            leftover.len(),
+            scan.unchained.len()
+        ));
+    } else {
+        if let Some(alert) = sealed::check::leftover_alert(&leftover) {
+            alerts.notify(alert);
+        }
+        if !scan.unchained.is_empty() {
+            let first: Vec<String> = scan
+                .unchained
+                .iter()
+                .take(sealed::check::SUMMARY_LIST)
+                .map(ToString::to_string)
+                .collect();
+            tracing::warn!(
+                event_type = "sealed_state_unchained_agents",
+                agents = scan.unchained.len(),
+                first = %first.join(","),
+                "agent directories with a state but no local chain, not on the roster; never enrolled"
+            );
+            alerts.notify(
+                alerts::Alert::new(
+                    alerts::AlertKind::SealedStateUnchainedAgents,
+                    format!(
+                        "{} agent(s) have a state but no local chain; enrol them with agora-seed \
+                         sealed-enroll",
+                        scan.unchained.len()
+                    ),
+                )
+                .count(scan.unchained.len())
+                .detail("agents", scan.unchained.len())
+                .detail("first", first.join(", ")),
+            );
+        }
     }
     // The anchors not yet judged are judged here where they can be, so a
     // session's verdict says what was found for the newest (beta round 12)
@@ -1999,7 +2078,7 @@ async fn sealed_start_check(
     let mut dropped: Vec<sealed::check::Dropped> = Vec::new();
     // Full verifications made this start, kept in the roster
     let mut vouches: Vec<(AgentId, sealed::roster::Vouch)> = Vec::new();
-    let mut unreadable: Vec<(AgentId, String)> = Vec::new();
+    let mut unopenable: Vec<(AgentId, String, sealed::check::Unopenable)> = Vec::new();
     for (id, state) in pool.iter() {
         let Some((hash, sizes)) = enrolled.get(id) else {
             continue;
@@ -2009,18 +2088,52 @@ async fn sealed_start_check(
         }
         let name = state.soul.name.to_string();
         let dir = state_dir.join(id.to_string());
-        let (outcome, vouch) = sealed::check::check_vouched(
-            &dir,
-            *id,
-            hash,
-            *sizes,
-            keys,
-            api,
-            start.as_ref(),
-            scan.vouched.get(id),
-        )
-        .await;
-        vouches.extend(vouch.map(|v| (*id, v)));
+        let check = async |hash, sizes| {
+            sealed::check::check_vouched(
+                &dir,
+                *id,
+                hash,
+                sizes,
+                keys,
+                api,
+                start.as_ref(),
+                scan.vouched.get(id),
+            )
+            .await
+        };
+        let (mut outcome, mut found) = check(hash, *sizes).await;
+        // Another process may have saved the agent since its state was
+        // loaded: read it again under its seal lock and check once more
+        // before refusing a mismatch
+        if matches!(
+            outcome,
+            sealed::check::Outcome::Refuse {
+                reason: sealed::notice::Refusal::Mismatch,
+                ..
+            }
+        ) && let Some((again, sizes)) = reloaded(state_dir, *id).await
+            && again != *hash
+        {
+            tracing::info!(
+                event_type = "sealed_state_rechecked",
+                agent_id = %id,
+                "the state changed since it was loaded; checked again"
+            );
+            (outcome, found) = check(&again, sizes).await;
+        }
+        vouches.extend(found.vouch.map(|v| (*id, v)));
+        if let Some(u) = found.unopenable {
+            tracing::warn!(
+                event_type = "sealed_state_unopenable",
+                agent = %name,
+                agent_id = %id,
+                versions = u.versions,
+                missing = u.missing,
+                damaged = u.damaged,
+                "sealed versions whose copies here are missing or damaged"
+            );
+            unopenable.push((*id, name.clone(), u));
+        }
         match outcome {
             sealed::check::Outcome::ServerFault { kind, detail } => {
                 skipped.push(Skipped::new(
@@ -2033,7 +2146,8 @@ async fn sealed_start_check(
                 run.server_faults.push((*id, name, kind, detail));
             }
             sealed::check::Outcome::Refuse { reason, detail } => {
-                sealed::check::refuse(&dir, *id, &name, reason, &detail, alerts).await;
+                let reason = sealed::check::marked_reason(&dir).unwrap_or(reason);
+                sealed::check::mark(&dir, *id, &name, reason, &detail).await;
                 skipped.push(Skipped::new(
                     *id,
                     Some(name.clone()),
@@ -2046,6 +2160,7 @@ async fn sealed_start_check(
                     name,
                     reason,
                     uploads: uploads_of(*id),
+                    detail,
                 });
             }
             sealed::check::Outcome::Run {
@@ -2081,23 +2196,14 @@ async fn sealed_start_check(
                     }
                     dropped.push((*id, name.clone(), drops));
                 }
-                match hold {
-                    // One summary for the run: a secrets tree gone
-                    // unreadable would otherwise mail once per agent
-                    Some(sealed::check::Hold::Unreadable) => {
-                        unreadable.push((*id, name.clone()));
-                        run.held.push(*id);
-                    }
-                    Some(hold) => {
-                        // Every start while held, rate-limited by the alerter
-                        let held = agora_agentkit::state::storage::AgentSeal::new(&dir, *id)
-                            .held()
-                            .await
-                            .ok();
-                        alerts.notify(sealed::check::hold_alert(hold, *id, &name, held.as_ref()));
-                        run.held.push(*id);
-                    }
-                    None => {}
+                if let Some(hold) = hold {
+                    // Every start while held, rate-limited by the alerter
+                    let held = agora_agentkit::state::storage::AgentSeal::new(&dir, *id)
+                        .held()
+                        .await
+                        .ok();
+                    alerts.notify(sealed::check::hold_alert(hold, *id, &name, held.as_ref()));
+                    run.held.push(*id);
                 }
                 // Asked of Agora only for an agent that uploads
                 if sealed::check::Upload::of(&dir, keys, *id) == sealed::check::Upload::Now
@@ -2146,12 +2252,27 @@ async fn sealed_start_check(
     if let Some(alert) = sealed::check::drop_summary(&dropped) {
         alerts.notify(alert);
     }
-    if let Some(alert) = sealed::check::unreadable_summary(&unreadable) {
+    if let Some(alert) = sealed::check::unopenable_summary(&unopenable) {
         alerts.notify(alert);
     }
     run.outstanding = scan.refused.difference(&refused).count();
     pool.retain(|(id, _)| !refused.contains(id));
     run
+}
+
+/// `id`'s state read again under its seal lock (a save in progress
+/// finishes first): its plaintext hash and sizes. `None` if it can't be.
+async fn reloaded(
+    state_dir: &std::path::Path,
+    id: AgentId,
+) -> Option<(agora_agentkit::govlog::Sha256Hex, sealed::sizes::Sizes)> {
+    let seal = agora_agentkit::state::storage::AgentSeal::new(&state_dir.join(id.to_string()), id);
+    let _lock = seal.lock().await.ok()?;
+    let value = FsStorage::new(state_dir).load_raw(id).await.ok()?.value;
+    Some((
+        agora_agentkit::state::storage::plaintext_hash(&value),
+        sealed::sizes::Sizes::of(&value),
+    ))
 }
 
 /// `agora-seed <sealed command>`: the data dir, server and
@@ -3585,16 +3706,12 @@ mod tests {
             .await
         };
 
-        // A hold (sealed/ unreadable) runs: the run goes on
-        let head = ids[3].1.join("sealed/head.json");
-        let saved = std::fs::read(&head).unwrap();
-        std::fs::write(&head, b"{ not json").unwrap();
+        // Healthy: the run goes on (an unreadable sealed/ is no longer a
+        // hold that runs: `unreadable_local_evidence_never_runs_the_fleet`)
         let mut pool = pool_of();
         let run = check(&mut pool).await;
-        assert_eq!(run.held, vec![ids[3].0]);
-        assert!(run.refused.is_empty());
+        assert!(run.refused.is_empty() && run.held.is_empty());
         assert!(refuse_run(&run, &alerts::Alerter::off()).is_ok());
-        std::fs::write(&head, saved).unwrap();
 
         // One wipe among four: the run is refused
         FsStorage::new(&state_dir)
@@ -3643,6 +3760,7 @@ mod tests {
                     name: "tarn".into(),
                     reason,
                     uploads: true,
+                    detail: String::new(),
                 }],
                 ..SealedRun::default()
             };
@@ -3800,9 +3918,13 @@ mod tests {
     ) -> SealedRun {
         let state_dir = root.join("state");
         let keys = sealed::KeyStore::new(root.join("secrets"));
-        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
-            .await
-            .unwrap();
+        // Loaded as a run loads them: through the sealed storage
+        let storage = agora_agentkit::state::storage::Mirrored::new(
+            FsStorage::new(&state_dir),
+            (),
+            Arc::new(sealed::SealedEnrolment::with_keys(&state_dir, keys.clone())),
+        );
+        let loaded = load_states(&storage, &state_dir).await.unwrap();
         sealed_start_check(
             pool,
             &loaded.sealed,
@@ -3967,6 +4089,282 @@ mod tests {
         assert!(e.is::<RefusedRun>());
         assert!(pool.is_empty());
         assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// `n` agents chained locally under `root`, with a pool for them.
+    async fn local_fleet(
+        root: &std::path::Path,
+        n: usize,
+    ) -> (Vec<AgentId>, impl Fn() -> Vec<(AgentId, SeedState)>) {
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            ids.push(sealed::check::tests::enrolled_local(root).await.0);
+        }
+        let pool = {
+            let ids = ids.clone();
+            move || {
+                ids.iter()
+                    .map(|id| (*id, crate::agent_selection_tests::pooled("tarn").1))
+                    .collect::<Vec<_>>()
+            }
+        };
+        (ids, pool)
+    }
+
+    fn agent_dir(root: &std::path::Path, id: AgentId) -> std::path::PathBuf {
+        root.join("state").join(id.to_string())
+    }
+
+    async fn empty_state(root: &std::path::Path, id: AgentId) {
+        FsStorage::new(root.join("state"))
+            .save_raw(id, serde_json::json!({ "memory": "" }), None)
+            .await
+            .unwrap();
+    }
+
+    /// Review of B2, scenario 1: every state emptied and every head.json
+    /// truncated. The roster knows a head should be there: each is a
+    /// loss, and the run is refused (it used to run them all, held).
+    /// Scenario 2: every state emptied and one outbox item of each
+    /// damaged, which agentkit's recovery can't read: local evidence that
+    /// can't be read refuses the agent, and twelve stop the run.
+    #[tokio::test]
+    async fn unreadable_local_evidence_never_runs_the_fleet() {
+        for scenario in [1, 2] {
+            let root = sealed::TestDir::in_memory("main-unreadable-fleet");
+            let (ids, pool_of) = local_fleet(&root, 12).await;
+            let api = sealed::api::fake::guarded(&root);
+            let mut pool = pool_of();
+            let run = local_start(&root, &mut pool, &api).await;
+            assert!(run.refused.is_empty() && run.held.is_empty());
+            for id in &ids {
+                empty_state(&root, *id).await;
+                let sealed = agent_dir(&root, *id).join("sealed");
+                if scenario == 1 {
+                    std::fs::write(sealed.join("head.json"), b"").unwrap();
+                } else {
+                    let item = std::fs::read_dir(sealed.join("outbox"))
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .find(|p| p.extension().is_some_and(|x| x == "json"))
+                        .unwrap();
+                    std::fs::write(item, b"{ torn").unwrap();
+                }
+            }
+            let mut pool = pool_of();
+            let run = local_start(&root, &mut pool, &api).await;
+            assert_eq!(run.refused.len(), 12, "scenario {scenario}: {:?}", run.held);
+            assert!(
+                run.held.is_empty() && pool.is_empty(),
+                "scenario {scenario}"
+            );
+            let want = if scenario == 1 {
+                sealed::notice::Refusal::HeadMissing
+            } else {
+                sealed::notice::Refusal::SealUnreadable
+            };
+            assert!(
+                run.refused.iter().all(|r| r.reason == want),
+                "scenario {scenario}: {:?}",
+                run.refused.iter().map(|r| r.reason).collect::<Vec<_>>()
+            );
+            assert!(refuse_run(&run, &alerts::Alerter::off()).is_err());
+            assert!(api.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Review of B2, scenario 3: the roster and its `began` lost together
+    /// with every agent's sealed/. The secrets root's witness refuses the
+    /// run; without it, three or more strays beside a roster kept before
+    /// would. A roster that lost agents other than by forget is refused.
+    #[tokio::test]
+    async fn a_lost_roster_is_caught_by_its_witness() {
+        let root = sealed::TestDir::new("main-roster-witness");
+        let (ids, pool_of) = local_fleet(&root, 3).await;
+        let api = sealed::api::fake::guarded(&root);
+        let run = local_start(&root, &mut pool_of(), &api).await;
+        assert!(run.fleet.is_empty() && run.refused.is_empty());
+        let witness = root.join("secrets").join(sealed::roster::WITNESS);
+        assert!(witness.exists());
+        // An agent taken off the roster by hand: refused
+        let roster_path = root.join(sealed::roster::ROSTER);
+        let kept = std::fs::read(&roster_path).unwrap();
+        let mut roster = sealed::roster::load(&root).unwrap().unwrap();
+        roster.agents.remove(&ids[0]);
+        std::fs::write(&roster_path, serde_json::to_vec(&roster).unwrap()).unwrap();
+        let run = local_start(&root, &mut pool_of(), &api).await;
+        assert_eq!(run.fleet.len(), 1, "{:?}", run.fleet);
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_err());
+        std::fs::write(&roster_path, kept).unwrap();
+        // The roster, began and every sealed/ gone
+        std::fs::rename(&roster_path, root.join("roster.aside")).unwrap();
+        std::fs::rename(root.join(sealed::roster::BEGAN), root.join("began.aside")).unwrap();
+        for id in &ids {
+            std::fs::rename(
+                agent_dir(&root, *id).join("sealed"),
+                root.join(format!("sealed-{id}")),
+            )
+            .unwrap();
+        }
+        let run = local_start(&root, &mut pool_of(), &api).await;
+        assert!(
+            run.fleet.iter().any(|f| f.contains("sealed roster")),
+            "{:?}",
+            run.fleet
+        );
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_err());
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// Strays beside a roster kept before: three or more agents with keys
+    /// but no chain, or states never chained, refuse the run.
+    #[tokio::test]
+    async fn strays_beside_a_kept_roster_are_fleet_shaped() {
+        let root = sealed::TestDir::new("main-strays");
+        let (ids, pool_of) = local_fleet(&root, 4).await;
+        let api = sealed::api::fake::guarded(&root);
+        let run = local_start(&root, &mut pool_of(), &api).await;
+        assert!(run.fleet.is_empty());
+        // Three never chained, and not on the roster
+        for _ in 0..3 {
+            let id = AgentId::new();
+            FsStorage::new(root.join("state"))
+                .save_raw(id, sealed::check::tests::state(1), None)
+                .await
+                .unwrap();
+        }
+        let run = local_start(&root, &mut pool_of(), &api).await;
+        assert_eq!(run.fleet.len(), 1, "{:?}", run.fleet);
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_err());
+        let _ = ids;
+    }
+
+    /// Review of B2, scenario 5: another process saves an agent between
+    /// this one's load and its check. The check reads the state again
+    /// before refusing a mismatch: a healthy agent runs.
+    #[tokio::test]
+    async fn a_save_between_load_and_check_is_not_a_mismatch() {
+        let root = sealed::TestDir::new("main-overlap");
+        let (ids, pool_of) = local_fleet(&root, 1).await;
+        let state_dir = root.join("state");
+        let keys = sealed::KeyStore::new(root.join("secrets"));
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        // The other process's save
+        sealed::props::save(&root, ids[0], sealed::check::tests::state(2)).await;
+        let mut pool = pool_of();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &root,
+            &state_dir,
+            &keys,
+            &sealed::api::fake::guarded(&root),
+            &alerts::Alerter::off(),
+            false,
+            &mut Vec::new(),
+            None,
+        )
+        .await;
+        assert!(run.refused.is_empty(), "{:?}", run.refused);
+        assert_eq!(pool.len(), 1);
+    }
+
+    /// Review of B2, scenario 9: a directory removed is refused for its
+    /// missing state; recreated to hold the marker, the next start keeps
+    /// that reason, and offers only what can put a state back.
+    #[tokio::test]
+    async fn a_removed_directory_keeps_its_first_reason() {
+        let root = sealed::TestDir::new("main-first-reason");
+        let (ids, pool_of) = local_fleet(&root, 2).await;
+        let api = sealed::api::fake::guarded(&root);
+        local_start(&root, &mut pool_of(), &api).await;
+        std::fs::rename(agent_dir(&root, ids[0]), root.join("gone")).unwrap();
+        for _ in 0..2 {
+            let run = local_start(&root, &mut pool_of(), &api).await;
+            assert_eq!(
+                run.refused
+                    .iter()
+                    .map(|r| (r.id, r.reason))
+                    .collect::<Vec<_>>(),
+                vec![(ids[0], sealed::notice::Refusal::StateMissing)]
+            );
+        }
+        let options = refusal_options(ids[0], sealed::notice::Refusal::StateMissing);
+        assert!(
+            options.iter().all(|o| !o.contains("sealed-accept")),
+            "{options:?}"
+        );
+        assert!(
+            sealed::notice::Notice::load(&agent_dir(&root, ids[0]))
+                .unwrap()
+                .is_some_and(|n| n.reason == sealed::notice::Refusal::StateMissing)
+        );
+    }
+
+    /// Review of B2, scenario 11: agents still refused from earlier runs
+    /// stop every run until resolved, not only the one that reached three.
+    #[test]
+    fn three_outstanding_refusals_stop_every_run() {
+        let run = SealedRun {
+            outstanding: 3,
+            ..SealedRun::default()
+        };
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_err());
+        let run = SealedRun {
+            outstanding: 2,
+            ..SealedRun::default()
+        };
+        assert!(refuse_run(&run, &alerts::Alerter::off()).is_ok());
+    }
+
+    /// Review of B2, scenario 12: at fleet scale through the sealed
+    /// storage, as a run loads them, the May loss's other faces each
+    /// refuse the run: directories removed, sealed/ removed, and each
+    /// state replaced by its own older archive.
+    #[tokio::test]
+    async fn the_may_loss_through_the_sealed_storage() {
+        const MAY: usize = 1_556;
+        let base = sealed::TestDir::in_memory("main-may-mirrored");
+        let (ids, pool_of) = local_fleet(&base, MAY).await;
+        // A second save each, so each has an older archive
+        for id in &ids {
+            sealed::props::save(&base, *id, sealed::check::tests::state(2)).await;
+        }
+        let api = sealed::api::fake::guarded(&base);
+        let run = local_start(&base, &mut pool_of(), &api).await;
+        assert!(run.refused.is_empty() && run.fleet.is_empty());
+        for face in ["directory", "sealed", "archive"] {
+            let root = sealed::TestDir::in_memory("main-may-face");
+            std::process::Command::new("cp")
+                .arg("-a")
+                .arg(format!("{}/.", base.display()))
+                .arg(root.path())
+                .status()
+                .unwrap();
+            for id in &ids {
+                let dir = agent_dir(&root, *id);
+                match face {
+                    "directory" => std::fs::rename(&dir, root.join(format!("gone-{id}"))).unwrap(),
+                    "sealed" => {
+                        std::fs::rename(dir.join("sealed"), root.join(format!("gone-{id}")))
+                            .unwrap()
+                    }
+                    _ => {
+                        let older = sealed::enroll::archives(&dir).unwrap().remove(0);
+                        std::fs::copy(older.path, dir.join("state.json")).unwrap();
+                    }
+                }
+            }
+            let api = sealed::api::fake::guarded(&root);
+            let mut pool = pool_of();
+            let run = local_start(&root, &mut pool, &api).await;
+            assert_eq!(run.refused.len(), MAY, "{face}");
+            assert!(pool.is_empty(), "{face}");
+            assert!(refuse_run(&run, &alerts::Alerter::off()).is_err(), "{face}");
+            assert!(api.calls.lock().unwrap().is_empty(), "{face}");
+        }
     }
 
     /// A dry run checks nothing, so refuses nothing.

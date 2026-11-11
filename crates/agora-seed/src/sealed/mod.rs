@@ -64,7 +64,7 @@ pub mod lost;
 pub mod memory_tool;
 pub mod notice;
 #[cfg(test)]
-mod props;
+pub(crate) mod props;
 pub mod receipts;
 pub mod restore;
 pub mod roster;

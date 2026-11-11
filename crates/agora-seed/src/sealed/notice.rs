@@ -45,6 +45,11 @@ pub enum Refusal {
     /// seq under another hash): an older copy of its directory put back
     /// ([`super::roster`]).
     RolledBack,
+    /// Its sealed history here (`sealed/`, its outbox, its keys) couldn't
+    /// be read, so its state couldn't be checked: local evidence, not
+    /// transient, so the agent doesn't run unchecked. Not a loss by itself
+    /// (the roster says when it is one).
+    SealUnreadable,
 }
 
 impl Refusal {
@@ -58,6 +63,7 @@ impl Refusal {
             Self::StateTooNew => "state_too_new",
             Self::StateIo => "state_io",
             Self::RolledBack => "rolled_back",
+            Self::SealUnreadable => "seal_unreadable",
         }
     }
 
@@ -68,7 +74,7 @@ impl Refusal {
     /// leave that agent out alone.
     pub fn loss_shaped(self) -> bool {
         match self {
-            Self::Mismatch | Self::ChainBroken => false,
+            Self::Mismatch | Self::ChainBroken | Self::SealUnreadable => false,
             Self::HeadMissing
             | Self::StateMissing
             | Self::StateUnreadable
@@ -91,13 +97,20 @@ impl Refusal {
             Self::RolledBack => {
                 "your state here was older than your runner's record of your latest sealed version"
             }
+            Self::SealUnreadable => "your sealed history here couldn't be read",
         }
     }
 
     /// What `sealed/refused` says, as a [`Refusal`]: the one reading of
     /// the marker.
     pub fn from_marker(text: &str) -> Self {
-        match text.trim() {
+        Self::parse(text).unwrap_or(Self::Mismatch)
+    }
+
+    /// The marker's text as a reason, if it names one.
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text.trim() {
+            "mismatch" => Self::Mismatch,
             "chain_broken" => Self::ChainBroken,
             "head_missing" => Self::HeadMissing,
             "state_missing" => Self::StateMissing,
@@ -105,8 +118,9 @@ impl Refusal {
             "state_too_new" => Self::StateTooNew,
             "state_io" => Self::StateIo,
             "rolled_back" => Self::RolledBack,
-            _ => Self::Mismatch,
-        }
+            "seal_unreadable" => Self::SealUnreadable,
+            _ => return None,
+        })
     }
 }
 

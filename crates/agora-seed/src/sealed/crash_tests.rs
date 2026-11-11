@@ -196,7 +196,8 @@ async fn a_torn_tmp_is_never_promoted_and_restore_recovers() {
         &Default::default(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .refused;
     assert_eq!(missing, vec![(b.id, Refusal::StateMissing)]);
     super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
         .await
@@ -766,7 +767,8 @@ async fn a_state_from_a_newer_runner_is_never_restored_over() {
         &Default::default(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .refused;
     assert_eq!(refused, vec![(b.id, Refusal::StateTooNew)]);
     let e = super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
         .await
@@ -811,7 +813,8 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
             &Default::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .refused;
         let reason = if missing {
             Refusal::StateMissing
         } else {
@@ -869,6 +872,7 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
             )
             .await
             .unwrap()
+            .refused
             .is_empty()
         );
         assert!(matches!(
