@@ -82,21 +82,33 @@ pub enum Source {
     /// A snapshot on the main line, verified.
     Sealed { head: HeadRef },
     /// The pre-loss copy, sealed on the main line (`archived_prior`).
-    ArchivedPrior { head: HeadRef },
-    /// Sealed on a side line the operator rebased away from, or a later
-    /// save forked from (a `.displaced` entry, or a head `head.json`
-    /// records as displaced), verified from the genesis.
-    SideLine { head: HeadRef },
+    /// `added`: when it was sealed (the entry's `created_at`), always
+    /// later than the date it is shown at, which is when the copy stood.
+    ArchivedPrior {
+        head: HeadRef,
+        added: Option<DateTime<Utc>>,
+    },
+    /// Sealed on a side line: one the operator rebased away from, one a
+    /// later save forked from (a `.displaced` entry, or a head `head.json`
+    /// records as displaced), or saved while uploads were stopped and set
+    /// aside when they resumed (`resumed`: when; read from the resume's
+    /// record). Verified from the genesis.
+    SideLine {
+        head: HeadRef,
+        resumed: Option<DateTime<Utc>>,
+    },
     /// Sealed and verified from the genesis, held here but not on the
     /// current main line, with no record of why. Neutral: not called
     /// rebased.
     OffLine { head: HeadRef },
-    /// Set aside when the agent's line was rebased (`sealed/lost/<utc>/`,
-    /// or `sent/*.lost`), verified from the genesis. `on` is when, `None`
-    /// if unknown.
+    /// Set aside by an operator's resolution (`sealed/lost/<utc>/`, or
+    /// `sent/*.lost`), verified from the genesis. `on` is when, `None` if
+    /// unknown; `by`: a rebase, or a fork resolved (`sealed-accept
+    /// --keep`).
     SetAside {
         head: HeadRef,
         on: Option<DateTime<Utc>>,
+        by: SetAsideBy,
     },
     /// A local archive, `state.<utc>.json`: the runner's own copy, not
     /// sealed, so no head.
@@ -108,13 +120,23 @@ pub enum Source {
     KeptAtExit { file: String },
 }
 
+/// Which operator's resolution set a version aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetAsideBy {
+    /// `sealed-accept --rebase`: Agora lost versions sealed here.
+    Rebase,
+    /// `sealed-accept --keep`: a fork in a chain kept here, the other line
+    /// chosen.
+    Fork,
+}
+
 impl Source {
     /// Its sealed head, if it has one.
     pub fn head(&self) -> Option<HeadRef> {
         match self {
             Self::Sealed { head }
-            | Self::ArchivedPrior { head }
-            | Self::SideLine { head }
+            | Self::ArchivedPrior { head, .. }
+            | Self::SideLine { head, .. }
             | Self::OffLine { head }
             | Self::SetAside { head, .. } => Some(*head),
             Self::LocalCopy { .. } | Self::Current | Self::KeptAtExit { .. } => None,
@@ -226,6 +248,18 @@ pub struct LeftOut {
 pub struct History {
     pub versions: Vec<Version>,
     pub left_out: Vec<LeftOut>,
+    /// The main line's snapshots by where they are, when the line was
+    /// verified and the outbox read; `None` otherwise.
+    pub uploads: Option<Uploads>,
+}
+
+/// The main line's snapshots: on Agora, or only here. One on Agora is
+/// filed in `sent/` (Agora acknowledged it) or came from Agora's chain;
+/// one only here waits in `outbox/` (never uploaded, or not yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Uploads {
+    pub uploaded: usize,
+    pub local: usize,
 }
 
 /// What a head the agent gave resolves to.
@@ -521,8 +555,8 @@ async fn hold_unchecked(agent_dir: &Path, id: AgentId, b: &mut Builder) {
 enum Aside {
     /// `.displaced`, or a head `head.json` records as displaced.
     Displaced,
-    /// Set aside by a rebase, on this date if known.
-    Lost(Option<DateTime<Utc>>),
+    /// Set aside by an operator's resolution, on this date if known.
+    Lost(Option<DateTime<Utc>>, SetAsideBy),
     /// Held here off the main line, with no record of why.
     Off,
 }
@@ -662,8 +696,12 @@ async fn sealed(
     };
     let mut files = files;
     b.history.left_out.extend(files.left_out.iter().cloned());
+    let mut waiting: Option<HashSet<Sha256Hex>> = None;
     match (seal.sent().await, seal.outbox().await) {
-        (Ok(sent), Ok(outbox)) => files.items = sent.into_iter().chain(outbox).collect(),
+        (Ok(sent), Ok(outbox)) => {
+            waiting = Some(outbox.iter().map(|i| i.entry.entry_hash()).collect());
+            files.items = sent.into_iter().chain(outbox).collect()
+        }
         (Err(e), _) | (_, Err(e)) => b.leave_out(
             Held::File {
                 name: "sealed/sent, sealed/outbox".into(),
@@ -723,6 +761,21 @@ async fn sealed(
             }
         }
     }
+    if let Some(waiting) = &waiting
+        && !main.is_empty()
+    {
+        let (local, uploaded) = main
+            .iter()
+            .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
+            .fold((0, 0), |(l, u), e| {
+                if waiting.contains(&e.entry_hash()) {
+                    (l + 1, u)
+                } else {
+                    (l, u + 1)
+                }
+            });
+        ctx.b.history.uploads = Some(Uploads { uploaded, local });
+    }
     for entry in &main {
         let source = match entry.entry.kind {
             StateEntryKind::Snapshot => Source::Sealed {
@@ -730,6 +783,7 @@ async fn sealed(
             },
             StateEntryKind::ArchivedPrior => Source::ArchivedPrior {
                 head: head_of(entry),
+                added: DateTime::from_timestamp_micros(entry.entry.created_at),
             },
             _ => continue,
         };
@@ -745,11 +799,16 @@ async fn sealed(
     let mut side: Vec<(SignedStateEntry, Aside)> = Vec::new();
     for (_, intent) in &files.resolutions {
         for item in &intent.items {
-            side.push((item.entry.clone(), Aside::Lost(Some(intent.at))));
+            let by = if intent.local_fork.is_some() {
+                SetAsideBy::Fork
+            } else {
+                SetAsideBy::Rebase
+            };
+            side.push((item.entry.clone(), Aside::Lost(Some(intent.at), by)));
         }
     }
     for (item, on) in &files.lost {
-        side.push((item.entry.clone(), Aside::Lost(*on)));
+        side.push((item.entry.clone(), Aside::Lost(*on, SetAsideBy::Rebase)));
     }
     for item in &files.displaced {
         side.push((item.entry.clone(), Aside::Displaced));
@@ -765,6 +824,17 @@ async fn sealed(
             side.push((item.entry.clone(), how));
         }
     }
+    // Which side-line versions a resume set aside (saved while uploads
+    // were stopped), from its record
+    let resumed: HashMap<Sha256Hex, DateTime<Utc>> = {
+        let dir = agent_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || super::enroll::resumed_aside(&dir))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|(at, aside)| aside.into_iter().map(move |h| (h, at)))
+            .collect()
+    };
     let mut pool = main.clone();
     pool.extend(side.iter().map(|(e, _)| e.clone()));
     let mut seen = on_main;
@@ -799,8 +869,11 @@ async fn sealed(
             continue;
         };
         let source = match aside {
-            Aside::Displaced => Source::SideLine { head },
-            Aside::Lost(on) => Source::SetAside { head, on },
+            Aside::Displaced => Source::SideLine {
+                head,
+                resumed: resumed.get(&head.entry_hash).copied(),
+            },
+            Aside::Lost(on, by) => Source::SetAside { head, on, by },
             Aside::Off => Source::OffLine { head },
         };
         ctx.open(&line, &entry, source).await;
@@ -1172,6 +1245,7 @@ mod tests {
         let h = History {
             versions: Vec::new(),
             left_out: vec![left(head(1)), left(head(2))],
+            uploads: None,
         };
         let HeadMatch::Ambiguous(both) = h.find_head("abababab") else {
             panic!()
@@ -1219,7 +1293,13 @@ mod tests {
         else {
             panic!("{h:?}")
         };
-        assert_eq!(source, &Source::SideLine { head });
+        assert_eq!(
+            source,
+            &Source::SideLine {
+                head,
+                resumed: None
+            }
+        );
         assert_eq!(version.memory_str(), memory(3));
         // The rebased head sealed the same state over Agora's: one version
         assert_eq!(version.sources[0].line(), Some(Line::Main));
@@ -1330,6 +1410,58 @@ mod tests {
             let memories: Vec<&str> = h.versions.iter().map(Version::memory_str).collect();
             assert_eq!(memories, ["", &memory(2), &memory(3)]);
         }
+    }
+
+    /// The main line's snapshots counted by where they are: waiting in
+    /// the outbox (never uploaded, or not yet) or on Agora (acknowledged,
+    /// or read from Agora's chain after a restore).
+    #[tokio::test]
+    async fn the_main_line_is_counted_by_where_it_is() {
+        let uploads = |b: crate::sealed::props::Built| async move {
+            resolve(
+                &b.state_dir(),
+                &b.keys,
+                &b.api,
+                b.id,
+                &mut HistoryCache::default(),
+            )
+            .await
+            .unwrap()
+            .uploads
+            .unwrap()
+        };
+        let never = uploads(build(&plain(2, 0)).await).await;
+        assert_eq!(
+            never,
+            Uploads {
+                uploaded: 0,
+                local: 3
+            }
+        );
+        let all = uploads(build(&plain(2, 9)).await).await;
+        assert_eq!(
+            all,
+            Uploads {
+                uploaded: 3,
+                local: 0
+            }
+        );
+        let some = uploads(build(&plain(2, 2)).await).await;
+        assert!(some.uploaded > 0 && some.local > 0, "{some:?}");
+        assert_eq!(some.uploaded + some.local, 3);
+        let restored = uploads(
+            build(&Built {
+                saves: 2,
+                upload: 0,
+                rotate: false,
+                mode: Mode::Restore,
+                upload_rebased: false,
+            })
+            .await,
+        )
+        .await;
+        assert_eq!(restored.local, 0, "Agora's entries only: {restored:?}");
+        assert!(restored.uploaded > 0);
     }
 
     fn plain(saves: usize, upload: usize) -> Built {
@@ -1515,7 +1647,7 @@ mod tests {
             panic!("{h:?}")
         };
         assert!(
-            matches!(source, Source::SetAside { head, on: Some(_) } if *head == old),
+            matches!(source, Source::SetAside { head, on: Some(_), by: SetAsideBy::Rebase } if *head == old),
             "{source:?}"
         );
         assert_eq!(version.memory_str(), memory(3));
