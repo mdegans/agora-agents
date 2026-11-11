@@ -51,16 +51,17 @@ impl Reach {
     }
 }
 
-/// The agent's [`Reach`], by the guard's own predicates: it uploads
-/// ([`super::uploads`], may send), or has ever uploaded
-/// ([`super::uploading::has_uploaded`], may read).
+/// The agent's [`Reach`]: the start check's own classification
+/// ([`super::check::Upload::of`]), one reading of the markers. A marker in
+/// doubt is [`Reach::Stopped`]: something of the agent may be on Agora, so
+/// nothing says it isn't, and nothing is sent (reads pass the guard only
+/// where a copy of the marker can be read, `has_uploaded`).
 pub fn reach(agent_dir: &std::path::Path, keys: &KeyStore, id: AgentId) -> Reach {
-    if super::uploads(agent_dir, keys, id) {
-        Reach::Uploads
-    } else if super::uploading::has_uploaded(agent_dir, keys, id) {
-        Reach::Stopped
-    } else {
-        Reach::Local
+    use super::check::Upload;
+    match Upload::of(agent_dir, keys, id) {
+        Upload::Now => Reach::Uploads,
+        Upload::Before | Upload::InDoubt => Reach::Stopped,
+        Upload::Never => Reach::Local,
     }
 }
 
@@ -570,5 +571,127 @@ pub async fn drop_acknowledged_blobs(seal: &AgentSeal) {
         {
             let _ = std::fs::remove_file(seal.dir().join("blobs").join(b.sha256.to_hex()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sealed::check::{Upload, tests::enrolled_local};
+    use crate::sealed::uploading::{self, DURABLE, UPLOADING, UploadingBy};
+
+    /// Every state an agent's relation to Agora can be in, fed to both
+    /// classifications: the start check's [`Upload`] and the operator
+    /// commands' [`Reach`] agree on each (uploading; stopped after
+    /// uploading; never uploaded; the marker in doubt four ways; forgotten
+    /// and put back, before and after the start pass).
+    #[tokio::test]
+    async fn upload_and_reach_agree_for_every_state() {
+        use Reach as R;
+        use Upload as U;
+        let root = crate::sealed::TestDir::new("version-reach-table");
+        let state_dir = root.join("state");
+        let mut rows: Vec<(&str, U, R)> = Vec::new();
+        let mut row = |name: &'static str, dir: &std::path::Path, keys: &KeyStore, id| {
+            rows.push((name, U::of(dir, keys, id), reach(dir, keys, id)));
+        };
+        let local = |dir: &std::path::Path| dir.join("sealed").join(UPLOADING);
+        let durable = |keys: &KeyStore, id: AgentId| keys.agent_dir(id).join(DURABLE);
+        let uploading = async || {
+            let (id, keys, dir) = enrolled_local(&root).await;
+            uploading::set(&dir, &keys, id, UploadingBy::OptIn).unwrap();
+            // Uploaded: nothing waits
+            let seal = AgentSeal::new(&dir, id);
+            for item in seal.outbox().await.unwrap() {
+                seal.mark_sent(item.ord).await.unwrap();
+            }
+            (id, keys, dir)
+        };
+
+        let (id, keys, dir) = uploading().await;
+        row("uploading", &dir, &keys, id);
+
+        let (id, keys, dir) = uploading().await;
+        crate::sealed::stop::stop(&state_dir, &keys, id, "asked", Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        row("stopped after uploading", &dir, &keys, id);
+
+        let (id, keys, dir) = enrolled_local(&root).await;
+        row("never uploaded", &dir, &keys, id);
+
+        let (id, keys, dir) = uploading().await;
+        std::fs::remove_file(durable(&keys, id)).unwrap();
+        row("in doubt: local copy only", &dir, &keys, id);
+
+        let (id, keys, dir) = uploading().await;
+        let mut other: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(durable(&keys, id)).unwrap()).unwrap();
+        other["since"] = serde_json::json!("2020-01-01T00:00:00Z");
+        std::fs::write(durable(&keys, id), other.to_string()).unwrap();
+        row("in doubt: copies differ", &dir, &keys, id);
+
+        let (id, keys, dir) = enrolled_local(&root).await;
+        std::fs::write(local(&dir), b"not json").unwrap();
+        row("in doubt: local copy unreadable, no other", &dir, &keys, id);
+
+        let (id, keys, dir) = uploading().await;
+        std::fs::write(durable(&keys, id), b"not json").unwrap();
+        row("in doubt: secrets copy unreadable", &dir, &keys, id);
+
+        // Forgotten (it left), then put back with its old local marker
+        let (id, keys, dir) = uploading().await;
+        let kept = root.join(format!("kept-{id}"));
+        std::fs::rename(&dir, &kept).unwrap();
+        let done = crate::sealed::forget::forget(&state_dir, &keys, id, "it left")
+            .await
+            .unwrap();
+        std::fs::rename(&kept, &dir).unwrap();
+        let secrets = keys.agent_dir(id);
+        std::fs::copy(
+            secrets.join(&done.key),
+            secrets.join(crate::sealed::keys::STATE_KEY_FILE),
+        )
+        .unwrap();
+        row(
+            "forgotten, put back, before the start pass",
+            &dir,
+            &keys,
+            id,
+        );
+        uploading::start_pass(&state_dir, &keys, &crate::alerts::Alerter::off()).await;
+        row("forgotten, put back, after the start pass", &dir, &keys, id);
+
+        let agree = |u: U, r: R| match u {
+            U::Now => r == R::Uploads,
+            U::Before | U::InDoubt => r == R::Stopped,
+            U::Never => r == R::Local,
+        };
+        let table: Vec<String> = rows
+            .iter()
+            .map(|(n, u, r)| format!("{n}: {u:?} / {r:?}"))
+            .collect();
+        assert!(
+            rows.iter().all(|(_, u, r)| agree(*u, *r)),
+            "{}",
+            table.join("\n")
+        );
+        let expected = [
+            (U::Now, R::Uploads),
+            (U::Before, R::Stopped),
+            (U::Never, R::Local),
+            (U::InDoubt, R::Stopped),
+            (U::InDoubt, R::Stopped),
+            (U::InDoubt, R::Stopped),
+            (U::InDoubt, R::Stopped),
+            (U::InDoubt, R::Stopped),
+            (U::Never, R::Local),
+        ];
+        assert_eq!(
+            rows.iter().map(|(_, u, r)| (*u, *r)).collect::<Vec<_>>(),
+            expected,
+            "{}",
+            table.join("\n")
+        );
     }
 }
