@@ -341,10 +341,10 @@ pub struct LeftOutFile {
     pub archives: Vec<LeftOut>,
 }
 
-const LEFT_OUT: &str = "left_out.json";
+pub const LEFT_OUT: &str = "left_out.json";
 
-/// What `sealed/left_out.json` records; empty when there is none.
-// B7/wording step: the `memory` tool's log is to read this too
+/// What `sealed/left_out.json` records; empty when there is none. The
+/// `memory` tool's `log` says the count, once.
 pub fn left_out(agent_dir: &Path) -> std::io::Result<Vec<LeftOut>> {
     match std::fs::read(
         agent_dir

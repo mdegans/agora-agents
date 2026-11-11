@@ -182,6 +182,61 @@ pub async fn mark_memory_ids_told(agent_dir: &Path) -> std::io::Result<()> {
         .map_err(std::io::Error::other)?
 }
 
+/// `sealed/left_out_told.json`: how many of the copies its chain left out
+/// ([`super::enroll::left_out`]) the agent has been told of, by `log`.
+pub const LEFT_OUT_TOLD: &str = "left_out_told.json";
+
+/// What `log` says, once, of the runner's local copies the chain couldn't
+/// include.
+pub fn left_out_line(n: usize) -> String {
+    if n == 1 {
+        "1 of your runner's local copies couldn't be read and is not in your sealed history."
+            .to_string()
+    } else {
+        format!(
+            "{n} of your runner's local copies couldn't be read and are not in your sealed \
+             history."
+        )
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct LeftOutTold {
+    told: usize,
+}
+
+/// The left-out line, with the count to mark told, if `log` hasn't said
+/// this many yet. Anything unreadable says nothing: never worth a guess.
+async fn left_out_note(agent_dir: &Path) -> Option<(String, usize)> {
+    let dir = agent_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let n = super::enroll::left_out(&dir).ok()?.len();
+        let told = match std::fs::read(
+            dir.join(agora_agentkit::state::storage::SEALED_DIR)
+                .join(LEFT_OUT_TOLD),
+        ) {
+            Ok(bytes) => serde_json::from_slice::<LeftOutTold>(&bytes).ok()?.told,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return None,
+        };
+        (n > told).then(|| (left_out_line(n), n))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Mark `n` left-out copies told. Atomic, 0600.
+async fn mark_left_out_told(agent_dir: &Path, n: usize) -> std::io::Result<()> {
+    let path = agent_dir
+        .join(agora_agentkit::state::storage::SEALED_DIR)
+        .join(LEFT_OUT_TOLD);
+    let body = serde_json::to_vec_pretty(&LeftOutTold { told: n })?;
+    tokio::task::spawn_blocking(move || super::write_private(&path, &body))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// One answer: its text, and whether it is a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
@@ -289,7 +344,24 @@ impl MemoryReader {
         let view = View::new(history, ids, self.id, &anchors);
         let current = view.current(current_id, &current);
         let text = match action {
-            MemoryAction::Log { before, limit } => view.log(before.as_ref(), limit, &current),
+            MemoryAction::Log { before, limit } => {
+                let text = view.log(before.as_ref(), limit, &current);
+                // Once: the local copies the chain couldn't include
+                match left_out_note(&self.agent_dir()).await {
+                    Some((line, n)) => {
+                        if let Err(e) = mark_left_out_told(&self.agent_dir(), n).await {
+                            tracing::warn!(
+                                event_type = "memory_tool_left_out_not_marked",
+                                agent_id = %self.id,
+                                error = %e,
+                                "the left-out line not marked told; the next log repeats it"
+                            );
+                        }
+                        compose(&[line], &text)
+                    }
+                    None => text,
+                }
+            }
             MemoryAction::Show { id, budget } => view.show(id.as_slice(), budget, current),
             MemoryAction::Diff { a, b } => view.diff(&a, b.as_ref(), current),
             MemoryAction::Search { query, limit } => {
@@ -1457,6 +1529,64 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(format!("{:?}", result.content).contains("couldn't be worked out"));
+    }
+
+    /// The local copies the chain left out are told once, by `log`: the
+    /// count, never which; told again only when more are left out.
+    #[tokio::test]
+    async fn log_says_once_how_many_local_copies_were_left_out() {
+        use crate::sealed::enroll::{LEFT_OUT, LeftOut, LeftOutFile, Unreadable};
+        let root = crate::sealed::TestDir::new("memory-tool-left-out");
+        let state_dir = root.join("state");
+        let id = AgentId::new();
+        let mut fs = FsStorage::new(&state_dir);
+        fs.save_raw(id, version(1), None).await.unwrap();
+        let ks = KeyStore::new(root.join("secrets"));
+        let api: Arc<dyn SealedApi> = Arc::new(FakeApi::new());
+        let mut r = reader(&state_dir, &ks, id, 1, None);
+        let log = async |r: &mut MemoryReader| {
+            let a = r
+                .answer(
+                    MemoryAction::Log {
+                        before: None,
+                        limit: None,
+                    },
+                    api.as_ref(),
+                )
+                .await;
+            assert!(!a.error, "{}", a.text);
+            a.text
+        };
+        assert!(
+            !log(&mut r).await.contains("couldn't be read and"),
+            "none left out"
+        );
+        let write = |n: usize| {
+            let file = LeftOutFile {
+                archives: (0..n)
+                    .map(|i| LeftOut {
+                        name: format!("state.2026010{i}T000000000Z.json"),
+                        reason: Unreadable::NotJson,
+                    })
+                    .collect(),
+            };
+            std::fs::write(
+                state_dir.join(id.to_string()).join("sealed").join(LEFT_OUT),
+                serde_json::to_vec(&file).unwrap(),
+            )
+            .unwrap();
+        };
+        std::fs::create_dir_all(state_dir.join(id.to_string()).join("sealed")).unwrap();
+        write(2);
+        let text = log(&mut r).await;
+        assert!(text.starts_with(&left_out_line(2)), "{text}");
+        assert!(!log(&mut r).await.contains("couldn't be read and"), "once");
+        write(3);
+        assert!(log(&mut r).await.starts_with(&left_out_line(3)));
+        assert_eq!(
+            left_out_line(1),
+            "1 of your runner's local copies couldn't be read and is not in your sealed history."
+        );
     }
 
     fn head(n: u8) -> agora_agentkit::state::verify::HeadRef {
