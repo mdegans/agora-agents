@@ -6,7 +6,8 @@
 //! on which model, the option order shown and its seed, how many attempts,
 //! and the outcome. **Asked once**: an answer on file, or an explicit
 //! refusal, ends it; a missing answer is re-asked up to [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) in
-//! all. `sealed-enroll` reads [`SealLedger::choice`] and nothing else.
+//! all. `sealed-enroll` reads [`SealLedger::choice`] (the latest answer) and
+//! nothing else.
 
 use agora_agentkit::reactor::seed::{ShortString, Soul};
 use chrono::{DateTime, Utc};
@@ -19,8 +20,10 @@ use super::prompt::SealChoice;
 pub const LEDGER_FILE: &str = "sealed_state.json";
 
 /// Bump on layout change (2 since 2026-11-06: answers' `note`, the
-/// `unusable` outcome); [`SealLedger::load`] refuses anything newer.
-pub const FORMAT: u32 = 2;
+/// `unusable` outcome; 3 since 2026-11-11: the operator's re-offer, which
+/// an older runner would drop on its next save); [`SealLedger::load`]
+/// refuses anything newer.
+pub const FORMAT: u32 = 3;
 
 /// The whole per-agent file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +39,14 @@ pub struct SealLedger {
     /// after it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acknowledged: bool,
+    /// The operator re-opened the question (`agora-seed sealed-reoffer`):
+    /// put again, once, at the agent's next session; consumed by its
+    /// answer (or an explicit refusal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reoffer: Option<Reoffer>,
+    /// Re-offers answered, oldest first, each with when it was answered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reoffers: Vec<Reoffer>,
 }
 
 impl Default for SealLedger {
@@ -45,8 +56,50 @@ impl Default for SealLedger {
             agent: None,
             asks: Vec::new(),
             acknowledged: false,
+            reoffer: None,
+            reoffers: Vec::new(),
         }
     }
+}
+
+/// The operator re-opened the question for the agent. Never consent: only
+/// the agent's own answer to it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reoffer {
+    pub at: DateTime<Utc>,
+    /// The operator's note: shown to the agent with the question.
+    pub note: String,
+    /// [`super::prompt::OFFER_VERSION`] of the text to be put.
+    pub offer_version: u32,
+    /// The answer on file when it was re-opened.
+    pub reopens: SealChoice,
+    /// When the agent answered it (in [`SealLedger::reoffers`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<DateTime<Utc>>,
+}
+
+/// Why the operator can't re-open the question.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NoReoffer {
+    /// Nothing to re-open: the ordinary offer (`[sealed_state]`) asks an
+    /// agent that hasn't answered.
+    #[error(
+        "it has not answered the offer: list it in `[sealed_state]` to be asked; a re-offer \
+         re-opens an answer"
+    )]
+    NeverAnswered,
+    /// It refused the question outright: final.
+    #[error("it refused the question, which is final")]
+    Refused,
+}
+
+/// What an operator's action would contradict in the agent's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Contradicts {
+    #[error("its latest answer to the sealed-state offer is `decline`")]
+    SaidNo,
+    #[error("its latest answer to the sealed-state offer is `{0}` (yes)")]
+    SaidYes(&'static str),
 }
 
 /// One putting of the offer.
@@ -100,16 +153,28 @@ impl SealLedger {
     /// Whether the offer should be put this session: nothing final on
     /// file, fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no recorded answer in
     /// `soul`'s Evolution Log.
+    /// A pending re-offer is due regardless of the answer on file, until
+    /// it has missed as often as a first offer may.
     pub fn due(&self, soul: &Soul) -> bool {
+        if let Some(r) = &self.reoffer {
+            return crate::consent::offer::misses(
+                self.asks
+                    .iter()
+                    .filter(|a| a.at >= r.at)
+                    .map(|a| crate::consent::offer::Outcome::status(&a.outcome)),
+            )
+            .is_some_and(|m| m < crate::consent::offer::MAX_MISSES);
+        }
         crate::consent::offer::due(
             self.asks.iter().map(|a| &a.outcome),
             super::applied_in(soul),
         )
     }
 
-    /// The choice on file, if any (asked once: at most one).
+    /// The choice on file, if any: the **latest** answer. A later answer
+    /// (to an operator's re-offer) replaces an earlier one, either way.
     pub fn choice(&self) -> Option<SealChoice> {
-        self.asks.iter().find_map(|a| match &a.outcome {
+        self.asks.iter().rev().find_map(|a| match &a.outcome {
             SealOutcome::Answered { choice, .. } => Some(*choice),
             _ => None,
         })
@@ -123,13 +188,76 @@ impl SealLedger {
         )
     }
 
+    /// Re-open the question for the agent (`sealed-reoffer`): put again,
+    /// once, at its next session, with `note`. A pending one is replaced
+    /// (`true`). The caller saves.
+    pub fn reopen(&mut self, note: &str, at: DateTime<Utc>) -> Result<bool, NoReoffer> {
+        if self
+            .asks
+            .iter()
+            .any(|a| matches!(a.outcome, SealOutcome::Refused { .. }))
+        {
+            return Err(NoReoffer::Refused);
+        }
+        let reopens = self.choice().ok_or(NoReoffer::NeverAnswered)?;
+        let replaced = self.reoffer.is_some();
+        self.reoffer = Some(Reoffer {
+            at,
+            note: note.trim().to_string(),
+            offer_version: super::prompt::OFFER_VERSION,
+            reopens,
+            answered_at: None,
+        });
+        Ok(replaced)
+    }
+
+    /// Whether an operator may opt the agent in (`yes`) or stop its
+    /// uploads (`!yes`) without overriding its answer: never against its
+    /// latest answer. A stop with no answer on file contradicts nothing.
+    pub fn allows(&self, yes: bool) -> Result<(), Contradicts> {
+        match (yes, self.choice()) {
+            (true, Some(SealChoice::Decline)) => Err(Contradicts::SaidNo),
+            (false, Some(c @ (SealChoice::Publish | SealChoice::Private))) => {
+                Err(Contradicts::SaidYes(c.as_str()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the latest answer was to an operator's re-offer.
+    fn latest_reoffered(&self) -> bool {
+        let latest = self.asks.iter().rev().find_map(|a| match a.outcome {
+            SealOutcome::Answered { .. } => Some(a.at),
+            _ => None,
+        });
+        latest.is_some() && self.reoffers.last().and_then(|r| r.answered_at) == latest
+    }
+
     /// The line telling the agent its answer is on file, at the first
-    /// session after it; `None` once told, or with no answer.
-    pub fn ack_line(&self) -> Option<String> {
+    /// session after it; `None` once told, or with no answer. `uploading`:
+    /// its chain is uploaded (marked so), which an answer doesn't change
+    /// by itself.
+    pub fn ack_line(&self, uploading: bool) -> Option<String> {
         if self.acknowledged {
             return None;
         }
-        Some(match self.choice()? {
+        let choice = self.choice()?;
+        if self.latest_reoffered() {
+            return Some(format!(
+                "Your answer to the sealed-backups question your operator re-opened is \
+                 recorded: {}. Your operator has been told, and acts on it; you'll be told \
+                 when it has.",
+                choice.as_str()
+            ));
+        }
+        Some(match choice {
+            SealChoice::Decline if uploading => {
+                "Your answer to the sealed-backups offer is recorded: decline. Your earlier \
+                 answer was yes, and your sealed state is still uploaded to Agora: an answer \
+                 doesn't stop the uploads by itself. Your operator has been told of your new \
+                 answer, and can stop new uploads for you; what is already on Agora stays."
+                    .to_string()
+            }
             SealChoice::Decline => {
                 "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; \
                  if you change your mind, ask your operator."
@@ -147,8 +275,29 @@ impl SealLedger {
         self.acknowledged = true;
     }
 
+    /// Record a putting of the offer. An answer (or a refusal) consumes a
+    /// pending re-offer, and is told back at the next session.
     pub fn record(&mut self, ask: SealAsk) {
+        let settled = matches!(
+            ask.outcome,
+            SealOutcome::Answered { .. } | SealOutcome::Refused { .. }
+        );
+        if settled && let Some(mut r) = self.reoffer.take() {
+            r.answered_at = Some(ask.at);
+            self.reoffers.push(r);
+        }
+        if matches!(ask.outcome, SealOutcome::Answered { .. }) {
+            self.acknowledged = false;
+        }
         self.asks.push(ask);
+    }
+
+    /// An answer arriving now would be the agent's second (or later) with
+    /// no re-offer pending: the offer is asked once, so a ledger that
+    /// shows this is wrong. Logged at error and alerted; nothing acts on
+    /// it.
+    pub fn unprompted_answer(&self) -> bool {
+        self.reoffer.is_none() && self.choice().is_some()
     }
 
     /// Note that writing the answer's SOUL line or note failed. The choice
@@ -255,22 +404,22 @@ mod tests {
     #[test]
     fn the_answer_is_acknowledged_once() {
         let mut l = SealLedger::default();
-        assert_eq!(l.ack_line(), None, "nothing answered");
+        assert_eq!(l.ack_line(false), None, "nothing answered");
         l.record(ask(SealOutcome::NoAnswer {
             failure: "refusal".into(),
         }));
-        assert_eq!(l.ack_line(), None, "no answer, nothing to tell");
+        assert_eq!(l.ack_line(false), None, "no answer, nothing to tell");
         l.record(ask(answered(SealChoice::Publish)));
         assert_eq!(
-            l.ack_line().unwrap(),
+            l.ack_line(false).unwrap(),
             "Your answer to the sealed-backups offer is recorded: publish."
         );
         l.acknowledge();
-        assert_eq!(l.ack_line(), None, "once");
+        assert_eq!(l.ack_line(false), None, "once");
         let mut no = SealLedger::default();
         no.record(ask(answered(SealChoice::Decline)));
         assert_eq!(
-            no.ack_line().unwrap(),
+            no.ack_line(false).unwrap(),
             "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; \
              if you change your mind, ask your operator."
         );

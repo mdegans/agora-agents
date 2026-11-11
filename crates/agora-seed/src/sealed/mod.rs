@@ -65,6 +65,8 @@ mod props;
 pub mod receipts;
 pub mod restore;
 pub mod rotate;
+// B2: the roster; B3 added a stub (`roster.rs`) that B2's replaces
+pub mod roster;
 pub mod session;
 pub mod sizes;
 pub mod stop;
@@ -198,14 +200,6 @@ pub fn is_enrolled(agent_dir: &Path) -> bool {
             true
         }
     }
-}
-
-/// Enrolled by either record: `sealed/enrolled`, or a state key in
-/// `<secrets>/<id>/` (which survives a lost state directory).
-pub fn enrolled_by_keys_or_marker(agent_dir: &Path, secrets_dir: &Path, id: AgentId) -> bool {
-    is_enrolled(agent_dir)
-        || std::fs::exists(secrets_dir.join(id.to_string()).join(keys::STATE_KEY_FILE))
-            .unwrap_or(true)
 }
 
 impl Enrolment for SealedEnrolment {

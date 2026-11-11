@@ -242,6 +242,16 @@ pub struct Notice {
     /// With an acceptance: what changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<Diff>,
+    // B3: the minimum for a resume's notice (B2 owns this file)
+    /// Not a refusal: uploads resumed after a stop, and this many versions
+    /// saved while stopped were kept here and not sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_while_stopped: Option<usize>,
+    // B3: an opt-in against the agent's answer (B2 owns this file)
+    /// Not a refusal: the operator started uploading although the agent's
+    /// latest answer is `decline`, with its note.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opted_in_against_answer: bool,
 }
 
 fn path(agent_dir: &Path) -> PathBuf {
@@ -295,14 +305,32 @@ impl Notice {
                 restored: None,
                 agora_lost: None,
                 diff: None,
+                kept_while_stopped: None,
+                opted_in_against_answer: false,
             },
         )
     }
 
-    /// Stopped backups resumed over a changed state, with the operator's
-    /// note. An earlier notice not yet shown is kept aside.
-    pub fn resumed(agent_dir: &Path, note: &str) -> std::io::Result<()> {
-        Self::operator_note(agent_dir, note, false, true)
+    // B3: an opt-in against the agent's answer (B2 owns this file)
+    /// The operator started uploading against the agent's `decline`, with
+    /// its note. An earlier notice not yet shown is kept aside.
+    pub fn opted_in_against(agent_dir: &Path, note: &str) -> std::io::Result<()> {
+        Self::operator_note(agent_dir, note, false, false)?;
+        let mut n = Self::load(agent_dir)?.expect("just written");
+        n.opted_in_against_answer = true;
+        write(agent_dir, &n)
+    }
+
+    // B3: a resume after a stop (B2 owns this file)
+    /// Uploads resumed after a stop: `kept` versions saved while stopped
+    /// were kept here and not sent (none: the state changed outside the
+    /// store, and `note` says why). An earlier notice not yet shown is
+    /// kept aside.
+    pub fn resumed_kept(agent_dir: &Path, note: Option<&str>, kept: usize) -> std::io::Result<()> {
+        Self::operator_note(agent_dir, note.unwrap_or_default(), false, true)?;
+        let mut n = Self::load(agent_dir)?.expect("just written");
+        n.kept_while_stopped = (kept > 0).then_some(kept);
+        write(agent_dir, &n)
     }
 
     /// Agora lost versions sealed here; the operator sealed the state on
@@ -360,6 +388,8 @@ impl Notice {
                 restored: None,
                 agora_lost: None,
                 diff: None,
+                kept_while_stopped: None,
+                opted_in_against_answer: false,
             },
         )
     }
@@ -423,6 +453,8 @@ impl Notice {
             restored: None,
             agora_lost: None,
             diff: None,
+            kept_while_stopped: None,
+            opted_in_against_answer: false,
         }
     }
 
@@ -482,6 +514,33 @@ impl Notice {
                     lost.kept, accepted.note
                 )
             });
+        }
+        // B3: an opt-in against the agent's answer (B2 owns this file)
+        if self.opted_in_against_answer {
+            return Some(format!(
+                "On {}, your operator started uploading your sealed state to Agora, although \
+                 your answer on file is `decline`. Your operator's note: {}",
+                accepted.at.format("%-d %B %Y"),
+                accepted.note
+            ));
+        }
+        // B3: a resume that kept the stopped interval here (B2 owns this file)
+        if let Some(n) = self.kept_while_stopped.filter(|_| self.resumed) {
+            let versions = if n == 1 {
+                "The version of your state saved while uploads were stopped was".to_string()
+            } else {
+                format!("The {n} versions of your state saved while uploads were stopped were")
+            };
+            let mut line = format!(
+                "On {}, your operator resumed uploading your sealed state. {versions} kept here \
+                 on your runner and not sent to Agora; uploading went on from your state as it \
+                 was then.",
+                accepted.at.format("%-d %B %Y"),
+            );
+            if !accepted.note.is_empty() {
+                line.push_str(&format!(" Your operator's note: {}", accepted.note));
+            }
+            return Some(line);
         }
         if self.resumed {
             return Some(format!(

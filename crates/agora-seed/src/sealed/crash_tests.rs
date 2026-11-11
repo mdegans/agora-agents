@@ -851,29 +851,6 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
     }
 }
 
-#[test]
-fn an_enrolled_agent_counts_as_enrolled_by_either_record() {
-    let root = super::TestDir::new("enrolled-either");
-    let id = AgentId::new();
-    let (agent_dir, secrets) = (
-        root.join("state").join(id.to_string()),
-        root.join("secrets"),
-    );
-    assert!(!super::enrolled_by_keys_or_marker(&agent_dir, &secrets, id));
-    std::fs::create_dir_all(secrets.join(id.to_string())).unwrap();
-    std::fs::write(
-        secrets
-            .join(id.to_string())
-            .join(super::keys::STATE_KEY_FILE),
-        b"{}",
-    )
-    .unwrap();
-    assert!(
-        super::enrolled_by_keys_or_marker(&agent_dir, &secrets, id),
-        "its key, its directory gone"
-    );
-}
-
 /// Beside a live runner (its shared hold on runner.lock), `sealed-accept
 /// --rebase` refuses before reading or writing anything: no start check,
 /// no size record, no resolution begun.

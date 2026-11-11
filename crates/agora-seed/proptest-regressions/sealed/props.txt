@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b396c8dbd70467d68840d5f0d84d180000f22de3e3b42af4714d257313e33ae8 # shrinks to h = History { saves: 0, upload: 0, rotate: true, mode: Plain, upload_rebased: false }
+cc bed54d0e670dbc1899b868a4c8792f040d31ff4a1e67ef0f2fe0cbec1062cfe4 # shrinks to h = History { saves: 0, upload: 0, rotate: true, mode: Plain, upload_rebased: false }
+cc a71f035d6d0381657cd5ac7a9fec2bd51848540002dc6e5a01b23a9717e45d82 # shrinks to h = History { saves: 0, upload: 0, rotate: true, mode: Plain, upload_rebased: false }, f = ServerUnreachable
+cc 5fb2aa60471a6dcf5b9b54f05731e1d6142c1476d67070a17728561ba5747a62 # shrinks to h = History { saves: 0, upload: 1, rotate: true, mode: Plain, upload_rebased: false }, l = Wiped

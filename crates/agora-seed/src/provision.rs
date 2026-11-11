@@ -10,7 +10,9 @@
 //! **What it writes,** under `--data-dir` and nowhere else: before the request,
 //! `provision-<name>.json` (0600: the new agent's secret key and the action id), so a
 //! lost answer can be retried with the same key; after it, the key in `secrets/`, the
-//! state in `state/`, and that file removed. A rerun never overwrites either: a stored
+//! state in `state/` chained locally from its first version (a genesis of class `none`,
+//! then that state: its state key cached in `secrets/`, nothing sent), and that file
+//! removed. A rerun never overwrites either: a stored
 //! key must match, and existing state is left alone, since the runner may already have
 //! run the agent. It signs with a software key, which is refused above 5 agents; create
 //! agents on the account page then.
@@ -136,19 +138,34 @@ async fn install(
         }
         Err(e) => return Err(e).context("writing the agent's key"),
     }
-    let mut storage = FsStorage::new(state_dir);
+    let mut storage = FsStorage::new(&state_dir);
     match storage.load_raw(id).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {}
         Err(FsStorageError::NotFound(_)) => {
             // As `load_states` reads it
-            // A new agent: no sealed chain, so no base
+            // A new agent: no sealed chain yet, so no base
             storage
                 .save_raw(id, state()?, None)
                 .await
                 .map(|_| ())
-                .context("writing the agent's state")
+                .context("writing the agent's state")?;
         }
-        Err(e) => Err(e).with_context(|| format!("agent {id}'s state can't be read")),
+        Err(e) => return Err(e).with_context(|| format!("agent {id}'s state can't be read")),
+    }
+    // Chained from its first state, locally: a genesis of class `none`,
+    // then the state. A rerun finishes a chain cut short, and leaves a
+    // chained agent alone
+    let enroller = crate::sealed::enroll::Enroller {
+        keys: crate::sealed::KeyStore::new(secrets_dir),
+        state_dir,
+        restore: None,
+    };
+    match enroller
+        .chain_as(id, false, crate::sealed::enroll::Genesis::New)
+        .await
+    {
+        Ok(_) | Err(crate::sealed::enroll::Skip::Chained) => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context("chaining the agent's state")),
     }
 }
 

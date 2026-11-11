@@ -142,6 +142,10 @@ pub enum AlertKind {
     /// nothing to restore it from: skipped (`sealed-forget` sets the key
     /// aside).
     SealedStateKeysWithoutState,
+    /// An agent answered the sealed-state question again: its operator's
+    /// re-offer (`sealed-reoffer`), or, a bug, with none pending. Nothing
+    /// changed by the answer; the operator acts on it.
+    SealedStateAnsweredAgain,
     /// An agent's sealed entries are signed by a key the runner doesn't
     /// recognise (its record of past keys lost, or a forgery): the run is
     /// refused, nothing marked. Never rate-limited.
@@ -178,7 +182,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -204,6 +208,7 @@ impl AlertKind {
         Self::SealedStateAnchorWrong,
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
+        Self::SealedStateAnsweredAgain,
         Self::SealedStateUntrustedKey,
         Self::MemoryIdKeyRefused,
         Self::QuestionUnanswered,
@@ -253,6 +258,7 @@ impl AlertKind {
             Self::SealedStateAnchorWrong => "sealed_state_anchor_wrong",
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
+            Self::SealedStateAnsweredAgain => "sealed_state_answered_again",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
             Self::QuestionUnanswered => "question_unanswered",
@@ -481,6 +487,16 @@ impl AlertKind {
                  If not, nothing can be restored: if it left, `agora-seed \
                  sealed-forget --agent <id> --note \"…\"` sets its key aside \
                  (nothing is deleted). It was skipped either way."
+            }
+            Self::SealedStateAnsweredAgain => {
+                "An agent answered the sealed-backups question again, normally \
+                 the one you re-opened with `agora-seed sealed-reoffer`; both \
+                 answers are below, with the command that acts on the new one \
+                 (`act`). The answer changed nothing by itself: no upload was \
+                 started or stopped, and the agent was told you have been told \
+                 and will act. With `reoffered: false` no re-offer was pending, \
+                 which the offer's asked-once rule should prevent: a bug to \
+                 report; act only on what the agent asks you."
             }
             Self::MemoryIdKeyRefused => {
                 "An agent's memory-id key (<secrets>/<id>/memory_id_key.json) \

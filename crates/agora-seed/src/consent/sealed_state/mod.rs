@@ -235,6 +235,45 @@ pub fn evolution_line(choice: SealChoice) -> String {
     )
 }
 
+/// Why `sealed-reoffer` left an agent as it was.
+#[derive(Debug, thiserror::Error)]
+pub enum ReofferError {
+    #[error(transparent)]
+    Not(#[from] ledger::NoReoffer),
+    /// Unreadable or too new: neither asked nor saved over.
+    #[error("its sealed-state ledger is unreadable ({0}); nothing written")]
+    Unreadable(std::io::Error),
+    #[error("writing its sealed-state ledger: {0}")]
+    Write(std::io::Error),
+}
+
+/// `agora-seed sealed-reoffer`: re-open the sealed-state question for the
+/// agent in `agent_dir`, put again once at its next session with `note`
+/// (required, shown to it). `Ok(true)`: a pending re-offer was replaced.
+/// The caller holds the runner lock exclusively, so no session saves the
+/// ledger over this write. The note is never logged.
+pub async fn reoffer(
+    agent_dir: &std::path::Path,
+    id: AgentId,
+    note: &str,
+) -> Result<bool, ReofferError> {
+    use crate::consent::offer::Stored as _;
+    let mut ledger = ledger::SealLedger::load(agent_dir)
+        .await
+        .map_err(ReofferError::Unreadable)?;
+    let replaced = ledger.reopen(note, chrono::Utc::now())?;
+    ledger.save(agent_dir).await.map_err(ReofferError::Write)?;
+    tracing::warn!(
+        event_type = "sealed_state_reoffered",
+        agent_id = %id,
+        replaced,
+        reopens = ledger.choice().map(SealChoice::as_str),
+        note_chars = note.trim().chars().count(),
+        "the operator re-opened the sealed-state question; it is put at the agent's next session"
+    );
+    Ok(replaced)
+}
+
 /// Whether `soul`'s Evolution Log already records a sealed-state answer.
 pub fn applied_in(soul: &Soul) -> bool {
     crate::consent::offer::in_log(soul, OFFERED)
