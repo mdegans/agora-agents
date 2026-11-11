@@ -208,7 +208,7 @@ fn read_copy(path: &Path, id: AgentId) -> Copy {
 
 /// The marker's lock, held until the file is dropped. Blocking, briefly:
 /// every holder only reads and writes the two small copies.
-// B4/5: public for `sealed-forget`, which sets the secrets copy aside
+// Public for `sealed-forget`, which sets the secrets copy aside
 // under it.
 pub fn lock(keys: &KeyStore, id: AgentId) -> std::io::Result<std::fs::File> {
     let dir = keys.agent_dir(id);
@@ -1085,7 +1085,7 @@ pub mod tests {
         }
     }
 
-    /// B4/5: the migration runs once per data directory: an agent that
+    /// The migration runs once per data directory: an agent that
     /// would qualify later (its marker lost, `sent/` and a yes ledger) is
     /// never marked by a later start.
     #[tokio::test]

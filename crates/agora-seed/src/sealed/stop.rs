@@ -16,11 +16,11 @@
 //! tree first. `chained`, `uploading`, `head.json`, the outbox and the
 //! whole history stay.
 //!
-//! `sealed-enroll --agent` on a stopped agent resumes the uploads on the
-//! same chain ([`super::enroll`]). The versions saved while stopped are
-//! the agent's and stay local, set aside from the uploaded line, unless
-//! the agent asks for them to go up: until that is built (steps B3/B5 of
-//! the plan), a resume is refused while any of them waits.
+//! `sealed-enroll --resume --agent <id>` resumes the uploads on the same
+//! chain ([`super::enroll`]). The versions saved while stopped are the
+//! agent's and stay local, set aside from the uploaded line at the resume
+//! (kept, never uploaded; sending them at the agent's request is not
+//! built).
 //!
 //! **A stop from before the chain went on while stopped** (none exists in
 //! the fleet): its saves went plainly, unsealed, so its start check finds
@@ -37,7 +37,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-// B4/5: public for the uploading start pass, which sets a forgotten
+// Public for the uploading start pass, which sets a forgotten
 // agent's leftover local stop aside.
 /// `sealed/stopped`.
 pub const STOPPED: &str = "stopped";

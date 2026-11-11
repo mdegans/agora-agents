@@ -359,7 +359,6 @@ impl Call {
 }
 
 impl Call {
-    // B4: the key-maintenance class, for `rotate-keys` on a stopped agent.
     /// Key maintenance of a chain already on Agora: a rotation naming its
     /// head, and a wrap of the state key to the agent's own X25519 key.
     /// Sends no state and no choice, and without them a stopped agent's

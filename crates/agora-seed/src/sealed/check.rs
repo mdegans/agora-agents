@@ -1895,10 +1895,8 @@ async fn check_chain(
     };
     // The drainer does the anchor work only for an agent not held that
     // uploads ([`super::drain::Drainer::anchor_all`])
-    // B2: a non-uploader gets here only after its `chain` call was refused
-    // unsent (`api::UploadGuard`), so it reads as "Agora unchecked" and
-    // `NotJudged::Held`; the verdict must instead say nothing of it is on
-    // Agora, and make no server call at all for it.
+    // Only an agent that uploads gets here: the others' verdicts were
+    // given above, with no server call for one that never uploaded.
     let checks_later = matches!(status, HeadStatus::Same | HeadStatus::Pending)
         && super::uploads(agent_dir, keys, id);
     // Every version on Agora (in step, nothing waiting): what the drainer

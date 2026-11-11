@@ -917,7 +917,7 @@ pub(crate) mod tests {
         assert_eq!(
             *api.calls.lock().unwrap(),
             [
-                // B4: the pre-flight's read, and the re-wrap's seq from Agora
+                // The pre-flight's read, and the re-wrap's seq from Agora
                 "chain",
                 "signer_registered",
                 "rotate_key",

@@ -945,8 +945,8 @@ impl Enroller {
     /// if it is the last snapshot's, so the start check finds the agent
     /// intact rather than refusing it. Needs no memory-restore config.
     /// `Some(head)`: finished now.
-    // B2/B6: call before the start check, before reactors are built
-    // (`main.rs`), with an `Enroller` over the run's state and keys
+    /// At run start `main.rs`'s start check calls it (through
+    /// [`Self::append_prior`]) before the agent is judged.
     pub async fn finish_prior(&self, id: AgentId) -> anyhow::Result<Option<HeadRef>> {
         let agent_dir = self.state_dir.join(id.to_string());
         let seal = AgentSeal::new(&agent_dir, id);

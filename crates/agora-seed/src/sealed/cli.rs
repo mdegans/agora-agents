@@ -147,7 +147,7 @@ pub enum Command {
     /// Stop uploading an agent's sealed state, at its request: what waits
     /// is uploaded first, what is on Agora stays, and the agent is shown
     /// the note. Its state is still sealed, chained and checked locally.
-    /// `sealed-enroll --agent` resumes the uploads.
+    /// `sealed-enroll --resume --agent` resumes the uploads.
     SealedStop {
         #[arg(long)]
         agent: AgentId,
@@ -522,7 +522,7 @@ pub async fn run(
             let stopped = super::stop::stop(&state_dir, &keys, agent, &note, drain).await?;
             println!(
                 "{agent}: uploads stopped at {}; what is on Agora stays, and its state is still \
-                 sealed and checked here, locally. `sealed-enroll --agent {agent}` resumes the \
+                 sealed and checked here, locally. `sealed-enroll --resume --agent {agent}` resumes the \
                  uploads",
                 stopped.at
             );

@@ -574,7 +574,7 @@ pub async fn publish_if_chosen(
     let ledger = SealLedger::load(agent_dir)
         .await
         .map_err(|e| format!("sealed-state ledger unreadable: {e}"))?;
-    // B3: the choice in force is the one acted on when it began uploading
+    // The choice in force is the one acted on when it began uploading
     // (the marker's `since`), never a later re-answer, which changes nothing
     // by itself; the agent's own `config` tool changes it directly
     // (the local copy: absent or unreadable, nothing is published)
@@ -691,7 +691,7 @@ pub(crate) mod tests {
     use agora_agentkit::state::anchor::{anchor_leaf, inclusion_proof, merkle_root};
 
     /// A ledger on file with `choice`.
-    // B3: answered before the opt-in (the marker's `since`), as in life
+    // Answered before the opt-in (the marker's `since`), as in life
     pub(crate) async fn chose(dir: &Path, choice: SealChoice) {
         use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
         let mut l = SealLedger::default();
@@ -1428,7 +1428,6 @@ pub(crate) mod tests {
         assert_eq!(AnchorsFile::load(&dir).unwrap().proofs, vec![proof]);
     }
 
-    // B3
     /// A re-answer after the opt-in changes nothing by itself: a later
     /// `publish` over the `private` acted on publishes nothing.
     #[tokio::test]
