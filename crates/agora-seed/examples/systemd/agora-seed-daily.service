@@ -25,6 +25,12 @@ TimeoutStartSec=20h
 # run the day again. Agents whose sessions had not started wait for
 # tomorrow's run.
 KillMode=mixed
+# One descriptor per agent the runner claims for a session (its
+# session.lock, held from routing to the end of the run): a sweep may route
+# most of the fleet, past systemd's default soft limit of 1024. The runner
+# never claims past what the limit leaves, and alerts
+# session_locks_capped when it can't claim them all.
+LimitNOFILE=65536
 TimeoutStopSec=35min
 SuccessExitStatus=3 130 143
 # 75: the sealed-state start check refused agents and nobody ran (a

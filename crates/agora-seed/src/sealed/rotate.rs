@@ -360,10 +360,14 @@ pub async fn rotate_keys(
     super::session::no_session(state_dir, id, false)?;
     let agent_dir = state_dir.join(id.to_string());
     let enrolled = super::is_enrolled(&agent_dir);
+    // B6: the session lock either way (`take` holds it for a chained one)
     let _lock = if enrolled {
-        Some(super::session::take(state_dir, id, false).await?)
+        (
+            Some(super::session::take(state_dir, id, false).await?),
+            None,
+        )
     } else {
-        None
+        (None, Some(super::session::agent_lock(state_dir, id)?))
     };
     let reach = super::version::reach(&agent_dir, keys, id);
     let current = keys

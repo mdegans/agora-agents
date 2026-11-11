@@ -724,3 +724,94 @@ In `consent/sealed_state/prompt.rs` `offer()`:
 - `sealed_state/mod.rs` `evolution_line` was reworded ("Uploads to Agora
   start when its operator acts on it"); the history labels must not imply
   Agora for a non-uploader.
+
+## B6: per-agent session lock, unsaved sessions, cut-save promotion
+
+Nothing in B6 deletes a file of an agent's. No state content is logged,
+printed or mailed (sizes, ids, classes, hashes only). Installing changes
+nothing by itself.
+
+### Files read
+
+- `<state>/<id>/state.json` and `<state>/<id>/sealed/head.json`:
+  metadata only (device, inode, size, mtime), once before the run loads
+  states and again under the agent's session lock. When they differ, the
+  state is read again through the sealed storage (as at load) and the
+  start check runs again on it in full (as at start: outbox, sent, blobs
+  hashed, never decrypted beyond what the check already did).
+- Promotion at the start (only for an agent with a `state.json.tmp`):
+  `state.json`'s link count and inode, the archives' names and inodes,
+  the tmp's mtime and its envelope's shape; for a chained agent its
+  chain markers' existence, `head.json`, the outbox's `.tmp`/`.abandoned`
+  items, and the tmp, `.aside` files and `state.json` loaded and hashed
+  (`sealed::restore::cut_saves`, the rule `sealed-restore --from-cut-save`
+  uses). Content is held in memory only to hash it.
+- `--dry-run`: each agent directory's `sealed/enrolled` (existence).
+- `/proc/self/limits`, `/proc/self/fd` (the runner's own descriptors).
+
+### Files written
+
+| File | When | How |
+|---|---|---|
+| `<state>/<id>/session.lock` (new, empty) | created the first time the agent is claimed for a session, or an operator command (`sealed-accept`, `sealed-restore`, `sealed-forget`, `rotate-keys`, `sealed-enroll` per agent, `sealed-stop`) or the start's promotion takes it. Never in a directory that doesn't exist (no directory is made for it) | `open(create)`, never truncated, never removed (as lock files are); an exclusive `flock` held from routing to the end of the run, never waited for |
+| `<state>/<id>/state.json` | promotion of a new-order cut save: `state.json.tmp` renamed over it, the directory fsynced. The old `state.json` stays whole as the newest archive (it is that archive's inode) | only under: runner.lock exclusive, the agent's session lock, its `sealed/lock` (chained), agentkit's directory lock; tmp settled 10 min, a complete envelope, linked as the newest archive, and (chained) a prepared outbox item following the head that records the tmp's state hash. Otherwise left alone and warned (`state_tmp_not_promoted`); agentkit sets the tmp aside at the next save, as before |
+| `<state>/<id>/sealed/notice.json` | after a run whose save of the agent failed, for a chained agent: the unsaved sentence added to the notice waiting (a field `unsaved: {at, kept}`), or a notice of its own (`operator_act: {kind: "unsaved"}`) | one atomic write (`write_private`), as every notice. A notice that supersedes it (a refusal, an operator's act) carries the field over; the superseded file is kept aside as before |
+| `<state>/<id>/unsaved.<utc>.json` | as before (a session whose save failed), now tried 3 times, 5 s apart; **never printed to stdout/journald when it can't be written** (it used to be, whole) | unchanged: 0600, unique tmp, fsync, rename, dir fsync |
+
+No longer written: the whole unsaved state to stdout (and so to journald)
+when its rescue file couldn't be written. That state is now lost when the
+process exits; its size and the error are logged and alerted.
+
+### What changes for a run
+
+- **Per-agent session lock.** After routing, before any reactor is built,
+  each routed agent's `session.lock` is tried. Held elsewhere (another
+  runner has it in session or queued, or an operator command is working on
+  it): left for this sweep, one `agent_busy` event, no alert, nothing
+  written, still due. Changed on disk since this run loaded it: read again
+  and checked again under the lock (`session_state_reloaded`); a check that
+  doesn't let it run leaves it out (`session_recheck_not_run`, stage
+  `recheck`), nothing marked; the next start judges it with the full
+  refusal rule. Released after the run has saved, rescued and told every
+  agent (or at any exit, by the kernel).
+- **Operator commands** that change an agent now refuse while a runner
+  holds that agent (including while it is only queued), not only while its
+  session journal exists. `sealed-stop`, which runs beside a runner, is
+  refused for an agent the runner has claimed this run; run it after the
+  run, or drain.
+- **Descriptors.** One per claimed agent for the whole run. The units set
+  `LimitNOFILE=65536` (systemd's default soft limit is 1024; the units are
+  symlinks into the agents checkout, so `systemctl --user daemon-reload`
+  after the bump). Without it, a sweep routing more than about 760 agents
+  claims as many as fit and leaves the rest due, with one
+  `session_locks_capped` alert.
+- **Saves are independent.** The end-of-run bulk save saves each agent on
+  its own; one directory that fails no longer makes every later agent in
+  the batch unsaved (`state_save_failed`, with a class:
+  `disk_full`, `permission_denied`, `locked`, …).
+- **One `state_unsaved` alert a run** for the agents whose saves failed:
+  the count, the first ten ids, the reason classes, how many were kept.
+- **Promotion** now also puts in place a save cut under agentkit 0.158's
+  order (above). The old-order branch (no `state.json`) is unchanged.
+- **Dry run** says how many agents still carry `sealed/enrolled` (a dry
+  run doesn't move it, so it counts them as not enrolled).
+
+### The first run after install
+
+Every claimed agent gets an empty `session.lock`, which stays. A
+`fleet-metrics` count of files per agent directory rises by one (B7).
+Nothing else changes for an agent unless a save fails or a cut save is
+found. The roster's keeper reads heads without any agent lock, so it never
+waits on, or holds up, a session.
+
+### New agent-facing sentences (for the wording round)
+
+- Kept: "Your state from your session on {date} could not be saved; your
+  operator keeps a copy of it, and this session starts from your state as
+  it was before that session."
+- Not kept: "Your state from your session on {date} could not be saved,
+  and no copy of it could be kept; this session starts from your state as
+  it was before that session."
+
+Seated after any other notice line, in the agent's next start check;
+only for a chained agent (an agent not chained has no notice seat).
