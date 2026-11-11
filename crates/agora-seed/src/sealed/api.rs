@@ -358,6 +358,43 @@ impl Call {
     }
 }
 
+impl Call {
+    /// A read of what is already on Agora: sends nothing of the agent's
+    /// state or choices. The rest are writes.
+    pub fn is_read(self) -> bool {
+        matches!(
+            self,
+            Self::Chain
+                | Self::Head
+                | Self::HeadKnown
+                | Self::StateKeys
+                | Self::Rotations
+                | Self::Blob
+                | Self::Proofs
+        )
+    }
+}
+
+/// What [`UploadGuard`] asks of an agent, by its two predicates.
+pub trait UploadGate: Send + Sync {
+    /// May send its state, a key record or a choice: it uploads
+    /// ([`super::uploads`]: marked uploading, not stopped).
+    fn may_send(&self, id: AgentId) -> bool;
+    /// May read back what is already on Agora: it has ever uploaded
+    /// ([`super::uploading::has_uploaded`]: a marker naming it in either
+    /// copy, stopped or not, contradictory or not).
+    fn may_read(&self, id: AgentId) -> bool;
+}
+
+impl<G: UploadGate> UploadGate for std::sync::Arc<G> {
+    fn may_send(&self, id: AgentId) -> bool {
+        (**self).may_send(id)
+    }
+    fn may_read(&self, id: AgentId) -> bool {
+        (**self).may_read(id)
+    }
+}
+
 impl std::fmt::Display for Call {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -369,7 +406,10 @@ impl std::fmt::Display for Call {
 /// beginning [`LOCAL_ONLY`] ([`is_local_only`]); a [`BlobError`] that is
 /// not worth a retry for [`SealedApi::blob`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("local only: agent {id} doesn't upload its sealed state; `{call}` was not sent to Agora")]
+#[error(
+    "local only: agent {id} doesn't upload its sealed state (or, for a read, never did); \
+     `{call}` was not sent to Agora"
+)]
 pub struct LocalOnly {
     pub id: AgentId,
     pub call: Call,
@@ -387,16 +427,19 @@ impl From<LocalOnly> for BlobError {
     }
 }
 
-/// The per-agent server client, guarded: every per-agent call for an
-/// agent that doesn't [`upload`](agora_agentkit::state::storage::Enrolment::uploads)
-/// returns [`LocalOnly`] without touching the network. The backstop behind
-/// agentkit's drain gate: code that forgets to ask can't leak an agent's
-/// chain, keys record, blobs, reads or publish choice. Calls that aren't
-/// about one agent's sealed state pass: [`SealedApi::anchor_data`] (the
-/// public governance log), and the agent's identity on Agora, which every
-/// agent has whether or not it uploads ([`SealedApi::register_encryption_key`],
-/// [`SealedApi::signer_registered`], and a [`SealedApi::rotate_key`] that
-/// names no head).
+/// The per-agent server client, guarded: a per-agent call the agent's
+/// state doesn't allow returns [`LocalOnly`] without touching the network.
+/// The backstop behind agentkit's drain gate: code that forgets to ask
+/// can't leak an agent's chain, key record, blobs or publish choice.
+///
+/// | Call | Passes when |
+/// |---|---|
+/// | **write**: `post_state_key`, `publish_chosen`, `post_anchor`, a `rotate_key` naming a head | the agent uploads ([`UploadGate::may_send`]: marked uploading, not stopped) |
+/// | **read**: `chain`, `head`, `head_known`, `state_keys`, `rotations`, `blob`, `proofs` ([`Call::is_read`]) | the agent has ever uploaded ([`UploadGate::may_read`]: a marker naming it in either copy; stopped or in doubt, it can still be restored from, and read back, what is on Agora) |
+/// | `anchor_data`, `register_encryption_key`, `signer_registered`, a `rotate_key` naming no head | always: the public governance log, and the agent's identity on Agora, which every agent has |
+///
+/// An agent with no marker in either copy makes no sealed-state call at
+/// all: nothing of it is on Agora to read.
 ///
 /// **Opting in.** The opt-in step posts the agent's state key record
 /// before the agent is marked uploading, so no entry ever reaches Agora
@@ -413,7 +456,7 @@ pub struct UploadGuard<A, E> {
     strict: bool,
 }
 
-impl<A, E: agora_agentkit::state::storage::Enrolment> UploadGuard<A, E> {
+impl<A, E: UploadGate> UploadGuard<A, E> {
     pub fn new(inner: A, enrolment: E) -> Self {
         Self {
             inner,
@@ -439,7 +482,12 @@ impl<A, E: agora_agentkit::state::storage::Enrolment> UploadGuard<A, E> {
 
     /// Whether `call` for `id` may go to Agora.
     pub fn check(&self, id: AgentId, call: Call) -> Result<(), LocalOnly> {
-        if self.enrolment.uploads(id) {
+        let allowed = if call.is_read() {
+            self.enrolment.may_read(id)
+        } else {
+            self.enrolment.may_send(id)
+        };
+        if allowed {
             return Ok(());
         }
         if Call::OPT_IN.contains(&call)
@@ -508,7 +556,7 @@ impl Drop for OptingIn<'_> {
 impl<A, E> SealedApi for UploadGuard<A, E>
 where
     A: SealedApi,
-    E: agora_agentkit::state::storage::Enrolment,
+    E: UploadGate,
 {
     async fn chain(&self, id: AgentId, key: &SigningKey) -> Result<Vec<SignedStateEntry>, String> {
         self.check(id, Call::Chain)?;
@@ -912,20 +960,45 @@ pub mod fake {
 mod tests {
     use super::fake::FakeApi;
     use super::*;
-    use agora_agentkit::state::storage::{Enrolment, SealKeys};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// One switch for every agent: uploads or not.
+    /// One switch for every agent: whether it uploads (`.0`), and whether
+    /// it ever did (`.1`).
     #[derive(Default)]
-    struct Switch(AtomicBool);
+    struct Switch(AtomicBool, AtomicBool);
 
-    impl Enrolment for &Switch {
-        fn uploads(&self, _: AgentId) -> bool {
+    impl UploadGate for &Switch {
+        fn may_send(&self, _: AgentId) -> bool {
             self.0.load(Ordering::SeqCst)
         }
-        fn keys(&self, _: AgentId) -> Option<SealKeys> {
-            None
+        fn may_read(&self, _: AgentId) -> bool {
+            self.1.load(Ordering::SeqCst)
         }
+    }
+
+    /// The names of [`every_call`], in its order.
+    const EVERY: [&str; 11] = [
+        "chain",
+        "state_keys",
+        "post_state_key",
+        "rotate_key",
+        "rotations",
+        "blob",
+        "proofs",
+        "head",
+        "head_known",
+        "publish_chosen",
+        "post_anchor",
+    ];
+
+    /// The calls of [`every_call`] that weren't refused.
+    fn passed(results: &[Result<(), String>]) -> Vec<&'static str> {
+        EVERY
+            .into_iter()
+            .zip(results)
+            .filter(|(_, r)| r.as_ref().err().is_none_or(|e| !is_local_only(e)))
+            .map(|(n, _)| n)
+            .collect()
     }
 
     fn rotation(id: AgentId, key: &SigningKey, at_head: bool) -> KeyRotation {
@@ -1035,6 +1108,25 @@ mod tests {
             ]
         );
 
+        // Uploaded once, stopped (or a marker in doubt): reads only
+        guard.calls.lock().unwrap().clear();
+        switch.1.store(true, Ordering::SeqCst);
+        let reads = [
+            "chain",
+            "state_keys",
+            "rotations",
+            "blob",
+            "proofs",
+            "head",
+            "head_known",
+        ];
+        assert_eq!(passed(&every_call(&guard, id, &key).await), reads);
+        assert_eq!(
+            *guard.calls.lock().unwrap(),
+            reads,
+            "no write reached Agora"
+        );
+
         // Uploading: every call goes through
         guard.calls.lock().unwrap().clear();
         switch.0.store(true, Ordering::SeqCst);
@@ -1059,26 +1151,8 @@ mod tests {
         {
             let _hold = guard.opting_in(id);
             let results = every_call(&guard, id, &key).await;
-            let passed: Vec<&str> = [
-                "chain",
-                "state_keys",
-                "post_state_key",
-                "rotate_key",
-                "rotations",
-                "blob",
-                "proofs",
-                "head",
-                "head_known",
-                "publish_chosen",
-                "post_anchor",
-            ]
-            .into_iter()
-            .zip(&results)
-            .filter(|(_, r)| r.as_ref().err().is_none_or(|e| !is_local_only(e)))
-            .map(|(n, _)| n)
-            .collect();
             assert_eq!(
-                passed,
+                passed(&results),
                 [
                     "chain",
                     "state_keys",
