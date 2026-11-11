@@ -11,9 +11,9 @@
 //!
 //! Under the session guard and the agent's `sealed/lock`, after a drain so
 //! nothing waiting is lost (refused if anything still waits): writes
-//! `sealed/stopped` (`{at, note, shown, chained}`, local; the note is shown
+//! `sealed/stopped` (`{at, note, shown}`, local; the note is shown
 //! to the agent, not uploaded in v1), and its durable copy in the secrets
-//! tree first. `enrolled`, `uploading`, `head.json`, the outbox and the
+//! tree first. `chained`, `uploading`, `head.json`, the outbox and the
 //! whole history stay.
 //!
 //! `sealed-enroll --agent` on a stopped agent resumes the uploads on the
@@ -22,10 +22,11 @@
 //! the agent asks for them to go up: until that is built (steps B3/B5 of
 //! the plan), a resume is refused while any of them waits.
 //!
-//! **A stop from before the chain went on while stopped** (`chained:
-//! false`): its saves were written plainly, unsealed. [`catch_up`] seals
-//! the state it left as the next local version, once, at the next start,
-//! so the start check finds it intact.
+//! **A stop from before the chain went on while stopped** (none exists in
+//! the fleet): its saves went plainly, unsealed, so its start check finds
+//! a mismatch and refuses it. The operator resolves that with
+//! `sealed-accept --note`, so the agent is shown why; nothing seals the
+//! unchecked interval silently.
 
 use std::path::{Path, PathBuf};
 
@@ -51,10 +52,6 @@ pub struct Stopped {
     /// The first session after the stop has shown the note.
     #[serde(default)]
     pub shown: bool,
-    /// The chain goes on while stopped. `false`: a stop written before it
-    /// did, whose saves went plainly until [`catch_up`].
-    #[serde(default)]
-    pub chained: bool,
 }
 
 fn path(agent_dir: &Path) -> PathBuf {
@@ -188,113 +185,6 @@ impl Stopped {
     }
 }
 
-/// What [`catch_up`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaughtUp {
-    /// Not a stop from before the chain went on while stopped.
-    NotNeeded,
-    /// The state was its head's: only the stop marked `chained`.
-    Marked,
-    /// The state left by the plain saves sealed as the next local version.
-    Sealed(agora_agentkit::state::verify::HeadRef),
-}
-
-/// A stop from before the chain went on while stopped (`chained: false`):
-/// its saves were plain, so the state may be one the chain never saw, which
-/// the start check would refuse as a mismatch. Under the session guard and
-/// the agent's lock, the state is sealed as the next version on the head
-/// (local: the agent is stopped, so nothing of it uploads), then the stop
-/// marked `chained` (the secrets copy first). Once per agent. The agent was
-/// told its state wasn't checked while stopped; from here it is. A refused
-/// agent, or one with no head, is left as it is, for the start check.
-pub async fn catch_up(
-    state_dir: &Path,
-    keys: &super::KeyStore,
-    id: AgentId,
-) -> anyhow::Result<CaughtUp> {
-    let agent_dir = state_dir.join(id.to_string());
-    let Some(mut stopped) = Stopped::load(&agent_dir)? else {
-        return Ok(CaughtUp::NotNeeded);
-    };
-    if stopped.chained || !super::is_enrolled(&agent_dir) {
-        return Ok(CaughtUp::NotNeeded);
-    }
-    let seal = AgentSeal::new(&agent_dir, id);
-    let lock = super::session::take(state_dir, id, false).await?;
-    anyhow::ensure!(
-        !seal.is_refused().await?,
-        "agent {id} is refused; the start check and sealed-accept resolve it"
-    );
-    let head = seal
-        .head()
-        .await?
-        .context("sealed/head.json is missing; the start check refuses it")?;
-    let current = agora_agentkit::reactor::FsStorage::new(state_dir)
-        .load_raw(id)
-        .await
-        .context("the agent's state won't load")?
-        .value;
-    let done = if head.plaintext_sha256
-        == Some(agora_agentkit::state::storage::plaintext_hash(&current))
-    {
-        CaughtUp::Marked
-    } else {
-        let sealing = keys.seal_keys(id).context("sealing keys for the agent")?;
-        let new = super::session::append(
-            &seal,
-            &lock,
-            &sealing,
-            &agora_agentkit::state::codec::KeyframePolicy::default(),
-            agora_agentkit::enums::StateEntryKind::Snapshot,
-            &current,
-            Utc::now(),
-        )
-        .await
-        .context("sealing the state left by the plain saves")?;
-        CaughtUp::Sealed(new)
-    };
-    stopped.chained = true;
-    // The durable copy first, as for the stop itself
-    if durable(keys, id)?.is_some() {
-        write_at(&keys.agent_dir(id).join(DURABLE), &stopped)?;
-    }
-    write(&agent_dir, &stopped)?;
-    drop(lock);
-    tracing::warn!(
-        event_type = "sealed_state_stop_caught_up",
-        agent_id = %id,
-        sealed = matches!(done, CaughtUp::Sealed(_)),
-        "a stop from before the chain went on while stopped: its state sealed locally; the chain \
-         goes on from here"
-    );
-    Ok(done)
-}
-
-/// [`catch_up`] for every stopped agent here: at the start of a run,
-/// before states load. One that can't be caught up now (a session in
-/// progress, a refusal) is logged and tried again at the next start.
-pub async fn catch_up_all(state_dir: &Path, keys: &super::KeyStore) {
-    let Ok(entries) = std::fs::read_dir(state_dir) else {
-        return;
-    };
-    let mut ids: Vec<AgentId> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().to_str()?.parse::<AgentId>().ok())
-        .filter(|id| std::fs::exists(path(&state_dir.join(id.to_string()))).unwrap_or(false))
-        .collect();
-    ids.sort();
-    for id in ids {
-        if let Err(e) = catch_up(state_dir, keys, id).await {
-            tracing::error!(
-                event_type = "sealed_state_stop_catch_up_failed",
-                agent_id = %id,
-                error = %e,
-                "a stop from before the local chain couldn't be caught up; tried again next start"
-            );
-        }
-    }
-}
-
 /// Upload what waits, under no lock (the drain takes the agent's lock
 /// itself). The command then checks, under the lock, that nothing waits.
 pub type Drain = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
@@ -366,7 +256,6 @@ pub async fn stop(
         at: Utc::now(),
         note: note.to_string(),
         shown: false,
-        chained: true,
     };
     // The durable copy first: a stop must never be lost with sealed/
     write_at(&keys.agent_dir(id).join(DURABLE), &stopped)
@@ -424,7 +313,6 @@ mod tests {
         assert!(is_stopped(&dir));
         assert!(seal.is_enrolled().await.unwrap() && seal.head().await.unwrap().is_some());
         assert!(!seal.sent().await.unwrap().is_empty());
-        assert!(s.chained, "the chain goes on while stopped");
         assert!(
             s.line()
                 .starts_with("Your operator stopped uploading your sealed state on ")
@@ -516,66 +404,5 @@ mod tests {
             .to_string();
         assert!(e.contains("doesn't upload"), "{e}");
         assert!(!is_stopped(&dir));
-    }
-
-    /// A stop from before the chain went on while stopped: its plainly
-    /// saved state is sealed once, locally, and the start check finds it
-    /// intact; a second start does nothing.
-    #[tokio::test]
-    async fn a_stop_from_before_the_local_chain_is_caught_up_once() {
-        use agora_agentkit::state::storage::Recovery;
-        let root = crate::sealed::TestDir::new("stop-catch-up");
-        let (id, keys, dir) = enrolled(&root).await;
-        let state_dir = root.join("state");
-        let seal = AgentSeal::new(&dir, id);
-        for item in seal.outbox().await.unwrap() {
-            seal.mark_sent(item.ord).await.unwrap();
-        }
-        let mut s = stop(&state_dir, &keys, id, "asked", drained())
-            .await
-            .unwrap();
-        // As an older runner wrote it, and saved plainly while stopped
-        s.chained = false;
-        let mut old = serde_json::to_value(&s).unwrap();
-        old.as_object_mut().unwrap().remove("chained");
-        let old = serde_json::to_vec(&old).unwrap();
-        std::fs::write(path(&dir), &old).unwrap();
-        std::fs::write(keys.agent_dir(id).join(DURABLE), &old).unwrap();
-        assert!(!Stopped::load(&dir).unwrap().unwrap().chained);
-        let mut fs = agora_agentkit::reactor::FsStorage::new(&state_dir);
-        fs.save_raw(id, serde_json::json!({ "memory": "saved plainly" }), None)
-            .await
-            .unwrap();
-        let local = |v: &serde_json::Value| agora_agentkit::state::storage::plaintext_hash(v);
-        let current = fs.load_raw(id).await.unwrap().value;
-        assert!(matches!(
-            seal.recover(Some(&local(&current))).await.unwrap(),
-            Recovery::Mismatch(_)
-        ));
-        let head = seal.head().await.unwrap().unwrap().head;
-
-        catch_up_all(&state_dir, &keys).await;
-        let new = seal.head().await.unwrap().unwrap().head;
-        assert_eq!(new.seq, head.seq + 1, "one version, on the head");
-        assert!(matches!(
-            seal.recover(Some(&local(&current))).await.unwrap(),
-            Recovery::Intact(_)
-        ));
-        assert_eq!(
-            seal.outbox().await.unwrap().len(),
-            1,
-            "local: nothing uploads"
-        );
-        assert!(!super::super::uploads(&dir, &keys, id));
-        assert!(Stopped::load(&dir).unwrap().unwrap().chained);
-        assert!(durable(&keys, id).unwrap().unwrap().chained);
-        assert_eq!(Stopped::load(&dir).unwrap().unwrap().note, "asked");
-
-        // Once
-        assert_eq!(
-            catch_up(&state_dir, &keys, id).await.unwrap(),
-            CaughtUp::NotNeeded
-        );
-        assert_eq!(seal.head().await.unwrap().unwrap().head, new);
     }
 }

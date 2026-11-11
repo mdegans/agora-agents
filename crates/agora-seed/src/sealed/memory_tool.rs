@@ -122,7 +122,7 @@ pub fn enrollment_sentence(earliest: &str) -> String {
 }
 
 /// Whether the agent is due the enrolment sentence: enrolled, its
-/// memory-id key's fingerprint written before its `sealed/enrolled` marker
+/// memory-id key's fingerprint written before its `sealed/chained` marker
 /// (it had memory ids before its versions were sealed; an agent enrolled
 /// before it had a key has no ids to keep), and not told yet. Anything
 /// unreadable is "not due": the sentence is never worth a guess.
@@ -130,7 +130,7 @@ fn enrollment_due(agent_dir: &Path) -> bool {
     let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let sealed = agent_dir.join(agora_agentkit::state::storage::SEALED_DIR);
     let (Some(enrolled), Some(fingerprint)) = (
-        mtime(sealed.join("enrolled")),
+        mtime(sealed.join(agora_agentkit::state::storage::CHAINED)),
         mtime(agent_dir.join(super::keys::MEMORY_ID_FINGERPRINT_FILE)),
     ) else {
         return false;

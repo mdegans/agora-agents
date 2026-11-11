@@ -125,10 +125,11 @@ pub async fn run(
     let api = Arc::new(super::api::guarded(client.clone(), enrolment.clone()));
     let dry_run = matches!(command, Command::SealedEnroll { dry_run: true, .. });
     if !dry_run {
-        // As at a run's start: a lost local marker put back, and the agents
-        // that uploaded before the marker existed marked (idempotent)
-        super::uploading::reconcile_all(&state_dir, &keys);
-        super::uploading::migrate_all(&state_dir, &keys);
+        // As at a run's start, before any command reads a marker: the
+        // chain's marker moved to its new name, a lost or half-written
+        // uploading marker repaired, the agents that uploaded before the
+        // marker existed marked (idempotent). In doubt: logged at error
+        super::uploading::start_pass(&state_dir, &keys, &crate::alerts::Alerter::off()).await;
     }
     match command {
         Command::SealedEnroll {

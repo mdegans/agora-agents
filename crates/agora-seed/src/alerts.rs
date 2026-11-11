@@ -142,6 +142,9 @@ pub enum AlertKind {
     /// nothing to restore it from: skipped (`sealed-forget` sets the key
     /// aside).
     SealedStateKeysWithoutState,
+    /// Agents whose uploading marker is contradictory or unreadable after
+    /// the start's repair pass: treated as not uploading. One summary a run.
+    SealedStateUploadingInDoubt,
     /// An agent's sealed entries are signed by a key the runner doesn't
     /// recognise (its record of past keys lost, or a forgery): the run is
     /// refused, nothing marked. Never rate-limited.
@@ -207,6 +210,7 @@ impl AlertKind {
         Self::SealedStateAnchorWrong,
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
+        Self::SealedStateUploadingInDoubt,
         Self::SealedStateUntrustedKey,
         Self::SealedStateUnchainedAgents,
         Self::MemoryIdKeyRefused,
@@ -257,6 +261,7 @@ impl AlertKind {
             Self::SealedStateAnchorWrong => "sealed_state_anchor_wrong",
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
+            Self::SealedStateUploadingInDoubt => "sealed_state_uploading_in_doubt",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::SealedStateUnchainedAgents => "sealed_state_unchained_agents",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
@@ -507,6 +512,16 @@ impl AlertKind {
                  If not, nothing can be restored: if it left, `agora-seed \
                  sealed-forget --agent <id> --note \"…\"` sets its key aside \
                  (nothing is deleted). They were skipped either way."
+            }
+            Self::SealedStateUploadingInDoubt => {
+                "The agents below said yes to uploading their sealed state, \
+                 but their uploading marker (<state>/<id>/sealed/uploading \
+                 and its copy <secrets>/<id>/sealed_uploading) is \
+                 contradictory or unreadable, so nothing of theirs is \
+                 uploaded: the runner fails closed. Their chains are kept \
+                 locally. Compare the two copies (the error says which is \
+                 wrong) and put the right one back in both places; nothing \
+                 rewrites a marker in doubt by itself."
             }
             Self::MemoryIdKeyRefused => {
                 "An agent's memory-id key (<secrets>/<id>/memory_id_key.json) \
