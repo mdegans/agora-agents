@@ -64,6 +64,7 @@ pub mod notice;
 mod props;
 pub mod receipts;
 pub mod restore;
+pub mod roster;
 pub mod rotate;
 pub mod session;
 pub mod sizes;
