@@ -4196,12 +4196,13 @@ mod tests {
             "the stop, then the verdict: {:?}",
             seat.lines
         );
+        // B7: the stop line's wording (`sealed/stop.rs`)
         assert!(
             seat.lines[0].starts_with("Your operator stopped uploading your sealed state on ")
                 && seat.lines[0].ends_with(
-                    ": It asked. Your earlier versions stay on Agora. Your state is still sealed \
-                     and checked at the start of each session, here on your runner; the \
-                     versions saved from now on stay here."
+                    ": It asked. The versions already uploaded stay on Agora. Your state is \
+                     still sealed and checked at the start of each session, here on your \
+                     runner; the versions saved from now on stay here."
                 ),
             "{:?}",
             seat.lines

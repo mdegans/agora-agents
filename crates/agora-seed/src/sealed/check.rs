@@ -501,7 +501,7 @@ pub const LOCAL_LIMITS: &str = "A record kept on the same machine as your state 
 /// For an agent whose uploading marker is in doubt, after
 /// [`LOCAL_VERDICT`].
 pub const LOCAL_IN_DOUBT: &str = " Your runner couldn't tell whether your state is being \
-     uploaded to Agora; your operator has been told, and nothing is being sent meanwhile.";
+     uploaded to Agora; your operator has been told, and nothing is uploaded meanwhile.";
 
 /// The end of a local verdict on a start that checked only the line since
 /// the last full check ([`Checked::Since`]); the date follows.
@@ -519,12 +519,12 @@ impl Kept {
         match self {
             Self::Only => LOCAL_NOTHING_ON_AGORA.to_string(),
             Self::Since(Some(OnAgora::Nothing)) => {
-                " Agora holds none of its versions; those saved since \
+                " Agora holds none of your sealed versions; those saved since \
                  your uploads stopped stay on this runner."
                     .to_string()
             }
             Self::Since(Some(OnAgora::Upto { versions, newest })) => format!(
-                " Agora holds {versions} of its versions, the newest dated {}; those saved since \
+                " Agora holds {versions} of your sealed versions, the newest dated {}; those saved since \
                  your uploads stopped stay on this runner.",
                 newest.format("%Y-%m-%d")
             ),
@@ -4410,12 +4410,12 @@ pub(crate) mod tests {
                 newest: day
             }))
             .sentence(),
-            " Agora holds 4 of its versions, the newest dated 2026-11-05; those saved since your \
+            " Agora holds 4 of your sealed versions, the newest dated 2026-11-05; those saved since your \
              uploads stopped stay on this runner."
         );
         assert_eq!(
             Kept::Since(Some(OnAgora::Nothing)).sentence(),
-            " Agora holds none of its versions; those saved since your uploads stopped stay on \
+            " Agora holds none of your sealed versions; those saved since your uploads stopped stay on \
              this runner."
         );
         assert_eq!(
@@ -4426,7 +4426,7 @@ pub(crate) mod tests {
         assert_eq!(
             Kept::InDoubt.sentence(),
             " Your runner couldn't tell whether your state is being uploaded to Agora; your \
-             operator has been told, and nothing is being sent meanwhile."
+             operator has been told, and nothing is uploaded meanwhile."
         );
         assert_eq!(
             LOCAL_CHECKED_SINCE,
@@ -4491,8 +4491,41 @@ pub(crate) mod tests {
             "waiting to upload",
             "steward",
             "verified by",
+            "enrol",
+            "you verified",
+            "you checked",
         ] {
             assert!(!lower.contains(banned), "{banned:?} in {text}");
+        }
+    }
+
+    /// What an agent that uploaded (now or before) is told of its chain:
+    /// never that nothing of it is on Agora, and never that Agora's
+    /// servers read it.
+    #[test]
+    fn an_uploaders_local_sentences_never_say_nothing_is_on_agora() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        for kept in [
+            Kept::Since(Some(OnAgora::Upto {
+                versions: 4,
+                newest: day,
+            })),
+            Kept::Since(Some(OnAgora::Nothing)),
+            Kept::Since(None),
+            Kept::InDoubt,
+        ] {
+            let t = kept.sentence().to_lowercase();
+            assert!(!t.contains("nothing of your state is on agora"), "{t}");
+            assert!(!t.contains("enrol") && !t.contains("can read"), "{t}");
+        }
+        for line in [
+            FORK_LINE,
+            HEAD_MISSING_LINE,
+            UNCHECKED_LINE,
+            SEAL_FAILED_LINE,
+        ] {
+            let t = line.to_lowercase();
+            assert!(!t.contains("nothing of") && !t.contains("enrol"), "{line}");
         }
     }
 
@@ -4662,7 +4695,7 @@ pub(crate) mod tests {
         assert!(
             seat[0].starts_with(&format!(
                 "Your sealed state: intact, checked against the record your runner keeps on this \
-                 machine. Agora holds 1 of its versions, the newest dated {today}; those saved \
+                 machine. Agora holds 1 of your sealed versions, the newest dated {today}; those saved \
                  since your uploads stopped stay on this runner. It has 2 versions since "
             )),
             "{seat:?}"
@@ -4724,7 +4757,7 @@ pub(crate) mod tests {
             panic!("{out:?}")
         };
         assert!(
-            seat[0].contains(" Agora holds 1 of its versions, "),
+            seat[0].contains(" Agora holds 1 of your sealed versions, "),
             "{seat:?}"
         );
         assert!(seat[0].contains(": links, signatures, and that your state matches"));

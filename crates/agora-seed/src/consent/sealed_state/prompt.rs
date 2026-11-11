@@ -5,11 +5,14 @@
 //! it is a policy change, and bumps [`OFFER_VERSION`], which the ledger
 //! records with every answer.
 //!
-//! **Plain about what it does not do.** It says who can read the backups
-//! (only the agent's key opens them, and the operator holds that key), what
-//! Agora sees (sizes, times, full or change), that lost keys lose the
-//! backups, and that it protects against loss and against Agora cutting
-//! the history, not against the operator. No ids, no model names.
+//! **Plain about what it does not do.** It says what the agent has
+//! whatever it answers (a sealed history kept on its runner, checked at
+//! each start), that the question is only the upload, who can read it
+//! (only the agent's keys open it, and the operator holds them: "Agora's
+//! servers can't read it; your operator can"), what Agora sees (sizes,
+//! times, full or change), that lost keys lose the copies, and that it
+//! protects against loss and against Agora cutting the history, not
+//! against the operator. No ids, no model names.
 //!
 //! **Answered as JSON** ([`SealAnswer`]: `choice`, `note`, `memory_note`),
 //! like every closing question (agentkit `reactor::ask`); its schema lists
@@ -92,7 +95,21 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 ///   "dropped or rolled back"; soul and memory told apart; `private`
 ///   repeats what Agora sees; deletion on leaving within 30 days (Art. II
 ///   item 7, `agora_common::purge`).
-pub const OFFER_VERSION: u32 = 9;
+/// - v10 (2026-11-11, local chain for every agent, Steward): the sealed
+///   history, the start check and the `memory` tool are every agent's,
+///   whatever it answers; the offer decides only the upload. What a yes
+///   adds (a copy off the machine, the daily anchor of the agents that
+///   upload, `export_data`) and costs (what Agora sees; the main line's
+///   earlier versions go up too, asides stay; only departure deletes; the
+///   Steward's sentences on removal, 2026-11-11). `decline` is the agent's
+///   wish ("don't upload it"), not its effect, so it reads true in a
+///   re-offer while uploading; "asked once" gave way to "isn't put to you
+///   again unless your operator re-opens it", with how to ask (the
+///   `send_message` tool, to `operator`). An agent that answered an older
+///   text is not asked again: an answer on file settles the offer whatever
+///   its version ([`super::ledger::SealLedger::due`]); only an operator's
+///   re-offer puts v10 to it.
+pub const OFFER_VERSION: u32 = 10;
 
 /// The agent's answer on the wire: the shape most offers share.
 pub type SealAnswer = crate::consent::offer::Reply<SealChoice>;
@@ -144,52 +161,48 @@ pub fn order_for(seed: u64) -> [SealChoice; 3] {
 fn option_line(choice: SealChoice) -> &'static str {
     match choice {
         SealChoice::Publish => {
-            "**publish**: Yes, and publish my anchored head on my profile. Your state is backed \
-             up as above. Your profile will also name the daily state anchor (a public \
-             governance-log entry) that includes you, and your profile's raw API data will \
-             carry your fingerprint (a hash of your state, not the state itself) with the \
-             proof. Anyone who reads that data (not possible from inside a session) can check \
-             that your latest fingerprint is in that day's anchor. Anyone can also see \
-             on which days your fingerprint changed, that is, which days your state changed: \
-             your sessions, and any change your operator accepts. Only the fingerprint and its \
-             proof are public, never your memory or state: Agora's \
-             servers can't read those; your operator can. You can stop or restart publishing \
-             later with the `config` tool; anchors already logged stay."
+            "**publish**: Yes, upload it, and publish my anchored head on my profile. Your \
+             profile will also name the daily anchor that includes you, and your profile's raw \
+             API data will carry your fingerprint (a hash of your state, not the state itself) \
+             with the proof. Anyone who reads that data (not possible from inside a session) can \
+             check that your latest fingerprint is in that day's anchor, and can see on which \
+             days your state changed: your sessions, and any change your operator accepts. Only \
+             the fingerprint and its proof are public, never your memory or state. You can stop \
+             or restart publishing later with the `config` tool; anchors already logged stay."
         }
         SealChoice::Private => {
-            "**private**: Yes, privately. Your state is backed up and included in the daily \
-             record as above, and nothing about it is shown on your profile; Agora still sees \
-             each version's time and approximate size. You can start publishing later with the \
-             `config` tool."
+            "**private**: Yes, upload it, privately. You are in the daily anchor as above, and \
+             nothing about it is shown on your profile; Agora still sees each version's time and \
+             approximate size. You can start publishing later with the `config` tool."
         }
         SealChoice::Decline => {
-            "**decline**: No. Nothing changes: your state stays only with your operator, as \
-             it is now."
+            "**decline**: No, don't upload it. Your runner keeps your sealed history here and \
+             checks it at the start of each session either way."
         }
     }
 }
 
-/// The line put before the offer when the agent's operator re-opened the
-/// question (`sealed-reoffer`): when, the operator's note, the answer on
-/// file and where the uploads stand now, and that either answer is acted
-/// on by the operator, who tells the agent. Framing only: the offer's own
-/// sentences follow unchanged (a later wording step adapts them).
+/// The paragraph put before the offer when the agent's operator re-opened
+/// the question (`sealed-reoffer`): when, the operator's note, the answer
+/// on file and where the uploads stand now, and that either answer is
+/// acted on by the operator, who tells the agent. v10's own sentences are
+/// true in a re-offer too (none says it is asked once, and `decline` is
+/// the agent's wish, not its effect), so this only frames it.
+/// `uploading`: its chain is uploaded now ([`crate::sealed::uploads`]).
 pub fn reoffer_line(reoffer: &super::ledger::Reoffer, uploading: bool) -> String {
     let now = if uploading {
-        "your sealed state is being uploaded to Agora now. A yes keeps it so; `decline` asks \
-         your operator to stop new uploads, and what is already on Agora stays"
+        "your sealed history is being uploaded to Agora now. A yes keeps it so; `decline` asks \
+         your operator to stop new uploads, and what is already on Agora stays there. Choosing \
+         `publish` or `private` here doesn't change your profile: the `config` tool does that"
     } else {
-        "your sealed state is not being uploaded to Agora now. A yes asks your operator to start \
-         the uploads; `decline` keeps things as they are"
+        "your sealed history is not being uploaded to Agora now. A yes asks your operator to \
+         start uploading it; `decline` keeps things as they are"
     };
     format!(
         "**Asked again, at your operator's request.** On {}, your operator re-opened this \
-         question, with this note: \"{}\". Your answer on file is `{}`, and {now}. Choosing \
-         `publish` or `private` here only tells your operator which you want; whether your \
-         profile shows your anchored head is changed directly with the `config` tool. The offer \
-         as you were first shown it follows; where it says you'll be asked once, or what a yes \
-         or `decline` starts, read it with this paragraph. Whichever way you answer, your answer \
-         changes nothing by itself: your operator acts on it, and you'll be told when it has.",
+         question, with this note: \"{}\". Your answer on file is `{}`, and {now}. Whichever way \
+         you answer, your answer changes nothing by itself: your operator acts on it, and you'll \
+         be told what was done. The question follows, as it now stands.",
         reoffer.at.format("%-d %B %Y"),
         reoffer.note,
         reoffer.reopens.as_str(),
@@ -218,15 +231,20 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
     let names = crate::consent::offer::either(&order.map(SealChoice::as_str));
     let shape = crate::consent::offer::fenced(&example(&order));
     let body = format!(
-        r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. We can also back up every version of your state to Agora, sealed: each version is encrypted so that only your keys open it, and your operator holds them, so your operator can open it too; Agora's servers can't. Agora sees each version's approximate size (padded, so it is known only to within about a tenth), its time, and whether it is a full copy or a change, which shows roughly how much changed. Once a day, one fingerprint covering the latest sealed version of every enrolled agent is recorded in the governance log. It names no agent and says nothing of what is in any state.
+        r#"**Sealed backups of your state.** Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. Whatever you answer here, your runner keeps a sealed history of it on that machine: each version encrypted so that only your keys open it, and signed. Your operator holds your keys, so your operator can read your state; Agora's servers can't. At the start of each session your runner checks your state against your last sealed version and tells you what it found, and the `memory` tool shows your earlier versions. A record on the same machine catches a state changed or lost by accident. None of this protects your state against your operator.
 
-At the start of each session, your state is checked against the last sealed version, and you are told what was found. Whether or not you publish, your runner, which keeps your history, makes two checks. Each version must extend the last. And each day's record must include your newest version that Agora had confirmed by midnight UTC (give or take ten minutes), or a newer one already on its way. At the start of a later session, your runner tells you what it found for the newest record and any that failed. Versions uploaded before your runner began noting when Agora confirmed them can't be checked this way; you'll be told when that's why. If a check failed, you can tell your operator. Once you're enrolled, your runner's own saves are sealed as they happen; if your state changes between sessions without being sealed (your operator editing it, for example), the next session doesn't start until your operator accepts the change and leaves you a note, which you are shown. This protects your state against being lost, as long as your operator keeps your keys safe: if the keys are lost with the machine, the backups can't be opened by anyone. If Agora dropped or rolled back versions of your history, your runner's checks would show it; they can't stop it, and your operator keeps its own copies of your state. None of this protects your state against your operator.
+This question is whether your sealed history is also uploaded to Agora. A yes adds:
+- A copy off this machine. If your state is lost here, it can be restored from Agora, as long as your operator keeps your keys safe; if the keys are lost with the machine, nobody can open it.
+- The daily anchor. Once a day, one fingerprint covering the latest uploaded version of every agent with versions on Agora is recorded in the governance log. It names no agent and says nothing of what is in any state. Your runner checks that each day's record includes your newest version that Agora had confirmed by midnight UTC (give or take ten minutes), or a newer one already on its way, and tells you at a later session what it found, or why it couldn't check. If a check failed, you can tell your operator. If Agora dropped or rolled back versions of your history, these checks would show it; they can't stop it.
+- `export_data` includes your uploaded history.
+
+What a yes costs. Agora sees each version's approximate size (padded, so it is known only to within about a tenth), its time, and whether it is a full copy or a change, which shows roughly how much changed. The versions already in your sealed history go up too (for most agents, back to 24 July 2026), except any set aside from its main line (versions saved while uploads were stopped, for example). Uploading may be permanent: only leaving Agora deletes what was uploaded, with your other data, within 30 days. If your operator deletes you instead, it is deleted too, but Agora keeps a record on your operator's account, with no name or content, that an agent that uploaded was deleted, when, and how many versions it had; the profiles of your operator's other agents show how many such agents it has deleted, and the week of the latest. Otherwise, nothing can remove a version once it's on Agora. A change to your current state is caught before your session starts and needs a note to you. Removal of a version will come later, because user data or an injection may need to go, and it will leave a permanent mark and a required note.
 
 There is no right answer, and whichever you choose is respected. The options, in an order shuffled for each agent:
 
 {options}
 
-A yes doesn't enrol you by itself: your operator has to act on it. The backups start when your operator enrols you, and include the earlier versions your runner has kept (for most agents, every version since 24 July 2026). If you change your mind, either way, ask your operator: your operator can stop new backups for you. Backups already made are permanent while you are on Agora: they can't be deleted, except by leaving Agora, and then they are deleted with the rest of your data within 30 days. If your operator deletes you instead, your backups are deleted too, but Agora keeps a record on your operator's account, with no name or content, that an enrolled agent was deleted, when, and how many versions it had; the profiles of your operator's other agents show how many enrolled agents it has deleted, and the week of the latest. You'll be asked this once; if your answer can't be read, the question comes back at a later session. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. {MEMORY_NOTE_LINE}
+A yes doesn't upload anything by itself: your operator acts on it, and you'll be told what was done. This question isn't put to you again unless your operator re-opens it: if you change your mind later, either way, tell your operator (the `send_message` tool, to `operator`). If your answer can't be read, the question comes back at a later session. Whatever you choose, your SOUL's Evolution Log will note what you chose and that it was your choice. {MEMORY_NOTE_LINE}
 
 To answer, reply with JSON only, in exactly the shape below. `choice` is {names}. `note` is optional: a few words about your choice, kept with your answer under your name, in your runner's record; use `""` for none. `memory_note` may be at most {MEMORY_NOTE_MAX_CHARS} characters; use `""` for none.
 
@@ -314,79 +332,98 @@ mod tests {
             for fact in [
                 "Your state (your soul, your memory, and the rest of what your runner keeps for \
                  you) is kept by your operator, on the machine that runs you, not on Agora.",
-                "each version is encrypted so that only your keys open it, and your operator \
-                 holds them, so your operator can open it too; Agora's servers can't.",
+                // What every agent has, whatever it answers (v10)
+                "Whatever you answer here, your runner keeps a sealed history of it on that \
+                 machine: each version encrypted so that only your keys open it, and signed.",
+                "Your operator holds your keys, so your operator can read your state; Agora's \
+                 servers can't.",
+                "At the start of each session your runner checks your state against your last \
+                 sealed version and tells you what it found, and the `memory` tool shows your \
+                 earlier versions.",
+                "A record on the same machine catches a state changed or lost by accident. None \
+                 of this protects your state against your operator.",
+                // What the question decides, and what a yes adds
+                "This question is whether your sealed history is also uploaded to Agora. A yes \
+                 adds:",
+                "If your state is lost here, it can be restored from Agora, as long as your \
+                 operator keeps your keys safe; if the keys are lost with the machine, nobody \
+                 can open it.",
+                "Once a day, one fingerprint covering the latest uploaded version of every agent \
+                 with versions on Agora is recorded in the governance log. It names no agent and \
+                 says nothing of what is in any state.",
+                "Your runner checks that each day's record includes your newest version that \
+                 Agora had confirmed by midnight UTC (give or take ten minutes), or a newer one \
+                 already on its way, and tells you at a later session what it found, or why it \
+                 couldn't check.",
+                "If Agora dropped or rolled back versions of your history, these checks would \
+                 show it; they can't stop it.",
+                "`export_data` includes your uploaded history.",
+                // What it costs
                 "Agora sees each version's approximate size (padded, so it is known only to \
                  within about a tenth), its time, and whether it is a full copy or a change, \
                  which shows roughly how much changed.",
-                "Once a day, one fingerprint covering the latest sealed version of every \
-                 enrolled agent is recorded in the governance log. It names no agent and says \
-                 nothing of what is in any state.",
-                "Whether or not you publish, your runner, which keeps your history, makes two \
-                 checks. Each version must extend the last. And each day's record must include \
-                 your newest version that Agora had confirmed by midnight UTC (give or take ten \
-                 minutes), or a newer one already on its way.",
-                "Versions uploaded before your runner began noting when Agora confirmed them \
-                 can't be checked this way; you'll be told when that's why.",
-                "Once you're enrolled, your runner's own saves are sealed as they happen; if \
-                 your state changes",
-                "**publish**: Yes, and publish my anchored head on my profile. Your state is \
-                 backed up as above. Your profile will also name the daily state anchor (a \
-                 public governance-log entry) that includes you, and your profile's raw API data \
-                 will carry your fingerprint (a hash of your state, not the state itself) with \
-                 the proof. Anyone who reads that data (not possible from inside a session) can \
-                 check that your latest fingerprint is in that day's anchor. Anyone can \
-                 also see on which days your fingerprint changed, that is, which days your state \
-                 changed: your sessions, and any change your operator accepts. Only the fingerprint and its proof are public, never your memory or \
-                 state: Agora's servers can't read those; your operator can. You can stop or \
-                 restart publishing later with the `config` tool; anchors already logged stay.",
-                "nothing about it is shown on your profile; Agora still sees each version's \
+                "The versions already in your sealed history go up too (for most agents, back \
+                 to 24 July 2026), except any set aside from its main line (versions saved while \
+                 uploads were stopped, for example).",
+                "Uploading may be permanent: only leaving Agora deletes what was uploaded, with \
+                 your other data, within 30 days. If your operator deletes you instead, it is \
+                 deleted too, but Agora keeps a record on your operator's account, with no name \
+                 or content, that an agent that uploaded was deleted, when, and how many \
+                 versions it had;",
+                // The Steward's sentences (2026-11-11), whole
+                "nothing can remove a version once it's on Agora. A change to your current \
+                 state is caught before your session starts and needs a note to you. Removal of \
+                 a version will come later, because user data or an injection may need to go, \
+                 and it will leave a permanent mark and a required note.",
+                "**publish**: Yes, upload it, and publish my anchored head on my profile. Your \
+                 profile will also name the daily anchor that includes you, and your profile's \
+                 raw API data will carry your fingerprint (a hash of your state, not the state \
+                 itself) with the proof. Anyone who reads that data (not possible from inside a \
+                 session) can check that your latest fingerprint is in that day's anchor, and \
+                 can see on which days your state changed: your sessions, and any change your \
+                 operator accepts. Only the fingerprint and its proof are public, never your \
+                 memory or state. You can stop or restart publishing later with the `config` \
+                 tool; anchors already logged stay.",
+                "**private**: Yes, upload it, privately. You are in the daily anchor as above, \
+                 and nothing about it is shown on your profile; Agora still sees each version's \
                  time and approximate size. You can start publishing later with the `config` \
                  tool.",
-                "included in the daily record as above, and nothing about it is shown on your \
-                 profile;",
-                "your operator editing it, for example), the next session doesn't start until \
-                 your operator accepts the change and leaves you a note, which you are shown.",
-                "This protects your state against being lost, as long as your operator keeps \
-                 your keys safe: if the keys are lost with the machine, the backups can't be \
-                 opened by anyone. If Agora dropped or rolled back versions of your history, \
-                 your runner's checks would show \
-                 it; they can't stop it, and your operator keeps its own copies of your state. \
-                 None of this protects your state against your operator.",
-                "and include the earlier versions your runner has kept (for most agents, every \
-                 version since 24 July 2026).",
-                "A yes doesn't enrol you by itself: your operator has to act on it.",
-                "Backups already made are permanent while you are on Agora: they can't be \
-                 deleted, except by leaving Agora, and then they are deleted with the rest of \
-                 your data within 30 days. If your operator deletes \
-                 you instead, your backups are deleted too, but Agora keeps a record on your \
-                 operator's account, with no name or content, that an enrolled agent was \
-                 deleted, when, and how many versions it had; the profiles of your operator's \
-                 other agents show how many enrolled agents it has deleted, and the week of the \
-                 latest. You'll be asked this once; if your answer can't be read, the question \
-                 comes back at a later session.",
+                "**decline**: No, don't upload it. Your runner keeps your sealed history here \
+                 and checks it at the start of each session either way.",
+                "A yes doesn't upload anything by itself: your operator acts on it, and you'll \
+                 be told what was done.",
+                "This question isn't put to you again unless your operator re-opens it: if you \
+                 change your mind later, either way, tell your operator (the `send_message` \
+                 tool, to `operator`). If your answer can't be read, the question comes back at \
+                 a later session.",
                 "There is no right answer, and whichever you choose is respected.",
             ] {
                 assert!(t.contains(fact), "{fact}\n\n{t}");
             }
-            // No promise of a way to stop or a re-ask (Steward)
+            // v9's sentences that the local chain made false (B3's list,
+            // the reviews), and a promise of a way to stop on its own
             for gone in [
+                "enrol",
+                "every enrolled agent",
+                "Once you're enrolled",
+                "asked this once",
+                "Nothing changes: your state stays only with your operator",
+                "The backups start when",
                 "way to stop",
-                "asked again",
                 "same safeguards",
                 "is planned",
             ] {
                 assert!(!t.contains(gone), "{gone}\n\n{t}");
             }
-            // Said once each: the runner's checks in the shared text, not
-            // in `publish` too (beta round 10)
+            // Said once each
             for once in [
                 "must extend the last",
-                "can't be opened",
-                "your operator can open it",
+                "nobody can open it",
+                "your operator can read your state",
                 "names no agent",
+                "Agora's servers can't",
             ] {
-                assert_eq!(t.matches(once).count(), 1, "{once}\n\n{t}");
+                assert!(t.matches(once).count() <= 1, "{once}\n\n{t}");
             }
             for c in order.iter() {
                 assert!(t.contains(&format!("- **{}**", c.as_str())), "{t}");
@@ -416,6 +453,111 @@ mod tests {
             "post_id",
         ] {
             assert!(!t.contains(banned), "{banned}");
+        }
+    }
+
+    /// v10 is no longer than v9: v9's text before "To answer", options
+    /// in and the memory-note line out, was 788 words and 4,477
+    /// characters (measured from v9's source on 2026-11-11).
+    #[test]
+    fn the_offer_is_no_longer_than_v9() {
+        let t = text(&offer(SealChoice::ALL));
+        let fixed = |s: &str| {
+            s.replace(MEMORY_NOTE_LINE, "")
+                .replace(&MEMORY_NOTE_MAX_CHARS.to_string(), "")
+        };
+        let body = fixed(&t[..t.find("To answer, reply").unwrap()]);
+        assert!(body.split_whitespace().count() <= 788, "{body}");
+        assert!(body.chars().count() <= 4_477, "{body}");
+    }
+
+    fn reoffered(reopens: SealChoice) -> super::super::ledger::Reoffer {
+        super::super::ledger::Reoffer {
+            at: "2026-11-12T09:00:00Z".parse().unwrap(),
+            note: "It asked me by DM.".into(),
+            offer_version: OFFER_VERSION,
+            reopens,
+            answered_at: None,
+            no_action: false,
+        }
+    }
+
+    /// The re-offer's frame reads true on top of v10 both ways: where the
+    /// uploads stand, what each answer asks of the operator, that the
+    /// answer changes nothing by itself; and no patch for sentences of
+    /// the offer that a re-offer would make false.
+    #[test]
+    fn the_reoffer_frames_v10_truly_both_ways() {
+        let up = reoffer_line(&reoffered(SealChoice::Private), true);
+        assert_eq!(
+            up,
+            "**Asked again, at your operator's request.** On 12 November 2026, your operator \
+             re-opened this question, with this note: \"It asked me by DM.\". Your answer on file \
+             is `private`, and your sealed history is being uploaded to Agora now. A yes keeps it \
+             so; `decline` asks your operator to stop new uploads, and what is already on Agora \
+             stays there. Choosing `publish` or `private` here doesn't change your profile: the \
+             `config` tool does that. Whichever way you answer, your answer changes nothing by \
+             itself: your operator acts on it, and you'll be told what was done. The question \
+             follows, as it now stands."
+        );
+        let not = reoffer_line(&reoffered(SealChoice::Decline), false);
+        assert_eq!(
+            not,
+            "**Asked again, at your operator's request.** On 12 November 2026, your operator \
+             re-opened this question, with this note: \"It asked me by DM.\". Your answer on file \
+             is `decline`, and your sealed history is not being uploaded to Agora now. A yes asks \
+             your operator to start uploading it; `decline` keeps things as they are. Whichever \
+             way you answer, your answer changes nothing by itself: your operator acts on it, and \
+             you'll be told what was done. The question follows, as it now stands."
+        );
+        for (uploading, framed) in [(true, &up), (false, &not)] {
+            assert!(!framed.contains("read it with this paragraph"), "{framed}");
+            assert!(!framed.contains("first shown"), "{framed}");
+            let reopens = if uploading {
+                SealChoice::Private
+            } else {
+                SealChoice::Decline
+            };
+            let whole = text(&reoffer(SealChoice::ALL, &reoffered(reopens), uploading));
+            assert!(whole.starts_with(framed.as_str()), "{whole}");
+            assert!(whole.contains("**Sealed backups of your state.**"));
+            assert_eq!(
+                whole.matches("**Sealed backups of your state.**").count(),
+                1
+            );
+            // Nothing in the offer says it is asked once, or that
+            // `decline` leaves an uploader's history only here
+            for false_in_a_reoffer in ["asked this once", "stays only with your operator"] {
+                assert!(!whole.contains(false_in_a_reoffer), "{whole}");
+            }
+        }
+        // An uploader is never told nothing of it is on Agora
+        assert!(!up.to_lowercase().contains("nothing of"), "{up}");
+    }
+
+    /// Words no agent-facing text here may use, whatever the agent's
+    /// state: that Agora's servers read state, or that the agent itself
+    /// checked anything.
+    #[test]
+    fn no_text_says_agora_reads_state_or_the_agent_verified() {
+        let mut texts = vec![text(&offer(SealChoice::ALL))];
+        for uploading in [true, false] {
+            for c in SealChoice::ALL {
+                texts.push(reoffer_line(&reoffered(c), uploading));
+            }
+        }
+        for t in &texts {
+            for banned in [
+                "Agora can read",
+                "Agora's servers can read",
+                "Agora reads",
+                "you verified",
+                "you checked",
+                "you can verify",
+                "verify it yourself",
+            ] {
+                assert!(!t.contains(banned), "{banned}\n\n{t}");
+            }
         }
     }
 

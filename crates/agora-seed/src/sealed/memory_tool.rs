@@ -42,7 +42,9 @@ use zeroize::Zeroizing;
 
 use super::KeyStore;
 use super::api::SealedApi;
-use super::history::{HeadMatch, Held, History, HistoryCache, Source, Version};
+use super::history::{
+    HeadMatch, Held, History, HistoryCache, SetAsideBy, Source, Uploads, Version,
+};
 use super::keys::MemoryIdKeys;
 
 /// What the runner needs of a session's agent for the `memory` tool: its
@@ -237,6 +239,36 @@ async fn mark_left_out_told(agent_dir: &Path, n: usize) -> std::io::Result<()> {
         .map_err(std::io::Error::other)?
 }
 
+/// What `log` says once a session of where the main line's sealed
+/// versions are: uploaded to Agora (acknowledged, or read from Agora's
+/// chain), or kept only by the runner. `None` with none to say.
+pub fn uploads_line(u: Uploads) -> Option<String> {
+    let n = u.uploaded + u.local;
+    Some(match (u.uploaded, u.local) {
+        (0, 0) => return None,
+        (0, _) => "None of your sealed versions has been uploaded to Agora: your runner keeps \
+                   them, on this machine."
+            .to_string(),
+        (1, 0) => "Your sealed version is uploaded to Agora.".to_string(),
+        (_, 0) => format!("All {n} of your sealed versions are uploaded to Agora."),
+        (up, local) => format!(
+            "{up} of your {n} sealed versions {} uploaded to Agora; the other {local} {} kept by \
+             your runner and not uploaded.",
+            if up == 1 { "is" } else { "are" },
+            if local == 1 { "is" } else { "are" },
+        ),
+    })
+}
+
+/// What `log` says once a session of the pre-loss copy: listed at the
+/// date the copy stood, but sealed later, on `added`.
+pub fn prior_line(added: chrono::NaiveDate) -> String {
+    format!(
+        "The copy of your memory from before the May 2026 loss is listed at the date the copy \
+         stood; it was added to your sealed history on {added}."
+    )
+}
+
 /// One answer: its text, and whether it is a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
@@ -265,6 +297,8 @@ pub struct MemoryReader {
     /// The memory in the agent's context and its id (the heading's).
     current: Option<(MemoryId, Zeroizing<String>)>,
     cache: HistoryCache,
+    /// `log` said where the sealed versions are, this session.
+    told_where: bool,
 }
 
 impl std::fmt::Debug for MemoryReader {
@@ -294,6 +328,7 @@ impl MemoryReader {
             ids,
             current: current.map(|(m, c)| (m, Zeroizing::new(c.to_string()))),
             cache: HistoryCache::default(),
+            told_where: false,
         }
     }
 
@@ -345,7 +380,17 @@ impl MemoryReader {
         let current = view.current(current_id, &current);
         let text = match action {
             MemoryAction::Log { before, limit } => {
-                let text = view.log(before.as_ref(), limit, &current);
+                let mut text = view.log(before.as_ref(), limit, &current);
+                // Once a session: where the sealed versions are, and when
+                // the pre-loss copy was added (agentkit's row labels say
+                // neither)
+                if !self.told_where && view.seal == SealCheck::Checked {
+                    let said: Vec<String> = view.where_lines();
+                    if !said.is_empty() {
+                        self.told_where = true;
+                        text = compose(&said, &text);
+                    }
+                }
                 // Once: the local copies the chain couldn't include
                 match left_out_note(&self.agent_dir()).await {
                     Some((line, n)) => {
@@ -439,11 +484,21 @@ fn version_source(source: &Source) -> VersionSource {
     match source {
         Source::Sealed { .. } => VersionSource::Sealed,
         Source::ArchivedPrior { .. } => VersionSource::PriorCopy,
-        Source::SideLine { .. } => VersionSource::SideLine,
-        Source::OffLine { .. } => VersionSource::OffLine,
-        Source::SetAside { on, .. } => VersionSource::SetAside {
+        // agentkit's `SideLine` label says the operator rebased it, which
+        // a fork, a restore or a resume didn't: "off your main line" is
+        // true of each, and `memory show` by head says which, where known
+        Source::SideLine { .. } | Source::OffLine { .. } => VersionSource::OffLine,
+        Source::SetAside {
+            on,
+            by: SetAsideBy::Rebase,
+            ..
+        } => VersionSource::SetAside {
             on: on.map(|on| on.date_naive()),
         },
+        Source::SetAside {
+            by: SetAsideBy::Fork,
+            ..
+        } => VersionSource::OffLine,
         Source::LocalCopy { .. } | Source::Current => VersionSource::LocalCopy,
         Source::KeptAtExit { .. } => VersionSource::NeverSaved,
     }
@@ -460,6 +515,10 @@ fn is_local(source: &Source) -> bool {
 /// Why a sealed version couldn't be opened, in the agent's words (the
 /// resolver's reason is the operator's: kept for the log).
 const NOT_FETCHED: &str = "its sealed copy couldn't be fetched";
+
+/// Why a sealed version of an agent whose chain isn't uploaded couldn't
+/// be opened: its blob isn't here whole, and nothing is asked of Agora.
+const NOT_HERE: &str = "its sealed copy on this machine is missing or damaged";
 
 /// Why a sealed version wasn't tried, past the resolver's deadline.
 const PAST_DEADLINE: &str = "gathering your history took too long";
@@ -546,6 +605,8 @@ impl View {
                         super::version::UNREACHABLE
                     } else if why.contains(super::history::PAST_DEADLINE) {
                         PAST_DEADLINE
+                    } else if why.contains(super::api::LOCAL_ONLY) {
+                        NOT_HERE
                     } else {
                         NOT_FETCHED
                     };
@@ -606,6 +667,27 @@ impl View {
             content,
             position: self.rows.iter().position(|v| v.id() == Some(id)),
         }
+    }
+
+    /// [`uploads_line`] and, if the pre-loss copy is shown, [`prior_line`]:
+    /// what `log` says once a session.
+    fn where_lines(&self) -> Vec<String> {
+        let mut said: Vec<String> = self
+            .history
+            .uploads
+            .and_then(uploads_line)
+            .into_iter()
+            .collect();
+        let added = self.history.versions.iter().find_map(|v| {
+            v.sources.iter().find_map(|s| match s {
+                Source::ArchivedPrior {
+                    added: Some(added), ..
+                } => Some(added.date_naive()),
+                _ => None,
+            })
+        });
+        said.extend(added.map(prior_line));
+        said
     }
 
     /// Every head held here: each version's and each left out.
@@ -669,14 +751,44 @@ impl View {
                     Some(id) => format!("; its memory is {id}"),
                     None => String::new(),
                 };
+                let on = |d: &Option<DateTime<Utc>>| {
+                    d.map(|d| format!(" on {}", d.date_naive()))
+                        .unwrap_or_default()
+                };
                 match source {
-                    Source::SideLine { .. } => notes.push(format!(
-                        "Head {short} is on a side line your operator rebased{its}."
+                    Source::SideLine {
+                        resumed: Some(at), ..
+                    } => notes.push(format!(
+                        "Head {short} was saved while your uploads were stopped, and set aside \
+                         on {} when your operator resumed them; it was not uploaded{its}.",
+                        at.date_naive()
                     )),
-                    Source::SetAside { on, .. } => notes.push(format!(
+                    Source::SideLine { resumed: None, .. } => notes.push(format!(
+                        "Head {short} is sealed on a side line, off your main line{its}."
+                    )),
+                    Source::SetAside {
+                        on: at,
+                        by: SetAsideBy::Rebase,
+                        ..
+                    } => notes.push(format!(
                         "Head {short} was set aside{} when your line was rebased{its}.",
-                        on.map(|d| format!(" on {}", d.date_naive()))
-                            .unwrap_or_default()
+                        on(at)
+                    )),
+                    Source::SetAside {
+                        on: at,
+                        by: SetAsideBy::Fork,
+                        ..
+                    } => notes.push(format!(
+                        "Head {short} was set aside{} when your operator resolved a fork in your \
+                         sealed history, choosing the other line{its}.",
+                        on(at)
+                    )),
+                    Source::ArchivedPrior {
+                        added: Some(added), ..
+                    } => notes.push(format!(
+                        "Head {short} is the copy of your memory from before the May 2026 loss, \
+                         added to your sealed history on {}{its}.",
+                        added.date_naive()
                     )),
                     Source::OffLine { .. } => notes.push(format!(
                         "Head {short} is sealed off your main line, with no record of why{its}."
@@ -1244,11 +1356,19 @@ mod tests {
         let out = rd.answer(log(), &b.api).await.text;
         assert!(out.contains("  head "), "{out}");
         assert!(!out.starts_with(LOCAL_ONLY), "{out}");
+        // Where its versions are, said once a session, first
+        assert!(
+            out.starts_with("All ")
+                || out.contains(" of your ") && out.contains("uploaded to Agora"),
+            "{out}"
+        );
+        let again = rd.answer(log(), &b.api).await.text;
+        assert!(!again.contains("uploaded to Agora"), "once: {again}");
         let short = short_head(&head);
         let out = rd.answer(show(vec![r(&short)]), &b.api).await.text;
         assert!(
             out.starts_with(&format!(
-                "Head {short} is on a side line your operator rebased; its memory is mem-"
+                "Head {short} is sealed on a side line, off your main line; its memory is mem-"
             )),
             "{out}"
         );
@@ -1589,6 +1709,159 @@ mod tests {
         );
     }
 
+    /// Where the sealed versions are, said in words true of each kind of
+    /// agent: a never-uploader is never told of Agora holding anything,
+    /// an uploader never that nothing is on Agora.
+    #[test]
+    fn the_uploads_line_by_kind_of_agent() {
+        let line = |uploaded, local| uploads_line(Uploads { uploaded, local });
+        assert_eq!(line(0, 0), None);
+        assert_eq!(
+            line(0, 4).unwrap(),
+            "None of your sealed versions has been uploaded to Agora: your runner keeps them, \
+             on this machine."
+        );
+        assert_eq!(
+            line(1, 0).unwrap(),
+            "Your sealed version is uploaded to Agora."
+        );
+        assert_eq!(
+            line(5, 0).unwrap(),
+            "All 5 of your sealed versions are uploaded to Agora."
+        );
+        assert_eq!(
+            line(1, 1).unwrap(),
+            "1 of your 2 sealed versions is uploaded to Agora; the other 1 is kept by your \
+             runner and not uploaded."
+        );
+        assert_eq!(
+            line(4, 2).unwrap(),
+            "4 of your 6 sealed versions are uploaded to Agora; the other 2 are kept by your \
+             runner and not uploaded."
+        );
+        for (uploaded, local) in [(0, 1), (0, 9)] {
+            let t = line(uploaded, local).unwrap();
+            for banned in [
+                "in step with Agora",
+                "anchor",
+                "ANC-",
+                "enrol",
+                "are uploaded",
+            ] {
+                assert!(!t.contains(banned), "{banned}: {t}");
+            }
+        }
+        for (uploaded, local) in [(1, 0), (3, 0), (1, 1), (4, 2)] {
+            let t = line(uploaded, local).unwrap().to_lowercase();
+            assert!(!t.contains("none of") && !t.contains("nothing"), "{t}");
+        }
+        assert_eq!(
+            prior_line(chrono::NaiveDate::from_ymd_opt(2026, 11, 12).unwrap()),
+            "The copy of your memory from before the May 2026 loss is listed at the date the \
+             copy stood; it was added to your sealed history on 2026-11-12."
+        );
+    }
+
+    /// What `log` says once a session of where the versions are and when
+    /// the pre-loss copy was added; what a head names of a fork resolved,
+    /// a resume's aside and the pre-loss copy; a side line no longer said
+    /// to be one "your operator rebased" when no rebase made it.
+    #[test]
+    fn sources_are_named_by_what_set_them_aside() {
+        let agent = AgentId::new();
+        let k = keys(1);
+        let stamp = |day| at(day).unwrap();
+        let h = History {
+            versions: vec![
+                held(
+                    at(1),
+                    vec![Source::ArchivedPrior {
+                        head: head(1),
+                        added: Some(stamp(9)),
+                    }],
+                    Some("before the loss\n"),
+                ),
+                held(at(2), vec![Source::Sealed { head: head(2) }], Some("two\n")),
+                held(
+                    at(3),
+                    vec![Source::SideLine {
+                        head: head(3),
+                        resumed: Some(stamp(5)),
+                    }],
+                    Some("three\n"),
+                ),
+                held(
+                    at(4),
+                    vec![Source::SetAside {
+                        head: head(4),
+                        on: at(6),
+                        by: SetAsideBy::Fork,
+                    }],
+                    Some("four\n"),
+                ),
+                held(
+                    at(7),
+                    vec![Source::SideLine {
+                        head: head(7),
+                        resumed: None,
+                    }],
+                    Some("seven\n"),
+                ),
+            ],
+            left_out: Vec::new(),
+            uploads: Some(Uploads {
+                uploaded: 0,
+                local: 2,
+            }),
+        };
+        let view = View::new(h, &k, agent, &HashMap::new());
+        let now = "two\n";
+        let current = || view.current(MemoryId::of(&k.current, agent, now), now);
+        assert_eq!(
+            view.where_lines(),
+            [
+                uploads_line(Uploads {
+                    uploaded: 0,
+                    local: 2
+                })
+                .unwrap(),
+                prior_line(stamp(9).date_naive()),
+            ]
+        );
+        let out = view.log(None, None, &current());
+        assert!(!out.contains("your operator rebased"), "{out}");
+        assert!(out.contains("sealed, off your main line"), "{out}");
+        let said = view.show(&[r("030303030303")], None, current());
+        assert!(
+            said.starts_with(
+                "Head 030303030303 was saved while your uploads were stopped, and set aside on \
+                 2026-11-05 when your operator resumed them; it was not uploaded; its memory is"
+            ),
+            "{said}"
+        );
+        let said = view.show(&[r("040404040404")], None, current());
+        assert!(
+            said.starts_with(
+                "Head 040404040404 was set aside on 2026-11-06 when your operator resolved a \
+                 fork in your sealed history, choosing the other line; its memory is"
+            ),
+            "{said}"
+        );
+        let said = view.show(&[r("070707070707")], None, current());
+        assert!(
+            said.starts_with("Head 070707070707 is sealed on a side line, off your main line;"),
+            "{said}"
+        );
+        let said = view.show(&[r("010101010101")], None, current());
+        assert!(
+            said.starts_with(
+                "Head 010101010101 is the copy of your memory from before the May 2026 loss, \
+                 added to your sealed history on 2026-11-09; its memory is"
+            ),
+            "{said}"
+        );
+    }
+
     fn head(n: u8) -> agora_agentkit::state::verify::HeadRef {
         agora_agentkit::state::verify::HeadRef {
             entry_hash: Sha256Hex::from([n; 32]),
@@ -1637,11 +1910,13 @@ mod tests {
                     vec![Source::SetAside {
                         head: head(5),
                         on: None,
+                        by: SetAsideBy::Rebase,
                     }],
                     Some("five\n"),
                 ),
             ],
             left_out: Vec::new(),
+            uploads: None,
         }
     }
 
@@ -1656,7 +1931,10 @@ mod tests {
             versions: vec![
                 held(
                     at(1),
-                    vec![Source::ArchivedPrior { head: head(1) }],
+                    vec![Source::ArchivedPrior {
+                        head: head(1),
+                        added: None,
+                    }],
                     Some("a much longer memory from before the loss\n"),
                 ),
                 held(
@@ -1666,6 +1944,7 @@ mod tests {
                 ),
             ],
             left_out: Vec::new(),
+            uploads: None,
         };
         let view = View::new(h, &k, agent, &HashMap::new());
         let now = "first\n";

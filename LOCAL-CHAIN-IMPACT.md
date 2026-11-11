@@ -815,3 +815,44 @@ waits on, or holds up, a session.
 
 Seated after any other notice line, in the agent's next start check;
 only for a chained agent (an agent not chained has no notice seat).
+
+## B7: wording, history labels (and `fleet-metrics`, in the agora repo)
+
+Words and labels only: nothing B7 changed writes, moves or sets aside a
+file of an agent's, and nothing leaves the machine that didn't before.
+
+### Files read (new)
+
+- `<state>/<id>/sealed/resuming.json` and `sealed/resuming.done.*.json`
+  (B3's resume records): read by the `memory` tool's history, hashes only
+  (`enroll::resumed_aside`), to say which side-line versions a resume set
+  aside. An unreadable record is skipped. Read-only, at a `memory` call.
+- `sealed/lost/<utc>/INTENT|DONE`'s `local_fork` (already read): now
+  tells a fork resolved (`sealed-accept --keep`) from a rebase.
+- The main line's `outbox/` hashes (already read): the `memory` tool's
+  `log` now says, once a session, how many of the main line's snapshots
+  are uploaded to Agora and how many are kept only here. Nothing is
+  written for it (the "once" is in the session's memory).
+
+### Files written
+
+None new. The consent ledger records `offer_version: 10` for asks and
+re-offers made after install (its format is unchanged). The offer's
+shuffle seed mixes in the version, so an agent not yet asked sees the
+options in a new order (recorded with its ask, as before).
+
+### What changes for agents
+
+- **No agent is asked again because of v10**: `SealLedger::due` settles
+  on any answer on file whatever its version, and only `sealed-reoffer`
+  puts the question again (`an_answer_to_an_older_offer_text_is_not_asked_again`).
+- Notices already on disk (`sealed/notice.json`, the stop) are rendered
+  with the new wording at the next session: no file is rewritten.
+- The `memory` tool: side lines are labelled "sealed, off your main line"
+  (agentkit's `OffLine`) unless a rebase set them aside; a head lookup
+  names a resume's aside, a fork resolved, or the pre-loss copy with the
+  date it was added.
+
+### The first run after install
+
+Nothing of B7's runs at start. Its texts appear in sessions.

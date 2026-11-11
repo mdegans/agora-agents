@@ -449,6 +449,29 @@ struct Resuming {
 
 const RESUMING: &str = "resuming.json";
 
+// B7: read-only, for the `memory` tool's labels (`history.rs`): which
+// versions a resume set aside, and when. Owned by the resume's builder.
+/// The versions each resume set aside as saved while uploads were
+/// stopped, with when it ran: `resuming.json` (a resume under way) and
+/// every `resuming.done.*.json`. Hashes only; an unreadable record is
+/// skipped (its versions are then labelled as any other side line).
+pub fn resumed_aside(agent_dir: &Path) -> Vec<(DateTime<Utc>, Vec<Sha256Hex>)> {
+    let dir = agent_dir.join(agora_agentkit::state::storage::SEALED_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name == RESUMING || (name.starts_with("resuming.done.") && name.ends_with(".json"))
+        })
+        .filter_map(|e| serde_json::from_slice::<Resuming>(&std::fs::read(e.path()).ok()?).ok())
+        .map(|r| (r.at, r.aside))
+        .collect()
+}
+
 fn resuming_path(agent_dir: &Path) -> PathBuf {
     agent_dir
         .join(agora_agentkit::state::storage::SEALED_DIR)
@@ -2568,9 +2591,10 @@ pub(crate) mod tests {
                 .unwrap()
                 .line()
                 .unwrap();
+            // B7: the notice's wording (`notice.rs`)
             assert!(
                 line.contains(
-                    "The 2 versions of your state saved while uploads were stopped were kept here"
+                    "The 2 versions of your state saved while uploads were stopped are kept here"
                 ),
                 "{line}"
             );

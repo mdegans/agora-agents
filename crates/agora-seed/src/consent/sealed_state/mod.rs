@@ -19,13 +19,17 @@
 //! - `private`: yes, nothing on its profile;
 //! - `decline`: nothing changes.
 //!
-//! **A yes changes nothing by itself.** The operator enrols the agent with
-//! `agora-seed sealed-enroll` (key, genesis, archives, the current state);
-//! only an enrolled agent's saves are sealed ([`crate::sealed`]).
+//! **Every agent is chained locally whatever it answers** (`sealed-enroll`:
+//! key, genesis, archives, the current state; [`crate::sealed`]); the offer
+//! decides only the upload. **A yes changes nothing by itself**: the
+//! operator opts the agent in (`sealed-enroll --opt-in`), and it is told.
 //!
 //! **Asked once**, only of agents the config lists by id (or of every
-//! agent, with `all = true`: the fleet offer), the siblings' rule: an answer on file (or an explicit refusal) ends it; a missing
-//! answer is asked again, up to [`ledger::MAX_MISSES`] times. Never beside
+//! agent, with `all = true`: the fleet offer), the siblings' rule: an
+//! answer on file (or an explicit refusal) ends it, whatever the text's
+//! version; a missing answer is asked again, up to
+//! [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) times; only the
+//! operator's re-offer (`sealed-reoffer`) puts it again. Never beside
 //! the role offer or the memory-restore offer, whose answer the genesis
 //! records.
 //!
