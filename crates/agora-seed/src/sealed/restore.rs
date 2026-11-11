@@ -649,8 +649,16 @@ pub async fn restore_with(
     // The notice first: what was found here is known now, and a rerun of
     // a restore cut short keeps it. The marker and the refusal last, so a
     // cut anywhere leaves a rerun to do (refused, or not enrolled)
-    Notice::restored(&agent_dir, from, note, reason, found, refused)
-        .context("writing the notice")?;
+    Notice::restored_from(
+        &agent_dir,
+        from,
+        note,
+        reason,
+        found,
+        refused,
+        reach == super::version::Reach::Local,
+    )
+    .context("writing the notice")?;
     super::crash::point("restore:noticed")?;
     // A stray tmp (a save or restore cut short) is kept, never truncated
     // by the write below
@@ -1398,6 +1406,8 @@ mod tests {
         assert!(done.rebuilt_head);
         assert_eq!(done.head, head.head);
         assert_eq!(local(&root, id).await, head.plaintext_sha256.unwrap());
+        let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+        assert!(!line.contains("the copy on Agora"), "{line}");
 
         let root = crate::sealed::TestDir::new("restore-local-sealed");
         let (id, keys, dir) = check::tests::enrolled_local(&root).await;
