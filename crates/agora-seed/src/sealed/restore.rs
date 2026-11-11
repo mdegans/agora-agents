@@ -328,8 +328,18 @@ pub async fn restore(
     // The notice first: what was found here is known now, and a rerun of
     // a restore cut short keeps it. The marker and the refusal last, so a
     // cut anywhere leaves a rerun to do (refused, or not enrolled)
-    Notice::restored(&agent_dir, from, note, reason, found, refused)
-        .context("writing the notice")?;
+    // B5: pass `RestoredFrom::Local` when the version came from the local
+    // chain, and set the roster's head (`roster::replace`)
+    Notice::restored(
+        &agent_dir,
+        from,
+        note,
+        reason,
+        found,
+        refused,
+        super::notice::RestoredFrom::Agora,
+    )
+    .context("writing the notice")?;
     super::crash::point("restore:noticed")?;
     // A stray tmp (a save or restore cut short) is kept, never truncated
     // by the write below

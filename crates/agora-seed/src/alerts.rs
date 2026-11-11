@@ -149,6 +149,16 @@ pub enum AlertKind {
     /// recognise (its record of past keys lost, or a forgery): the run is
     /// refused, nothing marked. Never rate-limited.
     SealedStateUntrustedKey,
+    /// Agent directories with a state but no local chain, and not on the
+    /// roster: never enrolled. One alert a run, with the count.
+    SealedStateUnchainedAgents,
+    /// Chained agents have sealed versions whose blob files here are
+    /// missing or damaged: those versions can't be opened here. One alert
+    /// a run.
+    SealedStateBlobsMissing,
+    /// The sealed roster was last written long before the newest chained
+    /// state: possibly a data directory restored from an older backup.
+    SealedStateRosterStale,
     /// An agent's memory-id key couldn't be had: a key `sealed-forget` set
     /// aside that can't be read, its secrets not in the secrets tree, or a
     /// key there that isn't the one its state directory's fingerprint
@@ -181,7 +191,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 35] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -209,6 +219,9 @@ impl AlertKind {
         Self::SealedStateKeysWithoutState,
         Self::SealedStateUploadingInDoubt,
         Self::SealedStateUntrustedKey,
+        Self::SealedStateUnchainedAgents,
+        Self::SealedStateBlobsMissing,
+        Self::SealedStateRosterStale,
         Self::MemoryIdKeyRefused,
         Self::QuestionUnanswered,
         Self::ApiRefusal,
@@ -259,6 +272,9 @@ impl AlertKind {
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
             Self::SealedStateUploadingInDoubt => "sealed_state_uploading_in_doubt",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
+            Self::SealedStateUnchainedAgents => "sealed_state_unchained_agents",
+            Self::SealedStateBlobsMissing => "sealed_state_unopenable",
+            Self::SealedStateRosterStale => "sealed_roster_stale",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
             Self::QuestionUnanswered => "question_unanswered",
             Self::ApiRefusal => "api_refusal_alert",
@@ -391,20 +407,25 @@ impl AlertKind {
                  fixed. Agents already enrolled stay sealed and checked."
             }
             Self::SealedStateDrop => {
-                "An enrolled agent's memory or soul is less than half the \
-                 size it was at its previous sealed version (sizes below, in \
-                 characters). The agent was told and runs as usual: it may \
-                 have condensed its own memory. If it didn't, its earlier \
-                 versions are sealed and can be restored. Look at counts and \
-                 sizes, not content."
+                "Chained agents' memories or souls are less than half the \
+                 size they were at their previous sealed versions (the first \
+                 few below, by how much; one mail for the run, each one a \
+                 `sealed_state_drop` event in the run log). Each agent was \
+                 told and runs as usual: most condensed their own memory. If \
+                 one didn't, its earlier versions are sealed and can be \
+                 restored. Many at once that didn't run a session is \
+                 fleet-shaped. Look at counts and sizes, not content."
             }
             Self::SealedStateUnreadable => {
-                "An enrolled agent's sealed/ directory could not be read at \
-                 the start of its session (permissions, a malformed file, a \
-                 lock). Its state could not be checked; it runs anyway, its \
-                 saves are written locally but not sealed (recorded in \
-                 sealed/seal_failed.json), and its uploads are held. Fix the \
-                 directory; the next start checks again."
+                "Chained agents' sealed/ directories or keys could not be read \
+                 at the start (permissions, a malformed file, a lock): one \
+                 mail for the run, the first few agents below; many at once \
+                 points at the secrets tree or a disk. (Sent per agent when \
+                 an uploading agent's chain runs through Agora, which \
+                 couldn't be reached.) Their states could not be checked; \
+                 they run anyway, their saves are written locally but not \
+                 sealed (recorded in sealed/seal_failed.json), and uploads \
+                 are held. Fix the directory; the next start checks again."
             }
             Self::SealedStateRotationUnknown => {
                 "Agora lists a rotation of this agent's signing key that the \
@@ -423,18 +444,23 @@ impl AlertKind {
             }
             Self::SealedStateRefusedRun => {
                 "The seed runner refused to run: the sealed-state start check \
-                 refused the agents listed below (a state that matches no \
-                 sealed version, a chain that doesn't verify, or a lost \
-                 head), and a state that matches nothing is likely \
-                 fleet-wide, so no agent runs. The unit does not restart on \
-                 this exit (75). For each agent: `agora-seed sealed-restore \
-                 --agent <id>` puts its last sealed version back (damage), or \
-                 `agora-seed sealed-accept --agent <id> --note \"…\"` keeps \
-                 its state (a deliberate change). For a missing state \
-                 (state_missing) of an agent that left, `agora-seed \
-                 sealed-forget --agent <id> --note \"…\"` sets its key \
-                 aside instead. Then start the runner. Look \
-                 at counts and sizes, not content."
+                 refused the agents listed below, or the runner's own records \
+                 failed (the sealed roster missing or unreadable, the secrets \
+                 tree unlistable). The whole run stops for a loss (a state, \
+                 its directory or its head gone, unreadable, or older than \
+                 the roster's record), any refused agent that uploads, or \
+                 three or more refused agents, counting those still refused \
+                 from earlier runs; one or two agents that don't upload, \
+                 refused for a mismatch or a broken chain, are left out \
+                 alone instead (`sealed_state_refused`). The unit does not \
+                 restart on this exit (75). For each agent: `agora-seed \
+                 sealed-restore --agent <id>` puts its last sealed version \
+                 back (damage), or `agora-seed sealed-accept --agent <id> \
+                 --note \"…\"` keeps its state (a deliberate change). For a \
+                 missing state (state_missing) of an agent that left, \
+                 `agora-seed sealed-forget --agent <id> --note \"…\"` sets its \
+                 key aside instead. Then start the runner. Look at counts \
+                 and sizes, not content."
             }
             Self::SealedStateAnchorFailed => {
                 "The runner's anchor check for an agent stopped before it \
@@ -478,14 +504,43 @@ impl AlertKind {
                  backup, then start again. Nothing was marked against the \
                  agents. This alert is never rate-limited."
             }
+            Self::SealedStateUnchainedAgents => {
+                "Agent directories hold a state.json but no local chain, and \
+                 the sealed roster doesn't list them: they were never \
+                 enrolled (every agent is chained since the local chain), so \
+                 their state is not checked at the start. The count and the \
+                 first few ids are below; one mail a run. Enrol them with \
+                 `agora-seed sealed-enroll`; the runner never enrols them on \
+                 its own."
+            }
+            Self::SealedStateBlobsMissing => {
+                "At their full check (every 7 to 14 days), chained agents were \
+                 found with sealed versions whose blob files in sealed/blobs \
+                 are missing or don't hash to their names, so those versions \
+                 can't be opened here (the memory tool's history, a restore). \
+                 Their current states are fine and they run; each agent was \
+                 told how many and since when. Versions already uploaded are \
+                 not looked at (they are on Agora). Look at the disk and the \
+                 backups; counts and sizes, not content."
+            }
+            Self::SealedStateRosterStale => {
+                "The sealed roster (<data_dir>/sealed-roster.json) was last \
+                 written long before the newest chained agent's state.json: \
+                 the data directory may have been restored from an older \
+                 backup, which every witness inside it can't tell. Nothing \
+                 was refused. Check where the data directory came from before \
+                 the runner goes on."
+            }
             Self::SealedStateKeysWithoutState => {
-                "An agent has a state key in the secrets tree, and Agora \
-                 holds no sealed head for it (or doesn't know it). If its \
+                "Agents have a state key in the secrets tree but no chained \
+                 state, and neither the sealed roster nor Agora holds a head \
+                 for them (Agora is asked only of an agent that uploaded). \
+                 One mail for the run, the first few below. If an agent's \
                  state is here, its enrolment was cut after its key was \
                  cached: `agora-seed sealed-enroll --agent <id>` resumes it. \
                  If not, nothing can be restored: if it left, `agora-seed \
                  sealed-forget --agent <id> --note \"…\"` sets its key aside \
-                 (nothing is deleted). It was skipped either way."
+                 (nothing is deleted). They were skipped either way."
             }
             Self::SealedStateUploadingInDoubt => {
                 "The agents below said yes to uploading their sealed state, \
@@ -576,6 +631,10 @@ pub struct Alert {
     pub model: Option<String>,
     /// Further fields, in order (`error`, `from`, `to`, …).
     pub details: Vec<(&'static str, String)>,
+    /// For a run's summary of many agents: how many. One with more than
+    /// the last one sent under its key goes out inside the rate limit, so
+    /// a sweep of one can't hide the next sweep's thousand.
+    pub count: Option<usize>,
 }
 
 impl Alert {
@@ -588,7 +647,14 @@ impl Alert {
             agent_id: None,
             model: None,
             details: Vec::new(),
+            count: None,
         }
+    }
+
+    /// A summary of `n` agents ([`Self::count`]).
+    pub fn count(mut self, n: usize) -> Self {
+        self.count = Some(n);
+        self
     }
 
     pub fn agent(mut self, name: impl Into<String>, id: AgentId) -> Self {
@@ -1101,7 +1167,7 @@ impl Inner {
         let reserved = if alert.kind.unlimited() {
             Ok(true)
         } else {
-            self.reserve(&key, now).await
+            self.reserve(&key, now, alert.count).await
         };
         match reserved {
             Ok(true) => true,
@@ -1173,14 +1239,19 @@ impl Inner {
 
     /// Claim the send slot for `key`: `true` if it may send now (and the
     /// time is recorded), `false` inside the rate limit.
-    async fn reserve(&self, key: &str, now: DateTime<Utc>) -> anyhow::Result<bool> {
+    async fn reserve(
+        &self,
+        key: &str,
+        now: DateTime<Utc>,
+        count: Option<usize>,
+    ) -> anyhow::Result<bool> {
         if self.min_interval.is_zero() {
             return Ok(true);
         }
         let _guard = self.state_lock.lock().await;
         let mut state = RateState::load(&self.state_path).await?;
         state.prune(now, self.min_interval);
-        let allowed = state.allow(key, now, self.min_interval);
+        let allowed = state.allow(key, now, self.min_interval, count);
         if allowed {
             state.save(&self.state_path).await?;
         }
@@ -1205,6 +1276,9 @@ impl Inner {
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 struct RateState {
     last_sent: BTreeMap<String, DateTime<Utc>>,
+    /// The count of the last summary sent under a key ([`Alert::count`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    counts: BTreeMap<String, usize>,
 }
 
 impl RateState {
@@ -1233,15 +1307,27 @@ impl RateState {
     }
 
     /// `true` (and recorded) if `key` last sent at least `min_interval`
-    /// ago, or never.
-    fn allow(&mut self, key: &str, now: DateTime<Utc>, min_interval: Duration) -> bool {
+    /// ago, or never, or `count` is more than the last one sent under it.
+    fn allow(
+        &mut self,
+        key: &str,
+        now: DateTime<Utc>,
+        min_interval: Duration,
+        count: Option<usize>,
+    ) -> bool {
         let interval = chrono::Duration::from_std(min_interval).unwrap_or(chrono::Duration::MAX);
+        let more = count.is_some_and(|n| self.counts.get(key).is_none_or(|last| n > *last));
         if let Some(last) = self.last_sent.get(key)
             && now.signed_duration_since(*last) < interval
+            && !more
         {
             return false;
         }
         self.last_sent.insert(key.to_string(), now);
+        match count {
+            Some(n) => self.counts.insert(key.to_string(), n),
+            None => self.counts.remove(key),
+        };
         true
     }
 
@@ -1249,6 +1335,7 @@ impl RateState {
     fn release(&mut self, key: &str, at: DateTime<Utc>) -> bool {
         if self.last_sent.get(key) == Some(&at) {
             self.last_sent.remove(key);
+            self.counts.remove(key);
             true
         } else {
             false
@@ -1260,6 +1347,8 @@ impl RateState {
         let interval = chrono::Duration::from_std(min_interval).unwrap_or(chrono::Duration::MAX);
         self.last_sent
             .retain(|_, last| now.signed_duration_since(*last) < interval);
+        let kept = &self.last_sent;
+        self.counts.retain(|key, _| kept.contains_key(key));
     }
 }
 
@@ -1462,16 +1551,40 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let mut s = RateState::default();
-        assert!(s.allow("a|1", t0, hour));
-        assert!(!s.allow("a|1", t0 + chrono::Duration::minutes(59), hour));
-        assert!(s.allow("a|2", t0, hour), "keys are independent");
-        assert!(s.allow("a|1", t0 + chrono::Duration::minutes(60), hour));
+        assert!(s.allow("a|1", t0, hour, None));
+        assert!(!s.allow("a|1", t0 + chrono::Duration::minutes(59), hour, None));
+        assert!(s.allow("a|2", t0, hour, None), "keys are independent");
+        assert!(s.allow("a|1", t0 + chrono::Duration::minutes(60), hour, None));
         s.prune(t0 + chrono::Duration::minutes(90), hour);
         assert_eq!(s.last_sent.len(), 1, "a|2 aged out, a|1 (at 60) did not");
         // Releasing only undoes the matching reservation.
         assert!(!s.release("a|1", t0));
         assert!(s.release("a|1", t0 + chrono::Duration::minutes(60)));
         assert!(s.last_sent.is_empty());
+    }
+
+    /// A summary of more agents than the last one sent under its key goes
+    /// out inside the limit: one drop can't hide the next sweep's 1,500.
+    #[test]
+    fn a_larger_summary_passes_the_rate_limit() {
+        let hour = Duration::from_secs(3600);
+        let t0 = DateTime::parse_from_rfc3339("2026-11-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let m = |n| t0 + chrono::Duration::minutes(n);
+        let mut s = RateState::default();
+        assert!(s.allow("drop|-", t0, hour, Some(1)));
+        assert!(
+            !s.allow("drop|-", m(10), hour, Some(1)),
+            "the same count waits"
+        );
+        assert!(s.allow("drop|-", m(20), hour, Some(1_500)), "a jump passes");
+        assert!(!s.allow("drop|-", m(30), hour, Some(1_400)), "fewer waits");
+        assert!(!s.allow("drop|-", m(40), hour, None));
+        assert!(
+            s.allow("drop|-", m(81), hour, Some(3)),
+            "after the hour, any"
+        );
     }
 
     /// `dispatch` says whether the mail went out: not when the send fails

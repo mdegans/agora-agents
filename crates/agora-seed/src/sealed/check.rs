@@ -35,6 +35,7 @@ use agora_agentkit::state::verify::{HeadRef, HeadStatus, head_status, verify_cha
 use super::KeyStore;
 use super::api::SealedApi;
 use super::notice::{Notice, Refusal};
+use super::roster::Vouch;
 use super::sizes::{Recorded, SizeLog, Sizes, drop_lines};
 use crate::alerts::{Alert, AlertKind, Alerter};
 use agora_agentkit::reactor::seed::memory::short_head;
@@ -49,9 +50,6 @@ pub enum Hold {
     SealFailed,
     HeadMissing,
     Fork,
-    /// `sealed/` couldn't be read: the agent runs, its saves go unsealed
-    /// (no base) and are recorded as such.
-    Unreadable,
     /// The chain couldn't be checked (Agora unreachable for a main line
     /// that runs through it): the agent runs, uploads held. No refusal
     /// without evidence.
@@ -395,6 +393,147 @@ pub enum Server {
     /// Anything else: uploads waiting, or a problem a line of its own
     /// tells.
     Other,
+    /// The agent doesn't upload: checked against the runner's own record
+    /// ([`Kept`]), in full or from the last full check on ([`Checked`]).
+    Local(Kept, Checked),
+}
+
+/// Whether the agent's chain goes to Agora, decided before any server
+/// call of the start check, from the runner's own markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upload {
+    /// It uploads ([`super::uploads`]): the full check, Agora's copy
+    /// included.
+    Now,
+    /// It doesn't, but did ([`super::uploading::has_uploaded`]: either
+    /// copy of the uploading marker, stopped). Agora's copy up to then may
+    /// be read (the guard's `may_read`); no anchor is judged.
+    Before,
+    /// Its uploading marker is in doubt (contradictory or unreadable): the
+    /// runner can't tell, sends nothing, asks nothing, and says so.
+    InDoubt,
+    /// It never did: no server call at all.
+    Never,
+}
+
+impl Upload {
+    pub fn of(agent_dir: &Path, keys: &KeyStore, id: AgentId) -> Self {
+        use super::uploading::Marker;
+        if super::uploads(agent_dir, keys, id) {
+            Self::Now
+        } else if matches!(
+            super::uploading::state(agent_dir, keys, id),
+            Marker::Contradictory(_) | Marker::Unreadable(_)
+        ) {
+            Self::InDoubt
+        } else if super::uploading::has_uploaded(agent_dir, keys, id) {
+            Self::Before
+        } else {
+            Self::Never
+        }
+    }
+
+    /// For the refusal rule ([`stops_run`]): it uploads, or its marker is
+    /// in doubt (fail closed).
+    pub fn counts_as_uploading(agent_dir: &Path, keys: &KeyStore, id: AgentId) -> bool {
+        super::uploads(agent_dir, keys, id)
+            || matches!(
+                super::uploading::state(agent_dir, keys, id),
+                super::uploading::Marker::Contradictory(_)
+                    | super::uploading::Marker::Unreadable(_)
+            )
+    }
+}
+
+/// What a verdict says of a chain kept only here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// Never uploaded: nothing of it is on Agora.
+    Only,
+    /// Uploaded before: what Agora holds of its line; `None` when
+    /// Agora's copy couldn't be read.
+    Since(Option<OnAgora>),
+    /// The uploading marker is in doubt ([`Upload::InDoubt`]).
+    InDoubt,
+}
+
+/// What this start verified of a local line, for the verdict's last
+/// sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checked {
+    /// The whole line.
+    Full,
+    /// The line from the head of the last full check, made on this date
+    /// ([`super::roster::Vouch`]).
+    Since(chrono::NaiveDate),
+}
+
+/// What Agora holds of a line no longer uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnAgora {
+    Nothing,
+    /// This many of its snapshots, the newest dated so.
+    Upto {
+        versions: usize,
+        newest: chrono::NaiveDate,
+    },
+}
+
+// What an agent whose chain is kept only here is told, apart from the
+// sentences it shares with an uploading agent's verdict. Tune here (beta
+// rounds); each is pinned by `a_local_verdict_says_what_a_local_record_shows`.
+
+/// After "Your sealed state: " in the verdict.
+pub const LOCAL_VERDICT: &str =
+    "intact, checked against the record your runner keeps on this machine.";
+
+/// After [`LOCAL_VERDICT`], for an agent that never uploaded.
+pub const LOCAL_NOTHING_ON_AGORA: &str = " Nothing of your state is on Agora.";
+
+/// Ends a local verdict, after its sizes.
+pub const LOCAL_CHECKED_BY: &str = "Checked by your runner with";
+
+/// What a record on the same machine shows, and what it can't: said in
+/// every local verdict, once.
+pub const LOCAL_LIMITS: &str = "A record kept on the same machine as your state catches a state \
+     changed or lost by accident; it can't show a change made by whoever runs your runner.";
+
+/// For an agent whose uploading marker is in doubt, after
+/// [`LOCAL_VERDICT`].
+pub const LOCAL_IN_DOUBT: &str = " Your runner couldn't tell whether your state is being \
+     uploaded to Agora; your operator has been told, and nothing is being sent meanwhile.";
+
+/// The end of a local verdict on a start that checked only the line since
+/// the last full check ([`Checked::Since`]); the date follows.
+pub const LOCAL_CHECKED_SINCE: &str = ": that your state matches the last sealed version, and the \
+     links and signatures of the versions saved since its last full check of every version, on";
+
+/// [`SEAL_FAILED_LINE`] for an agent that doesn't upload.
+pub const LOCAL_SEAL_FAILED_LINE: &str = "Your last save was written here but could not be \
+     sealed, so your sealed history does not include it yet. This session starts from that save, \
+     and your operator has been told.";
+
+impl Kept {
+    /// After [`LOCAL_VERDICT`].
+    fn sentence(self) -> String {
+        match self {
+            Self::Only => LOCAL_NOTHING_ON_AGORA.to_string(),
+            Self::Since(Some(OnAgora::Nothing)) => {
+                " Agora holds none of its versions; those saved since \
+                 your uploads stopped stay on this runner."
+                    .to_string()
+            }
+            Self::Since(Some(OnAgora::Upto { versions, newest })) => format!(
+                " Agora holds {versions} of its versions, the newest dated {}; those saved since \
+                 your uploads stopped stay on this runner.",
+                newest.format("%Y-%m-%d")
+            ),
+            Self::Since(None) => " Agora's copy couldn't be read this session; the versions saved \
+                 since your uploads stopped stay on this runner."
+                .to_string(),
+            Self::InDoubt => LOCAL_IN_DOUBT.to_string(),
+        }
+    }
 }
 
 /// The version a verdict compares the state's sizes against
@@ -706,6 +845,66 @@ pub fn verdict_line(
     anchors: &AnchorsSaid,
     checks_later: bool,
 ) -> String {
+    verdict_of(
+        &LineSummary::of(line),
+        head,
+        sizes,
+        previous,
+        server,
+        anchors,
+        checks_later,
+    )
+}
+
+/// What a verdict says of the main line: its snapshots, the earliest
+/// one's `state_at`, the pre-loss copy's, and the newest entry's. Kept in
+/// the roster with a full verification ([`super::roster::Vouch`]), so a
+/// start that verifies only the line's tail still says it of the whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LineSummary {
+    pub snapshots: usize,
+    pub since: Option<i64>,
+    pub prior: Option<i64>,
+    pub last: Option<i64>,
+}
+
+impl LineSummary {
+    pub fn of(line: &[SignedStateEntry]) -> Self {
+        Self::default().then(line)
+    }
+
+    /// This summary, then `more` (entries after the ones it covers).
+    pub fn then(mut self, more: &[SignedStateEntry]) -> Self {
+        for e in more {
+            match e.entry.kind {
+                StateEntryKind::Snapshot => {
+                    self.snapshots += 1;
+                    self.since = Some(
+                        self.since
+                            .map_or(e.entry.state_at, |s| s.min(e.entry.state_at)),
+                    );
+                }
+                StateEntryKind::ArchivedPrior if self.prior.is_none() => {
+                    self.prior = Some(e.entry.state_at);
+                }
+                _ => {}
+            }
+            self.last = Some(e.entry.state_at);
+        }
+        self
+    }
+}
+
+/// [`verdict_line`], over a [`LineSummary`].
+fn verdict_of(
+    line: &LineSummary,
+    head: &HeadRef,
+    sizes: Sizes,
+    previous: Option<Previous>,
+    server: Server,
+    anchors: &AnchorsSaid,
+    checks_later: bool,
+) -> String {
     // "Earlier", not "previous": the baseline is the newest version whose
     // sizes were recorded, which may be older than the one just before
     // (review of 0.151.2).
@@ -760,25 +959,36 @@ pub fn verdict_line(
         previous.map(|p| p.sizes.soul_chars),
         false,
     );
-    let verdict = match server {
-        Server::InStep => "intact, and in step with Agora.",
-        Server::Unchecked => "intact here; Agora's copy couldn't be checked this session.",
-        Server::Other => "intact.",
+    let (verdict, kept) = match server {
+        Server::InStep => ("intact, and in step with Agora.", String::new()),
+        Server::Unchecked => (
+            "intact here; Agora's copy couldn't be checked this session.",
+            String::new(),
+        ),
+        Server::Other => ("intact.", String::new()),
+        Server::Local(kept, _) => (LOCAL_VERDICT, kept.sentence()),
     };
-    let snapshots: Vec<&SignedStateEntry> = line
-        .iter()
-        .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
-        .collect();
-    let since = snapshots
-        .iter()
-        .map(|e| e.entry.state_at)
-        .min()
+    let checked_by = match server {
+        Server::Local(_, Checked::Full) => format!(
+            "{LOCAL_CHECKED_BY} {VERIFIER}: links, signatures, and that your state matches the \
+             last sealed version. {LOCAL_LIMITS}"
+        ),
+        Server::Local(_, Checked::Since(day)) => format!(
+            "{LOCAL_CHECKED_BY} {VERIFIER}{LOCAL_CHECKED_SINCE} {}. {LOCAL_LIMITS}",
+            day.format("%Y-%m-%d")
+        ),
+        _ => format!(
+            "Checked by {VERIFIER}: links, signatures, and that your state matches the last \
+             sealed version."
+        ),
+    };
+    let since = line
+        .since
         .and_then(day)
         .unwrap_or_else(|| "an unknown date".into());
     let prior = line
-        .iter()
-        .find(|e| e.entry.kind == StateEntryKind::ArchivedPrior)
-        .and_then(|e| day(e.entry.state_at))
+        .prior
+        .and_then(day)
         .map(|d| format!(", plus a copy of your state from before a loss, dated {d}"))
         .unwrap_or_default();
     // In sentences, not one run (beta round 11). What the newest anchor
@@ -817,8 +1027,8 @@ pub fn verdict_line(
                 && anchors.unjudged.is_none()
         })
         .filter(|_| checks_later)
-        .and_then(|c| Some((&c.anc_id, line.last()?)))
-        .and_then(|(anc, h)| Some((anc, day(h.entry.state_at)?)))
+        .and_then(|c| Some((&c.anc_id, line.last?)))
+        .and_then(|(anc, at)| Some((anc, day(at)?)))
         .map(|(anc, d)| {
             // Named: an earlier anchors' sentence may stand between
             // (review of round 13: "that anchor" read as one of them)
@@ -832,13 +1042,12 @@ pub fn verdict_line(
         .unwrap_or_default();
     let short = short_head(&head.entry_hash);
     format!(
-        "Your sealed state: {verdict} It has {} version{} since \
+        "Your sealed state: {verdict}{kept} It has {} version{} since \
          {since}{prior}.{anchored}{unanchored} This session starts from head {short} \
          {HEAD_MARKER} In this version, your \
-         memory is {} characters{memory_change} and your soul {}{soul_change}. Checked by \
-         {VERIFIER}: links, signatures, and that your state matches the last sealed version.",
-        snapshots.len(),
-        if snapshots.len() == 1 { "" } else { "s" },
+         memory is {} characters{memory_change} and your soul {}{soul_change}. {checked_by}",
+        line.snapshots,
+        if line.snapshots == 1 { "" } else { "s" },
         thousands(sizes.memory_chars),
         thousands(sizes.soul_chars),
     )
@@ -932,10 +1141,6 @@ pub const HEAD_MISSING_LINE: &str = "Your latest sealed version is not on Agora:
      matches your last sealed version; new versions are kept here, not uploaded, and your \
      operator has been told.";
 
-pub const UNREADABLE_LINE: &str = "Your sealed history couldn't be read here at the start of \
-     this session, so it couldn't be checked. This session runs on your state as it is; its \
-     save is kept here but not sealed, and your operator has been told.";
-
 pub const UNCHECKED_LINE: &str = "Your sealed history couldn't be checked at the start of this \
      session: part of it is on Agora, which couldn't be reached. This session runs on your \
      state as it is, and your operator has been told.";
@@ -1020,15 +1225,76 @@ pub async fn check_with(
     server: &dyn SealedApi,
     start: Option<&StartAnchors<'_>>,
 ) -> Outcome {
-    let out = check_chain(agent_dir, id, local, sizes, keys, server, start).await;
+    check_vouched(agent_dir, id, local, sizes, keys, server, start, None)
+        .await
+        .0
+}
+
+/// What a start check found besides its outcome ([`check_vouched`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    /// The vouch to keep: this check verified the whole local line of an
+    /// agent that doesn't upload, and the agent runs.
+    pub vouch: Option<Vouch>,
+    /// Sealed versions that can't be opened here ([`Unopenable`]), as
+    /// this check or the vouch it relied on found.
+    pub unopenable: Option<Unopenable>,
+}
+
+/// [`check_with`], given the roster's last full verification of the agent
+/// (`vouched`, [`super::roster::Vouch`]): for an agent that doesn't upload,
+/// a fresh one lets the check verify only the line from its head on
+/// ([`tail_line`]). Returns the outcome and what else it found
+/// ([`Found`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn check_vouched(
+    agent_dir: &Path,
+    id: AgentId,
+    local: &Sha256Hex,
+    sizes: Sizes,
+    keys: &KeyStore,
+    server: &dyn SealedApi,
+    start: Option<&StartAnchors<'_>>,
+    vouched: Option<&Vouch>,
+) -> (Outcome, Found) {
+    let upload = Upload::of(agent_dir, keys, id);
+    let mut found = Found::default();
+    let out = check_chain(
+        agent_dir, id, local, sizes, keys, server, start, upload, vouched, &mut found,
+    )
+    .await;
+    // Vouched only for an agent that runs: a refusal or a hold vouches
+    // for nothing
+    if !matches!(out, Outcome::Run { hold: None, .. }) {
+        found.vouch = None;
+    }
+    (
+        with_anchor_hold(agent_dir, id, start, upload, out).await,
+        found,
+    )
+}
+
+/// A hold decided before the verdict could be written still says what was
+/// found of the anchors ([`check_with`]).
+async fn with_anchor_hold(
+    agent_dir: &Path,
+    id: AgentId,
+    start: Option<&StartAnchors<'_>>,
+    upload: Upload,
+    out: Outcome,
+) -> Outcome {
     // A hold decided before the verdict could be written (the sealed
     // history unreadable, or not checkable): its one line still says what
-    // was found of the anchors, and that none is checked while held
+    // was found of the anchors, and that none is checked while held. Only
+    // for an agent that uploads: no anchor is judged for one that doesn't
+    if upload != Upload::Now {
+        return out;
+    }
     match out {
         Outcome::Run {
             mut seat,
             notice,
-            hold: Some(hold @ (Hold::Unreadable | Hold::Unchecked)),
+            hold: Some(hold @ Hold::Unchecked),
             drops,
             told: _,
             judged,
@@ -1163,16 +1429,18 @@ async fn check_chain(
     keys: &KeyStore,
     server: &dyn SealedApi,
     start: Option<&StartAnchors<'_>>,
+    upload: Upload,
+    vouched: Option<&Vouch>,
+    found: &mut Found,
 ) -> Outcome {
     let seal = AgentSeal::new(agent_dir, id);
     let refuse = |reason: Refusal, detail: String| Outcome::Refuse { reason, detail };
-    let unreadable = || Outcome::Run {
-        seat: vec![UNREADABLE_LINE.to_string()],
-        notice: false,
-        hold: Some(Hold::Unreadable),
-        drops: Vec::new(),
-        told: Vec::new(),
-        judged: None,
+    // Local evidence that can't be read is not transient (a server that
+    // can't be reached is): the agent doesn't run unchecked. Refused,
+    // not a loss by itself; the roster says when it is one
+    let unreadable = |what: &str| Outcome::Refuse {
+        reason: Refusal::SealUnreadable,
+        detail: format!("its sealed history here couldn't be read: {what}"),
     };
     let unchecked = || Outcome::Run {
         seat: vec![UNCHECKED_LINE.to_string()],
@@ -1187,10 +1455,14 @@ async fn check_chain(
         Ok(false) => {}
         Ok(true) => {
             let why = std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default();
+            // The notice's reason, else the marker's; neither readable:
+            // the loss-shaped side (fail closed)
             let reason = Notice::load(agent_dir)
                 .ok()
                 .flatten()
-                .map_or(Refusal::Mismatch, |n| n.reason);
+                .map(|n| n.reason)
+                .or_else(|| Refusal::parse(&why))
+                .unwrap_or(Refusal::StateIo);
             return refuse(
                 reason,
                 format!("still refused ({why}); clear with sealed-accept"),
@@ -1198,7 +1470,7 @@ async fn check_chain(
         }
         Err(e) => {
             tracing::warn!(agent_id = %id, error = %e, "sealed refusal marker unreadable");
-            return unreadable();
+            return unreadable("the refusal marker");
         }
     }
     let (head, seal_failed) = match seal.recover(Some(local)).await {
@@ -1231,146 +1503,199 @@ async fn check_chain(
         }
         Ok(Recovery::Unreadable(kind)) => {
             tracing::warn!(agent_id = %id, kind = ?kind, "sealed state unreadable");
-            return unreadable();
+            return unreadable("sealed/");
         }
         Err(e) => {
             tracing::warn!(agent_id = %id, error = %e, kind = ?e.kind(), "sealed state unreadable");
-            return unreadable();
+            return unreadable("sealed/");
         }
     };
-    let entries = match local_entries(&seal).await {
-        Ok(entries) => entries,
-        Err(e) => {
-            tracing::warn!(agent_id = %id, error = %e, "local sealed chain unreadable");
-            return unreadable();
+    // An agent that doesn't upload, its whole chain verified lately
+    // (the roster's vouch): only the line from the vouched head on
+    let tail = match (upload, vouched) {
+        // Not a stopped agent's: what it says of Agora's copy counts the
+        // whole line
+        (Upload::Never, Some(v)) if v.fresh(id, chrono::Utc::now()) => {
+            tail_line(&seal, id, &head, v, keys).await
         }
+        _ => None,
     };
-    // After a rebase the main line runs through Agora's entries, which
-    // aren't kept here: they are read from Agora and verified below with
-    // the runner's own trust, never taken on its word. Local entries win;
-    // what fails only on Agora's data is a hold, never a refusal (no
-    // refusal on the server's evidence alone)
-    let mut fetched: Option<Result<Vec<SignedStateEntry>, String>> = None;
-    // Hashes of the entries only Agora holds, and the seq Agora's chain
-    // reaches: what is Agora's evidence, and what isn't
-    let mut server_only: HashMap<Sha256Hex, u64> = HashMap::new();
-    let mut walked = walk_line(&entries, &head.entry_hash, Some(head.seq));
-    // A file deleted here is local evidence, whatever Agora says
-    let next_ord = match seal.head().await {
-        Ok(Some(h)) => h.next_ord,
-        _ => 0,
+    let checked = match (&tail, vouched) {
+        (Some(_), Some(v)) => Checked::Since(v.at.date_naive()),
+        _ => Checked::Full,
     };
-    let gap = match local_gap(&seal, next_ord) {
-        Ok(gap) => gap,
-        Err(e) => {
-            tracing::warn!(agent_id = %id, error = %e, "sealed/ unreadable for its numbering");
-            return unreadable();
-        }
-    };
-    // An entry held here at the missing link's seq, under another hash:
-    // that entry changed here
-    let corrupted = walked.as_ref().err().is_some_and(|m| {
-        m.seq.is_some_and(|s| {
-            entries
-                .iter()
-                .any(|e| e.entry.seq == s && e.entry_hash() != m.hash)
-        })
-    });
-    if let Err(missing) = &walked
-        && (gap || corrupted)
-    {
-        return refuse(
-            Refusal::ChainBroken,
-            format!(
-                "the main line to head {} lacks {} (seq {:?}), and sealed/ is missing an item it \
-                 numbered",
-                head.entry_hash, missing.hash, missing.seq
-            ),
-        );
-    }
-    if walked.is_err()
-        && let Some(signing) = keys.signing(id)
-    {
-        let chain = super::api::chain(server, id, &signing).await;
-        if let Ok(chain) = &chain {
-            let all = match merge_server(&entries, chain) {
-                Ok(all) => all,
-                Err(hash) => return disagreement(id, hash, &entries, keys),
-            };
-            let ours: std::collections::HashSet<Sha256Hex> =
-                entries.iter().map(|e| e.entry_hash()).collect();
-            server_only = chain
-                .iter()
-                .filter(|e| !ours.contains(&e.entry_hash()))
-                .map(|e| (e.entry_hash(), e.entry.seq))
-                .collect();
-            walked = walk_line(&all, &head.entry_hash, Some(head.seq));
-            // Nothing here was lost (no gap): what is missing is Agora's
-            if let Err(missing) = &walked {
-                return on_fault(
-                    id,
-                    FaultKind::ServerChainBroken,
-                    format!(
-                        "the main line through Agora's chain lacks {} (seq {:?})",
-                        missing.hash, missing.seq
-                    ),
-                );
+    let (line, entries, fetched, summary) = if let Some((line, summary)) = tail {
+        found.unopenable = vouched.and_then(|v| v.unopenable);
+        (line.clone(), line, None, summary)
+    } else {
+        let entries = match local_entries(&seal).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(agent_id = %id, error = %e, "local sealed chain unreadable");
+                return unreadable("its entries");
             }
+        };
+        // After a rebase the main line runs through Agora's entries, which
+        // aren't kept here: they are read from Agora and verified below with
+        // the runner's own trust, never taken on its word. Local entries win;
+        // what fails only on Agora's data is a hold, never a refusal (no
+        // refusal on the server's evidence alone)
+        let mut fetched: Option<Result<Vec<SignedStateEntry>, String>> = None;
+        // Hashes of the entries only Agora holds, and the seq Agora's chain
+        // reaches: what is Agora's evidence, and what isn't
+        let mut server_only: HashMap<Sha256Hex, u64> = HashMap::new();
+        let mut walked = walk_line(&entries, &head.entry_hash, Some(head.seq));
+        // A file deleted here is local evidence, whatever Agora says
+        let next_ord = match seal.head().await {
+            Ok(Some(h)) => h.next_ord,
+            _ => 0,
+        };
+        let gap = match local_gap(&seal, next_ord) {
+            Ok(gap) => gap,
+            Err(e) => {
+                tracing::warn!(agent_id = %id, error = %e, "sealed/ unreadable for its numbering");
+                return unreadable("its numbering");
+            }
+        };
+        // An entry held here at the missing link's seq, under another hash:
+        // that entry changed here
+        let corrupted = walked.as_ref().err().is_some_and(|m| {
+            m.seq.is_some_and(|s| {
+                entries
+                    .iter()
+                    .any(|e| e.entry.seq == s && e.entry_hash() != m.hash)
+            })
+        });
+        if let Err(missing) = &walked
+            && (gap || corrupted)
+        {
+            return refuse(
+                Refusal::ChainBroken,
+                format!(
+                    "the main line to head {} lacks {} (seq {:?}), and sealed/ is missing an item it \
+                     numbered",
+                    head.entry_hash, missing.hash, missing.seq
+                ),
+            );
         }
-        fetched = Some(chain);
-    }
-    let line = match (walked, &fetched) {
-        (Ok(line), _) => line,
-        // Agora couldn't be asked, or there is no key to ask with: no
-        // evidence either way, so the agent runs, unchecked
-        (Err(_), Some(Err(e))) => {
-            tracing::warn!(agent_id = %id, error = %e, "the main line runs through Agora's chain, which couldn't be read");
-            return unchecked();
+        // No copy on Agora of an agent that never uploaded: a missing link is
+        // the local chain's own, decided here
+        if let Err(missing) = &walked
+            && upload == Upload::Never
+        {
+            return refuse(
+                Refusal::ChainBroken,
+                format!(
+                    "the main line to head {} lacks {} (seq {:?}); the chain is kept only here",
+                    head.entry_hash, missing.hash, missing.seq
+                ),
+            );
         }
-        (Err(_), _) => return unchecked(),
-    };
-    // Keys that can't be read are no evidence against the chain
-    let trusted = match keys.trusted(id) {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            tracing::warn!(agent_id = %id, "no signing key to verify the sealed chain with");
-            return unreadable();
+        // Its marker in doubt: nothing is asked of Agora, so the line
+        // can't be checked; it doesn't run unchecked
+        if walked.is_err() && upload == Upload::InDoubt {
+            return unreadable("its line runs through entries not held here");
         }
-        Err(e) => {
-            tracing::warn!(agent_id = %id, error = %e, "the agent's key records are unreadable");
-            return unreadable();
+        if walked.is_err()
+            && let Some(signing) = keys.signing(id)
+        {
+            let chain = super::api::chain(server, id, &signing).await;
+            if let Ok(chain) = &chain {
+                let all = match merge_server(&entries, chain) {
+                    Ok(all) => all,
+                    Err(hash) => return disagreement(id, hash, &entries, keys),
+                };
+                let ours: std::collections::HashSet<Sha256Hex> =
+                    entries.iter().map(|e| e.entry_hash()).collect();
+                server_only = chain
+                    .iter()
+                    .filter(|e| !ours.contains(&e.entry_hash()))
+                    .map(|e| (e.entry_hash(), e.entry.seq))
+                    .collect();
+                walked = walk_line(&all, &head.entry_hash, Some(head.seq));
+                // Nothing here was lost (no gap): what is missing is Agora's
+                if let Err(missing) = &walked {
+                    return on_fault(
+                        id,
+                        FaultKind::ServerChainBroken,
+                        format!(
+                            "the main line through Agora's chain lacks {} (seq {:?})",
+                            missing.hash, missing.seq
+                        ),
+                    );
+                }
+            }
+            fetched = Some(chain);
         }
-    };
-    let report = verify_chain(id, &line, &trusted);
-    for notice in &report.notices {
-        tracing::warn!(event_type = "sealed_state_key_notice", agent_id = %id, notice = ?notice, "sealed-state key notice");
-    }
-    if !report.intact || report.head != Some(head) {
-        let server_hashes: std::collections::HashSet<Sha256Hex> =
-            server_only.keys().copied().collect();
-        return judge_failure(
-            id,
-            &report.problems,
-            &line,
-            &server_hashes,
-            &known_keys(keys, id),
-        );
-    }
+        let line = match (walked, &fetched) {
+            (Ok(line), _) => line,
+            // Agora couldn't be asked, or there is no key to ask with: no
+            // evidence either way, so the agent runs, unchecked
+            (Err(_), Some(Err(e))) => {
+                tracing::warn!(agent_id = %id, error = %e, "the main line runs through Agora's chain, which couldn't be read");
+                return unchecked();
+            }
+            (Err(_), _) => return unchecked(),
+        };
+        // Keys that can't be read are no evidence against the chain
+        let trusted = match keys.trusted(id) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                tracing::warn!(agent_id = %id, "no signing key to verify the sealed chain with");
+                return unreadable("its signing key");
+            }
+            Err(e) => {
+                tracing::warn!(agent_id = %id, error = %e, "the agent's key records are unreadable");
+                return unreadable("its key records");
+            }
+        };
+        let report = verify_chain(id, &line, &trusted);
+        for notice in &report.notices {
+            tracing::warn!(event_type = "sealed_state_key_notice", agent_id = %id, notice = ?notice, "sealed-state key notice");
+        }
+        if !report.intact || report.head != Some(head) {
+            let server_hashes: std::collections::HashSet<Sha256Hex> =
+                server_only.keys().copied().collect();
+            return judge_failure(
+                id,
+                &report.problems,
+                &line,
+                &server_hashes,
+                &known_keys(keys, id),
+            );
+        }
 
-    // Every entry held here is on the main line (a set-aside fork is kept
-    // under another name): one that isn't was changed here
-    let on_line: std::collections::HashSet<Sha256Hex> =
-        line.iter().map(|e| e.entry_hash()).collect();
-    if let Some(stray) = entries.iter().find(|e| !on_line.contains(&e.entry_hash())) {
-        return refuse(
-            Refusal::ChainBroken,
-            format!(
-                "entry seq {} held here ({}) is not on the main line: changed here",
-                stray.entry.seq,
-                stray.entry_hash()
-            ),
-        );
-    }
+        // Every entry held here is on the main line (a set-aside fork is kept
+        // under another name): one that isn't was changed here
+        let on_line: std::collections::HashSet<Sha256Hex> =
+            line.iter().map(|e| e.entry_hash()).collect();
+        if let Some(stray) = entries.iter().find(|e| !on_line.contains(&e.entry_hash())) {
+            return refuse(
+                Refusal::ChainBroken,
+                format!(
+                    "entry seq {} held here ({}) is not on the main line: changed here",
+                    stray.entry.seq,
+                    stray.entry_hash()
+                ),
+            );
+        }
+        // Every version's sealed copy is here and whole (only in a full
+        // check; one uploaded is on Agora, and isn't looked at here)
+        let sent: std::collections::HashSet<Sha256Hex> = match upload {
+            Upload::Never => Default::default(),
+            _ => match seal.sent().await {
+                Ok(sent) => sent.iter().map(|i| i.entry.entry_hash()).collect(),
+                Err(_) => return unreadable("sent/"),
+            },
+        };
+        found.unopenable = openable(&seal, &line, &entries, &sent).await;
+        // Only the tail path's own: an agent that never uploaded
+        if upload == Upload::Never {
+            found.vouch = vouch_of(&seal, &line, found.unopenable).await;
+        }
+        let summary = LineSummary::of(&line);
+        (line, entries, fetched, summary)
+    };
 
     let mut seat = Vec::new();
     let mut notice = false;
@@ -1445,6 +1770,41 @@ async fn check_chain(
     }
     let drop_lines: Vec<String> = drops.iter().map(|d| d.1.clone()).collect();
     let drops: Vec<(&'static str, u32)> = drops.iter().map(|d| (d.0, d.2)).collect();
+    if upload != Upload::Now {
+        let hold = if seal_failed.is_some() {
+            seat.push(LOCAL_SEAL_FAILED_LINE.to_string());
+            Some(Hold::SealFailed)
+        } else {
+            let kept = match upload {
+                Upload::Never => Kept::Only,
+                Upload::InDoubt => Kept::InDoubt,
+                _ => match on_agora(id, &line, &entries, keys, server, fetched).await {
+                    Ok(kept) => kept,
+                    Err(fault) => return *fault,
+                },
+            };
+            seat.push(verdict_of(
+                &summary,
+                &head,
+                sizes,
+                previous,
+                Server::Local(kept, checked),
+                &AnchorsSaid::default(),
+                false,
+            ));
+            None
+        };
+        seat.extend(found.unopenable.map(Unopenable::line));
+        seat.extend(drop_lines);
+        return Outcome::Run {
+            seat,
+            notice,
+            hold,
+            drops,
+            told: Vec::new(),
+            judged: None,
+        };
+    }
     if seal_failed.is_some() {
         let (said, told) = anchors_said(agent_dir, id, start, NotJudged::Held, None).await;
         seat.push(format!("{SEAL_FAILED_LINE}{}", said.text()));
@@ -1606,6 +1966,7 @@ async fn check_chain(
         &said,
         checks_later,
     ));
+    seat.extend(found.unopenable.map(Unopenable::line));
     seat.extend(drop_lines);
     let hold = match status {
         HeadStatus::Same | HeadStatus::Pending => None,
@@ -1628,27 +1989,412 @@ async fn check_chain(
     }
 }
 
+/// Entries before the vouched head that a tail check takes onto its line
+/// too, and then back to a keyframe: the verdict compares sizes with an
+/// earlier version, usually among them, opened from its keyframe.
+pub const LOOKBACK: u64 = 8;
+
+/// Sealed versions of an agent that can't be opened here: a blob of
+/// theirs (or of the keyframe they open from) missing or not hashing to
+/// its name. Not a refusal (the state now is the one checked); the agent
+/// is told, the operator alerted once a run. Found at a full check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Unopenable {
+    pub versions: usize,
+    /// The earliest one's `state_at` (µs).
+    pub earliest: i64,
+    /// Blob files missing, and present but damaged.
+    pub missing: usize,
+    pub damaged: usize,
+}
+
+/// What the agent is told of [`Unopenable`]; the count and date follow.
+pub const UNOPENABLE_LINE: &str = "can't be opened here: their sealed copies on this machine are \
+     missing or damaged. Your state now is not affected, and your operator has been told.";
+
+impl Unopenable {
+    /// "3 of your sealed versions, the earliest dated 2026-11-05, can't be
+    /// opened here: …"
+    pub fn line(self) -> String {
+        let date = day(self.earliest).unwrap_or_else(|| "an unknown date".into());
+        if self.versions == 1 {
+            format!("1 of your sealed versions, dated {date}, {UNOPENABLE_LINE}")
+        } else {
+            format!(
+                "{} of your sealed versions, the earliest dated {date}, {UNOPENABLE_LINE}",
+                self.versions
+            )
+        }
+    }
+}
+
+/// Whether every version on `line` held here can be opened here: each
+/// blob file exists and hashes to its name. Versions uploaded (in `sent`)
+/// aren't looked at: their copies are on Agora, and the runner before
+/// this release removed acknowledged blobs here. Entries only Agora holds
+/// aren't either. `None`: all can be.
+async fn openable(
+    seal: &AgentSeal,
+    line: &[SignedStateEntry],
+    held: &[SignedStateEntry],
+    sent: &std::collections::HashSet<Sha256Hex>,
+) -> Option<Unopenable> {
+    use sha2::Digest as _;
+    let here: std::collections::HashSet<Sha256Hex> = held.iter().map(|e| e.entry_hash()).collect();
+    let (mut missing, mut damaged) = (0, 0);
+    let mut bad: std::collections::HashSet<Sha256Hex> = Default::default();
+    for e in line {
+        let hash = e.entry_hash();
+        let Some(blob) = e.entry.blob.as_ref() else {
+            continue;
+        };
+        if !here.contains(&hash) || sent.contains(&hash) {
+            continue;
+        }
+        match seal.read_blob(&blob.sha256).await {
+            Ok(bytes) => {
+                let got: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+                if Sha256Hex::from(got) != blob.sha256 {
+                    damaged += 1;
+                    bad.insert(blob.sha256);
+                }
+            }
+            Err(_) => {
+                missing += 1;
+                bad.insert(blob.sha256);
+            }
+        }
+    }
+    if bad.is_empty() {
+        return None;
+    }
+    let keyframe_of: HashMap<Sha256Hex, Sha256Hex> = line
+        .iter()
+        .filter_map(|e| Some((e.entry_hash(), e.entry.blob.as_ref()?.sha256)))
+        .collect();
+    let cant: Vec<i64> = line
+        .iter()
+        .filter(|e| !sent.contains(&e.entry_hash()))
+        .filter_map(|e| {
+            let blob = e.entry.blob.as_ref()?;
+            let base_bad = blob
+                .encoding
+                .base()
+                .and_then(|base| keyframe_of.get(&base))
+                .is_some_and(|b| bad.contains(b));
+            (bad.contains(&blob.sha256) || base_bad).then_some(e.entry.state_at)
+        })
+        .collect();
+    Some(Unopenable {
+        versions: cant.len(),
+        earliest: cant.iter().copied().min().unwrap_or_default(),
+        missing,
+        damaged,
+    })
+}
+
+/// The run's one alert for agents with versions that can't be opened
+/// here ([`Unopenable`]), on the fleet-wide key.
+pub fn unopenable_summary(agents: &[(AgentId, String, Unopenable)]) -> Option<Alert> {
+    if agents.is_empty() {
+        return None;
+    }
+    let mut alert = Alert::new(
+        AlertKind::SealedStateBlobsMissing,
+        format!(
+            "{} agent(s) have sealed versions whose copies here are missing or damaged",
+            agents.len()
+        ),
+    )
+    .count(agents.len())
+    .detail("agents", agents.len());
+    for (id, name, u) in agents.iter().take(SUMMARY_LIST) {
+        alert = alert.detail(
+            "agent",
+            format!(
+                "{name} ({id}): {} version(s), {} blob(s) missing, {} damaged",
+                u.versions, u.missing, u.damaged
+            ),
+        );
+    }
+    if agents.len() > SUMMARY_LIST {
+        alert = alert.detail(
+            "more",
+            format!(
+                "{} more; each is a sealed_state_unopenable event in the run log",
+                agents.len() - SUMMARY_LIST
+            ),
+        );
+    }
+    Some(alert)
+}
+
+/// The vouch for a whole local line just verified.
+async fn vouch_of(
+    seal: &AgentSeal,
+    line: &[SignedStateEntry],
+    unopenable: Option<Unopenable>,
+) -> Option<Vouch> {
+    let head = line.last()?;
+    let next_ord = seal.head().await.ok()??.next_ord;
+    Some(Vouch {
+        head: HeadRef {
+            entry_hash: head.entry_hash(),
+            seq: head.entry.seq,
+        },
+        next_ord,
+        at: chrono::Utc::now(),
+        keyframe: line
+            .iter()
+            .rev()
+            .find(|e| {
+                e.entry
+                    .blob
+                    .as_ref()
+                    .is_some_and(|b| b.encoding.base().is_none())
+            })
+            .map(SignedStateEntry::entry_hash),
+        summary: LineSummary::of(line),
+        unopenable,
+    })
+}
+
+/// Every item in `sealed/<sub>/` numbered `from` or later (by its file
+/// name, as agentkit names them), below `below` when given.
+fn items_from(
+    seal: &AgentSeal,
+    sub: &str,
+    from: u64,
+    below: Option<u64>,
+) -> std::io::Result<Vec<SignedStateEntry>> {
+    let dir = seal.dir().join(sub);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let digits: String = name
+            .unwrap_or_default()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.parse::<u64>().is_ok_and(|o| o >= from) {
+            let item: agora_agentkit::state::storage::OutboxItem =
+                serde_json::from_slice(&std::fs::read(&path)?)?;
+            if below.is_none_or(|b| item.ord < b) {
+                out.push(item.entry);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The main line from the vouched head to `head`, with up to [`LOOKBACK`]
+/// entries before it, verified, and what the verdict says of the whole
+/// line ([`LineSummary`]); read from the outbox items numbered from the
+/// vouch's on. `None` on anything off (a gap in the numbering, the vouched
+/// head not on the line, any problem but the cut's own): the caller then
+/// checks the whole line, which judges it. Never a refusal on its own.
+///
+/// What this no longer catches at each start, until the full check comes
+/// round ([`super::roster::FULL_VERIFY_EVERY`]) or anything else is off:
+/// an entry file before the vouched head changed or damaged, and an entry
+/// held here off the main line. The numbering, the head, the state
+/// against it and the roster's head are still checked every start.
+async fn tail_line(
+    seal: &AgentSeal,
+    id: AgentId,
+    head: &HeadRef,
+    v: &Vouch,
+    keys: &KeyStore,
+) -> Option<(Vec<SignedStateEntry>, LineSummary)> {
+    let off = |why: &'static str| {
+        tracing::info!(
+            event_type = "sealed_state_full_check",
+            agent_id = %id,
+            why,
+            "the start check verifies the agent's whole local chain"
+        );
+        None
+    };
+    let Ok(Some(head_file)) = seal.head().await else {
+        return off("head.json unreadable");
+    };
+    if v.head.seq > head.seq || v.next_ord > head_file.next_ord {
+        return off("the vouched head is ahead of this one");
+    }
+    if !matches!(local_gap(seal, head_file.next_ord), Ok(false)) {
+        return off("the outbox numbering has a gap");
+    }
+    // Back far enough for the keyframe the earlier versions open from
+    let back = LOOKBACK + u64::from(agora_agentkit::state::codec::DEFAULT_MAX_CHAIN);
+    let from = v.next_ord.saturating_sub(1 + back);
+    let mut items = match items_from(seal, "sent", from, None) {
+        Ok(items) => items,
+        Err(_) => return off("sent/ unreadable"),
+    };
+    match items_from(seal, "outbox", from, Some(head_file.next_ord)) {
+        Ok(more) => items.extend(more),
+        Err(_) => return off("outbox/ unreadable"),
+    }
+    let by_hash: HashMap<Sha256Hex, &SignedStateEntry> =
+        items.iter().map(|e| (e.entry_hash(), e)).collect();
+    let mut line = Vec::new();
+    let mut at = Some(head.entry_hash);
+    let mut before = None;
+    while let Some(hash) = at {
+        let Some(e) = by_hash.get(&hash) else { break };
+        if hash == v.head.entry_hash {
+            if e.entry.seq != v.head.seq {
+                return off("the vouched head's seq differs");
+            }
+            before = Some(line.len());
+        }
+        line.push((*e).clone());
+        let keyframe = e
+            .entry
+            .blob
+            .as_ref()
+            .is_some_and(|b| b.encoding.base().is_none());
+        if before.is_some_and(|b| line.len() > b + LOOKBACK as usize && keyframe)
+            || line.len() > items.len()
+        {
+            break;
+        }
+        at = e.entry.prev_hash;
+    }
+    let Some(after) = before else {
+        return off("the vouched head is not on the line");
+    };
+    line.reverse();
+    // The vouched head's place, oldest first; entries after it are new
+    let vouched_at = line.len() - 1 - after;
+    // Verified from the vouched head on; what is before it was verified
+    // with the vouch, and is here for the verdict's earlier version
+    let trusted = keys.trusted(id).ok()??;
+    let tail = &line[vouched_at..];
+    let report = verify_chain(id, tail, &trusted);
+    if report.head != Some(*head) {
+        return off("the tail's head is not the head");
+    }
+    let vouched_bases: std::collections::HashSet<Sha256Hex> = line[..vouched_at]
+        .iter()
+        .map(SignedStateEntry::entry_hash)
+        .chain(v.keyframe)
+        .collect();
+    use agora_agentkit::state::verify::ChainProblem as P;
+    let expected = |p: &P| match p {
+        // The cut's own: the tail starts after the genesis
+        P::MissingGenesis => tail[0].entry.seq != 0,
+        // A base before the cut, among the vouched entries
+        P::DeltaWithoutBase { seq } => tail.iter().find(|e| e.entry.seq == *seq).is_some_and(|e| {
+            e.entry
+                .blob
+                .as_ref()
+                .and_then(|b| b.encoding.base())
+                .is_some_and(|base| vouched_bases.contains(&base))
+        }),
+        _ => false,
+    };
+    if !report.problems.iter().all(expected) {
+        return off("the tail didn't verify on its own");
+    }
+    let summary = v.summary.then(&line[vouched_at + 1..]);
+    Some((line, summary))
+}
+
+/// For an agent that uploaded before and doesn't now ([`Upload::Before`]):
+/// how many snapshots of its line Agora holds, and the newest one's date,
+/// read with the runner's own trust. Agora's copy of an entry held here
+/// that differs from it is judged as for any agent ([`disagreement`]).
+async fn on_agora(
+    id: AgentId,
+    line: &[SignedStateEntry],
+    local: &[SignedStateEntry],
+    keys: &KeyStore,
+    server: &dyn SealedApi,
+    fetched: Option<Result<Vec<SignedStateEntry>, String>>,
+) -> Result<Kept, Box<Outcome>> {
+    let chain = match (fetched, keys.signing(id)) {
+        (Some(chain), _) => chain,
+        (None, Some(signing)) => super::api::chain(server, id, &signing).await,
+        (None, None) => Err("no signing key to ask Agora with".into()),
+    };
+    let chain = match chain {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::warn!(
+                event_type = "sealed_state_server_unchecked",
+                agent_id = %id,
+                error = %e,
+                "the copy on Agora of an agent that no longer uploads could not be read"
+            );
+            return Ok(Kept::Since(None));
+        }
+    };
+    if let Err(hash) = merge_server(local, &chain) {
+        return Err(Box::new(disagreement(id, hash, local, keys)));
+    }
+    let there: std::collections::HashSet<Sha256Hex> =
+        chain.iter().map(|e| e.entry_hash()).collect();
+    let held: Vec<&SignedStateEntry> = line
+        .iter()
+        .filter(|e| e.entry.kind == StateEntryKind::Snapshot && there.contains(&e.entry_hash()))
+        .collect();
+    let newest = held
+        .last()
+        .and_then(|e| chrono::DateTime::from_timestamp_micros(e.entry.state_at));
+    Ok(Kept::Since(Some(match newest {
+        Some(at) => OnAgora::Upto {
+            versions: held.len(),
+            newest: at.date_naive(),
+        },
+        None => OnAgora::Nothing,
+    })))
+}
+
 /// Agents enrolled by their keys (a state key in the secrets tree) whose
-/// `state.json` is gone, with the whole directory or alone: refused
-/// ([`Refusal::StateMissing`]), since a deletion is the May loss's other
-/// face. Unless Agora answers that it holds no sealed head for one
-/// (`head: null`, never uploaded; or a 404, an unknown or deleted agent
-/// whose secrets were left behind), which is warned, alerted and skipped. Agora unreachable, or no key to ask with: refused
-/// (fail closed).
+/// `state.json` is gone, with the whole directory or alone, or whose chain
+/// marker is gone beside its state: refused ([`Refusal::StateMissing`],
+/// [`Refusal::HeadMissing`]), since a deletion is the May loss's other
+/// face. A state there and chained must load, or it is refused too.
+///
+/// Which are losses, the roster decides ([`super::roster`]): one on it is
+/// refused, marked (the directory recreated if it is gone, so a session
+/// journal left behind doesn't block the restore), with no server call.
+/// One not on it is leftover keys (an agent gone, its secrets left behind)
+/// or an enrolment cut short: for an agent that never uploaded, skipped
+/// with no server call and nothing written; for one that did, Agora is
+/// asked whether it holds a sealed head (`head: null` or a 404: skipped;
+/// unreachable: refused, fail closed). The skipped ones go to the operator
+/// in one alert ([`AlertKind::SealedStateKeysWithoutState`]).
+///
+/// `Err`: the secrets tree couldn't be listed, which refuses the run.
+/// The skipped ones are returned for the caller to alert, or to refuse
+/// the run when they are fleet-shaped ([`leftover_alert`]).
 pub async fn missing_states(
     state_dir: &Path,
     keys: &KeyStore,
     server: &dyn SealedApi,
     alerts: &Alerter,
-) -> Vec<(AgentId, Refusal)> {
-    let ids = match keys.with_state_keys() {
-        Ok(ids) => ids,
-        Err(e) => {
-            tracing::warn!(error = %e, "the secrets tree couldn't be listed for missing states");
-            return Vec::new();
-        }
-    };
+    on_roster: &std::collections::BTreeSet<AgentId>,
+) -> std::io::Result<Missing> {
+    let ids = keys.with_state_keys().inspect_err(|e| {
+        tracing::error!(
+            event_type = "sealed_state_secrets_unlisted",
+            error = %e,
+            "the secrets tree couldn't be listed for missing states; the run is refused"
+        )
+    })?;
     let mut missing = Vec::new();
+    let mut leftover: Vec<(AgentId, bool)> = Vec::new();
     for id in ids {
         let dir = state_dir.join(id.to_string());
         let state_here = std::fs::exists(dir.join("state.json")).unwrap_or(true);
@@ -1687,64 +2433,108 @@ pub async fn missing_states(
             }
             continue;
         };
-        let known = match keys.signing(id) {
-            Some(signing) => server.head_known(id, &signing).await,
-            None => Err("no signing key to ask Agora with".into()),
-        };
-        match known {
-            Ok(false) => {
-                tracing::warn!(
-                    event_type = "sealed_state_keys_without_state",
+        if !on_roster.contains(&id) {
+            let known = match Upload::of(&dir, keys, id) {
+                // Nothing of it was ever on Agora to ask about
+                Upload::Never => Ok(false),
+                // Nothing asked: whether it uploaded is unknown, so it
+                // is refused (fail closed)
+                Upload::InDoubt => Err("its uploading marker is in doubt".into()),
+                Upload::Now | Upload::Before => match keys.signing(id) {
+                    Some(signing) => server.head_known(id, &signing).await,
+                    None => Err("no signing key to ask Agora with".into()),
+                },
+            };
+            match known {
+                Ok(false) => {
+                    tracing::warn!(
+                        event_type = "sealed_state_keys_without_state",
+                        agent_id = %id,
+                        state_here,
+                        "a state key is here but no chained state, and none is on the roster or on Agora; skipped"
+                    );
+                    leftover.push((id, state_here));
+                    continue;
+                }
+                Ok(true) => {}
+                Err(e) => tracing::warn!(
                     agent_id = %id,
-                    "a state key is here but no state, and Agora holds no sealed head for it; skipped"
-                );
-                // A state here: an enrolment cut after its key was cached.
-                // None: an agent gone, its keys left behind
-                let (summary, what, command) = if state_here {
-                    (
-                        format!(
-                            "{id}: an enrolment that didn't finish (a state key, no enrolment marker, nothing on Agora)"
-                        ),
-                        "resume",
-                        format!("agora-seed sealed-enroll --agent {id}"),
-                    )
-                } else {
-                    (
-                        format!(
-                            "{id}: a state key but no state here, and nothing on Agora to restore"
-                        ),
-                        "forget",
-                        format!("agora-seed sealed-forget --agent {id} --note \"…\""),
-                    )
-                };
-                alerts.notify(
-                    Alert::new(AlertKind::SealedStateKeysWithoutState, summary)
-                        .agent(id.to_string(), id)
-                        .detail(what, command),
-                );
-                continue;
+                    error = %e,
+                    "Agora couldn't say whether it holds the missing state's head; refused"
+                ),
             }
-            Ok(true) => {}
-            Err(e) => tracing::warn!(
-                agent_id = %id,
-                error = %e,
-                "Agora couldn't say whether it holds the missing state's head; refused"
-            ),
         }
-        // Marked (the directory recreated if it is gone), so a session
-        // journal left behind doesn't block the restore
+        let reason = marked_reason(&dir).unwrap_or(reason);
         refuse(
             &dir,
             id,
             &format!("({})", reason.as_str()),
             reason,
-            "an enrolled agent's state or sealed/ is missing; `agora-seed sealed-restore` restores it from Agora",
+            "an enrolled agent's state or sealed/ is missing; `agora-seed sealed-restore` restores it",
             alerts,
         )
         .await;
         missing.push((id, reason));
     }
-    missing
+    Ok(Missing {
+        refused: missing,
+        leftover,
+    })
+}
+
+/// What [`missing_states`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Missing {
+    /// Refused and marked, with why.
+    pub refused: Vec<(AgentId, Refusal)>,
+    /// Skipped: a state key with no chained state, on neither the roster
+    /// nor Agora (`true`: a state is here).
+    pub leftover: Vec<(AgentId, bool)>,
+}
+
+/// Agents named in a summary alert, at most; the run log has every one.
+pub const SUMMARY_LIST: usize = 10;
+
+/// The one alert for the run's leftover state keys (`(id, state here)`),
+/// on the fleet-wide key.
+pub fn leftover_alert(leftover: &[(AgentId, bool)]) -> Option<Alert> {
+    if leftover.is_empty() {
+        return None;
+    }
+    let mut alert = Alert::new(
+        AlertKind::SealedStateKeysWithoutState,
+        format!(
+            "{} agent(s) with a state key but no chained state, on neither the roster nor Agora; skipped",
+            leftover.len()
+        ),
+    )
+    .count(leftover.len());
+    for (id, state_here) in leftover.iter().take(SUMMARY_LIST) {
+        alert = alert.detail(
+            "agent",
+            if *state_here {
+                format!(
+                    "{id}: an enrolment that didn't finish (a state key, no chain marker): \
+                     agora-seed sealed-enroll --agent {id}"
+                )
+            } else {
+                format!(
+                    "{id}: a state key but no state here: if it left, agora-seed sealed-forget \
+                     --agent {id} --note \"…\""
+                )
+            },
+        );
+    }
+    if leftover.len() > SUMMARY_LIST {
+        alert = alert.detail(
+            "more",
+            format!(
+                "{} more; each is a sealed_state_keys_without_state event in the run log",
+                leftover.len() - SUMMARY_LIST
+            ),
+        );
+    }
+    Some(alert)
 }
 
 /// Rotations the server lists that the runner's own `rotations.json`
@@ -1778,7 +2568,8 @@ pub async fn unknown_rotations(
 }
 
 /// Act on a refusal: `sealed/refused` (blocks every seal), the notice for
-/// the agent, the alert. Never touches the state.
+/// the agent, the alert. Never touches the state. An agent marked
+/// already keeps its first reason and notice ([`marked_reason`]).
 pub async fn refuse(
     agent_dir: &Path,
     id: AgentId,
@@ -1787,6 +2578,14 @@ pub async fn refuse(
     detail: &str,
     alerts: &Alerter,
 ) {
+    mark(agent_dir, id, name, reason, detail).await;
+    alerts.notify(refused_alert(id, name, reason, detail));
+}
+
+/// [`refuse`] without the alert: the start check sends the agents' alerts
+/// once it knows whether the whole run stops (one alert then, not one per
+/// agent).
+pub async fn mark(agent_dir: &Path, id: AgentId, name: &str, reason: Refusal, detail: &str) {
     let seal = AgentSeal::new(agent_dir, id);
     if !seal.is_refused().await.unwrap_or(false)
         && let Err(e) = seal.refuse(reason.as_str()).await
@@ -1804,28 +2603,107 @@ pub async fn refuse(
         detail,
         "sealed state did not check out; the agent is left out until `agora-seed sealed-accept`"
     );
-    alerts.notify(
-        Alert::new(
-            AlertKind::SealedStateRefused,
-            format!("{name}'s session was refused: {}", reason.plain()),
-        )
-        .agent(name, id)
-        .detail("reason", reason.as_str())
-        .detail("detail", detail),
-    );
 }
 
-/// The alert for a memory or soul that shrank.
-pub fn drop_alert(id: AgentId, name: &str, drops: &[(&'static str, u32)]) -> Alert {
+/// The alert for one refused agent.
+pub fn refused_alert(id: AgentId, name: &str, reason: Refusal, detail: &str) -> Alert {
+    Alert::new(
+        AlertKind::SealedStateRefused,
+        format!("{name}'s session was refused: {}", reason.plain()),
+    )
+    .agent(name, id)
+    .detail("reason", reason.as_str())
+    .detail("detail", detail)
+}
+
+/// The reason an agent was first refused for, when it is marked: the
+/// marker's own word. A later start that finds a different face of the
+/// same loss (a directory recreated to hold the marker) keeps it.
+pub fn marked_reason(agent_dir: &Path) -> Option<Refusal> {
+    let marker = agent_dir
+        .join(agora_agentkit::state::storage::SEALED_DIR)
+        .join("refused");
+    Refusal::parse(&std::fs::read_to_string(marker).ok()?)
+}
+
+/// One agent's shrink, for [`drop_summary`]: its id, name, and what shrank
+/// by how many percent.
+pub type Dropped = (AgentId, String, Vec<(&'static str, u32)>);
+
+/// The run's one alert for memories or souls that shrank past the
+/// threshold ([`super::sizes`]), on the fleet-wide key: with every agent
+/// chained, any agent that condenses its own memory crosses it, so one
+/// mail an interval, with the count and the first agents, never one per
+/// agent. Each is a `sealed_state_drop` event in the run log.
+pub fn drop_summary(drops: &[Dropped]) -> Option<Alert> {
+    if drops.is_empty() {
+        return None;
+    }
     let mut alert = Alert::new(
         AlertKind::SealedStateDrop,
-        format!("{name}: memory or soul much smaller than at the previous sealed version"),
+        format!(
+            "{} agent(s): memory or soul much smaller than at the previous sealed version",
+            drops.len()
+        ),
     )
-    .agent(name, id);
-    for (what, pct) in drops {
-        alert = alert.detail("smaller", format!("{what} by {pct}%"));
+    .count(drops.len())
+    .detail("agents", drops.len());
+    for (id, name, what) in drops.iter().take(SUMMARY_LIST) {
+        let what: Vec<String> = what
+            .iter()
+            .map(|(w, pct)| format!("{w} by {pct}%"))
+            .collect();
+        alert = alert.detail("smaller", format!("{name} ({id}): {}", what.join(", ")));
     }
-    alert
+    if drops.len() > SUMMARY_LIST {
+        alert = alert.detail(
+            "more",
+            format!(
+                "{} more; each is a sealed_state_drop event in the run log",
+                drops.len() - SUMMARY_LIST
+            ),
+        );
+    }
+    Some(alert)
+}
+
+/// From this many refused agents at once, counting those still refused
+/// from earlier runs, the whole run stops, whatever their reasons
+/// (Steward, 2026-11-11): more than a couple is fleet-shaped.
+pub const REFUSED_AGENTS_STOP_RUN: usize = 3;
+
+/// One refusal at the start, as the rule over the run sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// An agent refused for `reason`. `uploads`: it uploads, or its
+    /// uploading marker is in doubt ([`Upload::counts_as_uploading`]).
+    Agent { reason: Refusal, uploads: bool },
+    /// Agora's copy of an agent's history failed while its local state is
+    /// intact ([`Outcome::ServerFault`]).
+    ServerFault,
+    /// The fleet's own record failed: the roster missing or unreadable,
+    /// the secrets tree or the state directory unlistable.
+    Fleet,
+}
+
+/// Whether the whole run stops (exit [`super::REFUSED_RUN_EXIT`]), or the
+/// refused agents are left out and the rest run (Steward, 2026-11-11). It
+/// stops for: a loss-shaped reason ([`Refusal::loss_shaped`]); any refused
+/// agent that uploads; any server fault or fleet failure; or
+/// [`REFUSED_AGENTS_STOP_RUN`] or more refused agents, `outstanding` being
+/// those still marked refused from earlier runs and not among `refused`.
+/// What is left: one or two agents that don't upload, refused for a
+/// mismatch or a broken chain, decided here on local evidence.
+pub fn stops_run(refused: &[Refused], outstanding: usize) -> bool {
+    let fleet_shaped = refused.iter().any(|r| match r {
+        Refused::Agent { reason, uploads } => reason.loss_shaped() || *uploads,
+        Refused::ServerFault | Refused::Fleet => true,
+    });
+    let agents = refused
+        .iter()
+        .filter(|r| matches!(r, Refused::Agent { .. }))
+        .count();
+    fleet_shaped || agents + outstanding >= REFUSED_AGENTS_STOP_RUN
 }
 
 /// The alert for a run that goes on held.
@@ -1847,10 +2725,6 @@ pub fn hold_alert(
         Hold::Fork => (
             AlertKind::SealedStateFork,
             "the sealed chain on Agora moved on from the local head; uploads held",
-        ),
-        Hold::Unreadable => (
-            AlertKind::SealedStateUnreadable,
-            "sealed/ or its keys could not be read; the agent runs, uploads held",
         ),
         Hold::Unchecked => (
             AlertKind::SealedStateUnreadable,
@@ -2132,9 +3006,9 @@ pub(crate) mod tests {
         assert!(
             linked[0].contains("the next session's will differ). Its memory is mem-0707070707,")
         );
-        let mut held = vec![UNREADABLE_LINE.to_string()];
+        let mut held = vec![UNCHECKED_LINE.to_string()];
         link_memory_id(&mut held, &memory);
-        assert_eq!(held, [UNREADABLE_LINE], "no head, no link");
+        assert_eq!(held, [UNCHECKED_LINE], "no head, no link");
 
         // Agora has all of it: the same
         *server.chain.lock().unwrap() = Ok(sealed_chain(&dir, id).await);
@@ -2760,91 +3634,40 @@ pub(crate) mod tests {
         assert!(!line.contains("rewrote"), "{line}");
     }
 
-    /// A `sealed/` that can't be read never refuses on its own: the agent
-    /// runs, told, held.
+    /// A `sealed/` that can't be read is local evidence, not transient:
+    /// the agent doesn't run unchecked. Refused for that (not a loss by
+    /// itself), uploading or not.
     #[tokio::test]
-    async fn an_unreadable_seal_runs_held_and_is_never_refused() {
+    async fn an_unreadable_seal_is_refused_not_run() {
         let root = crate::sealed::TestDir::new("check-unreadable");
-        let (id, keys, dir) = enrolled(&root).await;
-        std::fs::write(dir.join("sealed/head.json"), b"{ not json").unwrap();
-        let out = check(
-            &dir,
-            id,
-            &local_hash(&root, id).await,
-            Sizes::default(),
-            &keys,
-            &server(Vec::new()),
-        )
-        .await;
-        assert_eq!(
-            out,
-            Outcome::Run {
-                seat: vec![UNREADABLE_LINE.to_string()],
-                notice: false,
-                hold: Some(Hold::Unreadable),
-                drops: Vec::new(),
-                told: Vec::new(),
-                judged: None,
-            }
-        );
-        // With the log: what was judged before, and that no anchor is
-        // checked while held, on the one line it has (beta round 12)
-        let checked = crate::sealed::inclusion::Checked {
-            anc_id: "ANC-2026-0003".parse().unwrap(),
-            date: chrono::NaiveDate::from_ymd_opt(2026, 11, 3),
-            finding: crate::sealed::inclusion::Finding::NotIncluded,
-            at: chrono::Utc::now(),
-            told: false,
-            alerted: false,
-        };
-        crate::sealed::inclusion::InclusionFile {
-            through: Some(checked.anc_id.clone()),
-            checked: vec![checked],
-        }
-        .save(&dir)
-        .unwrap();
-        let verified = crate::sealed::anchors::VerifiedAnchors::new([3, 4].map(|n: u8| {
-            (
-                format!("ANC-2026-{n:04}").parse().unwrap(),
-                Sha256Hex::from([n; 32]),
-                chrono::DateTime::parse_from_rfc3339("2026-11-06T00:05:00Z")
-                    .unwrap()
-                    .to_utc(),
+        for local in [false, true] {
+            let (id, keys, dir) = if local {
+                enrolled_local(&root).await
+            } else {
+                enrolled(&root).await
+            };
+            std::fs::write(dir.join("sealed/head.json"), b"{ not json").unwrap();
+            let out = check(
+                &dir,
+                id,
+                &local_hash(&root, id).await,
+                Sizes::default(),
+                &keys,
+                &crate::sealed::api::fake::guarded(&root),
             )
-        }));
-        let out = check_with(
-            &dir,
-            id,
-            &local_hash(&root, id).await,
-            Sizes::default(),
-            &keys,
-            &server(Vec::new()),
-            Some(&StartAnchors {
-                verified: &verified,
-                alerted: true,
-            }),
-        )
-        .await;
-        let Outcome::Run {
-            seat, told, hold, ..
-        } = out
-        else {
-            panic!("{out:?}")
-        };
-        assert_eq!(hold, Some(Hold::Unreadable));
-        assert_eq!(told, vec!["ANC-2026-0003".parse().unwrap()]);
-        assert_eq!(
-            seat,
-            vec![format!(
-                "{UNREADABLE_LINE} ANC-2026-0003, the anchor for 2026-11-03, doesn't \
-                 include you, and needn't: Agora hadn't confirmed receiving any version \
-                 of yours by the end of that day (UTC). ANC-2026-0004, logged \
-                 2026-11-06 (UTC) and the newest in the governance log, hasn't been \
-                 checked for you yet: your runner doesn't check anchors while your \
-                 uploads to Agora are held, as they are this session. It checks it \
-                 once they go ahead again."
-            )]
-        );
+            .await;
+            assert!(
+                matches!(
+                    out,
+                    Outcome::Refuse {
+                        reason: Refusal::SealUnreadable,
+                        ..
+                    }
+                ),
+                "{out:?}"
+            );
+            assert!(!Refusal::SealUnreadable.loss_shaped());
+        }
     }
 
     /// A rotation the server lists and the runner never made is counted,
@@ -2870,10 +3693,11 @@ pub(crate) mod tests {
         assert_eq!(unknown_rotations(&keys, &api, id).await, Some(0));
     }
 
-    /// No refusal without evidence: unreadable key records, or a chain
-    /// that runs through an unreachable Agora, run held.
+    /// Unreadable key records are local evidence that can't be read:
+    /// refused, not run. A chain that runs through an unreachable Agora
+    /// is transient: run held.
     #[tokio::test]
-    async fn transient_failures_run_held_and_are_never_refused() {
+    async fn transient_failures_run_held_and_unreadable_keys_are_refused() {
         let root = crate::sealed::TestDir::new("check-transient");
         let (id, keys, dir) = enrolled(&root).await;
         std::fs::write(keys.agent_dir(id).join("rotations.json"), b"{ not json").unwrap();
@@ -2889,14 +3713,13 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 out,
-                Outcome::Run {
-                    hold: Some(Hold::Unreadable),
+                Outcome::Refuse {
+                    reason: Refusal::SealUnreadable,
                     ..
                 }
             ),
             "{out:?}"
         );
-        assert!(!AgentSeal::new(&dir, id).is_refused().await.unwrap());
 
         // A main line through Agora's entries, Agora unreachable
         std::fs::rename(
@@ -3556,6 +4379,753 @@ pub(crate) mod tests {
         );
     }
 
+    /// Every new sentence a never-uploading agent can be told, verbatim,
+    /// for the beta round to tune knowing what it changes.
+    #[test]
+    fn the_local_sentences_are_pinned() {
+        assert_eq!(
+            LOCAL_VERDICT,
+            "intact, checked against the record your runner keeps on this machine."
+        );
+        assert_eq!(
+            LOCAL_NOTHING_ON_AGORA,
+            " Nothing of your state is on Agora."
+        );
+        assert_eq!(LOCAL_CHECKED_BY, "Checked by your runner with");
+        assert_eq!(
+            LOCAL_LIMITS,
+            "A record kept on the same machine as your state catches a state changed or lost by \
+             accident; it can't show a change made by whoever runs your runner."
+        );
+        assert_eq!(
+            LOCAL_SEAL_FAILED_LINE,
+            "Your last save was written here but could not be sealed, so your sealed history \
+             does not include it yet. This session starts from that save, and your operator has \
+             been told."
+        );
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        assert_eq!(
+            Kept::Since(Some(OnAgora::Upto {
+                versions: 4,
+                newest: day
+            }))
+            .sentence(),
+            " Agora holds 4 of its versions, the newest dated 2026-11-05; those saved since your \
+             uploads stopped stay on this runner."
+        );
+        assert_eq!(
+            Kept::Since(Some(OnAgora::Nothing)).sentence(),
+            " Agora holds none of its versions; those saved since your uploads stopped stay on \
+             this runner."
+        );
+        assert_eq!(
+            Kept::Since(None).sentence(),
+            " Agora's copy couldn't be read this session; the versions saved since your uploads \
+             stopped stay on this runner."
+        );
+        assert_eq!(
+            Kept::InDoubt.sentence(),
+            " Your runner couldn't tell whether your state is being uploaded to Agora; your \
+             operator has been told, and nothing is being sent meanwhile."
+        );
+        assert_eq!(
+            LOCAL_CHECKED_SINCE,
+            ": that your state matches the last sealed version, and the links and signatures \
+             of the versions saved since its last full check of every version, on"
+        );
+        assert_eq!(
+            Unopenable {
+                versions: 3,
+                earliest: 1_762_300_800_000_000,
+                missing: 2,
+                damaged: 1
+            }
+            .line(),
+            "3 of your sealed versions, the earliest dated 2025-11-05, can't be opened here: \
+             their sealed copies on this machine are missing or damaged. Your state now is not \
+             affected, and your operator has been told."
+        );
+        assert_eq!(
+            Unopenable {
+                versions: 1,
+                earliest: 1_762_300_800_000_000,
+                missing: 1,
+                damaged: 0
+            }
+            .line(),
+            "1 of your sealed versions, dated 2025-11-05, can't be opened here: their sealed \
+             copies on this machine are missing or damaged. Your state now is not affected, and \
+             your operator has been told."
+        );
+        assert_eq!(
+            Refusal::SealUnreadable.plain(),
+            "your sealed history here couldn't be read"
+        );
+        for line in [
+            LOCAL_VERDICT,
+            LOCAL_LIMITS,
+            LOCAL_SEAL_FAILED_LINE,
+            LOCAL_CHECKED_SINCE,
+            UNOPENABLE_LINE,
+        ] {
+            assert_banned_absent(line);
+        }
+    }
+
+    /// What a never-uploader's text must not say: Agora only in "nothing
+    /// … is on Agora"; nothing of anchors, being in step, being held, or
+    /// anyone but the runner checking.
+    fn assert_banned_absent(text: &str) {
+        // The file and commit that checked it name agentkit's repository
+        let without = text
+            .replace(LOCAL_NOTHING_ON_AGORA.trim(), "")
+            .replace(VERIFIER, "");
+        let lower = without.to_lowercase();
+        for banned in [
+            "agora",
+            "in step",
+            "anchor",
+            "anc-",
+            "held",
+            "uploads",
+            "waiting to upload",
+            "steward",
+            "verified by",
+        ] {
+            assert!(!lower.contains(banned), "{banned:?} in {text}");
+        }
+    }
+
+    /// An agent that never uploaded: its whole start check asks Agora
+    /// nothing (any call panics under the strict guard), and its verdict
+    /// says the check was against the runner's own record, that nothing
+    /// of it is on Agora, its sizes with their change, the file and
+    /// commit, and what a local record can and can't show.
+    #[tokio::test]
+    async fn a_local_verdict_says_what_a_local_record_shows() {
+        let root = crate::sealed::TestDir::new("check-local-verdict");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        let api = crate::sealed::api::fake::guarded(&root);
+        let longer = serde_json::json!({ "memory": { "content": "a longer synthetic memory" } });
+        crate::sealed::props::save(&root, id, longer.clone()).await;
+        let anchors = crate::sealed::anchors::VerifiedAnchors::new([(
+            "ANC-2026-0003".parse().unwrap(),
+            Sha256Hex::from([3; 32]),
+            chrono::Utc::now(),
+        )]);
+        let start = StartAnchors {
+            verified: &anchors,
+            alerted: true,
+        };
+        let out = check_with(
+            &dir,
+            id,
+            &plaintext_hash(&longer),
+            Sizes::of(&longer),
+            &keys,
+            &api,
+            Some(&start),
+        )
+        .await;
+        let Outcome::Run {
+            seat,
+            hold: None,
+            told,
+            judged: None,
+            ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert!(told.is_empty());
+        assert_eq!(seat.len(), 1, "{seat:?}");
+        let v = &seat[0];
+        assert!(
+            v.starts_with(
+                "Your sealed state: intact, checked against the record your runner keeps on this \
+                 machine. Nothing of your state is on Agora. It has 2 versions since "
+            ),
+            "{v}"
+        );
+        assert!(
+            v.contains(" characters (+") && v.contains("since your earlier sealed version, head "),
+            "sizes with their change: {v}"
+        );
+        assert!(
+            v.ends_with(&format!(
+                "Checked by your runner with {VERIFIER}: links, signatures, and that your state \
+                 matches the last sealed version. {LOCAL_LIMITS}"
+            )),
+            "{v}"
+        );
+        assert_banned_absent(v);
+        assert_eq!(v.matches(LOCAL_LIMITS).count(), 1, "said once");
+        assert!(
+            api.calls.lock().unwrap().is_empty(),
+            "nothing asked of Agora"
+        );
+
+        // A failed seal: its own line, nothing of uploads or anchors
+        let mut seat_failed = vec![LOCAL_SEAL_FAILED_LINE.to_string()];
+        link_memory_id(
+            &mut seat_failed,
+            &agora_agentkit::reactor::seed::MemoryId::from([7; 32]),
+        );
+        assert_eq!(seat_failed, [LOCAL_SEAL_FAILED_LINE]);
+    }
+
+    /// A missing link in a chain kept only here (no gap in the numbering,
+    /// no entry changed at its seq) is local evidence: refused, decided
+    /// here, with no server call.
+    #[tokio::test]
+    async fn a_missing_link_of_a_local_chain_is_refused_here() {
+        let root = crate::sealed::TestDir::new("check-local-link");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        crate::sealed::props::save(&root, id, state(2)).await;
+        crate::sealed::props::save(&root, id, state(3)).await;
+        let api = crate::sealed::api::fake::guarded(&root);
+        // The middle snapshot's entry moved to another seq: its link is
+        // held nowhere, and nothing is numbered missing
+        let outbox = dir.join("sealed/outbox");
+        let mut files: Vec<_> = std::fs::read_dir(&outbox)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        files.sort();
+        let middle = &files[files.len() - 2];
+        let mut item: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(middle).unwrap()).unwrap();
+        item["entry"]["entry"]["seq"] = 999.into();
+        std::fs::write(middle, serde_json::to_vec(&item).unwrap()).unwrap();
+        let out = check(
+            &dir,
+            id,
+            &plaintext_hash(&state(3)),
+            Sizes::of(&state(3)),
+            &keys,
+            &api,
+        )
+        .await;
+        assert!(
+            matches!(
+                out,
+                Outcome::Refuse {
+                    reason: Refusal::ChainBroken,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// An agent that uploaded and was stopped: Agora's copy may be read,
+    /// and the verdict says what it holds and that the versions since stay
+    /// on this runner; no anchor is judged or named.
+    #[tokio::test]
+    async fn a_stopped_agents_verdict_says_what_agora_holds() {
+        let root = crate::sealed::TestDir::new("check-stopped-verdict");
+        let (id, keys, dir) = enrolled(&root).await;
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        let api = crate::sealed::api::fake::guarded(&root);
+        *api.chain.lock().unwrap() = Ok(sealed_chain(&dir, id).await);
+        crate::sealed::stop::stop(
+            &root.join("state"),
+            &keys,
+            id,
+            "It asked",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        crate::sealed::props::save(&root, id, state(2)).await;
+        assert_eq!(Upload::of(&dir, &keys, id), Upload::Before);
+        let out = check(
+            &dir,
+            id,
+            &plaintext_hash(&state(2)),
+            Sizes::of(&state(2)),
+            &keys,
+            &api,
+        )
+        .await;
+        let Outcome::Run {
+            seat, hold: None, ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        assert!(
+            seat[0].starts_with(&format!(
+                "Your sealed state: intact, checked against the record your runner keeps on this \
+                 machine. Agora holds 1 of its versions, the newest dated {today}; those saved \
+                 since your uploads stopped stay on this runner. It has 2 versions since "
+            )),
+            "{seat:?}"
+        );
+        assert!(!seat[0].contains("anchor") && !seat[0].contains("in step"));
+        assert_eq!(
+            *api.calls.lock().unwrap(),
+            ["chain"],
+            "a read, nothing sent"
+        );
+    }
+
+    /// A stopped agent never takes the tail path: what its verdict says
+    /// of Agora's copy counts its whole line (review of B2, 4).
+    #[tokio::test]
+    async fn a_stopped_agent_is_checked_in_full_whatever_its_vouch() {
+        let root = crate::sealed::TestDir::new("check-stopped-full");
+        let (id, keys, dir) = enrolled(&root).await;
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        let api = crate::sealed::api::fake::guarded(&root);
+        *api.chain.lock().unwrap() = Ok(sealed_chain(&dir, id).await);
+        crate::sealed::stop::stop(
+            &root.join("state"),
+            &keys,
+            id,
+            "It asked",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        for n in 2..=4 {
+            crate::sealed::props::save(&root, id, state(n)).await;
+        }
+        let entries = sealed_chain(&dir, id).await;
+        let head = seal.head().await.unwrap().unwrap();
+        let fresh = Vouch {
+            head: head.head,
+            next_ord: head.next_ord,
+            at: chrono::Utc::now(),
+            keyframe: None,
+            summary: LineSummary::of(&entries),
+            unopenable: None,
+        };
+        let (out, found) = check_vouched(
+            &dir,
+            id,
+            &plaintext_hash(&state(4)),
+            Sizes::of(&state(4)),
+            &keys,
+            &api,
+            None,
+            Some(&fresh),
+        )
+        .await;
+        let Outcome::Run { seat, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert!(
+            seat[0].contains(" Agora holds 1 of its versions, "),
+            "{seat:?}"
+        );
+        assert!(seat[0].contains(": links, signatures, and that your state matches"));
+        assert!(
+            found.vouch.is_none(),
+            "an agent that uploaded keeps no vouch"
+        );
+    }
+
+    /// An agent whose uploading marker is in doubt is told so, and Agora
+    /// is asked nothing; a refusal marker whose notice is gone and whose
+    /// text names nothing reads as the loss-shaped side.
+    #[tokio::test]
+    async fn a_marker_in_doubt_is_said_and_an_unknown_refusal_fails_closed() {
+        let root = crate::sealed::TestDir::new("check-in-doubt");
+        let (id, keys, dir) = enrolled(&root).await;
+        std::fs::remove_file(keys.agent_dir(id).join(crate::sealed::uploading::DURABLE)).unwrap();
+        assert_eq!(Upload::of(&dir, &keys, id), Upload::InDoubt);
+        let api = crate::sealed::api::fake::guarded(&root);
+        let out = check(
+            &dir,
+            id,
+            &local_hash(&root, id).await,
+            Sizes::default(),
+            &keys,
+            &api,
+        )
+        .await;
+        let Outcome::Run {
+            seat, hold: None, ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert!(seat[0].contains(LOCAL_IN_DOUBT), "{seat:?}");
+        assert!(!seat[0].contains("uploads stopped"));
+        assert!(api.calls.lock().unwrap().is_empty());
+        std::fs::write(dir.join("sealed/refused"), b"???").unwrap();
+        let out = check(
+            &dir,
+            id,
+            &local_hash(&root, id).await,
+            Sizes::default(),
+            &keys,
+            &api,
+        )
+        .await;
+        assert!(
+            matches!(out, Outcome::Refuse { reason, .. } if reason.loss_shaped()),
+            "{out:?}"
+        );
+    }
+
+    /// The full check finds versions whose blob is missing or damaged
+    /// here: the agent runs and is told how many and since when; a tail
+    /// start repeats what the full check found. An uploader's blobs of
+    /// versions already sent aren't looked at.
+    #[tokio::test]
+    async fn a_missing_or_damaged_blob_is_told_not_refused() {
+        let root = crate::sealed::TestDir::new("check-blobs");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        for n in 2..=4 {
+            crate::sealed::props::save(&root, id, state(n)).await;
+        }
+        let api = crate::sealed::api::fake::guarded(&root);
+        let entries = sealed_chain(&dir, id).await;
+        let blob = |n: usize| entries[n].entry.blob.as_ref().unwrap().sha256;
+        let blobs = dir.join("sealed/blobs");
+        std::fs::remove_file(blobs.join(blob(2).to_hex())).unwrap();
+        std::fs::write(blobs.join(blob(3).to_hex()), b"damaged").unwrap();
+        let run = async |v: Option<&Vouch>| {
+            check_vouched(
+                &dir,
+                id,
+                &plaintext_hash(&state(4)),
+                Sizes::of(&state(4)),
+                &keys,
+                &api,
+                None,
+                v,
+            )
+            .await
+        };
+        let (out, found) = run(None).await;
+        let Outcome::Run {
+            seat, hold: None, ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        let u = found.unopenable.expect("found");
+        assert_eq!((u.missing, u.damaged), (1, 1));
+        assert!(u.versions >= 2, "{u:?}");
+        assert!(seat.contains(&u.line()), "{seat:?}");
+        let vouch = found.vouch.expect("vouched");
+        let (out, again) = run(Some(&vouch)).await;
+        let Outcome::Run { seat, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(again.unopenable, Some(u));
+        assert!(seat.contains(&u.line()), "the tail start repeats it");
+
+        // An uploader: versions sent have no blob here, and that's no damage
+        let (id, keys, dir) = enrolled(&root).await;
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        for f in std::fs::read_dir(dir.join("sealed/blobs")).unwrap() {
+            std::fs::remove_file(f.unwrap().path()).unwrap();
+        }
+        let server = server(sealed_chain(&dir, id).await);
+        let (_, found) = check_vouched(
+            &dir,
+            id,
+            &local_hash(&root, id).await,
+            Sizes::default(),
+            &keys,
+            &server,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(found.unopenable, None);
+    }
+
+    /// The rule over a run's refusals (Steward, 2026-11-11).
+    #[test]
+    fn the_refusal_rule() {
+        use Refusal as R;
+        let local = |reason| Refused::Agent {
+            reason,
+            uploads: false,
+        };
+        let uploading = |reason| Refused::Agent {
+            reason,
+            uploads: true,
+        };
+        let table: &[(&[Refused], usize, bool, &str)] = &[
+            (&[], 0, false, "nothing refused"),
+            (
+                &[local(R::Mismatch)],
+                0,
+                false,
+                "one local mismatch: left out",
+            ),
+            (
+                &[local(R::ChainBroken), local(R::Mismatch)],
+                0,
+                false,
+                "two: left out",
+            ),
+            (
+                &[local(R::Mismatch)],
+                1,
+                false,
+                "one more still refused: two in all",
+            ),
+            (
+                &[local(R::Mismatch)],
+                2,
+                true,
+                "three in all, counting earlier runs",
+            ),
+            (&[], 3, true, "three still refused, none new"),
+            (
+                &[
+                    local(R::Mismatch),
+                    local(R::Mismatch),
+                    local(R::ChainBroken),
+                ],
+                0,
+                true,
+                "three",
+            ),
+            (&[uploading(R::Mismatch)], 0, true, "an agent that uploads"),
+            (&[local(R::StateMissing)], 0, true, "state missing"),
+            (&[local(R::StateUnreadable)], 0, true, "state unreadable"),
+            (&[local(R::StateIo)], 0, true, "I/O"),
+            (&[local(R::StateTooNew)], 0, true, "too new"),
+            (&[local(R::HeadMissing)], 0, true, "head missing"),
+            (&[local(R::RolledBack)], 0, true, "rolled back"),
+            (
+                &[local(R::SealUnreadable)],
+                0,
+                false,
+                "one unreadable seal: left out",
+            ),
+            (
+                &[local(R::SealUnreadable), local(R::SealUnreadable)],
+                1,
+                true,
+                "three unreadable, counting one from an earlier run",
+            ),
+            (
+                &[local(R::SealUnreadable); 3],
+                0,
+                true,
+                "three unreadable at once",
+            ),
+            (
+                &[uploading(R::SealUnreadable)],
+                0,
+                true,
+                "an uploader's unreadable seal",
+            ),
+            (&[Refused::ServerFault], 0, true, "a server fault"),
+            (&[Refused::Fleet], 0, true, "the roster or the secrets tree"),
+            (
+                &[local(R::Mismatch), Refused::ServerFault],
+                0,
+                true,
+                "a server fault beside a local refusal",
+            ),
+        ];
+        for (refused, outstanding, stops, why) in table {
+            assert_eq!(stops_run(refused, *outstanding), *stops, "{why}");
+        }
+        assert_eq!(REFUSED_AGENTS_STOP_RUN, 3);
+    }
+
+    /// The run's one alert for many shrinks, and for many unreadable
+    /// seals: on the fleet-wide key (no agent), the first few named.
+    #[test]
+    fn shrinks_and_unopenable_versions_alert_once_a_run() {
+        let drops: Vec<Dropped> = (0..1_667)
+            .map(|n| (AgentId::new(), format!("a{n}"), vec![("memory", 60)]))
+            .collect();
+        let alert = drop_summary(&drops).unwrap();
+        assert_eq!(alert.kind, AlertKind::SealedStateDrop);
+        assert!(alert.agent_id.is_none(), "the fleet-wide key");
+        assert_eq!(
+            alert.details.iter().filter(|d| d.0 == "smaller").count(),
+            SUMMARY_LIST
+        );
+        assert!(alert.summary.starts_with("1667 agent(s)"));
+        assert!(drop_summary(&[]).is_none());
+        assert_eq!(alert.count, Some(1_667), "a jump passes the rate limit");
+        let u = Unopenable {
+            versions: 2,
+            earliest: 0,
+            missing: 1,
+            damaged: 0,
+        };
+        let unopenable: Vec<_> = drops.iter().map(|d| (d.0, d.1.clone(), u)).collect();
+        let alert = unopenable_summary(&unopenable).unwrap();
+        assert_eq!(alert.kind, AlertKind::SealedStateBlobsMissing);
+        assert!(alert.agent_id.is_none());
+        assert!(unopenable_summary(&[]).is_none());
+    }
+
+    /// The tail check, given the roster's vouch, says what the full check
+    /// says, and falls back to it when anything is off.
+    #[tokio::test]
+    async fn a_vouched_tail_check_says_what_the_full_check_says() {
+        let root = crate::sealed::TestDir::new("check-tail");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        for n in 2..=12 {
+            crate::sealed::props::save(&root, id, state(n)).await;
+        }
+        let api = crate::sealed::api::fake::guarded(&root);
+        let run = async |vouched: Option<&Vouch>, n: usize| {
+            check_vouched(
+                &dir,
+                id,
+                &plaintext_hash(&state(n)),
+                Sizes::of(&state(n)),
+                &keys,
+                &api,
+                None,
+                vouched,
+            )
+            .await
+        };
+        // What a tail start says it checked, in place of the full one's
+        let as_tail = |out: &Outcome, v: &Vouch| {
+            let Outcome::Run { seat, .. } = out else {
+                panic!("{out:?}")
+            };
+            seat[0].replace(
+                &format!(
+                    "{VERIFIER}: links, signatures, and that your state matches the last sealed \
+                     version."
+                ),
+                &format!(
+                    "{VERIFIER}{LOCAL_CHECKED_SINCE} {}.",
+                    v.at.date_naive().format("%Y-%m-%d")
+                ),
+            )
+        };
+        let line = |out: &Outcome| {
+            let Outcome::Run { seat, .. } = out else {
+                panic!("{out:?}")
+            };
+            seat[0].clone()
+        };
+        let (full, vouch) = run(None, 12).await;
+        let vouch = vouch.vouch.expect("vouched");
+        assert_eq!(vouch.summary.snapshots, 12);
+        let (tail, again) = run(Some(&vouch), 12).await;
+        assert_ne!(line(&tail), line(&full), "it says what it checked");
+        assert_eq!(line(&tail), as_tail(&full, &vouch));
+        assert!(
+            line(&tail).contains(
+                "that your state matches the last sealed version, and the links and signatures \
+                 of the versions saved since its last full check of every version, on "
+            ),
+            "{}",
+            line(&tail)
+        );
+        assert!(again.vouch.is_none());
+        // Saves after the vouch: the tail counts them on the vouch's summary
+        for n in 13..=15 {
+            crate::sealed::props::save(&root, id, state(n)).await;
+        }
+        let (full, _) = run(None, 15).await;
+        let (tail, _) = run(Some(&vouch), 15).await;
+        assert_eq!(line(&tail), as_tail(&full, &vouch));
+        // A vouch whose head isn't on the line: the full check
+        let mut wrong = vouch;
+        wrong.head.entry_hash = Sha256Hex::from([9; 32]);
+        assert_eq!(run(Some(&wrong), 15).await.0, full);
+        // A stale vouch: the full check, which vouches again
+        let mut stale = vouch;
+        stale.at -= chrono::TimeDelta::days(15);
+        assert!(run(Some(&stale), 15).await.1.vouch.is_some());
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// The start check's cost for one agent that doesn't upload, whose
+    /// outbox is its whole chain: `versions` snapshots after the genesis.
+    /// Synthetic state only. The median of five checks, in full and with
+    /// the roster's vouch (`a_vouched_tail_check_says_what_the_full_check_says`
+    /// compares their verdicts).
+    async fn start_cost(versions: usize) -> (std::time::Duration, std::time::Duration) {
+        let root = crate::sealed::TestDir::in_memory("check-cost");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        let seal = AgentSeal::new(&dir, id);
+        let k = keys.seal_keys(id).unwrap();
+        let mut last = state(1);
+        for n in 2..=versions {
+            last = state(n);
+            seal.append_state(
+                &k,
+                &KeyframePolicy::default(),
+                StateEntryKind::Snapshot,
+                &last,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        }
+        let api = crate::sealed::api::fake::guarded(&root);
+        let run = async |vouched: Option<&Vouch>| {
+            let at = std::time::Instant::now();
+            let (out, made) = check_vouched(
+                &dir,
+                id,
+                &plaintext_hash(&last),
+                Sizes::of(&last),
+                &keys,
+                &api,
+                None,
+                vouched,
+            )
+            .await;
+            let t = at.elapsed();
+            assert!(matches!(out, Outcome::Run { hold: None, .. }), "{out:?}");
+            (t, made, out)
+        };
+        let median = |mut t: Vec<std::time::Duration>| {
+            t.sort();
+            t[t.len() / 2]
+        };
+        let mut full = Vec::new();
+        let mut vouch = None;
+        for _ in 0..5 {
+            let (t, made, _) = run(None).await;
+            full.push(t);
+            vouch = made.vouch;
+        }
+        let vouch = vouch.expect("a full check vouches");
+        let mut tail = Vec::new();
+        for _ in 0..5 {
+            let (t, made, _) = run(Some(&vouch)).await;
+            assert!(made.vouch.is_none(), "a tail check vouches for nothing");
+            tail.push(t);
+        }
+        (median(full), median(tail))
+    }
+
+    /// `cargo test -p agora-seed --release -- --ignored start_cost --nocapture`
+    #[tokio::test]
+    #[ignore = "a measurement, not a test"]
+    async fn start_cost_of_a_local_chain() {
+        for versions in [500, 5_000] {
+            let (full, tail) = start_cost(versions).await;
+            println!("start check, {versions} versions: full {full:?}, vouched {tail:?}");
+        }
+    }
+
     #[test]
     fn the_verifier_is_the_locked_agentkit() {
         let lock = include_str!("../../../../Cargo.lock");
@@ -3577,7 +5147,6 @@ pub(crate) mod tests {
             FORK_LINE,
             HEAD_MISSING_LINE,
             SEAL_FAILED_LINE,
-            UNREADABLE_LINE,
             UNCHECKED_LINE,
         ] {
             let l = line.to_lowercase();

@@ -230,9 +230,12 @@ mod tests {
                 &state_dir,
                 &keys,
                 &api,
-                &crate::alerts::Alerter::off()
+                &crate::alerts::Alerter::off(),
+                &Default::default(),
             )
             .await
+            .unwrap()
+            .refused
             .is_empty()
         );
     }

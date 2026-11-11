@@ -188,8 +188,16 @@ async fn a_torn_tmp_is_never_promoted_and_restore_recovers() {
     std::fs::write(b.dir.join("state.json.tmp"), b"{\"format\": 2, \"st").unwrap();
     std::fs::rename(b.dir.join("state.json"), b.dir.join(archive_name())).unwrap();
     assert_eq!(crate::promote::promote_tmp_states(&state_dir, later()), 0);
-    let missing =
-        check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off()).await;
+    let missing = check::missing_states(
+        &state_dir,
+        &b.keys,
+        &b.api,
+        &crate::alerts::Alerter::off(),
+        &Default::default(),
+    )
+    .await
+    .unwrap()
+    .refused;
     assert_eq!(missing, vec![(b.id, Refusal::StateMissing)]);
     super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
         .await
@@ -751,8 +759,16 @@ async fn a_state_from_a_newer_runner_is_never_restored_over() {
     let b = build(&h).await;
     let state_dir = b.state_dir();
     std::fs::write(b.dir.join("state.json"), br#"{"format": 99, "state": {}}"#).unwrap();
-    let refused =
-        check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off()).await;
+    let refused = check::missing_states(
+        &state_dir,
+        &b.keys,
+        &b.api,
+        &crate::alerts::Alerter::off(),
+        &Default::default(),
+    )
+    .await
+    .unwrap()
+    .refused;
     assert_eq!(refused, vec![(b.id, Refusal::StateTooNew)]);
     let e = super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
         .await
@@ -789,9 +805,16 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
         } else {
             std::fs::write(b.dir.join("state.json"), b"").unwrap();
         }
-        let refused =
-            check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off())
-                .await;
+        let refused = check::missing_states(
+            &state_dir,
+            &b.keys,
+            &b.api,
+            &crate::alerts::Alerter::off(),
+            &Default::default(),
+        )
+        .await
+        .unwrap()
+        .refused;
         let reason = if missing {
             Refusal::StateMissing
         } else {
@@ -840,9 +863,17 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
         );
         assert!(b.api.anchored.lock().unwrap().is_empty(), "nothing sent");
         assert!(
-            check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off())
-                .await
-                .is_empty()
+            check::missing_states(
+                &state_dir,
+                &b.keys,
+                &b.api,
+                &crate::alerts::Alerter::off(),
+                &Default::default()
+            )
+            .await
+            .unwrap()
+            .refused
+            .is_empty()
         );
         assert!(matches!(
             check_at(&state_dir, &b).await,
