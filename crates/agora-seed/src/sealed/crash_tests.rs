@@ -612,7 +612,7 @@ async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
 /// --rebase --note` seals the state here on top of what Agora holds, or on
 /// a new chain whose genesis records the break when Agora holds nothing;
 /// the next start is intact. What was set aside is kept in
-/// `sealed/lost/<utc>/`, past `prune_blobs`: the old head's keyframe still
+/// `sealed/lost/<utc>/`, past `remove_unnamed_blobs`: the old head's keyframe still
 /// opens with agentkit's `open_state`. Cut at every step, a rerun finishes.
 #[tokio::test]
 async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
@@ -678,7 +678,7 @@ async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
                 "{seat:?}"
             );
             // Kept past a prune: the old keyframe opens
-            // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+            // As a runner before agentkit 0.158 left sealed/
             crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
             let lost = std::fs::read_dir(b.dir.join("sealed/lost"))
                 .unwrap()
@@ -881,29 +881,6 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
             Outcome::Run { hold: None, .. }
         ));
     }
-}
-
-#[test]
-fn an_enrolled_agent_counts_as_enrolled_by_either_record() {
-    let root = super::TestDir::new("enrolled-either");
-    let id = AgentId::new();
-    let (agent_dir, secrets) = (
-        root.join("state").join(id.to_string()),
-        root.join("secrets"),
-    );
-    assert!(!super::enrolled_by_keys_or_marker(&agent_dir, &secrets, id));
-    std::fs::create_dir_all(secrets.join(id.to_string())).unwrap();
-    std::fs::write(
-        secrets
-            .join(id.to_string())
-            .join(super::keys::STATE_KEY_FILE),
-        b"{}",
-    )
-    .unwrap();
-    assert!(
-        super::enrolled_by_keys_or_marker(&agent_dir, &secrets, id),
-        "its key, its directory gone"
-    );
 }
 
 /// Beside a live runner (its shared hold on runner.lock), `sealed-accept

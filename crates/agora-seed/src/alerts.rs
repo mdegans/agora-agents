@@ -142,6 +142,10 @@ pub enum AlertKind {
     /// nothing to restore it from: skipped (`sealed-forget` sets the key
     /// aside).
     SealedStateKeysWithoutState,
+    /// An agent answered the sealed-state question again: its operator's
+    /// re-offer (`sealed-reoffer`), or, a bug, with none pending. Nothing
+    /// changed by the answer; the operator acts on it.
+    SealedStateAnsweredAgain,
     /// Agents whose uploading marker is contradictory or unreadable after
     /// the start's repair pass: treated as not uploading. One summary a run.
     SealedStateUploadingInDoubt,
@@ -191,7 +195,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -217,6 +221,7 @@ impl AlertKind {
         Self::SealedStateAnchorWrong,
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
+        Self::SealedStateAnsweredAgain,
         Self::SealedStateUploadingInDoubt,
         Self::SealedStateUntrustedKey,
         Self::SealedStateUnchainedAgents,
@@ -270,6 +275,7 @@ impl AlertKind {
             Self::SealedStateAnchorWrong => "sealed_state_anchor_wrong",
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
+            Self::SealedStateAnsweredAgain => "sealed_state_answered_again",
             Self::SealedStateUploadingInDoubt => "sealed_state_uploading_in_doubt",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::SealedStateUnchainedAgents => "sealed_state_unchained_agents",
@@ -541,6 +547,16 @@ impl AlertKind {
                  If not, nothing can be restored: if it left, `agora-seed \
                  sealed-forget --agent <id> --note \"…\"` sets its key aside \
                  (nothing is deleted). They were skipped either way."
+            }
+            Self::SealedStateAnsweredAgain => {
+                "An agent answered the sealed-backups question again, normally \
+                 the one you re-opened with `agora-seed sealed-reoffer`; both \
+                 answers are below, with the command that acts on the new one \
+                 (`act`). The answer changed nothing by itself: no upload was \
+                 started or stopped, and the agent was told you have been told \
+                 and will act. With `reoffered: false` no re-offer was pending, \
+                 which the offer's asked-once rule should prevent: a bug to \
+                 report; act only on what the agent asks you."
             }
             Self::SealedStateUploadingInDoubt => {
                 "The agents below said yes to uploading their sealed state, \

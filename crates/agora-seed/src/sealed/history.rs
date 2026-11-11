@@ -1102,7 +1102,7 @@ mod tests {
             upload_rebased: false,
         })
         .await;
-        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        // As a runner before agentkit 0.158 left sealed/
         crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         b.api.calls.lock().unwrap().clear();
         let before = tree(b.root.path());
@@ -1350,7 +1350,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_fetch_failure_keeps_sealed_versions_sealed_and_the_cache_spares_refetches() {
         let b = build(&plain(3, 9)).await;
-        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        // As a runner before agentkit 0.158 left sealed/
         crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         *b.api.fail.lock().unwrap() = Some("blob");
         let mut cache = HistoryCache::default();
@@ -1639,7 +1639,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hanging_server_costs_at_most_the_deadline() {
         let b = build(&plain(3, 9)).await;
-        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        // As a runner before agentkit 0.158 left sealed/
         crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         *b.api.blob_delay.lock().unwrap() = Some(std::time::Duration::from_secs(3600));
         let start = tokio::time::Instant::now();
@@ -1667,7 +1667,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hanging_server_costs_a_session_one_wait() {
         let b = build(&plain(3, 9)).await;
-        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        // As a runner before agentkit 0.158 left sealed/
         crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         *b.api.blob_delay.lock().unwrap() = Some(std::time::Duration::from_secs(3600));
         let mut cache = HistoryCache::default();
@@ -1701,7 +1701,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn persistent_503s_on_a_long_history_cost_a_few_seconds() {
         let b = build(&plain(110, 200)).await;
-        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        // As a runner before agentkit 0.158 left sealed/
         crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         *b.api.fail.lock().unwrap() = Some("blob");
         let mut cache = HistoryCache::default();
@@ -1732,7 +1732,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_missing_blob_is_asked_for_once() {
         let b = build(&plain(3, 9)).await;
-        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        // As a runner before agentkit 0.158 left sealed/
         crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         b.api.blobs.lock().unwrap().clear();
         let mut cache = HistoryCache::default();

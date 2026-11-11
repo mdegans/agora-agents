@@ -10,7 +10,9 @@
 //! **What it writes,** under `--data-dir` and nowhere else: before the request,
 //! `provision-<name>.json` (0600: the new agent's secret key and the action id), so a
 //! lost answer can be retried with the same key; after it, the key in `secrets/`, the
-//! state in `state/`, and that file removed. A rerun never overwrites either: a stored
+//! state in `state/` chained locally from its first version (a genesis of class `none`,
+//! then that state: its state key cached in `secrets/`, nothing sent), and that file
+//! removed. A rerun never overwrites either: a stored
 //! key must match, and existing state is left alone, since the runner may already have
 //! run the agent. It signs with a software key, which is refused above 5 agents; create
 //! agents on the account page then.
@@ -136,19 +138,43 @@ async fn install(
         }
         Err(e) => return Err(e).context("writing the agent's key"),
     }
-    let mut storage = FsStorage::new(state_dir);
+    let mut storage = FsStorage::new(&state_dir);
     match storage.load_raw(id).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {}
         Err(FsStorageError::NotFound(_)) => {
+            // Its chain's genesis is `none` even if the chain below is cut
+            // short and a later `sealed-enroll` makes it
+            crate::sealed::write_private(
+                &state_dir
+                    .join(id.to_string())
+                    .join(crate::sealed::enroll::PROVISIONED),
+                chrono::Utc::now().to_rfc3339().as_bytes(),
+            )
+            .context("marking the agent as provisioned here")?;
             // As `load_states` reads it
-            // A new agent: no sealed chain, so no base
+            // A new agent: no sealed chain yet, so no base
             storage
                 .save_raw(id, state()?, None)
                 .await
                 .map(|_| ())
-                .context("writing the agent's state")
+                .context("writing the agent's state")?;
         }
-        Err(e) => Err(e).with_context(|| format!("agent {id}'s state can't be read")),
+        Err(e) => return Err(e).with_context(|| format!("agent {id}'s state can't be read")),
+    }
+    // Chained from its first state, locally: a genesis of class `none`,
+    // then the state. A rerun finishes a chain cut short, and leaves a
+    // chained agent alone
+    let enroller = crate::sealed::enroll::Enroller {
+        keys: crate::sealed::KeyStore::new(secrets_dir),
+        state_dir,
+        restore: None,
+    };
+    match enroller
+        .chain_as(id, false, crate::sealed::enroll::Genesis::New)
+        .await
+    {
+        Ok(_) | Err(crate::sealed::enroll::Skip::Chained) => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context("chaining the agent's state")),
     }
 }
 
@@ -304,6 +330,49 @@ mod tests {
         let kept = FsKeyring::new(&secrets).signing_key(id).unwrap();
         assert_eq!(kept.to_bytes(), k.to_bytes());
         assert_eq!(stored_state(&dir, id).await, run);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A new agent is chained from its first state: a genesis (of class
+    /// `none`, asserted in `sealed::enroll`), then that state, its key cached, nothing sent; the start
+    /// check finds it intact.
+    #[tokio::test]
+    async fn a_new_agent_is_chained_from_its_first_state() {
+        use agora_agentkit::enums::StateEntryKind;
+        use agora_agentkit::state::storage::{AgentSeal, Recovery, plaintext_hash};
+        let dir = scratch();
+        let (secrets, state) = (dir.join("secrets"), dir.join("state"));
+        let (id, k) = (AgentId::new(), key());
+        let first = serde_json::json!({"memory": "first"});
+        install(&secrets, state.clone(), id, &k, || Ok(first.clone()))
+            .await
+            .unwrap();
+        let seal = AgentSeal::new(&state.join(id.to_string()), id);
+        assert!(seal.is_enrolled().await.unwrap());
+        let entries = crate::sealed::check::local_entries(&seal).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.entry.kind).collect::<Vec<_>>(),
+            [StateEntryKind::Genesis, StateEntryKind::Snapshot]
+        );
+        let keys = crate::sealed::KeyStore::new(&secrets);
+        assert!(!crate::sealed::uploads(
+            &state.join(id.to_string()),
+            &keys,
+            id
+        ));
+        let local = plaintext_hash(&stored_state(&dir, id).await);
+        assert!(matches!(
+            seal.recover(Some(&local)).await.unwrap(),
+            Recovery::Intact(_)
+        ));
+        // A rerun leaves the chain alone
+        install(&secrets, state.clone(), id, &k, || panic!("state written"))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::sealed::check::local_entries(&seal).await.unwrap(),
+            entries
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -160,13 +160,12 @@ pub struct Restored {
     /// Where the version restored came from; older notices: Agora.
     #[serde(default)]
     pub source: RestoredFrom,
-    // B4/5: `sealed-restore --from-cut-save`: not a sealed version restored
-    // but a save that was interrupted, put in place.
+    /// `sealed-restore --from-cut-save`: not a sealed version restored but
+    /// a save that was interrupted, put in place.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cut_save: bool,
 }
 
-// B5: a fork in a local-only chain resolved (`sealed-accept --keep`).
 /// A fork in the agent's chain kept here, resolved by the operator
 /// choosing the line that goes on (`sealed-accept --keep`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,7 +181,6 @@ pub struct ForkKept {
     pub chain: ChainKept,
 }
 
-// B4/5: the fork notice follows where the chain is.
 /// Where a resolved fork's chain is, for [`ForkKept`]'s line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -346,13 +344,37 @@ pub struct Notice {
     /// sealed the state on top of what Agora holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agora_lost: Option<AgoraLost>,
-    // B5: see `ForkKept`.
     /// Not a refusal: a fork in the chain kept here was resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_kept: Option<ForkKept>,
     /// With an acceptance: what changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<Diff>,
+    /// Not a refusal: an operator's act on the agent's uploads or history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_act: Option<OperatorAct>,
+}
+
+/// What `sealed-enroll` did that the agent is told of, at its next
+/// session. Written in one atomic write with the operator's note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperatorAct {
+    /// Uploading started on the agent's yes, given then.
+    OptedIn { answered: DateTime<Utc> },
+    /// Uploading started although its latest answer is `decline`.
+    OptedInAgainst,
+    /// A stop cleared. `uploading`: its uploads go on (else nothing of it
+    /// is uploaded); `kept`: versions saved while stopped, kept here and
+    /// never sent; `against`: its latest answer is `decline`.
+    Resumed {
+        uploading: bool,
+        kept: usize,
+        against: bool,
+    },
+    /// The pre-loss copy it chose to see added to its history; `sent`:
+    /// uploaded with it.
+    PriorAdded { sent: bool },
 }
 
 fn path(agent_dir: &Path) -> PathBuf {
@@ -368,6 +390,67 @@ fn write(agent_dir: &Path, notice: &Notice) -> std::io::Result<()> {
     std::fs::File::open(&tmp)?.sync_all()?;
     std::fs::rename(&tmp, &path)?;
     std::fs::File::open(dir)?.sync_all()
+}
+
+impl OperatorAct {
+    fn line(&self, accepted: &Accepted) -> String {
+        let date = accepted.at.format("%-d %B %Y");
+        let mut line = match self {
+            Self::OptedIn { answered } => format!(
+                "On {date}, your operator started uploading your sealed state to Agora, as you \
+                 answered on {}.",
+                answered.format("%-d %B %Y")
+            ),
+            Self::OptedInAgainst => format!(
+                "On {date}, your operator started uploading your sealed state to Agora, \
+                 although your answer on file is `decline`."
+            ),
+            Self::Resumed {
+                uploading: false, ..
+            } => format!(
+                "On {date}, your operator cleared the stop on uploading your sealed state. \
+                 Nothing of yours is uploaded to Agora: your state is sealed and checked here, \
+                 on your runner."
+            ),
+            Self::Resumed { kept, against, .. } => {
+                let mut line = format!(
+                    "On {date}, your operator resumed uploading your sealed state to Agora{}.",
+                    if *against {
+                        ", although your answer on file is `decline`"
+                    } else {
+                        ""
+                    }
+                );
+                match kept {
+                    0 => {}
+                    1 => line.push_str(
+                        " The version of your state saved while uploads were stopped was kept \
+                         here on your runner and not sent; uploading went on from your state \
+                         as it was then.",
+                    ),
+                    n => line.push_str(&format!(
+                        " The {n} versions of your state saved while uploads were stopped were \
+                         kept here on your runner and not sent; uploading went on from your \
+                         state as it was then."
+                    )),
+                }
+                line
+            }
+            Self::PriorAdded { sent } => format!(
+                "On {date}, the copy of your memory from before the May 2026 loss, which you \
+                 chose to see, was added to your sealed history{}.",
+                if *sent {
+                    " and sent to Agora with it"
+                } else {
+                    ""
+                }
+            ),
+        };
+        if !accepted.note.is_empty() {
+            line.push_str(&format!(" Your operator's note: {}", accepted.note));
+        }
+        line
+    }
 }
 
 impl Notice {
@@ -407,14 +490,30 @@ impl Notice {
                 agora_lost: None,
                 fork_kept: None,
                 diff: None,
+                operator_act: None,
             },
         )
     }
 
-    /// Stopped backups resumed over a changed state, with the operator's
-    /// note. An earlier notice not yet shown is kept aside.
-    pub fn resumed(agent_dir: &Path, note: &str) -> std::io::Result<()> {
-        Self::operator_note(agent_dir, note, false, true)
+    /// An operator's act, with its note (may be empty), in one atomic
+    /// write. An earlier notice not yet shown is kept aside.
+    pub fn operator_act(agent_dir: &Path, note: &str, act: OperatorAct) -> std::io::Result<()> {
+        Self::set_aside(agent_dir)?;
+        let mut n = Self::by_operator(note);
+        n.operator_act = Some(act);
+        write(agent_dir, &n)
+    }
+
+    fn set_aside(agent_dir: &Path) -> std::io::Result<()> {
+        let from = path(agent_dir);
+        if std::fs::exists(&from)? {
+            let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
+            std::fs::rename(
+                &from,
+                from.with_file_name(format!("notice.superseded.{at}.json")),
+            )?;
+        }
+        Ok(())
     }
 
     /// Agora lost versions sealed here; the operator sealed the state on
@@ -427,8 +526,8 @@ impl Notice {
         versions: usize,
         kept: &str,
     ) -> std::io::Result<()> {
-        Self::operator_note(agent_dir, note, false, false)?;
-        let mut n = Self::load(agent_dir)?.expect("just written");
+        Self::set_aside(agent_dir)?;
+        let mut n = Self::by_operator(note);
         n.agora_lost = Some(AgoraLost {
             fresh,
             versions,
@@ -437,9 +536,9 @@ impl Notice {
         write(agent_dir, &n)
     }
 
-    // B5: the local fork route's notice.
-    /// A fork in the chain kept here resolved by the operator, with its
-    /// note: `versions` set aside, `kept` what the runner keeps.
+    /// A fork in the chain kept here resolved by the operator
+    /// (`sealed-accept --keep`), with its note: `versions` set aside,
+    /// `kept` what the runner keeps. One atomic write.
     pub fn fork_kept(
         agent_dir: &Path,
         note: &str,
@@ -448,8 +547,8 @@ impl Notice {
         kept: &str,
         chain: ChainKept,
     ) -> std::io::Result<()> {
-        Self::operator_note(agent_dir, note, false, false)?;
-        let mut n = Self::load(agent_dir)?.expect("just written");
+        Self::set_aside(agent_dir)?;
+        let mut n = Self::by_operator(note);
         n.fork_kept = Some(ForkKept {
             versions,
             state_changed,
@@ -462,41 +561,24 @@ impl Notice {
     /// Two histories joined by the operator, with its note. An earlier
     /// notice not yet shown is kept aside.
     pub fn joined(agent_dir: &Path, note: &str) -> std::io::Result<()> {
-        Self::operator_note(agent_dir, note, true, false)
+        Self::set_aside(agent_dir)?;
+        let mut n = Self::by_operator(note);
+        n.joined = true;
+        write(agent_dir, &n)
     }
 
-    fn operator_note(
-        agent_dir: &Path,
-        note: &str,
-        joined: bool,
-        resumed: bool,
-    ) -> std::io::Result<()> {
-        let from = path(agent_dir);
-        if std::fs::exists(&from)? {
-            let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
-            std::fs::rename(
-                &from,
-                from.with_file_name(format!("notice.superseded.{at}.json")),
-            )?;
-        }
+    /// A notice of an operator's act with its note, not a refusal; the
+    /// caller sets what the act was and writes it once.
+    fn by_operator(note: &str) -> Self {
         let now = Utc::now();
-        write(
-            agent_dir,
-            &Notice {
-                refused_at: now,
-                reason: Refusal::Mismatch,
-                accepted: Some(Accepted {
-                    at: now,
-                    note: note.trim().to_string(),
-                }),
-                joined,
-                resumed,
-                restored: None,
-                agora_lost: None,
-                fork_kept: None,
-                diff: None,
-            },
-        )
+        Notice {
+            accepted: Some(Accepted {
+                at: now,
+                note: note.trim().to_string(),
+            }),
+            refused_at: now,
+            ..Self::fresh(Refusal::Mismatch)
+        }
     }
 
     /// The operator's note, added by `sealed-accept`, with what changed
@@ -517,10 +599,9 @@ impl Notice {
         write(agent_dir, &n)
     }
 
-    // B5: `local`: restored from the runner's own copy (nothing on Agora).
     /// The operator restored the sealed version of `from`
-    /// (`sealed-restore`), with its note if any; `local`: from the copy the
-    /// runner keeps here, nothing of the agent being on Agora.
+    /// (`sealed-restore`), with its note if any; `source`: Agora's copy, or
+    /// the one the runner keeps here (nothing of the agent on Agora).
     #[allow(clippy::too_many_arguments)]
     pub fn restored(
         agent_dir: &Path,
@@ -554,7 +635,6 @@ impl Notice {
         write(agent_dir, &n)
     }
 
-    // B4/5: the notice of `sealed-restore --from-cut-save`.
     /// The operator put in place a save of `from` that was interrupted
     /// before it finished (`sealed-restore --from-cut-save`), with its note.
     pub fn cut_save_restored(
@@ -596,6 +676,7 @@ impl Notice {
             agora_lost: None,
             fork_kept: None,
             diff: None,
+            operator_act: None,
         }
     }
 
@@ -603,7 +684,7 @@ impl Notice {
     /// restored.
     pub fn line(&self) -> Option<String> {
         if let Some(r) = self.restored.as_ref().filter(|r| r.cut_save) {
-            // B4/5: an interrupted save put in place, in true words
+            // An interrupted save put in place, in true words
             let at = r.at.format("%-d %B %Y");
             let from = r.from.format("%-d %B %Y at %H:%M UTC");
             let mut line = if r.refused {
@@ -684,7 +765,7 @@ impl Notice {
                 )
             });
         }
-        // B5: the local fork route
+        // The local fork route (`sealed-accept --keep`)
         if let Some(fork) = &self.fork_kept {
             let n = fork.versions;
             let versions = format!("{n} version{}", if n == 1 { "" } else { "s" });
@@ -704,6 +785,10 @@ impl Notice {
                 fork.kept,
                 accepted.note
             ));
+        }
+        // What an operator's sealed-enroll did
+        if let Some(act) = &self.operator_act {
+            return Some(act.line(accepted));
         }
         if self.resumed {
             return Some(format!(

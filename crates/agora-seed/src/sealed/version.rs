@@ -562,6 +562,7 @@ pub async fn drop_acknowledged_blobs(seal: &AgentSeal) {
     }
     for i in seal.outbox().await.unwrap() {
         keep.extend(i.entry.entry.blob.map(|b| b.sha256));
+        keep.extend(i.keyframe_after.as_ref().and_then(|k| k.blob_sha256()));
     }
     for i in seal.sent().await.unwrap() {
         if let Some(b) = i.entry.entry.blob

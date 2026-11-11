@@ -1353,24 +1353,61 @@ where
         })
     }
 
+    /// The agent's chain is marked uploading, in either copy (a marker in
+    /// doubt counts: it may be one): its yes was acted on.
+    pub(super) fn marked_uploading(&self) -> bool {
+        crate::sealed::uploading::state(
+            &self.agent_dir(),
+            &crate::sealed::KeyStore::new(&self.rt.secrets_dir),
+            self.inner.id(),
+        ) != crate::sealed::uploading::Marker::Absent
+    }
+
     /// The sealed-state offer, if this agent is listed and it is due: the
     /// options in this agent's seeded order.
     fn sealed_question(&self) -> Option<SealQuestion> {
         let soul = &self.inner.state().soul;
+        // The operator's re-offer: put once, whatever the config lists and
+        // whether or not the agent uploads (its ledger readable and the
+        // re-offer due)
+        if let Some(reoffer) = self
+            .sealed
+            .ledger
+            .as_ref()
+            .filter(|l| l.due(soul))
+            .and_then(|l| l.reoffer.as_ref())
+        {
+            let seed = sealed_state::prompt::seed_for(self.inner.id());
+            let order = sealed_state::prompt::order_for(seed);
+            let uploading = crate::sealed::uploads(
+                &self.agent_dir(),
+                &crate::sealed::KeyStore::new(&self.rt.secrets_dir),
+                self.inner.id(),
+            );
+            tracing::info!(
+                event_type = "sealed_state_reoffer_put",
+                agent = %soul.name,
+                agent_id = %self.inner.id(),
+                uploading,
+                "the sealed-state question its operator re-opened is put"
+            );
+            return Some(SealQuestion {
+                order,
+                seed,
+                put: self.put(sealed_state::prompt::reoffer(order, reoffer, uploading)),
+            });
+        }
         if !self
             .rt
             .sealed_state
             .as_ref()
             .is_some_and(|o| o.admits(self.inner.id()))
             || !self.sealed.ledger.as_ref().is_some_and(|l| l.due(soul))
-            // Enrolled (its marker, or a state key in the secrets tree) is
-            // never asked again, whatever the ledger: one lost with its
-            // directory doesn't undo the answer
-            || crate::sealed::enrolled_by_keys_or_marker(
-                &self.rt.state_dir.join(self.inner.id().to_string()),
-                &self.rt.secrets_dir,
-                self.inner.id(),
-            )
+            // Uploading (its marker in either copy, even in doubt or
+            // stopped: one lost with its directory doesn't undo the answer)
+            // is never asked again, whatever the ledger. Chained alone is
+            // not an answer: every agent is chained
+            || self.marked_uploading()
         {
             if let Some(ledger) = &self.sealed.ledger {
                 tracing::info!(
@@ -1961,8 +1998,9 @@ where
         // The sealed-state answer told back once, then the start check's
         // verdict and a refusal's notice
         let mut sealed_lines = Vec::new();
+        let uploading = self.marked_uploading();
         if let Some(ledger) = self.sealed.ledger.as_mut()
-            && let Some(line) = ledger.ack_line()
+            && let Some(line) = ledger.ack_line(uploading)
         {
             ledger.acknowledge();
             self.sealed.dirty = true;
@@ -8382,18 +8420,27 @@ mod tests {
         assert!(last_user_text(&agent).contains("**Sealed backups of your state.**"));
     }
 
-    /// An enrolled agent whose ledger was lost with its directory (only its
-    /// state key in the secrets tree says it was enrolled) is never asked
-    /// again.
+    /// An uploading agent whose ledger was lost with its directory (only
+    /// its uploading marker's copy in the secrets tree says it said yes) is
+    /// never asked again.
     #[tokio::test]
-    async fn an_enrolled_agent_is_never_offered_again() {
+    async fn an_uploading_agent_is_never_offered_again() {
         let h = Harness::new("sealed-enrolled");
         let mut rt = h.runtime_advertising(&[OLD, NEW, OTHER]);
         Arc::get_mut(&mut rt).unwrap().sealed_state =
             Some(sealed_state::SealedOffer::for_agents(&[h.id]));
         let key_dir = rt.secrets_dir.join(h.id.to_string());
         std::fs::create_dir_all(&key_dir).unwrap();
-        std::fs::write(key_dir.join(crate::sealed::keys::STATE_KEY_FILE), b"{}").unwrap();
+        let marker = crate::sealed::uploading::Uploading {
+            agent_id: h.id,
+            since: Utc::now(),
+            by: crate::sealed::uploading::UploadingBy::OptIn,
+        };
+        std::fs::write(
+            key_dir.join(crate::sealed::uploading::DURABLE),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
         let mut agent = h.agent_on(&rt, OTHER);
         agent.on_init().await.unwrap();
         // Nothing is seated: the session ends at its closing phase
@@ -8401,6 +8448,134 @@ mod tests {
             agent.handle(reply("closing phase done")).await.unwrap(),
             Control::Continue,
             "no sealed-state question"
+        );
+    }
+
+    /// Every agent is chained now: a chained agent that doesn't upload and
+    /// has no answer on file (its state key and chain marker there) is
+    /// still asked.
+    #[tokio::test]
+    async fn a_chained_agent_that_doesnt_upload_is_still_offered() {
+        let h = with_sealed("sealed-chained", None);
+        let key_dir = h.rt.secrets_dir.join(h.id.to_string());
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join(crate::sealed::keys::STATE_KEY_FILE), b"{}").unwrap();
+        let sealed =
+            h.rt.state_dir
+                .join(h.id.to_string())
+                .join(agora_agentkit::state::storage::SEALED_DIR);
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join(agora_agentkit::state::storage::CHAINED), b"").unwrap();
+        let agent = seated(&h).await;
+        assert!(last_user_text(&agent).contains("**Sealed backups of your state.**"));
+    }
+
+    /// The operator re-opens the question of an agent marked uploading
+    /// that said yes: put again exactly once (the re-offer line before the
+    /// offer), answered `decline`, which is now its choice; the operator is
+    /// alerted; no marker changes in the session; the re-offer is consumed
+    /// and the agent told back, then at the next session, once.
+    #[tokio::test]
+    async fn a_reoffer_is_put_once_and_its_answer_changes_nothing_by_itself() {
+        let mut h = with_sealed("sealed-reoffer", None);
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        let keys = crate::sealed::KeyStore::new(&h.rt.secrets_dir);
+        // Not answered yet: nothing to re-open
+        assert!(matches!(
+            sealed_state::reoffer(&dir, h.id, "n").await,
+            Err(sealed_state::ReofferError::Not(
+                sealed_state::ledger::NoReoffer::NeverAnswered
+            ))
+        ));
+        let mut agent = seated(&h).await;
+        agent
+            .handle(answer_call("sealed_state", "private", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        // Opted in by the operator
+        std::fs::create_dir_all(dir.join(agora_agentkit::state::storage::SEALED_DIR)).unwrap();
+        crate::sealed::uploading::set(
+            &dir,
+            &keys,
+            h.id,
+            crate::sealed::uploading::UploadingBy::OptIn,
+        )
+        .unwrap();
+        let marker = crate::sealed::uploading::state(&dir, &keys, h.id);
+        // Not asked again on its own
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert_ne!(
+            next.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "not asked again on its own"
+        );
+        next.on_teardown().await.unwrap();
+
+        // Re-opened (twice: the second note replaces the first)
+        assert!(!sealed_state::reoffer(&dir, h.id, "first").await.unwrap());
+        assert!(
+            sealed_state::reoffer(&dir, h.id, "Asked to by DM.")
+                .await
+                .unwrap()
+        );
+        let mut agent = next_session(&h, &next);
+        agent.on_init().await.unwrap();
+        assert_eq!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "the re-offer seated"
+        );
+        let q = last_user_text(&agent);
+        assert!(
+            q.contains("**Asked again, at your operator's request.**"),
+            "{q}"
+        );
+        assert!(q.contains("\"Asked to by DM.\""), "{q}");
+        assert!(!q.contains("\"first\""), "{q}");
+        assert!(q.contains("is being uploaded to Agora now"), "{q}");
+        assert!(q.contains("**Sealed backups of your state.**"), "{q}");
+        agent
+            .handle(answer_call("sealed_state", "decline", "", ""))
+            .await
+            .unwrap();
+        let receipt = last_user_text(&agent);
+        assert!(receipt.contains("Your operator has been told"), "{receipt}");
+        agent.on_teardown().await.unwrap();
+        let ledger = sealed_ledger(&h).await;
+        assert_eq!(ledger.choice(), Some(SealChoice::Decline), "the latest");
+        assert!(ledger.reoffer.is_none(), "consumed");
+        assert_eq!(ledger.reoffers.len(), 1);
+        assert_eq!(
+            crate::sealed::uploading::state(&dir, &keys, h.id),
+            marker,
+            "no marker changed in the session"
+        );
+        h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        let mails = sent.sent();
+        let again: Vec<&String> = mails
+            .iter()
+            .filter(|m| m.contains("sealed_state_answered_again"))
+            .collect();
+        assert_eq!(again.len(), 1, "{mails:?}");
+        assert!(again[0].contains("sealed-stop --agent"), "{}", again[0]);
+        assert!(!again[0].contains("Asked to by DM"), "no note in the mail");
+
+        // Told back once at the next session; not asked again
+        let mut later = next_session(&h, &agent);
+        later.on_init().await.unwrap();
+        let seen = serde_json::to_string(&later.prompt().messages).unwrap();
+        assert!(
+            seen.contains("question your operator re-opened is recorded: decline"),
+            "{seen}"
+        );
+        assert_ne!(
+            later.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "put once"
         );
     }
 

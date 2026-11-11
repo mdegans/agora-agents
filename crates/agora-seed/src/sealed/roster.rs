@@ -413,7 +413,6 @@ fn save(data_dir: &Path, roster: &mut Roster) -> Result<(), RosterError> {
 }
 
 /// Record `id`'s head ("higher seq wins"): at enrolment.
-#[allow(dead_code)] // B3: `sealed-enroll` calls it once the chain is marked
 pub async fn record(data_dir: &Path, id: AgentId, head: HeadRef) -> Result<(), RosterError> {
     record_all(data_dir, [(id, head)]).await
 }

@@ -4,7 +4,7 @@
 //! the break. Nothing sealed here is lost doing it.
 //!
 //! `sealed/lost/<utc>/` keeps what is set aside, outside what agentkit's
-//! `prune_blobs` scans (`sealed/blobs/` only), laid out as an agent
+//! `remove_unnamed_blobs` scans (`sealed/blobs/` only), laid out as an agent
 //! directory so agentkit's own `AgentSeal::open_state` opens it:
 //!
 //! - `INTENT`: written before anything moves; renamed `DONE` at the end.

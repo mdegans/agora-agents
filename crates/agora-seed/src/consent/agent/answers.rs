@@ -155,7 +155,22 @@ where
         choice: &str,
         note: NoteFate<'_>,
     ) -> Result<(), Rejection<A::Error>> {
-        let line = receipt(kind.about(), choice, note);
+        self.seat_receipt_with(kind, choice, note, None)
+    }
+
+    /// [`Self::seat_receipt`], with a line of the offer's own after it.
+    fn seat_receipt_with(
+        &mut self,
+        kind: OfferKind,
+        choice: &str,
+        note: NoteFate<'_>,
+        extra: Option<&str>,
+    ) -> Result<(), Rejection<A::Error>> {
+        let mut line = receipt(kind.about(), choice, note);
+        if let Some(extra) = extra {
+            line.push(' ');
+            line.push_str(extra);
+        }
         let (_, prompt) = self.inner.parts();
         Self::seat_user(prompt, Content::from(line)).map_err(Rejection::Error)
     }
@@ -171,6 +186,96 @@ where
             model: model.to_string(),
             response_id: response_id.to_string(),
         });
+    }
+
+    /// The sealed-state answer about to be recorded, when it is not the
+    /// agent's first: to its operator's re-offer, or (defensively) with
+    /// none pending, which the offer's asked-once rule should make
+    /// impossible. Either way the operator is alerted with both answers and
+    /// what would act on the new one, and nothing changes here: no marker
+    /// is set or cleared in a session. The line added to the agent's
+    /// receipt, for a re-offer.
+    pub(super) fn sealed_answered_again(&mut self, choice: SealChoice) -> Option<&'static str> {
+        let ledger = self.sealed.ledger.as_ref()?;
+        let reoffered = ledger.reoffer.is_some();
+        let was = match &ledger.reoffer {
+            Some(r) => r.reopens,
+            None if ledger.unprompted_answer() => ledger.choice()?,
+            None => return None,
+        };
+        let id = self.inner.id();
+        let name = self.inner.state().soul.name.to_string();
+        let dir = self.agent_dir();
+        let keys = crate::sealed::KeyStore::new(&self.rt.secrets_dir);
+        let marked = self.marked_uploading();
+        let stopped = crate::sealed::stop::is_stopped(&dir)
+            || crate::sealed::stop::durable(&keys, id).map_or(true, |d| d.is_some());
+        let yes = choice != SealChoice::Decline;
+        // `publish` against `private` is not the operator's: the agent's own
+        // `config` tool changes it
+        let act = match (yes, marked, stopped) {
+            (true, false, _) => Some(format!("agora-seed sealed-enroll --opt-in --agent {id}")),
+            (true, true, true) => Some(format!("agora-seed sealed-enroll --resume --agent {id}")),
+            (false, true, false) => {
+                Some(format!("agora-seed sealed-stop --agent {id} --note \"…\""))
+            }
+            _ => None,
+        };
+        if reoffered
+            && act.is_none()
+            && let Some(l) = self.sealed.ledger.as_mut()
+        {
+            l.reoffer_needs_no_action();
+        }
+        if reoffered {
+            tracing::warn!(
+                event_type = "sealed_state_reoffer_answered",
+                agent = %name,
+                agent_id = %id,
+                was = was.as_str(),
+                now = choice.as_str(),
+                "an agent answered its operator's re-offer; its operator is alerted to act"
+            );
+        } else {
+            tracing::error!(
+                event_type = "sealed_state_unprompted_answer",
+                agent = %name,
+                agent_id = %id,
+                was = was.as_str(),
+                now = choice.as_str(),
+                "a second sealed-state answer with no re-offer pending; recorded, nothing acts on it"
+            );
+        }
+        self.rt.alerts.notify(
+            Alert::new(
+                AlertKind::SealedStateAnsweredAgain,
+                if reoffered {
+                    "an agent answered the sealed-state question its operator re-opened"
+                } else {
+                    "an agent answered the sealed-state offer a second time with no re-offer: a bug"
+                },
+            )
+            .agent(name, id)
+            .detail("was", was.as_str())
+            .detail("now", choice.as_str())
+            .detail("reoffered", reoffered)
+            .detail(
+                "act",
+                act.as_deref()
+                    .unwrap_or("nothing: its uploads already match the answer"),
+            ),
+        );
+        match (reoffered, act.is_some()) {
+            (false, _) => None,
+            (true, true) => Some(
+                "Your operator has been told, and acts on your answer; you'll be told when it \
+                 has. Nothing changes by this answer alone.",
+            ),
+            (true, false) => Some(
+                "Your uploads already match this answer, so nothing needs to change; your \
+                 operator has been told.",
+            ),
+        }
     }
 
     /// The mail for an API refusal, with no content.
@@ -599,6 +704,25 @@ trait NotedOffer: Offering<Answer = Reply<Self::Choice>> {
     {
         Self::slot(agent).stage(write);
     }
+    /// Before `choice` is recorded over what the ledger holds: a line
+    /// added to the receipt, if any.
+    fn before_record<A>(_agent: &mut ConsentAgent<A>, _choice: Self::Choice) -> Option<&'static str>
+    where
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    {
+        None
+    }
+    /// The SOUL line for `choice` in this agent's case.
+    fn line_for<A>(
+        _agent: &ConsentAgent<A>,
+        choice: Self::Choice,
+        today: chrono::NaiveDate,
+    ) -> String
+    where
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    {
+        Self::line(choice, today)
+    }
 }
 
 impl NotedOffer for OfferQuestion<RestoreChoice, 2> {
@@ -634,6 +758,28 @@ impl NotedOffer for OfferQuestion<SealChoice, 3> {
     }
     fn line(choice: SealChoice, _: chrono::NaiveDate) -> String {
         sealed_state::evolution_line(choice)
+    }
+    fn before_record<A>(agent: &mut ConsentAgent<A>, choice: SealChoice) -> Option<&'static str>
+    where
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    {
+        agent.sealed_answered_again(choice)
+    }
+    /// An answer to the operator's re-offer: its own line, true whichever
+    /// way the uploads stand.
+    fn line_for<A>(agent: &ConsentAgent<A>, choice: SealChoice, today: chrono::NaiveDate) -> String
+    where
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    {
+        match agent
+            .sealed
+            .ledger
+            .as_ref()
+            .and_then(|l| l.reoffer.as_ref())
+        {
+            Some(_) => sealed_state::reanswer_line(choice),
+            None => Self::line(choice, today),
+        }
     }
     fn answered(
         choice: SealChoice,
@@ -699,18 +845,23 @@ where
         Q::stage(
             self,
             Write {
-                edit: Some(Edit::Line(Q::line(choice, Utc::now().date_naive()))),
+                edit: Some(Edit::Line(Q::line_for(
+                    self,
+                    choice,
+                    Utc::now().date_naive(),
+                ))),
                 note: memory_note.clone(),
             },
         );
         let outcome = Q::answered(choice, note, memory_note.is_some(), dropped.clone());
+        let extra = Q::before_record(self, choice);
         self.record_offer(ask, asked, None, outcome);
         let fate = match (&dropped, &memory_note) {
             (Some(why), _) => NoteFate::Dropped(why),
             (None, Some(_)) => NoteFate::Added,
             (None, None) => NoteFate::None,
         };
-        self.seat_receipt(Q::KIND, choice.as_str(), fate)?;
+        self.seat_receipt_with(Q::KIND, choice.as_str(), fate, extra)?;
         Ok(Next::Continue)
     }
 
