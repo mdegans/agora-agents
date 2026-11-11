@@ -37,7 +37,10 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-const STOPPED: &str = "stopped";
+// B4/5: public for the uploading start pass, which sets a forgotten
+// agent's leftover local stop aside.
+/// `sealed/stopped`.
+pub const STOPPED: &str = "stopped";
 /// `<secrets>/<id>/sealed_stopped`: the stop, kept beside the keys too,
 /// so it survives a lost `sealed/` (or state directory) and a restore
 /// leaves the agent stopped. Authoritative when `sealed/stopped` is gone.

@@ -359,6 +359,16 @@ impl Call {
 }
 
 impl Call {
+    // B4: the key-maintenance class, for `rotate-keys` on a stopped agent.
+    /// Key maintenance of a chain already on Agora: a rotation naming its
+    /// head, and a wrap of the state key to the agent's own X25519 key.
+    /// Sends no state and no choice, and without them a stopped agent's
+    /// chain on Agora could not be verified (a rotation) or opened (a
+    /// re-wrap after an X25519 rotation). Passes as a read does.
+    pub fn is_key_maintenance(self) -> bool {
+        matches!(self, Self::RotateKeyAtHead | Self::PostStateKey)
+    }
+
     /// A read of what is already on Agora: sends nothing of the agent's
     /// state or choices. The rest are writes.
     pub fn is_read(self) -> bool {
@@ -434,8 +444,9 @@ impl From<LocalOnly> for BlobError {
 ///
 /// | Call | Passes when |
 /// |---|---|
-/// | **write**: `post_state_key`, `publish_chosen`, `post_anchor`, a `rotate_key` naming a head | the agent uploads ([`UploadGate::may_send`]: marked uploading, not stopped) |
+/// | **write**: `publish_chosen`, `post_anchor` | the agent uploads ([`UploadGate::may_send`]: marked uploading, not stopped) |
 /// | **read**: `chain`, `head`, `head_known`, `state_keys`, `rotations`, `blob`, `proofs` ([`Call::is_read`]) | the agent has ever uploaded ([`UploadGate::may_read`]: a marker naming it in either copy; stopped or in doubt, it can still be restored from, and read back, what is on Agora) |
+/// | **key maintenance**: `post_state_key`, a `rotate_key` naming a head ([`Call::is_key_maintenance`]) | as a read: `rotate-keys` on a stopped agent keeps its chain on Agora verifiable and openable; no state or choice is sent |
 /// | `anchor_data`, `register_encryption_key`, `signer_registered`, a `rotate_key` naming no head | always: the public governance log, and the agent's identity on Agora, which every agent has |
 ///
 /// An agent with no marker in either copy makes no sealed-state call at
@@ -482,7 +493,7 @@ impl<A, E: UploadGate> UploadGuard<A, E> {
 
     /// Whether `call` for `id` may go to Agora.
     pub fn check(&self, id: AgentId, call: Call) -> Result<(), LocalOnly> {
-        let allowed = if call.is_read() {
+        let allowed = if call.is_read() || call.is_key_maintenance() {
             self.enrolment.may_read(id)
         } else {
             self.enrolment.may_send(id)
@@ -1108,12 +1119,15 @@ mod tests {
             ]
         );
 
-        // Uploaded once, stopped (or a marker in doubt): reads only
+        // Uploaded once, stopped (or a marker in doubt): reads, and key
+        // maintenance (a re-wrap, a rotation naming the head)
         guard.calls.lock().unwrap().clear();
         switch.1.store(true, Ordering::SeqCst);
         let reads = [
             "chain",
             "state_keys",
+            "post_state_key",
+            "rotate_key",
             "rotations",
             "blob",
             "proofs",
@@ -1124,7 +1138,7 @@ mod tests {
         assert_eq!(
             *guard.calls.lock().unwrap(),
             reads,
-            "no write reached Agora"
+            "no state or choice reached Agora"
         );
 
         // Uploading: every call goes through

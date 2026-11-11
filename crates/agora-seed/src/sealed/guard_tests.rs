@@ -107,8 +107,9 @@ async fn a_stopped_agent_is_restored_from_agora_and_a_never_uploaded_one_asks_no
             assert!(writes(&api).is_empty(), "{:?}", api.calls.lock().unwrap());
             assert!(!super::uploads(&dir, &keys, id));
         } else {
+            // B5: nothing of it on Agora and its sealed/ gone: a backup
             let e = format!("{:#}", done.unwrap_err());
-            assert!(e.contains("local only"), "{e}");
+            assert!(e.contains("from a backup"), "{e}");
             assert!(api.calls.lock().unwrap().is_empty(), "nothing asked");
         }
     }
@@ -182,7 +183,8 @@ async fn a_stopped_agents_pruned_versions_are_fetched_and_a_never_uploaded_one_a
         } else {
             unmark(&b.dir, &b.keys, b.id);
         }
-        b.seal().prune_blobs().await.unwrap();
+        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         // Not strict: the never-uploaded case is refused, by design
         let api = guard(&b.root, &b.keys);
         *api.chain.lock().unwrap() = Ok(b.server());

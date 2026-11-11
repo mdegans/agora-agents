@@ -7,7 +7,11 @@
 //! `state_key.forgotten.<utc>.json`, the memory-id key
 //! `memory_id_key.forgotten.<utc>.json` (the same `<utc>`, so putting the
 //! agent back restores both together and its memory ids still resolve),
-//! the durable stop (if any) `sealed_stopped.forgotten.<utc>`, and the note
+//! the durable stop (if any) `sealed_stopped.forgotten.<utc>`, the durable
+//! uploading marker (if any) `sealed_uploading.forgotten.<utc>`, under the
+//! marker's lock (whose file stays, as lock files do) (so an
+//! agent put back is not silently uploading again: its secrets copy alone
+//! would read as uploading, with the stop set aside beside it), and the note
 //! is kept beside them as `state_key.forgotten.<utc>.note.json`, naming
 //! what this forget moves. The signing keys stay. A memory-id key set aside
 //! is reused, never minted over, if the agent is ever asked for one again
@@ -52,6 +56,9 @@ struct Forgotten {
     /// Where the durable stop goes, if there was one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stop: Option<String>,
+    /// Where the durable uploading marker goes, if there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uploading: Option<String>,
 }
 
 /// What `sealed-forget` set aside: file names only.
@@ -59,6 +66,8 @@ struct Forgotten {
 pub struct Forgot {
     pub key: String,
     pub stop: Option<String>,
+    /// The durable uploading marker's new name, if the agent had one.
+    pub uploading: Option<String>,
     /// The memory-id key's new name, if the agent had one.
     pub memory_id_key: Option<String>,
     /// The search index was there, and was deleted.
@@ -77,12 +86,19 @@ fn move_aside(dir: &Path, from: &str, to: &str) -> std::io::Result<()> {
 }
 
 /// The moves after the commit, as `plan` names them.
-fn finish(dir: &Path, plan: &Forgotten) -> anyhow::Result<()> {
+fn finish(keys: &KeyStore, id: AgentId, dir: &Path, plan: &Forgotten) -> anyhow::Result<()> {
     if let Some(to) = &plan.memory_id_key {
         move_aside(dir, MEMORY_ID_KEY_FILE, to).context("setting the memory-id key aside")?;
     }
     if let Some(to) = &plan.stop {
         move_aside(dir, super::stop::DURABLE, to).context("setting the stop aside")?;
+    }
+    if let Some(to) = &plan.uploading {
+        // Under the marker's lock, as every writer of it; the lock file
+        // stays, as every lock file does
+        let _lock = super::uploading::lock(keys, id).context("the uploading marker's lock")?;
+        move_aside(dir, super::uploading::DURABLE, to)
+            .context("setting the uploading marker aside")?;
     }
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
@@ -107,7 +123,8 @@ fn cut_forget(dir: &Path) -> anyhow::Result<Option<(String, Forgotten)>> {
         })
     };
     let unfinished = pending(MEMORY_ID_KEY_FILE, &plan.memory_id_key)?
-        || pending(super::stop::DURABLE, &plan.stop)?;
+        || pending(super::stop::DURABLE, &plan.stop)?
+        || pending(super::uploading::DURABLE, &plan.uploading)?;
     Ok(unfinished.then_some((stamp, plan)))
 }
 
@@ -134,7 +151,7 @@ pub fn forget(
         };
         let index = super::history_index::remove(&state_dir.join(id.to_string()))
             .context("deleting the search index")?;
-        finish(&dir, &plan)?;
+        finish(keys, id, &dir, &plan)?;
         tracing::warn!(
             event_type = "sealed_state_forgotten",
             agent_id = %id,
@@ -146,6 +163,7 @@ pub fn forget(
         return Ok(Forgot {
             key: FORGOTTEN_STATE_KEY.name(&stamp),
             stop: plan.stop,
+            uploading: plan.uploading,
             memory_id_key: plan.memory_id_key,
             index,
             finished_cut: true,
@@ -166,7 +184,9 @@ pub fn forget(
         memory_id_key: std::fs::exists(dir.join(MEMORY_ID_KEY_FILE))?
             .then(|| FORGOTTEN_MEMORY_ID_KEY.name(&stamp)),
         stop: std::fs::exists(dir.join(super::stop::DURABLE))?
-            .then(|| format!("{}.forgotten.{stamp}", super::stop::DURABLE)),
+            .then(|| super::keys::FORGOTTEN_STOP.name(&stamp)),
+        uploading: std::fs::exists(dir.join(super::uploading::DURABLE))?
+            .then(|| super::keys::FORGOTTEN_UPLOADING.name(&stamp)),
     };
     // The note first: a key set aside always says why, and what goes with it
     let note_path = dir.join(FORGOTTEN_NOTE.name(&stamp));
@@ -176,7 +196,8 @@ pub fn forget(
     let key_to = FORGOTTEN_STATE_KEY.name(&stamp);
     std::fs::rename(&key, dir.join(&key_to)).context("setting the state key aside")?;
     super::crash::point("forget:committed")?;
-    finish(&dir, &plan)?;
+    // B2/B5: roster::replace(data_dir, id, None) here, once the roster merges
+    finish(keys, id, &dir, &plan)?;
     tracing::warn!(
         event_type = "sealed_state_forgotten",
         agent_id = %id,
@@ -187,6 +208,7 @@ pub fn forget(
     Ok(Forgot {
         key: key_to,
         stop: plan.stop,
+        uploading: plan.uploading,
         memory_id_key: plan.memory_id_key,
         index,
         finished_cut: false,
@@ -358,5 +380,89 @@ mod tests {
         let after = record(&s2);
         assert!(String::from_utf8_lossy(&after[1]).contains("second"));
         assert_eq!(after[3], b"{\"n\":2}");
+    }
+
+    /// An agent uploads (stopped at its request, or not), leaves, and is
+    /// forgotten; then it is put back, its directory with or without its
+    /// old local markers, its state key copied back, and the runner's
+    /// start pass runs (the one-time migration not yet done here, so its
+    /// guard is what holds): neither uploading nor stopped, and no durable
+    /// marker made again. Only an explicit opt-in marks it.
+    #[tokio::test]
+    async fn a_forgotten_uploader_put_back_is_not_uploading_after_the_start_pass() {
+        for stopped in [true, false] {
+            for with_local_markers in [true, false] {
+                let case = format!("stopped {stopped}, local markers {with_local_markers}");
+                let root = crate::sealed::TestDir::new("forget-uploading");
+                let (id, keys, dir) = enrolled(&root).await;
+                crate::sealed::uploading::tests::ledger(&dir, true);
+                let state_dir = root.join("state");
+                // Uploaded: nothing waits
+                let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+                for item in seal.outbox().await.unwrap() {
+                    seal.mark_sent(item.ord).await.unwrap();
+                }
+                if stopped {
+                    crate::sealed::stop::stop(
+                        &state_dir,
+                        &keys,
+                        id,
+                        "It asked",
+                        Box::pin(async { Ok(()) }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let kept = root.join("kept");
+                std::fs::rename(&dir, &kept).unwrap();
+                let done = forget(&state_dir, &keys, id, "it left").unwrap();
+                let secrets = keys.agent_dir(id);
+                assert!(done.uploading.is_some(), "{case}");
+                assert_eq!(done.stop.is_some(), stopped, "{case}");
+                std::fs::rename(&kept, &dir).unwrap();
+                if !with_local_markers {
+                    for m in [
+                        crate::sealed::uploading::UPLOADING,
+                        crate::sealed::stop::STOPPED,
+                    ] {
+                        let _ = std::fs::remove_file(dir.join("sealed").join(m));
+                    }
+                }
+                std::fs::copy(secrets.join(&done.key), secrets.join(STATE_KEY_FILE)).unwrap();
+                crate::sealed::uploading::start_pass(
+                    &state_dir,
+                    &keys,
+                    &crate::alerts::Alerter::off(),
+                )
+                .await;
+                assert!(
+                    !crate::sealed::uploading::is_uploading(&dir, &keys, id),
+                    "{case}"
+                );
+                assert!(!crate::sealed::uploads(&dir, &keys, id), "{case}");
+                assert!(!crate::sealed::stop::is_stopped(&dir), "{case}");
+                for durable in [
+                    crate::sealed::uploading::DURABLE,
+                    crate::sealed::stop::DURABLE,
+                ] {
+                    assert!(!std::fs::exists(secrets.join(durable)).unwrap(), "{case}");
+                }
+                // An explicit opt-in marks it again
+                crate::sealed::uploading::set(
+                    &dir,
+                    &keys,
+                    id,
+                    crate::sealed::uploading::UploadingBy::OptIn,
+                )
+                .unwrap();
+                crate::sealed::uploading::start_pass(
+                    &state_dir,
+                    &keys,
+                    &crate::alerts::Alerter::off(),
+                )
+                .await;
+                assert!(crate::sealed::uploads(&dir, &keys, id), "{case}");
+            }
+        }
     }
 }

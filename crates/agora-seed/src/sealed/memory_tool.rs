@@ -1203,7 +1203,8 @@ mod tests {
             upload_rebased: false,
         })
         .await;
-        b.seal().prune_blobs().await.unwrap();
+        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         *b.api.fail.lock().unwrap() = Some("blob");
         let mut rd = reader(&b.state_dir(), &b.keys, b.id, 4, None);
         let mut cache = HistoryCache::default();
@@ -1253,7 +1254,8 @@ mod tests {
             upload_rebased: false,
         })
         .await;
-        b.seal().prune_blobs().await.unwrap();
+        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         *b.api.blob_delay.lock().unwrap() = Some(std::time::Duration::from_secs(3600));
         let mut rd = reader(&b.state_dir(), &b.keys, b.id, 4, None);
         let out = rd.answer(search("synthetic"), &b.api).await.text;
@@ -1275,7 +1277,8 @@ mod tests {
             upload_rebased: false,
         })
         .await;
-        b.seal().prune_blobs().await.unwrap();
+        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         let mut rd = reader(&b.state_dir(), &b.keys, b.id, 4, None);
         let out = rd.answer(search("synthetic"), &b.api).await.text;
         assert!(out.starts_with(INDEX_BUILT), "{out}");

@@ -38,8 +38,19 @@
 //! so whoever takes it inside the agent's `sealed/lock` or agentkit's
 //! directory lock can't deadlock with them.
 //!
-//! [`migrate_all`]: the one-time migration of agents that uploaded before
-//! the marker existed.
+//! [`migrate_once`]: the one-time migration of agents that uploaded before
+//! the marker existed. **Once per data directory**: the first start pass
+//! that completes it writes `<data_dir>/sealed-uploading-migrated` (when,
+//! how many), and no later pass runs it.
+//!
+//! **A forgotten agent** (`sealed-forget` set its durable copies aside as
+//! `sealed_uploading.forgotten.<utc>` / `sealed_stopped.forgotten.<utc>`)
+//! is not uploading and not stopped when it is put back, until an explicit
+//! opt-in ([`set`]): nothing here makes or restores a marker from evidence
+//! older than the forget. [`migrate`] passes it over, [`finish`] never
+//! completes a local copy from before the forget, and the start pass sets
+//! such leftover local copies (`sealed/uploading`, `sealed/stopped` that
+//! came back with the directory) aside as `<name>.forgotten.<utc>`.
 
 use std::path::{Path, PathBuf};
 
@@ -64,7 +75,7 @@ pub const LOCK: &str = "sealed_uploading.lock";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadingBy {
-    /// [`migrate_all`]: the agent uploaded before the marker existed.
+    /// [`migrate_once`]: the agent uploaded before the marker existed.
     Migration,
     /// The agent's yes to the offer, acted on.
     OptIn,
@@ -105,6 +116,80 @@ fn durable_path(keys: &KeyStore, id: AgentId) -> PathBuf {
     keys.agent_dir(id).join(DURABLE)
 }
 
+/// When `sealed-forget` last set this agent's durable markers aside, if
+/// it ever did: the newest stamp of either kind in its secrets directory.
+pub fn forgotten_at(keys: &KeyStore, id: AgentId) -> Option<DateTime<Utc>> {
+    let dir = keys.agent_dir(id);
+    [
+        super::keys::FORGOTTEN_UPLOADING,
+        super::keys::FORGOTTEN_STOP,
+    ]
+    .iter()
+    .filter_map(|kind| kind.stamps(&dir).ok())
+    .flatten()
+    .filter_map(|s| {
+        chrono::NaiveDateTime::parse_from_str(&s, super::STAMP_FORMAT)
+            .ok()
+            .map(|t| t.and_utc())
+    })
+    .max()
+}
+
+/// A forgotten agent put back with its directory: the local copies of
+/// its markers that predate the forget (and have no durable copy since),
+/// set aside as `sealed/<name>.forgotten.<utc>`, under the marker's lock.
+/// Never deleted. Returns the names set aside.
+pub fn set_aside_forgotten(
+    agent_dir: &Path,
+    keys: &KeyStore,
+    id: AgentId,
+) -> std::io::Result<Vec<&'static str>> {
+    let Some(forgot) = forgotten_at(keys, id) else {
+        return Ok(Vec::new());
+    };
+    let _lock = lock(keys, id)?;
+    let sealed = agent_dir.join(SEALED_DIR);
+    let stamp = Utc::now().format(super::STAMP_FORMAT);
+    let mut moved = Vec::new();
+    // The uploading copy: from before the forget, nothing made since
+    let stale_uploading = !std::fs::exists(durable_path(keys, id))?
+        && match read_copy(&local_path(agent_dir), id) {
+            Copy::Present(u) => u.since <= forgot,
+            Copy::Unreadable(_) => true,
+            Copy::Absent => false,
+        };
+    if stale_uploading {
+        std::fs::rename(
+            local_path(agent_dir),
+            sealed.join(format!("{UPLOADING}.forgotten.{stamp}")),
+        )?;
+        moved.push(UPLOADING);
+    }
+    let stale_stop = !std::fs::exists(keys.agent_dir(id).join(super::stop::DURABLE))?
+        && std::fs::exists(sealed.join(super::stop::STOPPED))?
+        && super::stop::Stopped::load(agent_dir)
+            .ok()
+            .flatten()
+            .is_none_or(|s| s.at <= forgot);
+    if stale_stop {
+        std::fs::rename(
+            sealed.join(super::stop::STOPPED),
+            sealed.join(format!("{}.forgotten.{stamp}", super::stop::STOPPED)),
+        )?;
+        moved.push(super::stop::STOPPED);
+    }
+    if !moved.is_empty() {
+        std::fs::File::open(&sealed)?.sync_all()?;
+        tracing::warn!(
+            event_type = "sealed_state_forgotten_markers_set_aside",
+            agent_id = %id,
+            moved = %moved.join(","),
+            "a forgotten agent came back with its old local markers; set aside, not acted on"
+        );
+    }
+    Ok(moved)
+}
+
 fn read_copy(path: &Path, id: AgentId) -> Copy {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<Uploading>(&bytes) {
@@ -123,7 +208,9 @@ fn read_copy(path: &Path, id: AgentId) -> Copy {
 
 /// The marker's lock, held until the file is dropped. Blocking, briefly:
 /// every holder only reads and writes the two small copies.
-fn lock(keys: &KeyStore, id: AgentId) -> std::io::Result<std::fs::File> {
+// B4/5: public for `sealed-forget`, which sets the secrets copy aside
+// under it.
+pub fn lock(keys: &KeyStore, id: AgentId) -> std::io::Result<std::fs::File> {
     let dir = keys.agent_dir(id);
     std::fs::create_dir_all(&dir)?;
     let file = std::fs::OpenOptions::new()
@@ -290,6 +377,10 @@ fn finish_locked(
     let Copy::Present(u) = read_copy(&local_path(agent_dir), id) else {
         return Ok(None);
     };
+    // A local copy from before a forget is not an opt-in to complete
+    if forgotten_at(keys, id).is_some_and(|f| u.since <= f) {
+        return Ok(None);
+    }
     super::write_private(&durable_path(keys, id), &serde_json::to_vec_pretty(&u)?)?;
     tracing::warn!(
         event_type = "sealed_state_uploading_finished",
@@ -328,6 +419,9 @@ fn all_ids(state_dir: &Path, keys: &KeyStore) -> Vec<AgentId> {
 pub fn reconcile_all(state_dir: &Path, keys: &KeyStore) {
     for id in all_ids(state_dir, keys) {
         let dir = state_dir.join(id.to_string());
+        if let Err(e) = set_aside_forgotten(&dir, keys, id) {
+            tracing::error!(agent_id = %id, error = %e, "a forgotten agent's old local markers couldn't be set aside");
+        }
         if let Err(e) = reconcile(&dir, keys, id) {
             tracing::error!(agent_id = %id, error = %e, "the durable uploading marker couldn't be put back");
         }
@@ -348,9 +442,12 @@ pub enum NotMigrated {
     NeverUploaded,
     /// Its sealed-state ledger doesn't say yes (or can't be read).
     NotOptedIn,
+    /// `sealed-forget` set its markers aside: only an explicit opt-in
+    /// marks it again.
+    Forgotten,
 }
 
-/// One agent of [`migrate_all`]: marked uploading only if it is enrolled,
+/// One agent of [`migrate_once`]: marked uploading only if it is enrolled,
 /// has no marker, has uploaded before (a non-empty `sealed/sent/`) and its
 /// sealed-state ledger says yes. Reads directory entries and the ledger's
 /// answer only; decides and writes under the marker's lock.
@@ -363,6 +460,9 @@ pub fn migrate(
     // Strictly: an enrolment that can't be checked is not migrated
     if !std::fs::exists(sealed.join(CHAINED)).unwrap_or(false) {
         return Ok(Err(NotMigrated::NotEnrolled));
+    }
+    if forgotten_at(keys, id).is_some() {
+        return Ok(Err(NotMigrated::Forgotten));
     }
     let _lock = lock(keys, id)?;
     if state(agent_dir, keys, id) != Marker::Absent {
@@ -397,7 +497,14 @@ pub fn migrate(
 /// does not. So an agent that did upload (enrolled, its ledger yes,
 /// something in `sealed/sent/`) is marked, one `sealed_state_uploading_migrated`
 /// event each; no other agent ever is. The agents marked.
+#[cfg(test)]
 pub fn migrate_all(state_dir: &Path, keys: &KeyStore) -> Vec<AgentId> {
+    migrate_all_counted(state_dir, keys).0
+}
+
+/// The one-time migration over every agent, and how many agents it couldn't decide (an I/O error).
+fn migrate_all_counted(state_dir: &Path, keys: &KeyStore) -> (Vec<AgentId>, usize) {
+    let mut failed = 0;
     let mut migrated = Vec::new();
     for id in all_ids(state_dir, keys) {
         match migrate(&state_dir.join(id.to_string()), keys, id) {
@@ -410,15 +517,63 @@ pub fn migrate_all(state_dir: &Path, keys: &KeyStore) -> Vec<AgentId> {
                 migrated.push(id);
             }
             Ok(Err(_)) => {}
+            Err(e) => {
+                failed += 1;
+                tracing::error!(
+                    event_type = "sealed_state_uploading_migration_failed",
+                    agent_id = %id,
+                    error = %e,
+                    "the uploading migration couldn't be done for an agent; it stays not uploading"
+                )
+            }
+        }
+    }
+    (migrated, failed)
+}
+
+/// `<data_dir>/sealed-uploading-migrated`: the one-time migration ran to
+/// the end here; never again.
+pub const MIGRATED: &str = "sealed-uploading-migrated";
+
+/// The record [`MIGRATED`] holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Migrated {
+    pub at: DateTime<Utc>,
+    /// How many agents it marked.
+    pub migrated: usize,
+}
+
+/// The migration over every agent, once per data directory (`state_dir`'s parent): run
+/// only while [`MIGRATED`] is absent, which a pass that decided every agent
+/// then writes. `None`: already done, nothing run.
+pub fn migrate_once(state_dir: &Path, keys: &KeyStore) -> Option<Vec<AgentId>> {
+    let record = state_dir.parent().unwrap_or(state_dir).join(MIGRATED);
+    // A record that can't be checked: not run (marking is the risky side)
+    if std::fs::exists(&record).unwrap_or(true) {
+        return None;
+    }
+    let (migrated, failed) = migrate_all_counted(state_dir, keys);
+    if failed == 0 {
+        let done = Migrated {
+            at: Utc::now(),
+            migrated: migrated.len(),
+        };
+        match serde_json::to_vec_pretty(&done)
+            .map_err(std::io::Error::other)
+            .and_then(|b| super::write_private(&record, &b))
+        {
+            Ok(()) => tracing::warn!(
+                event_type = "sealed_state_uploading_migration_done",
+                migrated = migrated.len(),
+                "the one-time uploading migration is done for this data directory"
+            ),
             Err(e) => tracing::error!(
-                event_type = "sealed_state_uploading_migration_failed",
-                agent_id = %id,
                 error = %e,
-                "the uploading migration couldn't be done for an agent; it stays not uploading"
+                "the uploading migration's record couldn't be written; it runs again next start"
             ),
         }
     }
-    migrated
+    Some(migrated)
 }
 
 /// The agents whose marker is still in doubt after the repairs, with why.
@@ -482,14 +637,15 @@ pub async fn migrate_markers(state_dir: &Path) -> Vec<AgentId> {
 /// The start's pass over the markers, before states load: the chain's
 /// marker moved to its new name ([`migrate_markers`]), then
 /// [`reconcile_all`] (a lost local copy back, a half-written marker
-/// finished), then [`migrate_all`] (which needs the new name); then any
+/// finished, a forgotten agent's old copies set aside), then
+/// [`migrate_once`] (which needs the new name); then any
 /// agent whose marker is still in doubt is one summary alert
 /// ([`AlertKind::SealedStateUploadingInDoubt`]): a consenting agent
 /// silently not uploading must be seen. The agents in doubt.
 pub async fn start_pass(state_dir: &Path, keys: &KeyStore, alerts: &Alerter) -> Vec<AgentId> {
     migrate_markers(state_dir).await;
     reconcile_all(state_dir, keys);
-    migrate_all(state_dir, keys);
+    migrate_once(state_dir, keys);
     let doubt = in_doubt(state_dir, keys);
     if !doubt.is_empty() {
         let ids: Vec<String> = doubt.iter().map(|(id, _)| id.to_string()).collect();
@@ -927,5 +1083,24 @@ pub mod tests {
                 );
             }
         }
+    }
+
+    /// B4/5: the migration runs once per data directory: an agent that
+    /// would qualify later (its marker lost, `sent/` and a yes ledger) is
+    /// never marked by a later start.
+    #[tokio::test]
+    async fn the_migration_runs_once_per_data_dir() {
+        let root = crate::sealed::TestDir::new("uploading-once");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        let state_dir = root.join("state");
+        assert_eq!(migrate_once(&state_dir, &keys), Some(vec![]));
+        let record: Migrated =
+            serde_json::from_slice(&std::fs::read(root.join(MIGRATED)).unwrap()).unwrap();
+        assert_eq!(record.migrated, 0);
+        sent_one(&dir);
+        ledger(&dir, true);
+        assert_eq!(migrate_once(&state_dir, &keys), None, "never again");
+        start_pass(&state_dir, &keys, &Alerter::off()).await;
+        assert!(!is_uploading(&dir, &keys, id));
     }
 }

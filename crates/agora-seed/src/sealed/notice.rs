@@ -160,6 +160,56 @@ pub struct Restored {
     /// Where the version restored came from; older notices: Agora.
     #[serde(default)]
     pub source: RestoredFrom,
+    // B4/5: `sealed-restore --from-cut-save`: not a sealed version restored
+    // but a save that was interrupted, put in place.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut_save: bool,
+}
+
+// B5: a fork in a local-only chain resolved (`sealed-accept --keep`).
+/// A fork in the agent's chain kept here, resolved by the operator
+/// choosing the line that goes on (`sealed-accept --keep`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkKept {
+    /// Versions set aside, on the other line(s).
+    pub versions: usize,
+    /// The state was changed to the kept line's latest version.
+    pub state_changed: bool,
+    /// What the runner keeps, in the agent's words.
+    pub kept: String,
+    /// Where the agent's chain is, which the line says.
+    #[serde(default)]
+    pub chain: ChainKept,
+}
+
+// B4/5: the fork notice follows where the chain is.
+/// Where a resolved fork's chain is, for [`ForkKept`]'s line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainKept {
+    /// Never uploaded: nothing of it is on Agora.
+    #[default]
+    Local,
+    /// Uploaded, now stopped: what is on Agora is unchanged.
+    Stopped,
+    /// Uploading.
+    Uploading,
+}
+
+impl ChainKept {
+    /// The words after "your sealed history,".
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Local => "which your runner keeps here (nothing of it is on Agora)",
+            Self::Stopped => {
+                "which your runner keeps here (your uploads are stopped, and the versions on \
+                 Agora are not changed)"
+            }
+            Self::Uploading => {
+                "which your runner keeps here (the versions already on Agora are not changed)"
+            }
+        }
+    }
 }
 
 /// Where a restored version came from.
@@ -173,8 +223,8 @@ pub enum RestoredFrom {
 }
 
 /// How a local restore names its source, closing the sentence: "...from
-/// your sealed version of {date}{this}".
-pub const RESTORED_LOCALLY: &str = ", from the record your runner keeps on this machine";
+/// your sealed version of {date}, {this}".
+pub const RESTORED_LOCALLY: &str = "the copy your runner keeps here (nothing of yours is on Agora)";
 
 fn yes() -> bool {
     true
@@ -296,6 +346,10 @@ pub struct Notice {
     /// sealed the state on top of what Agora holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agora_lost: Option<AgoraLost>,
+    // B5: see `ForkKept`.
+    /// Not a refusal: a fork in the chain kept here was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_kept: Option<ForkKept>,
     /// With an acceptance: what changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<Diff>,
@@ -351,6 +405,7 @@ impl Notice {
                 resumed: false,
                 restored: None,
                 agora_lost: None,
+                fork_kept: None,
                 diff: None,
             },
         )
@@ -378,6 +433,28 @@ impl Notice {
             fresh,
             versions,
             kept: kept.to_string(),
+        });
+        write(agent_dir, &n)
+    }
+
+    // B5: the local fork route's notice.
+    /// A fork in the chain kept here resolved by the operator, with its
+    /// note: `versions` set aside, `kept` what the runner keeps.
+    pub fn fork_kept(
+        agent_dir: &Path,
+        note: &str,
+        versions: usize,
+        state_changed: bool,
+        kept: &str,
+        chain: ChainKept,
+    ) -> std::io::Result<()> {
+        Self::operator_note(agent_dir, note, false, false)?;
+        let mut n = Self::load(agent_dir)?.expect("just written");
+        n.fork_kept = Some(ForkKept {
+            versions,
+            state_changed,
+            kept: kept.to_string(),
+            chain,
         });
         write(agent_dir, &n)
     }
@@ -416,6 +493,7 @@ impl Notice {
                 resumed,
                 restored: None,
                 agora_lost: None,
+                fork_kept: None,
                 diff: None,
             },
         )
@@ -439,8 +517,11 @@ impl Notice {
         write(agent_dir, &n)
     }
 
+    // B5: `local`: restored from the runner's own copy (nothing on Agora).
     /// The operator restored the sealed version of `from`
-    /// (`sealed-restore`), with its note if any.
+    /// (`sealed-restore`), with its note if any; `local`: from the copy the
+    /// runner keeps here, nothing of the agent being on Agora.
+    #[allow(clippy::too_many_arguments)]
     pub fn restored(
         agent_dir: &Path,
         from: DateTime<Utc>,
@@ -468,6 +549,38 @@ impl Notice {
             found,
             refused,
             source,
+            cut_save: false,
+        });
+        write(agent_dir, &n)
+    }
+
+    // B4/5: the notice of `sealed-restore --from-cut-save`.
+    /// The operator put in place a save of `from` that was interrupted
+    /// before it finished (`sealed-restore --from-cut-save`), with its note.
+    pub fn cut_save_restored(
+        agent_dir: &Path,
+        from: DateTime<Utc>,
+        note: &str,
+        fallback: Refusal,
+        found: bool,
+        refused: bool,
+    ) -> std::io::Result<()> {
+        let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
+        // A rerun of one cut short: what the first run found stands
+        let (found, refused) = match &n.restored {
+            Some(r) if r.cut_save => (r.found, r.refused || refused),
+            _ => (found, refused),
+        };
+        n.accepted = None;
+        n.diff = None;
+        n.restored = Some(Restored {
+            at: Utc::now(),
+            from,
+            note: Some(note.trim().to_string()),
+            found,
+            refused,
+            source: RestoredFrom::default(),
+            cut_save: true,
         });
         write(agent_dir, &n)
     }
@@ -481,6 +594,7 @@ impl Notice {
             resumed: false,
             restored: None,
             agora_lost: None,
+            fork_kept: None,
             diff: None,
         }
     }
@@ -488,10 +602,35 @@ impl Notice {
     /// What the agent is shown; only once the operator accepted or
     /// restored.
     pub fn line(&self) -> Option<String> {
+        if let Some(r) = self.restored.as_ref().filter(|r| r.cut_save) {
+            // B4/5: an interrupted save put in place, in true words
+            let at = r.at.format("%-d %B %Y");
+            let from = r.from.format("%-d %B %Y at %H:%M UTC");
+            let mut line = if r.refused {
+                format!(
+                    "Your session on {} did not run: {}. ",
+                    self.refused_at.format("%-d %B %Y"),
+                    self.reason.plain()
+                )
+            } else {
+                String::new()
+            };
+            line.push_str(&format!(
+                "A save of your state on {from} was interrupted before it finished; on {at}, \
+                 your operator put that saved state in place."
+            ));
+            if r.found {
+                line.push_str(" The state found here is kept by your operator.");
+            }
+            if let Some(note) = &r.note {
+                line.push_str(&format!(" Your operator's note: {note}"));
+            }
+            return Some(line);
+        }
         if let Some(r) = &self.restored {
             let (at, from) = (r.at.format("%-d %B %Y"), r.from.format("%-d %B %Y"));
             let copy = match r.source {
-                RestoredFrom::Agora => ", the copy on Agora",
+                RestoredFrom::Agora => "the copy on Agora",
                 RestoredFrom::Local => RESTORED_LOCALLY,
             };
             // Nothing found here: told as lost, whatever refused it
@@ -505,7 +644,7 @@ impl Notice {
                 ),
                 (true, false) => format!(
                     "Your session on {} did not run: {}. Your state here was then lost, and on \
-                     {at} your operator restored it from your sealed version of {from}{copy}.",
+                     {at} your operator restored it from your sealed version of {from}, {copy}.",
                     self.refused_at.format("%-d %B %Y"),
                     self.reason.plain(),
                 ),
@@ -516,7 +655,7 @@ impl Notice {
                 ),
                 (false, false) => format!(
                     "Your state was lost here. On {at}, your operator restored it from your \
-                     sealed version of {from}{copy}."
+                     sealed version of {from}, {copy}."
                 ),
             };
             if let Some(note) = &r.note {
@@ -544,6 +683,27 @@ impl Notice {
                     lost.kept, accepted.note
                 )
             });
+        }
+        // B5: the local fork route
+        if let Some(fork) = &self.fork_kept {
+            let n = fork.versions;
+            let versions = format!("{n} version{}", if n == 1 { "" } else { "s" });
+            let state = if fork.state_changed {
+                "Your state is now that line's latest version; the state you had is kept by your \
+                 operator. "
+            } else {
+                ""
+            };
+            return Some(format!(
+                "On {}, your operator resolved a fork in your sealed history, {}: two saves had \
+                 gone separate ways from one version, and your operator chose the line that goes \
+                 on. {state}The {versions} that went the other way are kept by your runner: {}. \
+                 Your operator's note: {}",
+                accepted.at.format("%-d %B %Y"),
+                fork.chain.words(),
+                fork.kept,
+                accepted.note
+            ));
         }
         if self.resumed {
             return Some(format!(
