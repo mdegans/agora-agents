@@ -353,6 +353,42 @@ pub struct Notice {
     /// Not a refusal: an operator's act on the agent's uploads or history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_act: Option<OperatorAct>,
+    /// The agent's last session's state could not be saved: told with
+    /// whatever else the notice says, or alone ([`OperatorAct::Unsaved`]).
+    /// Carried over when another notice supersedes this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsaved: Option<Unsaved>,
+}
+
+/// A session whose state could not be saved (the runner's end-of-run
+/// save failed; `main.rs`). Written once the run gave up on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unsaved {
+    /// When the run gave up on the save.
+    pub at: DateTime<Utc>,
+    /// The runner kept the state in a rescue file (`unsaved.<utc>.json`),
+    /// which only the operator reads.
+    pub kept: bool,
+}
+
+impl Unsaved {
+    /// The one sentence the agent is told.
+    pub fn line(&self) -> String {
+        let date = self.at.format("%-d %B %Y");
+        if self.kept {
+            format!(
+                "Your state from your session on {date} could not be saved; your operator keeps \
+                 a copy of it, and this session starts from your state as it was before that \
+                 session."
+            )
+        } else {
+            format!(
+                "Your state from your session on {date} could not be saved, and no copy of it \
+                 could be kept; this session starts from your state as it was before that \
+                 session."
+            )
+        }
+    }
 }
 
 /// What `sealed-enroll` did that the agent is told of, at its next
@@ -375,6 +411,9 @@ pub enum OperatorAct {
     /// The pre-loss copy it chose to see added to its history; `sent`:
     /// uploaded with it.
     PriorAdded { sent: bool },
+    /// Nothing but [`Notice::unsaved`]: the notice exists only to tell the
+    /// agent its last session's state could not be saved.
+    Unsaved,
 }
 
 fn path(agent_dir: &Path) -> PathBuf {
@@ -431,6 +470,8 @@ impl OperatorAct {
                 }
                 line
             }
+            // `Notice::line` says it, from the notice's `unsaved`
+            Self::Unsaved => return String::new(),
             Self::PriorAdded { sent } => format!(
                 "On {date}, the copy of your memory from before the May 2026 loss, which you \
                  chose to see, was added to your sealed history{}.",
@@ -460,47 +501,70 @@ impl Notice {
     /// Record a refused session. An earlier, unaccepted refusal keeps its
     /// date and reason: the agent hears when it first stopped.
     pub fn refused(agent_dir: &Path, reason: Refusal) -> std::io::Result<()> {
-        match Self::load(agent_dir)? {
+        let carried = match Self::load(agent_dir)? {
             Some(n) if n.accepted.is_none() => return Ok(()),
             // Accepted but not yet shown: kept aside, never overwritten
-            Some(_) => {
-                let from = path(agent_dir);
-                let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
-                std::fs::rename(
-                    &from,
-                    from.with_file_name(format!("notice.superseded.{at}.json")),
-                )?;
+            Some(_) => Self::set_aside(agent_dir)?,
+            None => None,
+        };
+        let mut n = Self::fresh(reason);
+        n.unsaved = carried;
+        write(agent_dir, &n)
+    }
+
+    /// The agent's last session's state could not be saved: added to the
+    /// notice waiting for it (which that session may have seated without
+    /// saving that it did), or written alone. One atomic write.
+    pub fn unsaved(agent_dir: &Path, unsaved: Unsaved) -> std::io::Result<()> {
+        let n = match Self::load(agent_dir)? {
+            Some(mut n) => {
+                n.unsaved = Some(unsaved);
+                n
             }
-            None => {}
-        }
-        write(
-            agent_dir,
-            &Notice {
-                refused_at: Utc::now(),
-                reason,
-                accepted: None,
-                joined: false,
-                resumed: false,
-                restored: None,
-                agora_lost: None,
-                fork_kept: None,
-                diff: None,
-                operator_act: None,
+            None => {
+                let mut n = Self::by_operator("");
+                n.operator_act = Some(OperatorAct::Unsaved);
+                n.unsaved = Some(unsaved);
+                n
+            }
+        };
+        write(agent_dir, &n)
+    }
+
+    /// The notice waiting for the agent, for an operator's act to add to;
+    /// a fresh one (`fallback`) when there is none, or only a notice that
+    /// its last state couldn't be saved (carried into the fresh one).
+    fn load_or(agent_dir: &Path, fallback: Refusal) -> std::io::Result<Self> {
+        Ok(match Self::load(agent_dir)? {
+            Some(n) if n.operator_act == Some(OperatorAct::Unsaved) => Notice {
+                unsaved: n.unsaved,
+                ..Self::fresh(fallback)
             },
-        )
+            Some(n) => n,
+            None => Self::fresh(fallback),
+        })
     }
 
     /// An operator's act, with its note (may be empty), in one atomic
     /// write. An earlier notice not yet shown is kept aside.
     pub fn operator_act(agent_dir: &Path, note: &str, act: OperatorAct) -> std::io::Result<()> {
-        Self::set_aside(agent_dir)?;
+        let carried = Self::set_aside(agent_dir)?;
         let mut n = Self::by_operator(note);
         n.operator_act = Some(act);
+        n.unsaved = carried;
         write(agent_dir, &n)
     }
 
-    fn set_aside(agent_dir: &Path) -> std::io::Result<()> {
+    /// The notice waiting, kept aside as `notice.superseded.<utc>.json`;
+    /// what it says of an unsaved session is returned, for the notice that
+    /// replaces it to carry.
+    fn set_aside(agent_dir: &Path) -> std::io::Result<Option<Unsaved>> {
         let from = path(agent_dir);
+        let carried = match Self::load(agent_dir) {
+            Ok(n) => n.and_then(|n| n.unsaved),
+            // Unreadable: kept aside whole all the same
+            Err(_) => None,
+        };
         if std::fs::exists(&from)? {
             let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
             std::fs::rename(
@@ -508,7 +572,7 @@ impl Notice {
                 from.with_file_name(format!("notice.superseded.{at}.json")),
             )?;
         }
-        Ok(())
+        Ok(carried)
     }
 
     /// Agora lost versions sealed here; the operator sealed the state on
@@ -521,8 +585,9 @@ impl Notice {
         versions: usize,
         kept: &str,
     ) -> std::io::Result<()> {
-        Self::set_aside(agent_dir)?;
+        let carried = Self::set_aside(agent_dir)?;
         let mut n = Self::by_operator(note);
+        n.unsaved = carried;
         n.agora_lost = Some(AgoraLost {
             fresh,
             versions,
@@ -542,8 +607,9 @@ impl Notice {
         kept: &str,
         chain: ChainKept,
     ) -> std::io::Result<()> {
-        Self::set_aside(agent_dir)?;
+        let carried = Self::set_aside(agent_dir)?;
         let mut n = Self::by_operator(note);
+        n.unsaved = carried;
         n.fork_kept = Some(ForkKept {
             versions,
             state_changed,
@@ -556,8 +622,9 @@ impl Notice {
     /// Two histories joined by the operator, with its note. An earlier
     /// notice not yet shown is kept aside.
     pub fn joined(agent_dir: &Path, note: &str) -> std::io::Result<()> {
-        Self::set_aside(agent_dir)?;
+        let carried = Self::set_aside(agent_dir)?;
         let mut n = Self::by_operator(note);
+        n.unsaved = carried;
         n.joined = true;
         write(agent_dir, &n)
     }
@@ -584,7 +651,7 @@ impl Notice {
         fallback: Refusal,
         diff: Option<Diff>,
     ) -> std::io::Result<()> {
-        let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
+        let mut n = Self::load_or(agent_dir, fallback)?;
         n.accepted = Some(Accepted {
             at: Utc::now(),
             note: note.trim().to_string(),
@@ -607,7 +674,7 @@ impl Notice {
         refused: bool,
         source: RestoredFrom,
     ) -> std::io::Result<()> {
-        let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
+        let mut n = Self::load_or(agent_dir, fallback)?;
         // A rerun of a restore cut short: what the first run found stands
         let (found, refused) = match &n.restored {
             Some(r) => (r.found, r.refused || refused),
@@ -640,7 +707,7 @@ impl Notice {
         found: bool,
         refused: bool,
     ) -> std::io::Result<()> {
-        let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
+        let mut n = Self::load_or(agent_dir, fallback)?;
         // A rerun of one cut short: what the first run found stands
         let (found, refused) = match &n.restored {
             Some(r) if r.cut_save => (r.found, r.refused || refused),
@@ -672,12 +739,27 @@ impl Notice {
             fork_kept: None,
             diff: None,
             operator_act: None,
+            unsaved: None,
         }
     }
 
-    /// What the agent is shown; only once the operator accepted or
-    /// restored.
+    /// What the agent is shown: the operator's act (only once the operator
+    /// accepted or restored, for a refusal), then the sentence on a session
+    /// whose state couldn't be saved, if any.
     pub fn line(&self) -> Option<String> {
+        let unsaved = self.unsaved.map(|u| u.line());
+        if self.operator_act == Some(OperatorAct::Unsaved) {
+            return unsaved;
+        }
+        // A refusal not yet resolved says nothing: the agent doesn't run
+        let main = self.main_line()?;
+        Some(match unsaved {
+            Some(u) => format!("{main}\n\n{u}"),
+            None => main,
+        })
+    }
+
+    fn main_line(&self) -> Option<String> {
         if let Some(r) = self.restored.as_ref().filter(|r| r.cut_save) {
             // An interrupted save put in place, in true words
             let at = r.at.format("%-d %B %Y");
@@ -1001,6 +1083,101 @@ mod tests {
                 .count(),
             1,
             "kept, not deleted"
+        );
+    }
+
+    /// A session whose state couldn't be saved: told alone in one
+    /// sentence; added to a notice waiting (not set aside); carried by a
+    /// refusal that supersedes it, and said once the refusal is accepted;
+    /// an accept over it alone is an accept's notice, still saying it.
+    #[test]
+    fn an_unsaved_session_is_told_with_whatever_else_waits() {
+        let at: DateTime<Utc> = "2026-11-11T20:00:00Z".parse().unwrap();
+        let root = crate::sealed::TestDir::new("notice-unsaved");
+        let dir = root.join("alone");
+        Notice::unsaved(&dir, Unsaved { at, kept: true }).unwrap();
+        assert_eq!(
+            Notice::load(&dir).unwrap().unwrap().line().unwrap(),
+            "Your state from your session on 11 November 2026 could not be saved; your operator \
+             keeps a copy of it, and this session starts from your state as it was before that \
+             session."
+        );
+        let lost = root.join("lost");
+        Notice::unsaved(&lost, Unsaved { at, kept: false }).unwrap();
+        assert_eq!(
+            Notice::load(&lost).unwrap().unwrap().line().unwrap(),
+            "Your state from your session on 11 November 2026 could not be saved, and no copy \
+             of it could be kept; this session starts from your state as it was before that \
+             session."
+        );
+
+        // Beside an operator's act the session seated but couldn't save
+        let beside = root.join("beside");
+        Notice::joined(&beside, "Joined by hand.").unwrap();
+        let joined = Notice::load(&beside).unwrap().unwrap().line().unwrap();
+        Notice::unsaved(&beside, Unsaved { at, kept: true }).unwrap();
+        let line = Notice::load(&beside).unwrap().unwrap().line().unwrap();
+        assert!(line.starts_with(&joined), "{line}");
+        assert!(line.ends_with("as it was before that session."), "{line}");
+        assert_eq!(
+            std::fs::read_dir(beside.join(SEALED_DIR)).unwrap().count(),
+            1,
+            "nothing set aside"
+        );
+
+        // A refusal supersedes it, carrying it; said once accepted
+        Notice::refused(&dir, Refusal::Mismatch).unwrap();
+        let refused = Notice::load(&dir).unwrap().unwrap();
+        assert_eq!(refused.unsaved, Some(Unsaved { at, kept: true }));
+        assert!(refused.line().is_none(), "nothing until accepted");
+        Notice::accept(&dir, "Checked.", Refusal::Mismatch, None).unwrap();
+        let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+        assert!(
+            line.contains("Your operator accepted the current state"),
+            "{line}"
+        );
+        assert!(line.ends_with("as it was before that session."), "{line}");
+
+        // An accept over the unsaved notice alone
+        let over = root.join("over");
+        Notice::unsaved(&over, Unsaved { at, kept: true }).unwrap();
+        Notice::accept(&over, "Checked.", Refusal::StateIo, None).unwrap();
+        let n = Notice::load(&over).unwrap().unwrap();
+        assert_eq!(n.reason, Refusal::StateIo);
+        let line = n.line().unwrap();
+        assert!(line.contains("Your operator accepted"), "{line}");
+        assert!(line.ends_with("as it was before that session."), "{line}");
+    }
+
+    /// Seated at the agent's next start check like any notice.
+    #[tokio::test]
+    async fn an_unsaved_notice_is_seated_at_the_next_start() {
+        let root = crate::sealed::TestDir::new("notice-unsaved-seated");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled_local(&root).await;
+        Notice::unsaved(
+            &dir,
+            Unsaved {
+                at: Utc::now(),
+                kept: true,
+            },
+        )
+        .unwrap();
+        let out = crate::sealed::check::check(
+            &dir,
+            id,
+            &crate::sealed::check::tests::local_hash(&root, id).await,
+            Default::default(),
+            &keys,
+            &crate::sealed::api::fake::FakeApi::new(),
+        )
+        .await;
+        let crate::sealed::check::Outcome::Run { seat, notice, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert!(notice);
+        assert!(
+            seat.iter().any(|l| l.contains("could not be saved")),
+            "{seat:?}"
         );
     }
 }

@@ -146,6 +146,9 @@ pub async fn forget(
 ) -> anyhow::Result<Forgot> {
     let note = note.trim();
     anyhow::ensure!(!note.is_empty(), "--note is required: it says why");
+    // B6: the agent's session lock for the whole command, before its state
+    // is looked for (none is made for a directory that is gone)
+    let _session = super::session::agent_lock(state_dir, id)?;
     anyhow::ensure!(
         !std::fs::exists(state_dir.join(id.to_string()).join("state.json"))?,
         "agent {id} has a state here: its backups are stopped with `sealed-stop`, not forgotten"

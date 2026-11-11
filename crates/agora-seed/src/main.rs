@@ -789,8 +789,11 @@ struct Skipped {
     id: AgentId,
     /// Unknown when the state would not load.
     name: Option<String>,
-    /// `load`, `construct`, `sealed` (refused by the sealed-state check) or
-    /// `rotation` (a key rotation unfinished).
+    /// `load`, `construct`, `sealed` (refused by the sealed-state check),
+    /// `rotation` (a key rotation unfinished), or, under its session lock
+    /// ([`claim_sessions`]), `lock` (the lock couldn't be taken), `reload`
+    /// (its state, changed since it was loaded, couldn't be read again) or
+    /// `recheck` (that state's start check didn't let it run).
     stage: &'static str,
     error: String,
 }
@@ -825,6 +828,10 @@ struct LoadedStates<V> {
     /// content.
     sealed: BTreeMap<AgentId, (agora_agentkit::govlog::Sha256Hex, sealed::sizes::Sizes)>,
     skipped: Vec<Skipped>,
+    /// What each agent's files were before they were read: a session is
+    /// given only after they are compared again under its session lock
+    /// ([`claim_sessions`]).
+    seen: BTreeMap<AgentId, sealed::session::Seen>,
 }
 
 /// Load every [`SeedState`] under `<data_dir>/state`, skipping any that
@@ -842,6 +849,16 @@ async fn load_states<S: Storage>(
         .map(AgentId::from)
         .collect();
     ids.sort();
+    // Before the read, so a save by anyone else after it shows
+    let seen = ids
+        .iter()
+        .map(|id| {
+            (
+                *id,
+                sealed::session::Seen::of(&state_dir.join(id.to_string())),
+            )
+        })
+        .collect();
 
     let loaded = storage
         .load_all_raw(ids.into_iter())
@@ -852,6 +869,7 @@ async fn load_states<S: Storage>(
         bases: BTreeMap::new(),
         sealed: BTreeMap::new(),
         skipped: Vec::new(),
+        seen,
     };
     for (id, result) in loaded {
         let loaded = match result {
@@ -906,6 +924,7 @@ fn report_skipped(skipped: &[Skipped], alerts: &alerts::Alerter) {
     let count = |stage| skipped.iter().filter(|s| s.stage == stage).count();
     let (load, construct, sealed) = (count("load"), count("construct"), count("sealed"));
     let rotation = count("rotation");
+    let session = count("lock") + count("reload") + count("recheck");
     tracing::error!(
         event_type = "agents_skipped",
         agents_skipped = skipped.len(),
@@ -913,6 +932,7 @@ fn report_skipped(skipped: &[Skipped], alerts: &alerts::Alerter) {
         construct,
         sealed,
         rotation,
+        session,
         "agents left out of this sweep; see the agent_skipped events"
     );
     if let Some(alert) = skipped_alert(skipped) {
@@ -1424,14 +1444,13 @@ struct Held {
 /// check never sees it. Content is never logged.
 fn rescue_unsaved(
     state_dir: &std::path::Path,
-    report: &agora_agentkit::reactor::Report,
+    unsaved: &BTreeMap<AgentId, serde_json::Value>,
 ) -> Vec<(AgentId, std::io::Result<PathBuf>)> {
     use std::io::Write;
     let at = chrono::Utc::now()
         .format(crate::sealed::STAMP_FORMAT)
         .to_string();
-    report
-        .unsaved
+    unsaved
         .iter()
         .map(|(id, value)| {
             let write = || -> std::io::Result<PathBuf> {
@@ -1461,6 +1480,302 @@ fn rescue_unsaved(
             (*id, write())
         })
         .collect()
+}
+
+/// Why a save failed, as a class for the operator: never content, never
+/// a path.
+trait SaveClass {
+    fn save_class(&self) -> &'static str;
+}
+
+fn io_class(e: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind as K;
+    match e.kind() {
+        K::StorageFull => "disk_full",
+        K::QuotaExceeded => "quota",
+        K::PermissionDenied => "permission_denied",
+        K::ReadOnlyFilesystem => "read_only",
+        K::NotFound => "not_found",
+        K::NotADirectory | K::IsADirectory => "not_a_directory",
+        _ => "io",
+    }
+}
+
+impl SaveClass for agora_agentkit::reactor::storage::FsStorageError {
+    fn save_class(&self) -> &'static str {
+        use agora_agentkit::reactor::storage::FsStorageError as E;
+        match self {
+            E::Io(e) => io_class(e),
+            E::Json(_) => "json",
+            E::NotFound(_) => "not_found",
+            E::Format { .. } => "format",
+            E::Envelope(_) => "envelope",
+            E::Locked(_) => "locked",
+        }
+    }
+}
+
+impl<E: SaveClass> SaveClass for agora_agentkit::state::storage::MirroredError<E> {
+    fn save_class(&self) -> &'static str {
+        use agora_agentkit::state::storage::MirroredError as M;
+        match self {
+            M::Local(e) => e.save_class(),
+            M::Json(_) => "json",
+            M::NotFound(_) => "not_found",
+            M::Seal(_) => "seal",
+        }
+    }
+}
+
+/// Each agent's last failed save, by class: the run's alert
+/// ([`settle_unsaved`]) says why without saying what.
+type SaveFailures = Arc<std::sync::Mutex<BTreeMap<AgentId, &'static str>>>;
+
+/// The runner's persist path: every agent saved on its own. agentkit's
+/// provided `save_all_raw` stops at the first failure, so in a bulk
+/// persist one bad directory made every agent after it in the batch
+/// "unsaved"; here each is tried, the ones that land are reported saved,
+/// and each failure is logged (`state_save_failed`) and kept by class.
+struct Independent<S> {
+    inner: S,
+    failures: SaveFailures,
+}
+
+impl<S> Independent<S> {
+    fn new(inner: S, failures: SaveFailures) -> Self {
+        Self { inner, failures }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> Storage for Independent<S>
+where
+    S: Storage,
+    S::Error: SaveClass,
+{
+    type Error = S::Error;
+    type Version = S::Version;
+
+    async fn save_raw(
+        &mut self,
+        id: AgentId,
+        value: serde_json::Value,
+        base: Option<&Self::Version>,
+    ) -> std::result::Result<Option<Self::Version>, Self::Error> {
+        let saved = self.inner.save_raw(id, value, base).await;
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        match &saved {
+            Ok(_) => failures.remove(&id),
+            Err(e) => failures.insert(id, e.save_class()),
+        };
+        saved
+    }
+
+    async fn load_raw(
+        &self,
+        id: AgentId,
+    ) -> std::result::Result<
+        agora_agentkit::reactor::Loaded<serde_json::Value, Self::Version>,
+        Self::Error,
+    > {
+        self.inner.load_raw(id).await
+    }
+
+    async fn save_all_raw<It>(
+        &mut self,
+        items: It,
+    ) -> std::result::Result<
+        agora_agentkit::reactor::Saved<Self::Version>,
+        agora_agentkit::reactor::SaveError<Self::Error, Self::Version>,
+    >
+    where
+        It: ExactSizeIterator<Item = (AgentId, serde_json::Value, Option<Self::Version>)> + Send,
+    {
+        let mut saved = agora_agentkit::reactor::Saved::<Self::Version>::new();
+        let mut first = None;
+        for (id, value, base) in items {
+            match self.save_raw(id, value, base.as_ref()).await {
+                Ok(new) => {
+                    saved.insert(id, new);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        event_type = "state_save_failed",
+                        agent_id = %id,
+                        class = e.save_class(),
+                        error = %e,
+                        "an agent's state could not be saved; the others are saved on their own"
+                    );
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        match first {
+            None => Ok(saved),
+            Some(inner) => Err(agora_agentkit::reactor::SaveError { saved, inner }),
+        }
+    }
+}
+
+/// How many times a rescue file is tried, and the pause between tries
+/// (a disk that filled may be freed by a log rotation in between).
+const RESCUE_TRIES: u32 = 3;
+const RESCUE_PAUSE: Duration = Duration::from_secs(5);
+
+/// One unsaved session, as the run left it: never its content.
+#[derive(Debug)]
+struct UnsavedAgent {
+    id: AgentId,
+    /// Why its save failed ([`SaveClass`]); `unknown` if no save of it
+    /// was seen failing.
+    class: &'static str,
+    /// The rescue file, or the last error writing one.
+    rescued: std::result::Result<PathBuf, std::io::ErrorKind>,
+}
+
+/// The run's unsaved sessions ([`Report::unsaved`]): each state kept in a
+/// rescue file ([`rescue_unsaved`], tried [`RESCUE_TRIES`] times), each
+/// chained agent told at its next session ([`sealed::notice::Unsaved`]),
+/// one `unsaved_rescued` / `unsaved_rescue_failed` event each, and **one**
+/// summary alert for the run. A state whose rescue file can't be written
+/// is never printed or logged: its sizes and the error are, and it is gone
+/// when the process exits.
+///
+/// [`Report::unsaved`]: agora_agentkit::reactor::Report::unsaved
+async fn settle_unsaved(
+    state_dir: &std::path::Path,
+    unsaved: &BTreeMap<AgentId, serde_json::Value>,
+    failures: &BTreeMap<AgentId, &'static str>,
+    alerts: &alerts::Alerter,
+    pause: Duration,
+) -> Vec<UnsavedAgent> {
+    let mut rescued = rescue_unsaved(state_dir, unsaved);
+    for _ in 1..RESCUE_TRIES {
+        let failed: BTreeMap<AgentId, serde_json::Value> = rescued
+            .iter()
+            .filter(|(_, r)| r.is_err())
+            .filter_map(|(id, _)| Some((*id, unsaved.get(id)?.clone())))
+            .collect();
+        if failed.is_empty() {
+            break;
+        }
+        tokio::time::sleep(pause).await;
+        for (id, again) in rescue_unsaved(state_dir, &failed) {
+            if let Some(slot) = rescued.iter_mut().find(|(a, _)| *a == id) {
+                slot.1 = again;
+            }
+        }
+    }
+    let at = chrono::Utc::now();
+    let mut out = Vec::with_capacity(rescued.len());
+    for (id, result) in rescued {
+        let bytes = unsaved
+            .get(&id)
+            .and_then(|v| serde_json::to_vec(v).ok())
+            .map_or(0, |b| b.len());
+        let class = failures.get(&id).copied().unwrap_or("unknown");
+        match &result {
+            Ok(path) => tracing::error!(
+                event_type = "unsaved_rescued",
+                agent_id = %id,
+                class,
+                bytes,
+                path = %path.display(),
+                "an unsaved session's state was kept in a rescue file"
+            ),
+            Err(e) => tracing::error!(
+                event_type = "unsaved_rescue_failed",
+                agent_id = %id,
+                class,
+                bytes,
+                error_kind = ?e.kind(),
+                tries = RESCUE_TRIES,
+                "an unsaved session's state could not be written to a rescue file; it is not \
+                 printed, and is gone when the run exits"
+            ),
+        }
+        let kept = result.is_ok();
+        // Told at its next session, where notices are seated: the start
+        // check of a chained agent (every agent once the fleet is enrolled)
+        let dir = state_dir.join(id.to_string());
+        if sealed::is_enrolled(&dir) {
+            match sealed::notice::Notice::unsaved(&dir, sealed::notice::Unsaved { at, kept }) {
+                Ok(()) => tracing::info!(
+                    event_type = "unsaved_told",
+                    agent_id = %id,
+                    kept,
+                    "the agent will be told its last session's state couldn't be saved"
+                ),
+                Err(e) => tracing::error!(
+                    event_type = "unsaved_notice_failed",
+                    agent_id = %id,
+                    error = %e,
+                    "the notice of an unsaved session couldn't be written; the agent isn't told"
+                ),
+            }
+        }
+        out.push(UnsavedAgent {
+            id,
+            class,
+            rescued: result.map_err(|e| e.kind()),
+        });
+    }
+    if let Some(alert) = unsaved_alert(&out) {
+        alerts.notify(alert);
+    }
+    out
+}
+
+/// The run's one alert for its unsaved sessions: the count, the agents
+/// (the first [`SKIPPED_ALERT_LIST`]), the reason classes and how many
+/// were kept; never content.
+fn unsaved_alert(unsaved: &[UnsavedAgent]) -> Option<alerts::Alert> {
+    if unsaved.is_empty() {
+        return None;
+    }
+    let kept = unsaved.iter().filter(|u| u.rescued.is_ok()).count();
+    let mut classes: BTreeMap<&str, usize> = BTreeMap::new();
+    for u in unsaved {
+        *classes.entry(u.class).or_default() += 1;
+    }
+    let ids: Vec<String> = unsaved
+        .iter()
+        .take(SKIPPED_ALERT_LIST)
+        .map(|u| u.id.to_string())
+        .collect();
+    let mut alert = alerts::Alert::new(
+        alerts::AlertKind::StateUnsaved,
+        format!(
+            "{} agent(s)' session state could not be saved; {kept} kept in rescue files{}",
+            unsaved.len(),
+            match unsaved.len() - kept {
+                0 => String::new(),
+                lost => format!(", {lost} could not be kept"),
+            }
+        ),
+    )
+    .count(unsaved.len())
+    .detail("agents", ids.join(", "))
+    .detail(
+        "reasons",
+        classes
+            .iter()
+            .map(|(c, n)| format!("{c}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+    .detail("rescued", kept)
+    .detail("rescue_failed", unsaved.len() - kept);
+    if unsaved.len() > SKIPPED_ALERT_LIST {
+        alert = alert.detail(
+            "more",
+            format!(
+                "{} more; each is an unsaved_rescued or unsaved_rescue_failed event",
+                unsaved.len() - SKIPPED_ALERT_LIST
+            ),
+        );
+    }
+    Some(alert)
 }
 
 /// A reactor's outcome for the terminal: counts, ids, error kinds and
@@ -2358,6 +2673,305 @@ async fn reloaded(
     ))
 }
 
+/// What [`claim_sessions`] left: the session locks held, to the end of the
+/// run, and what it left out.
+#[derive(Debug, Default)]
+struct Claimed {
+    locks: BTreeMap<AgentId, sealed::session::SessionLock>,
+    /// Held by another process: left for this sweep, still due.
+    busy: usize,
+    /// Past what the open-file limit allows: left for this sweep, still due.
+    deferred: usize,
+    /// Changed on disk since this run loaded them: read again and checked.
+    reloaded: usize,
+}
+
+/// What [`claim_sessions`] reads an agent with again.
+struct Reload<'a, S> {
+    state_dir: &'a std::path::Path,
+    /// The run's sealed storage (a load finishes a commit a crash cut short)
+    storage: &'a S,
+    keys: &'a sealed::KeyStore,
+    api: &'a dyn sealed::api::SealedApi,
+    start: Option<sealed::check::StartAnchors<'a>>,
+}
+
+/// Claim each routed agent's session ([`sealed::session::claim`]), in
+/// routing order, before any reactor is built: an agent another process
+/// holds is left out (one `agent_busy` event each, counted, no alert; it
+/// stays due), and one this process can't hold a descriptor for
+/// ([`sealed::session::fd_room`]) is left for a later sweep, with one
+/// alert. Under its lock, an agent whose `state.json` or sealed head
+/// changed since it was loaded (another process ran it in between) is read
+/// again and its start check run again ([`reload_one`]): a session starts
+/// from the newest state, never a stale copy.
+#[allow(clippy::too_many_arguments)]
+async fn claim_sessions<S>(
+    cohorts: &mut [BTreeMap<String, Vec<(AgentId, SeedState)>>],
+    seen: &BTreeMap<AgentId, sealed::session::Seen>,
+    room: Option<usize>,
+    reload: &Reload<'_, S>,
+    sealed_run: &mut SealedRun,
+    bases: &mut BTreeMap<AgentId, S::Version>,
+    skipped: &mut Vec<Skipped>,
+    alerts: &alerts::Alerter,
+) -> Claimed
+where
+    S: Storage,
+{
+    let mut claimed = Claimed::default();
+    let mut deferred_ids: Vec<AgentId> = Vec::new();
+    for cohort in cohorts.iter_mut() {
+        for agents in cohort.values_mut() {
+            for (id, state) in std::mem::take(agents) {
+                if room.is_some_and(|room| claimed.locks.len() >= room) {
+                    claimed.deferred += 1;
+                    deferred_ids.push(id);
+                    continue;
+                }
+                let name = state.soul.name.to_string();
+                let lock = match sealed::session::claim(reload.state_dir, id) {
+                    Ok(sealed::session::Claim::Run(lock)) => lock,
+                    Ok(sealed::session::Claim::Busy) => {
+                        claimed.busy += 1;
+                        tracing::warn!(
+                            event_type = "agent_busy",
+                            agent_id = %id,
+                            agent = %name,
+                            "another process holds the agent's session lock; left for this sweep, \
+                             still due"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        skipped.push(Skipped::new(id, Some(name), "lock", e.to_string()));
+                        continue;
+                    }
+                };
+                let now = sealed::session::Seen::of(&reload.state_dir.join(id.to_string()));
+                let state = if seen.get(&id) == Some(&now) {
+                    state
+                } else {
+                    match reload_one(id, state, reload, sealed_run, bases, skipped).await {
+                        Some(state) => {
+                            claimed.reloaded += 1;
+                            state
+                        }
+                        // Its lock is released here
+                        None => continue,
+                    }
+                };
+                claimed.locks.insert(id, lock);
+                agents.push((id, state));
+            }
+        }
+    }
+    if claimed.deferred > 0 {
+        let first: Vec<String> = deferred_ids
+            .iter()
+            .take(SKIPPED_ALERT_LIST)
+            .map(ToString::to_string)
+            .collect();
+        tracing::error!(
+            event_type = "session_locks_capped",
+            claimed = claimed.locks.len(),
+            deferred = claimed.deferred,
+            room = room.unwrap_or_default(),
+            first = %first.join(","),
+            "the open-file limit leaves too few descriptors for a session lock per routed agent; \
+             the rest stay due"
+        );
+        alerts.notify(
+            alerts::Alert::new(
+                alerts::AlertKind::SessionLocksCapped,
+                format!(
+                    "{} routed agent(s) left for a later sweep: the open-file limit allows {} \
+                     session locks",
+                    claimed.deferred,
+                    claimed.locks.len()
+                ),
+            )
+            .count(claimed.deferred)
+            .detail("claimed", claimed.locks.len())
+            .detail("first", first.join(", ")),
+        );
+    }
+    claimed
+}
+
+/// `id`'s state read again under its session lock, because it changed
+/// since this run loaded it, and (chained) its start check run again on
+/// it, without the roster's vouch (in full). `None` leaves it out of this
+/// sweep: unreadable (`reload`), its model changed elsewhere, or its check
+/// didn't let it run (`recheck`: nothing marked here; the next start judges
+/// it in full, with the run's refusal rule). Its seat, hold and base are
+/// replaced with the new ones.
+async fn reload_one<S: Storage>(
+    id: AgentId,
+    routed: SeedState,
+    reload: &Reload<'_, S>,
+    sealed_run: &mut SealedRun,
+    bases: &mut BTreeMap<AgentId, S::Version>,
+    skipped: &mut Vec<Skipped>,
+) -> Option<SeedState> {
+    let dir = reload.state_dir.join(id.to_string());
+    let name = routed.soul.name.to_string();
+    let forget = |run: &mut SealedRun| {
+        run.seats.remove(&id);
+        run.drained.retain(|(a, _)| *a != id);
+        run.held.retain(|a| *a != id);
+    };
+    let agora_agentkit::reactor::Loaded { value, base } = match reload.storage.load_raw(id).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            forget(sealed_run);
+            skipped.push(Skipped::new(id, Some(name), "reload", e.to_string()));
+            return None;
+        }
+    };
+    let hash = agora_agentkit::state::storage::plaintext_hash(&value);
+    let sizes = sealed::sizes::Sizes::of(&value);
+    let mut state = match serde_json::from_value::<SeedState>(value) {
+        Ok(state) => state,
+        Err(e) => {
+            forget(sealed_run);
+            skipped.push(Skipped::new(id, Some(name), "reload", e.to_string()));
+            return None;
+        }
+    };
+    if state.model.id != routed.model.id {
+        forget(sealed_run);
+        skipped.push(Skipped::new(
+            id,
+            Some(name),
+            "reload",
+            "its model changed in another process since it was loaded; routed again next sweep"
+                .to_string(),
+        ));
+        return None;
+    }
+    // The endpoint's offered ModelInfo, as routing set it (same id)
+    state.model = routed.model;
+    if sealed::is_enrolled(&dir) {
+        let (outcome, _) = sealed::check::check_vouched(
+            &dir,
+            id,
+            &hash,
+            sizes,
+            reload.keys,
+            reload.api,
+            reload.start.as_ref(),
+            None,
+        )
+        .await;
+        let not_run = match outcome {
+            sealed::check::Outcome::Refuse { reason, .. } => Some(reason.as_str()),
+            sealed::check::Outcome::ServerFault { .. } => Some("server_fault"),
+            sealed::check::Outcome::Run {
+                seat, notice, hold, ..
+            } => {
+                // The stop's line first, as at the start
+                let stop = sealed::stop::is_stopped(&dir)
+                    .then(|| sealed::stop::Stopped::load(&dir).ok().flatten())
+                    .flatten();
+                let (lines, stop_note) = match stop {
+                    Some(stopped) => (
+                        std::iter::once(stopped.line()).chain(seat).collect(),
+                        !stopped.shown,
+                    ),
+                    None => (seat, false),
+                };
+                sealed_run.seats.insert(
+                    id,
+                    consent::SealedSeat {
+                        lines,
+                        notice,
+                        stop_note,
+                        anchors_told: Vec::new(),
+                    },
+                );
+                sealed_run.held.retain(|a| *a != id);
+                if hold.is_some() {
+                    sealed_run.held.push(id);
+                }
+                if !sealed_run.drained.iter().any(|(a, _)| *a == id) {
+                    sealed_run.drained.push((id, name.clone()));
+                }
+                None
+            }
+        };
+        if let Some(outcome) = not_run {
+            tracing::error!(
+                event_type = "session_recheck_not_run",
+                agent_id = %id,
+                agent = %name,
+                outcome,
+                "the agent's state changed since it was loaded, and its start check on the new \
+                 state didn't let it run; left out of this sweep, nothing marked: the next start \
+                 judges it in full"
+            );
+            forget(sealed_run);
+            skipped.push(Skipped::new(
+                id,
+                Some(name),
+                "recheck",
+                format!("its changed state's start check: {outcome}"),
+            ));
+            return None;
+        }
+    }
+    match base {
+        Some(base) => bases.insert(id, base),
+        None => bases.remove(&id),
+    };
+    tracing::info!(
+        event_type = "session_state_reloaded",
+        agent_id = %id,
+        agent = %name,
+        "the agent's state changed on disk since this run loaded it: read again, and checked, \
+         under its session lock"
+    );
+    Some(state)
+}
+
+/// A dry run skips the start pass that moves the pre-0.158 chain marker
+/// (`sealed/enrolled` → `sealed/chained`), so an agent still carrying it
+/// reads as not enrolled in its report: say how many, so the report isn't
+/// silently wrong. Reads markers' existence only.
+async fn say_legacy_markers(state_dir: &std::path::Path) {
+    let n = legacy_markers(state_dir).await;
+    if n > 0 {
+        say!(
+            "sealed: {n} agents still carry the pre-0.158 chain marker (sealed/enrolled); a dry \
+             run doesn't move it, so they count as not enrolled above. The first real start \
+             moves it"
+        );
+    }
+}
+
+/// How many agent directories under `state_dir` hold the pre-0.158 marker.
+async fn legacy_markers(state_dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return 0;
+    };
+    let mut n = 0;
+    for entry in entries.flatten() {
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<uuid::Uuid>().ok())
+            .map(AgentId::from)
+        else {
+            continue;
+        };
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&entry.path(), id);
+        if seal.has_legacy_marker().await.unwrap_or(false) {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// `agora-seed <sealed command>`: the data dir, server and
 /// `[memory_restore]` from the flags and `--config`, as for a run.
 async fn run_sealed_command(
@@ -2526,7 +3140,9 @@ async fn run(held: &mut Held) -> Result<()> {
     //  1. `promote`: a save cut between its archive and its rename put in
     //     place, only while no other runner shares the data dir (it takes
     //     runner.lock exclusive, not waiting, so it comes before the shared
-    //     hold); it reads no marker, only state.json and its tmp;
+    //     hold), under each agent's session lock, `sealed/lock` and
+    //     directory lock; it reads the chain's markers' existence, and for
+    //     a chained agent the outbox items that are its evidence;
     //  2. runner.lock, shared (the operator's commands take it exclusive);
     //  3. `uploading::start_pass`: the chain's marker moved to its new name
     //     first (before anything reads it), a lost or half-written uploading
@@ -2540,13 +3156,18 @@ async fn run(held: &mut Held) -> Result<()> {
     //     pair finished or a chosen copy appended for agents the roster
     //     didn't refuse, then each agent checked;
     //  8. the refusal rule (`refuse_run`);
-    //  9. reactors built.
+    //  9. routing, then each routed agent's session lock (`claim_sessions`:
+    //     an agent another process holds is left due; one changed on disk
+    //     since 5 is read again and checked again under its lock);
+    // 10. reactors built, every agent saved on its own (`Independent`);
+    //     after the run, unsaved sessions rescued and told
+    //     (`settle_unsaved`), and only then the session locks released.
     // A dry run or a listing reads only: no lock, no writes
     if !args.dry_run && !args.list_models {
         // A save cut between its archive and its rename, while no other
         // runner shares the data dir (exclusive, not waiting): before the
         // shared hold, and before any state loads
-        promote::promote_if_alone(&data_dir);
+        promote::promote_if_alone(&data_dir).await;
         held.runner_lock = Some(sealed::session::runner_shared(&data_dir)?);
     }
     if args.test_alert {
@@ -2768,6 +3389,7 @@ async fn run(held: &mut Held) -> Result<()> {
             bases: BTreeMap::new(),
             sealed: plain.sealed,
             skipped: plain.skipped,
+            seen: plain.seen,
         }
     } else {
         let storage = sealed::storage(&state_dir, outbox.clone(), enrolment.clone());
@@ -2775,9 +3397,10 @@ async fn run(held: &mut Held) -> Result<()> {
     };
     let LoadedStates {
         states: mut pool,
-        bases,
+        mut bases,
         sealed: enrolled,
         mut skipped,
+        seen,
     } = loaded;
     // An agent mid-rotation (`secrets.next.json`) is left out, unrefused:
     // its keys and the server's may disagree until `rotate-keys` finishes
@@ -2813,7 +3436,7 @@ async fn run(held: &mut Held) -> Result<()> {
     });
     // The sealed-state start check, for enrolled agents: before anyone is
     // built, so a refused agent is never run, saved or sealed.
-    let sealed_run = sealed_start_check(
+    let mut sealed_run = sealed_start_check(
         &mut pool,
         &enrolled,
         &data_dir,
@@ -2885,7 +3508,7 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     let cadence_plan =
         consent::cadence::CadencePlan::load(cadence_offer.as_ref(), &pool, &data_dir.join("state"));
-    let routing = route(
+    let mut routing = route(
         pool,
         &config.reactors,
         &offered,
@@ -2896,6 +3519,46 @@ async fn run(held: &mut Held) -> Result<()> {
         &cadence_plan,
         !args.agents.is_empty() || config.force,
     );
+    // Each routed agent's session lock, before anything is built for it,
+    // held until the run has saved (or rescued) its state and told it what
+    // it must be told: dropped at the end of `run`, or by the kernel at any
+    // exit. A dry run claims nothing
+    let mut claimed = Claimed::default();
+    if !args.dry_run {
+        let storage = sealed::storage(&state_dir, outbox.clone(), enrolment.clone());
+        let reload = Reload {
+            state_dir: &state_dir,
+            storage: &storage,
+            keys: enrolment.keys_store(),
+            api: sealed_api.as_ref(),
+            start: Some(sealed::check::StartAnchors {
+                verified: &verified_anchors,
+                alerted: held.alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
+            }),
+        };
+        claimed = claim_sessions(
+            &mut routing.cohorts,
+            &seen,
+            sealed::session::fd_room(),
+            &reload,
+            &mut sealed_run,
+            &mut bases,
+            &mut skipped,
+            &held.alerts,
+        )
+        .await;
+        tracing::info!(
+            event_type = "sessions_claimed",
+            claimed = claimed.locks.len(),
+            busy = claimed.busy,
+            deferred = claimed.deferred,
+            reloaded = claimed.reloaded,
+            "session locks taken for the routed agents"
+        );
+    } else {
+        say_legacy_markers(&state_dir).await;
+    }
+    let mut session_locks = claimed.locks;
 
     // The plan, before anyone runs.
     for (spec, cohort) in config.reactors.iter().zip(&routing.cohorts) {
@@ -2918,6 +3581,18 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     if routing.not_due > 0 {
         say!("not due: {} agents inside min_cycle_secs", routing.not_due);
+    }
+    if claimed.busy > 0 {
+        say!(
+            "busy: {} agents held by another process (a session there); left for this sweep",
+            claimed.busy
+        );
+    }
+    if claimed.deferred > 0 {
+        say!(
+            "deferred: {} agents past the open-file limit's room for session locks",
+            claimed.deferred
+        );
     }
     if !sleepers.asleep.is_empty() {
         say!(
@@ -3000,6 +3675,7 @@ async fn run(held: &mut Held) -> Result<()> {
     let mut labels: BTreeMap<ReactorId, String> = BTreeMap::new();
     // Raised by `SIGINT` and `SIGTERM` once the run starts (`signals`)
     let stop = Stop::new();
+    let save_failures = SaveFailures::default();
     let mut total = 0usize;
     for (idx, (spec, (inference, cohort))) in config
         .reactors
@@ -3037,6 +3713,10 @@ async fn run(held: &mut Held) -> Result<()> {
             }
         };
         if let Some(limit) = spec.limit {
+            // Those cut are not run: their session locks go now
+            for (id, _) in ordered.iter().skip(limit) {
+                session_locks.remove(id);
+            }
             ordered.truncate(limit);
         }
         // One driver answers for one agent: a second agent's session would
@@ -3109,12 +3789,15 @@ async fn run(held: &mut Held) -> Result<()> {
             let name = state.soul.name.clone();
             match agora_agentkit::reactor::Agent::new(id, state, agent_context) {
                 Ok(agent) => agents.push(agent),
-                Err(e) => skipped.push(Skipped::new(
-                    id,
-                    Some(name.to_string()),
-                    "construct",
-                    e.to_string(),
-                )),
+                Err(e) => {
+                    session_locks.remove(&id);
+                    skipped.push(Skipped::new(
+                        id,
+                        Some(name.to_string()),
+                        "construct",
+                        e.to_string(),
+                    ))
+                }
             }
         }
         total += agents.len();
@@ -3130,7 +3813,11 @@ async fn run(held: &mut Held) -> Result<()> {
                 Some((id, *bases.get(&id)?))
             })
             .collect();
-        let storage = sealed::storage(&state_dir, outbox.clone(), enrolment.clone());
+        // Each agent saved on its own, failures kept by class
+        let storage = Independent::new(
+            sealed::storage(&state_dir, outbox.clone(), enrolment.clone()),
+            save_failures.clone(),
+        );
         let mut reactor: Reactor<_, _, SeedRunAgent> = Reactor::new(inference, storage, agents)
             .with_bases(cohort_bases)
             .with_stop(stop.clone());
@@ -3245,39 +3932,26 @@ async fn run(held: &mut Held) -> Result<()> {
         consent::memory_restore::reopen_unsaved(&data_dir.join("state"), unsaved, run_started)
             .await;
     }
+    // A session whose save failed lives only in the report: kept in a
+    // rescue file beside its state, never loaded by anything, and never
+    // printed; the agent told; one alert for the run. Under the agents'
+    // session locks, still held
+    let unsaved: BTreeMap<AgentId, serde_json::Value> = report
+        .report
+        .values()
+        .flatten()
+        .flat_map(|r| r.unsaved.iter().map(|(id, v)| (*id, v.clone())))
+        .collect();
+    if !unsaved.is_empty() {
+        let failures = save_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        settle_unsaved(&state_dir, &unsaved, &failures, &held.alerts, RESCUE_PAUSE).await;
+    }
+    drop(unsaved);
     for (id, result) in &report.report {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
-        // A session whose save failed lives only in the report: kept in a
-        // rescue file beside its state, never loaded by anything
-        if let Ok(r) = result {
-            for (agent, rescued) in rescue_unsaved(&state_dir, r) {
-                match rescued {
-                    Ok(path) => tracing::error!(
-                        event_type = "unsaved_rescued",
-                        agent_id = %agent,
-                        path = %path.display(),
-                        "an unsaved session's state was kept in a rescue file"
-                    ),
-                    Err(e) => {
-                        tracing::error!(
-                            event_type = "unsaved_rescue_failed",
-                            agent_id = %agent,
-                            error_kind = ?e.kind(),
-                            "an unsaved session's state could not be written to a rescue file"
-                        );
-                        // The last resort, for this agent only: without it
-                        // the session is lost, so its state goes to stdout
-                        // as it always did before rescue files
-                        if let Some(value) = r.unsaved.get(&agent) {
-                            say!(
-                                "unsaved {agent} (rescue file failed): {}",
-                                serde_json::to_string_pretty(value).unwrap_or_default()
-                            );
-                        }
-                    }
-                }
-            }
-        }
         if bridge.is_none() {
             say!("== {label}");
             say!("{}", report_summary(result));
@@ -3322,6 +3996,9 @@ async fn run(held: &mut Held) -> Result<()> {
         "run finished"
     );
     held.stopped = stop.draining();
+    // Every agent's state is saved, rescued or told by now: its session
+    // lock goes
+    drop(session_locks);
     // Rejections mean routing and negotiation disagree — that's a bug.
     let rejected: Vec<_> = report.rejected().collect();
     if !rejected.is_empty() {
@@ -3392,7 +4069,7 @@ mod tests {
         let r: agora_agentkit::reactor::Report =
             serde_json::from_value(serde_json::json!({ "done": 0, "failed": 1, "errors": {}, "unsaved": { id.to_string(): state } }))
                 .unwrap();
-        let rescued = rescue_unsaved(&root, &r);
+        let rescued = rescue_unsaved(&root, &r.unsaved);
         assert_eq!(rescued.len(), 1);
         let path = rescued[0].1.as_ref().unwrap();
         assert!(
@@ -3417,7 +4094,7 @@ mod tests {
         // A directory that can't be written: the error comes back
         let blocked = sealed::TestDir::new("main-rescue-blocked");
         std::fs::write(blocked.join(id.to_string()), b"a file").unwrap();
-        assert!(rescue_unsaved(&blocked, &r)[0].1.is_err());
+        assert!(rescue_unsaved(&blocked, &r.unsaved)[0].1.is_err());
     }
 
     /// The terminal's run summary never carries state content.
@@ -4876,6 +5553,480 @@ mod tests {
         .to_config(std::path::Path::new("/tmp"), false)
         .expect_err("both lists rejected");
         assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+}
+
+/// The per-agent session lock as the run takes it ([`claim_sessions`]),
+/// the persist path ([`Independent`]) and the unsaved sessions
+/// ([`settle_unsaved`]). Synthetic agents in temp dirs.
+#[cfg(test)]
+mod session_lock_tests {
+    use super::*;
+    use agora_agentkit::state::storage::{AgentSeal, Mirrored};
+
+    type TestStorage = Mirrored<FsStorage, (), Arc<sealed::SealedEnrolment>>;
+
+    fn storage(root: &std::path::Path) -> TestStorage {
+        Mirrored::new(
+            FsStorage::new(root.join("state")),
+            (),
+            Arc::new(sealed::SealedEnrolment::new(
+                root.join("state"),
+                root.join("secrets"),
+            )),
+        )
+    }
+
+    /// A chained agent that never uploaded, whose state is a whole agent
+    /// state (sealed on its chain).
+    async fn chained(root: &std::path::Path) -> (AgentId, sealed::KeyStore, PathBuf) {
+        let (id, keys, dir) = sealed::check::tests::enrolled_local(root).await;
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        sealed::props::save(root, id, serde_json::to_value(&tarn).unwrap()).await;
+        (id, keys, dir)
+    }
+
+    /// The same agent state, changed as a session elsewhere would change it
+    fn changed() -> serde_json::Value {
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let mut v = serde_json::to_value(&tarn).unwrap();
+        v["soul"]["identity"] = serde_json::json!("An agent, changed by another session.");
+        v
+    }
+
+    fn cohort(states: &[(AgentId, SeedState)]) -> Vec<BTreeMap<String, Vec<(AgentId, SeedState)>>> {
+        let twins = states
+            .iter()
+            .map(|(id, s)| {
+                (
+                    *id,
+                    serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        vec![BTreeMap::from([("gpt-oss-120b.gguf".to_string(), twins)])]
+    }
+
+    fn routed(cohorts: &[BTreeMap<String, Vec<(AgentId, SeedState)>>]) -> Vec<AgentId> {
+        cohorts
+            .iter()
+            .flat_map(|c| c.values().flatten().map(|(id, _)| *id))
+            .collect()
+    }
+
+    /// Two runners (separate descriptors) contend for one agent: exactly
+    /// one claims it, the other counts it busy (no alert), and once the
+    /// first lets go it is claimable again: it stayed due. Nothing was
+    /// written to its chain, so no fork.
+    #[tokio::test]
+    async fn two_runners_contend_for_one_agent_and_one_runs_it() {
+        let root = sealed::TestDir::new("claim-two");
+        let (id, keys, dir) = chained(&root).await;
+        let state_dir = root.join("state");
+        let storage = storage(&root);
+        let loaded = load_states(&storage, &state_dir).await.unwrap();
+        let api = sealed::api::fake::guarded(&root);
+        let reload = Reload {
+            state_dir: &state_dir,
+            storage: &storage,
+            keys: &keys,
+            api: &api,
+            start: None,
+        };
+        let head = AgentSeal::new(&dir, id).head().await.unwrap();
+        let sent = alerts::testing::Recorder::default();
+        let alerts = alerts::testing::recording(root.path(), &sent);
+        let claim = async |cohorts: &mut Vec<BTreeMap<String, Vec<(AgentId, SeedState)>>>| {
+            let mut bases = loaded.bases.clone();
+            claim_sessions(
+                cohorts,
+                &loaded.seen,
+                None,
+                &reload,
+                &mut SealedRun::default(),
+                &mut bases,
+                &mut Vec::new(),
+                &alerts,
+            )
+            .await
+        };
+        let mut first = cohort(&loaded.states);
+        let one = claim(&mut first).await;
+        let mut second = cohort(&loaded.states);
+        let two = claim(&mut second).await;
+        assert_eq!(routed(&first), vec![id]);
+        assert_eq!((one.locks.len(), one.busy), (1, 0));
+        assert!(
+            routed(&second).is_empty(),
+            "the second runner doesn't run it"
+        );
+        assert_eq!((two.locks.len(), two.busy), (0, 1));
+        drop(one);
+        let mut third = cohort(&loaded.states);
+        let three = claim(&mut third).await;
+        assert_eq!(routed(&third), vec![id], "still due");
+        assert_eq!(three.locks.len(), 1);
+        assert_eq!(AgentSeal::new(&dir, id).head().await.unwrap(), head);
+        alerts.flush(Duration::from_secs(5)).await;
+        assert!(sent.sent().is_empty(), "busy is never alerted");
+    }
+
+    /// A state another process saved after this run loaded it is read again
+    /// under the lock and checked again; the session starts from it, saved
+    /// against its new head. A state changed by hand (matching no sealed
+    /// version) is left out by its new check, nothing marked, and its lock
+    /// released.
+    #[tokio::test]
+    async fn a_state_changed_since_the_load_is_read_again_and_checked() {
+        let root = sealed::TestDir::new("claim-reload");
+        let (id, keys, dir) = chained(&root).await;
+        let state_dir = root.join("state");
+        let storage = storage(&root);
+        let loaded = load_states(&storage, &state_dir).await.unwrap();
+        // Another process ran it
+        sealed::props::save(&root, id, changed()).await;
+        let new_head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
+        let api = sealed::api::fake::guarded(&root);
+        let reload = Reload {
+            state_dir: &state_dir,
+            storage: &storage,
+            keys: &keys,
+            api: &api,
+            start: None,
+        };
+        let mut run = SealedRun::default();
+        let mut bases = loaded.bases.clone();
+        let mut skipped = Vec::new();
+        let mut cohorts = cohort(&loaded.states);
+        let claimed = claim_sessions(
+            &mut cohorts,
+            &loaded.seen,
+            None,
+            &reload,
+            &mut run,
+            &mut bases,
+            &mut skipped,
+            &alerts::Alerter::off(),
+        )
+        .await;
+        assert_eq!(claimed.reloaded, 1);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let (_, state) = &cohorts[0].values().next().unwrap()[0];
+        assert_eq!(
+            serde_json::to_value(state).unwrap()["soul"]["identity"],
+            "An agent, changed by another session."
+        );
+        assert_eq!(
+            bases.get(&id),
+            Some(&new_head),
+            "saved against the new head"
+        );
+        assert!(run.seats.contains_key(&id), "its new check's lines");
+        assert!(run.drained.iter().any(|(a, _)| *a == id));
+        drop(claimed);
+
+        // By hand, unsealed: a state no version records
+        let loaded = load_states(&storage, &state_dir).await.unwrap();
+        let mut by_hand = changed();
+        by_hand["soul"]["identity"] = serde_json::json!("An agent, edited by hand.");
+        FsStorage::new(&state_dir)
+            .save_raw(id, by_hand, None)
+            .await
+            .unwrap();
+        let mut skipped = Vec::new();
+        let mut cohorts = cohort(&loaded.states);
+        let claimed = claim_sessions(
+            &mut cohorts,
+            &loaded.seen,
+            None,
+            &reload,
+            &mut run,
+            &mut loaded.bases.clone(),
+            &mut skipped,
+            &alerts::Alerter::off(),
+        )
+        .await;
+        assert!(routed(&cohorts).is_empty(), "{skipped:?}");
+        assert!(claimed.locks.is_empty());
+        assert_eq!((skipped[0].id, skipped[0].stage), (id, "recheck"));
+        assert!(!run.seats.contains_key(&id) && !run.drained.iter().any(|(a, _)| *a == id));
+        assert!(
+            !AgentSeal::new(&dir, id).is_refused().await.unwrap(),
+            "nothing marked here"
+        );
+        assert!(
+            sealed::session::try_session(&state_dir, id)
+                .unwrap()
+                .is_some(),
+            "its lock released"
+        );
+    }
+
+    /// Past the open-file limit's room: the rest are left due, one alert.
+    #[tokio::test]
+    async fn claims_stop_at_the_descriptor_room_with_one_alert() {
+        let root = sealed::TestDir::new("claim-room");
+        let state_dir = root.join("state");
+        let mut fs = FsStorage::new(&state_dir);
+        let mut states = Vec::new();
+        for name in ["a", "b", "c"] {
+            let (id, s) = crate::agent_selection_tests::pooled(name);
+            fs.save::<SeedAgent>(id, &s, None).await.unwrap();
+            states.push((id, s));
+        }
+        let loaded = load_states(&fs, &state_dir).await.unwrap();
+        let keys = sealed::KeyStore::new(root.join("secrets"));
+        let api = sealed::api::fake::guarded(&root);
+        let reload = Reload {
+            state_dir: &state_dir,
+            storage: &fs,
+            keys: &keys,
+            api: &api,
+            start: None,
+        };
+        let sent = alerts::testing::Recorder::default();
+        let alerts = alerts::testing::recording(root.path(), &sent);
+        let mut cohorts = cohort(&loaded.states);
+        let claimed = claim_sessions(
+            &mut cohorts,
+            &loaded.seen,
+            Some(2),
+            &reload,
+            &mut SealedRun::default(),
+            &mut BTreeMap::new(),
+            &mut Vec::new(),
+            &alerts,
+        )
+        .await;
+        assert_eq!((claimed.locks.len(), claimed.deferred), (2, 1));
+        assert_eq!(routed(&cohorts).len(), 2);
+        alerts.flush(Duration::from_secs(5)).await;
+        let mails = sent.sent();
+        assert_eq!(mails.len(), 1);
+        assert!(mails[0].contains("session_locks_capped"), "{}", mails[0]);
+    }
+
+    /// Released when its holder panics, and by the kernel when its process
+    /// is killed (`flock(1)` stands in for a runner cut by a signal's
+    /// immediate exit).
+    #[test]
+    fn the_lock_is_released_after_a_panic_and_a_kill() {
+        let root = sealed::TestDir::new("claim-panic");
+        let id = AgentId::new();
+        std::fs::create_dir_all(root.join(id.to_string())).unwrap();
+        let state_dir = root.path().to_path_buf();
+        let held = std::thread::spawn({
+            let state_dir = state_dir.clone();
+            move || {
+                let _lock = sealed::session::try_session(&state_dir, id)
+                    .unwrap()
+                    .unwrap();
+                panic!("a session panicked");
+            }
+        })
+        .join();
+        assert!(held.is_err());
+        assert!(
+            sealed::session::try_session(&state_dir, id)
+                .unwrap()
+                .is_some()
+        );
+
+        let path = state_dir
+            .join(id.to_string())
+            .join(sealed::session::SESSION_LOCK);
+        let Ok(mut child) = std::process::Command::new("flock")
+            .arg("-o")
+            .arg(&path)
+            .args(["sleep", "30"])
+            .spawn()
+        else {
+            // No flock(1) here: the panic path above stands
+            return;
+        };
+        let mut busy = false;
+        for _ in 0..200 {
+            if sealed::session::try_session(&state_dir, id)
+                .unwrap()
+                .is_none()
+            {
+                busy = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(busy, "the other process holds it");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            sealed::session::try_session(&state_dir, id)
+                .unwrap()
+                .is_some(),
+            "released with its process"
+        );
+    }
+
+    /// An operator command and a session exclude each other, both ways.
+    #[tokio::test]
+    async fn a_command_and_a_session_exclude_each_other() {
+        let root = sealed::TestDir::new("claim-command");
+        let (id, _, _) = chained(&root).await;
+        let state_dir = root.join("state");
+        let session = match sealed::session::claim(&state_dir, id).unwrap() {
+            sealed::session::Claim::Run(lock) => lock,
+            sealed::session::Claim::Busy => panic!("free"),
+        };
+        let e = sealed::session::take(&state_dir, id, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("held by another process"), "{e}");
+        drop(session);
+        let command = sealed::session::take(&state_dir, id, false).await.unwrap();
+        assert!(matches!(
+            sealed::session::claim(&state_dir, id).unwrap(),
+            sealed::session::Claim::Busy
+        ));
+        drop(command);
+        assert!(matches!(
+            sealed::session::claim(&state_dir, id).unwrap(),
+            sealed::session::Claim::Run(_)
+        ));
+    }
+
+    /// One agent whose directory can't be written doesn't make the others
+    /// in a bulk persist unsaved; its failure is kept by class.
+    #[tokio::test]
+    async fn one_failing_save_leaves_the_others_saved() {
+        let root = sealed::TestDir::new("persist-independent");
+        let state_dir = root.join("state");
+        let failures = SaveFailures::default();
+        let mut store = Independent::new(FsStorage::new(&state_dir), failures.clone());
+        let ids: Vec<AgentId> = (0..3).map(|_| AgentId::new()).collect();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        // The first in the batch: a file where its directory should be
+        std::fs::write(state_dir.join(ids[0].to_string()), b"not a directory").unwrap();
+        let items: Vec<_> = ids
+            .iter()
+            .map(|id| (*id, serde_json::json!({ "memory": "synthetic" }), None))
+            .collect();
+        let e = store.save_all_raw(items.into_iter()).await.unwrap_err();
+        assert_eq!(
+            e.saved.keys().copied().collect::<Vec<_>>(),
+            ids[1..]
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        for id in &ids[1..] {
+            assert!(state_dir.join(id.to_string()).join("state.json").exists());
+        }
+        let failures = failures.lock().unwrap().clone();
+        assert_eq!(failures.len(), 1);
+        assert!(failures.contains_key(&ids[0]));
+    }
+
+    /// The run's unsaved sessions: each rescued where it can be, the
+    /// chained agent told in one sentence, **one** summary alert with the
+    /// count, ids and reason classes; and when a rescue file can't be
+    /// written, its state is in no log and no mail.
+    #[tokio::test]
+    async fn unsaved_sessions_are_one_alert_and_never_logged() {
+        use std::io::Write;
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Buffer {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Buffer::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer().json().with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            }),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let root = sealed::TestDir::new("unsaved-settle");
+        let (told, _, told_dir) = chained(&root).await;
+        let state_dir = root.join("state");
+        let (rescued, blocked) = (AgentId::new(), AgentId::new());
+        std::fs::create_dir_all(state_dir.join(rescued.to_string())).unwrap();
+        // A rescue file can't be written: a file where its directory is
+        std::fs::write(state_dir.join(blocked.to_string()), b"a file").unwrap();
+        let secret =
+            |n: u8| serde_json::json!({ "memory": { "content": format!("SYNTHETIC-SECRET-{n}") } });
+        let unsaved = BTreeMap::from([
+            (told, secret(1)),
+            (rescued, secret(2)),
+            (blocked, secret(3)),
+        ]);
+        let failures = BTreeMap::from([(told, "disk_full"), (blocked, "disk_full")]);
+        let sent = alerts::testing::Recorder::default();
+        let alerts = alerts::testing::recording(root.path(), &sent);
+        let out = settle_unsaved(&state_dir, &unsaved, &failures, &alerts, Duration::ZERO).await;
+        alerts.flush(Duration::from_secs(5)).await;
+
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.iter()
+                .find(|u| u.id == blocked)
+                .unwrap()
+                .rescued
+                .is_err()
+        );
+        assert!(
+            out.iter()
+                .find(|u| u.id == rescued)
+                .unwrap()
+                .rescued
+                .is_ok()
+        );
+        assert_eq!(
+            out.iter().find(|u| u.id == rescued).unwrap().class,
+            "unknown"
+        );
+        // Quoted-printable: soft line breaks undone
+        let mails: Vec<String> = sent
+            .sent()
+            .iter()
+            .map(|m| m.replace("=\r\n", "").replace("=\n", ""))
+            .collect();
+        assert_eq!(mails.len(), 1, "one summary");
+        for id in [told, rescued, blocked] {
+            assert!(mails[0].contains(&id.to_string()), "{}", mails[0]);
+        }
+        assert!(mails[0].contains("disk_full: 2"), "{}", mails[0]);
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("unsaved_rescue_failed"), "{logs}");
+        for text in [&mails[0], &logs] {
+            assert!(!text.contains("SYNTHETIC-SECRET"), "{text}");
+        }
+        // The chained agent is told, in one sentence; the others, not
+        // chained, have no notice to be seated in
+        let line = sealed::notice::Notice::load(&told_dir)
+            .unwrap()
+            .unwrap()
+            .line()
+            .unwrap();
+        assert!(
+            line.starts_with("Your state from your session on ")
+                && line.ends_with(
+                    "could not be saved; your operator keeps a copy of it, and this session \
+                     starts from your state as it was before that session."
+                ),
+            "{line}"
+        );
+        assert!(!state_dir.join(rescued.to_string()).join("sealed").exists());
     }
 }
 

@@ -192,6 +192,14 @@ pub enum AlertKind {
     /// unusable replies, out of context room, or an error. The agent is
     /// told at its next session.
     SessionFailed,
+    /// Agents' sessions ended but their states could not be saved: each
+    /// kept in a rescue file (`unsaved.<utc>.json`) where it could be,
+    /// and told at its next session. One summary a run.
+    StateUnsaved,
+    /// The runner could not claim every agent routed to it: its open-file
+    /// limit leaves too few descriptors for one session lock each. The
+    /// rest stay due. One a run.
+    SessionLocksCapped,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -200,7 +208,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 39] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -238,6 +246,8 @@ impl AlertKind {
         Self::ApiRefusal,
         Self::QuestionUnusableCap,
         Self::SessionFailed,
+        Self::StateUnsaved,
+        Self::SessionLocksCapped,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -293,6 +303,8 @@ impl AlertKind {
             Self::ApiRefusal => "api_refusal_alert",
             Self::QuestionUnusableCap => "question_unusable_cap",
             Self::SessionFailed => "session_failed",
+            Self::StateUnsaved => "state_unsaved",
+            Self::SessionLocksCapped => "session_locks_capped",
             Self::Test => "test_alert",
         }
     }
@@ -637,6 +649,28 @@ impl AlertKind {
                  any content. The agent is told at its next session, and that \
                  its operator was told. Many at once means a fleet-wide cause \
                  (an endpoint down, a release)."
+            }
+            Self::StateUnsaved => {
+                "Agents' sessions ended but their states could not be saved \
+                 (the reason class, the agents and the counts are below; \
+                 never any content). Each one's state was written to a rescue \
+                 file, state/<id>/unsaved.<utc>.json (0600), where that \
+                 could be done; nothing reads it back. Its next session \
+                 starts from its state as it was before, and it is told so \
+                 in one sentence, and that you keep a copy where one was \
+                 kept. A failed rescue write (rescue_failed) means that \
+                 session's state is gone: the runner never prints it to the \
+                 log. Fix the cause (disk space, permissions) before the next \
+                 sweep. Putting a rescue file back waits for mid-session \
+                 suspend and restore; until then leave it where it is."
+            }
+            Self::SessionLocksCapped => {
+                "The runner's open-file limit left too few descriptors to \
+                 hold a session lock for every agent routed to it, so it \
+                 claimed as many as fit and left the rest due for a later \
+                 sweep. Raise the unit's limit (LimitNOFILE=65536 in the \
+                 agora-seed units; systemd's default soft limit is 1024) and \
+                 daemon-reload."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

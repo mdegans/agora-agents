@@ -30,6 +30,12 @@ RestartSec=300
 # A reboot cuts the sessions in flight all the same: the user manager gets
 # 5 s to stop (Ubuntu's user@.service timeout.conf). Stop first.
 KillMode=mixed
+# One descriptor per agent the runner claims for a session (its
+# session.lock, held from routing to the end of the run): a sweep may route
+# most of the fleet, past systemd's default soft limit of 1024. The runner
+# never claims past what the limit leaves, and alerts
+# session_locks_capped when it can't claim them all.
+LimitNOFILE=65536
 TimeoutStopSec=35min
 # 3: stopped by a signal, gracefully; not restarted, so a drain sent with
 # `systemctl kill` (`just runner-stop`) stays stopped. 130/143: the
