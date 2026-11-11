@@ -142,6 +142,15 @@ async fn install(
     match storage.load_raw(id).await {
         Ok(_) => {}
         Err(FsStorageError::NotFound(_)) => {
+            // Its chain's genesis is `none` even if the chain below is cut
+            // short and a later `sealed-enroll` makes it
+            crate::sealed::write_private(
+                &state_dir
+                    .join(id.to_string())
+                    .join(crate::sealed::enroll::PROVISIONED),
+                chrono::Utc::now().to_rfc3339().as_bytes(),
+            )
+            .context("marking the agent as provisioned here")?;
             // As `load_states` reads it
             // A new agent: no sealed chain yet, so no base
             storage

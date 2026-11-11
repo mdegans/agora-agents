@@ -604,7 +604,7 @@ async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
 /// --rebase --note` seals the state here on top of what Agora holds, or on
 /// a new chain whose genesis records the break when Agora holds nothing;
 /// the next start is intact. What was set aside is kept in
-/// `sealed/lost/<utc>/`, past `prune_blobs`: the old head's keyframe still
+/// `sealed/lost/<utc>/`, past `remove_unnamed_blobs`: the old head's keyframe still
 /// opens with agentkit's `open_state`. Cut at every step, a rerun finishes.
 #[tokio::test]
 async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
@@ -670,7 +670,7 @@ async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
                 "{seat:?}"
             );
             // Kept past a prune: the old keyframe opens
-            b.seal().prune_blobs().await.unwrap();
+            b.seal().remove_unnamed_blobs().await.unwrap();
             let lost = std::fs::read_dir(b.dir.join("sealed/lost"))
                 .unwrap()
                 .map(|e| e.unwrap().path())

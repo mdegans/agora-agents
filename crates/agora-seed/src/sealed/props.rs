@@ -888,3 +888,27 @@ fn every_chain_problem_has_exactly_one_class() {
     )));
     assert!(refused(judge(&[], &agoras)));
 }
+
+// B3: agentkit 0.158 keeps acknowledged blobs (998a07b); the tests of a
+// version Agora alone holds simulate an agent pruned before it
+/// What agentkit's `prune_blobs` did before 0.158: delete the blobs of
+/// `sent/` entries, but never the head keyframe's or one an outbox item
+/// names. For tests of versions whose blob is on Agora only.
+pub async fn prune_sent_blobs(seal: &AgentSeal) {
+    let blobs = seal.dir().join("blobs");
+    let mut keep: std::collections::HashSet<Sha256Hex> = std::collections::HashSet::new();
+    if let Some(h) = seal.head().await.unwrap() {
+        keep.extend(h.keyframe.as_ref().and_then(|k| k.blob_sha256()));
+    }
+    for item in seal.outbox().await.unwrap() {
+        keep.extend(item.entry.entry.blob.as_ref().map(|b| b.sha256));
+        keep.extend(item.keyframe_after.as_ref().and_then(|k| k.blob_sha256()));
+    }
+    for item in seal.sent().await.unwrap() {
+        if let Some(b) = item.entry.entry.blob.as_ref()
+            && !keep.contains(&b.sha256)
+        {
+            let _ = std::fs::remove_file(blobs.join(b.sha256.to_hex()));
+        }
+    }
+}

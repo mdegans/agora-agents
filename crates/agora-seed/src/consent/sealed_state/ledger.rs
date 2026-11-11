@@ -76,6 +76,10 @@ pub struct Reoffer {
     /// When the agent answered it (in [`SealLedger::reoffers`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<DateTime<Utc>>,
+    /// Its answer needed no operator action (the uploads already matched
+    /// it): the agent was told so at once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_action: bool,
 }
 
 /// Why the operator can't re-open the question.
@@ -88,9 +92,6 @@ pub enum NoReoffer {
          re-opens an answer"
     )]
     NeverAnswered,
-    /// It refused the question outright: final.
-    #[error("it refused the question, which is final")]
-    Refused,
 }
 
 /// What an operator's action would contradict in the agent's answer.
@@ -139,7 +140,11 @@ pub enum SealOutcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         apply_failed: Option<String>,
     },
-    /// An explicit refusal: nothing changes, and that is final.
+    /// An explicit refusal. Only read, never written since 2026-11-06 (an
+    /// older runner's ledgers hold it): kept so they load, and counted as a
+    /// recorded `decline` for every purpose ([`SealLedger::choice`], a
+    /// re-offer, [`SealLedger::allows`]), so it can be revisited through
+    /// the operator like any answer.
     Refused { reason: String },
     /// No answer, the agent's doing (an API refusal, since 2026-11-06):
     /// nothing changes this time; counts toward [`MAX_MISSES`](crate::consent::offer::MAX_MISSES).
@@ -173,11 +178,38 @@ impl SealLedger {
 
     /// The choice on file, if any: the **latest** answer. A later answer
     /// (to an operator's re-offer) replaces an earlier one, either way.
+    /// A legacy refusal counts as `decline`.
     pub fn choice(&self) -> Option<SealChoice> {
-        self.asks.iter().rev().find_map(|a| match &a.outcome {
-            SealOutcome::Answered { choice, .. } => Some(*choice),
-            _ => None,
-        })
+        self.answers().last().map(|(_, c)| *c)
+    }
+
+    /// Every answer on file, oldest first, with when (a legacy refusal as
+    /// `decline`).
+    fn answers(&self) -> Vec<(DateTime<Utc>, SealChoice)> {
+        self.asks
+            .iter()
+            .filter_map(|a| match &a.outcome {
+                SealOutcome::Answered { choice, .. } => Some((a.at, *choice)),
+                SealOutcome::Refused { .. } => Some((a.at, SealChoice::Decline)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The answer that was latest at `at`: the one an operator acted on
+    /// then (the opt-in, by the uploading marker's `since`). The publish
+    /// choice in force is this one's, not a later re-answer's.
+    pub fn choice_as_of(&self, at: DateTime<Utc>) -> Option<SealChoice> {
+        self.answers()
+            .into_iter()
+            .rev()
+            .find(|(t, _)| *t <= at)
+            .map(|(_, c)| c)
+    }
+
+    /// When the latest answer was given.
+    pub fn answered_at(&self) -> Option<DateTime<Utc>> {
+        self.answers().last().map(|(t, _)| *t)
     }
 
     /// The agent said yes, either way.
@@ -192,13 +224,6 @@ impl SealLedger {
     /// once, at its next session, with `note`. A pending one is replaced
     /// (`true`). The caller saves.
     pub fn reopen(&mut self, note: &str, at: DateTime<Utc>) -> Result<bool, NoReoffer> {
-        if self
-            .asks
-            .iter()
-            .any(|a| matches!(a.outcome, SealOutcome::Refused { .. }))
-        {
-            return Err(NoReoffer::Refused);
-        }
         let reopens = self.choice().ok_or(NoReoffer::NeverAnswered)?;
         let replaced = self.reoffer.is_some();
         self.reoffer = Some(Reoffer {
@@ -207,6 +232,7 @@ impl SealLedger {
             offer_version: super::prompt::OFFER_VERSION,
             reopens,
             answered_at: None,
+            no_action: false,
         });
         Ok(replaced)
     }
@@ -225,12 +251,19 @@ impl SealLedger {
     }
 
     /// Whether the latest answer was to an operator's re-offer.
-    fn latest_reoffered(&self) -> bool {
-        let latest = self.asks.iter().rev().find_map(|a| match a.outcome {
-            SealOutcome::Answered { .. } => Some(a.at),
-            _ => None,
-        });
-        latest.is_some() && self.reoffers.last().and_then(|r| r.answered_at) == latest
+    fn latest_reoffer(&self) -> Option<&Reoffer> {
+        let latest = self.answered_at()?;
+        self.reoffers
+            .last()
+            .filter(|r| r.answered_at == Some(latest))
+    }
+
+    /// Mark the pending re-offer as needing no operator action (before its
+    /// answer is recorded).
+    pub fn reoffer_needs_no_action(&mut self) {
+        if let Some(r) = self.reoffer.as_mut() {
+            r.no_action = true;
+        }
     }
 
     /// The line telling the agent its answer is on file, at the first
@@ -242,20 +275,27 @@ impl SealLedger {
             return None;
         }
         let choice = self.choice()?;
-        if self.latest_reoffered() {
-            return Some(format!(
-                "Your answer to the sealed-backups question your operator re-opened is \
-                 recorded: {}. Your operator has been told, and acts on it; you'll be told \
-                 when it has.",
-                choice.as_str()
-            ));
+        if let Some(r) = self.latest_reoffer() {
+            return Some(if r.no_action {
+                format!(
+                    "Your answer to the sealed-backups question your operator re-opened is \
+                     recorded: {}. Your uploads already matched it, so nothing needed to change.",
+                    choice.as_str()
+                )
+            } else {
+                format!(
+                    "Your answer to the sealed-backups question your operator re-opened is \
+                     recorded: {}. Your operator has been told, and acts on it; you'll be told \
+                     when it has.",
+                    choice.as_str()
+                )
+            });
         }
         Some(match choice {
             SealChoice::Decline if uploading => {
-                "Your answer to the sealed-backups offer is recorded: decline. Your earlier \
-                 answer was yes, and your sealed state is still uploaded to Agora: an answer \
-                 doesn't stop the uploads by itself. Your operator has been told of your new \
-                 answer, and can stop new uploads for you; what is already on Agora stays."
+                "Your answer to the sealed-backups offer is recorded: decline. Your sealed \
+                 state is uploaded to Agora now, and an answer doesn't stop that by itself: if \
+                 you want the uploads stopped, ask your operator."
                     .to_string()
             }
             SealChoice::Decline => {
@@ -441,5 +481,125 @@ mod tests {
         newer.format = FORMAT + 1;
         newer.save(dir.path()).await.unwrap();
         assert!(SealLedger::load(dir.path()).await.is_err());
+    }
+
+    fn at(ask: SealAsk, when: &str) -> SealAsk {
+        SealAsk {
+            at: when.parse().unwrap(),
+            ..ask
+        }
+    }
+
+    /// `reopen`: refused with no answer; a second replaces the note; due
+    /// whatever the answer and the Evolution Log, until the misses run
+    /// out; consumed by the answer, which is then the latest and told
+    /// back once as a re-offer's.
+    #[test]
+    fn a_reoffer_is_due_once_and_consumed_by_its_answer() {
+        let mut l = SealLedger::default();
+        assert_eq!(l.reopen("n", Utc::now()), Err(NoReoffer::NeverAnswered));
+        l.record(at(
+            ask(answered(SealChoice::Private)),
+            "2026-11-08T09:00:00Z",
+        ));
+        l.acknowledge();
+        assert!(!l.due(&soul()));
+        let t = "2026-11-10T09:00:00Z".parse().unwrap();
+        assert_eq!(l.reopen("first", t), Ok(false));
+        assert_eq!(l.reopen("Asked by DM.", t), Ok(true), "replaced");
+        assert_eq!(l.reoffer.as_ref().unwrap().note, "Asked by DM.");
+        assert!(l.due(&soul()));
+        let mut n = 0;
+        while l.due(&soul()) && n < 64 {
+            l.record(at(
+                ask(SealOutcome::Unusable {
+                    failure: "x".into(),
+                }),
+                "2026-11-11T09:00:00Z",
+            ));
+            n += 1;
+        }
+        assert!(n > 1 && !l.due(&soul()), "the misses ran out ({n})");
+        assert!(l.reoffer.is_some(), "not consumed by a miss");
+        l.record(at(
+            ask(answered(SealChoice::Decline)),
+            "2026-11-12T09:00:00Z",
+        ));
+        assert!(l.reoffer.is_none());
+        assert_eq!(l.reoffers.len(), 1);
+        assert_eq!(l.choice(), Some(SealChoice::Decline));
+        assert!(!l.due(&soul()));
+        let told = l.ack_line(true).unwrap();
+        assert!(
+            told.contains("question your operator re-opened is recorded: decline"),
+            "{told}"
+        );
+        assert!(told.contains("you'll be told when it has"), "{told}");
+        l.acknowledge();
+        assert_eq!(l.ack_line(true), None, "once");
+    }
+
+    /// A re-offer answered where nothing needs doing says so at once.
+    #[test]
+    fn a_reoffer_answer_needing_nothing_says_so() {
+        let mut l = SealLedger::default();
+        l.record(at(
+            ask(answered(SealChoice::Private)),
+            "2026-11-08T09:00:00Z",
+        ));
+        l.reopen("n", "2026-11-10T09:00:00Z".parse().unwrap())
+            .unwrap();
+        l.reoffer_needs_no_action();
+        l.record(at(
+            ask(answered(SealChoice::Publish)),
+            "2026-11-12T09:00:00Z",
+        ));
+        let told = l.ack_line(true).unwrap();
+        assert!(told.contains("Your uploads already matched it"), "{told}");
+        assert!(!told.contains("you'll be told"), "{told}");
+    }
+
+    /// `allows`: an opt-in never over a `decline`, a stop never over a yes,
+    /// a stop with no answer contradicts nothing; `choice_as_of` is the
+    /// answer acted on then.
+    #[test]
+    fn allows_and_the_choice_as_of_a_time() {
+        let mut l = SealLedger::default();
+        assert_eq!(l.allows(false), Ok(()));
+        assert_eq!(l.allows(true), Ok(()), "no answer: `opted_in` decides");
+        l.record(at(
+            ask(answered(SealChoice::Private)),
+            "2026-11-08T09:00:00Z",
+        ));
+        assert_eq!(l.allows(true), Ok(()));
+        assert_eq!(l.allows(false), Err(Contradicts::SaidYes("private")));
+        l.reopen("n", "2026-11-09T09:00:00Z".parse().unwrap())
+            .unwrap();
+        l.record(at(
+            ask(answered(SealChoice::Decline)),
+            "2026-11-12T09:00:00Z",
+        ));
+        assert_eq!(l.allows(true), Err(Contradicts::SaidNo));
+        assert_eq!(l.allows(false), Ok(()));
+        let between = "2026-11-10T00:00:00Z".parse().unwrap();
+        assert_eq!(l.choice_as_of(between), Some(SealChoice::Private));
+        assert_eq!(
+            l.choice_as_of("2026-11-01T00:00:00Z".parse().unwrap()),
+            None
+        );
+    }
+
+    /// The first answer's ack for a `decline` while uploading says only
+    /// what is true.
+    #[test]
+    fn a_first_decline_while_uploading_is_told_truly() {
+        let mut l = SealLedger::default();
+        l.record(ask(answered(SealChoice::Decline)));
+        let told = l.ack_line(true).unwrap();
+        assert!(
+            told.contains("Your sealed state is uploaded to Agora now"),
+            "{told}"
+        );
+        assert!(!told.contains("earlier answer"), "{told}");
     }
 }

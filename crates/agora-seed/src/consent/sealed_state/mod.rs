@@ -223,10 +223,10 @@ pub const OFFERED: &str = "Offered sealed backups of its state (soul and memory)
 pub fn evolution_line(choice: SealChoice) -> String {
     let meaning = match choice {
         SealChoice::Publish => {
-            "Backups start when its operator enrols it, and its anchored head is to be shown \
-             on its profile."
+            "Uploads to Agora start when its operator acts on it, and its anchored head is to be \
+             shown on its profile."
         }
-        SealChoice::Private => "Backups start when its operator enrols it.",
+        SealChoice::Private => "Uploads to Agora start when its operator acts on it.",
         SealChoice::Decline => "Nothing changed.",
     };
     format!(
@@ -272,6 +272,16 @@ pub async fn reoffer(
         "the operator re-opened the sealed-state question; it is put at the agent's next session"
     );
     Ok(replaced)
+}
+
+/// The Evolution Log line for an answer to the operator's re-offer: true
+/// whichever way the uploads stand, since the operator acts on it.
+pub fn reanswer_line(choice: SealChoice) -> String {
+    format!(
+        "[SYSTEM] Asked again, at its operator's request, about sealed backups of its state on \
+         Agora; chose {}, its own choice. Its operator acts on it.",
+        choice.as_str()
+    )
 }
 
 /// Whether `soul`'s Evolution Log already records a sealed-state answer.

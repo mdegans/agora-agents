@@ -43,10 +43,15 @@ pub enum Command {
         /// next session).
         #[arg(long)]
         note: Option<String>,
-        /// With `--opt-in` and named agents: opt in even though an agent's
-        /// latest answer is `decline` (never one with no answer). Needs
-        /// `--note`, which the agent is shown.
-        #[arg(long, requires_all = ["note", "opt_in"])]
+        /// Resume the uploads of the stopped agents named with `--agent`,
+        /// on the line Agora holds: the versions saved while stopped stay
+        /// here. Only on a latest answer of yes (else `--against-answer`).
+        #[arg(long, conflicts_with = "opt_in", requires = "agents")]
+        resume: bool,
+        /// With `--opt-in` or `--resume` and named agents: act even though
+        /// an agent's latest answer is `decline` (never one with no answer
+        /// for an opt-in). Needs `--note`, which the agent is shown.
+        #[arg(long, requires = "note")]
         against_answer: bool,
     },
     /// Re-open the sealed-state question for agents that answered it: put
@@ -157,7 +162,7 @@ pub async fn run(
     // before its chain would save it unsealed over the chain (and be
     // alerted). Not waited for. A dry run writes nothing and needs none.
     let _runner = match &command {
-        Command::SealedEnroll { dry_run: false, .. } => {
+        Command::SealedEnroll { dry_run: false, .. } | Command::SealedReoffer { .. } => {
             Some(super::session::runner_exclusive(data_dir)?)
         }
         _ => None,
@@ -176,8 +181,13 @@ pub async fn run(
             dry_run,
             jobs,
             note,
+            resume,
             against_answer,
         } => {
+            anyhow::ensure!(
+                !against_answer || opt_in || resume,
+                "--against-answer goes with --opt-in or --resume"
+            );
             let enroller = Arc::new(super::enroll::Enroller {
                 state_dir: state_dir.clone(),
                 keys: keys.clone(),
@@ -191,9 +201,15 @@ pub async fn run(
                     "--against-answer acts only on agents named with --agent"
                 );
                 opt_in_pass(&enroller, &api, &outbox, agents, dry_run, against).await?;
+            } else if resume {
+                resume_pass(&enroller, agents, dry_run, note.as_deref(), against_answer).await?;
             } else {
+                anyhow::ensure!(
+                    note.is_none(),
+                    "--note goes with --resume or --opt-in --against-answer"
+                );
                 let jobs = jobs.map_or_else(default_jobs, usize::from);
-                chain_pass(&enroller, agents, dry_run, jobs, note.as_deref()).await?;
+                chain_pass(&enroller, agents, dry_run, jobs).await?;
             }
         }
         Command::SealedAccept {
@@ -298,7 +314,6 @@ pub async fn run(
                 !note.trim().is_empty(),
                 "--note is required: the agents read it"
             );
-            let _runner = super::session::runner_exclusive(data_dir)?;
             let mut failed = 0;
             for id in agents {
                 let dir = state_dir.join(id.to_string());
@@ -328,9 +343,28 @@ pub async fn run(
             let dir = state_dir.join(agent.to_string());
             {
                 use crate::consent::offer::Stored as _;
-                let ledger = crate::consent::sealed_state::ledger::SealLedger::load_blocking(&dir)
-                    .context("the agent's sealed-state ledger is unreadable")?;
-                if let Err(why) = ledger.allows(false) {
+                // Stopping is the safe direction: with the override, an
+                // unreadable ledger doesn't block it
+                let ledger =
+                    match crate::consent::sealed_state::ledger::SealLedger::load_blocking(&dir) {
+                        Ok(l) => Some(l),
+                        Err(e) if against_answer => {
+                            tracing::warn!(
+                                event_type = "sealed_state_stop_ledger_unreadable",
+                                agent_id = %agent,
+                                error = %e,
+                                "the agent's ledger couldn't be read; stopped with the override"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e).context(
+                                "the agent's sealed-state ledger is unreadable: pass \
+                                 --against-answer with the note to stop anyway",
+                            ));
+                        }
+                    };
+                if let Some(Err(why)) = ledger.map(|l| l.allows(false)) {
                     anyhow::ensure!(
                         against_answer,
                         "{agent}: {why}: not stopped. Re-open the question (`sealed-reoffer`), or \
@@ -415,6 +449,10 @@ impl Tally {
         *self.0.entry(outcome).or_default() += 1;
     }
 
+    fn add_n(&mut self, what: &'static str, n: usize) {
+        *self.0.entry(what).or_default() += n;
+    }
+
     fn get(&self, outcome: &str) -> usize {
         self.0.get(outcome).copied().unwrap_or(0)
     }
@@ -443,55 +481,22 @@ async fn chain_pass(
     named: Vec<AgentId>,
     dry_run: bool,
     jobs: usize,
-    note: Option<&str>,
 ) -> anyhow::Result<()> {
     use super::enroll::Skip;
     let mut tally = Tally::default();
-    let explicit = !named.is_empty();
-    let ids = if explicit { named } else { enroller.agents()? };
-    let mut chain = Vec::with_capacity(ids.len());
-    for id in ids {
-        let dir = enroller.state_dir.join(id.to_string());
-        let stopped = super::stop::is_stopped(&dir)
-            || super::stop::durable(&enroller.keys, id).map_or(true, |d| d.is_some());
-        // Only a stopped agent named is resumed: never a whole-fleet pass
-        if !(explicit && stopped && super::is_enrolled(&dir)) {
-            chain.push(id);
-            continue;
-        }
-        if dry_run {
-            println!(
-                "{id}: would resume its stopped uploads (the versions saved while stopped stay here)"
-            );
-            tally.add("would_resume");
-            continue;
-        }
-        match enroller.resume(id, note).await {
-            Ok(report) => {
-                tally.add("resumed");
-                let uploads = super::uploads(&dir, &enroller.keys, id);
-                println!(
-                    "{id}: resumed; {} version(s) saved while stopped kept here, not sent; {}",
-                    report.kept_local,
-                    if uploads {
-                        "its uploads go on"
-                    } else {
-                        "it is NOT marked uploading, so nothing of it is sent: `sealed-enroll \
-                         --opt-in --agent <id>` starts its uploads if its ledger says yes"
-                    }
-                );
-            }
-            Err(e) => {
-                tally.add("failed");
-                tracing::error!(event_type = "sealed_resume_failed", agent_id = %id, error = %e, "resume failed");
-                println!("{id}: failed: {e:#}");
-            }
-        }
-    }
+    let ids = if named.is_empty() {
+        enroller.agents()?
+    } else {
+        named
+    };
+    let chain = ids;
     let mut says_yes = 0;
     for (id, result) in enroller.chain_all(&chain, dry_run, jobs).await {
         match result {
             Ok(report) => {
+                tally.add_n("archives_sealed", report.sealed);
+                tally.add_n("duplicates_skipped", report.duplicates);
+                tally.add_n("unreadable_left_out", report.unreadable);
                 tally.add(match (dry_run, report.prior_later) {
                     (true, _) => "would_chain",
                     (false, true) => "prior_appended",
@@ -526,19 +531,18 @@ async fn chain_pass(
         // A dry run moves no old marker (the start pass does, first, in any
         // other command): a chain whose marker has agentkit's old name reads
         // here as a chain never finished
-        let mut unmarked = 0;
+        let mut old = 0;
         for &id in &chain {
             let dir = enroller.state_dir.join(id.to_string());
             let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
-            if !super::is_enrolled(&dir) && seal.head().await.is_ok_and(|h| h.is_some()) {
-                unmarked += 1;
+            if seal.has_legacy_marker().await.unwrap_or(false) {
+                old += 1;
             }
         }
-        if unmarked > 0 {
+        if old > 0 {
             println!(
-                "{unmarked} agent(s) have a chain but no chain marker: an older runner's marker \
-                 (moved at the next run start or non-dry command, then counted as chained) or \
-                 a chain cut short (finished by the run)"
+                "{old} agent(s) still have an older runner's chain marker: counted here as not \
+                 chained; the start pass of any non-dry command moves it first"
             );
         }
     }
@@ -548,8 +552,12 @@ async fn chain_pass(
              starts their uploads"
         );
     }
-    let failed = tally.get("failed");
-    anyhow::ensure!(failed == 0, "{failed} agent(s) failed");
+    let (failed, unreadable) = (tally.get("failed"), tally.get("unreadable_left_out"));
+    anyhow::ensure!(
+        failed == 0 && unreadable == 0,
+        "{failed} agent(s) failed, {unreadable} archive(s) unreadable and left out (recorded in \
+         each agent's sealed/left_out.json)"
+    );
     Ok(())
 }
 
@@ -683,6 +691,55 @@ async fn opt_in_pass(
     Ok(())
 }
 
+/// `sealed-enroll --resume --agent <id>…`: resume each stopped agent's
+/// uploads, never against its answer without `against`.
+async fn resume_pass(
+    enroller: &super::enroll::Enroller,
+    ids: Vec<AgentId>,
+    dry_run: bool,
+    note: Option<&str>,
+    against: bool,
+) -> anyhow::Result<()> {
+    let mut tally = Tally::default();
+    for id in ids {
+        let dir = enroller.state_dir.join(id.to_string());
+        if dry_run {
+            println!("{id}: would resume (the versions saved while stopped stay here)");
+            tally.add("would_resume");
+            continue;
+        }
+        match enroller.resume(id, note, against).await {
+            Ok(report) => {
+                tally.add("resumed");
+                let uploads = super::uploads(&dir, &enroller.keys, id);
+                println!(
+                    "{id}: resumed; {} version(s) saved while stopped kept here, not sent; {}",
+                    report.kept_local,
+                    if uploads {
+                        "its uploads go on"
+                    } else {
+                        "it is NOT marked uploading, so nothing of it is sent: `sealed-enroll \
+                         --opt-in --agent <id>` starts its uploads if its ledger says yes"
+                    }
+                );
+            }
+            Err(e) => {
+                tally.add("failed");
+                tracing::error!(event_type = "sealed_resume_failed", agent_id = %id, error = %e, "resume failed");
+                println!("{id}: failed: {e:#}");
+            }
+        }
+    }
+    tally.print(if dry_run {
+        "resume (dry run)"
+    } else {
+        "resume"
+    });
+    let failed = tally.get("failed");
+    anyhow::ensure!(failed == 0, "{failed} agent(s) failed");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +757,7 @@ mod tests {
             dry_run: false,
             jobs: Some(2),
             note: None,
+            resume: false,
             against_answer: false,
         }
     }
@@ -772,8 +830,32 @@ mod tests {
             b"{ not json"
         );
         crate::sealed::uploading::tests::ledger(&dir, true);
+        // Beside a runner: refused before anything is read or written
+        let runner = super::super::session::runner_shared(&root).unwrap();
+        let e = run(reoffer(vec![id]), &root, url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("stop the runner"), "{e}");
+        assert!(SealLedger::load_blocking(&dir).unwrap().reoffer.is_none());
+        drop(runner);
         run(reoffer(vec![id]), &root, url(), None).await.unwrap();
         let l = SealLedger::load_blocking(&dir).unwrap();
         assert_eq!(l.reoffer.as_ref().unwrap().note, "Asked by DM.");
+
+        // An unreadable ledger blocks a stop, but not with the override
+        // (nothing waits to upload, so the stop's drain sends nothing)
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        std::fs::write(SealLedger::path(&dir), b"{ not json").unwrap();
+        let e = format!(
+            "{:#}",
+            run(stop(false), &root, url(), None).await.unwrap_err()
+        );
+        assert!(e.contains("unreadable"), "{e}");
+        run(stop(true), &root, url(), None).await.unwrap();
+        assert!(super::super::stop::is_stopped(&dir));
     }
 }

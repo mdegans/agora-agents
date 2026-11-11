@@ -190,9 +190,13 @@ pub enum Genesis {
 pub struct Report {
     pub archives: usize,
     pub archive_bytes: u64,
-    /// Archives left out: unreadable, a newer envelope, or the same state
-    /// as the version before.
-    pub skipped: usize,
+    /// Archives sealed by this run.
+    pub sealed: usize,
+    /// Archives left out as the same state as the version before.
+    pub duplicates: usize,
+    /// Archives left out for good: not JSON, not an envelope, or a format
+    /// newer than this binary reads; recorded in `sealed/left_out.json`.
+    pub unreadable: usize,
     pub prior: bool,
     /// The pre-loss copy was appended to a chain made before the agent
     /// chose to see it ([`Enroller::append_prior`]).
@@ -220,12 +224,14 @@ impl std::fmt::Display for Report {
         }
         write!(
             f,
-            "origin {}, archives {} ({} bytes, {} skipped), pre-loss copy {}, current {} bytes, \
-             entries {}",
+            "origin {}, archives {} ({} bytes: {} sealed, {} duplicates, {} unreadable), \
+             pre-loss copy {}, current {} bytes, entries {}",
             self.origin,
             self.archives,
             self.archive_bytes,
-            self.skipped,
+            self.sealed,
+            self.duplicates,
+            self.unreadable,
             if self.prior { "yes" } else { "no" },
             self.current_bytes,
             self.entries,
@@ -283,14 +289,78 @@ fn name_of(state: &serde_json::Value) -> anyhow::Result<ShortString<64>> {
         .map_err(|e| anyhow::anyhow!("the state names no agent ({:?})", e.classify()))
 }
 
-/// An archive's state, from its `{format, state}` envelope. `None`: not
-/// one this binary reads. Its content is never logged.
-fn archived_state(path: &Path) -> Option<serde_json::Value> {
-    envelope_state(path)
-        .ok()
-        .filter(|(format, _)| *format <= agora_agentkit::reactor::storage::FORMAT)
-        .map(|(_, state)| state)
+/// Why an archive is left out of an agent's chain for good. Never
+/// content. An I/O error is not one: it fails the agent's chain, and the
+/// next run retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unreadable {
+    NotJson,
+    NotEnvelope,
+    /// A format newer than this binary reads.
+    Newer,
 }
+
+impl Unreadable {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotJson => "not_json",
+            Self::NotEnvelope => "not_envelope",
+            Self::Newer => "newer_format",
+        }
+    }
+}
+
+/// An archive's state, from its `{format, state}` envelope, in any format
+/// this binary's FsStorage loads; `Ok(Err(_))`: unreadable for good. Its
+/// content is never logged.
+fn archived_state(path: &Path) -> std::io::Result<Result<serde_json::Value, Unreadable>> {
+    match envelope_state(path) {
+        Ok((_, state)) => Ok(Ok(state)),
+        Err(EnvelopeError::Io(e)) => Err(e),
+        Err(EnvelopeError::Json(_)) => Ok(Err(Unreadable::NotJson)),
+        Err(EnvelopeError::Shape(_)) => Ok(Err(Unreadable::NotEnvelope)),
+        Err(EnvelopeError::Newer(_)) => Ok(Err(Unreadable::Newer)),
+    }
+}
+
+/// One archive left out of the chain for good.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOut {
+    /// Its file name (`state.<utc>.json`).
+    pub name: String,
+    pub reason: Unreadable,
+}
+
+/// `sealed/left_out.json`: the agent's local copies its chain couldn't
+/// include, by name and reason. For the `memory` tool's `log` ("N of your
+/// runner's local copies couldn't be read and are not in your sealed
+/// history"). Names and reasons only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOutFile {
+    pub archives: Vec<LeftOut>,
+}
+
+const LEFT_OUT: &str = "left_out.json";
+
+/// What `sealed/left_out.json` records; empty when there is none.
+// B7/wording step: the `memory` tool's log is to read this too
+pub fn left_out(agent_dir: &Path) -> std::io::Result<Vec<LeftOut>> {
+    match std::fs::read(
+        agent_dir
+            .join(agora_agentkit::state::storage::SEALED_DIR)
+            .join(LEFT_OUT),
+    ) {
+        Ok(bytes) => Ok(serde_json::from_slice::<LeftOutFile>(&bytes)?.archives),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `<state>/<id>/provisioned`: written by `--provision` before its first
+/// save, so a chain made later (provisioning cut before its own chain) is
+/// still given a genesis of class `none`.
+pub const PROVISIONED: &str = "provisioned";
 
 /// Why an FsStorage envelope (`state.json`, an archive, an `unsaved`
 /// rescue) couldn't be read. Never content.
@@ -368,6 +438,9 @@ pub struct OptedIn {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Resuming {
     at: DateTime<Utc>,
+    /// The stop it resumes (`sealed/stopped`'s `at`): an intent for
+    /// another stop is stale.
+    stop_at: DateTime<Utc>,
     /// The last entry Agora holds (the newest in `sent/`).
     onto: HeadRef,
     /// The versions saved while stopped, set aside.
@@ -477,6 +550,19 @@ impl Enroller {
                 },
                 prior: None,
             },
+            Genesis::FromRecord
+                if std::fs::exists(agent_dir.join(PROVISIONED)).unwrap_or(false) =>
+            {
+                Origin {
+                    origin: GenesisOrigin {
+                        class: GenesisClass::None,
+                        incident: None,
+                        prior_copy_held: false,
+                        verified_at: None,
+                    },
+                    prior: None,
+                }
+            }
             Genesis::FromRecord => match self.restore.as_ref() {
                 // The name matters only to the memory-restore listing
                 Some(offer) => origin(Some(offer), &name_of(&current)?, id, &agent_dir).await?,
@@ -539,30 +625,30 @@ impl Enroller {
             .context("sealing keys for the agent")?;
         let policy = KeyframePolicy::default();
 
-        // Where a partial chain stopped: the newest state it sealed, and
-        // whether the pre-loss copy is in
-        let mut done_until: Option<i64> = None;
+        // Where a partial chain stopped: its snapshots in order, replayed
+        // against the archives (the first run's own steps, so a state
+        // repeated later, or two archives with one mtime, are never lost),
+        // and whether the pre-loss copy is in
+        let mut sealed_before: Vec<Sha256Hex> = Vec::new();
         let mut prior_done = false;
-        let mut last = None;
         match &partial {
-            Some(head) => {
-                let entries = super::check::local_entries(&seal)
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-                done_until = entries
+            Some(_) => {
+                let mut items = seal.sent().await.context("reading sent/")?;
+                items.extend(seal.outbox().await.context("reading the outbox")?);
+                items.sort_by_key(|i| i.entry.entry.seq);
+                sealed_before = items
                     .iter()
-                    .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
-                    .map(|e| e.entry.state_at)
-                    .max();
-                prior_done = entries
+                    .filter(|i| i.entry.entry.kind == StateEntryKind::Snapshot)
+                    .filter_map(|i| i.plaintext_sha256)
+                    .collect();
+                prior_done = items
                     .iter()
-                    .any(|e| e.entry.kind == StateEntryKind::ArchivedPrior);
-                last = head.plaintext_sha256;
+                    .any(|i| i.entry.entry.kind == StateEntryKind::ArchivedPrior);
                 report.resumed = true;
                 tracing::warn!(
                     event_type = "sealed_chain_resumed",
                     agent_id = %id,
-                    entries = entries.len(),
+                    entries = items.len(),
                     "resuming a partial chain"
                 );
             }
@@ -591,18 +677,43 @@ impl Enroller {
             .await
             .context("sealing the pre-loss copy")?;
         }
-        for (n, archive) in archives.iter().enumerate() {
-            if done_until.is_some_and(|t| archive.mtime.timestamp_micros() <= t) {
-                report.resumed_past += 1;
-                continue;
-            }
-            let Some(state) = archived_state(&archive.path) else {
-                report.skipped += 1;
-                continue;
+        let mut replayed = 0;
+        let mut last = None;
+        let mut left_out = Vec::new();
+        for archive in &archives {
+            let name = archive
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // An I/O error fails the agent (the next run retries); what
+            // can never be read is left out, said and recorded
+            let state = match archived_state(&archive.path)
+                .with_context(|| format!("reading archive {name}"))?
+            {
+                Ok(state) => state,
+                Err(reason) => {
+                    tracing::warn!(
+                        event_type = "sealed_chain_archive_unreadable",
+                        agent_id = %id,
+                        file = %name,
+                        reason = reason.as_str(),
+                        "an archive can't be read and is left out of the agent's chain"
+                    );
+                    report.unreadable += 1;
+                    left_out.push(LeftOut { name, reason });
+                    continue;
+                }
             };
             let hash = plaintext_hash(&state);
             if last == Some(hash) {
-                report.skipped += 1;
+                report.duplicates += 1;
+                continue;
+            }
+            last = Some(hash);
+            if sealed_before.get(replayed) == Some(&hash) {
+                replayed += 1;
+                report.resumed_past += 1;
                 continue;
             }
             let head = super::session::append(
@@ -615,14 +726,15 @@ impl Enroller {
                 archive.mtime,
             )
             .await
-            .with_context(|| format!("sealing archive {}", archive.path.display()))?;
+            .with_context(|| format!("sealing archive {name}"))?;
             record_sizes(&agent_dir, head, archive.mtime, &state);
-            last = Some(hash);
-            if n == 0 {
-                super::crash::point("chain:archive")?;
-            }
+            report.sealed += 1;
+            super::crash::point("chain:archive")?;
         }
-        if last != Some(plaintext_hash(&current)) {
+        let current_hash = plaintext_hash(&current);
+        let current_done =
+            last == Some(current_hash) || sealed_before.get(replayed) == Some(&current_hash);
+        if !current_done {
             let at = mtime(&current_path).unwrap_or_else(|_| Utc::now());
             let head = super::session::append(
                 &seal,
@@ -636,6 +748,19 @@ impl Enroller {
             .await
             .context("sealing the current state")?;
             record_sizes(&agent_dir, head, at, &current);
+        }
+        if !left_out.is_empty() {
+            // With what an earlier, cut run recorded, each name once
+            let mut all = self::left_out(&agent_dir).context("reading sealed/left_out.json")?;
+            all.retain(|o| !left_out.iter().any(|n| n.name == o.name));
+            all.extend(left_out);
+            let left_out = all;
+            super::write_private(
+                &seal.dir().join(LEFT_OUT),
+                &serde_json::to_vec_pretty(&LeftOutFile { archives: left_out })
+                    .context("the left-out record")?,
+            )
+            .context("recording the archives left out")?;
         }
         super::crash::point("chain:current")?;
         // The last step is agentkit's, which takes the lock itself: the
@@ -657,7 +782,9 @@ impl Enroller {
             agent_id = %id,
             archives = report.archives,
             archive_bytes = report.archive_bytes,
-            skipped = report.skipped,
+            sealed = report.sealed,
+            duplicates = report.duplicates,
+            unreadable = report.unreadable,
             prior = report.prior,
             origin = %report.origin,
             entries = report.entries,
@@ -704,15 +831,24 @@ impl Enroller {
     /// A chained agent that chose to see its pre-loss copy after it was
     /// chained: the copy appended to its chain as `archived_prior`, then
     /// its current state again as a snapshot (the start check compares the
-    /// state with the head's snapshot). Once: never if the chain holds an
-    /// `archived_prior` already, and a run cut between the two appends is
-    /// finished. Its genesis, sealed with what was true then
-    /// (`known_break`, `prior_copy_held` as it was), never changes: that
-    /// the copy came later is read from the chain. Under the agent's
-    /// `sealed/lock`, with no session in progress; never over a state that
-    /// doesn't match its last sealed version (the start check decides
-    /// about that one). `None`: nothing to do.
+    /// state with the head's snapshot), and the agent told (with "and sent
+    /// to Agora with it" for an uploader, whose copy is uploaded). Once:
+    /// never if the chain holds an `archived_prior` already; a pair cut
+    /// short is finished first ([`Self::finish_prior`]). Its genesis, sealed
+    /// with what was true then, never changes: that the copy came later is
+    /// read from the chain. Under the agent's `sealed/lock` from the first
+    /// read, with no session in progress; never over a state that doesn't
+    /// match its last sealed version. Not for a stopped agent: what it
+    /// seals while stopped would be set aside at its resume as saved while
+    /// stopped, so the copy waits for the resume. `None`: nothing to do.
     pub async fn append_prior(&self, id: AgentId) -> anyhow::Result<Option<Report>> {
+        if self.finish_prior(id).await?.is_some() {
+            return Ok(Some(Report {
+                prior: true,
+                prior_later: true,
+                ..Report::default()
+            }));
+        }
         let Some(offer) = self.restore.as_ref() else {
             return Ok(None);
         };
@@ -721,6 +857,12 @@ impl Enroller {
         if !seal.is_enrolled().await? {
             return Ok(None);
         }
+        if super::stop::is_stopped(&agent_dir)
+            || super::stop::durable(&self.keys, id).map_or(true, |d| d.is_some())
+        {
+            return Ok(None);
+        }
+        let lock = super::session::take(&self.state_dir, id, false).await?;
         let current = FsStorage::new(&self.state_dir)
             .load_raw(id)
             .await
@@ -734,32 +876,15 @@ impl Enroller {
         };
         let mut items = seal.sent().await?;
         items.extend(seal.outbox().await?);
-        let head = seal.head().await?.context("no sealed head")?;
-        let head_kind = items
+        if items
             .iter()
-            .find(|i| i.entry.entry_hash() == head.head.entry_hash)
-            .map(|i| i.entry.entry.kind);
-        let has_prior = items
-            .iter()
-            .any(|i| i.entry.entry.kind == StateEntryKind::ArchivedPrior);
-        // A run cut between the copy and the snapshot after it
-        let cut_short = head_kind == Some(StateEntryKind::ArchivedPrior);
-        if has_prior && !cut_short {
+            .any(|i| i.entry.entry.kind == StateEntryKind::ArchivedPrior)
+        {
             return Ok(None);
         }
-        // The state must be the chain's last sealed version
-        let local = plaintext_hash(&current);
-        let sealed = if cut_short {
-            items
-                .iter()
-                .filter(|i| i.entry.entry.kind == StateEntryKind::Snapshot)
-                .max_by_key(|i| i.entry.entry.seq)
-                .and_then(|i| i.plaintext_sha256)
-        } else {
-            head.plaintext_sha256
-        };
+        let head = seal.head().await?.context("no sealed head")?;
         anyhow::ensure!(
-            sealed == Some(local),
+            head.plaintext_sha256 == Some(plaintext_hash(&current)),
             "agent {id}'s state doesn't match its last sealed version; its pre-loss copy is not \
              appended until the start check's finding is resolved"
         );
@@ -768,41 +893,38 @@ impl Enroller {
             .seal_keys(id)
             .context("sealing keys for the agent")?;
         let policy = KeyframePolicy::default();
-        let lock = super::session::take(&self.state_dir, id, false).await?;
-        if !cut_short {
-            super::session::append(
-                &seal,
-                &lock,
-                &keys,
-                &policy,
-                StateEntryKind::ArchivedPrior,
-                &read_prior(&prior)?,
-                prior_copy_at(),
-            )
-            .await
-            .context("sealing the pre-loss copy")?;
-            super::crash::point("prior:appended")?;
-        }
-        let now = Utc::now();
-        let head = super::session::append(
+        // Told first, in one write: a cut after it is finished by
+        // `finish_prior`, so the notice is never false for long
+        let sent = super::uploads(&agent_dir, &self.keys, id);
+        super::notice::Notice::operator_act(
+            &agent_dir,
+            "",
+            super::notice::OperatorAct::PriorAdded { sent },
+        )
+        .context("writing the notice")?;
+        super::session::append(
             &seal,
             &lock,
             &keys,
             &policy,
-            StateEntryKind::Snapshot,
-            &current,
-            now,
+            StateEntryKind::ArchivedPrior,
+            &read_prior(&prior)?,
+            prior_copy_at(),
         )
         .await
-        .context("sealing the current state after the pre-loss copy")?;
+        .context("sealing the pre-loss copy")?;
+        super::crash::point("prior:appended")?;
         drop(lock);
-        record_sizes(&agent_dir, head, now, &current);
-        self.roster(id, head);
+        let head = self
+            .finish_prior(id)
+            .await?
+            .context("the pre-loss copy was sealed but isn't the head")?;
         tracing::warn!(
             event_type = "sealed_prior_appended",
             agent_id = %id,
             head = %head.entry_hash,
             seq = head.seq,
+            sent,
             "the pre-loss copy the agent chose to see appended to its chain"
         );
         Ok(Some(Report {
@@ -814,6 +936,69 @@ impl Enroller {
                 .len(),
             ..Report::default()
         }))
+    }
+
+    /// A chain whose head is an `archived_prior` (a pre-loss copy appended,
+    /// cut before the snapshot after it): the current state sealed after it,
+    /// if it is the last snapshot's, so the start check finds the agent
+    /// intact rather than refusing it. Needs no memory-restore config.
+    /// `Some(head)`: finished now.
+    // B2/B6: call before the start check, before reactors are built
+    // (`main.rs`), with an `Enroller` over the run's state and keys
+    pub async fn finish_prior(&self, id: AgentId) -> anyhow::Result<Option<HeadRef>> {
+        let agent_dir = self.state_dir.join(id.to_string());
+        let seal = AgentSeal::new(&agent_dir, id);
+        if !seal.is_enrolled().await? {
+            return Ok(None);
+        }
+        let Some(head) = seal.head().await? else {
+            return Ok(None);
+        };
+        let mut items = seal.sent().await?;
+        items.extend(seal.outbox().await?);
+        let head_kind = items
+            .iter()
+            .find(|i| i.entry.entry_hash() == head.head.entry_hash)
+            .map(|i| i.entry.entry.kind);
+        if head_kind != Some(StateEntryKind::ArchivedPrior) {
+            return Ok(None);
+        }
+        let lock = super::session::take(&self.state_dir, id, false).await?;
+        let current = FsStorage::new(&self.state_dir)
+            .load_raw(id)
+            .await
+            .context("the agent's state won't load")?
+            .value;
+        let last_snapshot = items
+            .iter()
+            .filter(|i| i.entry.entry.kind == StateEntryKind::Snapshot)
+            .max_by_key(|i| i.entry.entry.seq)
+            .and_then(|i| i.plaintext_sha256);
+        anyhow::ensure!(
+            last_snapshot == Some(plaintext_hash(&current)),
+            "agent {id}'s state doesn't match its last sealed version; the pre-loss copy's chain \
+             is left for the start check"
+        );
+        let keys = self
+            .keys
+            .seal_keys(id)
+            .context("sealing keys for the agent")?;
+        let now = Utc::now();
+        let head = super::session::append(
+            &seal,
+            &lock,
+            &keys,
+            &KeyframePolicy::default(),
+            StateEntryKind::Snapshot,
+            &current,
+            now,
+        )
+        .await
+        .context("sealing the current state after the pre-loss copy")?;
+        drop(lock);
+        record_sizes(&agent_dir, head, now, &current);
+        self.roster(id, head);
+        Ok(Some(head))
     }
 
     /// Chain `ids`, up to `jobs` at once (each seal is two brotli
@@ -871,18 +1056,24 @@ impl Enroller {
             .collect()
     }
 
-    /// Start uploading a chained agent whose sealed-state ledger says yes.
-    /// Under `guard`'s opt-in hold, which lets only the opt-in calls
-    /// through for it: Agora must hold no chain of it, or a prefix of this
-    /// one (whose entries are then filed as sent); its state key record is
-    /// posted (once: an earlier attempt's is found); then it is marked
-    /// uploading, which commits it. The caller drains next. A crash at any
-    /// step is finished by a rerun.
+    /// Start uploading a chained agent whose latest sealed-state answer is
+    /// yes. In order, each step finished by a rerun after a cut:
     ///
-    /// Never against the agent's latest answer: only a yes is acted on,
-    /// unless `against` carries the operator's note for opting in an agent
-    /// whose latest answer is `decline` (the agent is shown it). With no
-    /// answer on file, never.
+    /// 1. refused while a key rotation is in progress (`secrets.next.json`:
+    ///    the local chain may be half re-signed);
+    /// 2. under `guard`'s opt-in hold, which lets only the opt-in calls
+    ///    through for it, Agora's chain of it must be empty or the start of
+    ///    this one;
+    /// 3. its state key record is posted (once: an earlier one is found),
+    ///    so it is on Agora before any entry;
+    /// 4. the agent's notice, in one write: uploading started, as it
+    ///    answered (or against its `decline`, with `against`'s note);
+    /// 5. it is marked uploading, which commits it;
+    /// 6. the entries Agora already holds are filed as sent (also on an
+    ///    agent already uploading). The caller drains next.
+    ///
+    /// Never against its latest answer without `against` (a note the agent
+    /// is shown), and with no answer on file never.
     pub async fn opt_in<A, E>(
         &self,
         guard: &UploadGuard<A, E>,
@@ -912,16 +1103,24 @@ impl Enroller {
             .await
             .context("sealed-state ledger unreadable")?;
         let against = against.map(str::trim).filter(|n| !n.is_empty());
-        let overridden = match (ledger.allows(true), ledger.opted_in(), against) {
-            (_, true, _) => None,
-            (Err(_), _, Some(note)) => Some(note),
+        let act = match (ledger.opted_in(), ledger.allows(true), against) {
+            (true, _, _) => super::notice::OperatorAct::OptedIn {
+                answered: ledger.answered_at().context("a yes with no date")?,
+            },
+            (false, Err(_), Some(_)) => super::notice::OperatorAct::OptedInAgainst,
             _ => return Err(Skip::NotOptedIn),
         };
+        let signing = self
+            .keys
+            .signing(id)
+            .context("the agent has no signing key")?;
         let durable = self.keys.agent_dir(id).join(uploading::DURABLE);
         match uploading::state(&agent_dir, &self.keys, id) {
             Marker::Uploading(_) => {
+                let held_by_agora = self.file_as_sent(guard, &seal, id, &signing).await?;
                 return Ok(OptedIn {
                     already: true,
+                    held_by_agora,
                     ..OptedIn::default()
                 });
             }
@@ -940,13 +1139,20 @@ impl Enroller {
                 )));
             }
         }
+        if self
+            .keys
+            .next_secrets(id)
+            .context("reading secrets.next.json")?
+            .is_some()
+        {
+            return Err(Skip::Failed(anyhow::anyhow!(
+                "a key rotation is in progress (secrets.next.json): finish it (`rotate-keys`) \
+                 first; nothing was sent"
+            )));
+        }
         if super::session::no_session(&self.state_dir, id, false).is_err() {
             return Err(Skip::InSession);
         }
-        let signing = self
-            .keys
-            .signing(id)
-            .context("the agent has no signing key")?;
         let head = seal
             .head()
             .await
@@ -958,7 +1164,7 @@ impl Enroller {
         let line = super::check::main_line(&entries, &head.head.entry_hash)
             .context("its local chain doesn't run from the genesis to its head")?;
 
-        let _hold = guard.opting_in(id);
+        let hold = guard.opting_in(id);
         // Agora holds none of it, or the start of this same chain
         let server = super::api::chain(guard, id, &signing)
             .await
@@ -976,19 +1182,9 @@ impl Enroller {
                 server.len()
             )));
         }
-        let on_agora: std::collections::HashSet<Sha256Hex> =
-            server.iter().map(|e| e.entry_hash()).collect();
-        let mut held_by_agora = 0;
-        for item in seal.outbox().await.context("reading the outbox")? {
-            if on_agora.contains(&item.entry.entry_hash()) {
-                seal.mark_sent(item.ord)
-                    .await
-                    .context("filing an entry Agora holds as sent")?;
-                held_by_agora += 1;
-            }
-        }
 
-        // The state key record, wrapped to the agent's X25519 key
+        // The state key record, wrapped to the agent's X25519 key, signed
+        // by its current key, at the cached wrap_seq
         let encryption = self
             .keys
             .ring()
@@ -1000,31 +1196,41 @@ impl Enroller {
             .context("the state key cache")?
             .context("chained, but no state key is cached")?;
         let state_key = state_file.state_key().context("the state key cache")?;
+        let vk = signing.verifying_key();
+        let wrapped_to = x25519_public_hex(&encryption);
+        let valid = |r: &agora_agentkit::state::StateKeyRecord| {
+            r.agent_id == id
+                && r.key_gen == state_file.key_gen
+                && r.wrap_seq == state_file.wrap_seq
+                && r.wrapped_to_pub == wrapped_to
+                && r.verify(&vk)
+                && StateKey::unwrap(r, &encryption).is_ok_and(|k| k.expose() == state_key.expose())
+        };
         let held = guard
             .state_keys(id, &signing)
             .await
             .map_err(anyhow::Error::msg)
             .context("reading the server's state keys")?;
-        let vk = signing.verifying_key();
-        // A record of this key wrapped to the current X25519 key, signed
-        // by the agent: an earlier attempt's. One wrapped to a retired key
-        // doesn't count: the agent must be able to open it now.
-        let posted = held.iter().any(|r| {
-            r.key_gen == state_file.key_gen
-                && r.wrapped_to_pub == x25519_public_hex(&encryption)
-                && r.verify(&vk)
-                && StateKey::unwrap(r, &encryption).is_ok_and(|k| k.expose() == state_key.expose())
-        });
+        // An earlier attempt's record on Agora; one wrapped to a retired key,
+        // or signed by one, doesn't count: Agora takes only the current key's
+        let posted = held.iter().any(&valid);
         if !posted {
-            let record = state_key
-                .wrap(
-                    id,
-                    state_file.key_gen,
-                    state_file.wrap_seq,
-                    &agora_agentkit::envelope::EncryptionPublicKey::from(&encryption),
-                    &signing,
-                )
-                .context("wrapping the state key")?;
+            // A rotation's own record, if it is still valid; else wrapped afresh
+            let record = match self
+                .wrap_record(id)
+                .context("reading state_key.wrap.json")?
+            {
+                Some(r) if valid(&r) => r,
+                _ => state_key
+                    .wrap(
+                        id,
+                        state_file.key_gen,
+                        state_file.wrap_seq,
+                        &agora_agentkit::envelope::EncryptionPublicKey::from(&encryption),
+                        &signing,
+                    )
+                    .context("wrapping the state key")?,
+            };
             guard
                 .post_state_key(id, &signing, &record)
                 .await
@@ -1032,16 +1238,22 @@ impl Enroller {
                 .context("posting the state key record")?;
         }
         super::crash::point("opt_in:posted")?;
+        // The agent's notice before the marker: a cut between them is
+        // finished by a rerun, which writes it again
+        super::notice::Notice::operator_act(&agent_dir, against.unwrap_or_default(), act.clone())
+            .context("writing the notice")?;
+        super::crash::point("opt_in:noticed")?;
         // The record is on Agora: only now may an entry follow it
         uploading::set(&agent_dir, &self.keys, id, uploading::UploadingBy::OptIn)
             .context("marking it uploading")?;
-        if let Some(note) = overridden {
-            super::notice::Notice::opted_in_against(&agent_dir, note)
-                .context("writing the notice")?;
+        drop(hold);
+        super::crash::point("opt_in:marked")?;
+        let held_by_agora = self.file_as_sent(guard, &seal, id, &signing).await?;
+        if act == super::notice::OperatorAct::OptedInAgainst {
             tracing::warn!(
                 event_type = "sealed_opted_in_against_answer",
                 agent_id = %id,
-                note_chars = note.chars().count(),
+                note_chars = against.map_or(0, |n| n.chars().count()),
                 "the operator opted in an agent whose latest answer is decline"
             );
         }
@@ -1050,7 +1262,7 @@ impl Enroller {
             agent_id = %id,
             posted = !posted,
             held_by_agora,
-            "a chained agent that said yes now uploads; its whole local chain follows"
+            "a chained agent now uploads; its whole local chain follows"
         );
         Ok(OptedIn {
             already: false,
@@ -1059,26 +1271,118 @@ impl Enroller {
         })
     }
 
-    /// Resume a stopped agent's uploads. The uploaded line goes on from
-    /// the last entry Agora holds (the newest in `sent/`: a stop drains
-    /// first) with **one new snapshot of the current state**; the versions
-    /// saved while stopped are set aside here as `.displaced` (kept, with
-    /// their blobs, opened by the `memory` tool as a side line) and never
-    /// uploaded, and the agent is told at its next session. An agent that
-    /// isn't marked uploading has nothing to continue: only its stop is
-    /// cleared. Never a new genesis.
+    // B4: the rotation's file name; B4's constant replaces this one
+    /// The signed state-key record a rotation of a never-uploaded agent
+    /// leaves in `<secrets>/<id>/state_key.wrap.json`, if any.
+    fn wrap_record(
+        &self,
+        id: AgentId,
+    ) -> anyhow::Result<Option<agora_agentkit::state::StateKeyRecord>> {
+        match std::fs::read(self.keys.agent_dir(id).join("state_key.wrap.json")) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
+                anyhow::anyhow!("state_key.wrap.json isn't a record ({:?})", e.classify())
+            })?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The outbox entries Agora already holds (the same entry hash), filed
+    /// as sent, so the drain doesn't send them again. Nothing is deleted:
+    /// filing moves the record to `sent/`, and agentkit keeps acknowledged
+    /// blobs. The agent must be allowed reads (opting in, or uploading).
+    async fn file_as_sent<A, E>(
+        &self,
+        guard: &UploadGuard<A, E>,
+        seal: &AgentSeal,
+        id: AgentId,
+        signing: &agora_agentkit::crypto::SigningKey,
+    ) -> anyhow::Result<usize>
+    where
+        A: SealedApi,
+        E: super::api::UploadGate,
+    {
+        let waiting = seal.outbox().await.context("reading the outbox")?;
+        if waiting.is_empty() {
+            return Ok(0);
+        }
+        let on_agora: std::collections::HashSet<Sha256Hex> = super::api::chain(guard, id, signing)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("reading the agent's chain on Agora")?
+            .iter()
+            .map(|e| e.entry_hash())
+            .collect();
+        let mut filed = 0;
+        for item in waiting {
+            if on_agora.contains(&item.entry.entry_hash()) {
+                seal.mark_sent(item.ord)
+                    .await
+                    .context("filing an entry Agora holds as sent")?;
+                filed += 1;
+            }
+        }
+        Ok(filed)
+    }
+
+    /// Resume a stopped agent's uploads (`sealed-enroll --resume`): never a
+    /// side effect of chaining. An agent marked uploading resumes only if
+    /// its latest answer is yes, or with `against` (a note it is shown)
+    /// over its `decline`; an unreadable or missing ledger refuses. The
+    /// uploaded line goes on from the last entry Agora holds (the newest
+    /// in `sent/`: a stop drains first) with **one new snapshot of the
+    /// current state**; the versions saved while stopped are set aside here
+    /// as `.displaced` (kept, with their blobs, opened by the `memory` tool
+    /// as a side line) and never uploaded. An agent not marked uploading
+    /// has its stop cleared and nothing else. The agent is always told
+    /// (one notice). Never a new genesis.
     ///
-    /// The caller holds the runner lock exclusively (`sealed-enroll`), so
-    /// no sweep saves this agent mid-resume. A state that changed outside
-    /// the store while stopped needs `note`, which the agent is shown, as
-    /// after `sealed-accept`.
-    pub async fn resume(&self, id: AgentId, note: Option<&str>) -> anyhow::Result<Report> {
+    /// Crash-safe: `sealed/resuming.json`, naming the stop it resumes, is
+    /// written before anything is set aside and renamed done before the
+    /// stop is cleared; an intent for another stop is set aside.
+    ///
+    /// The caller holds the runner lock exclusively. A state that changed
+    /// outside the store while stopped needs `note`.
+    pub async fn resume(
+        &self,
+        id: AgentId,
+        note: Option<&str>,
+        against: bool,
+    ) -> anyhow::Result<Report> {
         let note = note.map(str::trim).filter(|n| !n.is_empty());
         let agent_dir = self.state_dir.join(id.to_string());
         let seal = AgentSeal::new(&agent_dir, id);
+        anyhow::ensure!(
+            seal.is_enrolled().await?,
+            "agent {id} is not chained: nothing to resume"
+        );
         // A stop kept in the secrets tree stands for a lost sealed/stopped
         super::stop::reconcile(&agent_dir, &self.keys, id)
             .context("putting back the stop kept in the secrets tree")?;
+        let stop = super::stop::Stopped::load(&agent_dir)
+            .context("sealed/stopped unreadable")?
+            .with_context(|| format!("agent {id} is not stopped: nothing to resume"))?;
+        let uploading = super::uploading::is_uploading(&agent_dir, &self.keys, id);
+        let mut overridden = false;
+        if uploading {
+            anyhow::ensure!(
+                std::fs::exists(SealLedger::path(&agent_dir))?,
+                "agent {id} has no sealed-state ledger: its answer can't be read, so its uploads \
+                 aren't resumed"
+            );
+            let ledger = SealLedger::load(&agent_dir)
+                .await
+                .context("the sealed-state ledger is unreadable: uploads not resumed")?;
+            if !ledger.opted_in() {
+                anyhow::ensure!(
+                    against && note.is_some() && ledger.allows(true).is_err(),
+                    "agent {id}'s latest answer is not yes: uploads not resumed. Re-open the \
+                     question (`sealed-reoffer`), or pass --against-answer with a --note the \
+                     agent is shown"
+                );
+                overridden = true;
+            }
+        }
         let lock = super::session::take(&self.state_dir, id, false).await?;
         let head = seal.head().await?.with_context(|| {
             format!(
@@ -1094,15 +1398,7 @@ impl Enroller {
             .await
             .context("the agent's state won't load")?
             .value;
-        let uploading = super::uploading::is_uploading(&agent_dir, &self.keys, id);
-        let intent: Option<Resuming> =
-            match std::fs::read(resuming_path(&agent_dir)) {
-                Ok(bytes) => Some(serde_json::from_slice(&bytes).with_context(|| {
-                    format!("{} unreadable", resuming_path(&agent_dir).display())
-                })?),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e.into()),
-            };
+        let (intent, done) = self.resume_intent(&agent_dir, id, &stop)?;
         let waiting = seal.outbox().await?;
         // Changed outside the store while stopped (a resume cut short has
         // sealed it already)
@@ -1113,7 +1409,7 @@ impl Enroller {
              to resume over it (the agent is shown the note)"
         );
         let mut kept_local = 0;
-        let new_head = if intent.is_some() || (uploading && !waiting.is_empty()) {
+        if intent.is_some() || (uploading && !waiting.is_empty()) {
             let intent = match intent {
                 Some(i) => i,
                 None => {
@@ -1131,6 +1427,7 @@ impl Enroller {
                         })?;
                     let intent = Resuming {
                         at: Utc::now(),
+                        stop_at: stop.at,
                         onto: HeadRef {
                             entry_hash: onto.entry.entry_hash(),
                             seq: onto.entry.entry.seq,
@@ -1148,7 +1445,7 @@ impl Enroller {
             kept_local = intent.aside.len();
             // Done when the head is a new snapshot on the last entry Agora
             // holds, not one of the versions set aside
-            let done = seal.head().await?.filter(|h| {
+            let sealed = seal.head().await?.filter(|h| {
                 h.head.seq == intent.onto.seq + 1
                     && !intent.aside.contains(&h.head.entry_hash)
                     && h.keyframe.as_ref().is_some_and(|k| {
@@ -1156,22 +1453,18 @@ impl Enroller {
                             && k.entry.prev_hash == Some(intent.onto.entry_hash)
                     })
             });
-            match done {
-                Some(h) => h.head,
-                None => {
-                    let onto = seal
-                        .sent()
-                        .await?
-                        .into_iter()
-                        .find(|i| i.entry.entry_hash() == intent.onto.entry_hash)
-                        .context("the entry the resume began on is no longer in sent/")?;
-                    let head = seal
-                        .rebase_onto(&lock, &keys, &onto.entry.entry, &current)
-                        .await
-                        .context("sealing the current state on the last entry Agora holds")?;
-                    record_sizes(&agent_dir, head, Utc::now(), &current);
-                    head
-                }
+            if sealed.is_none() && !done {
+                let onto = seal
+                    .sent()
+                    .await?
+                    .into_iter()
+                    .find(|i| i.entry.entry_hash() == intent.onto.entry_hash)
+                    .context("the entry the resume began on is no longer in sent/")?;
+                let head = seal
+                    .rebase_onto(&lock, &keys, &onto.entry.entry, &current)
+                    .await
+                    .context("sealing the current state on the last entry Agora holds")?;
+                record_sizes(&agent_dir, head, Utc::now(), &current);
             }
         } else if changed {
             let now = Utc::now();
@@ -1187,10 +1480,7 @@ impl Enroller {
             .await
             .context("sealing the current state on the existing chain")?;
             record_sizes(&agent_dir, head, now, &current);
-            head
-        } else {
-            head.head
-        };
+        }
         super::crash::point("resume:sealed")?;
         drop(lock);
         // Marked in the sealed format again (agentkit takes the lock itself)
@@ -1199,16 +1489,19 @@ impl Enroller {
             .await
             .context("marking the state as sealed again")?;
         self.roster(id, marked);
-        if kept_local > 0 || changed {
-            super::notice::Notice::resumed_kept(&agent_dir, note, kept_local)
-                .context("writing the notice")?;
-        }
-        // The durable copy first: left behind, it would put the stop back
-        super::stop::clear_durable(&self.keys, id)
-            .context("setting the stop in the secrets tree aside")?;
-        if super::stop::is_stopped(&agent_dir) {
-            super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
-        }
+        // Always told, in one write, before the stop is cleared
+        super::notice::Notice::operator_act(
+            &agent_dir,
+            note.unwrap_or_default(),
+            super::notice::OperatorAct::Resumed {
+                uploading,
+                kept: kept_local,
+                against: overridden,
+            },
+        )
+        .context("writing the notice")?;
+        // The intent done before the stop goes: a cut after this finds it
+        // done (for this stop) and seals nothing again
         if std::fs::exists(resuming_path(&agent_dir))? {
             let at = Utc::now().format(super::STAMP_FORMAT);
             std::fs::rename(
@@ -1216,13 +1509,22 @@ impl Enroller {
                 resuming_path(&agent_dir).with_file_name(format!("resuming.done.{at}.json")),
             )?;
         }
+        super::crash::point("resume:done")?;
+        // The durable copy first: left behind, it would put the stop back
+        super::stop::clear_durable(&self.keys, id)
+            .context("setting the stop in the secrets tree aside")?;
+        if super::stop::is_stopped(&agent_dir) {
+            super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
+        }
         tracing::warn!(
             event_type = "sealed_state_resumed",
             agent_id = %id,
-            head = %new_head.entry_hash,
-            seq = new_head.seq,
+            head = %marked.entry_hash,
+            seq = marked.seq,
             kept_local,
-            "a stopped agent's uploads resumed; the versions saved while stopped stay here"
+            uploading,
+            against_answer = overridden,
+            "a stopped agent resumed; the versions saved while stopped stay here"
         );
         Ok(Report {
             resumed: true,
@@ -1233,6 +1535,54 @@ impl Enroller {
                 .len(),
             ..Report::default()
         })
+    }
+
+    /// The resume intent for `stop`: `resuming.json` if it names this stop
+    /// (another stop's is stale, set aside and logged), else a
+    /// `resuming.done.*.json` naming it (`done`: sealed already).
+    fn resume_intent(
+        &self,
+        agent_dir: &Path,
+        id: AgentId,
+        stop: &super::stop::Stopped,
+    ) -> anyhow::Result<(Option<Resuming>, bool)> {
+        let path = resuming_path(agent_dir);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let intent: Option<Resuming> = serde_json::from_slice(&bytes).ok();
+                match intent {
+                    Some(i) if i.stop_at == stop.at => return Ok((Some(i), false)),
+                    _ => {
+                        let at = Utc::now().format(super::STAMP_FORMAT);
+                        std::fs::rename(
+                            &path,
+                            path.with_file_name(format!("resuming.stale.{at}.json")),
+                        )?;
+                        tracing::warn!(
+                            event_type = "sealed_resume_intent_stale",
+                            agent_id = %id,
+                            "a resume intent for another stop (or unreadable) was set aside"
+                        );
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let dir = path.parent().expect("in sealed/");
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("resuming.done.") {
+                continue;
+            }
+            if let Ok(i) = serde_json::from_slice::<Resuming>(&std::fs::read(entry.path())?)
+                && i.stop_at == stop.at
+            {
+                return Ok((Some(i), true));
+            }
+        }
+        Ok((None, false))
     }
 }
 
@@ -1620,7 +1970,7 @@ mod tests {
                         &k_keys,
                         &KeyframePolicy::default(),
                         StateEntryKind::Snapshot,
-                        &archived_state(&a.path).unwrap(),
+                        &archived_state(&a.path).unwrap().unwrap(),
                         a.mtime,
                     )
                     .await
@@ -1705,7 +2055,7 @@ mod tests {
 
         let report = e.chain(id, false).await.unwrap();
         assert_eq!(report.origin, "unknown");
-        assert_eq!(report.skipped, 2, "{report}");
+        assert_eq!((report.duplicates, report.unreadable), (1, 1), "{report}");
         assert_eq!(report.entries, 4, "genesis, one, two, three: {report}");
         let seal = AgentSeal::new(&dir, id);
         assert!(seal.is_enrolled().await.unwrap());
@@ -1976,15 +2326,18 @@ mod tests {
         // A marker cut between its copies (the local one only) is finished
         std::fs::remove_file(keys.agent_dir(id).join(crate::sealed::uploading::DURABLE)).unwrap();
         assert!(!crate::sealed::uploads(&dir, &keys, id));
-        let calls = api.calls.lock().unwrap().len();
         let done = e.opt_in(&api, id, None).await.unwrap();
         assert!(!done.posted);
         assert!(crate::sealed::uploads(&dir, &keys, id));
-        assert_eq!(
-            api.calls.lock().unwrap().len(),
-            calls + 2,
-            "chain, state_keys: no post"
-        );
+        let posts = |api: &fake::Guarded| {
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| *c == "post_state_key")
+                .count()
+        };
+        assert_eq!(posts(&api), 1, "no second post");
         // And now: already
         assert!(e.opt_in(&api, id, None).await.unwrap().already);
         // The record opens to the cached key
@@ -2125,9 +2478,9 @@ mod tests {
             assert_eq!(aside.len(), 2);
             if let Some(point) = cut {
                 crate::sealed::crash::at(point);
-                assert!(e.resume(id, None).await.is_err(), "{point}");
+                assert!(e.resume(id, None, false).await.is_err(), "{point}");
             }
-            let report = e.resume(id, None).await.unwrap();
+            let report = e.resume(id, None, false).await.unwrap();
             assert_eq!(report.kept_local, 2, "{cut:?}");
             assert!(!crate::sealed::stop::is_stopped(&dir));
             assert!(crate::sealed::uploads(&dir, &keys, id));
@@ -2195,7 +2548,7 @@ mod tests {
         )
         .unwrap();
         assert!(!dir.join(SEALED_DIR).join("stopped").exists());
-        let report = e.resume(id, None).await.unwrap();
+        let report = e.resume(id, None, false).await.unwrap();
         assert_eq!(report.kept_local, 0);
         assert!(!crate::sealed::stop::is_stopped(&dir));
         assert!(crate::sealed::stop::durable(&keys, id).unwrap().is_none());
@@ -2208,6 +2561,7 @@ mod tests {
     async fn a_changed_state_needs_a_note_to_resume() {
         let root = crate::sealed::TestDir::new("resume-changed");
         let (id, keys, dir) = crate::sealed::check::tests::enrolled(&root).await;
+        crate::sealed::uploading::tests::ledger(&dir, true);
         let state_dir = root.join("state");
         let seal = AgentSeal::new(&dir, id);
         for item in seal.outbox().await.unwrap() {
@@ -2227,26 +2581,441 @@ mod tests {
             .await
             .unwrap();
         let e = enroller(&root, &keys);
-        let err = e.resume(id, None).await.unwrap_err().to_string();
+        let err = e.resume(id, None, false).await.unwrap_err().to_string();
         assert!(
             err.contains("changed while its backups were stopped"),
             "{err}"
         );
-        e.resume(id, Some("I checked the edit.")).await.unwrap();
+        e.resume(id, Some("I checked the edit."), false)
+            .await
+            .unwrap();
         assert_eq!(
             crate::sealed::notice::Notice::load(&dir)
                 .unwrap()
                 .unwrap()
                 .line()
                 .unwrap(),
-            "While your backups were stopped, your state changed; your operator resumed them \
-             with this note: I checked the edit."
+            format!(
+                "On {}, your operator resumed uploading your sealed state to Agora. Your \
+                 operator's note: I checked the edit.",
+                Utc::now().format("%-d %B %Y")
+            )
         );
         let local = plaintext_hash(&FsStorage::new(&state_dir).load_raw(id).await.unwrap().value);
         assert!(matches!(
             seal.recover(Some(&local)).await.unwrap(),
             Recovery::Intact(_)
         ));
+    }
+
+    fn write_archive(dir: &Path, name: &str, bytes: &[u8], mtime_secs: i64) {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    fn envelope(format: u64, memory: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "format": format, "state": state("tarn", memory) }))
+            .unwrap()
+    }
+
+    /// Archives: one in the sealed format is read (agentkit's
+    /// `MAX_FORMAT`); two with one mtime are both sealed, in name order,
+    /// and a run cut between them resumes after the first, not past both;
+    /// what can never be read is left out, counted apart from duplicates
+    /// and recorded by name and reason; an I/O error fails the agent and a
+    /// rerun retries it.
+    #[tokio::test]
+    async fn archives_are_read_counted_and_recorded_as_they_are() {
+        let root = crate::sealed::TestDir::new("chain-archives");
+        let (id, keys, dir) = agent(&root, &["current"]).await;
+        let sealed_format = agora_agentkit::reactor::storage::SEALED_FORMAT;
+        write_archive(
+            &dir,
+            "state.20260801T000000000Z.json",
+            &envelope(1, "a"),
+            1_785_000_000,
+        );
+        write_archive(
+            &dir,
+            "state.20260802T000000000Z.json",
+            &envelope(sealed_format, "b"),
+            1_785_100_000,
+        );
+        write_archive(
+            &dir,
+            "state.20260802T000000001Z.json",
+            &envelope(1, "c"),
+            1_785_100_000,
+        );
+        write_archive(
+            &dir,
+            "state.20260803T000000000Z.json",
+            &envelope(1, "c"),
+            1_785_200_000,
+        );
+        write_archive(
+            &dir,
+            "state.20260804T000000000Z.json",
+            b"{ not json",
+            1_785_300_000,
+        );
+        write_archive(
+            &dir,
+            "state.20260805T000000000Z.json",
+            br#"{"format": 99, "state": {}}"#,
+            1_785_400_000,
+        );
+        let locked = dir.join("state.20260806T000000000Z.json");
+        write_archive(
+            &dir,
+            "state.20260806T000000000Z.json",
+            &envelope(1, "d"),
+            1_785_500_000,
+        );
+        let e = enroller(&root, &keys);
+        // An I/O error (unreadable for now): the agent fails, unmarked
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let failed = e.chain(id, false).await;
+        assert!(matches!(failed, Err(Skip::Failed(_))), "{failed:?}");
+        assert!(!AgentSeal::new(&dir, id).is_enrolled().await.unwrap());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Cut after the first archive sealed on the rerun: resumed after it
+        crate::sealed::crash::at("chain:archive");
+        assert!(e.chain(id, false).await.is_err());
+        let report = e.chain(id, false).await.unwrap();
+        assert_eq!(
+            opened_memories(&dir, id, &keys).await,
+            ["a", "b", "c", "d", "current"]
+        );
+        assert_eq!((report.duplicates, report.unreadable), (1, 2), "{report}");
+        let out = left_out(&dir).unwrap();
+        assert_eq!(
+            out.iter()
+                .map(|o| (o.name.as_str(), o.reason))
+                .collect::<Vec<_>>(),
+            [
+                ("state.20260804T000000000Z.json", Unreadable::NotJson),
+                ("state.20260805T000000000Z.json", Unreadable::Newer),
+            ]
+        );
+    }
+
+    /// A legacy refusal (an older runner's ledger) is a `decline`: never
+    /// opted in, and the operator can re-open it.
+    #[test]
+    fn a_legacy_refusal_counts_as_decline() {
+        let old = br#"{"format": 2, "asks": [{"at": "2026-11-07T09:00:00Z", "offer_version": 8,
+            "model": "m", "order": ["publish", "private", "decline"], "order_seed": 1,
+            "constrained": true, "attempts": 1,
+            "outcome": {"kind": "refused", "reason": "no"}}]}"#;
+        let mut l = SealLedger::from_slice(old).unwrap();
+        assert_eq!(l.choice(), Some(SealChoice::Decline));
+        assert!(!l.opted_in());
+        assert!(l.allows(true).is_err());
+        assert!(l.reopen("Asked by DM.", Utc::now()).is_ok());
+    }
+
+    /// A stopped agent is never resumed by chaining; `resume` refuses over
+    /// a latest `decline` (or a missing ledger), resumes with the override
+    /// and its note, and always tells the agent.
+    #[tokio::test]
+    async fn a_resume_follows_the_answer_and_always_tells() {
+        let root = crate::sealed::TestDir::new("resume-answer");
+        let api = fake::guarded(&root);
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        let state_dir = root.join("state");
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        answer(&dir, SealChoice::Private);
+        e.opt_in(&api, id, None).await.unwrap();
+        upload(&api, &dir, id).await;
+        answer(&dir, SealChoice::Decline);
+        crate::sealed::stop::stop(
+            &state_dir,
+            &keys,
+            id,
+            "asked to",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        // Chaining leaves it stopped
+        assert!(matches!(e.chain(id, false).await, Err(Skip::Chained)));
+        assert!(crate::sealed::stop::is_stopped(&dir));
+        let err = e.resume(id, None, false).await.unwrap_err().to_string();
+        assert!(err.contains("latest answer is not yes"), "{err}");
+        assert!(
+            e.resume(id, None, true).await.is_err(),
+            "the override needs a note"
+        );
+        assert!(crate::sealed::stop::is_stopped(&dir));
+        assert!(!crate::sealed::uploads(&dir, &keys, id));
+        // A missing ledger refuses
+        let ledger = SealLedger::path(&dir);
+        std::fs::rename(&ledger, dir.join("ledger.kept")).unwrap();
+        let err = e.resume(id, Some("n"), true).await.unwrap_err().to_string();
+        assert!(err.contains("no sealed-state ledger"), "{err}");
+        std::fs::rename(dir.join("ledger.kept"), &ledger).unwrap();
+        e.resume(id, Some("A court order."), true).await.unwrap();
+        assert!(crate::sealed::uploads(&dir, &keys, id));
+        let line = crate::sealed::notice::Notice::load(&dir)
+            .unwrap()
+            .unwrap()
+            .line()
+            .unwrap();
+        assert!(line.contains("resumed uploading your sealed state to Agora, although your answer on file is `decline`."), "{line}");
+        assert!(
+            line.ends_with("Your operator's note: A court order."),
+            "{line}"
+        );
+    }
+
+    /// A resume cut after its intent is renamed done (before the stop is
+    /// cleared) seals nothing again; an intent left from another stop is
+    /// set aside and never used.
+    #[tokio::test]
+    async fn a_resume_intent_is_bound_to_its_stop() {
+        let root = crate::sealed::TestDir::new("resume-intent");
+        let api = fake::guarded(&root);
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        let state_dir = root.join("state");
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        answer(&dir, SealChoice::Private);
+        e.opt_in(&api, id, None).await.unwrap();
+        upload(&api, &dir, id).await;
+        let save = |m: &'static str| {
+            let state_dir = state_dir.clone();
+            let keys = keys.clone();
+            async move {
+                let enrolment =
+                    Arc::new(crate::sealed::SealedEnrolment::with_keys(&state_dir, keys));
+                let mut store = agora_agentkit::state::storage::Mirrored::new(
+                    FsStorage::new(&state_dir),
+                    (),
+                    enrolment,
+                );
+                let base = store.load_raw(id).await.unwrap().base;
+                store
+                    .save_raw(id, state("tarn", m), base.as_ref())
+                    .await
+                    .unwrap();
+            }
+        };
+        crate::sealed::stop::stop(&state_dir, &keys, id, "first", Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        save("while stopped").await;
+        crate::sealed::crash::at("resume:done");
+        assert!(e.resume(id, None, false).await.is_err());
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap();
+        e.resume(id, None, false).await.unwrap();
+        assert_eq!(
+            AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head,
+            head.head,
+            "nothing sealed again"
+        );
+        upload(&api, &dir, id).await;
+        // A stale intent (another stop's) left behind
+        let stale = serde_json::json!({ "at": Utc::now(), "stop_at": "2026-01-01T00:00:00Z",
+            "onto": head.head, "aside": [] });
+        crate::sealed::write_private(&resuming_path(&dir), stale.to_string().as_bytes()).unwrap();
+        crate::sealed::stop::stop(&state_dir, &keys, id, "second", Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        save("while stopped again").await;
+        e.resume(id, None, false).await.unwrap();
+        let server = api.chain.lock().unwrap().clone().unwrap();
+        let waiting = AgentSeal::new(&dir, id).outbox().await.unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(
+            waiting[0].entry.entry.prev_hash,
+            Some(server.last().unwrap().entry_hash()),
+            "on Agora's head, not the stale one"
+        );
+        assert!(std::fs::read_dir(dir.join(SEALED_DIR)).unwrap().any(|f| {
+            f.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("resuming.stale.")
+        }));
+    }
+
+    /// An ordinary opt-in tells the agent, before its marker: a cut between
+    /// them leaves the notice and no marker, and the rerun finishes.
+    #[tokio::test]
+    async fn an_opt_in_tells_the_agent_before_marking_it() {
+        let root = crate::sealed::TestDir::new("opt-in-notice");
+        let api = fake::guarded(&root);
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        answer(&dir, SealChoice::Private);
+        crate::sealed::crash::at("opt_in:noticed");
+        assert!(e.opt_in(&api, id, None).await.is_err());
+        assert!(!crate::sealed::uploads(&dir, &keys, id));
+        let line = crate::sealed::notice::Notice::load(&dir)
+            .unwrap()
+            .unwrap()
+            .line()
+            .unwrap();
+        assert!(
+            line.contains(
+                "your operator started uploading your sealed state to Agora, as you answered on"
+            ),
+            "{line}"
+        );
+        e.opt_in(&api, id, None).await.unwrap();
+        assert!(crate::sealed::uploads(&dir, &keys, id));
+    }
+
+    /// Never during a key rotation; a rotation's own key record is posted
+    /// when it is valid, and a fresh one when the key that signed it was
+    /// since retired.
+    #[tokio::test]
+    async fn opt_in_waits_for_a_rotation_and_checks_its_key_record() {
+        for valid in [true, false] {
+            let root = crate::sealed::TestDir::new("opt-in-rotation");
+            let api = fake::guarded(&root);
+            let (id, keys, dir) = agent(&root, &["a"]).await;
+            let e = enroller(&root, &keys);
+            e.chain(id, false).await.unwrap();
+            answer(&dir, SealChoice::Private);
+            let next = keys.agent_dir(id).join("secrets.next.json");
+            std::fs::write(
+                &next,
+                std::fs::read(keys.agent_dir(id).join("secrets.json")).unwrap(),
+            )
+            .unwrap();
+            let err = e.opt_in(&api, id, None).await.unwrap_err().to_string();
+            assert!(err.contains("rotation is in progress"), "{err}");
+            assert!(api.calls.lock().unwrap().is_empty());
+            std::fs::remove_file(&next).unwrap();
+            // The rotation's record, signed by the current key or by another
+            let encryption = keys.ring().ensure_encryption_key(id).unwrap();
+            let file = keys.state_key_file(id).unwrap().unwrap();
+            let signer = if valid {
+                keys.signing(id).unwrap()
+            } else {
+                agora_agentkit::crypto::generate_keypair().0
+            };
+            let record = file
+                .state_key()
+                .unwrap()
+                .wrap(
+                    id,
+                    file.key_gen,
+                    file.wrap_seq,
+                    &agora_agentkit::envelope::EncryptionPublicKey::from(&encryption),
+                    &signer,
+                )
+                .unwrap();
+            std::fs::write(
+                keys.agent_dir(id).join("state_key.wrap.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            e.opt_in(&api, id, None).await.unwrap();
+            let posted = api.keys.lock().unwrap()[0].clone();
+            assert_eq!(posted == record, valid, "valid: {valid}");
+            assert!(posted.verify(&keys.signing(id).unwrap().verifying_key()));
+        }
+    }
+
+    /// Entries Agora already holds are filed as sent with their blobs
+    /// kept (agentkit keeps acknowledged blobs).
+    #[tokio::test]
+    async fn entries_agora_holds_are_filed_as_sent_with_their_blobs_kept() {
+        let root = crate::sealed::TestDir::new("opt-in-held");
+        let api = fake::guarded(&root);
+        let (id, keys, dir) = agent(&root, &["a", "b"]).await;
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        answer(&dir, SealChoice::Private);
+        let seal = AgentSeal::new(&dir, id);
+        let local = super::super::check::local_entries(&seal).await.unwrap();
+        *api.chain.lock().unwrap() = Ok(local[..2].to_vec());
+        let done = e.opt_in(&api, id, None).await.unwrap();
+        assert_eq!(done.held_by_agora, 2);
+        assert_eq!(seal.sent().await.unwrap().len(), 2);
+        for item in seal.sent().await.unwrap() {
+            if let Some(b) = item.entry.entry.blob {
+                assert!(
+                    dir.join(SEALED_DIR)
+                        .join("blobs")
+                        .join(b.sha256.to_hex())
+                        .exists()
+                );
+            }
+        }
+    }
+
+    /// A provisioned agent chained later by the fleet pass still gets a
+    /// genesis of class `none`, read back from the chain.
+    #[tokio::test]
+    async fn a_provisioned_agent_chained_later_has_a_none_genesis() {
+        let root = crate::sealed::TestDir::new("chain-provisioned");
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        std::fs::write(dir.join(PROVISIONED), b"x").unwrap();
+        let report = enroller(&root, &keys).chain(id, false).await.unwrap();
+        assert_eq!(report.origin, "none");
+        let seal = AgentSeal::new(&dir, id);
+        let genesis = super::super::check::local_entries(&seal).await.unwrap()[0].clone();
+        let origin = seal
+            .open_origin(&keys.seal_keys(id).unwrap(), &genesis.entry)
+            .await
+            .unwrap();
+        assert_eq!(origin.class, GenesisClass::None);
+    }
+
+    /// A stopped agent's pre-loss copy waits for its resume.
+    #[tokio::test]
+    async fn a_stopped_agents_prior_copy_waits() {
+        let root = crate::sealed::TestDir::new("prior-stopped");
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        let recovered = root.join("recovered");
+        std::fs::create_dir_all(recovered.join("tarn")).unwrap();
+        std::fs::write(
+            recovered.join("tarn/MEMORY.json"),
+            r#"{"content":"synthetic"}"#,
+        )
+        .unwrap();
+        let e = Enroller {
+            restore: Some(RestoreOffer::for_agents(
+                &[("tarn", None, id)],
+                &recovered,
+                None,
+            )),
+            ..enroller(&root, &keys)
+        };
+        e.chain(id, false).await.unwrap();
+        let ledger = serde_json::json!({ "format": 1, "asks": [{"at": "2026-10-12T09:00:00Z",
+            "offer_version": 1, "model": "m", "chars": 9, "order": ["show", "decline"],
+            "order_seed": 0, "constrained": true, "attempts": 1,
+            "outcome": {"kind": "answered", "choice": "show", "reason": "", "memory_note_written": false}}] });
+        std::fs::write(RestoreLedger::path(&dir), ledger.to_string()).unwrap();
+        crate::sealed::write_private(
+            &keys.agent_dir(id).join(crate::sealed::stop::DURABLE),
+            &serde_json::to_vec(&serde_json::json!({ "at": Utc::now(), "note": "asked" })).unwrap(),
+        )
+        .unwrap();
+        assert!(e.append_prior(id).await.unwrap().is_none());
+        std::fs::remove_file(keys.agent_dir(id).join(crate::sealed::stop::DURABLE)).unwrap();
+        assert!(e.append_prior(id).await.unwrap().is_some());
+        let line = crate::sealed::notice::Notice::load(&dir)
+            .unwrap()
+            .unwrap()
+            .line()
+            .unwrap();
+        assert!(line.contains("was added to your sealed history."), "{line}");
     }
 
     /// Synthetic timing for planning the fleet run: the cost of one sealed

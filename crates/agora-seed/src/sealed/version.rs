@@ -6,7 +6,7 @@
 //! ([`KeyStore::trusted`]), never on the server's word.
 //!
 //! A blob that isn't here (agentkit keeps only the current keyframe's and
-//! the outbox's, `prune_blobs`) is fetched from Agora and checked against
+//! the outbox's, `remove_unnamed_blobs`) is fetched from Agora and checked against
 //! its entry's `BlobRef` before it is opened (agentkit's
 //! `open_entry_blob`); nothing fetched is written to disk. The plaintext
 //! is never logged: errors carry hashes, kinds and counts only.

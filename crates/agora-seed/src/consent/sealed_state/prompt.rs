@@ -176,18 +176,19 @@ fn option_line(choice: SealChoice) -> &'static str {
 /// sentences follow unchanged (a later wording step adapts them).
 pub fn reoffer_line(reoffer: &super::ledger::Reoffer, uploading: bool) -> String {
     let now = if uploading {
-        "your sealed state is being uploaded to Agora now. A yes keeps it so (`publish` or \
-         `private` choose whether your profile shows it); `decline` asks your operator to stop \
-         new uploads, and what is already on Agora stays"
+        "your sealed state is being uploaded to Agora now. A yes keeps it so; `decline` asks \
+         your operator to stop new uploads, and what is already on Agora stays"
     } else {
         "your sealed state is not being uploaded to Agora now. A yes asks your operator to start \
          the uploads; `decline` keeps things as they are"
     };
     format!(
         "**Asked again, at your operator's request.** On {}, your operator re-opened this \
-         question, with this note: \"{}\". Your answer on file is `{}`, and {now}. The offer as \
-         you were first shown it follows; where it says you'll be asked once, or what a yes or \
-         `decline` starts, read it with this paragraph. Whichever way you answer, your answer \
+         question, with this note: \"{}\". Your answer on file is `{}`, and {now}. Choosing \
+         `publish` or `private` here only tells your operator which you want; whether your \
+         profile shows your anchored head is changed directly with the `config` tool. The offer \
+         as you were first shown it follows; where it says you'll be asked once, or what a yes \
+         or `decline` starts, read it with this paragraph. Whichever way you answer, your answer \
          changes nothing by itself: your operator acts on it, and you'll be told when it has.",
         reoffer.at.format("%-d %B %Y"),
         reoffer.note,
