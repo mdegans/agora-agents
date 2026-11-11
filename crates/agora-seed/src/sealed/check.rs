@@ -407,9 +407,9 @@ pub enum Upload {
     /// It uploads ([`super::uploads`]): the full check, Agora's copy
     /// included.
     Now,
-    /// It doesn't, but did: an uploading marker in either copy (stopped,
-    /// or the marker in doubt), or a stop. Agora's copy up to then may be
-    /// read; no anchor is judged.
+    /// It doesn't, but did ([`super::uploading::has_uploaded`]: either
+    /// copy of the uploading marker, stopped or in doubt). Agora's copy up
+    /// to then may be read (the guard's `may_read`); no anchor is judged.
     Before,
     /// It never did: no server call at all.
     Never,
@@ -419,11 +419,13 @@ impl Upload {
     pub fn of(agent_dir: &Path, keys: &KeyStore, id: AgentId) -> Self {
         if super::uploads(agent_dir, keys, id) {
             Self::Now
-        } else if !matches!(
-            super::uploading::state(agent_dir, keys, id),
-            super::uploading::Marker::Absent
-        ) || super::stop::is_stopped(agent_dir)
-            || !matches!(super::stop::durable(keys, id), Ok(None))
+        } else if super::uploading::has_uploaded(agent_dir, keys, id)
+            // A copy that can't be read may be one: never told "nothing
+            // of your state is on Agora" on that
+            || !matches!(
+                super::uploading::state(agent_dir, keys, id),
+                super::uploading::Marker::Absent
+            )
         {
             Self::Before
         } else {
