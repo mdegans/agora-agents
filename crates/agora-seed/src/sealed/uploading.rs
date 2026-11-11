@@ -123,7 +123,9 @@ fn read_copy(path: &Path, id: AgentId) -> Copy {
 
 /// The marker's lock, held until the file is dropped. Blocking, briefly:
 /// every holder only reads and writes the two small copies.
-fn lock(keys: &KeyStore, id: AgentId) -> std::io::Result<std::fs::File> {
+// B4/5: public for `sealed-forget`, which sets the secrets copy aside
+// under it.
+pub fn lock(keys: &KeyStore, id: AgentId) -> std::io::Result<std::fs::File> {
     let dir = keys.agent_dir(id);
     std::fs::create_dir_all(&dir)?;
     let file = std::fs::OpenOptions::new()

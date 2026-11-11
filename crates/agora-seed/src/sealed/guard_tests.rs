@@ -107,8 +107,9 @@ async fn a_stopped_agent_is_restored_from_agora_and_a_never_uploaded_one_asks_no
             assert!(writes(&api).is_empty(), "{:?}", api.calls.lock().unwrap());
             assert!(!super::uploads(&dir, &keys, id));
         } else {
+            // B5: nothing of it on Agora and its sealed/ gone: a backup
             let e = format!("{:#}", done.unwrap_err());
-            assert!(e.contains("local only"), "{e}");
+            assert!(e.contains("from a backup"), "{e}");
             assert!(api.calls.lock().unwrap().is_empty(), "nothing asked");
         }
     }

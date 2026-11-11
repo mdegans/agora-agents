@@ -649,7 +649,7 @@ pub async fn restore_with(
     // The notice first: what was found here is known now, and a rerun of
     // a restore cut short keeps it. The marker and the refusal last, so a
     // cut anywhere leaves a rerun to do (refused, or not enrolled)
-    Notice::restored_from(
+    Notice::restored(
         &agent_dir,
         from,
         note,

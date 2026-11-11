@@ -8,7 +8,8 @@
 //! `memory_id_key.forgotten.<utc>.json` (the same `<utc>`, so putting the
 //! agent back restores both together and its memory ids still resolve),
 //! the durable stop (if any) `sealed_stopped.forgotten.<utc>`, the durable
-//! uploading marker (if any) `sealed_uploading.forgotten.<utc>` (so an
+//! uploading marker (if any) `sealed_uploading.forgotten.<utc>`, under the
+//! marker's lock (whose file stays, as lock files do) (so an
 //! agent put back is not silently uploading again: its secrets copy alone
 //! would read as uploading, with the stop set aside beside it), and the note
 //! is kept beside them as `state_key.forgotten.<utc>.note.json`, naming
@@ -85,7 +86,7 @@ fn move_aside(dir: &Path, from: &str, to: &str) -> std::io::Result<()> {
 }
 
 /// The moves after the commit, as `plan` names them.
-fn finish(dir: &Path, plan: &Forgotten) -> anyhow::Result<()> {
+fn finish(keys: &KeyStore, id: AgentId, dir: &Path, plan: &Forgotten) -> anyhow::Result<()> {
     if let Some(to) = &plan.memory_id_key {
         move_aside(dir, MEMORY_ID_KEY_FILE, to).context("setting the memory-id key aside")?;
     }
@@ -93,6 +94,9 @@ fn finish(dir: &Path, plan: &Forgotten) -> anyhow::Result<()> {
         move_aside(dir, super::stop::DURABLE, to).context("setting the stop aside")?;
     }
     if let Some(to) = &plan.uploading {
+        // Under the marker's lock, as every writer of it; the lock file
+        // stays, as every lock file does
+        let _lock = super::uploading::lock(keys, id).context("the uploading marker's lock")?;
         move_aside(dir, super::uploading::DURABLE, to)
             .context("setting the uploading marker aside")?;
     }
@@ -147,7 +151,7 @@ pub fn forget(
         };
         let index = super::history_index::remove(&state_dir.join(id.to_string()))
             .context("deleting the search index")?;
-        finish(&dir, &plan)?;
+        finish(keys, id, &dir, &plan)?;
         tracing::warn!(
             event_type = "sealed_state_forgotten",
             agent_id = %id,
@@ -192,7 +196,7 @@ pub fn forget(
     let key_to = FORGOTTEN_STATE_KEY.name(&stamp);
     std::fs::rename(&key, dir.join(&key_to)).context("setting the state key aside")?;
     super::crash::point("forget:committed")?;
-    finish(&dir, &plan)?;
+    finish(keys, id, &dir, &plan)?;
     tracing::warn!(
         event_type = "sealed_state_forgotten",
         agent_id = %id,
@@ -383,6 +387,11 @@ mod tests {
         let root = crate::sealed::TestDir::new("forget-uploading");
         let (id, keys, dir) = enrolled(&root).await;
         let state_dir = root.join("state");
+        // Uploaded: nothing waits
+        let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
         crate::sealed::stop::stop(
             &state_dir,
             &keys,

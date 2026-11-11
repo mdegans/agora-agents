@@ -1019,14 +1019,13 @@ mod tests {
     /// Stopped after uploading: Agora holds its chain to the last version
     /// it acknowledged. The rotation names that head; what was sealed here
     /// since is re-signed, what Agora holds is not; the re-wrap is posted.
-    /// (The plain fake: the guard's read class for stopped agents is B1's,
-    /// in flight.)
+    /// Through the strict guard: reads and key maintenance only.
     #[tokio::test]
     async fn a_stopped_agent_rotates_at_agoras_head() {
         let root = crate::sealed::TestDir::new("rotate-stopped");
         let (id, keys, dir) = enrolled(&root).await;
         keys.ring().ensure_encryption_key(id).unwrap();
-        let api = FakeApi::new();
+        let api = crate::sealed::api::fake::guarded(&root);
         *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
         uploaded(&dir, id, &api).await;
         let on_agora = api.chain.lock().unwrap().clone().unwrap();

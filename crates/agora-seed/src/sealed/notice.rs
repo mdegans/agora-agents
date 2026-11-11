@@ -425,23 +425,12 @@ impl Notice {
         write(agent_dir, &n)
     }
 
-    /// The operator restored the sealed version of `from`
-    /// (`sealed-restore`), with its note if any.
-    pub fn restored(
-        agent_dir: &Path,
-        from: DateTime<Utc>,
-        note: Option<&str>,
-        fallback: Refusal,
-        found: bool,
-        refused: bool,
-    ) -> std::io::Result<()> {
-        Self::restored_from(agent_dir, from, note, fallback, found, refused, false)
-    }
-
     // B5: `local`: restored from the runner's own copy (nothing on Agora).
-    /// [`Self::restored`]; `local`: from the copy the runner keeps here,
-    /// nothing of the agent being on Agora.
-    pub fn restored_from(
+    /// The operator restored the sealed version of `from`
+    /// (`sealed-restore`), with its note if any; `local`: from the copy the
+    /// runner keeps here, nothing of the agent being on Agora.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restored(
         agent_dir: &Path,
         from: DateTime<Utc>,
         note: Option<&str>,

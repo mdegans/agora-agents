@@ -51,19 +51,16 @@ impl Reach {
     }
 }
 
-/// The agent's [`Reach`]. "Ever uploaded" is an uploading marker in
-/// either copy (`sealed/uploading`, `<secrets>/<id>/sealed_uploading`);
-/// an unreadable one reads as never (no call, fail closed).
-// B1: the same predicate as the guard's read class once it lands on
-// `seed/local-chain`; replace this body with B1's function then.
+/// The agent's [`Reach`], by the guard's own predicates: it uploads
+/// ([`super::uploads`], may send), or has ever uploaded
+/// ([`super::uploading::has_uploaded`], may read).
 pub fn reach(agent_dir: &std::path::Path, keys: &KeyStore, id: AgentId) -> Reach {
-    use super::uploading::{Marker, state};
     if super::uploads(agent_dir, keys, id) {
-        return Reach::Uploads;
-    }
-    match state(agent_dir, keys, id) {
-        Marker::Uploading(_) | Marker::Contradictory(_) => Reach::Stopped,
-        Marker::Absent | Marker::Unreadable(_) => Reach::Local,
+        Reach::Uploads
+    } else if super::uploading::has_uploaded(agent_dir, keys, id) {
+        Reach::Stopped
+    } else {
+        Reach::Local
     }
 }
 
