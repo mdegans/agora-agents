@@ -2,9 +2,229 @@
 
 Plan: agora `memory/project_local_chain_for_all.md` (2026-11-11). Every agent
 is chained locally; consent decides only whether the chain is uploaded.
-Built in steps B1-B7 on the integration branch `seed/local-chain`; each step
-appends its section. Paths: `<state>` is `<data_dir>/state`, `<secrets>` is
-`<data_dir>/secrets`, `<id>` an agent id.
+Built in steps B1-B5 on `seed/local-chain` and integrated there
+(2026-11-11); B6 and B7 are still to come. Paths: `<state>` is
+`<data_dir>/state`, `<secrets>` is `<data_dir>/secrets`, `<id>` an agent id.
+
+The first part is the integrated statement: what the first start after
+install and the fleet's enrolment run do to each kind of agent, the start
+and deploy orders, the one-way door and the stated limits. The step
+sections that follow are each builder's, kept whole, with a note where
+integration changed what they say (marked **Integration:**).
+
+## Integrated: what changes, per kind of agent
+
+Nothing in this build deletes a file of an agent's. Superseded files are
+renamed aside or kept as copies. Two files are removed by design: the old
+chain marker `sealed/enrolled`, once `sealed/chained` is written and
+fsynced (agentkit `migrate_marker`), and the `memory` tool's search index
+when `sealed-forget` runs (a sidecar rebuilt on demand). Installing the
+binary changes nothing by itself. Everything below happens when the runner
+or a `sealed-*` / `rotate-keys` command first runs after install.
+
+**Start order** (`main.rs` states it in one comment): `promote` (a save cut
+between its archive and its rename, only while no other runner shares the
+data dir) → `runner.lock` shared → the uploading start pass (the chain
+marker moved first, uploading markers repaired, the one-time migration,
+markers in doubt alerted) → the stop reconcile → `load_states` (finishes a
+sealed commit a crash cut short) → the governance log verified → the
+roster and its witnesses → a pre-loss copy's pair cut short finished, or a
+copy the agent chose to see appended → each agent's start check → the
+refusal rule → reactors. Every operator command that writes takes
+`runner.lock` exclusively **before** its start pass and holds it to the
+end (`sealed-enroll` but `--dry-run`, `sealed-reoffer`, `sealed-accept`,
+`sealed-restore`, `sealed-forget`, `rotate-keys` but `--status`);
+`sealed-stop` runs beside a runner.
+
+**Data-directory files, once:** `<data_dir>/sealed-uploading-migrated`
+(the one-time migration's record), `<data_dir>/sealed-roster.json`,
+`sealed-roster.began`, `sealed-roster.lock`, and
+`<secrets>/sealed-roster.witness.json` (the roster's began-time and agent
+count; `with_state_keys` skips it). All atomic and durable, 0600.
+
+### Unenrolled today (the fleet, about 1,663 agents)
+
+*First start after install.* Read: `<state>/` and `<secrets>/` listings,
+each agent's `sealed/enrolled`, `sealed/chained`, uploading and stop
+markers (existence; none exist), `state.json` (loaded as before). Written:
+the data-directory files above (the roster begun, adopting only the agents
+already chained, with a state), nothing in an agent's directory beyond its
+ordinary saves. Saves stay plain (no `sealed/`); FsStorage now archives
+`state.json` by hard link and sets a leftover `state.json.tmp` aside as
+`state.json.tmp.<utc-ms>.aside`. One `sealed_state_unchained_agents` alert
+gives the count. **The second start refuses the run** (three or more
+agents with a state and no chain beside a kept roster), and the refusal
+says to run `agora-seed sealed-enroll` with the runner stopped. So: enrol
+before the units start (deploy order, below).
+
+*The fleet's enrolment run* (`agora-seed sealed-enroll`, runner stopped;
+no network call). Per agent, read: `state.json`, every `state.<utc>.json`
+archive (state and mtime), the memory-restore ledger and recovered copy
+(an agent that chose `show`), the session journal's existence (an agent
+with one is skipped), its signing key. Written:
+`<secrets>/<id>/state_key.json` (new, cached, never posted),
+`<state>/<id>/sealed/` (genesis, the pre-loss copy if chosen, one entry
+and blob per distinct archive, the current state: `blobs/`, `outbox/`,
+`head.json`), the sizes sidecar, `sealed/left_out.json` (archives that can
+never be read: name and reason class only), `state.json` rewritten at
+format 3 (the previous one hard-linked as an archive first), then
+`sealed/chained`; the roster records its head (the witness's count rises).
+A run cut short is finished by the next. Nothing uploads. The next start
+finds every agent on the roster and verifies each one's whole local line
+(then the tail only, with a full check every 7-14 days); its verdict says
+the check was against the runner's own record and that nothing of it is
+on Agora.
+
+### Enrolled and uploading (the three test agents)
+
+*First start.* `sealed/enrolled` → `sealed/chained` (agentkit, mtime and
+bytes kept). The one-time uploading migration finds each chained, with
+`sent/` non-empty and its ledger's latest answer yes: writes
+`sealed/uploading`, then `<secrets>/<id>/sealed_uploading` (and its
+`.lock`); then `sealed-uploading-migrated` is written and the migration
+never runs again. Adopted into the roster. The full start check against
+Agora, as before. Its next save writes `state.json` at format 3. agentkit
+0.158 **keeps acknowledged blobs** (`remove_unnamed_blobs` replaces
+`prune_blobs`), so `sealed/blobs/` stops shrinking after uploads. Each
+drain reads Agora's head (`Unchecked` when it can't, which holds nothing)
+and Agora's report of damaged blobs: agentkit writes `sealed/healing.json`
+(the last damaged list's count and time) and sends back the blobs it
+holds; the runner sums each pass (`sealed_state_healing`) and alerts
+`sealed_state_agora_blobs_unhealable` when blobs Agora lost can't be sent
+again from here.
+
+*The enrolment run.* Already chained: nothing, unless it chose `show`
+since it was chained (then the pre-loss copy is appended and uploaded, and
+it is told). The same append now also happens at run start.
+
+### Declined
+
+An agent whose latest answer is `decline` (or a legacy `refused`) and was
+never enrolled: as "unenrolled" above; the enrolment run chains it; it
+never uploads; the offer isn't put again (its answer is on file) unless
+the operator re-opens it (`sealed-reoffer`). One enrolled under an older
+runner whose ledger now says no: its marker moves; the migration doesn't
+mark it; it is chained and checked locally, and nothing of it is sent or
+read. **Check before installing** (counts only): no agent with a non-empty
+`sealed/sent/` and a ledger that isn't yes, since such an agent would read
+as never uploaded (its verdict would say nothing of it is on Agora).
+
+### Stopped (none exists)
+
+Marker moved as above; marked uploading by the migration if it had
+uploaded and its ledger says yes; still not uploading while stopped. Its
+saves now chain locally. A stop from before the chain went on while
+stopped would be refused at its first start check (its saves went plain);
+the operator resolves it with `sealed-accept --note`. `sealed-enroll
+--resume --agent <id>` resumes: the versions saved while stopped are set
+aside (`.displaced`, kept, never uploaded) and one new snapshot is sealed
+on the uploaded line.
+
+### Forgotten (`sealed-forget` was run)
+
+Its `state.json` is gone; its state key, memory-id key, durable stop and
+durable uploading marker are renamed `*.forgotten.<utc>*` with a note.
+`sealed-forget` now also takes it off the roster (`roster::replace(None)`,
+the witness's count lowered first), and its leftover `sealed/refused` no
+longer counts toward the refusal threshold. A chained directory left
+without a state is never adopted into the roster again. Put back (its
+directory and state key copied back), the start pass renames its old local
+markers `sealed/<name>.forgotten.<utc>`: it is neither uploading nor
+stopped until an explicit opt-in, and is adopted into the roster at the
+next start.
+
+## Integrated: deploy order
+
+1. Server first (migration 149 and the hardening branch).
+2. Release agentkit 0.158.0; drop the TEMPORARY path patch (the workspace
+   already asks for 0.158.0, and `VERIFIER` names it).
+3. The dry run on a `cp -a` copy of `state/` **and** `secrets/`, fleet
+   metrics before and after (counts and sizes only); count secrets
+   directories holding a state key against chained directories, and check
+   for the declined agents above.
+4. Stop both units and the timer.
+5. Install the runner.
+6. `agora-seed sealed-enroll --jobs 16`, before any start. It runs the
+   start pass itself (marker move, migration) and begins the roster.
+   Estimated 7-12 minutes (synthetic: about 0.3 s a version).
+7. Fleet metrics again; start the units; compare after the first sweep.
+
+If a unit starts before step 6, the first start runs (adopting the test
+agents and alerting the unchained count) and every later start refuses,
+naming `sealed-enroll`, which that refusal doesn't block. Integration
+tests that sequence.
+
+## Integrated: the one-way door
+
+Once the start pass moves `sealed/enrolled` to `sealed/chained`, or a
+chained agent's first save writes `state.json` at format 3, a runner
+older than this build finds no `sealed/enrolled` and refuses a format-3
+state: it parks the agent; it never seals it plainly or uploads it. After
+the enrolment run that is the whole fleet: **rolling the binary back parks
+every agent**; it never uploads one that didn't consent. A ledger that
+`sealed-reoffer` wrote is format 3 too, which an older runner refuses
+rather than drop the re-offer.
+
+## Integrated: stated limits
+
+- A local chain catches accidents (the May loss's shape: a state replaced,
+  a directory rolled back or removed). It proves nothing against the
+  operator, who holds the disk and the keys; agent-facing text says the
+  check was against the runner's own record.
+- A whole data directory restored from an older backup with its file times
+  kept passes every witness inside it (roster, `began`, the secrets
+  witness, the chains). A roster written a day before the newest state is
+  one alert. Deleting the roster, `began` and the witness together reads as
+  a first run.
+- A state lost before the roster first recorded its agent is found only by
+  its keys (`missing_states`), not by the roster: a chained directory
+  without a state is not adopted.
+- An agent the roster refuses for a missing directory has
+  `<state>/<id>/sealed/` recreated to hold its marker (B2, unchanged).
+- `sealed-accept` of a rolled-back agent cut after its new head is written
+  but before the roster takes it: the next start refuses it as rolled back
+  again; accepting again resolves it.
+- An agent that uploaded but has no uploading marker reads as never
+  uploaded (see Declined).
+- A pre-loss copy chosen after chaining is looked for at every start for
+  the agents whose memory-restore record says `show`: their chain's items
+  are read each start until the copy is in.
+
+## Integrated: what integration changed (beyond merging)
+
+- **The roster set by the operator's commands.** `sealed-accept` (accept,
+  `--rebase`, a loss resolved, `--keep`) and `sealed-restore` (a version, a
+  cut save) call `roster::replace(Some(head))` after `head.json` is
+  written; `sealed-forget` calls `replace(None)` after its commit (a rerun
+  cut before it finishes that too). `replace(None)` begins no roster.
+- **Adoption needs a state.** The roster adopts a chained directory only
+  with a `state.json` (B2 adopted any readable head, which re-added a
+  forgotten agent and refused it as missing a start later).
+- **Wide accept.** `--agents-file` holds back every loss-shaped refusal by
+  the start check's own `Refusal::loss_shaped`: `head_missing` and
+  `rolled_back` now join state missing, unreadable, I/O and too new (B4/5's
+  separate list removed). Those are accepted one at a time.
+- **One reading of the markers.** `version::reach` is `check::Upload::of`,
+  mapped (in doubt is `Stopped`). An uploading marker whose only copy is
+  unreadable read as never uploaded for the operator's commands; now it
+  reads as stopped (nothing sent; reads pass only where a copy can be
+  read).
+- **One rule for the state-key wrap** (`keys::wrap_usable`, `kept_wrap`,
+  `new_wrap`). The opt-in posts a rotation's kept wrap, **keeps a fresh
+  wrap in `<secrets>/<id>/state_key.wrap.json` before posting it** (new: an
+  opt-in now leaves that file), wraps past the highest seq Agora holds,
+  and names the posted seq in `state_key.json` when it differs.
+- **Run start** finishes a cut pre-loss pair and appends a chosen copy
+  (under the agent's seal lock, after the roster, never for a refused
+  agent, not in a dry run).
+- **The `memory` tool's `log`** says once how many local copies the chain
+  left out; writes `<state>/<id>/sealed/left_out_told.json` (`{told: N}`,
+  0600).
+- **Notices:** every notice is one atomic write through `write_private`
+  (`fork_kept` and `agora_lost` were two writes; the fixed
+  `notice.json.tmp` is now a unique tmp, and `notice.json` becomes 0600).
+- **Drain (agentkit 0.158):** healing summed and alerted on change;
+  `HeadStatus::Unchecked` holds nothing.
 
 ## B1: markers, API guard, storage, drain, stop, migration
 
@@ -78,7 +298,8 @@ it never uploads one that didn't consent.
 **(a) An agent not enrolled** (the whole fleet today). A `stat` of each
 marker; nothing written. Saves go plainly, as before (agentkit gives an
 agent with no `sealed/chained` no `sealed/`). Not in the start check. No
-change.
+change. **Integration:** until the enrolment run; see "Unenrolled today"
+above (B2's roster refuses a later start until it runs).
 
 **(b) An enrolled agent that uploads** (the three agora-sim betas). The
 start pass moves `sealed/enrolled` to `sealed/chained`, then the uploading
@@ -90,10 +311,9 @@ its ledger saying yes: it writes `sealed/uploading`, then
 anchored. Its next save writes `state.json` at format 3. Idempotent: later
 runs write nothing. *Gap:* an enrolled agent whose ledger says yes but
 whose first upload never succeeded (empty `sent/`) is **not** marked, by
-the rule in the brief, and silently stops uploading; `sealed-enroll` skips
-it as enrolled. Until B3's opt-in step exists the only fix is the
-Steward's. Check `sealed/sent/` of the three betas (counts only) before
-installing.
+the rule in the brief, and silently stops uploading. **Integration:**
+`sealed-enroll --opt-in` (B3) marks it; the three test agents each have
+75-88 sent (checked 2026-11-11), so the migration covers them.
 
 **(c) An enrolled agent whose uploads were stopped** (none exists: no
 agent has ever been stopped). The marker moves as in (b); the uploading
@@ -104,12 +324,12 @@ check, which now covers stopped agents, then refuses it (and with it the
 whole run, exit 75) as a mismatch. The operator resolves it with
 `sealed-accept --note`, so the agent is shown why; nothing seals the
 unchecked interval silently. From then on its saves chain locally; nothing
-of it is drained or sent. `sealed-enroll --agent <id>` (resume) is refused
-while any version saved while stopped waits (B3/B5 decide what a resume
-uploads).
+of it is drained or sent. **Integration:** `sealed-enroll --resume --agent
+<id>` (B3) resumes, setting the versions saved while stopped aside.
 
 **(d) An agent that declined.** Not enrolled (`sealed-enroll` enrols only a
-yes), so as (a). Should one be enrolled with a ledger that says no, the
+yes), so as (a). **Integration:** since B3 `sealed-enroll` chains every
+agent; a declined one is chained and never uploads. Should one be enrolled with a ledger that says no, the
 migration never marks it: it is chained and checked, and nothing uploads;
 before B1 it would have uploaded.
 
@@ -155,7 +375,7 @@ never uploaded): one summary alert, skipped.
 ### The first run after install
 
 The roster and `began` don't exist: every directory that is chained and has
-a readable head is adopted (the betas today, everyone once B3 enrols);
+a readable head (**Integration:** and a `state.json`) is adopted (the betas today, everyone once B3 enrols);
 `sealed_roster_added` logged with the count. Nothing else is adopted, so
 leftover secrets directories don't become refusals. Each chained agent that
 doesn't upload gets a full verification and a vouch in the roster.
@@ -210,6 +430,8 @@ otherwise). `with_state_keys` skips it (not an agent id).
   step B3's enrolment run has chained the fleet, every start after the
   first one that adopted the betas sees the whole unchained fleet and
   refuses. Run the enrolment before the units restart on this build.
+  **Integration:** the refusal's text names `sealed-enroll`, which it
+  doesn't block (tested).
 - A roster written more than a day before the newest chained state is one
   `sealed_roster_stale` alert. **Stated limit:** a whole data directory
   restored from an older backup with its file times kept passes every
@@ -303,7 +525,8 @@ key-maintenance class: `post_state_key` and a `rotate_key` naming a head),
   touches nothing; opening the last sealed version reads local blobs, or
   Agora's for an agent that has uploaded). `--yes` needs `--expect N` equal
   to the count. Per agent: a loss-shaped refusal (state missing,
-  unreadable, I/O, too new) is held back; a memory that shrank by more than
+  unreadable, I/O, too new; **Integration:** and head missing, rolled back,
+  by `Refusal::loss_shaped`) is held back; a memory that shrank by more than
   half (or can't be measured) is held back unless `--accept-shrunk`; an
   agent already accepted counts as already. Writes per accepted agent as a
   single `--note` accept.
@@ -339,9 +562,9 @@ neither uploading nor stopped (Start pass, above).
 
 ### Roster (B2)
 
-Call sites marked `// B2/B5: roster::replace` (accept, rebase, the Agora-loss
-resolution, `--keep`, restore, `--from-cut-save`, forget with `None`); not
-called until the roster merges.
+**Integration:** called at each of these sites (accept, rebase, the
+Agora-loss resolution, `--keep`, restore, `--from-cut-save`; forget with
+`None`), after `head.json` is written; see the integrated section.
 
 ## B3: local chain for every agent, opt-in, resume, re-offer
 
@@ -351,6 +574,7 @@ provisioning, creates an agent). Every `sealed-enroll` (but `--dry-run`)
 and `sealed-reoffer` takes `<data_dir>/runner.lock` **exclusively, first,
 for the whole command, without waiting**: refused while a runner runs
 (`just runner-stop` first); only then does B1's start pass run.
+**Integration:** every operator command that writes now does the same.
 
 ### `sealed-enroll` (chain; every agent with a state, or `--agent <id>`…)
 
@@ -387,7 +611,8 @@ or changes a stop.
   for the resume): then the agent's notice is written, `archived_prior`
   and its current state again are appended (`sealed_prior_appended`), once;
   never over a state that doesn't match its head. A pair cut between the
-  two is finished by `Enroller::finish_prior` (to be called at run start).
+  two is finished by `Enroller::finish_prior`. **Integration:** called at
+  run start, with `append_prior`.
   The genesis is never rewritten. For an uploader the copy is uploaded with
   the rest, and the notice says so.
 - **First run after install, the fleet** (~1,667 agents, ~18,000
@@ -422,7 +647,9 @@ empty or a prefix of the local one; writes the encryption key into
 `secrets.json` if missing; posts the state key record unless a valid one
 is on Agora (the rotation's `state_key.wrap.json` if it is signed by the
 current key, wrapped to the current X25519 key at the cached `wrap_seq`;
-else wrapped afresh); writes the agent's notice (one write); marks it
+else wrapped afresh; **Integration:** by `keys::wrap_usable`, a fresh wrap
+kept in `state_key.wrap.json` first, past Agora's highest seq, and
+`state_key.json` naming the seq posted); writes the agent's notice (one write); marks it
 uploading; then files the outbox entries Agora already holds as sent
 (`outbox/` → `sent/`; no blob is deleted), then drains. A cut at any step
 is finished by the same command. It is now the **only** way an agent
