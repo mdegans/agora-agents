@@ -19,6 +19,18 @@
 //! come back from a backup. Like every operator command it refuses while
 //! the agent has a session, and holds the agent's `sealed/lock`
 //! throughout.
+//!
+//! **An agent that never uploaded** makes no call to Agora: `--note` works
+//! as above from what is here, a lost `head.json` is rebuilt from the
+//! local chain ([`super::restore::adopt_local`]), and `--rebase` is
+//! refused (nothing of it is on Agora to join). A fork in its chain (two
+//! saves from one version) is resolved by `--keep` ([`keep_line`]): the
+//! operator chooses the line that goes on, and the other is kept under
+//! `sealed/lost/<utc>/` ([`super::lost`]).
+//!
+//! **Many at once** ([`accept_many`], `--agents-file`): one note, each
+//! agent under its own lock, after a fleet-wide event; the count must be
+//! confirmed with `--expect N`, or nothing is touched.
 
 use std::path::Path;
 
@@ -43,6 +55,13 @@ pub struct Accepted {
     /// A lost `head.json` was rebuilt from Agora's verified chain.
     pub adopted: bool,
 }
+
+/// The note when a head rebuilt from the chain kept here (an agent that
+/// never uploaded) matched and the operator gave none.
+pub const REBUILT_LOCAL_NOTE: &str = "the record of your last sealed version was missing \
+     here and was rebuilt from your chain as your runner keeps it here (nothing of yours is on \
+     Agora), after checking it with your runner's own keys; your state matched it, so nothing \
+     about your state changed.";
 
 /// The note when the rebuilt head matched and the operator gave none.
 pub const REBUILT_NOTE: &str = "the record of your last sealed version was missing here and \
@@ -99,12 +118,32 @@ pub async fn accept(
         .await
         .context("the agent's state won't load")?
         .value;
+    let reach = super::version::reach(&agent_dir, keys, id);
+    // A lost state key: from Agora's wrap when it is there
+    if keys.signing(id).is_some() && keys.state_key_file(id)?.is_none() {
+        super::keys::recover_state_key(keys, &agent_dir, api, id).await?;
+    }
     let k = keys
         .seal_keys(id)
         .context("no sealing keys for the agent")?;
 
     let mut adopted = None;
-    if seal.head().await?.is_none() {
+    if seal.head().await?.is_none() && !reach.on_agora() {
+        // Nothing on Agora: from the agent's own chain here
+        let trusted = keys
+            .trusted(id)?
+            .context("no signing key to verify the chain kept here with")?;
+        let result =
+            super::restore::adopt_local(&seal, &lock, &trusted, &k, Some(&current)).await?;
+        tracing::warn!(
+            event_type = "sealed_state_head_adopted",
+            agent_id = %id,
+            source = "local",
+            matched = matches!(result, Adopted::Intact(_)),
+            "head.json rebuilt from the verified chain kept here"
+        );
+        adopted = Some(result);
+    } else if seal.head().await?.is_none() {
         let signing = keys.signing(id).context("no signing key for the agent")?;
         let chain = super::api::chain(api, id, &signing)
             .await
@@ -143,13 +182,18 @@ pub async fn accept(
             if seal.is_refused().await? {
                 seal.clear_refusal().await.context("clearing the refusal")?;
             }
-            Notice::accept(&agent_dir, note.unwrap_or(REBUILT_NOTE), reason, None)
+            let rebuilt = if reach.on_agora() {
+                REBUILT_NOTE
+            } else {
+                REBUILT_LOCAL_NOTE
+            };
+            Notice::accept(&agent_dir, note.unwrap_or(rebuilt), reason, None)
                 .context("writing the notice")?;
             head
         }
         (Some(Adopted::Mismatch(head)), None) => anyhow::bail!(
-            "head.json was rebuilt from Agora (head {} at seq {}), but the state here doesn't \
-             match it: the agent stays refused. Pass --note to seal its current state on top",
+            "head.json was rebuilt (head {} at seq {}), but the state here doesn't match it: \
+             the agent stays refused. Pass --note to seal its current state on top",
             head.entry_hash,
             head.seq
         ),
@@ -256,6 +300,13 @@ pub async fn rebase(
 ) -> anyhow::Result<Rebased> {
     let note = note.trim();
     anyhow::ensure!(!note.is_empty(), "--note is required: the agent reads it");
+    let reach = super::version::reach(&state_dir.join(id.to_string()), keys, id);
+    anyhow::ensure!(
+        reach.on_agora(),
+        "agent {id} never uploaded: nothing of it is on Agora, so there is no line of Agora's \
+         to join it to. A fork in the chain kept here is resolved with `sealed-accept --agent \
+         {id} --keep <head|ord> --note \"…\"`; nothing was changed"
+    );
     // Before anything is read or written: no runner on this data dir (it
     // could be saving), held to the end, and no session in progress. The
     // start check below takes the agent's sealed/lock itself, so that lock
@@ -295,6 +346,12 @@ pub async fn rebase(
         .value;
     // A resolution of Agora's loss cut short: finished, as it began
     if let Some((dir, intent)) = super::lost::pending(&seal)? {
+        anyhow::ensure!(
+            intent.local_fork.is_none(),
+            "a fork resolution (`sealed-accept --keep`) is unfinished under {}: run that \
+             again first",
+            dir.display()
+        );
         let lock = super::session::take(state_dir, id, true).await?;
         return finish_lost(
             &seal, &lock, &k, &agent_dir, &dir, &intent, &current, &chain, note,
@@ -446,6 +503,358 @@ async fn finish_lost(
         head,
         set_aside: intent.items.len(),
     })
+}
+
+/// Which line `sealed-accept --keep` keeps: the head's, or the displaced
+/// line whose tip is the outbox item numbered `ord`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    Head,
+    Ord(u64),
+}
+
+impl std::str::FromStr for Keep {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim() {
+            "head" => Ok(Self::Head),
+            n => n.parse().map(Self::Ord).map_err(|_| {
+                format!(
+                    "`{n}`: name `head`, or the outbox number of a displaced line's tip (the \
+                     choices are listed when the wrong one is named)"
+                )
+            }),
+        }
+    }
+}
+
+/// What `sealed-accept --keep` did: hashes and counts only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    /// The kept line's tip, now the head.
+    pub head: HeadRef,
+    /// Outbox items set aside (kept, with their blobs and copies).
+    pub set_aside: usize,
+    /// The state became the kept tip's (the one here archived).
+    pub state_changed: bool,
+    /// Where the copies are.
+    pub kept: std::path::PathBuf,
+}
+
+/// Resolve a fork in a chain kept here (an agent that doesn't upload): two
+/// saves from one version, recorded in `head.json`'s `displaced`. `keep`
+/// names the line that goes on; every outbox item off it is kept under
+/// `sealed/lost/<utc>/` and set aside as `.displaced` ([`super::lost`]),
+/// `head.json` names the kept tip, and when that isn't the head, its state
+/// (opened from the blobs here, checked against its recorded hash) becomes
+/// the agent's, the state here archived by FsStorage. The agent is told,
+/// with `note`. A cut run is finished by the next, as it began. No call to
+/// Agora.
+pub async fn keep_line(
+    state_dir: &Path,
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    id: AgentId,
+    keep: Keep,
+    note: &str,
+) -> anyhow::Result<Kept> {
+    use agora_agentkit::state::storage::{OutboxItem, as_reloaded, plaintext_hash};
+    let note = note.trim();
+    anyhow::ensure!(!note.is_empty(), "--note is required: the agent reads it");
+    let agent_dir = state_dir.join(id.to_string());
+    let seal = AgentSeal::new(&agent_dir, id);
+    let reach = super::version::reach(&agent_dir, keys, id);
+    anyhow::ensure!(
+        reach != super::version::Reach::Uploads,
+        "agent {id} uploads: a fork against Agora's copy is resolved with `--rebase`"
+    );
+    let lock = super::session::take(state_dir, id, true).await?;
+    let k = keys
+        .seal_keys(id)
+        .context("no sealing keys for the agent")?;
+    let trusted = keys
+        .trusted(id)?
+        .context("no signing key to verify the chain kept here with")?;
+    let entries_now = async || -> anyhow::Result<(Vec<OutboxItem>, Vec<OutboxItem>)> {
+        Ok((seal.sent().await?, seal.outbox().await?))
+    };
+    let (dir, intent) = match super::lost::pending(&seal)? {
+        Some((dir, intent)) => {
+            let fork = intent.local_fork.as_ref().with_context(|| {
+                format!(
+                    "a resolution of versions Agora lost is unfinished under {}: \
+                     `sealed-accept --rebase` finishes it",
+                    dir.display()
+                )
+            })?;
+            let asked = match keep {
+                Keep::Head => None,
+                Keep::Ord(o) => Some(o),
+            };
+            anyhow::ensure!(
+                asked == fork.keep_ord,
+                "a fork resolution is unfinished under {}, keeping {}: run it again with that \
+                 choice",
+                dir.display(),
+                fork.keep_ord
+                    .map_or("the head".to_string(), |o| format!("ord {o}"))
+            );
+            (dir, intent)
+        }
+        None => {
+            let head = seal
+                .head()
+                .await?
+                .with_context(|| format!("agent {id}'s sealed/head.json is missing"))?;
+            anyhow::ensure!(
+                !head.displaced.is_empty(),
+                "agent {id}'s chain here has no fork to resolve"
+            );
+            let (sent, outbox) = entries_now().await?;
+            let choices = || {
+                let mut out = format!("head (seq {}, {})", head.head.seq, head.head.entry_hash);
+                for d in &head.displaced {
+                    if let Some(i) = outbox.iter().find(|i| i.entry.entry_hash() == d.entry_hash) {
+                        out.push_str(&format!(", {} (seq {}, {})", i.ord, d.seq, d.entry_hash));
+                    }
+                }
+                out
+            };
+            let (tip, keep_ord) = match keep {
+                Keep::Head => (head.head, None),
+                Keep::Ord(o) => {
+                    let item = outbox
+                        .iter()
+                        .find(|i| i.ord == o)
+                        .filter(|i| {
+                            head.displaced
+                                .iter()
+                                .any(|d| d.entry_hash == i.entry.entry_hash())
+                        })
+                        .with_context(|| {
+                            format!(
+                                "outbox item {o} is not the tip of a line a later save forked \
+                                 from. The choices: {}",
+                                choices()
+                            )
+                        })?;
+                    (
+                        HeadRef {
+                            entry_hash: item.entry.entry_hash(),
+                            seq: item.entry.entry.seq,
+                        },
+                        Some(o),
+                    )
+                }
+            };
+            let entries: Vec<_> = sent
+                .iter()
+                .chain(&outbox)
+                .map(|i| i.entry.clone())
+                .collect();
+            let line = super::check::main_line(&entries, &tip.entry_hash)
+                .context("the kept line has a missing link here")?;
+            let report = verify_chain(id, &line, &trusted);
+            anyhow::ensure!(
+                report.intact,
+                "the kept line doesn't verify ({:?}): nothing was changed",
+                report.problems
+            );
+            let on_line: std::collections::HashSet<_> =
+                line.iter().map(|e| e.entry_hash()).collect();
+            let aside: Vec<OutboxItem> = outbox
+                .into_iter()
+                .filter(|i| !on_line.contains(&i.entry.entry_hash()))
+                .collect();
+            super::lost::begin_fork(
+                &seal,
+                super::lost::LocalFork {
+                    keep: tip,
+                    keep_ord,
+                },
+                &aside,
+                note,
+            )
+            .await?
+        }
+    };
+    let fork = intent
+        .local_fork
+        .clone()
+        .context("not a fork's resolution")?;
+    // The kept line, from what stays (the items off it may be aside already)
+    let (sent, outbox) = entries_now().await?;
+    let all: Vec<&OutboxItem> = sent.iter().chain(&outbox).collect();
+    let entries: Vec<_> = all.iter().map(|i| i.entry.clone()).collect();
+    let line = super::check::main_line(&entries, &fork.keep.entry_hash)
+        .context("the kept line has a missing link here")?;
+    let report = verify_chain(id, &line, &trusted);
+    anyhow::ensure!(
+        report.intact && report.head == Some(fork.keep),
+        "the kept line doesn't verify ({:?})",
+        report.problems
+    );
+    let snapshot = line
+        .iter()
+        .rev()
+        .find(|e| e.entry.kind == StateEntryKind::Snapshot)
+        .cloned()
+        .context("the kept line holds no snapshot")?;
+    let recorded = all
+        .iter()
+        .find(|i| i.entry.entry_hash() == snapshot.entry_hash())
+        .and_then(|i| i.plaintext_sha256);
+    let tip = match fork.keep_ord {
+        Some(o) => Some(
+            outbox
+                .iter()
+                .find(|i| i.ord == o)
+                .with_context(|| format!("the kept tip, outbox item {o}, is gone"))?,
+        ),
+        None => None,
+    };
+    super::lost::finish_fork(&seal, &dir, &intent, tip, recorded).await?;
+    // The state: the kept tip's, when it isn't the head the agent ran on
+    let mut state_changed = false;
+    if tip.is_some() {
+        let state = super::version::open_reach(&seal, api, &k, &line, &snapshot.entry, reach)
+            .await
+            .context("opening the kept line's latest version")?;
+        let state = as_reloaded(&state).context("the kept state won't serialize")?;
+        let hash = plaintext_hash(&state);
+        anyhow::ensure!(
+            Some(hash) == recorded,
+            "the kept line's latest version hashes to {hash}, not its recorded {recorded:?}: \
+             not writing it (head.json names it; the agent stays as it is until this is fixed)"
+        );
+        let here = FsStorage::new(state_dir)
+            .load_raw(id)
+            .await
+            .ok()
+            .and_then(|l| as_reloaded(&l.value).ok())
+            .map(|v| plaintext_hash(&v));
+        if here != Some(hash) {
+            // Archives the state here as state.<utc>.json first
+            FsStorage::new(state_dir)
+                .save_sealed_raw(id, state)
+                .await
+                .context("writing the kept state")?;
+        }
+        state_changed = true;
+    }
+    super::crash::point("fork:state")?;
+    if seal.is_refused().await? {
+        seal.clear_refusal().await.context("clearing the refusal")?;
+    }
+    Notice::fork_kept(
+        &agent_dir,
+        note,
+        intent.items.len(),
+        state_changed,
+        &super::lost::kept_text(&intent),
+    )
+    .context("writing the notice")?;
+    super::lost::done(&dir)?;
+    drop(lock);
+    tracing::warn!(
+        event_type = "sealed_state_fork_kept",
+        agent_id = %id,
+        head = %fork.keep.entry_hash,
+        seq = fork.keep.seq,
+        set_aside = intent.items.len(),
+        state_changed,
+        kept = %dir.display(),
+        "the operator resolved a fork in a chain kept here; the other line is kept"
+    );
+    Ok(Kept {
+        head: fork.keep,
+        set_aside: intent.items.len(),
+        state_changed,
+        kept: dir,
+    })
+}
+
+/// Agent ids, one a line, as `--agents-file` (or stdin) gives them: blank
+/// lines and `#` comments skipped, each once, in order. A line that isn't
+/// an id is an error naming it.
+pub fn read_ids(text: &str) -> anyhow::Result<Vec<AgentId>> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let id: AgentId = line
+            .parse()
+            .map_err(|_| anyhow::anyhow!("line {}: `{line}` is not an agent id", n + 1))?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// The count table a wide accept prints: how many accepted, by reason, and
+/// each failure with its id. Ids, reasons and counts only.
+pub fn many_table(done: &[(AgentId, anyhow::Result<Accepted>)]) -> String {
+    use std::fmt::Write as _;
+    let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut failed = Vec::new();
+    for (id, r) in done {
+        match r {
+            Ok(a) => *by.entry(a.reason.as_str()).or_default() += 1,
+            Err(e) => failed.push(format!("  failed {id}: {e:#}")),
+        }
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<24} {:>6}", "accepted (reason)", "agents");
+    for (reason, n) in &by {
+        let _ = writeln!(out, "{reason:<24} {n:>6}");
+    }
+    let _ = writeln!(out, "{:<24} {:>6}", "failed", failed.len());
+    let _ = writeln!(out, "{:<24} {:>6}", "total", done.len());
+    for f in failed {
+        let _ = writeln!(out, "{f}");
+    }
+    out
+}
+
+/// `sealed-accept --agents-file`: [`accept`] for each of `ids` with one
+/// `note`, each under its own lock, failures counted and the rest done.
+/// `expect` must be how many agents `ids` names, or nothing is touched (a
+/// wide act is confirmed by its count, as the operator CLI's wide sends).
+pub async fn accept_many(
+    state_dir: &Path,
+    keys: &KeyStore,
+    api: &dyn SealedApi,
+    ids: &[AgentId],
+    note: &str,
+    expect: usize,
+) -> anyhow::Result<Vec<(AgentId, anyhow::Result<Accepted>)>> {
+    let note = note.trim();
+    anyhow::ensure!(
+        !note.is_empty(),
+        "--note is required: every agent accepted reads it"
+    );
+    anyhow::ensure!(
+        ids.len() == expect,
+        "{} agent(s) named, and --expect says {expect}: nothing was touched",
+        ids.len()
+    );
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let done = accept(state_dir, keys, api, id, Some(note)).await;
+        if let Err(e) = &done {
+            tracing::warn!(
+                event_type = "sealed_accept_many_failed",
+                agent_id = %id,
+                error = %format!("{e:#}"),
+                "one agent of a wide sealed-accept failed; the rest go on"
+            );
+        }
+        out.push((id, done));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -920,5 +1329,287 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Wiped and refused, an agent that never uploaded.
+    async fn local_refused(root: &Path) -> (AgentId, KeyStore, std::path::PathBuf) {
+        let (id, keys, dir) = check::tests::enrolled_local(root).await;
+        FsStorage::new(root.join("state"))
+            .save_raw(id, serde_json::json!({ "memory": "" }), None)
+            .await
+            .unwrap();
+        AgentSeal::new(&dir, id).refuse("mismatch").await.unwrap();
+        (id, keys, dir)
+    }
+
+    /// An agent that never uploaded: accepted with a note, its lost head
+    /// rebuilt from the chain kept here, and `--rebase` refused, all with
+    /// no call to Agora (the strict guard).
+    #[tokio::test]
+    async fn a_local_only_agent_is_accepted_without_agora() {
+        let root = crate::sealed::TestDir::new("accept-local");
+        let (id, keys, dir) = local_refused(&root).await;
+        let api = crate::sealed::api::fake::guarded(&root);
+        let state_dir = root.join("state");
+        let done = accept(&state_dir, &keys, &api, id, Some("a test wipe"))
+            .await
+            .unwrap();
+        assert!(!done.adopted);
+        assert!(!AgentSeal::new(&dir, id).is_refused().await.unwrap());
+        let e = rebase(&state_dir, &keys, &api, id, "join")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("nothing of it is on Agora") && e.contains("--keep"),
+            "{e}"
+        );
+
+        // head.json lost, the state still the head's: rebuilt here
+        let root = crate::sealed::TestDir::new("accept-local-head");
+        let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap();
+        std::fs::rename(dir.join("sealed/head.json"), root.join("head.lost")).unwrap();
+        AgentSeal::new(&dir, id)
+            .refuse("head_missing")
+            .await
+            .unwrap();
+        let api = crate::sealed::api::fake::guarded(&root);
+        let done = accept(&root.join("state"), &keys, &api, id, None)
+            .await
+            .unwrap();
+        assert!(done.adopted);
+        assert_eq!(done.head, head.head);
+        let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+        assert!(line.contains(REBUILT_LOCAL_NOTE), "{line}");
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// A chain kept here forked: two saves from one version.
+    async fn forked(root: &Path) -> (AgentId, KeyStore, std::path::PathBuf, HeadRef, HeadRef) {
+        use agora_agentkit::state::storage::Mirrored;
+        let (id, keys, dir) = check::tests::enrolled_local(root).await;
+        let state_dir = root.join("state");
+        let enrolment = std::sync::Arc::new(crate::sealed::SealedEnrolment::new(
+            state_dir.clone(),
+            root.join("secrets"),
+        ));
+        let mut store = Mirrored::new(FsStorage::new(&state_dir), (), enrolment);
+        let base = store.load_raw(id).await.unwrap().base;
+        let a = store
+            .save_raw(id, check::tests::state(20), base.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let b = store
+            .save_raw(id, check::tests::state(21), base.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap();
+        assert_eq!(head.head, b);
+        assert_eq!(head.displaced, vec![a], "a fork");
+        (id, keys, dir, a, b)
+    }
+
+    fn ord_of(dir: &Path, h: HeadRef) -> u64 {
+        for e in std::fs::read_dir(dir.join("sealed/outbox")).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let item: agora_agentkit::state::storage::OutboxItem =
+                serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            if item.entry.entry_hash() == h.entry_hash {
+                return item.ord;
+            }
+        }
+        panic!("no item")
+    }
+
+    /// `--keep head`: the head's line goes on, the other version is kept
+    /// aside (a `.displaced` item and its copies under sealed/lost/), the
+    /// fork cleared, the agent told; `--keep <ord>` of the other tip: that
+    /// line goes on and its state becomes the agent's. No call to Agora.
+    #[tokio::test]
+    async fn a_local_fork_is_resolved_by_the_line_kept() {
+        for keep_head in [true, false] {
+            let root = crate::sealed::TestDir::new("accept-keep");
+            let (id, keys, dir, a, b) = forked(&root).await;
+            let api = crate::sealed::api::fake::guarded(&root);
+            let state_dir = root.join("state");
+            let keep = if keep_head {
+                Keep::Head
+            } else {
+                Keep::Ord(ord_of(&dir, a))
+            };
+            let done = keep_line(&state_dir, &keys, &api, id, keep, "two saves at once")
+                .await
+                .unwrap();
+            let (kept, other, state) = if keep_head {
+                (b, a, check::tests::state(21))
+            } else {
+                (a, b, check::tests::state(20))
+            };
+            assert_eq!(done.head, kept);
+            assert_eq!(done.set_aside, 1);
+            assert_eq!(done.state_changed, !keep_head);
+            let seal = AgentSeal::new(&dir, id);
+            let head = seal.head().await.unwrap().unwrap();
+            assert_eq!(head.head, kept);
+            assert!(head.displaced.is_empty());
+            assert_eq!(
+                local(&root, id).await,
+                agora_agentkit::state::storage::plaintext_hash(&state)
+            );
+            assert_eq!(head.plaintext_sha256, Some(local(&root, id).await));
+            // The other version: aside, never deleted
+            assert!(
+                seal.outbox()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|i| i.entry.entry_hash() != other.entry_hash)
+            );
+            let aside = std::fs::read_dir(dir.join("sealed/outbox"))
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(&format!("{}.displaced", other.entry_hash))
+                })
+                .count();
+            assert_eq!(aside, 1);
+            let res = crate::sealed::lost::resolutions(&seal).unwrap();
+            assert_eq!(res.len(), 1);
+            assert!(std::fs::exists(res[0].0.join("DONE")).unwrap());
+            assert!(std::fs::exists(res[0].0.join("items")).unwrap());
+            // The main line verifies; the agent is told
+            let entries = check::local_entries(&seal).await.unwrap();
+            let line = check::main_line(&entries, &kept.entry_hash).unwrap();
+            assert!(verify_chain(id, &line, &keys.trusted(id).unwrap().unwrap()).intact);
+            let told = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+            assert!(
+                told.contains("resolved a fork") && told.contains("two saves at once"),
+                "{told}"
+            );
+            assert!(!told.contains("on Agora:"), "{told}");
+            assert!(api.calls.lock().unwrap().is_empty());
+            // Nothing left to resolve
+            assert!(
+                keep_line(&state_dir, &keys, &api, id, Keep::Head, "again")
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    /// A tip that isn't a displaced line's: refused, naming the choices,
+    /// nothing written.
+    #[tokio::test]
+    async fn keeping_a_wrong_line_names_the_choices() {
+        let root = crate::sealed::TestDir::new("accept-keep-wrong");
+        let (id, keys, dir, a, _) = forked(&root).await;
+        let api = crate::sealed::api::fake::guarded(&root);
+        let e = keep_line(&root.join("state"), &keys, &api, id, Keep::Ord(999), "n")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("The choices: head") && e.contains(&a.entry_hash.to_string()),
+            "{e}"
+        );
+        assert!(!std::fs::exists(dir.join("sealed/lost")).unwrap());
+    }
+
+    /// Cut after each step: the rerun finishes the same resolution.
+    #[tokio::test]
+    async fn a_cut_fork_resolution_finishes_on_rerun() {
+        for point in [
+            "fork:intent",
+            "fork:copied",
+            "fork:aside",
+            "fork:head",
+            "fork:state",
+        ] {
+            let root = crate::sealed::TestDir::new("accept-keep-cut");
+            let (id, keys, dir, a, _) = forked(&root).await;
+            let api = crate::sealed::api::fake::guarded(&root);
+            let keep = Keep::Ord(ord_of(&dir, a));
+            crate::sealed::crash::at(point);
+            let e = keep_line(&root.join("state"), &keys, &api, id, keep, "n")
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{e:#}").contains("simulated crash"),
+                "{point}: {e:#}"
+            );
+            let done = keep_line(&root.join("state"), &keys, &api, id, keep, "n")
+                .await
+                .unwrap();
+            assert_eq!(done.head, a, "{point}");
+            assert_eq!(done.set_aside, 1, "{point}");
+            assert_eq!(
+                local(&root, id).await,
+                agora_agentkit::state::storage::plaintext_hash(&check::tests::state(20)),
+                "{point}"
+            );
+            let res = crate::sealed::lost::resolutions(&AgentSeal::new(&dir, id)).unwrap();
+            assert_eq!(res.len(), 1, "{point}: one resolution");
+        }
+    }
+
+    /// `--agents-file`: a count that isn't `--expect` touches nothing; the
+    /// right one accepts each, with one note, and counts them.
+    #[tokio::test]
+    async fn a_wide_accept_needs_the_expected_count() {
+        let root = crate::sealed::TestDir::new("accept-many");
+        let (a, keys, dir_a) = local_refused(&root).await;
+        let (b, _, dir_b) = local_refused(&root).await;
+        let api = crate::sealed::api::fake::guarded(&root);
+        let state_dir = root.join("state");
+        let ids = read_ids(&format!("# after the event\n{a}\n\n{b}\n{a}\n")).unwrap();
+        assert_eq!(ids, vec![a, b], "each once, in order");
+        assert!(read_ids("not-an-id").is_err());
+        let e = accept_many(&state_dir, &keys, &api, &ids, "restored by hand", 3)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("nothing was touched"), "{e}");
+        for d in [&dir_a, &dir_b] {
+            assert!(
+                AgentSeal::new(d, AgentId::new())
+                    .is_refused()
+                    .await
+                    .unwrap()
+            );
+            assert!(Notice::load(d).unwrap().is_none(), "untouched");
+        }
+        assert!(
+            accept_many(&state_dir, &keys, &api, &ids, " ", 2)
+                .await
+                .is_err(),
+            "a note"
+        );
+        let done = accept_many(&state_dir, &keys, &api, &ids, "restored by hand", 2)
+            .await
+            .unwrap();
+        assert!(done.iter().all(|(_, r)| r.is_ok()));
+        let table = many_table(&done);
+        assert!(
+            table.contains("mismatch") && table.contains("total"),
+            "{table}"
+        );
+        for d in [&dir_a, &dir_b] {
+            assert!(
+                !AgentSeal::new(d, AgentId::new())
+                    .is_refused()
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(api.calls.lock().unwrap().is_empty());
     }
 }

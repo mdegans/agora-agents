@@ -41,16 +41,37 @@ pub enum Command {
     /// (or, for a lost head.json, rebuild it from Agora's verified chain),
     /// clear the refusal, and leave the note for its next session.
     SealedAccept {
-        #[arg(long)]
-        agent: AgentId,
+        // B4/5: `--keep`, `--agents-file`, `--expect` (the local paths and
+        // the wide accept)
+        #[arg(
+            long,
+            required_unless_present = "agents_file",
+            conflicts_with = "agents_file"
+        )]
+        agent: Option<AgentId>,
         /// What the agent is told, in its next session. Required, but for a
-        /// lost head.json rebuilt from Agora that the state matches.
+        /// lost head.json rebuilt (from Agora, or the chain kept here) that
+        /// the state matches.
         #[arg(long)]
         note: Option<String>,
         /// Resolve a held fork: seal the current state on top of Agora's
         /// verified head, keep the other branch locally, resume uploads.
-        #[arg(long, requires = "note")]
+        #[arg(long, requires = "note", conflicts_with = "keep")]
         rebase: bool,
+        /// Resolve a fork in a chain kept here (an agent that doesn't
+        /// upload): `head` keeps the head's line, or the outbox number of
+        /// a displaced line's tip keeps that line (its state becomes the
+        /// agent's). The other line is kept under sealed/lost/<utc>/.
+        #[arg(long, requires = "note")]
+        keep: Option<super::accept::Keep>,
+        /// Accept every agent named in this file (one id a line, `#`
+        /// comments; `-` reads stdin) with one note, each under its own
+        /// lock. Needs --expect.
+        #[arg(long, requires_all = ["note", "expect"], conflicts_with_all = ["rebase", "keep"])]
+        agents_file: Option<std::path::PathBuf>,
+        /// How many agents --agents-file names: a mismatch touches nothing.
+        #[arg(long)]
+        expect: Option<usize>,
     },
     /// Put an agent's last sealed version back as its state: a refused
     /// agent's, or one whose state, sealed/ or whole directory was lost
@@ -71,6 +92,13 @@ pub enum Command {
         /// this the restore refuses; `sealed-accept --note` keeps it.
         #[arg(long)]
         discard_local: bool,
+        // B4/5
+        /// Put back the newest save cut short (a complete state.json.tmp,
+        /// or one set aside as state.json.tmp.<utc>.aside, newer than the
+        /// sealed head) instead of the head's version. A restore that finds
+        /// one refuses without this, naming it.
+        #[arg(long)]
+        from_cut_save: bool,
     },
     /// Set aside the state key of an agent whose state is gone for good
     /// (it left, its secrets left behind), so its missing state stops
@@ -268,9 +296,80 @@ pub async fn run(
             anyhow::ensure!(failed == 0, "{failed} enrolment(s) failed");
         }
         Command::SealedAccept {
-            agent,
+            agents_file: Some(file),
+            note,
+            expect,
+            ..
+        } => {
+            let text = if file.as_os_str() == "-" {
+                std::io::read_to_string(std::io::stdin()).context("reading ids from stdin")?
+            } else {
+                std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?
+            };
+            let ids = super::accept::read_ids(&text)?;
+            let expect = expect.unwrap_or_default();
+            println!(
+                "sealed-accept: {} agent(s) named; --expect {expect}{}",
+                ids.len(),
+                if ids.len() == expect {
+                    ""
+                } else {
+                    ": a mismatch, nothing will be touched"
+                }
+            );
+            let _runner = super::session::runner_exclusive(data_dir)?;
+            let done = super::accept::accept_many(
+                &state_dir,
+                &keys,
+                api.as_ref(),
+                &ids,
+                note.as_deref().unwrap_or_default(),
+                expect,
+            )
+            .await?;
+            print!("{}", super::accept::many_table(&done));
+            let failed = done.iter().filter(|(_, r)| r.is_err()).count();
+            anyhow::ensure!(
+                failed == 0,
+                "{failed} of {} agent(s) not accepted",
+                done.len()
+            );
+        }
+        Command::SealedAccept {
+            agent: Some(agent),
+            note,
+            keep: Some(keep),
+            ..
+        } => {
+            let _runner = super::session::runner_exclusive(data_dir)?;
+            let done = super::accept::keep_line(
+                &state_dir,
+                &keys,
+                api.as_ref(),
+                agent,
+                keep,
+                note.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            println!(
+                "{agent}: fork resolved; head {} at seq {}; {} version(s) set aside, kept in {}{}",
+                done.head.entry_hash,
+                done.head.seq,
+                done.set_aside,
+                done.kept.display(),
+                if done.state_changed {
+                    "; its state is the kept line's (the one here archived)"
+                } else {
+                    ""
+                }
+            );
+        }
+        Command::SealedAccept {
+            agent: Some(agent),
             note,
             rebase: true,
+            ..
         } => {
             // `rebase` takes the runner lock itself, before it reads anything
             let done = super::accept::rebase(
@@ -294,7 +393,14 @@ pub async fn run(
                 ),
             }
         }
-        Command::SealedAccept { agent, note, .. } => {
+        Command::SealedAccept { agent: None, .. } => {
+            anyhow::bail!("name --agent <id> or --agents-file")
+        }
+        Command::SealedAccept {
+            agent: Some(agent),
+            note,
+            ..
+        } => {
             let _runner = super::session::runner_exclusive(data_dir)?;
             let done =
                 super::accept::accept(&state_dir, &keys, api.as_ref(), agent, note.as_deref())
@@ -305,7 +411,7 @@ pub async fn run(
                 done.head.entry_hash,
                 done.head.seq,
                 if done.adopted {
-                    "; head.json rebuilt from Agora's verified chain"
+                    "; head.json rebuilt from the verified chain"
                 } else {
                     ""
                 },
@@ -315,17 +421,27 @@ pub async fn run(
             agent,
             note,
             discard_local,
+            from_cut_save,
         } => {
             let _runner = super::session::runner_exclusive(data_dir)?;
-            let done = super::restore::restore(
+            let done = super::restore::restore_with(
                 &state_dir,
                 &keys,
                 api.as_ref(),
                 agent,
-                note.as_deref(),
-                discard_local,
+                super::restore::Options {
+                    note: note.as_deref(),
+                    discard_local,
+                    from_cut_save,
+                },
             )
             .await?;
+            if let Some(file) = &done.cut_save {
+                println!("{agent}: put back the save cut short in {file}");
+            }
+            if done.recovered_key {
+                println!("{agent}: state_key.json was missing and was recovered from Agora");
+            }
             println!(
                 "{agent}: restored ({}) from its sealed version of {} (head {} at seq {}{}); a \
                  state found is archived beside state.json{}",
@@ -334,7 +450,7 @@ pub async fn run(
                 done.head.entry_hash,
                 done.head.seq,
                 if done.rebuilt_head {
-                    ", head.json rebuilt from Agora"
+                    ", head.json rebuilt from the verified chain"
                 } else {
                     ""
                 },
@@ -349,13 +465,17 @@ pub async fn run(
             let _runner = super::session::runner_exclusive(data_dir)?;
             let done = super::forget::forget(&state_dir, &keys, agent, &note)?;
             println!(
-                "{agent}: state key set aside as {}{}{}; no key deleted{}",
+                "{agent}: state key set aside as {}{}{}{}; no key deleted{}",
                 done.key,
                 done.memory_id_key
                     .map(|k| format!(", its memory-id key as {k}"))
                     .unwrap_or_default(),
                 done.stop
                     .map(|s| format!(", its stop as {s}"))
+                    .unwrap_or_default(),
+                // B4/5
+                done.uploading
+                    .map(|u| format!(", its uploading marker as {u}"))
                     .unwrap_or_default(),
                 if done.index {
                     "; the search index (a rebuildable sidecar) deleted"
@@ -409,10 +529,24 @@ pub async fn run(
             )
             .await?;
             println!(
-                "{agent}: rotated signing {}, encryption {}, state key re-wrapped {}{}",
+                "{agent}: rotated signing {}, encryption {}, state key re-wrapped {}{}{}{}",
                 done.signing,
                 done.encryption,
                 done.rewrapped,
+                // B4/5
+                if done.wrap_kept_local {
+                    " (kept here for its opt-in: nothing of it is on Agora)"
+                } else {
+                    ""
+                },
+                if done.resigned > 0 {
+                    format!(
+                        "; {} local entr(ies) re-signed with the new key",
+                        done.resigned
+                    )
+                } else {
+                    String::new()
+                },
                 if done.resumed { " (resumed)" } else { "" }
             );
         }

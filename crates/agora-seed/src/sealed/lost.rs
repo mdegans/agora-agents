@@ -17,6 +17,17 @@
 //!   themselves move here, so the new numbering starts clean; on top of
 //!   Agora's head they stay in `sent/` as `<ord>-<hash>.lost` too, so the
 //!   numbering goes on with no gap.
+//!
+//! **A fork in a chain kept here** (an agent whose chain isn't uploaded,
+//! `sealed-accept --keep`, [`begin_fork`] and [`finish_fork`]): two saves
+//! from one version, the later recorded in `head.json`'s `displaced`. The
+//! operator chooses the line that goes on; every outbox item off it is
+//! kept the same way (`INTENT`, copies of the head, blobs and records,
+//! then renamed `outbox/<ord>-<hash>.displaced`, as agentkit's
+//! `rebase_onto` sets one aside), `head.json` names the kept line's tip
+//! with its forks cleared, and, if the kept tip isn't the head, its state
+//! becomes the agent's (`state.json` archived by FsStorage first). Nothing
+//! is deleted.
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +56,18 @@ pub struct Intent {
     /// The old head's keyframe: a full copy, if its blob is here.
     pub full_copy: Option<DateTime<Utc>>,
     pub note: String,
+    /// A fork in a chain kept here, not a loss on Agora: the line kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_fork: Option<LocalFork>,
+}
+
+/// The line `sealed-accept --keep` keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalFork {
+    /// Its tip.
+    pub keep: HeadRef,
+    /// The tip's outbox item, when it isn't the head `head.json` named.
+    pub keep_ord: Option<u64>,
 }
 
 /// The pending resolution, if one was cut short.
@@ -124,6 +147,39 @@ fn copy_if_missing(from: &Path, to: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Step 1 of a resolution: copies of the old head, the blobs still here
+/// (the items' and the old head's keyframe's) and the items' records,
+/// each written once.
+async fn copy_aside(seal: &AgentSeal, dir: &Path, intent: &Intent) -> anyhow::Result<()> {
+    let kept = dir.join("sealed");
+    copy_if_missing(&seal.dir().join("head.json"), &kept.join("head.json"))?;
+    let blobs = seal.dir().join("blobs");
+    let mut shas: Vec<_> = intent
+        .items
+        .iter()
+        .filter_map(|i| i.entry.entry.blob.as_ref().map(|b| b.sha256))
+        .collect();
+    if let Ok(Some(h)) = seal.head().await
+        && let Some(sha) = h.keyframe.as_ref().and_then(|k| k.blob_sha256())
+    {
+        shas.push(sha);
+    }
+    for sha in shas {
+        copy_if_missing(
+            &blobs.join(sha.to_hex()),
+            &kept.join("blobs").join(sha.to_hex()),
+        )?;
+    }
+    let records = dir.join("items");
+    for item in &intent.items {
+        let name = format!("{:020}-{}.json", item.ord, item.entry.entry_hash());
+        if !std::fs::exists(records.join(&name))? {
+            write_new(&records.join(&name), &serde_json::to_vec_pretty(item)?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Start a resolution: its directory and `INTENT`, nothing moved yet.
 pub async fn begin(
     seal: &AgentSeal,
@@ -157,6 +213,7 @@ pub async fn begin(
         items,
         full_copy,
         note: note.to_string(),
+        local_fork: None,
     };
     write_new(&dir.join(INTENT), &serde_json::to_vec_pretty(&intent)?)?;
     super::crash::point("lost:intent")?;
@@ -176,33 +233,9 @@ pub async fn finish(
     server_head: Option<&SignedStateEntry>,
 ) -> anyhow::Result<HeadRef> {
     let kept = dir.join("sealed");
-    // 1. Copies: the old head, the blobs still here, the items' records
-    copy_if_missing(&seal.dir().join("head.json"), &kept.join("head.json"))?;
-    let blobs = seal.dir().join("blobs");
-    let mut shas: Vec<_> = intent
-        .items
-        .iter()
-        .filter_map(|i| i.entry.entry.blob.as_ref().map(|b| b.sha256))
-        .collect();
-    if let Ok(Some(h)) = seal.head().await
-        && let Some(sha) = h.keyframe.as_ref().and_then(|k| k.blob_sha256())
-    {
-        shas.push(sha);
-    }
-    for sha in shas {
-        copy_if_missing(
-            &blobs.join(sha.to_hex()),
-            &kept.join("blobs").join(sha.to_hex()),
-        )?;
-    }
-    let records = dir.join("items");
-    for item in &intent.items {
-        let name = format!("{:020}-{}.json", item.ord, item.entry.entry_hash());
-        if !std::fs::exists(records.join(&name))? {
-            write_new(&records.join(&name), &serde_json::to_vec_pretty(item)?)?;
-        }
-    }
+    copy_aside(seal, dir, intent).await?;
     super::crash::point("lost:copied")?;
+    let records = dir.join("items");
     // 2. Set aside
     let sent = seal.dir().join("sent");
     let outbox = seal.dir().join("outbox");
@@ -321,6 +354,118 @@ pub async fn finish(
     std::fs::rename(dir.join(INTENT), dir.join(DONE))?;
     sync(dir)?;
     Ok(head)
+}
+
+/// Start a local fork's resolution: `INTENT` naming the line kept and the
+/// items set aside, nothing moved yet.
+pub async fn begin_fork(
+    seal: &AgentSeal,
+    keep: LocalFork,
+    aside: &[OutboxItem],
+    note: &str,
+) -> anyhow::Result<(PathBuf, Intent)> {
+    let at = Utc::now();
+    let dir = seal
+        .dir()
+        .join(LOST)
+        .join(at.format(crate::sealed::STAMP_FORMAT).to_string());
+    let head = seal.head().await?;
+    let full_copy = head
+        .as_ref()
+        .and_then(|h| h.keyframe.as_ref())
+        .filter(|k| {
+            k.blob_sha256().is_some_and(|sha| {
+                std::fs::exists(seal.dir().join("blobs").join(sha.to_hex())).unwrap_or(false)
+            })
+        })
+        .and_then(|k| DateTime::from_timestamp_micros(k.entry.state_at));
+    let intent = Intent {
+        at,
+        onto: None,
+        items: aside.to_vec(),
+        full_copy,
+        note: note.to_string(),
+        local_fork: Some(keep),
+    };
+    write_new(&dir.join(INTENT), &serde_json::to_vec_pretty(&intent)?)?;
+    super::crash::point("fork:intent")?;
+    Ok((dir, intent))
+}
+
+/// Steps 1 to 3 of the local fork resolution `intent` describes, each
+/// skipped once done, so a rerun after a cut finishes it: copies, the
+/// items off the kept line set aside, `head.json` naming the kept tip.
+/// `tip`: the kept tip's outbox item, when it isn't the head `head.json`
+/// named (`plaintext_sha256`: its line's last snapshot's). The caller
+/// then writes the tip's state, the notice, and calls [`done`].
+pub async fn finish_fork(
+    seal: &AgentSeal,
+    dir: &Path,
+    intent: &Intent,
+    tip: Option<&OutboxItem>,
+    plaintext_sha256: Option<agora_agentkit::govlog::Sha256Hex>,
+) -> anyhow::Result<()> {
+    let keep = intent
+        .local_fork
+        .as_ref()
+        .context("not a local fork's resolution")?;
+    // 1. Copies
+    copy_aside(seal, dir, intent).await?;
+    super::crash::point("fork:copied")?;
+    // 2. Set aside, as agentkit's rebase_onto does: `.displaced`
+    let outbox = seal.dir().join("outbox");
+    for item in &intent.items {
+        let from = outbox.join(format!("{:020}.json", item.ord));
+        let same = std::fs::read(&from)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<OutboxItem>(&b).ok())
+            .is_some_and(|i| i.entry.entry_hash() == item.entry.entry_hash());
+        if same {
+            std::fs::rename(
+                &from,
+                outbox.join(format!(
+                    "{:020}-{}.displaced",
+                    item.ord,
+                    item.entry.entry_hash()
+                )),
+            )?;
+        }
+    }
+    if std::fs::exists(&outbox)? {
+        sync(&outbox)?;
+    }
+    super::crash::point("fork:aside")?;
+    // 3. head.json: the kept tip, its forks resolved
+    let old = seal.head().await?.context("head.json is missing")?;
+    if old.head != keep.keep || !old.displaced.is_empty() {
+        let file = match tip {
+            None => agora_agentkit::state::storage::HeadFile {
+                displaced: Vec::new(),
+                ..old
+            },
+            Some(tip) => agora_agentkit::state::storage::HeadFile {
+                head: keep.keep,
+                plaintext_sha256,
+                keyframe: tip.keyframe_after.clone(),
+                next_ord: old.next_ord,
+                displaced: Vec::new(),
+                created_at: tip.entry.entry.created_at,
+            },
+        };
+        super::write_private(
+            &seal.dir().join("head.json"),
+            &serde_json::to_vec_pretty(&file)?,
+        )?;
+    }
+    super::crash::point("fork:head")?;
+    Ok(())
+}
+
+/// A resolution finished: `INTENT` renamed `DONE`.
+pub fn done(dir: &Path) -> anyhow::Result<()> {
+    std::fs::rename(dir.join(INTENT), dir.join(DONE))?;
+    sync(dir)?;
+    Ok(())
 }
 
 /// Re-sign the entries a resolution's record (`INTENT` or `DONE` in

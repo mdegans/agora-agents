@@ -402,9 +402,8 @@ async fn local_is_agoras(
     )
 }
 
-/// Restore `id`'s last sealed version as its state: a refused agent's, or
-/// one whose state or `sealed/` (or whole directory) is gone. A state
-/// here that isn't refused and has its `head.json` is never overwritten.
+/// [`restore_with`] without `--from-cut-save`: the tests' form.
+#[cfg(test)]
 pub async fn restore(
     state_dir: &Path,
     keys: &KeyStore,
@@ -427,7 +426,10 @@ pub async fn restore(
     .await
 }
 
-/// [`restore`], with every [`Options`].
+/// Restore `id`'s last sealed version as its state: a refused agent's, or
+/// one whose state or `sealed/` (or whole directory) is gone. A state
+/// here that isn't refused and has its `head.json` is never overwritten
+/// ([`Options`] says what more it may do).
 pub async fn restore_with(
     state_dir: &Path,
     keys: &KeyStore,
