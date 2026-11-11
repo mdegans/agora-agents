@@ -8575,7 +8575,7 @@ mod tests {
 
     /// Enrolment's sentence, once: to an agent that had memory ids before
     /// its versions were sealed (its key's fingerprint older than its
-    /// `sealed/enrolled`), appended to the verdict, marked told only when
+    /// `sealed/chained`), appended to the verdict, marked told only when
     /// the session saves; never to one enrolled before it had a key.
     #[tokio::test]
     async fn the_enrolment_sentence_is_told_once_to_agents_keyed_before_enrolling() {
@@ -8614,7 +8614,7 @@ mod tests {
         let sentence = enrollment_sentence(&today);
 
         // Enrolled before it had a key (the betas): never told
-        set_mtime(&dir.join("sealed/enrolled"), 3600);
+        set_mtime(&dir.join("sealed/chained"), 3600);
         let mut a = agent(&h);
         a.on_init().await.unwrap();
         let seen = intro(&a);
