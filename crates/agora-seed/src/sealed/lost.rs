@@ -323,6 +323,38 @@ pub async fn finish(
     Ok(head)
 }
 
+/// Re-sign the entries a resolution's record (`INTENT` or `DONE` in
+/// `dir`) holds, with `resign` (`rotate-keys`, for an agent that doesn't
+/// upload): the record rewritten whole if any changed. Returns how many.
+pub fn resign_record(
+    dir: &Path,
+    mut resign: impl FnMut(&Path, &mut SignedStateEntry) -> anyhow::Result<bool>,
+) -> anyhow::Result<usize> {
+    let mut count = 0;
+    for marker in [INTENT, DONE] {
+        let path = dir.join(marker);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let mut intent: Intent = serde_json::from_slice(&bytes)
+            .with_context(|| format!("{} unreadable", path.display()))?;
+        let mut changed = 0;
+        for item in &mut intent.items {
+            if resign(&path, &mut item.entry)? {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            super::write_private(&path, &serde_json::to_vec_pretty(&intent)?)
+                .with_context(|| format!("rewriting {}", path.display()))?;
+            count += changed;
+        }
+    }
+    Ok(count)
+}
+
 /// What the agent is told is kept.
 pub fn kept_text(intent: &Intent) -> String {
     let n = intent.items.len();

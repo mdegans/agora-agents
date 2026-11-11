@@ -43,6 +43,9 @@ pub const ROTATIONS_FILE: &str = "rotations.json";
 pub const PENDING_ROTATION_FILE: &str = "rotation.pending.json";
 /// The key memory ids are made with ([`MemoryIdKeys`]).
 pub const MEMORY_ID_KEY_FILE: &str = "memory_id_key.json";
+/// The newest wrap of the state key `rotate-keys` made: kept before it is
+/// posted, so a rerun posts the same bytes ([`KeyStore::wrap_record`]).
+pub const WRAP_FILE: &str = "state_key.wrap.json";
 
 /// The name of a file `sealed-forget` set aside under a stamp
 /// ([`super::STAMP_FORMAT`]): one place to make and to parse each.
@@ -105,7 +108,9 @@ pub const FORGOTTEN_MEMORY_ID_KEY: SetAsideName = SetAsideName {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StateKeyFile {
     pub key_gen: u32,
-    /// Which wrap of this generation was last posted.
+    /// Which wrap of this generation is current: for an agent that
+    /// uploads, the last posted; for one that doesn't, the one to post at
+    /// its opt-in (kept in [`WRAP_FILE`] when `rotate-keys` made it).
     pub wrap_seq: u32,
     /// 64 hex characters.
     pub key: String,
@@ -196,7 +201,6 @@ impl PastKeys {
     }
 
     /// Past X25519 secrets, newest first, to open an older wrap.
-    #[cfg(test)]
     pub fn encryption_secrets(&self) -> Vec<EncryptionSecretKey> {
         self.encryption
             .iter()
@@ -470,6 +474,34 @@ impl KeyStore {
     /// never hold a wrap of a key the runner could lose.
     pub fn write_state_key(&self, id: AgentId, file: &StateKeyFile) -> std::io::Result<()> {
         write_secret(&self.agent_dir(id).join(STATE_KEY_FILE), &to_json(file)?)
+    }
+
+    /// The wrap record `rotate-keys` made last ([`WRAP_FILE`]), if any.
+    /// Public material, kept 0600 like the rest.
+    pub fn wrap_record(
+        &self,
+        id: AgentId,
+    ) -> std::io::Result<Option<agora_agentkit::state::StateKeyRecord>> {
+        read_json(&self.agent_dir(id).join(WRAP_FILE))
+    }
+
+    /// Keep `record` as the newest wrap, before it is posted (if it ever
+    /// is): a rerun then posts these bytes, never a second wrap at the
+    /// same `(key_gen, wrap_seq)`.
+    pub fn write_wrap_record(
+        &self,
+        id: AgentId,
+        record: &agora_agentkit::state::StateKeyRecord,
+    ) -> std::io::Result<()> {
+        write_secret(&self.agent_dir(id).join(WRAP_FILE), &to_json(record)?)
+    }
+
+    /// Write the state key cache only if there is none: `Ok(false)` when
+    /// a file is already there, which is left as it was.
+    pub fn create_state_key(&self, id: AgentId, file: &StateKeyFile) -> std::io::Result<bool> {
+        let dir = self.agent_dir(id);
+        std::fs::create_dir_all(&dir)?;
+        create_secret(&dir.join(STATE_KEY_FILE), &to_json(file)?)
     }
 
     pub fn past_keys(&self, id: AgentId) -> std::io::Result<PastKeys> {
@@ -771,23 +803,151 @@ impl KeyStore {
         let Some(current) = self.signing(id) else {
             return Ok(None);
         };
+        self.trusted_ending_at(id, &current.verifying_key())
+            .map(Some)
+    }
+
+    /// [`Self::trusted`], ending at `current` rather than the key in
+    /// `secrets.json`: for `rotate-keys`, which checks a re-signed chain
+    /// under the new key before `secrets.json` becomes it.
+    pub fn trusted_ending_at(
+        &self,
+        id: AgentId,
+        current: &agora_agentkit::crypto::VerifyingKey,
+    ) -> std::io::Result<agora_agentkit::state::verify::TrustedKeys> {
         let rotations = self.rotations(id)?;
         let first = match rotations.iter().min_by_key(|r| r.seq) {
             Some(r) => r
                 .old_public_key
                 .to_verifying_key()
                 .map_err(|e| std::io::Error::other(format!("rotations.json: {e}")))?,
-            None => current.verifying_key(),
+            None => *current,
         };
         let trusted =
             agora_agentkit::state::verify::TrustedKeys::new(first).with_rotations(&rotations);
-        if trusted.current() != current.verifying_key() {
+        if trusted.current() != *current {
             return Err(std::io::Error::other(
                 "the recorded rotations don't end at the current signing key",
             ));
         }
-        Ok(Some(trusted))
+        Ok(trusted)
     }
+}
+
+/// What [`recover_state_key`] wrote: the generation and wrap it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveredStateKey {
+    pub key_gen: u32,
+    pub wrap_seq: u32,
+}
+
+/// `state_key.json` is the runner's only usable copy of an agent's state
+/// key. When it is missing and Agora holds the agent's chain (it uploads,
+/// or did before it was stopped), the wrap Agora holds is
+/// unwrapped back into it: the agent's records fetched (`state_keys`), only
+/// one signed by a signing key the runner trusts for the agent kept, opened
+/// with the agent's X25519 key (or a past one), the newest generation and
+/// wrap taken. When the agent's sealed head is here, the key must open its
+/// keyframe's blob too. Written only if no file is there (never over one),
+/// with a `sealed_state_key_recovered` event. `Ok(None)`: the file is here.
+///
+/// An agent that never uploaded has no copy on Agora: refused, saying the
+/// key went with the secrets directory and only a backup restores it.
+pub async fn recover_state_key(
+    keys: &KeyStore,
+    agent_dir: &Path,
+    api: &dyn super::api::SealedApi,
+    id: AgentId,
+) -> anyhow::Result<Option<RecoveredStateKey>> {
+    use anyhow::Context;
+    if keys.state_key_file(id)?.is_some() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        super::version::reach(agent_dir, keys, id).on_agora(),
+        "agent {id}'s state key ({}) is gone, and nothing of this agent is on Agora to \
+         recover it from: it went with the secrets directory. Only a backup of `secrets/{id}/` \
+         restores it; without it nothing sealed for the agent can be opened",
+        keys.agent_dir(id).join(STATE_KEY_FILE).display()
+    );
+    let signing = keys
+        .signing(id)
+        .with_context(|| format!("agent {id} has no signing key in the secrets directory"))?;
+    let trusted = keys
+        .trusted(id)?
+        .context("no signing key to verify the state key records with")?;
+    let past = keys.past_keys(id)?;
+    let mut signers = vec![signing.verifying_key()];
+    signers.extend(past.signing_public());
+    signers.retain(|k| trusted.trusts(k));
+    let mut secrets: Vec<EncryptionSecretKey> = keys
+        .secrets(id)?
+        .map(|s| s.encryption())
+        .transpose()?
+        .flatten()
+        .into_iter()
+        .collect();
+    secrets.extend(past.encryption_secrets());
+    let records = api
+        .state_keys(id, &signing)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("reading the agent's state key records on Agora")?;
+    let mut best: Option<(u32, u32, StateKey)> = None;
+    for r in &records {
+        if r.agent_id != id || !signers.iter().any(|k| r.verify(k)) {
+            continue;
+        }
+        let Some(key) = secrets.iter().find_map(|s| StateKey::unwrap(r, s).ok()) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(g, w, _)| (r.key_gen, r.wrap_seq) > (*g, *w))
+        {
+            best = Some((r.key_gen, r.wrap_seq, key));
+        }
+    }
+    let (key_gen, wrap_seq, state_key) = best.with_context(|| {
+        format!(
+            "Agora holds {} state key record(s) for agent {id}, and none is signed by a key this \
+             runner trusts and opens with its X25519 key: nothing written",
+            records.len()
+        )
+    })?;
+    // The key the agent's chain here is sealed with, if its head is here
+    let seal = agora_agentkit::state::storage::AgentSeal::new(agent_dir, id);
+    if let Ok(Some(head)) = seal.head().await
+        && let Some(kf) = head.keyframe
+    {
+        anyhow::ensure!(
+            kf.entry.key_gen == key_gen,
+            "the newest state key record on Agora is generation {key_gen}, and the agent's \
+             sealed head here is sealed under generation {}: nothing written",
+            kf.entry.key_gen
+        );
+        if let Some(sha) = kf.blob_sha256()
+            && let Ok(sealed) = seal.read_blob(&sha).await
+        {
+            agora_agentkit::state::crypto::open_entry_blob(&state_key, &kf.entry, &sealed)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .context(
+                    "the state key unwrapped from Agora doesn't open the agent's sealed head \
+                     here: nothing written",
+                )?;
+        }
+    }
+    let written = keys.create_state_key(id, &StateKeyFile::new(&state_key, key_gen, wrap_seq))?;
+    if written {
+        tracing::warn!(
+            event_type = "sealed_state_key_recovered",
+            agent_id = %id,
+            key_gen,
+            wrap_seq,
+            "state_key.json was missing; recovered from the agent's verified wrap on Agora"
+        );
+    }
+    Ok(written.then_some(RecoveredStateKey { key_gen, wrap_seq }))
 }
 
 /// `<state>/<id>/memory_id_key.fingerprint.json`: non-secret evidence that

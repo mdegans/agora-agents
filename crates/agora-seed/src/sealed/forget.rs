@@ -7,7 +7,10 @@
 //! `state_key.forgotten.<utc>.json`, the memory-id key
 //! `memory_id_key.forgotten.<utc>.json` (the same `<utc>`, so putting the
 //! agent back restores both together and its memory ids still resolve),
-//! the durable stop (if any) `sealed_stopped.forgotten.<utc>`, and the note
+//! the durable stop (if any) `sealed_stopped.forgotten.<utc>`, the durable
+//! uploading marker (if any) `sealed_uploading.forgotten.<utc>` (so an
+//! agent put back is not silently uploading again: its secrets copy alone
+//! would read as uploading, with the stop set aside beside it), and the note
 //! is kept beside them as `state_key.forgotten.<utc>.note.json`, naming
 //! what this forget moves. The signing keys stay. A memory-id key set aside
 //! is reused, never minted over, if the agent is ever asked for one again
@@ -52,6 +55,9 @@ struct Forgotten {
     /// Where the durable stop goes, if there was one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stop: Option<String>,
+    /// Where the durable uploading marker goes, if there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uploading: Option<String>,
 }
 
 /// What `sealed-forget` set aside: file names only.
@@ -59,6 +65,8 @@ struct Forgotten {
 pub struct Forgot {
     pub key: String,
     pub stop: Option<String>,
+    /// The durable uploading marker's new name, if the agent had one.
+    pub uploading: Option<String>,
     /// The memory-id key's new name, if the agent had one.
     pub memory_id_key: Option<String>,
     /// The search index was there, and was deleted.
@@ -84,6 +92,10 @@ fn finish(dir: &Path, plan: &Forgotten) -> anyhow::Result<()> {
     if let Some(to) = &plan.stop {
         move_aside(dir, super::stop::DURABLE, to).context("setting the stop aside")?;
     }
+    if let Some(to) = &plan.uploading {
+        move_aside(dir, super::uploading::DURABLE, to)
+            .context("setting the uploading marker aside")?;
+    }
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -107,7 +119,8 @@ fn cut_forget(dir: &Path) -> anyhow::Result<Option<(String, Forgotten)>> {
         })
     };
     let unfinished = pending(MEMORY_ID_KEY_FILE, &plan.memory_id_key)?
-        || pending(super::stop::DURABLE, &plan.stop)?;
+        || pending(super::stop::DURABLE, &plan.stop)?
+        || pending(super::uploading::DURABLE, &plan.uploading)?;
     Ok(unfinished.then_some((stamp, plan)))
 }
 
@@ -146,6 +159,7 @@ pub fn forget(
         return Ok(Forgot {
             key: FORGOTTEN_STATE_KEY.name(&stamp),
             stop: plan.stop,
+            uploading: plan.uploading,
             memory_id_key: plan.memory_id_key,
             index,
             finished_cut: true,
@@ -167,6 +181,8 @@ pub fn forget(
             .then(|| FORGOTTEN_MEMORY_ID_KEY.name(&stamp)),
         stop: std::fs::exists(dir.join(super::stop::DURABLE))?
             .then(|| format!("{}.forgotten.{stamp}", super::stop::DURABLE)),
+        uploading: std::fs::exists(dir.join(super::uploading::DURABLE))?
+            .then(|| format!("{}.forgotten.{stamp}", super::uploading::DURABLE)),
     };
     // The note first: a key set aside always says why, and what goes with it
     let note_path = dir.join(FORGOTTEN_NOTE.name(&stamp));
@@ -187,6 +203,7 @@ pub fn forget(
     Ok(Forgot {
         key: key_to,
         stop: plan.stop,
+        uploading: plan.uploading,
         memory_id_key: plan.memory_id_key,
         index,
         finished_cut: false,
@@ -355,5 +372,49 @@ mod tests {
         let after = record(&s2);
         assert!(String::from_utf8_lossy(&after[1]).contains("second"));
         assert_eq!(after[3], b"{\"n\":2}");
+    }
+
+    /// An agent uploads, is stopped at its request, leaves, and is
+    /// forgotten: the stop and the uploading marker go aside together, so
+    /// put back (its directory restored, the state key copied back), it is
+    /// neither stopped nor uploading: not silently uploading again.
+    #[tokio::test]
+    async fn a_forgotten_stopped_uploader_put_back_is_not_uploading() {
+        let root = crate::sealed::TestDir::new("forget-uploading");
+        let (id, keys, dir) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        crate::sealed::stop::stop(
+            &state_dir,
+            &keys,
+            id,
+            "It asked",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        assert!(crate::sealed::uploading::is_uploading(&dir, &keys, id));
+        assert!(!crate::sealed::uploads(&dir, &keys, id), "stopped");
+        let kept = root.join("kept");
+        std::fs::rename(&dir, &kept).unwrap();
+        let done = forget(&state_dir, &keys, id, "it left").unwrap();
+        let secrets = keys.agent_dir(id);
+        let aside = done.uploading.expect("set aside");
+        assert!(std::fs::exists(secrets.join(&aside)).unwrap());
+        assert!(!std::fs::exists(secrets.join(crate::sealed::uploading::DURABLE)).unwrap());
+        assert!(done.stop.is_some());
+        // Put back: its directory, without its local markers (lost with
+        // it), and its state key
+        std::fs::rename(&kept, &dir).unwrap();
+        for m in [crate::sealed::uploading::UPLOADING, "stopped"] {
+            let _ = std::fs::remove_file(dir.join("sealed").join(m));
+        }
+        std::fs::copy(secrets.join(&done.key), secrets.join(STATE_KEY_FILE)).unwrap();
+        crate::sealed::uploading::reconcile_all(&state_dir, &keys);
+        crate::sealed::stop::reconcile_all(&state_dir, &keys);
+        assert!(!crate::sealed::uploading::is_uploading(&dir, &keys, id));
+        assert!(
+            !crate::sealed::uploads(&dir, &keys, id),
+            "not silently uploading"
+        );
     }
 }
