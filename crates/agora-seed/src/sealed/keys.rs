@@ -1546,4 +1546,82 @@ mod tests {
             .unwrap();
         assert_eq!(store.seal_keys(id).unwrap().key_gen, 0);
     }
+
+    /// An uploader's state_key.json lost: recovered from its verified wrap
+    /// on Agora, only into a missing file; a record signed by a key the
+    /// runner doesn't trust is never taken; an agent that never uploaded
+    /// is told only a backup restores it, with no call.
+    #[tokio::test]
+    async fn a_lost_state_key_is_recovered_only_when_missing_and_verified() {
+        use crate::sealed::check::tests::{enrolled, enrolled_local};
+        let root = crate::sealed::TestDir::new("keys-recover");
+        let (id, keys, dir) = enrolled(&root).await;
+        let enc = keys.ring().ensure_encryption_key(id).unwrap();
+        let file = keys.state_key_file(id).unwrap().unwrap();
+        let key = file.state_key().unwrap();
+        let signing = keys.signing(id).unwrap();
+        let public = EncryptionPublicKey::from(&enc);
+        let api = crate::sealed::api::fake::FakeApi::new();
+        // A forged record, newer, by a key the runner doesn't trust
+        let stranger = agora_agentkit::crypto::generate_keypair().0;
+        let forged = StateKey::generate()
+            .wrap(id, 0, 5, &public, &stranger)
+            .unwrap();
+        api.keys
+            .lock()
+            .unwrap()
+            .extend([key.wrap(id, 0, 0, &public, &signing).unwrap(), forged]);
+        // Present: nothing asked, nothing written
+        assert_eq!(
+            recover_state_key(&keys, &dir, &api, id).await.unwrap(),
+            None
+        );
+        assert!(api.calls.lock().unwrap().is_empty());
+        // Lost: recovered from the trusted record, not the forged one
+        let lost = root.join("state_key.lost");
+        std::fs::rename(keys.agent_dir(id).join(STATE_KEY_FILE), &lost).unwrap();
+        let got = recover_state_key(&keys, &dir, &api, id).await.unwrap();
+        assert_eq!(
+            got,
+            Some(RecoveredStateKey {
+                key_gen: 0,
+                wrap_seq: 0
+            })
+        );
+        assert_eq!(
+            keys.state_key_file(id)
+                .unwrap()
+                .unwrap()
+                .state_key()
+                .unwrap()
+                .expose(),
+            key.expose()
+        );
+        // Only forged records: nothing written
+        std::fs::rename(keys.agent_dir(id).join(STATE_KEY_FILE), root.join("again")).unwrap();
+        api.keys.lock().unwrap().remove(0);
+        let e = recover_state_key(&keys, &dir, &api, id)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("none is signed by a key this runner trusts"),
+            "{e}"
+        );
+        assert!(keys.state_key_file(id).unwrap().is_none());
+
+        let root = crate::sealed::TestDir::new("keys-recover-local");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        std::fs::rename(keys.agent_dir(id).join(STATE_KEY_FILE), root.join("lost")).unwrap();
+        let api = crate::sealed::api::fake::guarded(&root);
+        let e = recover_state_key(&keys, &dir, &api, id)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&format!("Only a backup of `secrets/{id}/`")),
+            "{e}"
+        );
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
 }
