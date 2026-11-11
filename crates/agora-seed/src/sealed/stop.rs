@@ -504,4 +504,78 @@ mod tests {
         assert!(e.contains("is refused"), "{e}");
         assert!(!is_stopped(&dir));
     }
+
+    /// Stop is about uploads: an agent that doesn't upload has none to stop.
+    #[tokio::test]
+    async fn stopping_an_agent_that_doesnt_upload_is_refused() {
+        let root = crate::sealed::TestDir::new("stop-local");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled_local(&root).await;
+        let e = stop(&root.join("state"), &keys, id, "asked", drained())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("doesn't upload"), "{e}");
+        assert!(!is_stopped(&dir));
+    }
+
+    /// A stop from before the chain went on while stopped: its plainly
+    /// saved state is sealed once, locally, and the start check finds it
+    /// intact; a second start does nothing.
+    #[tokio::test]
+    async fn a_stop_from_before_the_local_chain_is_caught_up_once() {
+        use agora_agentkit::state::storage::Recovery;
+        let root = crate::sealed::TestDir::new("stop-catch-up");
+        let (id, keys, dir) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        let mut s = stop(&state_dir, &keys, id, "asked", drained())
+            .await
+            .unwrap();
+        // As an older runner wrote it, and saved plainly while stopped
+        s.chained = false;
+        let mut old = serde_json::to_value(&s).unwrap();
+        old.as_object_mut().unwrap().remove("chained");
+        let old = serde_json::to_vec(&old).unwrap();
+        std::fs::write(path(&dir), &old).unwrap();
+        std::fs::write(keys.agent_dir(id).join(DURABLE), &old).unwrap();
+        assert!(!Stopped::load(&dir).unwrap().unwrap().chained);
+        let mut fs = agora_agentkit::reactor::FsStorage::new(&state_dir);
+        fs.save_raw(id, serde_json::json!({ "memory": "saved plainly" }), None)
+            .await
+            .unwrap();
+        let local = |v: &serde_json::Value| agora_agentkit::state::storage::plaintext_hash(v);
+        let current = fs.load_raw(id).await.unwrap().value;
+        assert!(matches!(
+            seal.recover(Some(&local(&current))).await.unwrap(),
+            Recovery::Mismatch(_)
+        ));
+        let head = seal.head().await.unwrap().unwrap().head;
+
+        catch_up_all(&state_dir, &keys).await;
+        let new = seal.head().await.unwrap().unwrap().head;
+        assert_eq!(new.seq, head.seq + 1, "one version, on the head");
+        assert!(matches!(
+            seal.recover(Some(&local(&current))).await.unwrap(),
+            Recovery::Intact(_)
+        ));
+        assert_eq!(
+            seal.outbox().await.unwrap().len(),
+            1,
+            "local: nothing uploads"
+        );
+        assert!(!super::super::uploads(&dir, &keys, id));
+        assert!(Stopped::load(&dir).unwrap().unwrap().chained);
+        assert!(durable(&keys, id).unwrap().unwrap().chained);
+        assert_eq!(Stopped::load(&dir).unwrap().unwrap().note, "asked");
+
+        // Once
+        assert_eq!(
+            catch_up(&state_dir, &keys, id).await.unwrap(),
+            CaughtUp::NotNeeded
+        );
+        assert_eq!(seal.head().await.unwrap().unwrap().head, new);
+    }
 }

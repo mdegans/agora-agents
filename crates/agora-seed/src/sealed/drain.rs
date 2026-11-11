@@ -447,6 +447,110 @@ mod tests {
         );
     }
 
+    /// A chained agent that doesn't upload, and one whose uploads were
+    /// stopped, over several saves and every drainer pass: chained
+    /// locally, and not one request reaches Agora (the drain, the
+    /// receipts, the anchor work, the guarded API). Synthetic state only.
+    #[tokio::test]
+    async fn a_local_only_agent_makes_no_request_end_to_end() {
+        use agora_agentkit::reactor::Storage as _;
+        let root = crate::sealed::TestDir::new("drain-local-only");
+        let state_dir = root.join("state");
+        let (local, keys, local_dir) = crate::sealed::check::tests::enrolled_local(&root).await;
+        let (stopped, _, stopped_dir) = crate::sealed::check::tests::enrolled(&root).await;
+        let seal = AgentSeal::new(&stopped_dir, stopped);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        crate::sealed::stop::stop(
+            &state_dir,
+            &keys,
+            stopped,
+            "asked",
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+        .unwrap();
+        // Agora: counts every connection (and answers each 422)
+        let (url, hits) = rejecting().await;
+        let enrolment = Arc::new(SealedEnrolment::new(&state_dir, root.join("secrets")));
+        let client = agora_agentkit::client::Client::new(url).unwrap();
+        let outbox = AgoraOutbox::new(client.clone(), &state_dir, enrolment.clone());
+        let mut storage = crate::sealed::storage(&state_dir, outbox.clone(), enrolment.clone());
+        let before: Vec<usize> = vec![
+            AgentSeal::new(&local_dir, local)
+                .outbox()
+                .await
+                .unwrap()
+                .len(),
+            seal.outbox().await.unwrap().len(),
+        ];
+        for n in 0..5 {
+            for id in [local, stopped] {
+                let base = storage.load_raw(id).await.unwrap().base;
+                assert!(base.is_some(), "on its head");
+                let value = serde_json::json!({ "memory": format!("{id} {n}").repeat(40) });
+                assert!(
+                    storage
+                        .save_raw(id, value, base.as_ref())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+        for (dir, id, was) in [
+            (&local_dir, local, before[0]),
+            (&stopped_dir, stopped, before[1]),
+        ] {
+            let s = AgentSeal::new(dir, id);
+            assert_eq!(s.outbox().await.unwrap().len(), was + 5, "chained locally");
+            assert!(s.seal_failed().await.unwrap().is_none());
+            assert!(!crate::sealed::uploads(dir, &keys, id));
+        }
+        let drainer = Arc::new(
+            Drainer::new(
+                outbox,
+                state_dir.clone(),
+                // As the run makes them: none for an agent that doesn't upload
+                HashMap::new(),
+                vec![(local, "wren".into()), (stopped, "tarn".into())],
+                [],
+                Alerter::off(),
+            )
+            .with_anchors(Anchors {
+                api: Arc::new(crate::sealed::api::guarded(client, enrolment)),
+                keys: keys.clone(),
+                state_dir: state_dir.clone(),
+                verified: crate::sealed::anchors::VerifiedAnchors::new([(
+                    "ANC-2026-0002".parse().unwrap(),
+                    agora_agentkit::govlog::Sha256Hex::from([0; 32]),
+                    chrono::Utc::now(),
+                )]),
+            }),
+        );
+        let task = drainer.spawn();
+        drainer.drain_all().await;
+        drainer.anchor_all().await;
+        drainer.finish(task).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no request reached Agora");
+        for (dir, id) in [(&local_dir, local), (&stopped_dir, stopped)] {
+            assert_eq!(drainer.last(id), Some(DrainOutcome::LocalOnly));
+            assert!(!drainer.held(id));
+            assert!(
+                !dir.join("sealed")
+                    .join(super::super::receipts::RECEIPTS)
+                    .exists(),
+                "no receipts"
+            );
+            assert_eq!(
+                AgentSeal::new(dir, id).outbox().await.unwrap().len(),
+                if id == local { before[0] } else { before[1] } + 5,
+                "nothing moved"
+            );
+        }
+    }
+
     /// A 422 holds the agent for the run, alerted: no retry loop.
     #[tokio::test]
     async fn a_rejected_upload_is_held_not_retried() {

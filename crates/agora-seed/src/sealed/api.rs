@@ -907,3 +907,211 @@ pub mod fake {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::fake::FakeApi;
+    use super::*;
+    use agora_agentkit::state::storage::{Enrolment, SealKeys};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// One switch for every agent: uploads or not.
+    #[derive(Default)]
+    struct Switch(AtomicBool);
+
+    impl Enrolment for &Switch {
+        fn uploads(&self, _: AgentId) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn keys(&self, _: AgentId) -> Option<SealKeys> {
+            None
+        }
+    }
+
+    fn rotation(id: AgentId, key: &SigningKey, at_head: bool) -> KeyRotation {
+        KeyRotation::agent_signed(
+            id,
+            0,
+            key,
+            &agora_agentkit::crypto::generate_keypair().0,
+            at_head.then_some(agora_agentkit::state::verify::HeadRef {
+                entry_hash: agora_agentkit::govlog::Sha256Hex::from([1; 32]),
+                seq: 3,
+            }),
+            chrono::Utc::now(),
+        )
+    }
+
+    /// Every per-agent call, made once: what each returned (`Err` with
+    /// the refusal) and what reached the fake.
+    async fn every_call(
+        api: &dyn SealedApi,
+        id: AgentId,
+        key: &SigningKey,
+    ) -> Vec<Result<(), String>> {
+        let record = StateKey::generate()
+            .wrap(
+                id,
+                0,
+                0,
+                &agora_agentkit::envelope::EncryptionPublicKey::from(
+                    &agora_agentkit::envelope::generate_encryption_keypair().0,
+                ),
+                key,
+            )
+            .unwrap();
+        let sha = agora_agentkit::govlog::Sha256Hex::from([2; 32]);
+        vec![
+            api.chain(id, key).await.map(drop),
+            api.state_keys(id, key).await.map(drop),
+            api.post_state_key(id, key, &record).await,
+            api.rotate_key(id, key, &rotation(id, key, true)).await,
+            api.rotations(id, key).await.map(drop),
+            api.blob(id, key, &sha)
+                .await
+                .map(drop)
+                .map_err(|e| e.message),
+            api.proofs(id, key, None).await.map(drop),
+            api.head(id, key).await.map(drop),
+            api.head_known(id, key).await.map(drop),
+            api.publish_chosen(id, key).await.map(drop),
+            api.post_anchor(id, key, true).await,
+        ]
+    }
+    use agora_agentkit::state::crypto::StateKey;
+
+    #[tokio::test]
+    async fn a_call_for_an_agent_that_doesnt_upload_is_refused_unsent() {
+        let switch = Switch::default();
+        let guard = UploadGuard::new(FakeApi::new(), &switch);
+        let id = AgentId::new();
+        let key = agora_agentkit::crypto::generate_keypair().0;
+        let results = every_call(&guard, id, &key).await;
+        assert_eq!(results.len(), 11);
+        for r in &results {
+            let e = r.as_ref().unwrap_err();
+            assert!(is_local_only(e), "{e}");
+        }
+        assert!(
+            guard.calls.lock().unwrap().is_empty(),
+            "nothing reached Agora"
+        );
+        // Typed, for the callers that ask first
+        assert_eq!(
+            guard.check(id, Call::Blob),
+            Err(LocalOnly {
+                id,
+                call: Call::Blob
+            })
+        );
+        // Not about the agent's sealed state: these reach the fake (whatever
+        // it answers)
+        guard
+            .rotate_key(id, &key, &rotation(id, &key, false))
+            .await
+            .ok();
+        guard
+            .register_encryption_key(
+                id,
+                &key,
+                &agora_agentkit::envelope::EncryptionPublicKey::from(
+                    &agora_agentkit::envelope::generate_encryption_keypair().0,
+                ),
+            )
+            .await
+            .ok();
+        guard.signer_registered(id, &key).await.ok();
+        guard
+            .anchor_data(&"ANC-2026-0001".parse().unwrap())
+            .await
+            .ok();
+        assert_eq!(
+            *guard.calls.lock().unwrap(),
+            [
+                "rotate_key",
+                "register_encryption_key",
+                "signer_registered",
+                "anchor_data"
+            ]
+        );
+
+        // Uploading: every call goes through
+        guard.calls.lock().unwrap().clear();
+        switch.0.store(true, Ordering::SeqCst);
+        let results = every_call(&guard, id, &key).await;
+        assert!(
+            results
+                .iter()
+                .all(|r| r.as_ref().err().is_none_or(|e| !is_local_only(e))),
+            "{results:?}"
+        );
+        assert_eq!(guard.calls.lock().unwrap().len(), 11);
+    }
+
+    /// The opt-in step's hold: the opt-in calls, for that agent, while
+    /// held; nothing else.
+    #[tokio::test]
+    async fn opting_in_lets_only_the_opt_in_calls_through() {
+        let switch = Switch::default();
+        let guard = UploadGuard::new(FakeApi::new(), &switch);
+        let (id, other) = (AgentId::new(), AgentId::new());
+        let key = agora_agentkit::crypto::generate_keypair().0;
+        {
+            let _hold = guard.opting_in(id);
+            let results = every_call(&guard, id, &key).await;
+            let passed: Vec<&str> = [
+                "chain",
+                "state_keys",
+                "post_state_key",
+                "rotate_key",
+                "rotations",
+                "blob",
+                "proofs",
+                "head",
+                "head_known",
+                "publish_chosen",
+                "post_anchor",
+            ]
+            .into_iter()
+            .zip(&results)
+            .filter(|(_, r)| r.as_ref().err().is_none_or(|e| !is_local_only(e)))
+            .map(|(n, _)| n)
+            .collect();
+            assert_eq!(
+                passed,
+                [
+                    "chain",
+                    "state_keys",
+                    "post_state_key",
+                    "head",
+                    "head_known"
+                ]
+            );
+            assert!(
+                every_call(&guard, other, &key)
+                    .await
+                    .iter()
+                    .all(|r| r.as_ref().is_err_and(|e| is_local_only(e))),
+                "only the agent opting in"
+            );
+        }
+        guard.calls.lock().unwrap().clear();
+        assert!(
+            every_call(&guard, id, &key)
+                .await
+                .iter()
+                .all(|r| r.as_ref().is_err_and(|e| is_local_only(e))),
+            "not once the hold is dropped"
+        );
+        assert!(guard.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "local only")]
+    async fn a_strict_guard_fails_the_test() {
+        let switch = Switch::default();
+        let guard = UploadGuard::new(FakeApi::new(), &switch).strict();
+        let key = agora_agentkit::crypto::generate_keypair().0;
+        let _ = guard.head(AgentId::new(), &key).await;
+    }
+}
