@@ -16,12 +16,12 @@
 //! 4. the archives (`state.<utc>.json`), oldest first by mtime, each
 //!    `state_at` its mtime (when that state was written);
 //! 5. the current state;
-//! 6. `sealed/enrolled` ("chained"): from here every save is sealed and
+//! 6. the chain marker (agentkit's `CHAINED`): from here every save is sealed and
 //!    chained, locally; then the agent is recorded in the roster.
 //!
 //! With no session in progress, under the agent's `sealed/lock`. A partial
-//! chain (a chain but no `enrolled`) is resumed: the archives after the
-//! newest state it sealed, then the current state, then `enrolled`, with
+//! chain (a chain but no marker) is resumed: the archives after the
+//! newest state it sealed, then the current state, then the marker, with
 //! the same key. An agent that answers `show` to the memory-restore offer
 //! after it was chained gets its pre-loss copy appended then
 //! ([`Enroller::append_prior`]); its genesis never changes.
@@ -54,7 +54,7 @@ use agora_agentkit::reactor::storage::FsStorageError;
 use agora_agentkit::reactor::{FsStorage, Storage};
 use agora_agentkit::state::codec::KeyframePolicy;
 use agora_agentkit::state::crypto::StateKey;
-use agora_agentkit::state::storage::{AgentSeal, Enrolment, plaintext_hash};
+use agora_agentkit::state::storage::{AgentSeal, plaintext_hash};
 use agora_agentkit::state::verify::HeadRef;
 use agora_agentkit::state::{GenesisClass, GenesisOrigin, IncidentCite};
 use anyhow::Context;
@@ -307,8 +307,8 @@ pub enum EnvelopeError {
 }
 
 /// The `state` of an FsStorage `{format, state}` envelope at `path`, and
-/// its format: any format this binary's FsStorage loads (format 2 is a
-/// sealed agent's).
+/// its format: any format this binary's FsStorage loads (a chained agent's
+/// is agentkit's `SEALED_FORMAT`).
 pub fn envelope_state(path: &Path) -> Result<(u64, serde_json::Value), EnvelopeError> {
     let bytes = zeroize::Zeroizing::new(std::fs::read(path)?);
     let mut envelope: serde_json::Value =
@@ -639,9 +639,9 @@ impl Enroller {
         }
         super::crash::point("chain:current")?;
         // The last step is agentkit's, which takes the lock itself: the
-        // state rewritten as format 2 (a runner older than 0.147 then
+        // state rewritten in agentkit's sealed format (an older runner then
         // refuses it rather than overwriting it), resealed if the rewrite
-        // changed its hash, then `enrolled`
+        // changed its hash, then the chain marker
         drop(lock);
         let head = self.mark(id).await?;
         if let Ok(marked) = FsStorage::new(&self.state_dir).load_raw(id).await {
@@ -667,8 +667,8 @@ impl Enroller {
         Ok(report)
     }
 
-    /// agentkit's last step of a chain: the state marked format 2, the
-    /// head aligned with it, `enrolled`. Takes the agent's lock itself.
+    /// agentkit's last step of a chain: the state marked in its sealed
+    /// format, the head aligned with it, the chain marker. Takes the agent's lock itself.
     async fn mark(&self, id: AgentId) -> anyhow::Result<HeadRef> {
         let mut mirrored = agora_agentkit::state::storage::Mirrored::new(
             FsStorage::new(&self.state_dir),
@@ -891,7 +891,7 @@ impl Enroller {
     ) -> Result<OptedIn, Skip>
     where
         A: SealedApi,
-        E: Enrolment,
+        E: super::api::UploadGate,
     {
         use super::uploading::{self, Marker};
         let agent_dir = self.state_dir.join(id.to_string());
@@ -1193,7 +1193,7 @@ impl Enroller {
         };
         super::crash::point("resume:sealed")?;
         drop(lock);
-        // Marked format 2 again (agentkit takes the lock itself)
+        // Marked in the sealed format again (agentkit takes the lock itself)
         let marked = self
             .mark(id)
             .await
@@ -1415,8 +1415,9 @@ mod tests {
         let root = crate::sealed::TestDir::new("chain-none");
         let (id, keys, dir) = agent(&root, &["only"]).await;
         let e = enroller(&root, &keys);
-        let report = e.chain(id, false).await.unwrap();
+        let report = e.chain_as(id, false, Genesis::New).await.unwrap();
         assert_eq!((report.archives, report.entries), (0, 2));
+        assert_eq!(report.origin, "none", "a provisioned agent's");
         assert_eq!(opened_memories(&dir, id, &keys).await, ["only"]);
     }
 
@@ -1435,7 +1436,7 @@ mod tests {
     }
 
     /// A chain cut after its genesis, its first archive or its current
-    /// state (before `enrolled`) is finished by a rerun: every state once,
+    /// state (before its marker) is finished by a rerun: every state once,
     /// in order, one genesis.
     #[tokio::test]
     async fn a_cut_chain_is_finished_by_a_rerun() {

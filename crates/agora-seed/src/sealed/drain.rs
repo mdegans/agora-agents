@@ -78,7 +78,7 @@ pub struct Anchors {
 pub enum DrainOutcome {
     /// The agent doesn't upload: nothing read, sent or recorded.
     LocalOnly,
-    /// No `sealed/enrolled`: no chain to send.
+    /// No `sealed/chained`: no chain to send.
     NotEnrolled,
     /// Uploaded `uploaded`; Agora's head then `status`, `waiting` left.
     Ran {

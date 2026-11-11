@@ -2317,15 +2317,15 @@ async fn run(held: &mut Held) -> Result<()> {
     // Every per-agent sealed-state call of the run: nothing of an agent
     // that doesn't upload is sent or asked (`sealed::api::UploadGuard`)
     let sealed_api = Arc::new(sealed::api::guarded(sealed_client, enrolment.clone()));
-    // A stop or an uploading marker kept in the secrets tree stands for a
-    // lost local copy; the agents that uploaded before the uploading
-    // marker existed are marked (once); a stop from before the chain went
-    // on while stopped is caught up. A dry run writes nothing
+    // The chain's marker moved to its post-0.158 name; a stop or an
+    // uploading marker kept in the secrets tree stands for a lost local
+    // copy; a half-written uploading marker is finished; the
+    // agents that uploaded before the uploading marker existed are marked
+    // (once); markers still in doubt are alerted. A dry run writes nothing
     if !args.dry_run {
+        // First: the marker's move, before anything reads it
+        sealed::uploading::start_pass(&state_dir, enrolment.keys_store(), &held.alerts).await;
         sealed::stop::reconcile_all(&state_dir, enrolment.keys_store());
-        sealed::uploading::reconcile_all(&state_dir, enrolment.keys_store());
-        sealed::uploading::migrate_all(&state_dir, enrolment.keys_store());
-        sealed::stop::catch_up_all(&state_dir, enrolment.keys_store()).await;
     }
     let loaded = if args.dry_run {
         let plain = load_states(&FsStorage::new(&state_dir), &state_dir).await?;
@@ -2990,7 +2990,7 @@ mod tests {
     }
 
     /// A stopped agent is checked like any enrolled agent (its chain goes
-    /// on locally), never asked of Agora, and told: the note once, then a
+    /// on locally), sends nothing to Agora, and is told: the note once, then a
     /// short line, before its verdict.
     #[tokio::test]
     async fn a_stopped_agent_is_told_and_still_checked() {
@@ -3021,6 +3021,8 @@ mod tests {
             sealed::api::fake::FakeApi::new(),
             Arc::new(sealed::SealedEnrolment::with_keys(&state_dir, keys.clone())),
         );
+        // What it uploaded before it stopped is on Agora
+        *api.chain.lock().unwrap() = Ok(sealed::check::local_entries(&seal).await.unwrap());
         let run = sealed_start_check(
             &mut pool,
             &loaded.sealed,
@@ -3033,10 +3035,26 @@ mod tests {
             None,
         )
         .await;
-        assert!(
-            api.inner().calls.lock().unwrap().is_empty(),
-            "nothing asked of Agora"
-        );
+        // It uploaded before it stopped: it may read back what is on
+        // Agora, never send
+        let sends = |api: &sealed::api::fake::FakeApi| -> Vec<String> {
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| {
+                    [
+                        "post_state_key",
+                        "post_anchor",
+                        "publish_chosen",
+                        "rotate_key",
+                    ]
+                    .contains(&c.as_str())
+                })
+                .cloned()
+                .collect()
+        };
+        assert!(sends(api.inner()).is_empty(), "nothing sent to Agora");
         assert_eq!(pool.len(), 1);
         assert!(skipped.is_empty() && run.held.is_empty() && run.refused.is_empty());
         assert_eq!(run.drained, vec![(id, "tarn".to_string())], "checked");
@@ -3100,7 +3118,7 @@ mod tests {
             vec![(id, sealed::notice::Refusal::Mismatch)]
         );
         assert!(pool.is_empty());
-        assert!(api.inner().calls.lock().unwrap().is_empty());
+        assert!(sends(api.inner()).is_empty());
     }
 
     /// The sealed start check: an intact agent runs with its lines, a

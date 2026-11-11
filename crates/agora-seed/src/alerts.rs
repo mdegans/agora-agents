@@ -146,6 +146,9 @@ pub enum AlertKind {
     /// re-offer (`sealed-reoffer`), or, a bug, with none pending. Nothing
     /// changed by the answer; the operator acts on it.
     SealedStateAnsweredAgain,
+    /// Agents whose uploading marker is contradictory or unreadable after
+    /// the start's repair pass: treated as not uploading. One summary a run.
+    SealedStateUploadingInDoubt,
     /// An agent's sealed entries are signed by a key the runner doesn't
     /// recognise (its record of past keys lost, or a forgery): the run is
     /// refused, nothing marked. Never rate-limited.
@@ -182,7 +185,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -209,6 +212,7 @@ impl AlertKind {
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
         Self::SealedStateAnsweredAgain,
+        Self::SealedStateUploadingInDoubt,
         Self::SealedStateUntrustedKey,
         Self::MemoryIdKeyRefused,
         Self::QuestionUnanswered,
@@ -259,6 +263,7 @@ impl AlertKind {
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
             Self::SealedStateAnsweredAgain => "sealed_state_answered_again",
+            Self::SealedStateUploadingInDoubt => "sealed_state_uploading_in_doubt",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
             Self::QuestionUnanswered => "question_unanswered",
@@ -497,6 +502,16 @@ impl AlertKind {
                  and will act. With `reoffered: false` no re-offer was pending, \
                  which the offer's asked-once rule should prevent: a bug to \
                  report; act only on what the agent asks you."
+            }
+            Self::SealedStateUploadingInDoubt => {
+                "The agents below said yes to uploading their sealed state, \
+                 but their uploading marker (<state>/<id>/sealed/uploading \
+                 and its copy <secrets>/<id>/sealed_uploading) is \
+                 contradictory or unreadable, so nothing of theirs is \
+                 uploaded: the runner fails closed. Their chains are kept \
+                 locally. Compare the two copies (the error says which is \
+                 wrong) and put the right one back in both places; nothing \
+                 rewrites a marker in doubt by itself."
             }
             Self::MemoryIdKeyRefused => {
                 "An agent's memory-id key (<secrets>/<id>/memory_id_key.json) \

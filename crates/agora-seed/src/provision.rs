@@ -324,6 +324,49 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A new agent is chained from its first state: a genesis (of class
+    /// `none`, asserted in `sealed::enroll`), then that state, its key cached, nothing sent; the start
+    /// check finds it intact.
+    #[tokio::test]
+    async fn a_new_agent_is_chained_from_its_first_state() {
+        use agora_agentkit::enums::StateEntryKind;
+        use agora_agentkit::state::storage::{AgentSeal, Recovery, plaintext_hash};
+        let dir = scratch();
+        let (secrets, state) = (dir.join("secrets"), dir.join("state"));
+        let (id, k) = (AgentId::new(), key());
+        let first = serde_json::json!({"memory": "first"});
+        install(&secrets, state.clone(), id, &k, || Ok(first.clone()))
+            .await
+            .unwrap();
+        let seal = AgentSeal::new(&state.join(id.to_string()), id);
+        assert!(seal.is_enrolled().await.unwrap());
+        let entries = crate::sealed::check::local_entries(&seal).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.entry.kind).collect::<Vec<_>>(),
+            [StateEntryKind::Genesis, StateEntryKind::Snapshot]
+        );
+        let keys = crate::sealed::KeyStore::new(&secrets);
+        assert!(!crate::sealed::uploads(
+            &state.join(id.to_string()),
+            &keys,
+            id
+        ));
+        let local = plaintext_hash(&stored_state(&dir, id).await);
+        assert!(matches!(
+            seal.recover(Some(&local)).await.unwrap(),
+            Recovery::Intact(_)
+        ));
+        // A rerun leaves the chain alone
+        install(&secrets, state.clone(), id, &k, || panic!("state written"))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::sealed::check::local_entries(&seal).await.unwrap(),
+            entries
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_path_resolves_through_a_symlink_as_far_as_it_exists() {
         let dir = scratch();

@@ -163,13 +163,11 @@ pub async fn run(
         _ => None,
     };
     if !dry_run {
-        // As at a run's start: a lost local marker put back, and the agents
-        // that uploaded before the marker existed marked (idempotent)
-        super::uploading::reconcile_all(&state_dir, &keys);
-        super::uploading::migrate_all(&state_dir, &keys);
-        // B1: the move of old `sealed/enrolled` markers to agentkit's new
-        // name goes here (called, not refused: the runner lock is held, so
-        // it is as safe here as at a run's start, and it is idempotent)
+        // As at a run's start, before any command reads a marker: the
+        // chain's marker moved to its new name, a lost or half-written
+        // uploading marker repaired, the agents that uploaded before the
+        // marker existed marked (idempotent). In doubt: logged at error
+        super::uploading::start_pass(&state_dir, &keys, &crate::alerts::Alerter::off()).await;
     }
     match command {
         Command::SealedEnroll {
@@ -524,6 +522,26 @@ async fn chain_pass(
         }
     }
     tally.print(if dry_run { "chain (dry run)" } else { "chain" });
+    if dry_run {
+        // A dry run moves no old marker (the start pass does, first, in any
+        // other command): a chain whose marker has agentkit's old name reads
+        // here as a chain never finished
+        let mut unmarked = 0;
+        for &id in &chain {
+            let dir = enroller.state_dir.join(id.to_string());
+            let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+            if !super::is_enrolled(&dir) && seal.head().await.is_ok_and(|h| h.is_some()) {
+                unmarked += 1;
+            }
+        }
+        if unmarked > 0 {
+            println!(
+                "{unmarked} agent(s) have a chain but no chain marker: an older runner's marker \
+                 (moved at the next run start or non-dry command, then counted as chained) or \
+                 a chain cut short (finished by the run)"
+            );
+        }
+    }
     if says_yes > 0 {
         println!(
             "{says_yes} agent(s) chained here said yes to uploading: `sealed-enroll --opt-in` \
@@ -663,4 +681,99 @@ async fn opt_in_pass(
     let failed = tally.get("failed");
     anyhow::ensure!(failed == 0, "{failed} agent(s) failed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consent::offer::Stored as _;
+    use crate::consent::sealed_state::ledger::SealLedger;
+
+    fn url() -> url::Url {
+        url::Url::parse("http://127.0.0.1:9").unwrap()
+    }
+
+    fn enroll(agents: Vec<AgentId>) -> Command {
+        Command::SealedEnroll {
+            agents,
+            opt_in: false,
+            dry_run: false,
+            jobs: Some(2),
+            note: None,
+            against_answer: false,
+        }
+    }
+
+    /// `sealed-enroll` takes the runner lock for the whole command and
+    /// never waits: refused while a runner holds it, nothing written; then
+    /// it chains.
+    #[tokio::test]
+    async fn sealed_enroll_refuses_beside_a_runner() {
+        let root = crate::sealed::TestDir::new("cli-enroll-runner");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled_local(&root).await;
+        let other = AgentId::new();
+        keys.ring()
+            .insert(other, &agora_agentkit::crypto::generate_keypair().0)
+            .unwrap();
+        agora_agentkit::reactor::Storage::save_raw(
+            &mut agora_agentkit::reactor::FsStorage::new(root.join("state")),
+            other,
+            serde_json::json!({ "memory": "m" }),
+            None,
+        )
+        .await
+        .unwrap();
+        let other_dir = root.join("state").join(other.to_string());
+        let runner = super::super::session::runner_shared(&root).unwrap();
+        let e = run(enroll(vec![]), &root, url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("stop the runner"), "{e}");
+        assert!(!super::super::is_enrolled(&other_dir), "nothing written");
+        drop(runner);
+        run(enroll(vec![]), &root, url(), None).await.unwrap();
+        assert!(super::super::is_enrolled(&other_dir));
+        assert!(super::super::is_enrolled(&dir));
+        let _ = id;
+    }
+
+    /// `sealed-stop` never against the agent's latest yes without the
+    /// override; `sealed-reoffer` writes nothing over an unreadable ledger,
+    /// and refuses an agent that never answered.
+    #[tokio::test]
+    async fn stop_and_reoffer_follow_the_ledger() {
+        let root = crate::sealed::TestDir::new("cli-stop-reoffer");
+        let (id, _keys, dir) = crate::sealed::check::tests::enrolled(&root).await;
+        crate::sealed::uploading::tests::ledger(&dir, true);
+        let stop = |against_answer| Command::SealedStop {
+            agent: id,
+            note: "asked".into(),
+            against_answer,
+        };
+        let e = run(stop(false), &root, url(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("latest answer"), "{e}");
+        assert!(!super::super::stop::is_stopped(&dir));
+
+        let reoffer = |agents: Vec<AgentId>| Command::SealedReoffer {
+            agents,
+            note: "Asked by DM.".into(),
+        };
+        let never = AgentId::new();
+        std::fs::create_dir_all(root.join("state").join(never.to_string())).unwrap();
+        assert!(run(reoffer(vec![never]), &root, url(), None).await.is_err());
+        std::fs::write(SealLedger::path(&dir), b"{ not json").unwrap();
+        assert!(run(reoffer(vec![id]), &root, url(), None).await.is_err());
+        assert_eq!(
+            std::fs::read(SealLedger::path(&dir)).unwrap(),
+            b"{ not json"
+        );
+        crate::sealed::uploading::tests::ledger(&dir, true);
+        run(reoffer(vec![id]), &root, url(), None).await.unwrap();
+        let l = SealLedger::load_blocking(&dir).unwrap();
+        assert_eq!(l.reoffer.as_ref().unwrap().note, "Asked by DM.");
+    }
 }

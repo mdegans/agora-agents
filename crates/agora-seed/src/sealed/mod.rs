@@ -1,7 +1,8 @@
 //! Sealed state, the runner's side (agentkit 0.147 `state`; agora
 //! `docs/design-sealed-state.md`; the plan of 2026-11-02, "PR C").
 //!
-//! Every enrolled agent (`agora-seed sealed-enroll`, [`enroll`]) has every
+//! Every enrolled (chained: `sealed/chained`) agent (`agora-seed
+//! sealed-enroll`, [`enroll`]) has every
 //! save sealed and chained, locally, by agentkit's `Mirrored` storage;
 //! whether the chain is also **uploaded** is a separate fact, the agent's
 //! yes to the sealed-state offer ([`crate::consent::sealed_state`]) acted
@@ -36,7 +37,7 @@
 //! file: what is superseded is renamed aside.
 //!
 //! **Who is sealed.** An agent is sealed (chained) exactly when its
-//! `sealed/enrolled` marker exists, stopped or not; it uploads exactly
+//! `sealed/chained` marker exists, stopped or not; it uploads exactly
 //! when [`uploads`] says so. The `[sealed_state]` table only decides who is
 //! asked. Turning it off must not stop the seal, or an enrolled agent's
 //! next session would start from a state the seal never saw, and be
@@ -53,6 +54,8 @@ mod crash_tests;
 pub mod drain;
 pub mod enroll;
 pub mod forget;
+#[cfg(test)]
+mod guard_tests;
 pub mod history;
 pub mod history_index;
 pub mod inclusion;
@@ -77,7 +80,7 @@ use std::path::{Path, PathBuf};
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::state::outbox::AgoraOutbox;
-use agora_agentkit::state::storage::{Enrolment, Mirrored, SEALED_DIR, SealKeys};
+use agora_agentkit::state::storage::{CHAINED, Enrolment, Mirrored, SEALED_DIR, SealKeys};
 
 pub use keys::KeyStore;
 
@@ -157,7 +160,7 @@ pub fn uploads(agent_dir: &Path, keys: &KeyStore, id: AgentId) -> bool {
 }
 
 /// The runner's say on who uploads ([`uploads`]), with the keys in its
-/// own secrets tree. Who is chained is `sealed/enrolled`'s alone.
+/// own secrets tree. Who is chained is `sealed/chained`'s alone.
 #[derive(Debug, Clone)]
 pub struct SealedEnrolment {
     state_dir: PathBuf,
@@ -185,11 +188,13 @@ impl SealedEnrolment {
     }
 }
 
-/// Whether `<agent_dir>/sealed/enrolled` exists. A file that can't be
+/// Whether `<agent_dir>/sealed/chained` exists (agentkit's [`CHAINED`];
+/// `sealed/enrolled` before agentkit 0.158, moved by the start's
+/// [`uploading::start_pass`]). A file that can't be
 /// checked counts as enrolled: sealing (or refusing) an agent that isn't is
 /// recoverable, writing an enrolled one unsealed is not.
 pub fn is_enrolled(agent_dir: &Path) -> bool {
-    match std::fs::exists(agent_dir.join(SEALED_DIR).join("enrolled")) {
+    match std::fs::exists(agent_dir.join(SEALED_DIR).join(CHAINED)) {
         Ok(enrolled) => enrolled,
         Err(e) => {
             tracing::error!(
@@ -212,6 +217,16 @@ impl Enrolment for SealedEnrolment {
     /// signed and sealed with them.
     fn keys(&self, id: AgentId) -> Option<SealKeys> {
         self.keys.seal_keys(id)
+    }
+}
+
+impl api::UploadGate for SealedEnrolment {
+    fn may_send(&self, id: AgentId) -> bool {
+        uploads(&self.state_dir.join(id.to_string()), &self.keys, id)
+    }
+
+    fn may_read(&self, id: AgentId) -> bool {
+        uploading::has_uploaded(&self.state_dir.join(id.to_string()), &self.keys, id)
     }
 }
 

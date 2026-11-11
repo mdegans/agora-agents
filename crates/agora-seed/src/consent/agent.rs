@@ -8452,7 +8452,7 @@ mod tests {
     }
 
     /// Every agent is chained now: a chained agent that doesn't upload and
-    /// has no answer on file (its state key and `sealed/enrolled` there) is
+    /// has no answer on file (its state key and chain marker there) is
     /// still asked.
     #[tokio::test]
     async fn a_chained_agent_that_doesnt_upload_is_still_offered() {
@@ -8465,7 +8465,7 @@ mod tests {
                 .join(h.id.to_string())
                 .join(agora_agentkit::state::storage::SEALED_DIR);
         std::fs::create_dir_all(&sealed).unwrap();
-        std::fs::write(sealed.join("enrolled"), b"").unwrap();
+        std::fs::write(sealed.join(agora_agentkit::state::storage::CHAINED), b"").unwrap();
         let agent = seated(&h).await;
         assert!(last_user_text(&agent).contains("**Sealed backups of your state.**"));
     }
@@ -8750,7 +8750,7 @@ mod tests {
 
     /// Enrolment's sentence, once: to an agent that had memory ids before
     /// its versions were sealed (its key's fingerprint older than its
-    /// `sealed/enrolled`), appended to the verdict, marked told only when
+    /// `sealed/chained`), appended to the verdict, marked told only when
     /// the session saves; never to one enrolled before it had a key.
     #[tokio::test]
     async fn the_enrolment_sentence_is_told_once_to_agents_keyed_before_enrolling() {
@@ -8789,7 +8789,7 @@ mod tests {
         let sentence = enrollment_sentence(&today);
 
         // Enrolled before it had a key (the betas): never told
-        set_mtime(&dir.join("sealed/enrolled"), 3600);
+        set_mtime(&dir.join("sealed/chained"), 3600);
         let mut a = agent(&h);
         a.on_init().await.unwrap();
         let seen = intro(&a);
