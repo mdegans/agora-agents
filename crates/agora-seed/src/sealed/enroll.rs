@@ -1248,6 +1248,7 @@ mod tests {
     use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
     use crate::consent::sealed_state::prompt::SealChoice;
     use crate::sealed::api::fake;
+    use agora_agentkit::reactor::seed::memory::memory_text;
     use agora_agentkit::state::storage::{Recovery, SEALED_DIR};
     use agora_agentkit::state::verify::verify_chain;
 
@@ -1340,6 +1341,345 @@ mod tests {
             out.push(v["memory"]["content"].as_str().unwrap().to_string());
         }
         out
+    }
+
+    /// An agent keyed and searched before it enrols: `sealed-enroll
+    /// --dry-run` counts the same, the key's fingerprint and the index
+    /// beside its state are never taken for archives, and no `sealed/` is
+    /// made.
+    #[tokio::test]
+    async fn the_memory_tools_files_change_nothing_a_dry_run_counts() {
+        let root = crate::sealed::TestDir::new("enroll-memory-files");
+        let state_dir = root.join("state");
+        let keys = KeyStore::new(root.join("secrets"));
+        let id = AgentId::new();
+        keys.ring()
+            .insert(id, &agora_agentkit::crypto::generate_keypair().0)
+            .unwrap();
+        let mut fs = FsStorage::new(&state_dir);
+        for m in ["one", "two", "three"] {
+            fs.save_raw(id, state("tarn", m), None).await.unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let dir = state_dir.join(id.to_string());
+        let enroller = Enroller {
+            state_dir: state_dir.clone(),
+            keys: keys.clone(),
+            restore: None,
+        };
+        let before = enroller.chain(id, true).await.unwrap();
+        keys.memory_id_keys_or_create(id, &dir).unwrap();
+        crate::sealed::history_index::write(&dir, b"{}").unwrap();
+        assert!(crate::sealed::history_index::unsealed_path(&dir).exists());
+        assert_eq!(enroller.chain(id, true).await.unwrap(), before);
+        assert!(
+            enroller.opted_in().unwrap().is_empty(),
+            "no answer: not listed"
+        );
+        assert!(
+            !dir.join(agora_agentkit::state::storage::SEALED_DIR)
+                .exists()
+        );
+    }
+
+    /// The archive ↔ sealed round trip: enrolment's backfill, then sealed
+    /// saves, and every archive's state (and the current one) is a sealed
+    /// version: equal as JSON, equal in its canonical sealed bytes, and its
+    /// `memory.content` equal byte for byte. Awkward synthetic text only.
+    #[tokio::test]
+    async fn every_archive_round_trips_through_its_sealed_version() {
+        let root = crate::sealed::TestDir::new("enroll-round-trip");
+        let api = fake::guarded(&root);
+        let state_dir = root.join("state");
+        let keys = KeyStore::new(root.join("secrets"));
+        let id = AgentId::new();
+        keys.ring()
+            .insert(id, &agora_agentkit::crypto::generate_keypair().0)
+            .unwrap();
+        let memories = [
+            String::new(),
+            "plain\n".to_string(),
+            "crlf\r\nline\r\n  trailing spaces   \n\ttab\n".to_string(),
+            "unicode: é e\u{301} ß 漢字 🦀👩‍👩‍👧 \u{200b}zero-width \u{feff}bom".to_string(),
+            "escapes: \" \\ / \u{0} \u{7} \u{1f} </script> \\u0041".to_string(),
+            "no newline at end".to_string(),
+            "x".repeat(70_000) + "\n" + &"long line ".repeat(3_000),
+        ];
+        let awkward = |i: usize, m: &str| {
+            serde_json::json!({
+                "soul": { "name": "tarn", "n": i, "floats": [0.1, 1e-300, 1.7976931348623157e308,
+                    -0.0, 2.5e-7, 123_456_789.123_456_79], "big": u64::MAX, "neg": i64::MIN },
+                "memory": { "content": m },
+                "seen_posts": [i],
+            })
+        };
+        let mut fs = FsStorage::new(&state_dir);
+        for (i, m) in memories.iter().enumerate().take(4) {
+            fs.save_raw(id, awkward(i, m), None).await.unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let dir = state_dir.join(id.to_string());
+        let enroller = Enroller {
+            state_dir: state_dir.clone(),
+            keys: keys.clone(),
+            restore: None,
+        };
+        enroller.chain(id, false).await.unwrap();
+        // Sealed saves after enrolment archive the states they replace too
+        let enrolment = std::sync::Arc::new(super::super::SealedEnrolment::new(
+            &state_dir,
+            root.join("secrets"),
+        ));
+        let mut store = agora_agentkit::state::storage::Mirrored::new(
+            FsStorage::new(&state_dir),
+            (),
+            enrolment,
+        );
+        for (i, m) in memories.iter().enumerate().skip(4) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let base = store.load_raw(id).await.unwrap().base;
+            store
+                .save_raw(id, awkward(i, m), base.as_ref())
+                .await
+                .unwrap();
+        }
+
+        // Every sealed snapshot, opened
+        let seal = AgentSeal::new(&dir, id);
+        let head = seal.head().await.unwrap().unwrap();
+        let line = super::super::version::verified_line(&seal, &keys, &api, id, &head)
+            .await
+            .unwrap();
+        let k = keys.seal_keys(id).unwrap();
+        let mut sealed = Vec::new();
+        for e in line
+            .iter()
+            .filter(|e| e.entry.kind == StateEntryKind::Snapshot)
+        {
+            sealed.push(
+                super::super::version::open(&seal, &api, &k, &line, &e.entry)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(sealed.len(), memories.len(), "each state sealed once");
+
+        // Every archive, and the current state, against them
+        let mut files: Vec<PathBuf> = archives(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.path)
+            .collect();
+        files.push(dir.join("state.json"));
+        assert!(
+            files.len() > memories.len(),
+            "archives from both sides of enrolment"
+        );
+        for path in &files {
+            let (_, local) = envelope_state(path).unwrap();
+            let found = sealed
+                .iter()
+                .find(|v| plaintext_hash(v) == plaintext_hash(&local))
+                .unwrap_or_else(|| panic!("{} has no sealed version", path.display()));
+            assert_eq!(found, &local, "JSON-equal");
+            assert_eq!(
+                agora_agentkit::state::codec::plaintext(found).as_slice(),
+                agora_agentkit::state::codec::plaintext(&local).as_slice(),
+                "the same canonical bytes"
+            );
+            assert_eq!(
+                memory_text(found).as_bytes(),
+                memory_text(&local).as_bytes(),
+                "memory byte for byte"
+            );
+        }
+        // And in order, each memory once
+        let opened: Vec<&str> = sealed.iter().map(memory_text).collect();
+        assert_eq!(
+            opened,
+            memories.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        // The resolver merges each archive into its sealed version
+        let h =
+            crate::sealed::history::resolve(&state_dir, &keys, &api, id, &mut Default::default())
+                .await
+                .unwrap();
+        assert!(h.left_out.is_empty(), "{:?}", h.left_out);
+        assert_eq!(h.versions.len(), memories.len());
+        for (v, m) in h.versions.iter().zip(&memories) {
+            assert_eq!(v.memory_str().as_bytes(), m.as_bytes());
+            assert!(matches!(
+                v.sources[0],
+                crate::sealed::history::Source::Sealed { .. }
+            ));
+        }
+        let local_sources: usize = h
+            .versions
+            .iter()
+            .map(|v| v.sources.iter().filter(|s| s.head().is_none()).count())
+            .sum();
+        assert_eq!(local_sources, files.len(), "every file merged, none apart");
+    }
+
+    /// The origin from the memory-restore listing and ledger: fields only.
+    #[tokio::test]
+    async fn the_origin_follows_the_memory_restore_record() {
+        let root = crate::sealed::TestDir::new("enroll-origin");
+        let id = AgentId::new();
+        let agent_dir = root.join("state").join(id.to_string());
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let recovered = root.join("recovered");
+        std::fs::create_dir_all(recovered.join("tarn")).unwrap();
+        std::fs::write(
+            recovered.join("tarn/MEMORY.json"),
+            r#"{"content":"synthetic"}"#,
+        )
+        .unwrap();
+        let thread: agora_agentkit::ids::PostId =
+            "7ad26ccd-0000-4000-8000-000000000001".parse().unwrap();
+        let offer = RestoreOffer::for_agents(&[("tarn", None, id)], &recovered, Some(thread));
+        let name = ShortString::new("tarn").unwrap();
+
+        let none = origin(None, &name, id, &agent_dir).await.unwrap();
+        assert_eq!(none.origin.class, GenesisClass::Unknown);
+        let other = origin(Some(&offer), &name, AgentId::new(), &agent_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            other.origin.class,
+            GenesisClass::Unknown,
+            "listed under another id"
+        );
+
+        let listed = origin(Some(&offer), &name, id, &agent_dir).await.unwrap();
+        assert_eq!(listed.origin.class, GenesisClass::KnownBreak);
+        assert_eq!(listed.origin.incident, Some(IncidentCite::Post(thread)));
+        assert!(listed.origin.prior_copy_held);
+        assert!(listed.prior.is_none(), "not chosen: not sealed");
+
+        let ledger = serde_json::json!({
+            "format": 1,
+            "asks": [{"at": "2026-10-12T09:00:00Z", "offer_version": 1, "model": "m",
+                "chars": 9, "order": ["show", "decline"], "order_seed": 0,
+                "constrained": true, "attempts": 1,
+                "outcome": {"kind": "answered", "choice": "show", "reason": "",
+                    "memory_note_written": false}}],
+            "showings": [{"at": "2026-10-13T09:00:00Z", "outcome": "completed"}],
+        });
+        std::fs::write(RestoreLedger::path(&agent_dir), ledger.to_string()).unwrap();
+        let shown = origin(Some(&offer), &name, id, &agent_dir).await.unwrap();
+        assert_eq!(shown.origin.class, GenesisClass::Verified);
+        assert_eq!(
+            shown.origin.verified_at,
+            Some("2026-10-13T09:00:00Z".parse().unwrap())
+        );
+        assert_eq!(shown.prior, Some(recovered.join("tarn/MEMORY.json")));
+    }
+
+    /// An enrolment interrupted after `k` archives resumes where it
+    /// stopped: every state once, in order, no gap, one genesis.
+    #[tokio::test]
+    async fn an_interrupted_enrolment_resumes_without_duplicates_or_gaps() {
+        for k in 0..=4 {
+            let root = crate::sealed::TestDir::new("enroll-resume");
+            let state_dir = root.join("state");
+            let keys = KeyStore::new(root.join("secrets"));
+            let id = AgentId::new();
+            keys.ring()
+                .insert(id, &agora_agentkit::crypto::generate_keypair().0)
+                .unwrap();
+            let mut fs = FsStorage::new(&state_dir);
+            let memories = ["a", "b", "c", "d", "e"];
+            for m in memories {
+                fs.save_raw(id, state("tarn", m), None).await.unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let dir = state_dir.join(id.to_string());
+            // The first run: key, genesis, k archives, then it died
+            keys.write_state_key(id, &StateKeyFile::new(&StateKey::generate(), 0, 0))
+                .unwrap();
+            let seal = AgentSeal::new(&dir, id);
+            let k_keys = keys.seal_keys(id).unwrap();
+            let all = archives(&dir).unwrap();
+            {
+                let lock = seal.lock().await.unwrap();
+                let origin = GenesisOrigin {
+                    class: GenesisClass::Unknown,
+                    incident: None,
+                    prior_copy_held: false,
+                    verified_at: None,
+                };
+                crate::sealed::session::genesis(&seal, &lock, &k_keys, &origin, all[0].mtime)
+                    .await
+                    .unwrap();
+                for a in &all[..k] {
+                    crate::sealed::session::append(
+                        &seal,
+                        &lock,
+                        &k_keys,
+                        &KeyframePolicy::default(),
+                        StateEntryKind::Snapshot,
+                        &archived_state(&a.path).unwrap(),
+                        a.mtime,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            let enroller = Enroller {
+                state_dir: state_dir.clone(),
+                keys: keys.clone(),
+                restore: None,
+            };
+            let report = enroller.chain(id, false).await.unwrap();
+            assert!(report.resumed, "k={k}");
+            assert_eq!(report.resumed_past, k, "k={k}");
+            let entries = super::super::check::local_entries(&seal).await.unwrap();
+            assert_eq!(
+                entries.len(),
+                1 + memories.len(),
+                "k={k}: genesis and each state once"
+            );
+            assert!(verify_chain(id, &entries, &keys.trusted(id).unwrap().unwrap()).intact);
+            let mut opened = Vec::new();
+            for e in &entries[1..] {
+                let base = match e.entry.blob.as_ref().unwrap().encoding {
+                    agora_agentkit::state::BlobEncoding::Delta { base } => entries
+                        .iter()
+                        .map(|x| &x.entry)
+                        .find(|x| x.entry_hash() == base),
+                    _ => None,
+                };
+                let v = seal.open_state(&k_keys, &e.entry, base).await.unwrap();
+                opened.push(v["memory"]["content"].as_str().unwrap().to_string());
+            }
+            assert_eq!(
+                opened, memories,
+                "k={k}: in order, none twice, none missing"
+            );
+        }
+    }
+
+    /// Agora holding a chain of the agent that isn't the start of the one
+    /// here: never opted in, no key record posted.
+    #[tokio::test]
+    async fn opt_in_refuses_another_chain_on_agora() {
+        let root = crate::sealed::TestDir::new("opt-in-other-chain");
+        let (other, _, other_dir) = crate::sealed::check::tests::enrolled(&root).await;
+        let foreign = super::super::check::local_entries(&AgentSeal::new(&other_dir, other))
+            .await
+            .unwrap();
+        let api = fake::guarded(&root);
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        answer(&dir, SealChoice::Private);
+        *api.chain.lock().unwrap() = Ok(foreign);
+        let err = e.opt_in(&api, id, None).await.unwrap_err().to_string();
+        assert!(err.contains("isn't the start of the one here"), "{err}");
+        assert_eq!(*api.calls.lock().unwrap(), ["chain"], "no key posted");
+        assert!(!crate::sealed::uploads(&dir, &keys, id));
     }
 
     /// Every agent is chained, whatever its answer, with nothing sent: the
