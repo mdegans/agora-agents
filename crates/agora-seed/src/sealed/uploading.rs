@@ -38,7 +38,7 @@
 //! so whoever takes it inside the agent's `sealed/lock` or agentkit's
 //! directory lock can't deadlock with them.
 //!
-//! [`migrate_all`]: the one-time migration of agents that uploaded before
+//! [`migrate_once`]: the one-time migration of agents that uploaded before
 //! the marker existed. **Once per data directory**: the first start pass
 //! that completes it writes `<data_dir>/sealed-uploading-migrated` (when,
 //! how many), and no later pass runs it.
@@ -75,7 +75,7 @@ pub const LOCK: &str = "sealed_uploading.lock";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadingBy {
-    /// [`migrate_all`]: the agent uploaded before the marker existed.
+    /// [`migrate_once`]: the agent uploaded before the marker existed.
     Migration,
     /// The agent's yes to the offer, acted on.
     OptIn,
@@ -447,7 +447,7 @@ pub enum NotMigrated {
     Forgotten,
 }
 
-/// One agent of [`migrate_all`]: marked uploading only if it is enrolled,
+/// One agent of [`migrate_once`]: marked uploading only if it is enrolled,
 /// has no marker, has uploaded before (a non-empty `sealed/sent/`) and its
 /// sealed-state ledger says yes. Reads directory entries and the ledger's
 /// answer only; decides and writes under the marker's lock.
@@ -497,11 +497,12 @@ pub fn migrate(
 /// does not. So an agent that did upload (enrolled, its ledger yes,
 /// something in `sealed/sent/`) is marked, one `sealed_state_uploading_migrated`
 /// event each; no other agent ever is. The agents marked.
+#[cfg(test)]
 pub fn migrate_all(state_dir: &Path, keys: &KeyStore) -> Vec<AgentId> {
     migrate_all_counted(state_dir, keys).0
 }
 
-/// [`migrate_all`], and how many agents it couldn't decide (an I/O error).
+/// The one-time migration over every agent, and how many agents it couldn't decide (an I/O error).
 fn migrate_all_counted(state_dir: &Path, keys: &KeyStore) -> (Vec<AgentId>, usize) {
     let mut failed = 0;
     let mut migrated = Vec::new();
@@ -542,7 +543,7 @@ pub struct Migrated {
     pub migrated: usize,
 }
 
-/// [`migrate_all`], once per data directory (`state_dir`'s parent): run
+/// The migration over every agent, once per data directory (`state_dir`'s parent): run
 /// only while [`MIGRATED`] is absent, which a pass that decided every agent
 /// then writes. `None`: already done, nothing run.
 pub fn migrate_once(state_dir: &Path, keys: &KeyStore) -> Option<Vec<AgentId>> {

@@ -83,6 +83,13 @@ pub async fn accept(
     let note = note.map(str::trim).filter(|n| !n.is_empty());
     let agent_dir = state_dir.join(id.to_string());
     let seal = AgentSeal::new(&agent_dir, id);
+    // An id naming no agent here: nothing made for it (the lock would make
+    // its directory)
+    anyhow::ensure!(
+        std::fs::exists(&agent_dir)?,
+        "no agent {id} here ({}): nothing was written",
+        agent_dir.display()
+    );
     // No session in progress (a journal older than the refusal is one the
     // refused agent can't clear), and the lock for the whole command
     let lock = super::session::take(state_dir, id, true).await?;
@@ -255,6 +262,8 @@ pub async fn accept(
             .await
             .context("writing the enrolment marker")?;
     }
+    // B2/B5: roster::replace(data_dir, id, Some(head)) here, once the roster
+    // merges (also for a RolledBack refusal accepted with nothing changed)
     drop(lock);
     tracing::warn!(
         event_type = "sealed_state_accepted",
@@ -317,6 +326,11 @@ pub async fn rebase(
     let _runner = super::session::runner_exclusive(data_dir)?;
     super::session::no_session(state_dir, id, true)?;
     let agent_dir = state_dir.join(id.to_string());
+    anyhow::ensure!(
+        std::fs::exists(&agent_dir)?,
+        "no agent {id} here ({}): nothing was written",
+        agent_dir.display()
+    );
     let seal = AgentSeal::new(&agent_dir, id);
     anyhow::ensure!(
         seal.is_enrolled().await?,
@@ -443,6 +457,8 @@ pub async fn rebase(
         .context("sealing the current state on top of Agora's head")?;
     super::enroll::record_sizes(&agent_dir, head, Utc::now(), &current);
     Notice::joined(&agent_dir, note).context("writing the notice")?;
+    // B2/B5: roster::replace(data_dir, id, Some(head)) here, once the roster
+    // merges
     drop(lock);
     let onto = HeadRef {
         entry_hash: server_head.entry_hash(),
@@ -481,6 +497,8 @@ async fn finish_lost(
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
     super::enroll::record_sizes(agent_dir, head, Utc::now(), current);
+    // B2/B5: roster::replace(data_dir, id, Some(head)) here, once the roster
+    // merges
     Notice::agora_lost(
         agent_dir,
         note,
@@ -808,7 +826,8 @@ pub async fn keep_line(
     )
     .context("writing the notice")?;
     super::lost::done(&dir)?;
-    // B2: roster::replace(data_dir, id, Some(head)) once the roster lands
+    // B2/B5: roster::replace(data_dir, id, Some(fork.keep)) here, once the
+    // roster merges
     drop(lock);
     tracing::warn!(
         event_type = "sealed_state_fork_kept",
@@ -849,67 +868,243 @@ pub fn read_ids(text: &str) -> anyhow::Result<Vec<AgentId>> {
     Ok(out)
 }
 
-/// The count table a wide accept prints: how many accepted, by reason, and
-/// each failure with its id. Ids, reasons and counts only.
-pub fn many_table(done: &[(AgentId, anyhow::Result<Accepted>)]) -> String {
-    use std::fmt::Write as _;
-    let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
-    let mut failed = Vec::new();
-    for (id, r) in done {
-        match r {
-            Ok(a) => *by.entry(a.reason.as_str()).or_default() += 1,
-            Err(e) => failed.push(format!("  failed {id}: {e:#}")),
-        }
-    }
-    let mut out = String::new();
-    let _ = writeln!(out, "{:<24} {:>6}", "accepted (reason)", "agents");
-    for (reason, n) in &by {
-        let _ = writeln!(out, "{reason:<24} {n:>6}");
-    }
-    let _ = writeln!(out, "{:<24} {:>6}", "failed", failed.len());
-    let _ = writeln!(out, "{:<24} {:>6}", "total", done.len());
-    for f in failed {
-        let _ = writeln!(out, "{f}");
-    }
-    out
+/// What a wide accept may do ([`accept_many`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ManyOptions<'a> {
+    /// What every agent accepted reads.
+    pub note: &'a str,
+    /// How many agents the list names: a real run with another count
+    /// touches nothing.
+    pub expect: Option<usize>,
+    /// Say what would be done, per agent; touch nothing.
+    pub dry_run: bool,
+    /// Accept a state whose memory shrank by more than half (or whose
+    /// change can't be measured) too.
+    pub accept_shrunk: bool,
 }
 
-/// `sealed-accept --agents-file`: [`accept`] for each of `ids` with one
-/// `note`, each under its own lock, failures counted and the rest done.
-/// `expect` must be how many agents `ids` names, or nothing is touched (a
-/// wide act is confirmed by its count, as the operator CLI's wide sends).
+/// What a wide accept sees of one agent before it acts: counts and sizes,
+/// never content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preview {
+    /// Its refusal, if it is refused (or its head record lost).
+    pub reason: Option<Refusal>,
+    /// Memory and soul lengths (characters): the last sealed version's,
+    /// then the state here's. `None`: couldn't be measured.
+    pub memory: Option<(usize, usize)>,
+    pub soul: Option<(usize, usize)>,
+}
+
+impl Preview {
+    /// Memory shrank by more than half, or its change couldn't be
+    /// measured: a wipe looks like this.
+    pub fn shrunk(&self) -> bool {
+        match self.memory {
+            Some((before, after)) => after * 2 < before,
+            None => true,
+        }
+    }
+}
+
+/// What a wide accept did with one agent.
+#[derive(Debug)]
+pub enum ManyOutcome {
+    /// A dry run: would be accepted.
+    Would,
+    /// A dry run: would be held back, and why.
+    WouldHold(&'static str),
+    Accepted(Accepted),
+    /// Not refused, its head here: accepted before (a rerun).
+    Already,
+    /// Held back, and why: a loss-shaped refusal, or a shrunk memory
+    /// without `--accept-shrunk`.
+    Held(&'static str),
+    /// No such agent here: nothing made.
+    NoAgent,
+    Failed(anyhow::Error),
+}
+
+impl ManyOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Would => "would accept",
+            Self::WouldHold(_) => "would hold back",
+            Self::Accepted(_) => "accepted",
+            Self::Already => "already accepted",
+            Self::Held(_) => "held back",
+            Self::NoAgent => "no such agent",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// Counted as a failure of the command.
+    pub fn failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+/// Why a refusal reason is never accepted wholesale: the state is missing,
+/// unreadable or from elsewhere, which `sealed-restore` answers.
+// B2: a rolled-back refusal joins these once it lands.
+fn loss_shaped(reason: Refusal) -> bool {
+    matches!(
+        reason,
+        Refusal::StateMissing | Refusal::StateUnreadable | Refusal::StateIo | Refusal::StateTooNew
+    )
+}
+
+/// One agent, measured: its refusal, and the memory and soul sizes of its
+/// last sealed version against the state here.
+async fn preview(state_dir: &Path, keys: &KeyStore, api: &dyn SealedApi, id: AgentId) -> Preview {
+    let agent_dir = state_dir.join(id.to_string());
+    let seal = AgentSeal::new(&agent_dir, id);
+    let reason = match seal.is_refused().await {
+        Ok(true) => Some(Refusal::from_marker(
+            &std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default(),
+        )),
+        _ => match seal.head().await {
+            Ok(None) => Some(Refusal::HeadMissing),
+            _ => None,
+        },
+    };
+    let here = FsStorage::new(state_dir)
+        .load_raw(id)
+        .await
+        .ok()
+        .map(|l| super::sizes::Sizes::of(&l.value));
+    let sealed = super::version::last_sealed(&seal, keys, api, id)
+        .await
+        .ok()
+        .map(|l| super::sizes::Sizes::of(&l.state));
+    let (memory, soul) = match (sealed, here) {
+        (Some(b), Some(a)) => (
+            Some((b.memory_chars, a.memory_chars)),
+            Some((b.soul_chars, a.soul_chars)),
+        ),
+        _ => (None, None),
+    };
+    Preview {
+        reason,
+        memory,
+        soul,
+    }
+}
+
+/// `sealed-accept --agents-file`: each of `ids` measured ([`Preview`]),
+/// then, unless a dry run, [`accept`]ed with one note, each under its own
+/// lock. A real run needs `expect` to be the count, or nothing is touched,
+/// and holds back, per agent, a loss-shaped refusal (`sealed-restore`'s
+/// case) and a memory that shrank by more than half (or can't be measured)
+/// unless `accept_shrunk`. An agent accepted before counts as already; an
+/// id naming no agent here has nothing made for it.
 pub async fn accept_many(
     state_dir: &Path,
     keys: &KeyStore,
     api: &dyn SealedApi,
     ids: &[AgentId],
-    note: &str,
-    expect: usize,
-) -> anyhow::Result<Vec<(AgentId, anyhow::Result<Accepted>)>> {
-    let note = note.trim();
+    options: ManyOptions<'_>,
+) -> anyhow::Result<Vec<(AgentId, Preview, ManyOutcome)>> {
+    let note = options.note.trim();
     anyhow::ensure!(
         !note.is_empty(),
         "--note is required: every agent accepted reads it"
     );
-    anyhow::ensure!(
-        ids.len() == expect,
-        "{} agent(s) named, and --expect says {expect}: nothing was touched",
-        ids.len()
-    );
+    if !options.dry_run {
+        anyhow::ensure!(
+            options.expect == Some(ids.len()),
+            "{} agent(s) named, and --expect says {}: nothing was touched",
+            ids.len(),
+            options
+                .expect
+                .map_or("nothing".to_string(), |n| n.to_string())
+        );
+    }
     let mut out = Vec::with_capacity(ids.len());
     for &id in ids {
-        let done = accept(state_dir, keys, api, id, Some(note)).await;
-        if let Err(e) = &done {
-            tracing::warn!(
-                event_type = "sealed_accept_many_failed",
-                agent_id = %id,
-                error = %format!("{e:#}"),
-                "one agent of a wide sealed-accept failed; the rest go on"
-            );
+        if !std::fs::exists(state_dir.join(id.to_string()))? {
+            out.push((id, Preview::default(), ManyOutcome::NoAgent));
+            continue;
         }
-        out.push((id, done));
+        let p = preview(state_dir, keys, api, id).await;
+        let hold = match p.reason {
+            None => None,
+            Some(r) if loss_shaped(r) => {
+                Some("loss-shaped refusal: restore it (sealed-restore), never accept it")
+            }
+            Some(_) if p.shrunk() && !options.accept_shrunk => Some(
+                "its memory shrank by more than half since its last sealed version (or can't \
+                 be measured): --accept-shrunk accepts it",
+            ),
+            Some(_) => None,
+        };
+        let outcome = match (p.reason, hold, options.dry_run) {
+            (None, _, _) => ManyOutcome::Already,
+            (_, Some(why), true) => ManyOutcome::WouldHold(why),
+            (_, None, true) => ManyOutcome::Would,
+            (_, Some(why), false) => ManyOutcome::Held(why),
+            (_, None, false) => match accept(state_dir, keys, api, id, Some(note)).await {
+                Ok(a) => ManyOutcome::Accepted(a),
+                Err(e) => {
+                    tracing::warn!(
+                        event_type = "sealed_accept_many_failed",
+                        agent_id = %id,
+                        error = %format!("{e:#}"),
+                        "one agent of a wide sealed-accept failed; the rest go on"
+                    );
+                    ManyOutcome::Failed(e)
+                }
+            },
+        };
+        out.push((id, p, outcome));
     }
     Ok(out)
+}
+
+/// The table a wide accept prints: per agent its refusal, memory and soul
+/// sizes (last sealed → here) and what was done; then counts by outcome
+/// and by reason. Ids, reasons, sizes and counts only.
+pub fn many_table(done: &[(AgentId, Preview, ManyOutcome)]) -> String {
+    use std::fmt::Write as _;
+    let sizes = |s: Option<(usize, usize)>| match s {
+        Some((b, a)) => format!("{b}->{a}"),
+        None => "?".into(),
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<36} {:<16} {:>17} {:>15}  outcome",
+        "agent", "reason", "memory", "soul"
+    );
+    let mut by_outcome: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut by_reason: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (id, p, o) in done {
+        let reason = p.reason.map_or("-", Refusal::as_str);
+        *by_outcome.entry(o.label()).or_default() += 1;
+        *by_reason.entry(reason).or_default() += 1;
+        let why = match o {
+            ManyOutcome::WouldHold(why) | ManyOutcome::Held(why) => format!(": {why}"),
+            ManyOutcome::Failed(e) => format!(": {e:#}"),
+            ManyOutcome::Accepted(a) => format!(": head seq {}", a.head.seq),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "{id:<36} {reason:<16} {:>17} {:>15}  {}{why}",
+            sizes(p.memory),
+            sizes(p.soul),
+            o.label()
+        );
+    }
+    let _ = writeln!(out, "by outcome:");
+    for (k, n) in &by_outcome {
+        let _ = writeln!(out, "  {k:<20} {n:>6}");
+    }
+    let _ = writeln!(out, "by reason:");
+    for (k, n) in &by_reason {
+        let _ = writeln!(out, "  {k:<20} {n:>6}");
+    }
+    let _ = writeln!(out, "  {:<20} {:>6}", "total", done.len());
+    out
 }
 
 #[cfg(test)]
@@ -1616,24 +1811,56 @@ mod tests {
         }
     }
 
-    /// `--agents-file`: a count that isn't `--expect` touches nothing; the
-    /// right one accepts each, with one note, and counts them.
+    /// `--agents-file`: a dry run touches nothing and says what it would
+    /// do; a real run with a count that isn't `--expect` touches nothing;
+    /// with it, each refused agent is accepted with one note, a wiped
+    /// memory held back unless `--accept-shrunk`, a rerun counts them as
+    /// already, and an id naming no agent makes nothing.
     #[tokio::test]
-    async fn a_wide_accept_needs_the_expected_count() {
+    async fn a_wide_accept_is_previewed_counted_and_never_blesses_a_wipe() {
         let root = crate::sealed::TestDir::new("accept-many");
-        let (a, keys, dir_a) = local_refused(&root).await;
-        let (b, _, dir_b) = local_refused(&root).await;
+        // Sealed with 1,000 characters of memory, then changed and refused:
+        // a to nothing (a wipe), b to 900 (an edit)
+        let refused_with = async |chars: usize| {
+            use agora_agentkit::state::codec::KeyframePolicy;
+            let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+            let full = serde_json::json!({ "memory": { "content": "x".repeat(1000) } });
+            AgentSeal::new(&dir, id)
+                .append_state(
+                    &keys.seal_keys(id).unwrap(),
+                    &KeyframePolicy::default(),
+                    StateEntryKind::Snapshot,
+                    &full,
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            FsStorage::new(root.join("state"))
+                .save_raw(
+                    id,
+                    serde_json::json!({ "memory": { "content": "x".repeat(chars) } }),
+                    None,
+                )
+                .await
+                .unwrap();
+            AgentSeal::new(&dir, id).refuse("mismatch").await.unwrap();
+            (id, keys, dir)
+        };
+        let (a, keys, dir_a) = refused_with(0).await;
+        let (b, _, dir_b) = refused_with(900).await;
+        let ghost = AgentId::new();
         let api = crate::sealed::api::fake::guarded(&root);
         let state_dir = root.join("state");
-        let ids = read_ids(&format!("# after the event\n{a}\n\n{b}\n{a}\n")).unwrap();
-        assert_eq!(ids, vec![a, b], "each once, in order");
+        let ids = read_ids(&format!("# after the event\n{a}\n\n{b}\n{a}\n{ghost}\n")).unwrap();
+        assert_eq!(ids, vec![a, b, ghost], "each once, in order");
         assert!(read_ids("not-an-id").is_err());
-        let e = accept_many(&state_dir, &keys, &api, &ids, "restored by hand", 3)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("nothing was touched"), "{e}");
-        for d in [&dir_a, &dir_b] {
+        let opts = |dry_run, expect, accept_shrunk| ManyOptions {
+            note: "restored by hand",
+            expect,
+            dry_run,
+            accept_shrunk,
+        };
+        let untouched = async |d: &Path| {
             assert!(
                 AgentSeal::new(d, AgentId::new())
                     .is_refused()
@@ -1641,31 +1868,62 @@ mod tests {
                     .unwrap()
             );
             assert!(Notice::load(d).unwrap().is_none(), "untouched");
-        }
-        assert!(
-            accept_many(&state_dir, &keys, &api, &ids, " ", 2)
-                .await
-                .is_err(),
-            "a note"
-        );
-        let done = accept_many(&state_dir, &keys, &api, &ids, "restored by hand", 2)
+        };
+        // Dry run: what would be done, nothing done
+        let dry = accept_many(&state_dir, &keys, &api, &ids, opts(true, None, false))
             .await
             .unwrap();
-        assert!(done.iter().all(|(_, r)| r.is_ok()));
-        let table = many_table(&done);
         assert!(
-            table.contains("mismatch") && table.contains("total"),
+            matches!(dry[0].2, ManyOutcome::WouldHold(_)),
+            "{:?}",
+            dry[0]
+        );
+        assert_eq!(dry[0].1.memory, Some((1000, 0)));
+        assert_eq!(dry[1].1.memory, Some((1000, 900)));
+        assert!(matches!(dry[1].2, ManyOutcome::Would), "{:?}", dry[1]);
+        assert!(matches!(dry[2].2, ManyOutcome::NoAgent));
+        let table = many_table(&dry);
+        assert!(
+            table.contains("would hold back") && table.contains("mismatch"),
             "{table}"
         );
         for d in [&dir_a, &dir_b] {
-            assert!(
-                !AgentSeal::new(d, AgentId::new())
-                    .is_refused()
-                    .await
-                    .unwrap()
-            );
+            untouched(d).await;
         }
+        assert!(!std::fs::exists(state_dir.join(ghost.to_string())).unwrap());
+        // The wrong count: nothing
+        let e = accept_many(&state_dir, &keys, &api, &ids, opts(false, Some(2), false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("nothing was touched"), "{e}");
+        for d in [&dir_a, &dir_b] {
+            untouched(d).await;
+        }
+        // The real run: the wipe held back, the edit accepted
+        let done = accept_many(&state_dir, &keys, &api, &ids, opts(false, Some(3), false))
+            .await
+            .unwrap();
+        assert!(matches!(done[0].2, ManyOutcome::Held(_)));
+        assert!(matches!(done[1].2, ManyOutcome::Accepted(_)));
+        assert!(matches!(done[2].2, ManyOutcome::NoAgent));
+        assert!(!std::fs::exists(state_dir.join(ghost.to_string())).unwrap());
+        untouched(&dir_a).await;
+        // Told so: accepted; and a rerun counts the other as already
+        let done = accept_many(&state_dir, &keys, &api, &ids, opts(false, Some(3), true))
+            .await
+            .unwrap();
+        assert!(matches!(done[0].2, ManyOutcome::Accepted(_)));
+        assert!(matches!(done[1].2, ManyOutcome::Already));
+        assert!(done.iter().all(|(_, _, o)| !o.failed()));
         assert!(api.calls.lock().unwrap().is_empty());
+        // A single accept of an id naming no agent makes nothing either
+        assert!(
+            accept(&state_dir, &keys, &api, ghost, Some("n"))
+                .await
+                .is_err()
+        );
+        assert!(!std::fs::exists(state_dir.join(ghost.to_string())).unwrap());
     }
 
     /// A, B from one version; then A2 saved on A: A is an ancestor, not a

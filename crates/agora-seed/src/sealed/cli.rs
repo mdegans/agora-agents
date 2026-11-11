@@ -66,12 +66,20 @@ pub enum Command {
         keep: Option<super::accept::Keep>,
         /// Accept every agent named in this file (one id a line, `#`
         /// comments; `-` reads stdin) with one note, each under its own
-        /// lock. Needs --expect.
-        #[arg(long, requires_all = ["note", "expect"], conflicts_with_all = ["rebase", "keep"])]
+        /// lock. Without --yes, a dry run: what would be done, per agent
+        /// (refusal, memory and soul sizes), nothing touched.
+        #[arg(long, requires = "note", conflicts_with_all = ["rebase", "keep"])]
         agents_file: Option<std::path::PathBuf>,
+        /// Do it (after a dry run): needs --expect.
+        #[arg(long, requires_all = ["agents_file", "expect"])]
+        yes: bool,
         /// How many agents --agents-file names: a mismatch touches nothing.
-        #[arg(long)]
+        #[arg(long, requires = "agents_file")]
         expect: Option<usize>,
+        /// Accept a state whose memory shrank by more than half since its
+        /// last sealed version too (a wipe looks like that).
+        #[arg(long, requires = "yes")]
+        accept_shrunk: bool,
     },
     /// Put an agent's last sealed version back as its state: a refused
     /// agent's, or one whose state, sealed/ or whole directory was lost
@@ -304,6 +312,8 @@ pub async fn run(
             agents_file: Some(file),
             note,
             expect,
+            yes,
+            accept_shrunk,
             ..
         } => {
             let text = if file.as_os_str() == "-" {
@@ -313,14 +323,13 @@ pub async fn run(
                     .with_context(|| format!("reading {}", file.display()))?
             };
             let ids = super::accept::read_ids(&text)?;
-            let expect = expect.unwrap_or_default();
             println!(
-                "sealed-accept: {} agent(s) named; --expect {expect}{}",
+                "sealed-accept: {} agent(s) named{}",
                 ids.len(),
-                if ids.len() == expect {
+                if yes {
                     ""
                 } else {
-                    ": a mismatch, nothing will be touched"
+                    "; a dry run, nothing is touched (--yes --expect N does it)"
                 }
             );
             let _runner = super::session::runner_exclusive(data_dir)?;
@@ -329,17 +338,17 @@ pub async fn run(
                 &keys,
                 api.as_ref(),
                 &ids,
-                note.as_deref().unwrap_or_default(),
-                expect,
+                super::accept::ManyOptions {
+                    note: note.as_deref().unwrap_or_default(),
+                    expect,
+                    dry_run: !yes,
+                    accept_shrunk,
+                },
             )
             .await?;
             print!("{}", super::accept::many_table(&done));
-            let failed = done.iter().filter(|(_, r)| r.is_err()).count();
-            anyhow::ensure!(
-                failed == 0,
-                "{failed} of {} agent(s) not accepted",
-                done.len()
-            );
+            let failed = done.iter().filter(|(_, _, o)| o.failed()).count();
+            anyhow::ensure!(failed == 0, "{failed} of {} agent(s) failed", done.len());
         }
         Command::SealedAccept {
             agent: Some(agent),

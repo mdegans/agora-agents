@@ -196,6 +196,7 @@ pub fn forget(
     let key_to = FORGOTTEN_STATE_KEY.name(&stamp);
     std::fs::rename(&key, dir.join(&key_to)).context("setting the state key aside")?;
     super::crash::point("forget:committed")?;
+    // B2/B5: roster::replace(data_dir, id, None) here, once the roster merges
     finish(keys, id, &dir, &plan)?;
     tracing::warn!(
         event_type = "sealed_state_forgotten",
