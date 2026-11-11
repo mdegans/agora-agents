@@ -1595,7 +1595,7 @@ fn read_prior(path: &Path) -> anyhow::Result<serde_json::Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
     use crate::consent::sealed_state::prompt::SealChoice;
@@ -1631,7 +1631,7 @@ mod tests {
 
     /// An agent with a signing key and `memories` saved in turn (all but
     /// the last archived), not chained.
-    async fn agent(root: &Path, memories: &[&str]) -> (AgentId, KeyStore, PathBuf) {
+    pub(crate) async fn agent(root: &Path, memories: &[&str]) -> (AgentId, KeyStore, PathBuf) {
         let keys = KeyStore::new(root.join("secrets"));
         let id = AgentId::new();
         keys.ring()
@@ -1645,7 +1645,7 @@ mod tests {
         (id, keys, root.join("state").join(id.to_string()))
     }
 
-    fn enroller(root: &Path, keys: &KeyStore) -> Enroller {
+    pub(crate) fn enroller(root: &Path, keys: &KeyStore) -> Enroller {
         Enroller {
             state_dir: root.join("state"),
             keys: keys.clone(),

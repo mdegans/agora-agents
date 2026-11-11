@@ -1865,6 +1865,53 @@ fn server_fault_alert(faults: &[&Fault], alerts: &alerts::Alerter) {
     alerts.notify(alert);
 }
 
+/// One agent's pre-loss copy at run start ([`sealed_start_check`]): a pair
+/// cut short finished, only when its head's plaintext isn't the state's
+/// (a pair's head is the copy's); then, only for an agent the
+/// memory-restore record lists as having chosen to see a copy held here,
+/// the copy appended once ([`sealed::enroll::Enroller::append_prior`]).
+async fn prior_step(
+    enroller: &sealed::enroll::Enroller,
+    id: AgentId,
+    name: &agora_agentkit::reactor::seed::ShortString<64>,
+    hash: &agora_agentkit::govlog::Sha256Hex,
+) {
+    let dir = enroller.state_dir.join(id.to_string());
+    let head = agora_agentkit::state::storage::AgentSeal::new(&dir, id)
+        .head()
+        .await;
+    let done = match head {
+        Ok(Some(h)) if h.plaintext_sha256.as_ref() != Some(hash) => {
+            enroller.finish_prior(id).await.map(|h| h.is_some())
+        }
+        _ => Ok(false),
+    };
+    let done = match done {
+        Ok(false) => {
+            match sealed::enroll::origin(enroller.restore.as_ref(), name, id, &dir).await {
+                Ok(o) if o.prior.is_some() => enroller.append_prior(id).await.map(|r| r.is_some()),
+                Ok(_) => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+        other => other,
+    };
+    match done {
+        Ok(true) => tracing::warn!(
+            event_type = "sealed_prior_at_start",
+            agent_id = %id,
+            "the pre-loss copy's pair finished or appended at run start"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::error!(
+            event_type = "sealed_prior_at_start_failed",
+            agent_id = %id,
+            error = %format!("{e:#}"),
+            "the pre-loss copy couldn't be finished or appended; the start check judges the agent"
+        ),
+    }
+}
+
 /// Check each enrolled agent ([`sealed::check`]): refused ones leave the
 /// pool (stage `sealed`), the rest run with their lines, some held. First
 /// the roster ([`sealed::roster::check`]): an agent on it whose directory,
@@ -1883,6 +1930,7 @@ async fn sealed_start_check(
     dry_run: bool,
     skipped: &mut Vec<Skipped>,
     verified: Option<&sealed::anchors::VerifiedAnchors>,
+    prior: Option<&sealed::enroll::Enroller>,
 ) -> SealedRun {
     let mut run = SealedRun::default();
     // Stopped by the operator: uploads stopped, but checked like any other
@@ -2067,6 +2115,25 @@ async fn sealed_start_check(
                 .detail("agents", scan.unchained.len())
                 .detail("first", first.join(", ")),
             );
+        }
+    }
+    // A pre-loss copy's pair cut short is finished, so the agent isn't
+    // refused for it; a copy the agent chose to see since it was chained is
+    // appended (a stopped agent's waits for its resume). After the roster,
+    // which has judged every head as it was found (a pair appended to a
+    // rolled-back directory could otherwise carry its head past the
+    // roster's); never for an agent it or an earlier start refused. Each
+    // under the agent's seal lock; a failure is logged and the start check
+    // judges the agent as it is
+    if let Some(enroller) = prior {
+        for (id, state) in pool.iter() {
+            let Some((hash, _)) = enrolled.get(id) else {
+                continue;
+            };
+            if refused.contains(id) || scan.refused.contains(id) {
+                continue;
+            }
+            prior_step(enroller, *id, &state.soul.name, hash).await;
         }
     }
     // The anchors not yet judged are judged here where they can be, so a
@@ -2439,8 +2506,26 @@ async fn run(held: &mut Held) -> Result<()> {
             .context("no home directory")?
             .join("agents/agora"),
     };
-    // Shared with any other runner on this data dir; `rotate-keys` takes it
-    // exclusive. A dry run or a listing reads only
+    // The start, in order (each step sees what the ones before it leave):
+    //  1. `promote`: a save cut between its archive and its rename put in
+    //     place, only while no other runner shares the data dir (it takes
+    //     runner.lock exclusive, not waiting, so it comes before the shared
+    //     hold); it reads no marker, only state.json and its tmp;
+    //  2. runner.lock, shared (the operator's commands take it exclusive);
+    //  3. `uploading::start_pass`: the chain's marker moved to its new name
+    //     first (before anything reads it), a lost or half-written uploading
+    //     marker repaired, the one-time migration, markers in doubt alerted;
+    //  4. the stop reconcile;
+    //  5. `load_states`, which finishes a sealed commit a crash cut short (a
+    //     head only moves forward there);
+    //  6. the governance log verified (it reads no agent's state);
+    //  7. the sealed start check (`sealed_start_check`): the roster and its
+    //     witnesses against every head as 5 left it, then a pre-loss copy's
+    //     pair finished or a chosen copy appended for agents the roster
+    //     didn't refuse, then each agent checked;
+    //  8. the refusal rule (`refuse_run`);
+    //  9. reactors built.
+    // A dry run or a listing reads only: no lock, no writes
     if !args.dry_run && !args.list_models {
         // A save cut between its archive and its rename, while no other
         // runner shares the data dir (exclusive, not waiting): before the
@@ -2698,6 +2783,18 @@ async fn run(held: &mut Held) -> Result<()> {
         &held.alerts,
     )
     .await?;
+    // Never fatal: a table that can't be used is logged, alerted, and the
+    // run goes on without the offer. Resolved before the start check, which
+    // appends a pre-loss copy the agent chose to see
+    let restore_offer = config
+        .memory_restore
+        .as_ref()
+        .and_then(|c| consent::memory_restore::resolve_or_disable(c, &held.alerts));
+    let prior = (!args.dry_run).then(|| sealed::enroll::Enroller {
+        state_dir: state_dir.clone(),
+        keys: enrolment.keys_store().clone(),
+        restore: restore_offer.clone(),
+    });
     // The sealed-state start check, for enrolled agents: before anyone is
     // built, so a refused agent is never run, saved or sealed.
     let sealed_run = sealed_start_check(
@@ -2711,6 +2808,7 @@ async fn run(held: &mut Held) -> Result<()> {
         args.dry_run,
         &mut skipped,
         Some(&verified_anchors),
+        prior.as_ref(),
     )
     .await;
     // Before any reactor is built. A dry run checks nothing, so refuses
@@ -2744,12 +2842,6 @@ async fn run(held: &mut Held) -> Result<()> {
             tracing::warn!(agent = %name, "`[cadence_consent].agents` names no loaded agent");
         }
     }
-    // Never fatal: a table that can't be used is logged, alerted, and the
-    // run goes on without the offer.
-    let restore_offer = config
-        .memory_restore
-        .as_ref()
-        .and_then(|c| consent::memory_restore::resolve_or_disable(c, &held.alerts));
     if let Some(offer) = &restore_offer {
         for name in unknown_names(offer.names(), &pool) {
             tracing::warn!(agent = %name, "`[memory_restore]` agents_file names no loaded agent");
@@ -3377,6 +3469,7 @@ mod tests {
             false,
             &mut skipped,
             None,
+            None,
         )
         .await;
         // It uploaded before it stopped: it may read back what is on
@@ -3432,6 +3525,7 @@ mod tests {
             false,
             &mut skipped,
             None,
+            None,
         )
         .await;
         assert!(!run.seats[&id].stop_note);
@@ -3457,6 +3551,7 @@ mod tests {
             false,
             &mut skipped,
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -3468,6 +3563,102 @@ mod tests {
         );
         assert!(pool.is_empty());
         assert!(sends(api.inner()).is_empty());
+    }
+
+    /// A pre-loss copy's pair cut short (the copy sealed, the state not yet
+    /// after it) would be refused as a mismatch: the start check finishes
+    /// it first and runs the agent. A copy the agent chose to see since it
+    /// was chained is appended at the start, once. Without the run's
+    /// `Enroller` (a dry run) neither happens.
+    #[tokio::test]
+    async fn the_start_finishes_a_cut_prior_pair_and_appends_a_chosen_copy() {
+        use agora_agentkit::enums::StateEntryKind;
+        for cut in [true, false] {
+            let root = sealed::TestDir::new("main-prior");
+            let (id, keys, dir) = sealed::enroll::tests::agent(&root, &["a", "b"]).await;
+            let recovered = root.join("recovered");
+            std::fs::create_dir_all(recovered.join("tarn")).unwrap();
+            std::fs::write(
+                recovered.join("tarn/MEMORY.json"),
+                r#"{"content":"synthetic"}"#,
+            )
+            .unwrap();
+            let e = sealed::enroll::Enroller {
+                restore: Some(consent::memory_restore::RestoreOffer::for_agents(
+                    &[("tarn", None, id)],
+                    &recovered,
+                    None,
+                )),
+                ..sealed::enroll::tests::enroller(&root, &keys)
+            };
+            e.chain(id, false).await.unwrap();
+            // It chose `show` after it was chained
+            let ledger = serde_json::json!({
+                "format": 1,
+                "asks": [{"at": "2026-10-12T09:00:00Z", "offer_version": 1, "model": "m",
+                    "chars": 9, "order": ["show", "decline"], "order_seed": 0,
+                    "constrained": true, "attempts": 1,
+                    "outcome": {"kind": "answered", "choice": "show", "reason": "",
+                        "memory_note_written": false}}],
+            });
+            std::fs::write(
+                consent::memory_restore::ledger::RestoreLedger::path(&dir),
+                ledger.to_string(),
+            )
+            .unwrap();
+            if cut {
+                sealed::crash::at("prior:appended");
+                assert!(e.append_prior(id).await.is_err());
+            }
+            let state_dir = root.join("state");
+            let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+                .await
+                .unwrap();
+            let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+            let priors = async || {
+                sealed::check::local_entries(&seal)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|x| x.entry.kind == StateEntryKind::ArchivedPrior)
+                    .count()
+            };
+            assert_eq!(priors().await, usize::from(cut));
+            let api = sealed::api::fake::guarded(&root);
+            let start = async |prior: Option<&sealed::enroll::Enroller>| {
+                let mut pool = vec![(id, crate::agent_selection_tests::pooled("tarn").1)];
+                sealed_start_check(
+                    &mut pool,
+                    &loaded.sealed,
+                    &root,
+                    &state_dir,
+                    &keys,
+                    &api,
+                    &alerts::Alerter::off(),
+                    false,
+                    &mut Vec::new(),
+                    None,
+                    prior,
+                )
+                .await
+            };
+            if !cut {
+                // A dry run's start (no Enroller): not appended
+                let run = start(None).await;
+                assert!(run.refused.is_empty(), "{:?}", run.refused);
+                assert_eq!(priors().await, 0);
+            }
+            let run = start(Some(&e)).await;
+            assert!(run.refused.is_empty(), "cut {cut}: {:?}", run.refused);
+            assert_eq!(priors().await, 1, "cut {cut}");
+            let run = start(Some(&e)).await;
+            assert!(run.refused.is_empty());
+            assert_eq!(priors().await, 1, "once");
+            assert!(
+                api.calls.lock().unwrap().is_empty(),
+                "nothing asked of Agora"
+            );
+        }
     }
 
     /// The sealed start check: an intact agent runs with its lines, a
@@ -3506,6 +3697,7 @@ mod tests {
             &alerts::Alerter::off(),
             false,
             &mut skipped,
+            None,
             None,
         )
         .await;
@@ -3573,6 +3765,7 @@ mod tests {
             true,
             &mut skipped,
             Some(&verified),
+            None,
         )
         .await;
         assert!(run.seats.is_empty() && run.drained.is_empty());
@@ -3630,6 +3823,7 @@ mod tests {
             false,
             &mut skipped,
             Some(&verified),
+            None,
         )
         .await;
         alerter.flush(Duration::from_secs(5)).await;
@@ -3657,6 +3851,7 @@ mod tests {
             false,
             &mut skipped,
             Some(&verified),
+            None,
         )
         .await;
         alerter.flush(Duration::from_secs(5)).await;
@@ -3701,6 +3896,7 @@ mod tests {
                 &alerts::Alerter::off(),
                 false,
                 &mut skipped,
+                None,
                 None,
             )
             .await
@@ -3808,6 +4004,7 @@ mod tests {
                 false,
                 &mut Vec::new(),
                 None,
+                None,
             )
             .await
         };
@@ -3882,6 +4079,7 @@ mod tests {
                 false,
                 &mut Vec::new(),
                 None,
+                None,
             )
             .await
         };
@@ -3935,6 +4133,7 @@ mod tests {
             &alerts::Alerter::off(),
             false,
             &mut Vec::new(),
+            None,
             None,
         )
         .await
@@ -4265,6 +4464,7 @@ mod tests {
             false,
             &mut Vec::new(),
             None,
+            None,
         )
         .await;
         assert!(run.refused.is_empty(), "{:?}", run.refused);
@@ -4391,6 +4591,7 @@ mod tests {
             &alerts::Alerter::off(),
             true,
             &mut Vec::new(),
+            None,
             None,
         )
         .await;
