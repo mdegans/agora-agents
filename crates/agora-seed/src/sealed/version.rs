@@ -5,8 +5,8 @@
 //! them, Agora's, verified with the runner's own trust
 //! ([`KeyStore::trusted`]), never on the server's word.
 //!
-//! A blob that isn't here (agentkit keeps only the current keyframe's and
-//! the outbox's, `prune_blobs`) is fetched from Agora and checked against
+//! A blob that isn't here (a runner before agentkit 0.158 deleted the ones
+//! Agora acknowledged) is fetched from Agora and checked against
 //! its entry's `BlobRef` before it is opened (agentkit's
 //! `open_entry_blob`); nothing fetched is written to disk. For an agent
 //! that never uploaded ([`Reach::Local`]) nothing is asked of Agora: a
@@ -548,4 +548,26 @@ pub async fn last_sealed(
         snapshot,
         state,
     })
+}
+
+/// Tests: delete the blobs Agora acknowledged that nothing local still
+/// needs (not the head's keyframe's, not an outbox item's), as agentkit's
+/// `prune_blobs` did before 0.158 kept them. A `sealed/` written by an
+/// older runner looks like this.
+#[cfg(test)]
+pub async fn drop_acknowledged_blobs(seal: &AgentSeal) {
+    let mut keep = std::collections::HashSet::new();
+    if let Some(h) = seal.head().await.unwrap() {
+        keep.extend(h.keyframe.as_ref().and_then(|k| k.blob_sha256()));
+    }
+    for i in seal.outbox().await.unwrap() {
+        keep.extend(i.entry.entry.blob.map(|b| b.sha256));
+    }
+    for i in seal.sent().await.unwrap() {
+        if let Some(b) = i.entry.entry.blob
+            && !keep.contains(&b.sha256)
+        {
+            let _ = std::fs::remove_file(seal.dir().join("blobs").join(b.sha256.to_hex()));
+        }
+    }
 }

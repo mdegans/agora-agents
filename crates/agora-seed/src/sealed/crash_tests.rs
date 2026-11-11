@@ -670,7 +670,8 @@ async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
                 "{seat:?}"
             );
             // Kept past a prune: the old keyframe opens
-            b.seal().prune_blobs().await.unwrap();
+            // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+            crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
             let lost = std::fs::read_dir(b.dir.join("sealed/lost"))
                 .unwrap()
                 .map(|e| e.unwrap().path())

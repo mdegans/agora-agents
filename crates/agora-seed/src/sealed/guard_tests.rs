@@ -183,7 +183,8 @@ async fn a_stopped_agents_pruned_versions_are_fetched_and_a_never_uploaded_one_a
         } else {
             unmark(&b.dir, &b.keys, b.id);
         }
-        b.seal().prune_blobs().await.unwrap();
+        // B4/5: agentkit 0.158 keeps acknowledged blobs; an older runner's sealed/
+        crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         // Not strict: the never-uploaded case is refused, by design
         let api = guard(&b.root, &b.keys);
         *api.chain.lock().unwrap() = Ok(b.server());
