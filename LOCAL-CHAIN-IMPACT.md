@@ -118,81 +118,122 @@ contradictory or unreadable after the start pass is one operator alert per
 run (`sealed_state_uploading_in_doubt`, its ids and why), and uploads
 nothing until repaired by hand.
 
-## B4/B5: the operator's repair commands (rotate-keys, sealed-accept, sealed-restore, sealed-forget)
+## B4/B5: the operator's repair commands (rotate-keys, sealed-accept, sealed-restore, sealed-forget), revised after review
 
-Nothing here runs by itself: every change below happens only when the
-operator runs the command, with the runner stopped (`runner.lock` taken
-exclusively) and no session in progress (the agent's `sealed/lock` held).
-Installing the binary and the first run after install change nothing for
-any agent. Nothing is deleted; what is superseded is renamed aside or kept
-as a copy. No content of a state is logged or printed (hashes, counts,
-paths, dates).
+Every change below happens only when the operator runs the command, with
+the runner stopped (`runner.lock` exclusive) and no session in progress
+(the agent's `sealed/lock` held), **except the one-time migration record
+and the forgotten-marker pass, which run at every start pass** (see
+"Start pass"). Nothing is deleted; what is superseded is renamed aside or
+kept as a copy. No state content is logged or printed (hashes, counts,
+sizes, paths, dates).
 
-Three kinds of agent decide what each command may ask of Agora:
-uploading (as before), **stopped after uploading** (reads, and key
-maintenance, see below), **never uploaded** (no call at all).
+Three kinds of agent decide what each command may ask of Agora: uploading
+(as before), **stopped after uploading** (reads, plus the guard's new
+key-maintenance class: `post_state_key` and a `rotate_key` naming a head),
+**never uploaded** (no call at all).
+
+### Start pass (runner start, and every `sealed-*` command)
+
+- `<data_dir>/sealed-uploading-migrated` (new; `{at, migrated}`, 0600,
+  atomic): written by the first start pass whose uploading migration decided
+  every agent. While it exists the migration **never runs again**. On the
+  first start after install it is written whatever the migration marked
+  (the three betas, or none).
+- A forgotten agent (`<secrets>/<id>/sealed_uploading.forgotten.<utc>` or
+  `sealed_stopped.forgotten.<utc>` present) that came back with its
+  directory: its `sealed/uploading` and `sealed/stopped` from before the
+  forget, with no durable copy since, are renamed
+  `sealed/uploading.forgotten.<utc>` / `sealed/stopped.forgotten.<utc>`.
+  The migration skips it, and a half-written marker older than the forget
+  is never completed. It is neither uploading nor stopped until an explicit
+  opt-in (`uploading::set`). Nothing restores the forgotten records by
+  itself: the only automatic "revival" (the memory-id key) runs at the
+  agent's first `memory` use, so tying the markers to it would be the silent
+  re-upload this fixes.
 
 ### `rotate-keys`
 
-| File | What |
-|---|---|
-| `<secrets>/<id>/secrets.next.json`, `past_keys.json`, `rotations.json`, `rotation.pending.json` → `rotation.<seq>.taken.json`, `secrets.<utc>.json` | as before |
-| `<secrets>/<id>/state_key.wrap.json` (new) | the re-wrap of the state key, written **before** it is posted (a rerun posts the same bytes); for a never-uploaded agent never posted, kept for its opt-in. Public material, 0600 |
-| `<secrets>/<id>/state_key.json` | `wrap_seq` advanced to the re-wrap's (the key is unchanged) |
-| `<state>/<id>/sealed/outbox/*` (`.json`, `.tmp`, `.displaced`, `.abandoned`), `sealed/sent/*.lost`, `sealed/lost/<utc>/items/*.json` and `INTENT`/`DONE` | **rewritten in place**, each whole (unique temporary, fsync, rename over, fsync of the directory): every entry Agora didn't acknowledge is re-signed with the new key. Entry hashes, links, `head.json` and blobs are unchanged (the signature isn't in the hash). `sealed/sent/*.json` (what Agora holds) is never touched. An entry signed by none of the agent's keys is refused, never signed over |
-
-Server calls: never uploaded: the identity rotation naming no head and the
-X25519 registration only. Stopped: as an uploader (the rotation names
-Agora's head, which must be the newest version in `sent/`; the re-wrap is
-posted), through the guard's new key-maintenance class. Until the command
-finishes `secrets.next.json` stays, so the runner leaves the agent out of
-every run (`mid_rotation`): a half re-signed chain is never checked or run.
+- **Pre-flight, nothing written or sent**: every entry to be re-signed is
+  parsed and must be signed by one of the agent's keys; the line to the head
+  (completed by Agora's entries for an agent Agora holds) must verify as it
+  will after the rotation (new key generated in memory, rotation
+  simulated). A failure names the file and the fix. Reads only: `chain` for
+  an agent that has uploaded.
+- Then as before: `secrets.next.json`, `past_keys.json`, `rotations.json`,
+  `rotation.pending.json` → `rotation.<seq>.taken.json`,
+  `secrets.<utc>.json`; `state_key.wrap.json` (the re-wrap, kept before it is
+  posted; never posted for a never-uploaded agent); `state_key.json`'s
+  `wrap_seq` (the seq after the highest Agora holds when Agora may be read).
+- **Re-signed in place** (each file rewritten whole: unique temporary,
+  fsync, rename, dir fsync): every entry kept here **that Agora doesn't
+  hold**, for every kind of agent: `sealed/outbox/*` (`.json`, `.tmp`,
+  `.displaced`, `.abandoned`), `sealed/sent/*.lost`,
+  `sealed/lost/<utc>/items/*.json` and `INTENT`/`DONE`. Hashes, links,
+  `head.json` and blobs unchanged. An uploader's unsent `.tmp`/`.displaced`/
+  `.abandoned` items are now re-signed too.
+- `rotate-keys --agent <id> --status` (new): read-only (a `chain` read for
+  an agent that has uploaded); says the step reached and what blocks it.
+  Nothing ever suggests removing `secrets.next.json`.
 
 ### `sealed-accept`
 
-- `--note` for a never-uploaded agent: as before, from what is here, no call.
-- `head.json` lost, never uploaded: rebuilt from the local outbox and blobs
-  (the newest committed item is the head; its line verified with the
-  runner's keys); writes `sealed/head.json` and, if missing, the
-  keyframe's blob (agentkit `adopt_server_head`). The fork record
-  (`displaced`) of a lost head is not rebuilt.
-- `--rebase` for a never-uploaded agent: refused, nothing written.
-- `--keep <head|ord>` (new): writes `sealed/lost/<utc>/INTENT` (→ `DONE`),
-  copies of `head.json`, the set-aside items' blobs and the old keyframe's
-  blob, and the items' records under it; renames each outbox item off the
-  kept line to `outbox/<ord>-<hash>.displaced`; rewrites `head.json` (the
-  kept tip, forks cleared); with `<ord>`, writes the kept tip's state as
-  `state.json` (FsStorage archives the one there as `state.<utc>.json`);
-  `sealed/notice.json` for the agent; clears a refusal (kept as
-  `refused.cleared.<utc>`).
-- `--agents-file <path|->` with `--expect N` (new): the same as one
-  `--note` accept per agent, each under its own lock; a count that isn't N
-  touches nothing.
-- A missing `state_key.json` of an agent that has uploaded is first
-  recovered (below).
+- An id naming no agent here: refused before the lock, nothing made.
+- Never uploaded, `head.json` lost: rebuilt from the local chain (newest
+  committed item is the head). **Committed items off the head's line are
+  renamed `outbox/<ord>-<hash>.displaced` first**, then agentkit writes
+  `head.json` (and the keyframe blob if missing), then `head.json`'s
+  `displaced` is rewritten with those lines' tips, so `--keep` sees the
+  fork and an opt-in never uploads the other line.
+- `--keep <head|ord>`: the kept line verified and (tip not the head) its
+  state opened and hash-checked **before anything moves**. Then
+  `sealed/lost/<utc>/INTENT` (→ `DONE`), copies under it, off-line items
+  renamed `.displaced`, the kept line's `.displaced` items renamed back to
+  `<ord>.json`, `head.json` rewritten, the tip's state written as
+  `state.json` (FsStorage archives the one there), `sealed/notice.json`, a
+  refusal cleared. An `INTENT` that moved nothing and can't go on is renamed
+  `ABANDONED.<utc>` (kept). An ancestor is never kept as a tip.
+- `--agents-file` (`-` for stdin): **a dry run unless `--yes`** (prints per
+  agent its refusal and memory/soul sizes, last sealed → here, with totals;
+  touches nothing; opening the last sealed version reads local blobs, or
+  Agora's for an agent that has uploaded). `--yes` needs `--expect N` equal
+  to the count. Per agent: a loss-shaped refusal (state missing,
+  unreadable, I/O, too new) is held back; a memory that shrank by more than
+  half (or can't be measured) is held back unless `--accept-shrunk`; an
+  agent already accepted counts as already. Writes per accepted agent as a
+  single `--note` accept.
 
 ### `sealed-restore`
 
-- Never uploaded: as before from the local chain only; a lost `head.json`
-  rebuilt as for accept; `sealed/` gone: refused ("restore `state/<id>/`
-  and `secrets/<id>/` from a backup"), nothing written, no call. The
-  agent's notice says the copy restored from is the runner's, never Agora.
-- A save cut short (a complete `state.json.tmp` older than ten minutes, or a
-  `state.json.tmp.<utc>.aside`, newer than the head and not its state):
-  the restore refuses, naming the file; `--from-cut-save` writes that
-  state as `state.json` (the one there archived), then commits it (the
-  prepared outbox item it was) or seals it on the head. A stray tmp
-  restore sets aside itself is now named `state.json.tmp.<utc>.restored-over.aside`.
-- `state_key.json` missing and the agent has uploaded: recovered from its
-  wrap on Agora (`state_keys` read; only a record signed by a key the
-  runner trusts, opened with the agent's X25519 key or a past one, and
-  opening the sealed head's blob here when there is one), written only
-  into a missing file (`sealed_state_key_recovered` event). Never
-  uploaded: refused, "only a backup of `secrets/<id>/` restores it".
+- Never uploaded: from the local chain; `sealed/` gone refuses ("restore
+  `state/<id>/` and `secrets/<id>/` from a backup"). **`head.json` lost and
+  a state here (not refused) that isn't the newest sealed version: refused
+  unless `--discard-local`** (nothing written). The rebuild sets a fork's
+  other line aside as for accept.
+- `state_key.json` missing: recovered only after the guards and under the
+  agent's lock, for an agent that has uploaded: the newest verified record
+  that opens the sealed head here (falling back to the next), written only
+  into a missing file.
+- **A save that was interrupted** is one only by the chain's evidence: a
+  file (`state.json.tmp`, `state.json.tmp.<utc>.aside`, or `state.json`
+  itself) whose state loads as an agent state and hashes to a prepared
+  outbox item (`.tmp` or `.abandoned`) that follows the current head. A
+  plain restore refuses when one exists, naming it. `--from-cut-save
+  --note` writes it as `state.json` (FsStorage archives the one there and
+  sets a leftover tmp aside), then commits the prepared item or seals it on
+  the head; a rerun after the write recognises it in place and seals it.
+  Any other file is named and left as it is. A tmp restore sets aside itself
+  is named `state.json.tmp.<utc>.restored-over.aside`.
 
 ### `sealed-forget`
 
 Also renames `<secrets>/<id>/sealed_uploading` to
-`sealed_uploading.forgotten.<utc>` (the same stamp), under the marker's
-lock; `sealed_uploading.lock` stays, as lock files do. An agent put back
-is then neither stopped nor uploading until it opts in again.
+`sealed_uploading.forgotten.<utc>` (same stamp) under the marker's lock;
+`sealed_uploading.lock` stays, as lock files do. Put back, the agent is
+neither uploading nor stopped (Start pass, above).
+
+### Roster (B2)
+
+Call sites marked `// B2/B5: roster::replace` (accept, rebase, the Agora-loss
+resolution, `--keep`, restore, `--from-cut-save`, forget with `None`); not
+called until the roster merges.
