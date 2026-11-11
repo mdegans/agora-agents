@@ -381,15 +381,10 @@ fn path(agent_dir: &Path) -> PathBuf {
     agent_dir.join(SEALED_DIR).join(NOTICE)
 }
 
+/// The whole notice, in one atomic, durable write (a unique tmp, fsync,
+/// rename, the directory fsynced): every notice is one write.
 fn write(agent_dir: &Path, notice: &Notice) -> std::io::Result<()> {
-    let path = path(agent_dir);
-    let dir = path.parent().expect("in sealed/");
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(notice)?)?;
-    std::fs::File::open(&tmp)?.sync_all()?;
-    std::fs::rename(&tmp, &path)?;
-    std::fs::File::open(dir)?.sync_all()
+    super::write_private(&path(agent_dir), &serde_json::to_vec_pretty(notice)?)
 }
 
 impl OperatorAct {
