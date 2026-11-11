@@ -160,6 +160,11 @@ pub enum AlertKind {
     /// missing or damaged: those versions can't be opened here. One alert
     /// a run.
     SealedStateBlobsMissing,
+    /// Agora reported sealed blobs of uploading agents missing or damaged
+    /// at rest that this runner can't send again (not here, or not hashing
+    /// to their names here): those versions can't be opened from Agora.
+    /// Alerted when the count changes.
+    SealedStateAgoraBlobsUnhealable,
     /// The sealed roster was last written long before the newest chained
     /// state: possibly a data directory restored from an older backup.
     SealedStateRosterStale,
@@ -195,7 +200,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -226,6 +231,7 @@ impl AlertKind {
         Self::SealedStateUntrustedKey,
         Self::SealedStateUnchainedAgents,
         Self::SealedStateBlobsMissing,
+        Self::SealedStateAgoraBlobsUnhealable,
         Self::SealedStateRosterStale,
         Self::MemoryIdKeyRefused,
         Self::QuestionUnanswered,
@@ -280,6 +286,7 @@ impl AlertKind {
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
             Self::SealedStateUnchainedAgents => "sealed_state_unchained_agents",
             Self::SealedStateBlobsMissing => "sealed_state_unopenable",
+            Self::SealedStateAgoraBlobsUnhealable => "sealed_state_agora_blobs_unhealable",
             Self::SealedStateRosterStale => "sealed_roster_stale",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
             Self::QuestionUnanswered => "question_unanswered",
@@ -528,6 +535,17 @@ impl AlertKind {
                  told how many and since when. Versions already uploaded are \
                  not looked at (they are on Agora). Look at the disk and the \
                  backups; counts and sizes, not content."
+            }
+            Self::SealedStateAgoraBlobsUnhealable => {
+                "Agora's check at rest found sealed blobs of the agents below \
+                 missing or damaged, and the drain could not send them again: \
+                 this runner doesn't hold them (agentkit before 0.158 deleted \
+                 the ones Agora had acknowledged) or holds copies that don't \
+                 hash to their names. Those versions can't be opened from \
+                 Agora. The counts are below (partial where a drain was \
+                 interrupted); the drain sent back every blob it could. Look \
+                 at the server's blob store and its backups, and this \
+                 runner's backups of state/<id>/sealed/blobs; counts only."
             }
             Self::SealedStateRosterStale => {
                 "The sealed roster (<data_dir>/sealed-roster.json) was last \

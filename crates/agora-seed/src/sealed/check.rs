@@ -42,7 +42,7 @@ use agora_agentkit::reactor::seed::memory::short_head;
 
 /// What checked it, as the verdict line names it. Pinned to the agentkit
 /// in `Cargo.lock` by `the_verifier_is_the_locked_agentkit`.
-pub const VERIFIER: &str = "git:agora-agentkit:v0.157.1:src/state/verify.rs";
+pub const VERIFIER: &str = "git:agora-agentkit:v0.158.0:src/state/verify.rs";
 
 /// Why uploads are held this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1967,7 +1967,9 @@ async fn check_chain(
     seat.extend(found.unopenable.map(Unopenable::line));
     seat.extend(drop_lines);
     let hold = match status {
-        HeadStatus::Same | HeadStatus::Pending => None,
+        // Unchecked comes only from a drain (agentkit's `head_status` never
+        // says it); no hold on no evidence
+        HeadStatus::Same | HeadStatus::Pending | HeadStatus::Unchecked => None,
         HeadStatus::LocalMissing => {
             seat.push(HEAD_MISSING_LINE.into());
             Some(Hold::HeadMissing)

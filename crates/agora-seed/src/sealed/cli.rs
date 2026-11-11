@@ -585,6 +585,21 @@ pub async fn run(
     Ok(())
 }
 
+/// What a drain healed, for the command's line: nothing when Agora
+/// reported no damage.
+fn healing_said(h: &agora_agentkit::state::outbox::Healing) -> String {
+    use agora_agentkit::state::outbox::Damage;
+    match h.damaged {
+        Damage::Reported(n) if n > 0 => format!(
+            "; Agora reported {n} damaged blob(s): {} sent again, {} can't be from here{}",
+            h.healed,
+            h.unhealable,
+            if h.interrupted { " (partial)" } else { "" }
+        ),
+        _ => String::new(),
+    }
+}
+
 /// Agents chained at once by default: half the cores, 1 to 16. Each holds
 /// tens of MB while it seals (brotli's 16 MiB window, twice).
 fn default_jobs() -> usize {
@@ -798,12 +813,18 @@ async fn opt_in_pass(
                     }
                     _ => "",
                 };
-                format!("uploaded {}, {:?}{published}", d.uploaded, d.status)
+                format!(
+                    "uploaded {}, {:?}{}{published}",
+                    d.uploaded,
+                    d.status,
+                    healing_said(&d.healing)
+                )
             }
             Ok(Drained::LocalOnly) => "nothing uploaded (it doesn't upload)".to_string(),
             Ok(Drained::NotEnrolled) => "nothing uploaded (not chained)".to_string(),
-            Ok(Drained::Withdrawn { uploaded }) => format!(
-                "uploaded {uploaded}, then uploading was switched off; the rest stays local"
+            Ok(Drained::Withdrawn { uploaded, healed }) => format!(
+                "uploaded {uploaded} (and {healed} damaged blob(s) sent again), then uploading \
+                 was switched off; the rest stays local"
             ),
             Err(e) => {
                 tracing::warn!(

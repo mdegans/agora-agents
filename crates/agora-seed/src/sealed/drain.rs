@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::outbox::{AgoraOutbox, Drained};
+use agora_agentkit::state::outbox::{AgoraOutbox, Damage, Drained, Healing};
 use agora_agentkit::state::storage::AgentSeal;
 use agora_agentkit::state::verify::HeadStatus;
 
@@ -80,16 +80,46 @@ pub enum DrainOutcome {
     LocalOnly,
     /// No `sealed/chained`: no chain to send.
     NotEnrolled,
-    /// Uploaded `uploaded`; Agora's head then `status`, `waiting` left.
+    /// Uploaded `uploaded`; Agora's head then `status` (`Unchecked`: it
+    /// couldn't be read), `waiting` left; what Agora reported damaged at
+    /// rest and what was sent again (`healing`).
     Ran {
         uploaded: usize,
         status: HeadStatus,
         waiting: usize,
+        healing: Healing,
     },
-    /// Uploading was switched off mid-drain, after `uploaded`.
-    Withdrawn { uploaded: usize },
+    /// Uploading was switched off mid-drain, after `uploaded`, and after
+    /// `healed` damaged blobs were sent again.
+    Withdrawn { uploaded: usize, healed: usize },
     /// The upload failed (retried at the next wake, or held after a 422).
     Failed,
+}
+
+/// One pass's [`Healing`], summed over the agents.
+#[derive(Debug, Default)]
+struct HealingSummary {
+    /// Agents Agora reported any damaged blob for.
+    agents_damaged: usize,
+    damaged: u64,
+    healed: usize,
+    unhealable: usize,
+    /// Agents whose count is partial (an error cut the heal short).
+    interrupted: usize,
+}
+
+impl HealingSummary {
+    fn add(&mut self, h: &Healing) {
+        if let Damage::Reported(n) = h.damaged
+            && n > 0
+        {
+            self.agents_damaged += 1;
+            self.damaged += n;
+        }
+        self.healed += h.healed;
+        self.unhealable += h.unhealable;
+        self.interrupted += usize::from(h.interrupted);
+    }
 }
 
 pub struct Drainer {
@@ -108,6 +138,8 @@ pub struct Drainer {
     held: Mutex<BTreeSet<AgentId>>,
     /// Each agent's last drain, as it came out.
     last: Mutex<HashMap<AgentId, DrainOutcome>>,
+    /// The unhealable counts last alerted, so a pass alerts only a change.
+    unhealable_alerted: Mutex<HashMap<AgentId, usize>>,
     alerts: Alerter,
     stop: tokio::sync::Notify,
 }
@@ -132,6 +164,7 @@ impl Drainer {
             agents,
             held: Mutex::new(held.into_iter().collect()),
             last: Mutex::new(HashMap::new()),
+            unhealable_alerted: Mutex::new(HashMap::new()),
             alerts,
             stop: tokio::sync::Notify::new(),
         }
@@ -207,8 +240,9 @@ impl Drainer {
     }
 
     /// What `id`'s last drain this run came to; `None` before its first,
-    /// or while it is held. For the verdict (step B2), which must say
-    /// "nothing of this is on Agora" for [`DrainOutcome::LocalOnly`].
+    /// or while it is held. For a verdict, which must say "nothing of this
+    /// is on Agora" for [`DrainOutcome::LocalOnly`], and may say what
+    /// Agora reported damaged and what was sent again (`healing`).
     #[allow(dead_code)]
     pub fn last(&self, id: AgentId) -> Option<DrainOutcome> {
         self.last.lock().expect("last lock").get(&id).copied()
@@ -218,13 +252,69 @@ impl Drainer {
         self.last.lock().expect("last lock").insert(id, outcome);
     }
 
-    /// One pass over every agent not held.
+    /// One pass over every agent not held, then what it healed.
     pub async fn drain_all(&self) {
         for (id, name) in &self.agents {
             if !self.held(*id) {
                 self.drain_one(*id, name).await;
             }
         }
+        self.healing_summary();
+    }
+
+    /// The pass's healing, summed: logged when anything was reported or
+    /// sent again; alerted when the agents' unhealable counts changed
+    /// since the last alert (the operator must hear of blobs Agora lost
+    /// that nothing here can send again). Counts only.
+    fn healing_summary(&self) {
+        let mut sum = HealingSummary::default();
+        let mut unhealable: HashMap<AgentId, usize> = HashMap::new();
+        let mut first: Vec<String> = Vec::new();
+        for (id, name) in &self.agents {
+            let Some(DrainOutcome::Ran { healing, .. }) = self.last(*id) else {
+                continue;
+            };
+            sum.add(&healing);
+            if healing.unhealable > 0 {
+                unhealable.insert(*id, healing.unhealable);
+                if first.len() < super::check::SUMMARY_LIST {
+                    first.push(format!("{name} ({id}): {}", healing.unhealable));
+                }
+            }
+        }
+        if sum.damaged > 0 || sum.healed > 0 || sum.unhealable > 0 {
+            tracing::warn!(
+                event_type = "sealed_state_healing",
+                agents_damaged = sum.agents_damaged,
+                damaged = sum.damaged,
+                healed = sum.healed,
+                unhealable = sum.unhealable,
+                interrupted = sum.interrupted,
+                "Agora reported sealed blobs damaged at rest; the drain sent back what it held"
+            );
+        }
+        let mut alerted = self.unhealable_alerted.lock().expect("alerted lock");
+        if unhealable.is_empty() || *alerted == unhealable {
+            return;
+        }
+        *alerted = unhealable.clone();
+        self.alerts.notify(
+            Alert::new(
+                AlertKind::SealedStateAgoraBlobsUnhealable,
+                format!(
+                    "{} sealed blob(s) of {} agent(s) are damaged on Agora and can't be sent again \
+                     from here",
+                    sum.unhealable,
+                    unhealable.len()
+                ),
+            )
+            .count(sum.unhealable)
+            .detail("agents", unhealable.len())
+            .detail("damaged_reported", sum.damaged)
+            .detail("healed", sum.healed)
+            .detail("interrupted", sum.interrupted)
+            .detail("first", first.join(", ")),
+        );
     }
 
     async fn drain_one(&self, id: AgentId, name: &str) {
@@ -250,14 +340,15 @@ impl Drainer {
                 return self.record(id, DrainOutcome::LocalOnly);
             }
             Ok(Drained::NotEnrolled) => return self.record(id, DrainOutcome::NotEnrolled),
-            Ok(Drained::Withdrawn { uploaded }) => {
+            Ok(Drained::Withdrawn { uploaded, healed }) => {
                 tracing::info!(
                     event_type = "sealed_state_upload_withdrawn",
                     agent_id = %id,
                     uploaded,
+                    healed,
                     "uploading was switched off mid-drain; the rest stays local"
                 );
-                return self.record(id, DrainOutcome::Withdrawn { uploaded });
+                return self.record(id, DrainOutcome::Withdrawn { uploaded, healed });
             }
             Err(e) => return self.failed(id, name, e),
         };
@@ -267,6 +358,7 @@ impl Drainer {
                 uploaded: report.uploaded,
                 status: report.status,
                 waiting: report.waiting,
+                healing: report.healing,
             },
         );
         if report.uploaded > 0 {
@@ -279,7 +371,9 @@ impl Drainer {
             );
         }
         let hold = match report.status {
-            HeadStatus::Same | HeadStatus::Pending => return,
+            // Unchecked: Agora's head couldn't be read after the uploads;
+            // the next drain reads it again. Never a hold on no evidence
+            HeadStatus::Same | HeadStatus::Pending | HeadStatus::Unchecked => return,
             HeadStatus::LocalMissing => Hold::HeadMissing,
             HeadStatus::ServerAhead | HeadStatus::Diverged => Hold::Fork,
         };
@@ -398,6 +492,66 @@ mod tests {
             }
         });
         (format!("http://{addr}/").parse().unwrap(), hits)
+    }
+
+    /// A pass sums what Agora reported damaged and what was sent again;
+    /// the unhealable count is alerted when it changes, not every pass.
+    #[tokio::test]
+    async fn healing_is_summed_and_unhealable_alerted_on_change() {
+        let root = crate::sealed::TestDir::new("drain-healing");
+        let (a, b) = (AgentId::new(), AgentId::new());
+        let outbox = AgoraOutbox::new(
+            agora_agentkit::client::Client::new("http://127.0.0.1:9/".parse().unwrap()).unwrap(),
+            root.join("state"),
+            Arc::new(SealedEnrolment::new(
+                root.join("state"),
+                root.join("secrets"),
+            )),
+        );
+        let d = Drainer::new(
+            outbox,
+            root.join("state"),
+            HashMap::new(),
+            vec![(a, "tarn".into()), (b, "wren".into())],
+            [],
+            Alerter::off(),
+        );
+        let ran = |damaged, healed, unhealable| DrainOutcome::Ran {
+            uploaded: 0,
+            status: HeadStatus::Same,
+            waiting: 0,
+            healing: Healing {
+                damaged,
+                healed,
+                unhealable,
+                interrupted: false,
+            },
+        };
+        d.record(a, ran(Damage::Reported(3), 2, 1));
+        d.record(b, ran(Damage::NotReported, 0, 0));
+        let mut sum = HealingSummary::default();
+        for id in [a, b] {
+            if let Some(DrainOutcome::Ran { healing, .. }) = d.last(id) {
+                sum.add(&healing);
+            }
+        }
+        assert_eq!(
+            (sum.agents_damaged, sum.damaged, sum.healed, sum.unhealable),
+            (1, 3, 2, 1)
+        );
+        let alerted = || d.unhealable_alerted.lock().unwrap().clone();
+        d.healing_summary();
+        assert_eq!(alerted(), HashMap::from([(a, 1)]));
+        d.healing_summary();
+        assert_eq!(alerted(), HashMap::from([(a, 1)]), "unchanged: not again");
+        d.record(b, ran(Damage::Reported(1), 0, 1));
+        d.healing_summary();
+        assert_eq!(alerted(), HashMap::from([(a, 1), (b, 1)]));
+        // Healed since: nothing to alert, the last alert stands
+        d.record(a, ran(Damage::Reported(0), 0, 0));
+        d.record(b, ran(Damage::Unknown, 0, 0));
+        d.healing_summary();
+        assert_eq!(alerted(), HashMap::from([(a, 1), (b, 1)]));
     }
 
     /// A held agent gets no anchor work, so nothing is judged while its
