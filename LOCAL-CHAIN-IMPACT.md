@@ -181,3 +181,44 @@ as a first run: the stated gap.
   one) and the rest run.
 - Shrink alerts (`sealed_state_drop`) and unreadable-seal alerts are one
   per run, on the fleet-wide rate-limit key.
+
+### B2 review fixes
+
+**Reads, new:** at each full check (every start for an agent that has
+uploaded; every 7 to 14 days for one that never did), every blob file of
+the main line in `sealed/blobs/` (read whole and hashed, never decrypted);
+blobs of versions already in `sent/` are not read. `<secrets>/` gains one
+file read at every roster write and start, below. The modification time of
+each roster agent's `state.json` (metadata only).
+
+**Writes, new:** `<data_dir>/secrets/sealed-roster.witness.json` (the
+roster's began-time and agent count), atomic and durable, 0600, beside the
+roster on every roster write (before it when the count goes down, after it
+otherwise). `with_state_keys` skips it (not an agent id).
+
+**What changes for the run:**
+- A chained agent whose local sealed evidence can't be read (`sealed/`,
+  its refusal marker, its outbox items, its numbering, its keys) is
+  **refused** (`seal_unreadable`, not loss-shaped: one or two left out,
+  three stop the run) where it used to run held. This applies to uploading
+  agents too, whose refusal stops the run. Agora unreachable stays a hold.
+- An unreadable `head.json` of a roster agent is a loss (`head_missing`).
+- The roster missing beside its `began` or its witness, or holding fewer
+  agents than the witness says, refuses the run. Once a roster has been
+  kept, three or more agents with keys but no chain, or states never
+  chained, in one start refuse the run. **Deployment consequence:** until
+  step B3's enrolment run has chained the fleet, every start after the
+  first one that adopted the betas sees the whole unchained fleet and
+  refuses. Run the enrolment before the units restart on this build.
+- A roster written more than a day before the newest chained state is one
+  `sealed_roster_stale` alert. **Stated limit:** a whole data directory
+  restored from an older backup with its file times kept passes every
+  witness inside it (roster, began, witness, chains). Only a count and
+  digest kept outside that backup set closes it, for example on Agora for
+  agents that upload.
+- An agent refused in an earlier start keeps that reason and notice, even
+  when its directory was recreated to hold the marker.
+- Alerts for refused agents go out one per agent only when the run goes on;
+  when it stops, one alert names them. A summary alert counting more agents
+  than the last one sent under its key passes the rate limit
+  (`alerts-state.json` gains a `counts` map).
