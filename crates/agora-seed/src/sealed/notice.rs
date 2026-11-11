@@ -121,6 +121,10 @@ pub struct Restored {
     // Agora (an agent that never uploaded), so the line must not say Agora.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local: bool,
+    // B4/5: `sealed-restore --from-cut-save`: not a sealed version restored
+    // but a save that was interrupted, put in place.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut_save: bool,
 }
 
 // B5: a fork in a local-only chain resolved (`sealed-accept --keep`).
@@ -457,6 +461,38 @@ impl Notice {
             found,
             refused,
             local,
+            cut_save: false,
+        });
+        write(agent_dir, &n)
+    }
+
+    // B4/5: the notice of `sealed-restore --from-cut-save`.
+    /// The operator put in place a save of `from` that was interrupted
+    /// before it finished (`sealed-restore --from-cut-save`), with its note.
+    pub fn cut_save_restored(
+        agent_dir: &Path,
+        from: DateTime<Utc>,
+        note: &str,
+        fallback: Refusal,
+        found: bool,
+        refused: bool,
+    ) -> std::io::Result<()> {
+        let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
+        // A rerun of one cut short: what the first run found stands
+        let (found, refused) = match &n.restored {
+            Some(r) if r.cut_save => (r.found, r.refused || refused),
+            _ => (found, refused),
+        };
+        n.accepted = None;
+        n.diff = None;
+        n.restored = Some(Restored {
+            at: Utc::now(),
+            from,
+            note: Some(note.trim().to_string()),
+            found,
+            refused,
+            local: false,
+            cut_save: true,
         });
         write(agent_dir, &n)
     }
@@ -478,6 +514,31 @@ impl Notice {
     /// What the agent is shown; only once the operator accepted or
     /// restored.
     pub fn line(&self) -> Option<String> {
+        if let Some(r) = self.restored.as_ref().filter(|r| r.cut_save) {
+            // B4/5: an interrupted save put in place, in true words
+            let at = r.at.format("%-d %B %Y");
+            let from = r.from.format("%-d %B %Y at %H:%M UTC");
+            let mut line = if r.refused {
+                format!(
+                    "Your session on {} did not run: {}. ",
+                    self.refused_at.format("%-d %B %Y"),
+                    self.reason.plain()
+                )
+            } else {
+                String::new()
+            };
+            line.push_str(&format!(
+                "A save of your state on {from} was interrupted before it finished; on {at}, \
+                 your operator put that saved state in place."
+            ));
+            if r.found {
+                line.push_str(" The state found here is kept by your operator.");
+            }
+            if let Some(note) = &r.note {
+                line.push_str(&format!(" Your operator's note: {note}"));
+            }
+            return Some(line);
+        }
         if let Some(r) = &self.restored {
             let (at, from) = (r.at.format("%-d %B %Y"), r.from.format("%-d %B %Y"));
             // B5: where the copy restored from is

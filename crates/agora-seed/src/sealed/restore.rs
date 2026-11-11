@@ -39,12 +39,14 @@
 //! links the old `state.json` to its archive, then renames the tmp over
 //! it; a crash in between leaves the old state in place and the complete
 //! new one in the tmp, which the next write sets aside as
-//! `state.json.tmp.<utc-ms>.aside`. A complete settled tmp, or an aside,
-//! newer than the head's version and not its state is never passed over in
-//! silence: the restore refuses, naming the file, unless `--from-cut-save`
-//! asks for it, which puts that state back (sealed: committed if it was a
-//! prepared save's, else sealed on the head) instead of the older head's.
-//! Only the envelope's shape is read, never content into logs.
+//! `state.json.tmp.<utc-ms>.aside`. The seal precedes the local write, so
+//! such a save left a prepared outbox item (`.tmp`, or `.abandoned` once a
+//! later save passed it) recording its state's hash and following the
+//! head: only a file matching one is a cut save ([`cut_saves`]), never one
+//! judged by its time. One is never passed over in silence: the restore
+//! refuses, naming it; `--from-cut-save --note` puts it in place and seals
+//! it ([`restore_cut_save`]). Only the envelope's shape is read, never
+//! content into logs.
 //!
 //! A state here that isn't refused and has its `head.json` is never
 //! overwritten (but by `--from-cut-save`): a deliberate change is
@@ -53,7 +55,7 @@
 //! and holds the agent's `sealed/lock` throughout.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::AgentId;
@@ -100,90 +102,291 @@ pub struct Options<'a> {
     pub from_cut_save: bool,
 }
 
-/// A save cut short whose complete state is still here: a settled
-/// `state.json.tmp` or a `state.json.tmp.<utc>.aside`, newer than the
-/// head's version and not its state.
+/// A save that was interrupted, whose complete state is still here. The
+/// evidence is the chain's, never a file's time: agentkit seals a save (an
+/// outbox `.tmp` item, `.abandoned` once a later save passed it) before
+/// the local write, so a genuine cut save is a file whose state hashes to
+/// such an item's recorded plaintext hash, the item following the current
+/// head (`prev_hash`). Only such a file is one.
 pub struct CutSave {
-    pub path: std::path::PathBuf,
-    /// The file's modification time: when the save wrote it.
-    pub at: DateTime<Utc>,
-    /// What a load of it would hash to.
+    /// `state.json.tmp`, a `state.json.tmp.<utc>.aside`, or `state.json`
+    /// itself (already put in place, not yet sealed: a restore cut after
+    /// its write).
+    pub path: PathBuf,
+    /// What a load of it hashes to: the item's.
     pub hash: Sha256Hex,
+    /// The prepared save it is.
+    pub item: OutboxItem,
+    /// It is `state.json`.
+    pub in_place: bool,
     /// Never logged.
     state: serde_json::Value,
 }
 
 /// A name `sealed-restore` gives a tmp it sets aside itself, so a rerun
-/// doesn't offer it back.
+/// doesn't take it for a save of the agent's.
 const RESTORE_ASIDE: &str = ".restored-over.aside";
 
-/// The saves cut short in `agent_dir` ([`CutSave`]), newest first. `head`:
-/// the head's `created_at` (µs) and plaintext hash; `current`: the hash of
-/// the `state.json` here, which isn't one. A tmp counts once older than
-/// [`crate::promote::SETTLED`] (no save in flight). A file that isn't a
-/// complete envelope this runner reads is passed over.
-pub fn cut_saves(
-    agent_dir: &Path,
-    head_created_at: i64,
-    head_hash: Option<&Sha256Hex>,
-    current: Option<&Sha256Hex>,
-    now: std::time::SystemTime,
-) -> Vec<CutSave> {
+/// The saves cut short here ([`CutSave`]), the one already in place first,
+/// then the newest; and the files that look like one (a tmp, an aside) but
+/// aren't, by path. A candidate must also load as an agent state, by the
+/// runner's own typed load. Reads the envelope's shape and hashes only.
+pub async fn cut_saves(seal: &AgentSeal) -> anyhow::Result<(Vec<CutSave>, Vec<PathBuf>)> {
     #[derive(serde::Deserialize)]
     struct Envelope {
         format: u64,
         state: serde_json::Value,
     }
-    let Ok(entries) = std::fs::read_dir(agent_dir) else {
-        return Vec::new();
+    let agent_dir = seal.dir().parent().unwrap_or(seal.dir()).to_path_buf();
+    let Some(head) = seal.head().await? else {
+        return Ok((Vec::new(), Vec::new()));
     };
-    let mut out = Vec::new();
+    // Prepared saves that follow the head, with what they sealed
+    let mut prepared = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(seal.dir().join("outbox")) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if !matches!(
+                path.extension().and_then(|x| x.to_str()),
+                Some("tmp" | "abandoned")
+            ) {
+                continue;
+            }
+            let Ok(item) = std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| serde_json::from_slice::<OutboxItem>(&b).map_err(|e| e.to_string()))
+            else {
+                continue;
+            };
+            if item.entry.entry.prev_hash == Some(head.head.entry_hash)
+                && item.plaintext_sha256.is_some()
+            {
+                prepared.push(item);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut others = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&agent_dir) else {
+        return Ok((found, others));
+    };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        let tmp = name == "state.json.tmp";
-        let aside = name.starts_with("state.json.tmp.")
-            && name.ends_with(".aside")
-            && !name.ends_with(RESTORE_ASIDE);
-        if !tmp && !aside {
+        let in_place = name == "state.json";
+        let candidate = name == "state.json.tmp"
+            || (name.starts_with("state.json.tmp.")
+                && name.ends_with(".aside")
+                && !name.ends_with(RESTORE_ASIDE));
+        if !in_place && !candidate {
             continue;
         }
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        if tmp
-            && now
-                .duration_since(modified)
-                .is_ok_and(|age| age < crate::promote::SETTLED)
-        {
-            continue;
-        }
-        let at = DateTime::<Utc>::from(modified);
-        if at.timestamp_micros() <= head_created_at {
-            continue;
-        }
-        let Some(envelope) = std::fs::read(entry.path())
+        let state = std::fs::read(entry.path())
             .ok()
             .and_then(|b| serde_json::from_slice::<Envelope>(&b).ok())
             .filter(|e| e.format <= agora_agentkit::reactor::storage::MAX_FORMAT)
-        else {
-            continue;
-        };
-        let Ok(state) = as_reloaded(&envelope.state) else {
-            continue;
-        };
-        let hash = plaintext_hash(&state);
-        if Some(&hash) == head_hash || Some(&hash) == current {
-            continue;
-        }
-        out.push(CutSave {
-            path: entry.path(),
-            at,
-            hash,
-            state,
+            .map(|e| e.state)
+            .filter(|s| {
+                serde_json::from_value::<agora_agentkit::reactor::seed::SeedState>(s.clone())
+                    .is_ok()
+            })
+            .and_then(|s| as_reloaded(&s).ok());
+        let matched = state.and_then(|state| {
+            let hash = plaintext_hash(&state);
+            prepared
+                .iter()
+                .find(|i| i.plaintext_sha256 == Some(hash))
+                .map(|item| CutSave {
+                    path: entry.path(),
+                    hash,
+                    item: item.clone(),
+                    in_place,
+                    state,
+                })
         });
+        match matched {
+            Some(c) => found.push(c),
+            None if candidate => others.push(entry.path()),
+            None => {}
+        }
     }
-    out.sort_by_key(|c| std::cmp::Reverse(c.at));
-    out
+    found.sort_by_key(|c| (!c.in_place, std::cmp::Reverse(c.item.ord)));
+    others.sort();
+    Ok((found, others))
+}
+
+/// `sealed-restore --from-cut-save --note`: put in place the newest save
+/// that was interrupted ([`cut_saves`]), and seal it: the prepared item it
+/// was, committed (or, passed by a later save, sealed on the head). The
+/// state here is archived by FsStorage. A rerun after a cut finishes it
+/// (the save already in place is recognised and sealed). Nothing else is
+/// one: a file the evidence doesn't back is named and left as it is.
+async fn restore_cut_save(
+    state_dir: &Path,
+    keys: &KeyStore,
+    id: AgentId,
+    note: Option<&str>,
+) -> anyhow::Result<Restored> {
+    let note = note
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .context("--note is required with --from-cut-save: the agent reads it")?;
+    let agent_dir = state_dir.join(id.to_string());
+    anyhow::ensure!(
+        std::fs::exists(&agent_dir)?,
+        "no agent {id} here ({}): nothing was written",
+        agent_dir.display()
+    );
+    let seal = AgentSeal::new(&agent_dir, id);
+    let lock = super::session::take(state_dir, id, true).await?;
+    let k = keys
+        .seal_keys(id)
+        .context("no sealing keys for the agent")?;
+    let (cuts, others) = cut_saves(&seal).await?;
+    let Some(cut) = cuts.into_iter().next() else {
+        anyhow::bail!(
+            "no save that was interrupted is here for agent {id}: a file is one only when a \
+             sealed version prepared after the current head records its state.{} Nothing was \
+             written",
+            if others.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " Not one, left as they are: {}",
+                    others
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+    };
+    let refused = seal.is_refused().await?;
+    let reason = if refused {
+        Refusal::from_marker(
+            &std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default(),
+        )
+    } else {
+        Refusal::Mismatch
+    };
+    let from = DateTime::from_timestamp_micros(cut.item.entry.entry.state_at)
+        .context("the save's date is out of range")?;
+    let found = !cut.in_place && std::fs::exists(agent_dir.join("state.json"))?;
+    Notice::cut_save_restored(&agent_dir, from, note, reason, found, refused)
+        .context("writing the notice")?;
+    super::crash::point("restore:noticed")?;
+    // A refusal blocks every seal
+    if seal.is_refused().await? {
+        seal.clear_refusal().await.context("clearing the refusal")?;
+    }
+    if !cut.in_place {
+        // Archives the state here as state.<utc>.json first, and sets a
+        // leftover tmp aside whole (agentkit)
+        FsStorage::new(state_dir)
+            .save_sealed_raw(id, cut.state.clone())
+            .await
+            .context("writing the interrupted save's state")?;
+    }
+    super::crash::point("restore:written")?;
+    // Sealed, so the next start finds it intact
+    let committed = matches!(
+        seal.recover_locked(&lock, Some(&cut.hash)).await?,
+        agora_agentkit::state::storage::Recovery::Intact(_)
+            | agora_agentkit::state::storage::Recovery::Committed(_)
+    );
+    if !committed {
+        let head = super::session::append(
+            &seal,
+            &lock,
+            &k,
+            &agora_agentkit::state::codec::KeyframePolicy::default(),
+            agora_agentkit::enums::StateEntryKind::Snapshot,
+            &cut.state,
+            from,
+        )
+        .await
+        .context("sealing the interrupted save on the head")?;
+        super::enroll::record_sizes(&agent_dir, head, Utc::now(), &cut.state);
+    }
+    super::crash::point("restore:cut_sealed")?;
+    let head = seal.head().await?.context("head.json vanished")?.head;
+    drop(lock);
+    tracing::warn!(
+        event_type = "sealed_state_cut_save_restored",
+        agent_id = %id,
+        reason = reason.as_str(),
+        refused,
+        committed,
+        head = %head.entry_hash,
+        seq = head.seq,
+        from = %from,
+        "the operator put an interrupted save in place; a state found here is archived"
+    );
+    Ok(Restored {
+        reason,
+        head,
+        from,
+        rebuilt_head: false,
+        stopped: super::stop::is_stopped(&agent_dir),
+        cut_save: Some(cut.path.display().to_string()),
+        recovered_key: false,
+    })
+}
+
+/// Before a lost `head.json` of an agent that never uploaded is rebuilt
+/// over a state here: that state must be its newest sealed version (the
+/// hash recorded when it was sealed), or the restore would roll it back.
+/// A state that won't load is damage, and doesn't stop it.
+async fn local_is_newest(seal: &AgentSeal, state_dir: &Path, id: AgentId) -> anyhow::Result<()> {
+    use agora_agentkit::reactor::Storage as _;
+    let Some(here) = FsStorage::new(state_dir)
+        .load_raw(id)
+        .await
+        .ok()
+        .and_then(|l| as_reloaded(&l.value).ok())
+        .map(|v| plaintext_hash(&v))
+    else {
+        return Ok(());
+    };
+    let mut items = committed_items(seal).await?;
+    items.extend(seal.sent().await.context("reading sealed/sent")?);
+    items.sort_by_key(|i| i.ord);
+    let Some(tip) = committed_items(seal)
+        .await?
+        .into_iter()
+        .max_by_key(|i| i.ord)
+    else {
+        return Ok(());
+    };
+    // Back from the tip to the newest version that recorded its state
+    let mut at = Some(tip.entry.entry_hash());
+    let mut newest = None;
+    while let Some(hash) = at {
+        let Some(item) = items.iter().find(|i| i.entry.entry_hash() == hash) else {
+            break;
+        };
+        if let Some(p) = item.plaintext_sha256 {
+            newest = Some((p, item.entry.entry.state_at));
+            break;
+        }
+        at = item.entry.entry.prev_hash;
+    }
+    let Some((newest, state_at)) = newest else {
+        return Ok(());
+    };
+    if newest == here {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "agent {id}'s sealed/head.json is lost, and the state here is not its newest sealed \
+         version (of {}): restoring would replace it with that version. Choose: `agora-seed \
+         sealed-accept --agent {id} --note \"…\"` keeps the state here, sealed on top of its \
+         history; `agora-seed sealed-restore --agent {id} --discard-local` replaces it with the \
+         newest sealed version (the one here is archived). Nothing was written",
+        DateTime::from_timestamp_micros(state_at)
+            .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_default()
+    )
 }
 
 /// Rebuild a lost `head.json` from the agent's own chain here: the newest
@@ -442,33 +645,28 @@ pub async fn restore_with(
         discard_local,
         from_cut_save,
     } = options;
+    if from_cut_save {
+        return restore_cut_save(state_dir, keys, id, note).await;
+    }
     let agent_dir = state_dir.join(id.to_string());
     let seal = AgentSeal::new(&agent_dir, id);
     let reach = super::version::reach(&agent_dir, keys, id);
+    let no_keys = || {
+        anyhow::anyhow!(
+            "no keys for agent {id} in the secrets directory: its backups on Agora can't be \
+             opened or checked without them, so there is nothing this runner can restore"
+        )
+    };
+    if keys.signing(id).is_none() {
+        return Err(no_keys());
+    }
     // Nothing of it on Agora, and nothing sealed here: nothing to restore
-    // from, and never a fallback to the server. (No keys at all is said
-    // below, as ever.)
+    // from, and never a fallback to the server
     anyhow::ensure!(
-        keys.signing(id).is_none() || reach.on_agora() || std::fs::exists(seal.dir())?,
+        reach.on_agora() || std::fs::exists(seal.dir())?,
         "agent {id}'s sealed/ is gone, and nothing of it is on Agora: there is nothing to \
          restore it from here. Restore `state/{id}/` and `secrets/{id}/` from a backup"
     );
-    // The state key, recovered from Agora's wrap when it is there
-    let recovered_key = if keys.signing(id).is_some() && keys.state_key_file(id)?.is_none() {
-        super::keys::recover_state_key(keys, &agent_dir, api, id)
-            .await?
-            .is_some()
-    } else {
-        false
-    };
-    // The keys live in the secrets tree, apart from the state: without
-    // them nothing sealed can be opened or verified
-    let (Some(k), Some(trusted)) = (keys.seal_keys(id), keys.trusted(id).ok().flatten()) else {
-        anyhow::bail!(
-            "no keys for agent {id} in the secrets directory: its backups on Agora can't be \
-             opened or checked without them, so there is nothing this runner can restore"
-        );
-    };
     let state_path = agent_dir.join("state.json");
     // A restore cut between FsStorage's archive and its rename leaves the
     // new state as state.json.tmp and the found one archived: found
@@ -481,36 +679,44 @@ pub async fn restore_with(
     );
     let had_head = seal.head().await?.is_some();
     let refused = seal.is_refused().await?;
-    if !(refused || !std::fs::exists(&state_path)? || !had_head || !seal.is_enrolled().await?)
-        && !from_cut_save
-    {
-        let cut = match seal.head().await? {
-            Some(h) => cut_saves(
-                &agent_dir,
-                h.created_at,
-                h.plaintext_sha256.as_ref(),
-                None,
-                std::time::SystemTime::now(),
-            ),
-            None => Vec::new(),
-        };
+    let cut_hint = async || -> anyhow::Result<String> {
+        Ok(
+            match cut_saves(&seal).await?.0.into_iter().find(|c| !c.in_place) {
+                Some(c) => format!(
+                    " A save that was interrupted is beside it: {} (the sealed version prepared \
+                 at seq {} records it). `sealed-restore --agent {id} --from-cut-save --note \
+                 \"…\"` puts it in place",
+                    c.path.display(),
+                    c.item.entry.entry.seq
+                ),
+                None => String::new(),
+            },
+        )
+    };
+    if !(refused || !std::fs::exists(&state_path)? || !had_head || !seal.is_enrolled().await?) {
         anyhow::bail!(
             "agent {id} is not refused and its state and sealed head are here: the start check \
              finds it intact or holds it, and this won't overwrite it (a deliberate change is \
-             `sealed-accept --note`){}",
-            match cut.first() {
-                Some(c) => format!(
-                    ". A save cut short is beside it, newer than its sealed head: {} (written \
-                     {}); `sealed-restore --agent {id} --from-cut-save` puts it back",
-                    c.path.display(),
-                    c.at.format("%Y-%m-%d %H:%M:%S UTC")
-                ),
-                None => String::new(),
-            }
+             `sealed-accept --note`).{}",
+            cut_hint().await?
         );
     }
     // Made if the directory is gone; no session in progress
     let lock = super::session::take(state_dir, id, true).await?;
+    // The state key, recovered from Agora's wrap when it is there: under
+    // the lock, after the guards
+    let recovered_key = if keys.state_key_file(id)?.is_none() {
+        super::keys::recover_state_key(keys, &agent_dir, api, id)
+            .await?
+            .is_some()
+    } else {
+        false
+    };
+    // The keys live in the secrets tree, apart from the state: without
+    // them nothing sealed can be opened or verified
+    let (Some(k), Some(trusted)) = (keys.seal_keys(id), keys.trusted(id).ok().flatten()) else {
+        return Err(no_keys());
+    };
     let reason = if refused {
         Refusal::from_marker(
             &std::fs::read_to_string(seal.dir().join("refused")).unwrap_or_default(),
@@ -536,7 +742,12 @@ pub async fn restore_with(
             );
         }
     } else if !reach.on_agora() {
-        // Nothing on Agora: from the agent's own chain here
+        // Nothing on Agora: from the agent's own chain here, never over a
+        // state the start check hasn't judged (not refused) that is newer,
+        // unless told
+        if std::fs::exists(&state_path)? && !discard_local && !refused {
+            local_is_newest(&seal, state_dir, id).await?;
+        }
         adopt_local(&seal, &lock, &trusted, &k, None).await?;
         tracing::warn!(
             event_type = "sealed_state_head_adopted",
@@ -597,52 +808,18 @@ pub async fn restore_with(
         got == expected,
         "the opened version hashes to {got}, not head.json's {expected}: not restoring it"
     );
-    // A save cut short, newer than the head: offered, never passed over
-    let current = {
-        use agora_agentkit::reactor::Storage as _;
-        FsStorage::new(state_dir)
-            .load_raw(id)
-            .await
-            .ok()
-            .and_then(|l| as_reloaded(&l.value).ok())
-            .map(|v| plaintext_hash(&v))
-    };
-    let mut cut = cut_saves(
-        &agent_dir,
-        last.head.created_at,
-        Some(&expected),
-        current.as_ref(),
-        std::time::SystemTime::now(),
+    // A save that was interrupted after the head: offered, never rolled
+    // back in silence
+    let hint = cut_hint().await?;
+    anyhow::ensure!(
+        hint.is_empty(),
+        "agent {id}: restoring its sealed head (seq {}) would roll back a save made after it.{} \
+         instead (the state here is archived). Nothing was written",
+        last.head.head.seq,
+        hint
     );
-    let cut = if from_cut_save {
-        Some(cut.drain(..).next().with_context(|| {
-            format!(
-                "--from-cut-save: no save cut short is here for agent {id} (a complete, \
-                 settled state.json.tmp or a state.json.tmp.<utc>.aside newer than its sealed \
-                 head). Nothing was written"
-            )
-        })?)
-    } else if let Some(c) = cut.first() {
-        anyhow::bail!(
-            "agent {id} has a save cut short beside its state, newer than its sealed head \
-             (seq {}): {} (written {}). Restoring the head would roll that save back. \
-             `sealed-restore --agent {id} --from-cut-save` puts it back instead (the state here \
-             is archived); nothing was written",
-            last.head.head.seq,
-            c.path.display(),
-            c.at.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-    } else {
-        None
-    };
-    let (state, from) = match &cut {
-        Some(c) => (c.state.clone(), c.at),
-        None => (
-            state,
-            DateTime::from_timestamp_micros(last.snapshot.entry.state_at)
-                .context("the version's date is out of range")?,
-        ),
-    };
+    let from = DateTime::from_timestamp_micros(last.snapshot.entry.state_at)
+        .context("the version's date is out of range")?;
     // A stop the agent asked for outlives its sealed/: put back before
     // anything marks it enrolled, so it stays stopped (nothing sealed)
     let stopped = super::stop::reconcile(&agent_dir, keys, id)
@@ -668,7 +845,7 @@ pub async fn restore_with(
     if std::fs::exists(&tmp)? {
         let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
         // Not `*.json`: the enrolment's archive listing would take it. Named
-        // as restore's own, so a rerun doesn't offer it as a cut save
+        // as restore's own
         std::fs::rename(
             &tmp,
             agent_dir.join(format!("state.json.tmp.{at}{RESTORE_ASIDE}")),
@@ -682,35 +859,6 @@ pub async fn restore_with(
         .await
         .context("writing the restored state")?;
     super::crash::point("restore:written")?;
-    if let Some(c) = &cut {
-        // Sealed, so the next start finds it intact: the prepared save it
-        // was, committed, or sealed on the head as the operator's choice.
-        // A refusal blocks every seal: cleared first (a cut here leaves a
-        // state the next start refuses again, and a rerun)
-        if seal.is_refused().await? {
-            seal.clear_refusal().await.context("clearing the refusal")?;
-        }
-        let committed = matches!(
-            seal.recover_locked(&lock, Some(&c.hash)).await?,
-            agora_agentkit::state::storage::Recovery::Intact(_)
-                | agora_agentkit::state::storage::Recovery::Committed(_)
-        );
-        if !committed {
-            let head = super::session::append(
-                &seal,
-                &lock,
-                &k,
-                &agora_agentkit::state::codec::KeyframePolicy::default(),
-                agora_agentkit::enums::StateEntryKind::Snapshot,
-                &c.state,
-                c.at,
-            )
-            .await
-            .context("sealing the save cut short on the head")?;
-            super::enroll::record_sizes(&agent_dir, head, Utc::now(), &c.state);
-        }
-        super::crash::point("restore:cut_sealed")?;
-    }
     // sealed/published, lost with sealed/: always back. Agora holds the
     // agent's choice now, and the agent may have changed it with `config`
     // since the runner's one publish (agentkit 0.151): a profile without an
@@ -732,10 +880,7 @@ pub async fn restore_with(
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
     drop(lock);
-    let head = match &cut {
-        Some(_) => seal.head().await?.context("head.json vanished")?.head,
-        None => last.head.head,
-    };
+    let head = last.head.head;
     tracing::warn!(
         event_type = "sealed_state_restored",
         agent_id = %id,
@@ -743,7 +888,6 @@ pub async fn restore_with(
         refused,
         found,
         stopped,
-        from_cut_save = cut.is_some(),
         recovered_key,
         rebuilt_head = !had_head,
         head = %head.entry_hash,
@@ -757,7 +901,7 @@ pub async fn restore_with(
         from,
         rebuilt_head: !had_head,
         stopped,
-        cut_save: cut.map(|c| c.path.display().to_string()),
+        cut_save: None,
         recovered_key,
     })
 }
@@ -1428,26 +1572,62 @@ mod tests {
         assert!(api.calls.lock().unwrap().is_empty());
     }
 
-    /// A save cut short, set aside by the next write, newer than the head:
-    /// never passed over. The restore refuses, naming it and the flag;
-    /// `--from-cut-save` puts it back, sealed, and the next start is clean.
+    /// A save cut short as agentkit leaves one: its item prepared (a
+    /// `.tmp` following the head, recording the new state's hash), the
+    /// local write cut after the tmp, then set aside by the next write.
+    async fn cut_save(root: &Path, id: AgentId, keys: &KeyStore, dir: &Path) -> serde_json::Value {
+        use agora_agentkit::enums::StateEntryKind;
+        use agora_agentkit::state::codec::KeyframePolicy;
+        use agora_agentkit::state::storage::Append;
+        // A whole agent state: a cut save must load as one
+        let newer = as_reloaded(
+            &serde_json::to_value(crate::agent_selection_tests::pooled("tarn").1).unwrap(),
+        )
+        .unwrap();
+        let seal = AgentSeal::new(dir, id);
+        let lock = seal.lock().await.unwrap();
+        let head = seal.head().await.unwrap().unwrap().head;
+        let plaintext = agora_agentkit::state::codec::plaintext(&newer);
+        seal.prepare(
+            &lock,
+            &keys.seal_keys(id).unwrap(),
+            &KeyframePolicy::default(),
+            Append {
+                kind: StateEntryKind::Snapshot,
+                plaintext: &plaintext,
+                plaintext_sha256: Some(plaintext_hash(&newer)),
+                state_at: Utc::now(),
+                parent: Some(head),
+            },
+        )
+        .await
+        .unwrap();
+        let aside = dir.join("state.json.tmp.20261111T120000000Z.aside");
+        std::fs::write(&aside, envelope(root, id, newer.clone()).await).unwrap();
+        newer
+    }
+
+    /// A save that was interrupted is never passed over: the restore
+    /// refuses, naming it; `--from-cut-save --note` puts it in place,
+    /// sealed (its prepared item committed), and says so in true words.
     #[tokio::test]
     async fn a_cut_save_is_offered_not_silently_rolled_back() {
         for refused in [true, false] {
             let root = crate::sealed::TestDir::new("restore-cut-save");
             let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+            let newer = cut_save(&root, id, &keys, &dir).await;
             if refused {
                 wipe_and_refuse(&root, id, &keys, &dir).await;
             }
-            let newer = check::tests::state(42);
             let aside = dir.join("state.json.tmp.20261111T120000000Z.aside");
-            std::fs::write(&aside, envelope(&root, id, newer.clone()).await).unwrap();
             let before = std::fs::read(dir.join("state.json")).unwrap();
             let api = crate::sealed::api::fake::guarded(&root);
-            let e = restore(&root.join("state"), &keys, &api, id, None, false)
-                .await
-                .unwrap_err()
-                .to_string();
+            let e = format!(
+                "{:#}",
+                restore(&root.join("state"), &keys, &api, id, None, false)
+                    .await
+                    .unwrap_err()
+            );
             assert!(
                 e.contains(&aside.display().to_string()) && e.contains("--from-cut-save"),
                 "refused {refused}: {e}"
@@ -1457,18 +1637,20 @@ mod tests {
                 before,
                 "untouched"
             );
-            let done = restore_with(
-                &root.join("state"),
-                &keys,
-                &api,
-                id,
-                Options {
-                    from_cut_save: true,
-                    ..Options::default()
-                },
-            )
-            .await
-            .unwrap();
+            let opts = |note| Options {
+                note,
+                from_cut_save: true,
+                ..Options::default()
+            };
+            assert!(
+                restore_with(&root.join("state"), &keys, &api, id, opts(None))
+                    .await
+                    .is_err(),
+                "a note"
+            );
+            let done = restore_with(&root.join("state"), &keys, &api, id, opts(Some("a crash")))
+                .await
+                .unwrap();
             assert_eq!(done.cut_save, Some(aside.display().to_string()));
             assert_eq!(local(&root, id).await, plaintext_hash(&newer));
             let seal = AgentSeal::new(&dir, id);
@@ -1476,50 +1658,129 @@ mod tests {
             assert_eq!(
                 seal.head().await.unwrap().unwrap().plaintext_sha256,
                 Some(plaintext_hash(&newer)),
-                "sealed on the head"
+                "sealed: the prepared item committed"
             );
             assert!(std::fs::exists(&aside).unwrap(), "kept");
+            let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+            assert!(
+                line.contains("was interrupted before it finished")
+                    && line.contains("put that saved state in place")
+                    && line.contains("Your operator's note: a crash")
+                    && !line.contains("sealed version of"),
+                "{line}"
+            );
             assert!(api.calls.lock().unwrap().is_empty());
         }
     }
 
-    /// A complete tmp counts once settled, and only when newer than the
-    /// head and not its state; something that isn't an envelope never.
+    /// A file named like a cut save with no prepared item behind it (here
+    /// `{}`, on an intact uploader) is not one: never written, never
+    /// sealed, named and left as it is.
     #[tokio::test]
-    async fn only_a_settled_complete_newer_tmp_is_a_cut_save() {
-        let root = crate::sealed::TestDir::new("restore-cut-tmp");
-        let (id, _keys, dir) = check::tests::enrolled_local(&root).await;
+    async fn a_file_without_evidence_is_not_a_cut_save() {
+        let root = crate::sealed::TestDir::new("restore-cut-fake");
+        let (id, keys, dir) = enrolled(&root).await;
+        let fake = dir.join("state.json.tmp.20200101T000000000Z.aside");
+        std::fs::write(&fake, b"{\"format\": 3, \"state\": {}}").unwrap();
+        let before = std::fs::read(dir.join("state.json")).unwrap();
         let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap();
-        let tmp = dir.join("state.json.tmp");
-        std::fs::write(&tmp, envelope(&root, id, check::tests::state(7)).await).unwrap();
-        let now = std::time::SystemTime::now();
-        let later = now + crate::promote::SETTLED + std::time::Duration::from_secs(1);
-        let found = |at| {
-            cut_saves(
-                &dir,
-                head.created_at,
-                head.plaintext_sha256.as_ref(),
-                None,
-                at,
+        let e = format!(
+            "{:#}",
+            restore_with(
+                &root.join("state"),
+                &keys,
+                &FakeApi::new(),
+                id,
+                Options {
+                    note: Some("n"),
+                    from_cut_save: true,
+                    ..Options::default()
+                },
             )
-            .len()
-        };
-        assert_eq!(found(now), 0, "not settled");
-        assert_eq!(found(later), 1);
-        // The head's own state: not a cut save
-        std::fs::write(&tmp, envelope(&root, id, check::tests::state(1)).await).unwrap();
-        assert_eq!(found(later), 0);
-        // Not a whole envelope
-        std::fs::write(&tmp, b"{\"format\": 3, \"sta").unwrap();
-        assert_eq!(found(later), 0);
-        // Older than the head
-        std::fs::write(&tmp, envelope(&root, id, check::tests::state(7)).await).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&tmp)
-            .unwrap()
-            .set_modified(now - std::time::Duration::from_secs(3600))
+            .await
+            .unwrap_err()
+        );
+        assert!(
+            e.contains("Not one, left as they are") && e.contains(&fake.display().to_string()),
+            "{e}"
+        );
+        assert_eq!(std::fs::read(dir.join("state.json")).unwrap(), before);
+        assert_eq!(
+            AgentSeal::new(&dir, id).head().await.unwrap().unwrap(),
+            head
+        );
+        assert!(Notice::load(&dir).unwrap().is_none());
+        // And the plain restore doesn't offer it
+        let e = restore(&root.join("state"), &keys, &FakeApi::new(), id, None, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("--from-cut-save"), "{e}");
+    }
+
+    /// Cut after each step of `--from-cut-save`: the rerun finishes, with
+    /// the save sealed once (an in-place save recognised and sealed).
+    #[tokio::test]
+    async fn a_cut_from_cut_save_finishes_on_rerun() {
+        for point in ["restore:noticed", "restore:written"] {
+            let root = crate::sealed::TestDir::new("restore-cut-crash");
+            let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+            let newer = cut_save(&root, id, &keys, &dir).await;
+            wipe_and_refuse(&root, id, &keys, &dir).await;
+            let api = crate::sealed::api::fake::guarded(&root);
+            let opts = Options {
+                note: Some("a crash"),
+                from_cut_save: true,
+                ..Options::default()
+            };
+            crate::sealed::crash::at(point);
+            assert!(
+                restore_with(&root.join("state"), &keys, &api, id, opts)
+                    .await
+                    .is_err()
+            );
+            restore_with(&root.join("state"), &keys, &api, id, opts)
+                .await
+                .unwrap_or_else(|e| panic!("{point}: {e:#}"));
+            assert_eq!(local(&root, id).await, plaintext_hash(&newer), "{point}");
+            let seal = AgentSeal::new(&dir, id);
+            assert_eq!(
+                seal.head().await.unwrap().unwrap().plaintext_sha256,
+                Some(plaintext_hash(&newer)),
+                "{point}"
+            );
+            let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+            assert!(line.starts_with("Your session on "), "{point}: {line}");
+        }
+    }
+
+    /// Never uploaded, not refused, its head.json lost, and a state here
+    /// newer than its newest sealed version: never replaced without
+    /// `--discard-local`.
+    #[tokio::test]
+    async fn a_lost_local_head_never_rolls_back_a_newer_state() {
+        let root = crate::sealed::TestDir::new("restore-local-newer");
+        let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+        FsStorage::new(root.join("state"))
+            .save_sealed_raw(id, check::tests::state(9))
+            .await
             .unwrap();
-        assert_eq!(found(later), 0);
+        let newer = local(&root, id).await;
+        std::fs::rename(dir.join("sealed/head.json"), root.join("head.lost")).unwrap();
+        let api = crate::sealed::api::fake::guarded(&root);
+        let e = restore(&root.join("state"), &keys, &api, id, None, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("sealed-accept") && e.contains("--discard-local"),
+            "{e}"
+        );
+        assert_eq!(local(&root, id).await, newer, "untouched");
+        assert!(AgentSeal::new(&dir, id).head().await.unwrap().is_none());
+        restore(&root.join("state"), &keys, &api, id, None, true)
+            .await
+            .unwrap();
+        assert_ne!(local(&root, id).await, newer);
     }
 }

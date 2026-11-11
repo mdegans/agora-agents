@@ -905,50 +905,53 @@ pub async fn recover_state_key(
         .await
         .map_err(anyhow::Error::msg)
         .context("reading the agent's state key records on Agora")?;
-    let mut best: Option<(u32, u32, StateKey)> = None;
+    // Every record that verifies and opens, the newest first
+    let mut candidates: Vec<(u32, u32, StateKey)> = Vec::new();
     for r in &records {
         if r.agent_id != id || !signers.iter().any(|k| r.verify(k)) {
             continue;
         }
-        let Some(key) = secrets.iter().find_map(|s| StateKey::unwrap(r, s).ok()) else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(g, w, _)| (r.key_gen, r.wrap_seq) > (*g, *w))
-        {
-            best = Some((r.key_gen, r.wrap_seq, key));
+        if let Some(key) = secrets.iter().find_map(|s| StateKey::unwrap(r, s).ok()) {
+            candidates.push((r.key_gen, r.wrap_seq, key));
         }
     }
-    let (key_gen, wrap_seq, state_key) = best.with_context(|| {
-        format!(
-            "Agora holds {} state key record(s) for agent {id}, and none is signed by a key this \
-             runner trusts and opens with its X25519 key: nothing written",
-            records.len()
-        )
-    })?;
-    // The key the agent's chain here is sealed with, if its head is here
+    candidates.sort_by_key(|(g, w, _)| std::cmp::Reverse((*g, *w)));
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "Agora holds {} state key record(s) for agent {id}, and none is signed by a key this \
+         runner trusts and opens with its X25519 key: nothing written",
+        records.len()
+    );
+    // The key the agent's chain here is sealed with, if its head is here:
+    // the newest that opens it
     let seal = agora_agentkit::state::storage::AgentSeal::new(agent_dir, id);
-    if let Ok(Some(head)) = seal.head().await
-        && let Some(kf) = head.keyframe
-    {
-        anyhow::ensure!(
-            kf.entry.key_gen == key_gen,
-            "the newest state key record on Agora is generation {key_gen}, and the agent's \
-             sealed head here is sealed under generation {}: nothing written",
-            kf.entry.key_gen
-        );
-        if let Some(sha) = kf.blob_sha256()
-            && let Ok(sealed) = seal.read_blob(&sha).await
-        {
-            agora_agentkit::state::crypto::open_entry_blob(&state_key, &kf.entry, &sealed)
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context(
-                    "the state key unwrapped from Agora doesn't open the agent's sealed head \
-                     here: nothing written",
-                )?;
+    let keyframe = match seal.head().await {
+        Ok(Some(head)) => head.keyframe,
+        _ => None,
+    };
+    let sealed = match keyframe.as_ref().and_then(|kf| kf.blob_sha256()) {
+        Some(sha) => seal.read_blob(&sha).await.ok(),
+        None => None,
+    };
+    let opens = |key_gen: u32, key: &StateKey| match &keyframe {
+        None => true,
+        Some(kf) => {
+            kf.entry.key_gen == key_gen
+                && sealed.as_ref().is_none_or(|b| {
+                    agora_agentkit::state::crypto::open_entry_blob(key, &kf.entry, b).is_ok()
+                })
         }
-    }
+    };
+    let n = candidates.len();
+    let (key_gen, wrap_seq, state_key) = candidates
+        .into_iter()
+        .find(|(g, _, k)| opens(*g, k))
+        .with_context(|| {
+            format!(
+                "none of the {n} state key record(s) on Agora that verify opens agent {id}'s \
+                 sealed head here: nothing written"
+            )
+        })?;
     let written = keys.create_state_key(id, &StateKeyFile::new(&state_key, key_gen, wrap_seq))?;
     if written {
         tracing::warn!(
@@ -1579,10 +1582,16 @@ mod tests {
         let forged = StateKey::generate()
             .wrap(id, 0, 5, &public, &stranger)
             .unwrap();
-        api.keys
-            .lock()
-            .unwrap()
-            .extend([key.wrap(id, 0, 0, &public, &signing).unwrap(), forged]);
+        // And a newer, trusted record of a key that doesn't open the head
+        // here: passed over for the next that does
+        let wrong = StateKey::generate()
+            .wrap(id, 0, 7, &public, &signing)
+            .unwrap();
+        api.keys.lock().unwrap().extend([
+            key.wrap(id, 0, 0, &public, &signing).unwrap(),
+            forged,
+            wrong,
+        ]);
         // Present: nothing asked, nothing written
         assert_eq!(
             recover_state_key(&keys, &dir, &api, id).await.unwrap(),
@@ -1609,9 +1618,15 @@ mod tests {
                 .expose(),
             key.expose()
         );
-        // Only forged records: nothing written
+        // Only a forged record and one that doesn't open: nothing written
         std::fs::rename(keys.agent_dir(id).join(STATE_KEY_FILE), root.join("again")).unwrap();
         api.keys.lock().unwrap().remove(0);
+        let e = recover_state_key(&keys, &dir, &api, id)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("opens agent"), "{e}");
+        api.keys.lock().unwrap().pop();
         let e = recover_state_key(&keys, &dir, &api, id)
             .await
             .unwrap_err()
