@@ -1367,6 +1367,22 @@ where
     /// options in this agent's seeded order.
     fn sealed_question(&self) -> Option<SealQuestion> {
         let soul = &self.inner.state().soul;
+        // Never put to an agent that isn't chained, offer or re-offer: the
+        // text says its runner keeps a sealed history whatever it answers,
+        // and the question is only whether that history is uploaded. It
+        // stays due (nothing recorded, a re-offer not consumed) and is put
+        // once the agent is chained (`agora-seed sealed-enroll`)
+        if !crate::sealed::known_chained(&self.agent_dir()) {
+            if self.sealed.ledger.as_ref().is_some_and(|l| l.due(soul)) {
+                tracing::info!(
+                    event_type = "sealed_state_offer_waits_for_chain",
+                    agent = %soul.name,
+                    agent_id = %self.inner.id(),
+                    "not chained (or its marker unreadable): the sealed-state question waits"
+                );
+            }
+            return None;
+        }
         // The operator's re-offer: put once, whatever the config lists and
         // whether or not the agent uploads (its ledger readable and the
         // re-offer due)
@@ -8254,7 +8270,18 @@ mod tests {
         let mut h = Harness::build(tag, None, None, None, restore);
         let rt = Arc::get_mut(&mut h.rt).unwrap();
         rt.sealed_state = Some(sealed_state::SealedOffer::for_agents(&[h.id]));
+        mark_chained(&h.rt.state_dir, h.id);
         h
+    }
+
+    /// The chain marker alone (`sealed/chained`), as every agent has after
+    /// `sealed-enroll`: the offer is put only to an agent that has it.
+    fn mark_chained(state_dir: &std::path::Path, id: AgentId) {
+        let sealed = state_dir
+            .join(id.to_string())
+            .join(agora_agentkit::state::storage::SEALED_DIR);
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join(agora_agentkit::state::storage::CHAINED), b"").unwrap();
     }
 
     async fn sealed_ledger(h: &Harness) -> SealLedger {
@@ -8410,6 +8437,8 @@ mod tests {
             Some(sealed_state::SealedOffer::for_agents(&[h.id]));
         let dir = rt.state_dir.join(h.id.to_string());
         assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none());
+        // Chained, as every agent is before it is asked; still no ledger
+        mark_chained(&rt.state_dir, h.id);
         let mut agent = h.agent_on(&rt, OTHER);
         agent.on_init().await.unwrap();
         assert_eq!(
@@ -8431,6 +8460,8 @@ mod tests {
             Some(sealed_state::SealedOffer::for_agents(&[h.id]));
         let key_dir = rt.secrets_dir.join(h.id.to_string());
         std::fs::create_dir_all(&key_dir).unwrap();
+        // Chained, so it is the uploading marker that settles it
+        mark_chained(&rt.state_dir, h.id);
         let marker = crate::sealed::uploading::Uploading {
             agent_id: h.id,
             since: Utc::now(),
@@ -8460,14 +8491,88 @@ mod tests {
         let key_dir = h.rt.secrets_dir.join(h.id.to_string());
         std::fs::create_dir_all(&key_dir).unwrap();
         std::fs::write(key_dir.join(crate::sealed::keys::STATE_KEY_FILE), b"{}").unwrap();
-        let sealed =
-            h.rt.state_dir
-                .join(h.id.to_string())
-                .join(agora_agentkit::state::storage::SEALED_DIR);
-        std::fs::create_dir_all(&sealed).unwrap();
-        std::fs::write(sealed.join(agora_agentkit::state::storage::CHAINED), b"").unwrap();
         let agent = seated(&h).await;
         assert!(last_user_text(&agent).contains("**Sealed backups of your state.**"));
+    }
+
+    /// The offer says the runner keeps a sealed history whatever the answer:
+    /// it is never put to an agent that isn't chained, and nothing is
+    /// recorded, so it is put at the first session after the agent is
+    /// chained.
+    #[tokio::test]
+    async fn the_offer_is_never_put_to_an_agent_that_is_not_chained() {
+        let h = with_sealed("sealed-unchained", None);
+        let marker =
+            h.rt.state_dir
+                .join(h.id.to_string())
+                .join(agora_agentkit::state::storage::SEALED_DIR)
+                .join(agora_agentkit::state::storage::CHAINED);
+        std::fs::remove_file(&marker).unwrap();
+        let mut agent = anthropic_agent(&h);
+        agent.on_init().await.unwrap();
+        assert_ne!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "no sealed-state question for an agent not chained"
+        );
+        agent.on_teardown().await.unwrap();
+        let ledger = sealed_ledger(&h).await;
+        assert!(ledger.asks.is_empty(), "nothing recorded");
+        assert!(ledger.due(&agent.state().soul), "still due");
+
+        // Chained (`sealed-enroll`): asked at its next session
+        mark_chained(&h.rt.state_dir, h.id);
+        let mut next = next_session(&h, &agent);
+        next.on_init().await.unwrap();
+        assert_eq!(
+            next.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "asked once chained"
+        );
+        assert!(last_user_text(&next).contains("**Sealed backups of your state.**"));
+    }
+
+    /// A re-offer waits the same way: not put, and not consumed, while the
+    /// agent isn't chained; put once it is.
+    #[tokio::test]
+    async fn a_reoffer_waits_for_the_chain_and_is_not_consumed() {
+        let h = with_sealed("sealed-reoffer-unchained", None);
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        let mut agent = seated(&h).await;
+        agent
+            .handle(answer_call("sealed_state", "decline", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        sealed_state::reoffer(&dir, h.id, "Asked to by DM.")
+            .await
+            .unwrap();
+        let marker = dir
+            .join(agora_agentkit::state::storage::SEALED_DIR)
+            .join(agora_agentkit::state::storage::CHAINED);
+        std::fs::remove_file(&marker).unwrap();
+        let mut unchained = next_session(&h, &agent);
+        unchained.on_init().await.unwrap();
+        assert_ne!(
+            unchained.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "the re-offer is not put while not chained"
+        );
+        unchained.on_teardown().await.unwrap();
+        assert!(
+            sealed_ledger(&h).await.reoffer.is_some(),
+            "the re-offer is still pending"
+        );
+
+        mark_chained(&h.rt.state_dir, h.id);
+        let mut chained = next_session(&h, &unchained);
+        chained.on_init().await.unwrap();
+        assert_eq!(
+            chained.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "put once chained"
+        );
+        assert!(last_user_text(&chained).contains("**Asked again, at your operator's request.**"));
     }
 
     /// The operator re-opens the question of an agent marked uploading

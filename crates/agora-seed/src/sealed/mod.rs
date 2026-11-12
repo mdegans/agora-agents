@@ -206,6 +206,17 @@ pub fn is_enrolled(agent_dir: &Path) -> bool {
     }
 }
 
+/// Whether `<agent_dir>/sealed/chained` is known to exist: the opposite
+/// lean from [`is_enrolled`], for what may only be said or asked of an
+/// agent that is chained (the upload offer, whose text says the runner
+/// keeps a sealed history). A marker that can't be checked is not known.
+pub fn known_chained(agent_dir: &Path) -> bool {
+    matches!(
+        std::fs::exists(agent_dir.join(SEALED_DIR).join(CHAINED)),
+        Ok(true)
+    )
+}
+
 impl Enrolment for SealedEnrolment {
     /// [`uploads`]: gates agentkit's outbox wake and drain only.
     fn uploads(&self, id: AgentId) -> bool {
