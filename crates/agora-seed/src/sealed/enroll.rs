@@ -539,6 +539,56 @@ fn mtime(path: &Path) -> std::io::Result<DateTime<Utc>> {
     Ok(DateTime::<Utc>::from(std::fs::metadata(path)?.modified()?))
 }
 
+/// `sealed/chain_began.json`: the head the enrolment that began the chain
+/// left, written once, after the chain marker. The versions on the main
+/// line up to it were sealed by the enrolment (from the archives and the
+/// state as found), not by a save since: a change between two of them
+/// predates the chain ([`predates_chain`]). Hashes and a date only.
+const CHAIN_BEGAN: &str = "chain_began.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainBegan {
+    pub head: HeadRef,
+    pub at: DateTime<Utc>,
+}
+
+fn chain_began_path(agent_dir: &Path) -> PathBuf {
+    agent_dir
+        .join(agora_agentkit::state::storage::SEALED_DIR)
+        .join(CHAIN_BEGAN)
+}
+
+/// The record of the enrolment that began the chain, if it can be read. A
+/// chain without one (begun before the record existed, or its write
+/// failed) has none of its versions taken as the enrolment's.
+pub fn chain_began(agent_dir: &Path) -> Option<ChainBegan> {
+    serde_json::from_slice(&std::fs::read(chain_began_path(agent_dir)).ok()?).ok()
+}
+
+/// Whether every one of `versions` was sealed by the enrolment that began
+/// the chain: each on `line` (the main line, genesis first) at or before
+/// the head [`chain_began`] names, which must itself be on it. A line that
+/// no longer runs through that head (a fork resolved, a new genesis) has
+/// none.
+pub fn predates_chain(
+    agent_dir: &Path,
+    line: &[agora_agentkit::state::SignedStateEntry],
+    versions: &[Sha256Hex],
+) -> bool {
+    let Some(began) = chain_began(agent_dir) else {
+        return false;
+    };
+    let Some(pos) = line
+        .iter()
+        .position(|e| e.entry.seq == began.head.seq && e.entry_hash() == began.head.entry_hash)
+    else {
+        return false;
+    };
+    versions
+        .iter()
+        .all(|v| line[..=pos].iter().any(|e| e.entry_hash() == *v))
+}
+
 /// What [`Enroller::opt_in`] did: counts only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OptedIn {
@@ -985,6 +1035,25 @@ impl Enroller {
         let head = self.mark(id).await?;
         if let Ok(marked) = FsStorage::new(&self.state_dir).load_raw(id).await {
             record_sizes(&agent_dir, head, Utc::now(), &marked.value);
+        }
+        // Once: what the enrolment sealed, told from what is saved after
+        if chain_began(&agent_dir).is_none() {
+            let began = ChainBegan {
+                head,
+                at: Utc::now(),
+            };
+            let written = serde_json::to_vec_pretty(&began)
+                .map_err(std::io::Error::from)
+                .and_then(|b| super::write_private(&chain_began_path(&agent_dir), &b));
+            if let Err(e) = written {
+                tracing::warn!(
+                    event_type = "sealed_chain_began_unrecorded",
+                    agent_id = %id,
+                    error = %e,
+                    "the head the enrolment left couldn't be recorded; a shrink between its \
+                     archives is then reported as if it were new"
+                );
+            }
         }
         self.roster(id, head).await;
         report.entries = super::check::local_entries(&seal)

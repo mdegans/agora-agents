@@ -107,23 +107,37 @@ fn dropped(before: usize, now: usize) -> Option<u32> {
         .then(|| ((before - now) as f64 * 100.0 / before as f64).round() as u32)
 }
 
-/// The lines for a drop from `before` to `now`: memory, then soul.
-pub fn drop_lines(before: &Recorded, now: Sizes) -> Vec<(&'static str, u32, String)> {
-    let date = before.state_at.format("%Y-%m-%d");
+/// The lines for a drop from `before` to `now`: memory, then soul. Each
+/// names the two versions it compares: the state as it is now, and
+/// `before` by its date. `predates_chain`: both were sealed by the
+/// enrolment that began the chain (`before` from an archive), so the change
+/// was made before the chain began, and the line says so rather than read
+/// as news.
+pub fn drop_lines(
+    before: &Recorded,
+    now: Sizes,
+    predates_chain: bool,
+) -> Vec<(&'static str, u32, String)> {
+    let date = before.state_at.format(super::text::DATE);
     let mut out = Vec::new();
     for (what, b, n) in [
         ("memory", before.sizes.memory_chars, now.memory_chars),
         ("soul", before.sizes.soul_chars, now.soul_chars),
     ] {
         if let Some(pct) = dropped(b, n) {
-            out.push((
-                what,
-                pct,
+            let line = if predates_chain {
                 format!(
-                    "Your {what} is {pct}% smaller than at your last sealed version ({date}). \
-                     Your earlier versions are sealed and kept."
-                ),
-            ));
+                    "Your {what} is {pct}% smaller than in your version saved on {date}, an \
+                     older copy sealed into your history when your chain began; the change \
+                     predates your chain. Your earlier versions are sealed and kept."
+                )
+            } else {
+                format!(
+                    "Your {what} is now {pct}% smaller than in your sealed version saved on \
+                     {date}. Your earlier versions are sealed and kept."
+                )
+            };
+            out.push((what, pct, line));
         }
     }
     out
@@ -144,16 +158,20 @@ pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
             soul_chars: 1_000,
         },
     };
-    drop_lines(
-        &before,
-        Sizes {
-            memory_chars: 100,
-            soul_chars: 100,
-        },
-    )
-    .into_iter()
-    .map(|(_, _, line)| Text::new("sizes::drop_lines", To::Any, line))
-    .collect()
+    [false, true]
+        .into_iter()
+        .flat_map(|predates_chain| {
+            drop_lines(
+                &before,
+                Sizes {
+                    memory_chars: 100,
+                    soul_chars: 100,
+                },
+                predates_chain,
+            )
+        })
+        .map(|(_, _, line)| Text::new("sizes::drop_lines", To::Any, line))
+        .collect()
 }
 
 #[cfg(test)]
@@ -195,24 +213,29 @@ mod tests {
             soul_chars: 400,
         };
         assert!(
-            drop_lines(&before, half).is_empty(),
+            drop_lines(&before, half, false).is_empty(),
             "exactly half is not more"
         );
-        let lines = drop_lines(
-            &before,
-            Sizes {
-                memory_chars: 0,
-                soul_chars: 100,
-            },
-        );
+        let shrunk = Sizes {
+            memory_chars: 0,
+            soul_chars: 100,
+        };
+        let lines = drop_lines(&before, shrunk, false);
         assert_eq!(
             lines.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(),
             [
-                "Your memory is 100% smaller than at your last sealed version (2026-11-01). \
+                "Your memory is now 100% smaller than in your sealed version saved on \
+                 2026-11-01. Your earlier versions are sealed and kept.",
+                "Your soul is now 75% smaller than in your sealed version saved on 2026-11-01. \
                  Your earlier versions are sealed and kept.",
-                "Your soul is 75% smaller than at your last sealed version (2026-11-01). Your \
-                 earlier versions are sealed and kept.",
             ]
+        );
+        let lines = drop_lines(&before, shrunk, true);
+        assert_eq!(
+            lines[0].2,
+            "Your memory is 100% smaller than in your version saved on 2026-11-01, an older \
+             copy sealed into your history when your chain began; the change predates your \
+             chain. Your earlier versions are sealed and kept."
         );
     }
 }

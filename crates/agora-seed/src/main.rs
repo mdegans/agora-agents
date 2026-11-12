@@ -2681,6 +2681,9 @@ struct StartFound {
     /// Full verifications made, kept in the roster.
     vouches: Vec<(AgentId, sealed::roster::Vouch)>,
     unopenable: Vec<(AgentId, String, sealed::check::Unopenable)>,
+    /// Agents whose shrink is between two versions the enrolment sealed
+    /// (it predates their chain): counted, logged once, not alerted.
+    dropped_before_chain: usize,
 }
 
 impl StartFound {
@@ -2693,6 +2696,15 @@ impl StartFound {
                 agents = self.vouches.len(),
                 error = %e,
                 "the roster's record of full verifications couldn't be written; the next start verifies them in full again"
+            );
+        }
+        if self.dropped_before_chain > 0 {
+            tracing::info!(
+                event_type = "sealed_state_drop_before_chain",
+                agents = self.dropped_before_chain,
+                "agents whose memory or soul is much smaller than in an older version the \
+                 enrolment sealed from their archives: a change made before their chain began, \
+                 not alerted"
             );
         }
         if let Some(alert) = sealed::check::drop_summary(&self.dropped) {
@@ -2838,6 +2850,7 @@ async fn check_agent(
             notice,
             hold,
             drops,
+            drops_before_chain,
             told,
             judged,
         } => {
@@ -2853,7 +2866,11 @@ async fn check_agent(
                 drops = drops.len(),
                 "sealed state checked"
             );
-            if !drops.is_empty() {
+            if !drops.is_empty() && drops_before_chain {
+                // History sealed in bulk by the enrolment, possibly months
+                // old: one summary event for the run, no alert
+                found.dropped_before_chain += 1;
+            } else if !drops.is_empty() {
                 for (what, pct) in &drops {
                     tracing::warn!(
                         event_type = "sealed_state_drop",
@@ -4496,6 +4513,99 @@ mod tests {
         assert!(s.contains("done 1, failed 1, unsaved 1"), "{s}");
         assert!(s.contains(&format!("error {id}: Storage")), "{s}");
         assert!(s.contains(&format!("unsaved {id}: ")), "{s}");
+    }
+
+    /// A shrink the enrolment sealed from the archives (the last archive
+    /// ten times the state it was chained with) is history: at the first
+    /// start no drop alert, and the agent is told it predates its chain,
+    /// with the older version's date. The same shrink in a save after
+    /// chaining is alerted and told as a change since that version.
+    #[tokio::test]
+    async fn a_shrink_from_before_the_chain_is_not_news() {
+        let root = sealed::TestDir::new("main-drop-before-chain");
+        let state_dir = root.join("state");
+        let big = "x".repeat(1000);
+        let small = "y".repeat(100);
+        let (id, keys, dir) =
+            sealed::enroll::tests::agent(&root, &[big.as_str(), small.as_str()]).await;
+        sealed::enroll::tests::enroller(&root, &keys)
+            .chain(id, false)
+            .await
+            .unwrap();
+        assert!(sealed::enroll::chain_began(&dir).is_some());
+        let sent = alerts::testing::Recorder::default();
+        let alerter = alerts::testing::recording(&root, &sent);
+        let api = sealed::api::UploadGuard::new(
+            sealed::api::fake::FakeApi::new(),
+            Arc::new(sealed::SealedEnrolment::with_keys(&state_dir, keys.clone())),
+        );
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let start = async |pool: &mut Vec<(AgentId, SeedState)>| {
+            let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+                .await
+                .unwrap();
+            let run = sealed_start_check(
+                pool,
+                &loaded.sealed,
+                &root,
+                &state_dir,
+                &keys,
+                &api,
+                &alerter,
+                false,
+                &mut Vec::new(),
+                None,
+                None,
+            )
+            .await;
+            alerter.flush(std::time::Duration::from_secs(10)).await;
+            run
+        };
+        let drop_mails = || {
+            sent.sent()
+                .iter()
+                .filter(|m| m.contains("sealed_state_drop"))
+                .count()
+        };
+        let mut pool = vec![(id, tarn)];
+        let run = start(&mut pool).await;
+        assert_eq!(pool.len(), 1, "it runs");
+        assert_eq!(drop_mails(), 0, "no alert for a shrink before the chain");
+        let lines = &run.seats[&id].lines;
+        let told: Vec<&String> = lines.iter().filter(|l| l.contains("smaller")).collect();
+        assert_eq!(told.len(), 1, "{lines:?}");
+        assert!(
+            told[0].starts_with("Your memory is 90% smaller than in your version saved on ")
+                && told[0].contains("the change predates your chain"),
+            "{told:?}"
+        );
+
+        // A session's save since: the same kind of shrink is news
+        let enrolment = Arc::new(sealed::SealedEnrolment::with_keys(&state_dir, keys.clone()));
+        let mut store = agora_agentkit::state::storage::Mirrored::new(
+            FsStorage::new(&state_dir),
+            (),
+            enrolment,
+        );
+        let base = store.load_raw(id).await.unwrap().base;
+        store
+            .save_raw(
+                id,
+                serde_json::json!({ "soul": { "name": "tarn" }, "memory": { "content": "z" } }),
+                base.as_ref(),
+            )
+            .await
+            .unwrap();
+        let run = start(&mut pool).await;
+        assert_eq!(drop_mails(), 1, "alerted");
+        let lines = &run.seats[&id].lines;
+        assert!(
+            lines.iter().any(|l| l.starts_with(
+                "Your memory is now 99% smaller than in your sealed version saved on "
+            )),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("predates")), "{lines:?}");
     }
 
     /// A stopped agent is checked like any enrolled agent (its chain goes

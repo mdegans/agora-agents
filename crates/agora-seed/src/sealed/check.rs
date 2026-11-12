@@ -89,6 +89,10 @@ pub enum Outcome {
         /// A memory or soul that shrank past the threshold: what, by how
         /// many percent ([`super::sizes`]).
         drops: Vec<(&'static str, u32)>,
+        /// `drops` are between two versions the enrolment that began the
+        /// chain sealed ([`super::enroll::predates_chain`]): history, not
+        /// news. Told so, dated, and not alerted per agent.
+        drops_before_chain: bool,
         /// The anchors the verdict told of: marked told once the session
         /// showing it saves ([`super::inclusion::mark_told`]).
         told: Vec<GovernanceLogId>,
@@ -1364,6 +1368,7 @@ async fn with_anchor_hold(
             notice,
             hold: Some(hold @ Hold::Unchecked),
             drops,
+            drops_before_chain,
             told: _,
             judged,
         } if seat.len() == 1 => {
@@ -1374,6 +1379,7 @@ async fn with_anchor_hold(
                 notice,
                 hold: Some(hold),
                 drops,
+                drops_before_chain,
                 told,
                 judged,
             }
@@ -1515,6 +1521,7 @@ async fn check_chain(
         notice: false,
         hold: Some(Hold::Unchecked),
         drops: Vec::new(),
+        drops_before_chain: false,
         told: Vec::new(),
         judged: None,
     };
@@ -1565,6 +1572,7 @@ async fn check_chain(
                 notice: false,
                 hold: None,
                 drops: Vec::new(),
+                drops_before_chain: false,
                 told: Vec::new(),
                 judged: None,
             };
@@ -1814,8 +1822,15 @@ async fn check_chain(
         own_last_session,
         memory: previous_memory,
     });
+    // Both the head and the version it is compared with sealed by the
+    // enrolment (from the archives and the state as found): the change was
+    // made before the chain began. A failed seal's state is a save since
+    let drops_before_chain = seal_failed.is_none()
+        && before.as_ref().is_some_and(|b| {
+            super::enroll::predates_chain(agent_dir, &line, &[b.entry_hash, head.entry_hash])
+        });
     let drops: Vec<(&'static str, String, u32)> = match &before {
-        Some(before) => drop_lines(before, sizes)
+        Some(before) => drop_lines(before, sizes, drops_before_chain)
             .into_iter()
             .map(|(what, pct, text)| (what, text, pct))
             .collect(),
@@ -1875,6 +1890,7 @@ async fn check_chain(
             notice,
             hold,
             drops,
+            drops_before_chain,
             told: Vec::new(),
             judged: None,
         };
@@ -1888,6 +1904,7 @@ async fn check_chain(
             notice,
             hold: Some(Hold::SealFailed),
             drops,
+            drops_before_chain,
             told,
             judged: None,
         };
@@ -1909,6 +1926,7 @@ async fn check_chain(
             notice,
             hold: None,
             drops,
+            drops_before_chain,
             told,
             judged: None,
         };
@@ -2058,6 +2076,7 @@ async fn check_chain(
         notice,
         hold,
         drops,
+        drops_before_chain,
         told,
         judged,
     }
@@ -3845,9 +3864,9 @@ pub(crate) mod tests {
             assert_eq!(hold, None);
             assert_eq!(drops, vec![("memory", 100)], "sidecar {sidecar}");
             assert!(
-                seat.last()
-                    .unwrap()
-                    .starts_with("Your memory is 100% smaller than at your last sealed version ("),
+                seat.last().unwrap().starts_with(
+                    "Your memory is now 100% smaller than in your sealed version saved on "
+                ),
                 "{seat:?}"
             );
         }
