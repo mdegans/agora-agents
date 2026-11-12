@@ -87,6 +87,11 @@ pub struct Entry {
     /// roster step rather than finding "nothing to accept".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending: bool,
+    /// With `pending`: the lowest seq the command will set (the head it
+    /// seals, or adopts). Its rerun finishes only a head at or past it,
+    /// and a head the roster records at or past it ends the pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_at: Option<u64>,
 }
 
 impl Entry {
@@ -97,6 +102,7 @@ impl Entry {
             updated_at: Utc::now(),
             vouched: None,
             pending: false,
+            pending_at: None,
         }
     }
 }
@@ -153,14 +159,19 @@ impl Default for Roster {
 
 impl Roster {
     /// "Higher seq wins": `head` replaces the entry only if it is ahead.
-    /// Whether it did.
+    /// Whether it did. A pending command's step ([`Entry::pending`]) ends
+    /// once a head at or past the one it would set is recorded: what it
+    /// would have finished is done, and a rerun must not set the roster
+    /// to a head found later.
     fn merge(&mut self, id: AgentId, head: HeadRef) -> bool {
         match self.agents.get_mut(&id) {
             Some(e) if e.seq >= head.seq => false,
             Some(e) => {
+                let still = e.pending && e.pending_at.is_some_and(|at| head.seq < at);
                 *e = Entry {
                     vouched: e.vouched,
-                    pending: e.pending,
+                    pending: still,
+                    pending_at: e.pending_at.filter(|_| still),
                     ..Entry::of(head)
                 };
                 true
@@ -808,14 +819,17 @@ pub async fn replace(
 
 /// Before an operator's command clears an agent's refusal on its way to
 /// [`replace`]: the agent's entry, if it has one, is marked
-/// [`Entry::pending`], which only `replace` clears. Nothing is added for an
-/// agent not on the roster (the next start adopts it once chained).
-pub async fn expect(data_dir: &Path, id: AgentId) -> Result<(), RosterError> {
+/// [`Entry::pending`], with `at`, the lowest seq the command will set
+/// ([`Entry::pending_at`]); `replace` clears it, and so does a head at or
+/// past `at` recorded meanwhile ([`Roster::merge`]). Nothing is added for
+/// an agent not on the roster (the next start adopts it once chained).
+pub async fn expect(data_dir: &Path, id: AgentId, at: u64) -> Result<(), RosterError> {
     let _lock = lock(data_dir).await?;
     let (mut roster, _) = load_or_begin(data_dir, &data_dir.join("state"), &[id])?;
     match roster.agents.get_mut(&id) {
-        Some(e) if !e.pending => {
+        Some(e) if !(e.pending && e.pending_at == Some(at)) => {
             e.pending = true;
+            e.pending_at = Some(at);
             save(data_dir, &mut roster)
         }
         _ => Ok(()),
@@ -823,25 +837,25 @@ pub async fn expect(data_dir: &Path, id: AgentId) -> Result<(), RosterError> {
 }
 
 /// [`expect`] for an operator's command, which knows the state directory.
-pub async fn expect_for(state_dir: &Path, id: AgentId) -> anyhow::Result<()> {
+pub async fn expect_for(state_dir: &Path, id: AgentId, at: u64) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let data_dir = state_dir
         .parent()
         .context("the state directory has no parent data directory")?;
-    expect(data_dir, id).await.with_context(|| {
+    expect(data_dir, id, at).await.with_context(|| {
         format!("marking agent {id}'s entry in the sealed roster (nothing was changed)")
     })
 }
 
-/// Whether an operator's command left `id`'s roster step unfinished
-/// ([`expect`] without its [`replace`]). `false` when the roster can't be
+/// `id`'s entry, if an operator's command left its roster step unfinished
+/// ([`expect`] without its [`replace`]). `None` when the roster can't be
 /// read.
-pub fn is_pending(state_dir: &Path, id: AgentId) -> bool {
+pub fn pending(state_dir: &Path, id: AgentId) -> Option<Entry> {
     state_dir
         .parent()
         .and_then(|data_dir| load(data_dir).ok().flatten())
-        .and_then(|r| r.agents.get(&id).map(|e| e.pending))
-        .unwrap_or(false)
+        .and_then(|r| r.agents.get(&id).cloned())
+        .filter(|e| e.pending)
 }
 
 /// [`replace`] for an operator's command, which knows the state directory

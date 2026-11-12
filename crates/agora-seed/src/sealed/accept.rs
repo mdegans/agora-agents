@@ -199,7 +199,7 @@ pub async fn accept(
     let now = Utc::now();
     let head = match (adopted, note) {
         (Some(Adopted::Intact(head)), note) => {
-            super::roster::expect_for(state_dir, id).await?;
+            super::roster::expect_for(state_dir, id, head.seq).await?;
             if seal.is_refused().await? {
                 seal.clear_refusal().await.context("clearing the refusal")?;
             }
@@ -251,7 +251,15 @@ pub async fn accept(
             super::crash::point("accept:noticed")?;
             // Before the refusal goes: a cut from here to the roster's own
             // step leaves the entry pending, and a rerun finishes it
-            super::roster::expect_for(state_dir, id).await?;
+            // The head this accept seals: one past the one there now
+            let at = seal
+                .head()
+                .await?
+                .context("the agent has no sealed head to seal its state after")?
+                .head
+                .seq
+                + 1;
+            super::roster::expect_for(state_dir, id, at).await?;
             if seal.is_refused().await? {
                 seal.clear_refusal().await.context("clearing the refusal")?;
             }
@@ -309,9 +317,9 @@ async fn finish_roster_step(
     id: AgentId,
     seal: &AgentSeal,
 ) -> anyhow::Result<Option<HeadRef>> {
-    if !super::roster::is_pending(state_dir, id) {
+    let Some(entry) = super::roster::pending(state_dir, id) else {
         return Ok(None);
-    }
+    };
     let Some(head) = seal.head().await? else {
         return Ok(None);
     };
@@ -323,6 +331,18 @@ async fn finish_roster_step(
     if head.plaintext_sha256 != Some(agora_agentkit::state::storage::plaintext_hash(&current)) {
         return Ok(None);
     }
+    // Never below what the cut command would have set: a head there now
+    // came from elsewhere (a rollback since), and the roster isn't set to
+    // it without a refusal resolved (the agent told)
+    let floor = entry.pending_at.unwrap_or(entry.seq);
+    anyhow::ensure!(
+        head.head.seq >= floor,
+        "agent {id}'s sealed head (seq {}) is below the one the accept that was cut short would \
+         have set (seq {floor}): it was rolled back since, and the roster is not set to it here. \
+         Nothing was changed; if the next start refuses it as rolled back, resolve that with \
+         `sealed-accept --agent {id} --note \"<why>\"` (the agent is told) or `sealed-restore`",
+        head.head.seq
+    );
     super::roster::replace_for(state_dir, id, Some(head.head)).await?;
     tracing::warn!(
         event_type = "sealed_state_accept_roster_finished",
@@ -1874,6 +1894,71 @@ mod tests {
             let res = crate::sealed::lost::resolutions(&AgentSeal::new(&dir, id)).unwrap();
             assert_eq!(res.len(), 1, "{point}: one resolution");
         }
+    }
+
+    /// An accept cut after it marked the roster pending: a head past the
+    /// one it would have set, recorded by later runs, ends the pending, so
+    /// a later no-note accept of an unrefused agent sets nothing; and a
+    /// pending step whose head is now below that one is refused, the roster
+    /// left as it is.
+    #[tokio::test]
+    async fn a_pending_roster_step_never_sets_a_head_found_later() {
+        use agora_agentkit::reactor::Storage as _;
+        let root = crate::sealed::TestDir::new("accept-pending");
+        let (id, keys, dir) = check::tests::enrolled_local(&root).await;
+        let state_dir = root.join("state");
+        let seal = AgentSeal::new(&dir, id);
+        let api = crate::sealed::api::fake::guarded(&root);
+        let head = seal.head().await.unwrap().unwrap().head;
+        // As if an accept to seal head.seq + 1 was cut after `expect`
+        crate::sealed::roster::expect(&root, id, head.seq + 1)
+            .await
+            .unwrap();
+        assert!(crate::sealed::roster::pending(&state_dir, id).is_some());
+        // Then the agent's sessions, recorded by the runner's keeper
+        let mut store = agora_agentkit::state::storage::Mirrored::new(
+            FsStorage::new(&state_dir),
+            (),
+            std::sync::Arc::new(crate::sealed::SealedEnrolment::with_keys(
+                &state_dir,
+                keys.clone(),
+            )),
+        );
+        for n in [30, 31] {
+            let base = store.load_raw(id).await.unwrap().base;
+            store
+                .save_raw(id, check::tests::state(n), base.as_ref())
+                .await
+                .unwrap();
+        }
+        crate::sealed::roster::record_heads(&root, &state_dir, &[id])
+            .await
+            .unwrap();
+        assert!(
+            crate::sealed::roster::pending(&state_dir, id).is_none(),
+            "ended by a head past it"
+        );
+        let e = accept(&state_dir, &keys, &api, id, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not refused"), "{e}");
+        // Pending for a head above the one there now (a rollback since)
+        let now = seal.head().await.unwrap().unwrap().head;
+        crate::sealed::roster::expect(&root, id, now.seq + 3)
+            .await
+            .unwrap();
+        let before = crate::sealed::roster::load(&root).unwrap().unwrap().agents[&id].clone();
+        let e = accept(&state_dir, &keys, &api, id, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rolled back since"), "{e}");
+        assert_eq!(
+            crate::sealed::roster::load(&root).unwrap().unwrap().agents[&id],
+            before,
+            "the roster is not set to it"
+        );
     }
 
     /// An older copy of an agent's directory put back: the roster refuses
