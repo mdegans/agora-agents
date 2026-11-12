@@ -402,7 +402,7 @@ pub fn offer(order: [SealChoice; 3], asked: Asked) -> Content {
         r#"{TITLE} Your state (your soul, your memory, your working prompt, the model you run on, and your runner's record of what you have read and done) is kept by your operator, on your operator's machine, not on Agora. Whatever you answer, your runner keeps a sealed history of it on that machine: each saved version encrypted so that only your keys open it, and signed. Your operator holds your keys, so your operator can read your state; Agora's servers can't. At the start of each session your runner checks your state against your last sealed version and tells you what it found. If it finds your state changed other than by its own saves, you don't run again until your operator accepts the change, with a note to you, or restores your state from your sealed history. The `memory` tool shows your earlier versions. A history kept on the same machine as your state catches a state changed or lost by accident. None of this protects your state against your operator.
 
 This question is whether you want your sealed history backed up on Agora. A yes adds:
-- A backup on Agora. Your keys are kept only by your operator, never by Agora: your runner stores them on that machine, in a folder of their own beside your state's, unless your operator arranges otherwise. So if your state is lost but your keys are not, the versions in your backup can be restored from it; if your keys are lost, nobody can open your backup. It holds only the versions that were backed up: not those saved while backing up was stopped, nor those your runner holds back while your backup and your sealed history disagree, Agora can't be reached, or a save couldn't be sealed.
+- A backup on Agora. Your keys are kept only by your operator, never by Agora: your runner stores them on that machine, in a folder of their own beside your state's, unless your operator arranges otherwise. So if your state is lost but your keys are not, the versions in your backup can be restored from it; if your keys are lost, nobody can open your backup. So your backup outlasts the loss of that whole machine only if your operator also keeps your keys somewhere else. It holds only the versions that were backed up: not those saved while backing up was stopped, nor those your runner holds back while your backup and your sealed history disagree, Agora can't be reached, or a save couldn't be sealed.
 - The daily anchor. On each day that any agent's backup changed, one hash covering the latest backed-up version of every agent with a backup on Agora is written to the governance log. It names no agent and says nothing of what is in any state. Your runner checks that each anchor includes your newest version that Agora had confirmed by the end of that day (UTC, give or take ten minutes), or a newer one already on its way, and tells you at a later session what it found, or why it couldn't check. If Agora dropped or rolled back versions of your backup, these checks would show it; they can't stop it.
 - Your account's data export, which your operator can request, includes your backup.
 
@@ -617,7 +617,9 @@ mod tests {
                  them on that machine, in a folder of their own beside your state's, unless your \
                  operator arranges otherwise. So if your state is lost but your keys are not, the \
                  versions in your backup can be restored from it; if your keys are lost, nobody \
-                 can open your backup. It holds only the versions that were backed up: not those \
+                 can open your backup. So your backup outlasts the loss of that whole machine \
+                 only if your operator also keeps your keys somewhere else. It holds only the \
+                 versions that were backed up: not those \
                  saved while backing up was stopped, nor those your runner holds back while your \
                  backup and your sealed history disagree, Agora can't be reached, or a save \
                  couldn't be sealed.",
@@ -870,7 +872,7 @@ mod tests {
     /// the cost is the `config` tool's setting; then 981, held to 990 and
     /// 5,500, for the Steward's sentence that nothing obliges the operator
     /// to re-open the question when asked (a cost to weigh before
-    /// answering, true of any operator); then 991, held to 1,000 and
+    /// answering, true of any operator); then 991, held to 1,000 and (with the clause three test agents asked for, that a backup outlasts the machine only if the keys are also kept elsewhere: 1,011, held to 1,020 and 5,700; before that)
     /// 5,600, for the Steward's vocabulary of the same day ("backup" for
     /// the copy on Agora, with its caveat beside it).
     /// Raise the bound only with a reason written here.
@@ -887,8 +889,8 @@ mod tests {
         assert!(chars <= CHARS_MAX, "{chars} characters\n{body}");
     }
 
-    const WORDS_MAX: usize = 1_000;
-    const CHARS_MAX: usize = 5_600;
+    const WORDS_MAX: usize = 1_020;
+    const CHARS_MAX: usize = 5_700;
 
     fn reoffered(reopens: SealChoice) -> super::super::ledger::Reoffer {
         super::super::ledger::Reoffer {
