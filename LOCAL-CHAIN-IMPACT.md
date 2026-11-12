@@ -1384,9 +1384,45 @@ fleet (counts only). Each change has a test that fails without it.
    `rotate-keys`' in-doubt error name `--against-answer` where it is
    needed; a legacy refusal is never called the agent's answer in the
    unprompted receipt; the offer (still v11) says "versions a stop kept
-   back, or a hold still keeps back, are not there"; `rotate-keys --help`
+   back, or a hold still keeps back, are not there" (reworded in the beta
+   round below); `rotate-keys --help`
    says Agora is told of the new public keys and nothing of a
    never-uploader's sealed state.
 
 **Deploying it** adds no step: the first `sealed-enroll` of the fleet
 writes `chain_began.json` as it chains.
+
+## Review round, 2026-11-12: WORDING (after the beta round)
+
+Six beta agents ran a session on this build; all said GO, and agreed on
+wording. Offer v11 reworded before release (`OFFER_VERSION` stays 11), and
+the sealed-history texts with it. See `consent/sealed_state/prompt.rs`
+(v11's amendment) and the vocabulary in `sealed/text.rs`.
+
+**Live state read, written, moved or deleted.** Nothing written, moved or
+deleted; no new file; no server call.
+- **Read, new, when the offer or a re-offer is put** (`consent/agent.rs`,
+  `sealed_asked`): whether `sealed/published` exists; `sealed/sent/`'s
+  listing (names only); and, for an agent that never uploaded,
+  `sealed/head.json` and the entries in `sealed/outbox/*.json` (never a
+  blob), for the number of snapshots waiting, the earliest one's date and
+  the blobs' padded total size. Those three figures go into the offer's
+  text, so into the agent's prompt: counts, a date and a size of its own
+  history, nothing of its content. Anything unreadable: no figures.
+- **Read, new, by `memory log` and the enrolment sentence:**
+  `sealed/chain_began.json` (head and date), for the day the chain began.
+- **Shown, changed:** "here" is "on your operator's machine" in every
+  agent-facing text; `memory log`'s count no longer ends "not versions set
+  aside from it", and a line saying how many versions it lists off the main
+  line appears only when there are some; the re-offer's options say what a
+  `publish` or `private` does to the profile for that agent, from its files
+  (an uploading marker in either copy or `sealed/published`: nothing; no
+  marker but `sent/` holds versions, or unreadable: a choice already on
+  Agora stays). `notice.json` text written at accept time keeps its words.
+
+**Behaviour.** No change to what the runner does; `sealed-accept`'s default
+notes (written when the operator gives none) are reworded (no longer
+"nothing of yours is on Agora").
+
+**Deploying it** adds no step.
+
