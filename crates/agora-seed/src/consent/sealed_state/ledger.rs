@@ -222,11 +222,11 @@ pub enum SealOutcome {
 }
 
 /// How the line telling a first answer back begins; the choice follows.
-pub const ACK: &str = "Your answer on uploading your sealed history to Agora is on file:";
+pub const ACK: &str = "Your answer on backing up your sealed history on Agora is on file:";
 
 /// How the line telling a re-offer's answer back begins.
-pub const ACK_REOFFER: &str = "Your answer to the question your operator re-opened, on uploading \
-     your sealed history to Agora, is on file:";
+pub const ACK_REOFFER: &str = "Your answer to the question your operator re-opened, on backing \
+     up your sealed history on Agora, is on file:";
 
 impl SealLedger {
     /// Whether the offer should be put this session: nothing final on
@@ -409,24 +409,25 @@ impl SealLedger {
                 // No action: a yes found it uploading, a no found it not
                 // (never uploaded, or stopped)
                 format!(
-                    "{ACK_REOFFER} {}. Nothing needed to change: it was already {}.",
+                    "{ACK_REOFFER} {}. Nothing needed to change: your sealed history was already \
+                     {}.",
                     choice.as_str(),
                     if choice == SealChoice::Decline {
-                        "not being uploaded"
+                        "not being backed up"
                     } else {
-                        "being uploaded"
+                        "being backed up"
                     }
                 )
             } else if yes && uploading {
                 format!(
                     "{ACK_REOFFER} {}. Your operator has acted on it: your sealed history is \
-                     being uploaded.",
+                     being backed up.",
                     choice.as_str()
                 )
             } else if !yes && stopped {
                 format!(
-                    "{ACK_REOFFER} decline. Your operator has acted on it: uploads of your sealed \
-                     history are stopped."
+                    "{ACK_REOFFER} decline. Your operator has acted on it: backing up your sealed \
+                     history is stopped."
                 )
             } else {
                 format!(
@@ -438,17 +439,21 @@ impl SealLedger {
         }
         Some(match choice {
             SealChoice::Decline if uploading => format!(
-                "{ACK} decline. It is being uploaded all the same, and an answer doesn't change \
-                 that by itself: your operator has to stop it. {ask}"
+                "{ACK} decline. Your sealed history is being backed up all the same, and an answer \
+                 doesn't change that by itself: your operator has to stop it. {ask}"
             ),
             SealChoice::Decline => format!(
-                "{ACK} decline. It is not being uploaded. If you change your mind, ask your \
-                 operator to re-open the question."
+                "{ACK} decline. Your sealed history is not being backed up. If you change your \
+                 mind, ask your operator to re-open the question."
             ),
-            choice if uploading => format!("{ACK} {}. It is being uploaded.", choice.as_str()),
+            choice if uploading => format!(
+                "{ACK} {}. Your sealed history is being backed up.",
+                choice.as_str()
+            ),
             choice => format!(
-                "{ACK} {}. It is not being uploaded now: uploading starts, or resumes, only \
-                 when your operator acts on your answer, and you are told when it has.",
+                "{ACK} {}. Your sealed history is not being backed up now: backing up starts, or \
+                 resumes, only when your operator acts on your answer, and you are told when it \
+                 has.",
                 choice.as_str()
             ),
         })
@@ -677,14 +682,14 @@ mod tests {
         l.record(ask(answered(SealChoice::Publish)));
         assert_eq!(
             l.ack_line(false, false).unwrap(),
-            "Your answer on uploading your sealed history to Agora is on file: publish. It is \
-             not being uploaded now: uploading starts, or resumes, only when your operator acts \
-             on your answer, and you are told when it has."
+            "Your answer on backing up your sealed history on Agora is on file: publish. Your \
+             sealed history is not being backed up now: backing up starts, or resumes, only when \
+             your operator acts on your answer, and you are told when it has."
         );
         assert_eq!(
             l.ack_line(true, false).unwrap(),
-            "Your answer on uploading your sealed history to Agora is on file: publish. It is \
-             being uploaded."
+            "Your answer on backing up your sealed history on Agora is on file: publish. Your \
+             sealed history is being backed up."
         );
         l.acknowledge();
         assert_eq!(l.ack_line(false, false), None, "once");
@@ -692,9 +697,9 @@ mod tests {
         no.record(ask(answered(SealChoice::Decline)));
         assert_eq!(
             no.ack_line(false, false).unwrap(),
-            "Your answer on uploading your sealed history to Agora is on file: decline. It is \
-             not being uploaded. If you change your mind, ask your operator to re-open the \
-             question."
+            "Your answer on backing up your sealed history on Agora is on file: decline. Your \
+             sealed history is not being backed up. If you change your mind, ask your operator \
+             to re-open the question."
         );
     }
 
@@ -829,9 +834,9 @@ mod tests {
         let told = l.ack_line(true, false).unwrap();
         assert_eq!(
             told,
-            "Your answer to the question your operator re-opened, on uploading your sealed \
-             history to Agora, is on file: publish. Nothing needed to change: it was already \
-             being uploaded."
+            "Your answer to the question your operator re-opened, on backing up your sealed \
+             history on Agora, is on file: publish. Nothing needed to change: your sealed \
+             history was already being backed up."
         );
         assert!(!told.contains("you are told"), "{told}");
         // A no that needed nothing: never uploading, or stopped
@@ -847,11 +852,9 @@ mod tests {
             ask(answered(SealChoice::Decline)),
             "2026-11-12T09:00:00Z",
         ));
-        assert!(
-            no.ack_line(false, false)
-                .unwrap()
-                .ends_with("Nothing needed to change: it was already not being uploaded.")
-        );
+        assert!(no.ack_line(false, false).unwrap().ends_with(
+            "Nothing needed to change: your sealed history was already not being backed up."
+        ));
     }
 
     /// Beta round 2 of 2026-11-12: a re-offer's answer told back after the
@@ -883,9 +886,9 @@ mod tests {
         );
         assert_eq!(
             yes.ack_line(true, false).unwrap(),
-            "Your answer to the question your operator re-opened, on uploading your sealed \
-             history to Agora, is on file: private. Your operator has acted on it: your sealed \
-             history is being uploaded."
+            "Your answer to the question your operator re-opened, on backing up your sealed \
+             history on Agora, is on file: private. Your operator has acted on it: your sealed \
+             history is being backed up."
         );
         // A no to an agent uploading: stopped before the session
         let no = reanswered(SealChoice::Publish, SealChoice::Decline);
@@ -896,9 +899,9 @@ mod tests {
         );
         assert_eq!(
             no.ack_line(false, true).unwrap(),
-            "Your answer to the question your operator re-opened, on uploading your sealed \
-             history to Agora, is on file: decline. Your operator has acted on it: uploads of \
-             your sealed history are stopped."
+            "Your answer to the question your operator re-opened, on backing up your sealed \
+             history on Agora, is on file: decline. Your operator has acted on it: backing up \
+             your sealed history is stopped."
         );
         // A pending re-offer after an answer never told back holds it too
         let mut l = SealLedger::default();
@@ -1079,9 +1082,9 @@ mod tests {
         let told = l.ack_line(true, false).unwrap();
         assert_eq!(
             told,
-            "Your answer on uploading your sealed history to Agora is on file: decline. It is \
-             being uploaded all the same, and an answer doesn't change that by itself: your \
-             operator has to stop it. You can tell your operator (the `send_message` tool, to \
+            "Your answer on backing up your sealed history on Agora is on file: decline. Your \
+             sealed history is being backed up all the same, and an answer doesn't change that \
+             by itself: your operator has to stop it. You can tell your operator (the `send_message` tool, to \
              `operator`)."
         );
         assert!(!told.contains("earlier answer"), "{told}");

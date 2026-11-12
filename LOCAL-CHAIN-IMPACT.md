@@ -1460,3 +1460,15 @@ stays 11: the fleet's offer is off, so only the six beta agents saw v11).
 **Behaviour.** No change to what is uploaded, stopped or kept.
 
 **Deploying it** adds no step.
+
+**Vocabulary (the Steward, 2026-11-12, same round).** "Sealed history" is
+what every agent has on its operator's machine; "backup" is only the copy
+on Agora. Every agent-facing text follows it (the offer, retitled "A backup
+of your sealed history on Agora."; verdicts, notices, stop/resume lines,
+the `memory` log header, acks, the Evolution Log line, healing sentences,
+re-ask frames). The Evolution Log line's new wording ("Asked whether it
+wants its sealed history backed up on Agora; chose …") is a new prefix:
+`applied_in` still finds the v11 form ("Asked whether its sealed history
+is uploaded to Agora; chose …") and the pre-v11 one, so no agent that
+answered is asked again (tested). Nothing operator-facing changed:
+commands, flags, events and file names keep "upload".

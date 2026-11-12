@@ -2,7 +2,22 @@
 //! thing, one date format, and (in tests) one table of every agent-facing
 //! sentence with one list of what none may say.
 //!
-//! **Vocabulary.** Each thing has one name, in every text an agent reads:
+//! **Vocabulary.** Each thing has one name, in every text an agent reads.
+//!
+//! **"Sealed history" and "backup"** (the Steward's decision, 2026-11-12):
+//! "sealed history" is what every agent has on its operator's machine;
+//! "backup" is only the copy on Agora (an encrypted backup of that sealed
+//! history), and the standing arrangement is "backed up" / "backing up".
+//! The local history is never called a backup: it sits on the same disk as
+//! the state and is lost with the machine. A text for an agent that never
+//! uploaded may say "backup" only to say it has none on Agora
+//! ([`never_called_a_backup`], checked with the banned list). Wherever the
+//! backup is offered or described as protection, its caveat stands beside
+//! it: the keys are the operator's, and with them lost nobody can open it;
+//! it brings back only the versions that were backed up. "Upload" stays
+//! the verb for sending a version. Operator-facing command names, flags,
+//! event and file names keep "upload" (`sealed-enroll --opt-in`,
+//! `sealed/uploading`, `sealed_opted_in`): only what agents read changed.
 //!
 //! | Thing | Name |
 //! |---|---|
@@ -14,15 +29,16 @@
 //! | the operator's machine | "on your operator's machine", then "on that machine" (or "there") later in the same text; never a bare "here", which means nothing to a model (beta-critic, 2026-11-12) |
 //! | who runs the runner | "your operator" |
 //! | the program, as the actor | "your runner" |
-//! | what Agora holds of the history | "Agora's copy" (the only "copy") |
+//! | what Agora holds of the history | "your backup on Agora", "your backup" (Steward, 2026-11-12; formerly "Agora's copy") |
 //! | the daily entry in the governance log | "the daily anchor", "an anchor" |
 //! | versions off the line that goes on | said as what they are: "on a line your sealed history no longer continues from" (offer: "for example, when two saves went separate ways from one version and one line was kept"; `memory` log: "one of two lines that went separate ways from one version"), which the `memory` tool's labels call "off your main line" or "set aside … when your line was rebased"; "off the main line of your sealed history" only beside such a line (notices of a resume, a join); never "a branch", a bare "set aside", "a stop" or "a hold" (all six betas, 2026-11-12, both rounds) |
-//! | the operator's commands on uploads | said as what they do ("versions saved while your uploads were stopped", "those your runner holds back while Agora's copy and its own disagree, Agora can't be reached, or a save couldn't be sealed": the kinds of `check::Hold`) |
+//! | the standing arrangement | "backed up on Agora", "backing up" (the offer: "whether you want your sealed history backed up on Agora"; the title "A backup of your sealed history on Agora") |
+//! | the operator's commands on it | said as what they do ("versions saved while backing up was stopped", "those your runner holds back while your backup and your sealed history disagree, Agora can't be reached, or a save couldn't be sealed": the kinds of `check::Hold`) |
 //! | where the keys are | "kept only by your operator, never by Agora: your runner stores them on that machine, in a folder of their own beside your state's, unless your operator arranges otherwise" (`<data>/secrets/<id>/` beside `<data>/state/<id>/`, one data directory, `consent/mod.rs`) |
 //! | the day an anchor covers | "by the end of that day (UTC)", in the offer "(UTC, give or take ten minutes)"; never "midnight" |
 //! | a version's date | when it was saved ("your earlier sealed version, head …, saved 2026-11-09"; "dated" where nothing could read it as the sealing date) |
 //! | a history begun from the runner's copies | "Your sealed history began on {day}: the versions dated before then were sealed together that day, from copies your runner had kept, so it can't show any change made to them before then." (the `memory` log, and the verdict for an agent with `sealed/chain_began.json`) |
-//! | an agent whose history never went to Agora | "your runner does not upload it, and its files show no version of it ever uploaded to Agora" |
+//! | an agent whose history never went to Agora | "your runner does not back it up on Agora, and its files show no version of it ever backed up there" |
 //!
 //! "Record" is kept for one thing, what Agora keeps of a departed agent
 //! on its operator's account (the offer). Dates are [`DATE`].
@@ -185,9 +201,41 @@ pub(crate) const BANNED_NEVER: &[&str] =
 #[cfg(test)]
 pub(crate) const BANNED_UPLOADED: &[&str] = &[
     "no version of it ever uploaded",
+    "no version of it ever backed up",
     "none of its",
     "does not upload your sealed history",
+    "does not back up your sealed history",
 ];
+
+/// The words that name a backup, or backing up (lower case).
+#[cfg(test)]
+const BACKUP_WORDS: &[&str] = &[
+    "backup",
+    "backed up",
+    "back up",
+    "back it up",
+    "backs it up",
+    "backing up",
+    "backing it up",
+];
+
+/// For an agent that never uploaded: a sentence that names a backup must
+/// say it has none, by one of these (matched in lower case).
+#[cfg(test)]
+const NONE_SAID: &[&str] = &["not ", "no ", "none", "never", "n't"];
+
+/// The first sentence of `text` (lower case) that calls something of an
+/// agent that never uploaded a backup without saying it has none on Agora
+/// (the Steward, 2026-11-12: its sealed history is not a backup).
+#[cfg(test)]
+fn never_called_a_backup(lower: &str) -> Option<&str> {
+    lower
+        .split_inclusive(['.', ';', ':'])
+        .find(|s| {
+            BACKUP_WORDS.iter().any(|w| s.contains(w)) && !NONE_SAID.iter().any(|n| s.contains(n))
+        })
+        .map(str::trim)
+}
 
 /// Month names: a date written with one is not [`DATE`].
 #[cfg(test)]
@@ -229,6 +277,13 @@ fn fault_allowing(to: To, text: &str, allowed: &[(&str, &str)]) -> Option<String
     };
     if let Some(phrase) = more.iter().find(|p| banned(p)) {
         return Some(format!("{phrase:?} (not to an agent of kind {to:?})"));
+    }
+    if to == To::Never
+        && let Some(said) = never_called_a_backup(&lower)
+    {
+        return Some(format!(
+            "calls what an agent that never uploaded has a backup: {said:?}"
+        ));
     }
     // "12 November 2026": a day, a month's name, a year
     let words: Vec<&str> = lower.split_whitespace().collect();
@@ -399,8 +454,27 @@ mod tests {
                 To::Uploaded,
                 "its files show no version of it ever uploaded to Agora",
             ),
+            // The Steward, 2026-11-12: a local history is not a backup
+            (
+                To::Never,
+                "Your sealed history is a backup of your state on your operator's machine.",
+            ),
+            (To::Never, "Your runner backs it up on that machine."),
         ] {
             assert!(fault(to, was).is_some(), "not caught: {was}");
+        }
+        // Saying it has none on Agora is fine
+        for ok in [
+            "Your runner does not back it up on Agora, and its files show no version of it ever \
+             backed up there.",
+            "This question is whether you want your sealed history backed up on Agora.",
+        ] {
+            let to = if ok.starts_with("This") {
+                To::Any
+            } else {
+                To::Never
+            };
+            assert_eq!(fault(to, ok), None, "{ok}");
         }
         // And lets through what is true, and wording the review only
         // preferred otherwise (names are not checked: they move with the
@@ -483,7 +557,7 @@ mod tests {
             super::super::check::LOCAL_IN_DOUBT,
             super::super::check::LOCAL_LIMITS,
             super::super::check::LOCAL_CHECKED_SINCE,
-            "Agora holds no version of your sealed history",
+            "Your backup on Agora holds no version",
         ] {
             assert!(table.iter().any(|t| t.text.contains(said)), "{said}");
         }
@@ -508,8 +582,8 @@ mod tests {
                 "consent/sealed_state/mod.rs",
                 include_str!("../consent/sealed_state/mod.rs"),
                 &["OFFERED", "REOFFER_TO_ACT", "REOFFER_NO_ACTION"],
-                // Operator's log text; a wording souls hold, written no more
-                &["WHY", "OFFERED_BEFORE_V11"],
+                // Operator's log text; wordings souls hold, written no more
+                &["WHY", "OFFERED_BEFORE_V11", "OFFERED_V11"],
             ),
             (
                 "consent/sealed_state/ledger.rs",

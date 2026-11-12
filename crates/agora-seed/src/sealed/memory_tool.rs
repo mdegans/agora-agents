@@ -320,15 +320,15 @@ pub fn uploads_line(u: Uploads, uploading: bool) -> Option<String> {
         // As the verdict says it of an agent that doesn't upload: what
         // the runner's files show
         (0, _) if !uploading => format!(
-            "Your runner does not upload your sealed history, and its files show none of its \
-             {n} version{s} uploaded to Agora."
+            "Your runner does not back up your sealed history on Agora, and its files show none \
+             of its {n} version{s} ever backed up there."
         ),
-        (0, 1) => "The 1 version of your sealed history is not uploaded to Agora yet.".to_string(),
+        (0, 1) => "The 1 version of your sealed history is not backed up on Agora yet.".to_string(),
         (0, _) => {
-            format!("None of the {n} versions of your sealed history is uploaded to Agora yet.")
+            format!("None of the {n} versions of your sealed history is backed up on Agora yet.")
         }
         (_, 0) => format!(
-            "{} of your sealed history {} uploaded to Agora.",
+            "{} of your sealed history {} backed up on Agora.",
             if n == 1 {
                 "The 1 version".to_string()
             } else {
@@ -337,8 +337,8 @@ pub fn uploads_line(u: Uploads, uploading: bool) -> Option<String> {
             if n == 1 { "is" } else { "are" },
         ),
         (up, local) => format!(
-            "{up} of the {n} versions of your sealed history {} uploaded to Agora; the other \
-             {local} {} not uploaded{yet}.",
+            "{up} of the {n} versions of your sealed history {} backed up on Agora; the other \
+             {local} {} not backed up{yet}.",
             if up == 1 { "is" } else { "are" },
             if local == 1 { "is" } else { "are" },
         ),
@@ -669,9 +669,9 @@ fn head_note(source: &Source, short: &str, its: &str) -> Option<String> {
         Source::SideLine {
             resumed: Some(at), ..
         } => format!(
-            "Head {short} was not uploaded before your uploads were stopped, or was saved \
-             while they were, and was set aside from your sealed history on {} when your \
-             operator resumed them; it was not uploaded{its}.",
+            "Head {short} was not backed up before backing up was stopped, or was saved \
+             while it was, and was set aside from your sealed history on {} when your \
+             operator resumed it; it was not backed up{its}.",
             at.format(super::text::DATE)
         ),
         Source::SideLine { resumed: None, .. } => format!(
@@ -1618,11 +1618,11 @@ mod tests {
         // Where its versions are, said once a session, first
         assert!(
             out.starts_with("All ")
-                || out.contains(" of your ") && out.contains("uploaded to Agora"),
+                || out.contains(" of your ") && out.contains("backed up on Agora"),
             "{out}"
         );
         let again = rd.answer(log(), &b.api).await.text;
-        assert!(!again.contains("uploaded to Agora"), "once: {again}");
+        assert!(!again.contains("backed up on Agora"), "once: {again}");
         let short = short_head(&head);
         let out = rd.answer(show(vec![r(&short)]), &b.api).await.text;
         assert!(
@@ -1981,34 +1981,34 @@ mod tests {
         // An agent that doesn't upload: as its verdict says it
         assert_eq!(
             line(0, 4).unwrap(),
-            "Your runner does not upload your sealed history, and its files show none of its 4 \
-             versions uploaded to Agora."
+            "Your runner does not back up your sealed history on Agora, and its files show none \
+             of its 4 versions ever backed up there."
         );
         // One that uploads, nothing sent yet
         assert_eq!(
             up(0, 1).unwrap(),
-            "The 1 version of your sealed history is not uploaded to Agora yet."
+            "The 1 version of your sealed history is not backed up on Agora yet."
         );
         assert_eq!(
             up(1, 0).unwrap(),
-            "The 1 version of your sealed history is uploaded to Agora."
+            "The 1 version of your sealed history is backed up on Agora."
         );
         // The count no longer speaks of what it leaves out: `side_line`
         // does, only when there is some
         assert_eq!(
             up(5, 0).unwrap(),
-            "All 5 versions of your sealed history are uploaded to Agora."
+            "All 5 versions of your sealed history are backed up on Agora."
         );
         // "Not uploaded yet" only for an agent that uploads
         assert_eq!(
             up(1, 1).unwrap(),
-            "1 of the 2 versions of your sealed history is uploaded to Agora; the other 1 is not \
-             uploaded yet."
+            "1 of the 2 versions of your sealed history is backed up on Agora; the other 1 is not \
+             backed up yet."
         );
         assert_eq!(
             line(4, 2).unwrap(),
-            "4 of the 6 versions of your sealed history are uploaded to Agora; the other 2 are \
-             not uploaded."
+            "4 of the 6 versions of your sealed history are backed up on Agora; the other 2 are \
+             not backed up."
         );
         for (n, after) in [(0, true), (0, false)] {
             assert_eq!(side_line(n, after), None);
@@ -2127,9 +2127,9 @@ mod tests {
         let said = view.show(&[r("030303030303")], None, current());
         assert!(
             said.starts_with(
-                "Head 030303030303 was not uploaded before your uploads were stopped, or was \
-                 saved while they were, and was set aside from your sealed history on \
-                 2026-11-05 when your operator resumed them; it was not uploaded; its memory is"
+                "Head 030303030303 was not backed up before backing up was stopped, or was \
+                 saved while it was, and was set aside from your sealed history on \
+                 2026-11-05 when your operator resumed it; it was not backed up; its memory is"
             ),
             "{said}"
         );

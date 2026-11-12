@@ -4912,11 +4912,11 @@ mod tests {
         );
         // The stop line's wording (`sealed/stop.rs`)
         assert!(
-            seat.lines[0].starts_with("Your operator stopped uploading your sealed history on ")
+            seat.lines[0].starts_with("Your operator stopped backing up your sealed history on ")
                 && seat.lines[0].ends_with(
-                    ": It asked. The versions already uploaded stay on Agora. Your state is \
+                    ": It asked. Your backup on Agora stays as it was. Your state is \
                      still sealed and checked at the start of each session; the versions not \
-                     uploaded by then, and those saved from now on, stay on your operator's machine."
+                     backed up by then, and those saved from now on, stay on your operator's machine."
                 ),
             "{:?}",
             seat.lines
@@ -4939,7 +4939,7 @@ mod tests {
         assert!(!run.seats[&id].stop_note);
         assert!(
             run.seats[&id].lines[0]
-                .starts_with("Uploads of your sealed history are stopped (since ")
+                .starts_with("Backing up your sealed history is stopped (since ")
         );
         // A state changed by hand while stopped is refused, as anyone's
         FsStorage::new(&state_dir)
@@ -5257,7 +5257,7 @@ mod tests {
         assert!(seat.lines[0].starts_with("Your sealed state: "), "{seat:?}");
         let last = seat.lines.last().unwrap();
         assert!(
-            last.starts_with("Agora's check of what it stores found parts of your uploaded")
+            last.starts_with("Agora's check of what it stores found parts of your backup")
                 && last.contains("1 it could not send again"),
             "{last}"
         );
@@ -5785,8 +5785,8 @@ mod tests {
         assert!(
             run.seats[&id].lines[0].starts_with(
                 "Your sealed state: intact, checked against your sealed history, which your \
-                 runner keeps on your operator's machine. Your runner does not upload it, \
-                 and its files show no version of it ever uploaded to Agora."
+                 runner keeps on your operator's machine. Your runner does not back it up on \
+                 Agora, and its files show no version of it ever backed up there."
             ),
             "{:?}",
             run.seats[&id].lines

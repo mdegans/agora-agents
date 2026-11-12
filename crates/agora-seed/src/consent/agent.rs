@@ -8532,8 +8532,8 @@ mod tests {
         let intro = serde_json::to_string(&agent.prompt().messages).unwrap();
         assert!(
             intro.contains(
-                "VERDICT LINE\\n\\nAgora's check of what it stores found parts of your uploaded \
-                 sealed history missing or damaged there, and your runner has sent again"
+                "VERDICT LINE\\n\\nAgora's check of what it stores found parts of your backup \
+                 missing or damaged there, and your runner has sent again"
             ),
             "{intro}"
         );
@@ -8759,7 +8759,7 @@ mod tests {
         );
         assert!(q.contains("\"Asked to by DM.\""), "{q}");
         assert!(!q.contains("\"first\""), "{q}");
-        assert!(q.contains("is being uploaded to Agora now"), "{q}");
+        assert!(q.contains("is being backed up on Agora now"), "{q}");
         assert!(q.contains(sealed_state::prompt::TITLE), "{q}");
         agent
             .handle(answer_call("sealed_state", "decline", "", ""))
@@ -8797,7 +8797,7 @@ mod tests {
         let seen = serde_json::to_string(&later.prompt().messages).unwrap();
         assert!(
             seen.contains(
-                "question your operator re-opened, on uploading your sealed history to Agora, \
+                "question your operator re-opened, on backing up your sealed history on Agora, \
                  is on file: decline"
             ),
             "{seen}"
@@ -8820,8 +8820,8 @@ mod tests {
     #[tokio::test]
     async fn a_reoffer_answer_acted_on_is_never_told_as_waiting() {
         const WAITING: &str = "Nothing has changed yet";
-        const REOPENED: &str = "question your operator re-opened, on uploading your sealed \
-             history to Agora, is on file";
+        const REOPENED: &str = "question your operator re-opened, on backing up your sealed \
+             history on Agora, is on file";
         let seen = |a: &ConsentAgent<Fake>| serde_json::to_string(&a.prompt().messages).unwrap();
         for acted_first in [false, true] {
             let h = with_sealed(&format!("sealed-reoffer-acted-{acted_first}"), None);
@@ -8897,7 +8897,7 @@ mod tests {
                 assert!(
                     intro.contains(&format!(
                         "{REOPENED}: private. Your operator has acted on it: your sealed \
-                         history is being uploaded."
+                         history is being backed up."
                     )),
                     "{intro}"
                 );
@@ -8911,7 +8911,7 @@ mod tests {
                 .line()
                 .unwrap();
             assert!(
-                notice.contains("your operator started uploading your sealed history to Agora"),
+                notice.contains("your operator started backing up your sealed history on Agora"),
                 "{notice}"
             );
         }
@@ -9003,7 +9003,7 @@ mod tests {
             let seen = serde_json::to_string(&later.prompt().messages).unwrap();
             assert!(
                 seen.contains(
-                    "question your operator re-opened, on uploading your sealed history to Agora, \
+                    "question your operator re-opened, on backing up your sealed history on Agora, \
                      is on file: decline"
                 ),
                 "{config}: {seen}"
@@ -9120,9 +9120,9 @@ mod tests {
         let seen = serde_json::to_string(&next.prompt().messages).unwrap();
         assert!(
             seen.contains(
-                "Your answer on uploading your sealed history to Agora is on file: decline. It \
-                 is not being uploaded. If you change your mind, ask your operator to re-open \
-                 the question."
+                "Your answer on backing up your sealed history on Agora is on file: decline. Your \
+                 sealed history is not being backed up. If you change your mind, ask your \
+                 operator to re-open the question."
             ),
             "{seen}"
         );

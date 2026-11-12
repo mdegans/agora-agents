@@ -54,8 +54,8 @@ pub struct Healed {
 const STATE_UNAFFECTED: &str = "Your state now is not affected.";
 
 /// What Agora found, the same in every form.
-const FOUND: &str = "Agora's check of what it stores found parts of your uploaded sealed history \
-     missing or damaged there";
+const FOUND: &str = "Agora's check of what it stores found parts of your backup missing or \
+     damaged there";
 
 impl Healed {
     fn path(agent_dir: &Path) -> PathBuf {
@@ -301,20 +301,20 @@ mod tests {
         };
         assert_eq!(
             rec(3, 0).line(),
-            "Agora's check of what it stores found parts of your uploaded sealed history \
-             missing or damaged there, and your runner has sent again, from its sealed files on your operator's machine, those it has reached so far. Your state now is not affected."
+            "Agora's check of what it stores found parts of your backup missing or damaged \
+             there, and your runner has sent again, from its sealed files on your operator's machine, those it has reached so far. Your state now is not affected."
         );
         assert_eq!(
             rec(3, 2).line(),
-            "Agora's check of what it stores found parts of your uploaded sealed history \
-             missing or damaged there. Your runner has sent again those it has reached so far; \
+            "Agora's check of what it stores found parts of your backup missing or damaged \
+             there. Your runner has sent again those it has reached so far; \
              2 it could not send again, because its sealed files for them on your operator's machine are missing or damaged too, so some of your earlier versions may not open at all, on that machine or from Agora. You can tell your operator (the `send_message` tool, to `operator`). Your \
              state now is not affected."
         );
         assert_eq!(
             rec(0, 1).line(),
-            "Agora's check of what it stores found parts of your uploaded sealed history \
-             missing or damaged there. 1 of them your runner could not send again, because its sealed files for them on your operator's machine are missing or damaged too, so some of your earlier versions may not open at all, on that machine or from Agora. You can tell your operator (the \
+            "Agora's check of what it stores found parts of your backup missing or damaged \
+             there. 1 of them your runner could not send again, because its sealed files for them on your operator's machine are missing or damaged too, so some of your earlier versions may not open at all, on that machine or from Agora. You can tell your operator (the \
              `send_message` tool, to `operator`). Your state now is not affected."
         );
         // O3, O4 and O2: not "sent them again" (all, and confirmed), not

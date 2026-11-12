@@ -204,13 +204,15 @@ impl ChainKept {
     /// The words after "your sealed history,".
     pub fn words(self) -> &'static str {
         match self {
-            Self::Local => "which your runner keeps on your operator's machine and does not upload",
+            Self::Local => {
+                "which your runner keeps on your operator's machine and does not back up"
+            }
             Self::Stopped => {
-                "which your runner keeps on your operator's machine (your uploads are stopped, and the versions on \
-                 Agora are not changed)"
+                "which your runner keeps on your operator's machine (backing up is stopped, and your backup on \
+                 Agora is not changed)"
             }
             Self::Uploading => {
-                "which your runner keeps on your operator's machine (the versions already on Agora are not changed)"
+                "which your runner keeps on your operator's machine (the versions already in your backup on Agora are not changed)"
             }
         }
     }
@@ -441,7 +443,7 @@ impl OperatorAct {
             // One state with the `memory` tool's count and the re-offer's
             // "is being uploaded" (beta round 2 of 2026-11-12)
             Self::OptedIn { answered, uploaded } => format!(
-                "On {date}, your operator started uploading your sealed history to Agora, as you \
+                "On {date}, your operator started backing up your sealed history on Agora, as you \
                  answered on {}: {}, and each new version follows.",
                 answered.format(super::text::DATE),
                 match uploaded {
@@ -453,23 +455,23 @@ impl OperatorAct {
             Self::Resumed {
                 uploading: false, ..
             } => format!(
-                "On {date}, your operator cleared the stop on uploading your sealed history. \
-                 It is not being uploaded to Agora: your runner keeps it on your operator's machine, and checks your state against it."
+                "On {date}, your operator cleared the stop on backing up your sealed history. \
+                 It is not being backed up on Agora: your runner keeps it on your operator's machine, and checks your state against it."
             ),
             Self::Resumed { kept, .. } => {
                 let mut line = format!(
-                    "On {date}, your operator resumed uploading your sealed history to Agora."
+                    "On {date}, your operator resumed backing up your sealed history on Agora."
                 );
                 match kept {
                     0 => {}
                     1 => line.push_str(
-                        " The version not uploaded before the stop or saved while uploads were \
-                         stopped stays on your operator's machine, off the main line of your sealed history, and was not uploaded; uploading went on from your state as it was when your \
+                        " The version not backed up before the stop or saved while backing up was \
+                         stopped stays on your operator's machine, off the main line of your sealed history, and was not backed up; backing up went on from your state as it was when your \
                          operator resumed it.",
                     ),
                     n => line.push_str(&format!(
-                        " The {n} versions not uploaded before the stop or saved while uploads \
-                         were stopped stay on your operator's machine, off the main line of your sealed history, and were not uploaded; uploading went on from your state as it was when your \
+                        " The {n} versions not backed up before the stop or saved while backing up \
+                         was stopped stay on your operator's machine, off the main line of your sealed history, and were not backed up; backing up went on from your state as it was when your \
                          operator resumed it."
                     )),
                 }
@@ -481,7 +483,7 @@ impl OperatorAct {
                 "On {date}, the copy of your memory from before the May 2026 loss, which you \
                  chose to see, was added to your sealed history{}.",
                 if *sent {
-                    ", whose versions are uploaded to Agora"
+                    ", whose versions are backed up on Agora"
                 } else {
                     ""
                 }
@@ -855,7 +857,7 @@ impl Notice {
             let versions = format!("{n} version{}", if n == 1 { "" } else { "s" });
             return Some(if lost.fresh {
                 format!(
-                    "Agora had lost the {versions} of your sealed history uploaded from your \
+                    "Your backup on Agora had lost the {versions} uploaded to it from your \
                      operator's machine, and held none. On {date}, your operator started a new \
                      sealed history from your state on that machine; it records the break. Kept \
                      by your runner: {}. Your \
@@ -864,9 +866,9 @@ impl Notice {
                 )
             } else {
                 format!(
-                    "Agora had lost {versions} of your sealed history uploaded from your \
+                    "Your backup on Agora had lost {versions} uploaded to it from your \
                      operator's machine. On {date}, your operator sealed your state on that \
-                     machine on top of Agora's copy. Kept \
+                     machine on top of what your backup holds. Kept \
                      by your runner: {}. Your operator's note: {}",
                     lost.kept, accepted.note
                 )
@@ -900,16 +902,16 @@ impl Notice {
         }
         if self.resumed {
             return Some(format!(
-                "While uploading your sealed history to Agora was stopped, your state changed; \
-                 your operator resumed uploading with this note: {}",
+                "While backing up your sealed history on Agora was stopped, your state changed; \
+                 your operator resumed backing it up with this note: {}",
                 accepted.note
             ));
         }
         if self.joined {
             return Some(format!(
                 "On {}, your operator joined your two sealed histories, which had gone separate \
-                 ways: your state on your operator's machine is now sealed on top of Agora's \
-                 copy, and the versions that went the other way are kept on that machine, off \
+                 ways: your state on your operator's machine is now sealed on top of your backup \
+                 on Agora, and the versions that went the other way are kept on that machine, off \
                  the main line of your sealed history. Your operator's note: {}",
                 accepted.at.format(super::text::DATE),
                 accepted.note
@@ -1399,26 +1401,26 @@ pub(crate) mod tests {
         };
         assert_eq!(
             line("cleared the stop"),
-            "On 2026-11-12, your operator cleared the stop on uploading your sealed history. It is not being uploaded to Agora: your runner keeps it on your operator's machine, and checks your state against it. Your operator's note: n."
+            "On 2026-11-12, your operator cleared the stop on backing up your sealed history. It is not being backed up on Agora: your runner keeps it on your operator's machine, and checks your state against it. Your operator's note: n."
         );
         assert_eq!(
             line("which you chose to see, was added to your sealed history, whose"),
             "On 2026-11-12, the copy of your memory from before the May 2026 loss, which you \
-             chose to see, was added to your sealed history, whose versions are uploaded to Agora. \
+             chose to see, was added to your sealed history, whose versions are backed up on Agora. \
              Your operator's note: n."
         );
-        assert!(line("The version not uploaded before the stop").contains(
-            "stays on your operator's machine, off the main line of your sealed history, and was not uploaded; uploading \
+        assert!(line("The version not backed up before the stop").contains(
+            "stays on your operator's machine, off the main line of your sealed history, and was not backed up; backing up \
              went on from your state as it was when your operator resumed it."
         ));
-        assert!(line("The 3 versions not uploaded").contains(
-            "stay on your operator's machine, off the main line of your sealed history, and were not uploaded; uploading \
+        assert!(line("The 3 versions not backed up").contains(
+            "stay on your operator's machine, off the main line of your sealed history, and were not backed up; backing up \
              went on from your state as it was when your operator resumed it."
         ));
         assert_eq!(
-            line("While uploading"),
-            "While uploading your sealed history to Agora was stopped, your state changed; your \
-             operator resumed uploading with this note: n."
+            line("While backing up"),
+            "While backing up your sealed history on Agora was stopped, your state changed; your \
+             operator resumed backing it up with this note: n."
         );
         assert_eq!(
             line(
@@ -1441,22 +1443,22 @@ pub(crate) mod tests {
         // The fork's chain, by its kind: a never-uploader's says what the
         // runner does, not what is or isn't on Agora (F3)
         assert!(
-            line("which your runner keeps on your operator's machine and does not upload:")
+            line("which your runner keeps on your operator's machine and does not back up:")
                 .starts_with(
                     "On 2026-11-12, your operator resolved a fork in your sealed history,"
                 )
         );
         // Both of Agora's losses, whole
         assert_eq!(
-            line("Agora had lost 3 versions"),
-            "Agora had lost 3 versions of your sealed history uploaded from your operator's \
+            line("Your backup on Agora had lost 3 versions"),
+            "Your backup on Agora had lost 3 versions uploaded to it from your operator's \
              machine. On 2026-11-12, your operator sealed your state on that machine on top of \
-             Agora's copy. Kept by your runner: your whole state as sealed on 2026-11-12, and \
+             what your backup holds. Kept by your runner: your whole state as sealed on 2026-11-12, and \
              what it has of the 3 versions after it. Your operator's note: n."
         );
         assert_eq!(
-            line("Agora had lost the 1 version"),
-            "Agora had lost the 1 version of your sealed history uploaded from your operator's \
+            line("Your backup on Agora had lost the 1 version"),
+            "Your backup on Agora had lost the 1 version uploaded to it from your operator's \
              machine, and held none. On 2026-11-12, your operator started a new sealed history \
              from your state on that machine; it records the break. Kept by your runner: your \
              whole state as sealed on 2026-11-12, and what it has of the 1 version after it. \
