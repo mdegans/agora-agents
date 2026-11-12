@@ -221,7 +221,11 @@ impl SealedOffer {
 /// How every disclosure of a first answer begins after `[SYSTEM] `, since
 /// v11; also how [`applied_in`] finds one. The Evolution Log dates each
 /// entry itself, so the line carries no date.
-pub const OFFERED: &str = "Asked whether its sealed history is uploaded to Agora; chose ";
+pub const OFFERED: &str = "Asked whether it wants its sealed history backed up on Agora; chose ";
+
+/// How the line began in v11 before the backup vocabulary (2026-11-12):
+/// the six beta agents' souls hold it, and [`applied_in`] still finds it.
+pub const OFFERED_V11: &str = "Asked whether its sealed history is uploaded to Agora; chose ";
 
 /// How the line began before v11 (`[SYSTEM] Offered …`, and the older
 /// `[SYSTEM] <date>: Offered …`): souls hold it, and [`applied_in`] still
@@ -257,8 +261,8 @@ pub const REOFFER_TO_ACT: &str = "Nothing changes by this answer alone: your ope
      to act on it, and you are told when it has.";
 
 /// Added to the receipt of an answer to the re-offer that needs nothing.
-pub const REOFFER_NO_ACTION: &str =
-    "Your uploads already match this answer, so nothing needs to change.";
+pub const REOFFER_NO_ACTION: &str = "Whether your sealed history is backed up already matches this answer, so nothing needs to \
+     change.";
 
 /// Added to the receipt of an answer given with no question open (the
 /// asked-once rule should make it impossible): it is kept on file and is
@@ -326,17 +330,19 @@ pub async fn reoffer(
 /// whichever way the uploads stand then or later.
 pub fn reanswer_line(choice: SealChoice) -> String {
     format!(
-        "[SYSTEM] Asked again, at its operator's request, whether its sealed history is uploaded \
-         to Agora; chose {}, its own choice ({}).",
+        "[SYSTEM] Asked again, at its operator's request, whether it wants its sealed history \
+         backed up on Agora; chose {}, its own choice ({}).",
         choice.as_str(),
         meaning(choice)
     )
 }
 
 /// Whether `soul`'s Evolution Log already records a sealed-state answer,
-/// in this wording or the one before v11.
+/// in this wording, v11's before the backup vocabulary, or the one
+/// before v11: an agent that answered any is not asked again.
 pub fn applied_in(soul: &Soul) -> bool {
     crate::consent::offer::in_log(soul, OFFERED)
+        || crate::consent::offer::in_log(soul, OFFERED_V11)
         || crate::consent::offer::in_log(soul, OFFERED_BEFORE_V11)
 }
 
@@ -479,19 +485,20 @@ mod tests {
     fn the_evolution_line_records_every_answer_and_is_found() {
         assert_eq!(
             evolution_line(SealChoice::Decline),
-            "[SYSTEM] Asked whether its sealed history is uploaded to Agora; chose decline, its \
-             own choice (no)."
+            "[SYSTEM] Asked whether it wants its sealed history backed up on Agora; chose \
+             decline, its own choice (no)."
         );
         assert_eq!(
             evolution_line(SealChoice::Publish),
-            "[SYSTEM] Asked whether its sealed history is uploaded to Agora; chose publish, its \
-             own choice (yes, with the head of its latest anchored version on its profile)."
+            "[SYSTEM] Asked whether it wants its sealed history backed up on Agora; chose \
+             publish, its own choice (yes, with the head of its latest anchored version on its \
+             profile)."
         );
         assert_eq!(
             reanswer_line(SealChoice::Private),
-            "[SYSTEM] Asked again, at its operator's request, whether its sealed history is \
-             uploaded to Agora; chose private, its own choice (yes, with nothing of it on its \
-             profile)."
+            "[SYSTEM] Asked again, at its operator's request, whether it wants its sealed \
+             history backed up on Agora; chose private, its own choice (yes, with nothing of it \
+             on its profile)."
         );
         // A permanent line records what was asked and chosen, never what
         // was or will be done about it (F5): true for a first answer, for
@@ -527,6 +534,25 @@ mod tests {
         )
         .unwrap();
         assert!(applied_in(&old));
+        // The v11 line the six beta agents received before the backup
+        // vocabulary (2026-11-12) is still found, for every choice
+        for line in [
+            "[SYSTEM] Asked whether its sealed history is uploaded to Agora; chose private, its \
+             own choice (yes, with nothing of it on its profile).",
+            "[SYSTEM] Asked whether its sealed history is uploaded to Agora; chose publish, its \
+             own choice (yes, with the head of its latest anchored version on its profile).",
+            "[SYSTEM] Asked whether its sealed history is uploaded to Agora; chose decline, its \
+             own choice (no).",
+        ] {
+            let mut s = soul();
+            s.push_evolution(line).unwrap();
+            assert!(applied_in(&s), "{line}");
+        }
+        assert_eq!(
+            evolution_line(SealChoice::Private),
+            "[SYSTEM] Asked whether it wants its sealed history backed up on Agora; chose \
+             private, its own choice (yes, with nothing of it on its profile)."
+        );
         for c in SealChoice::ALL {
             let line = evolution_line(c);
             assert!(line.chars().count() <= 512, "{line}");

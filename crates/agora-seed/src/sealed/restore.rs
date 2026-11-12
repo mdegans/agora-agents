@@ -1209,7 +1209,9 @@ mod tests {
                 );
             }
             assert!(
-                seat[1].starts_with("Your sealed state: intact, and in step with Agora."),
+                seat[1].starts_with(
+                    "Your sealed state: intact, and in step with your backup on Agora."
+                ),
                 "{lose}: {seat:?}"
             );
 

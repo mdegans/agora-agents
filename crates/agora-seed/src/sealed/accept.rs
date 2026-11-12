@@ -65,7 +65,7 @@ pub const REBUILT_LOCAL_NOTE: &str = "the record of your last sealed version was
 
 /// The note when the rebuilt head matched and the operator gave none.
 pub const REBUILT_NOTE: &str = "the record of your last sealed version was missing on your \
-     operator's machine and was rebuilt from your sealed history on Agora, after checking it; \
+     operator's machine and was rebuilt from your backup on Agora, after checking it; \
      your state matched it, so nothing about your state changed.";
 
 /// Accept `id`'s current state. A lost `head.json` is first rebuilt from
@@ -2339,15 +2339,15 @@ mod tests {
         for (chain, words) in [
             (
                 ChainKept::Local,
-                "which your runner keeps on your operator's machine and does not upload:",
+                "which your runner keeps on your operator's machine and does not back up:",
             ),
             (
                 ChainKept::Stopped,
-                "(your uploads are stopped, and the versions on Agora are not changed)",
+                "(backing up is stopped, and your backup on Agora is not changed)",
             ),
             (
                 ChainKept::Uploading,
-                "(the versions already on Agora are not changed)",
+                "(the versions already in your backup on Agora are not changed)",
             ),
         ] {
             let root = crate::sealed::TestDir::new("accept-fork-notice");

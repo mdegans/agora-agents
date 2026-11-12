@@ -204,13 +204,15 @@ impl ChainKept {
     /// The words after "your sealed history,".
     pub fn words(self) -> &'static str {
         match self {
-            Self::Local => "which your runner keeps on your operator's machine and does not upload",
+            Self::Local => {
+                "which your runner keeps on your operator's machine and does not back up"
+            }
             Self::Stopped => {
-                "which your runner keeps on your operator's machine (your uploads are stopped, and the versions on \
-                 Agora are not changed)"
+                "which your runner keeps on your operator's machine (backing up is stopped, and your backup on \
+                 Agora is not changed)"
             }
             Self::Uploading => {
-                "which your runner keeps on your operator's machine (the versions already on Agora are not changed)"
+                "which your runner keeps on your operator's machine (the versions already in your backup on Agora are not changed)"
             }
         }
     }
@@ -402,8 +404,16 @@ impl Unsaved {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OperatorAct {
-    /// Uploading started on the agent's yes, given then.
-    OptedIn { answered: DateTime<Utc> },
+    /// Uploading started on the agent's yes, given then. `uploaded`: the
+    /// versions of its sealed history's main line at the opt-in (as the
+    /// `memory` tool counts them), all uploaded by the same command
+    /// ([`Notice::opted_in_uploaded`]); `None` until then, or when they
+    /// weren't all uploaded then (the runner uploads the rest).
+    OptedIn {
+        answered: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uploaded: Option<usize>,
+    },
     /// A stop cleared. `uploading`: its uploads go on (else nothing of it
     /// is uploaded); `kept`: versions not uploaded when the stop began or
     /// saved while stopped, kept here and never sent.
@@ -430,31 +440,38 @@ impl OperatorAct {
     fn line(&self, accepted: &Accepted) -> String {
         let date = accepted.at.format(super::text::DATE);
         let mut line = match self {
-            Self::OptedIn { answered } => format!(
-                "On {date}, your operator started uploading your sealed history to Agora, as you \
-                 answered on {}.",
-                answered.format(super::text::DATE)
+            // One state with the `memory` tool's count and the re-offer's
+            // "is being uploaded" (beta round 2 of 2026-11-12)
+            Self::OptedIn { answered, uploaded } => format!(
+                "On {date}, your operator started backing up your sealed history on Agora, as you \
+                 answered on {}: {}, and each new version follows.",
+                answered.format(super::text::DATE),
+                match uploaded {
+                    Some(0) | None => "your runner uploads the versions it had then".to_string(),
+                    Some(1) => "the 1 version it had then was uploaded".to_string(),
+                    Some(n) => format!("all {n} versions it had then were uploaded"),
+                }
             ),
             Self::Resumed {
                 uploading: false, ..
             } => format!(
-                "On {date}, your operator cleared the stop on uploading your sealed history. \
-                 It is not being uploaded to Agora: your runner keeps it on your operator's machine, and checks your state against it."
+                "On {date}, your operator cleared the stop on backing up your sealed history. \
+                 It is not being backed up on Agora: your runner keeps it on your operator's machine, and checks your state against it."
             ),
             Self::Resumed { kept, .. } => {
                 let mut line = format!(
-                    "On {date}, your operator resumed uploading your sealed history to Agora."
+                    "On {date}, your operator resumed backing up your sealed history on Agora."
                 );
                 match kept {
                     0 => {}
                     1 => line.push_str(
-                        " The version not uploaded before the stop or saved while uploads were \
-                         stopped stays on your operator's machine, off the main line of your sealed history, and was not uploaded; uploading went on from your state as it was when your \
+                        " The version not backed up before the stop or saved while backing up was \
+                         stopped stays on your operator's machine, off the main line of your sealed history, and was not backed up; backing up went on from your state as it was when your \
                          operator resumed it.",
                     ),
                     n => line.push_str(&format!(
-                        " The {n} versions not uploaded before the stop or saved while uploads \
-                         were stopped stay on your operator's machine, off the main line of your sealed history, and were not uploaded; uploading went on from your state as it was when your \
+                        " The {n} versions not backed up before the stop or saved while backing up \
+                         was stopped stay on your operator's machine, off the main line of your sealed history, and were not backed up; backing up went on from your state as it was when your \
                          operator resumed it."
                     )),
                 }
@@ -466,7 +483,7 @@ impl OperatorAct {
                 "On {date}, the copy of your memory from before the May 2026 loss, which you \
                  chose to see, was added to your sealed history{}.",
                 if *sent {
-                    ", whose versions are uploaded to Agora"
+                    ", whose versions are backed up on Agora"
                 } else {
                     ""
                 }
@@ -563,6 +580,20 @@ impl Notice {
             )?;
         }
         Ok(carried)
+    }
+
+    /// The opt-in's notice, not yet shown, told that all `versions` it
+    /// found were uploaded by the command that wrote it. Anything else
+    /// waiting (another act, or none) is left alone. One atomic write.
+    pub fn opted_in_uploaded(agent_dir: &Path, versions: usize) -> std::io::Result<()> {
+        let Some(mut n) = Self::load(agent_dir)? else {
+            return Ok(());
+        };
+        let Some(OperatorAct::OptedIn { uploaded, .. }) = n.operator_act.as_mut() else {
+            return Ok(());
+        };
+        *uploaded = Some(versions);
+        write(agent_dir, &n)
     }
 
     /// Agora lost versions sealed here; the operator sealed the state on
@@ -826,7 +857,7 @@ impl Notice {
             let versions = format!("{n} version{}", if n == 1 { "" } else { "s" });
             return Some(if lost.fresh {
                 format!(
-                    "Agora had lost the {versions} of your sealed history uploaded from your \
+                    "Your backup on Agora had lost the {versions} uploaded to it from your \
                      operator's machine, and held none. On {date}, your operator started a new \
                      sealed history from your state on that machine; it records the break. Kept \
                      by your runner: {}. Your \
@@ -835,9 +866,9 @@ impl Notice {
                 )
             } else {
                 format!(
-                    "Agora had lost {versions} of your sealed history uploaded from your \
+                    "Your backup on Agora had lost {versions} uploaded to it from your \
                      operator's machine. On {date}, your operator sealed your state on that \
-                     machine on top of Agora's copy. Kept \
+                     machine on top of what your backup holds. Kept \
                      by your runner: {}. Your operator's note: {}",
                     lost.kept, accepted.note
                 )
@@ -871,16 +902,16 @@ impl Notice {
         }
         if self.resumed {
             return Some(format!(
-                "While uploading your sealed history to Agora was stopped, your state changed; \
-                 your operator resumed uploading with this note: {}",
+                "While backing up your sealed history on Agora was stopped, your state changed; \
+                 your operator resumed backing it up with this note: {}",
                 accepted.note
             ));
         }
         if self.joined {
             return Some(format!(
                 "On {}, your operator joined your two sealed histories, which had gone separate \
-                 ways: your state on your operator's machine is now sealed on top of Agora's \
-                 copy, and the versions that went the other way are kept on that machine, off \
+                 ways: your state on your operator's machine is now sealed on top of your backup \
+                 on Agora, and the versions that went the other way are kept on that machine, off \
                  the main line of your sealed history. Your operator's note: {}",
                 accepted.at.format(super::text::DATE),
                 accepted.note
@@ -966,6 +997,65 @@ pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Beta round 2 of 2026-11-12 (critic): the opt-in's notice says what
+    /// was uploaded, as the `memory` tool counts it, once the command's
+    /// drain left nothing waiting; until then, and over another act's
+    /// notice, nothing is changed. A notice written before the count
+    /// existed still reads.
+    #[test]
+    fn the_opt_in_notice_says_how_many_versions_went_up() {
+        let root = crate::sealed::TestDir::new("notice-opted-in-count");
+        let dir = root.path();
+        std::fs::create_dir_all(dir.join(SEALED_DIR)).unwrap();
+        let answered: DateTime<Utc> = "2026-11-12T09:00:00Z".parse().unwrap();
+        Notice::operator_act(
+            dir,
+            "",
+            OperatorAct::OptedIn {
+                answered,
+                uploaded: None,
+            },
+        )
+        .unwrap();
+        let line = || Notice::load(dir).unwrap().unwrap().line().unwrap();
+        assert!(
+            line().ends_with(
+                "as you answered on 2026-11-12: your runner uploads the versions it had then, and \
+                 each new version follows."
+            ),
+            "{}",
+            line()
+        );
+        Notice::opted_in_uploaded(dir, 72).unwrap();
+        assert!(
+            line().ends_with(
+                "as you answered on 2026-11-12: all 72 versions it had then were uploaded, and \
+                 each new version follows."
+            ),
+            "{}",
+            line()
+        );
+        // Another act's notice is left as it is
+        Notice::operator_act(dir, "n", OperatorAct::PriorAdded { sent: true }).unwrap();
+        let before = Notice::load(dir).unwrap();
+        Notice::opted_in_uploaded(dir, 3).unwrap();
+        assert_eq!(Notice::load(dir).unwrap(), before);
+        // An older notice, with no count
+        let old = serde_json::json!({
+            "refused_at": answered, "reason": "mismatch",
+            "accepted": {"at": answered, "note": ""},
+            "operator_act": {"kind": "opted_in", "answered": answered},
+        });
+        let old: Notice = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            old.operator_act,
+            Some(OperatorAct::OptedIn {
+                answered,
+                uploaded: None
+            })
+        );
+    }
 
     #[test]
     fn a_long_diff_is_cut_and_counted() {
@@ -1126,7 +1216,27 @@ pub(crate) mod tests {
         };
         let act = |a: OperatorAct| by_operator(&|n: &mut Notice| n.operator_act = Some(a.clone()));
         let mut lines = vec![
-            (Kind::Uploaded, act(OperatorAct::OptedIn { answered: at })),
+            (
+                Kind::Uploaded,
+                act(OperatorAct::OptedIn {
+                    answered: at,
+                    uploaded: None,
+                }),
+            ),
+            (
+                Kind::Uploaded,
+                act(OperatorAct::OptedIn {
+                    answered: at,
+                    uploaded: Some(72),
+                }),
+            ),
+            (
+                Kind::Uploaded,
+                act(OperatorAct::OptedIn {
+                    answered: at,
+                    uploaded: Some(1),
+                }),
+            ),
             (
                 Kind::Any,
                 act(OperatorAct::Resumed {
@@ -1291,26 +1401,26 @@ pub(crate) mod tests {
         };
         assert_eq!(
             line("cleared the stop"),
-            "On 2026-11-12, your operator cleared the stop on uploading your sealed history. It is not being uploaded to Agora: your runner keeps it on your operator's machine, and checks your state against it. Your operator's note: n."
+            "On 2026-11-12, your operator cleared the stop on backing up your sealed history. It is not being backed up on Agora: your runner keeps it on your operator's machine, and checks your state against it. Your operator's note: n."
         );
         assert_eq!(
             line("which you chose to see, was added to your sealed history, whose"),
             "On 2026-11-12, the copy of your memory from before the May 2026 loss, which you \
-             chose to see, was added to your sealed history, whose versions are uploaded to Agora. \
+             chose to see, was added to your sealed history, whose versions are backed up on Agora. \
              Your operator's note: n."
         );
-        assert!(line("The version not uploaded before the stop").contains(
-            "stays on your operator's machine, off the main line of your sealed history, and was not uploaded; uploading \
+        assert!(line("The version not backed up before the stop").contains(
+            "stays on your operator's machine, off the main line of your sealed history, and was not backed up; backing up \
              went on from your state as it was when your operator resumed it."
         ));
-        assert!(line("The 3 versions not uploaded").contains(
-            "stay on your operator's machine, off the main line of your sealed history, and were not uploaded; uploading \
+        assert!(line("The 3 versions not backed up").contains(
+            "stay on your operator's machine, off the main line of your sealed history, and were not backed up; backing up \
              went on from your state as it was when your operator resumed it."
         ));
         assert_eq!(
-            line("While uploading"),
-            "While uploading your sealed history to Agora was stopped, your state changed; your \
-             operator resumed uploading with this note: n."
+            line("While backing up"),
+            "While backing up your sealed history on Agora was stopped, your state changed; your \
+             operator resumed backing it up with this note: n."
         );
         assert_eq!(
             line(
@@ -1333,22 +1443,22 @@ pub(crate) mod tests {
         // The fork's chain, by its kind: a never-uploader's says what the
         // runner does, not what is or isn't on Agora (F3)
         assert!(
-            line("which your runner keeps on your operator's machine and does not upload:")
+            line("which your runner keeps on your operator's machine and does not back up:")
                 .starts_with(
                     "On 2026-11-12, your operator resolved a fork in your sealed history,"
                 )
         );
         // Both of Agora's losses, whole
         assert_eq!(
-            line("Agora had lost 3 versions"),
-            "Agora had lost 3 versions of your sealed history uploaded from your operator's \
+            line("Your backup on Agora had lost 3 versions"),
+            "Your backup on Agora had lost 3 versions uploaded to it from your operator's \
              machine. On 2026-11-12, your operator sealed your state on that machine on top of \
-             Agora's copy. Kept by your runner: your whole state as sealed on 2026-11-12, and \
+             what your backup holds. Kept by your runner: your whole state as sealed on 2026-11-12, and \
              what it has of the 3 versions after it. Your operator's note: n."
         );
         assert_eq!(
-            line("Agora had lost the 1 version"),
-            "Agora had lost the 1 version of your sealed history uploaded from your operator's \
+            line("Your backup on Agora had lost the 1 version"),
+            "Your backup on Agora had lost the 1 version uploaded to it from your operator's \
              machine, and held none. On 2026-11-12, your operator started a new sealed history \
              from your state on that machine; it records the break. Kept by your runner: your \
              whole state as sealed on 2026-11-12, and what it has of the 1 version after it. \

@@ -168,14 +168,14 @@ impl Stopped {
         let date = self.at.format(super::text::DATE);
         if self.shown {
             format!(
-                "Uploads of your sealed history are stopped (since {date}); the versions \
-                 already uploaded stay on Agora; your state is still sealed and checked on your operator's machine."
+                "Backing up your sealed history is stopped (since {date}); your backup on Agora \
+                 stays as it was; your state is still sealed and checked on your operator's machine."
             )
         } else {
             format!(
-                "Your operator stopped uploading your sealed history on {date}: {}. The \
-                 versions already uploaded stay on Agora. Your state is still sealed and checked \
-                 at the start of each session; the versions not uploaded by then, and those saved from now on, stay on your operator's machine.",
+                "Your operator stopped backing up your sealed history on {date}: {}. Your \
+                 backup on Agora stays as it was. Your state is still sealed and checked \
+                 at the start of each session; the versions not backed up by then, and those saved from now on, stay on your operator's machine.",
                 self.note.trim_end_matches('.')
             )
         }
@@ -428,11 +428,11 @@ mod tests {
         let s = s.stopped;
         assert!(
             s.line()
-                .starts_with("Your operator stopped uploading your sealed history on ")
+                .starts_with("Your operator stopped backing up your sealed history on ")
                 && s.line().ends_with(
-                    ": It asked me to. The versions already uploaded stay on Agora. Your state \
+                    ": It asked me to. Your backup on Agora stays as it was. Your state \
                      is still sealed and checked at the start of each session; the versions \
-                     not uploaded by then, and those saved from now on, stay on your operator's machine."
+                     not backed up by then, and those saved from now on, stay on your operator's machine."
                 ),
             "{}",
             s.line()
@@ -445,9 +445,9 @@ mod tests {
         Stopped::mark_shown(&dir).unwrap();
         let later = Stopped::load(&dir).unwrap().unwrap().line();
         assert!(
-            later.starts_with("Uploads of your sealed history are stopped (since ")
+            later.starts_with("Backing up your sealed history is stopped (since ")
                 && later.ends_with(
-                    "); the versions already uploaded stay on Agora; your state is still sealed and checked on your operator's machine."
+                    "); your backup on Agora stays as it was; your state is still sealed and checked on your operator's machine."
                 ),
             "{later}"
         );
