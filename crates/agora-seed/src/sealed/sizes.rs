@@ -129,6 +129,33 @@ pub fn drop_lines(before: &Recorded, now: Sizes) -> Vec<(&'static str, u32, Stri
     out
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let before = Recorded {
+        entry_hash: Sha256Hex::from([1; 32]),
+        seq: 1,
+        state_at: "2026-11-05T09:00:00Z".parse().expect("a date"),
+        sizes: Sizes {
+            memory_chars: 1_000,
+            soul_chars: 1_000,
+        },
+    };
+    drop_lines(
+        &before,
+        Sizes {
+            memory_chars: 100,
+            soul_chars: 100,
+        },
+    )
+    .into_iter()
+    .map(|(_, _, line)| Text::new("sizes::drop_lines", To::Any, line))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -267,14 +267,10 @@ where
         );
         match (reoffered, act.is_some()) {
             (false, _) => None,
-            (true, true) => Some(
-                "Your operator has been told, and acts on your answer; you'll be told when it \
-                 has. Nothing changes by this answer alone.",
-            ),
-            (true, false) => Some(
-                "Your uploads already match this answer, so nothing needs to change; your \
-                 operator has been told.",
-            ),
+            // No claim that the operator was told: the alert above is
+            // not awaited, and may not be sent at all
+            (true, true) => Some(sealed_state::REOFFER_TO_ACT),
+            (true, false) => Some(sealed_state::REOFFER_NO_ACTION),
         }
     }
 

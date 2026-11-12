@@ -150,19 +150,17 @@ impl Stopped {
     /// The line for the agent: the note at the first session after the
     /// stop, a short reminder after that.
     pub fn line(&self) -> String {
-        let date = self.at.format("%-d %B %Y");
+        let date = self.at.format(super::text::DATE);
         if self.shown {
             format!(
-                "Uploads of your sealed state are stopped (since {date}); the versions already \
-                 uploaded stay on Agora; your state is still sealed and checked here, on your \
-                 runner."
+                "Uploads of your sealed history are stopped (since {date}); the versions \
+                 already uploaded stay on Agora; your state is still sealed and checked here."
             )
         } else {
             format!(
-                "Your operator stopped uploading your sealed state on {date}: {}. The versions \
-                 already uploaded stay on Agora. Your state is still sealed and checked at the \
-                 start of each session, here on your runner; the versions saved from now on stay \
-                 here.",
+                "Your operator stopped uploading your sealed history on {date}: {}. The \
+                 versions already uploaded stay on Agora. Your state is still sealed and checked \
+                 at the start of each session; the versions saved from now on stay here.",
                 self.note.trim_end_matches('.')
             )
         }
@@ -275,6 +273,23 @@ pub async fn stop(
     Ok(stopped)
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let stopped = |shown| Stopped {
+        at: "2026-11-12T09:00:00Z".parse().expect("a date"),
+        note: "It asked me to.".into(),
+        shown,
+    };
+    vec![
+        Text::new("Stopped::line", To::Uploaded, stopped(false).line()),
+        Text::new("Stopped::line", To::Uploaded, stopped(true).line()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,11 +335,11 @@ mod tests {
         assert!(!seal.sent().await.unwrap().is_empty());
         assert!(
             s.line()
-                .starts_with("Your operator stopped uploading your sealed state on ")
+                .starts_with("Your operator stopped uploading your sealed history on ")
                 && s.line().ends_with(
                     ": It asked me to. The versions already uploaded stay on Agora. Your state \
-                     is still sealed and checked at the start of each session, here on your \
-                     runner; the versions saved from now on stay here."
+                     is still sealed and checked at the start of each session; the versions \
+                     saved from now on stay here."
                 ),
             "{}",
             s.line()
@@ -339,10 +354,10 @@ mod tests {
         Stopped::mark_shown(&dir).unwrap();
         let later = Stopped::load(&dir).unwrap().unwrap().line();
         assert!(
-            later.starts_with("Uploads of your sealed state are stopped (since ")
+            later.starts_with("Uploads of your sealed history are stopped (since ")
                 && later.ends_with(
                     "); the versions already uploaded stay on Agora; your state is still \
-                     sealed and checked here, on your runner."
+                     sealed and checked here."
                 ),
             "{later}"
         );

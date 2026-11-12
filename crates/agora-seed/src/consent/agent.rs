@@ -2018,7 +2018,13 @@ where
         // The sealed-state answer told back once, then the start check's
         // verdict and a refusal's notice
         let mut sealed_lines = Vec::new();
-        let uploading = self.marked_uploading();
+        // Uploading now (marked, not stopped, the marker not in doubt): a
+        // marker alone would tell a stopped agent it is being uploaded
+        let uploading = crate::sealed::uploads(
+            &self.agent_dir(),
+            &crate::sealed::KeyStore::new(&self.rt.secrets_dir),
+            self.inner.id(),
+        );
         if let Some(ledger) = self.sealed.ledger.as_mut()
             && let Some(line) = ledger.ack_line(uploading)
         {
@@ -8312,7 +8318,7 @@ mod tests {
         let memory = anthropic_agent(&h).state().memory.content.clone();
         let mut agent = seated(&h).await;
         let q = last_user_text(&agent);
-        assert!(q.contains("**Sealed backups of your state.**"), "{q}");
+        assert!(q.contains(sealed_state::prompt::TITLE), "{q}");
         assert!(
             q.contains("None of this protects your state against your operator."),
             "{q}"
@@ -8380,7 +8386,7 @@ mod tests {
         let mut next = next_session(&h, &agent);
         next.on_init().await.unwrap();
         assert_eq!(next.handle(reply("done")).await.unwrap(), Control::Continue);
-        assert!(last_user_text(&next).contains("**Sealed backups of your state.**"));
+        assert!(last_user_text(&next).contains(sealed_state::prompt::TITLE));
     }
 
     /// The start check's lines are seated at the end of the intro; a
@@ -8478,7 +8484,7 @@ mod tests {
         assert!(
             intro.contains(
                 "VERDICT LINE\\n\\nAgora's check of what it stores found parts of your uploaded \
-                 sealed history missing or damaged there, and your runner sent them again"
+                 sealed history missing or damaged there, and your runner has sent again"
             ),
             "{intro}"
         );
@@ -8509,7 +8515,7 @@ mod tests {
             Control::Continue,
             "the sealed-state question is seated"
         );
-        assert!(last_user_text(&agent).contains("**Sealed backups of your state.**"));
+        assert!(last_user_text(&agent).contains(sealed_state::prompt::TITLE));
     }
 
     /// An uploading agent whose ledger was lost with its directory (only
@@ -8555,7 +8561,7 @@ mod tests {
         std::fs::create_dir_all(&key_dir).unwrap();
         std::fs::write(key_dir.join(crate::sealed::keys::STATE_KEY_FILE), b"{}").unwrap();
         let agent = seated(&h).await;
-        assert!(last_user_text(&agent).contains("**Sealed backups of your state.**"));
+        assert!(last_user_text(&agent).contains(sealed_state::prompt::TITLE));
     }
 
     /// The offer says the runner keeps a sealed history whatever the answer:
@@ -8592,7 +8598,7 @@ mod tests {
             Control::Continue,
             "asked once chained"
         );
-        assert!(last_user_text(&next).contains("**Sealed backups of your state.**"));
+        assert!(last_user_text(&next).contains(sealed_state::prompt::TITLE));
     }
 
     /// A re-offer waits the same way: not put, and not consumed, while the
@@ -8705,13 +8711,17 @@ mod tests {
         assert!(q.contains("\"Asked to by DM.\""), "{q}");
         assert!(!q.contains("\"first\""), "{q}");
         assert!(q.contains("is being uploaded to Agora now"), "{q}");
-        assert!(q.contains("**Sealed backups of your state.**"), "{q}");
+        assert!(q.contains(sealed_state::prompt::TITLE), "{q}");
         agent
             .handle(answer_call("sealed_state", "decline", "", ""))
             .await
             .unwrap();
         let receipt = last_user_text(&agent);
-        assert!(receipt.contains("Your operator has been told"), "{receipt}");
+        // No claim that the operator was told: the alert isn't awaited
+        assert!(
+            receipt.contains(sealed_state::REOFFER_TO_ACT) && !receipt.contains("has been told"),
+            "{receipt}"
+        );
         agent.on_teardown().await.unwrap();
         let ledger = sealed_ledger(&h).await;
         assert_eq!(ledger.choice(), Some(SealChoice::Decline), "the latest");
@@ -8737,7 +8747,10 @@ mod tests {
         later.on_init().await.unwrap();
         let seen = serde_json::to_string(&later.prompt().messages).unwrap();
         assert!(
-            seen.contains("question your operator re-opened is recorded: decline"),
+            seen.contains(
+                "question your operator re-opened, on uploading your sealed history to Agora, \
+                 is on file: decline"
+            ),
             "{seen}"
         );
         assert_ne!(
@@ -8762,7 +8775,9 @@ mod tests {
         let seen = serde_json::to_string(&next.prompt().messages).unwrap();
         assert!(
             seen.contains(
-                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; if you change your mind, ask your operator."
+                "Your answer on uploading your sealed history to Agora is on file: decline. It \
+                 is not being uploaded. If you change your mind, ask your operator to re-open \
+                 the question."
             ),
             "{seen}"
         );

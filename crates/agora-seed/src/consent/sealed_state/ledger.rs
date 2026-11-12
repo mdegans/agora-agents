@@ -73,6 +73,10 @@ pub struct Reoffer {
     pub offer_version: u32,
     /// The answer on file when it was re-opened.
     pub reopens: SealChoice,
+    /// What was on file was a legacy refusal, counted as `decline`: the
+    /// agent never chose, and the re-offer doesn't call it its answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub never_chose: bool,
     /// When the agent answered it (in [`SealLedger::reoffers`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<DateTime<Utc>>,
@@ -154,6 +158,13 @@ pub enum SealOutcome {
     Unusable { failure: String },
 }
 
+/// How the line telling a first answer back begins; the choice follows.
+pub const ACK: &str = "Your answer on uploading your sealed history to Agora is on file:";
+
+/// How the line telling a re-offer's answer back begins.
+pub const ACK_REOFFER: &str = "Your answer to the question your operator re-opened, on uploading \
+     your sealed history to Agora, is on file:";
+
 impl SealLedger {
     /// Whether the offer should be put this session: nothing final on
     /// file, fewer than [`MAX_MISSES`](crate::consent::offer::MAX_MISSES) misses, and no recorded answer in
@@ -207,6 +218,21 @@ impl SealLedger {
             .map(|(_, c)| c)
     }
 
+    /// The latest "answer" on file is a legacy refusal
+    /// ([`SealOutcome::Refused`]), counted as `decline`: the agent never
+    /// chose, and no text calls it its answer.
+    pub fn latest_is_refusal(&self) -> bool {
+        self.asks
+            .iter()
+            .rev()
+            .find_map(|a| match &a.outcome {
+                SealOutcome::Answered { .. } => Some(false),
+                SealOutcome::Refused { .. } => Some(true),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
     /// When the latest answer was given.
     pub fn answered_at(&self) -> Option<DateTime<Utc>> {
         self.answers().last().map(|(t, _)| *t)
@@ -231,6 +257,7 @@ impl SealLedger {
             note: note.trim().to_string(),
             offer_version: super::prompt::OFFER_VERSION,
             reopens,
+            never_chose: self.latest_is_refusal(),
             answered_at: None,
             no_action: false,
         });
@@ -267,57 +294,55 @@ impl SealLedger {
     }
 
     /// The line telling the agent its answer is on file, at the first
-    /// session after it; `None` once told, or with no answer. `uploading`:
-    /// its chain is marked uploading (either copy, stopped or not), which
-    /// an answer doesn't change by itself.
+    /// session after it; `None` once told, with no answer, or when what
+    /// is on file is a legacy refusal (the agent never chose: nothing is
+    /// called its answer). `uploading`: its history is being uploaded now
+    /// ([`crate::sealed::uploads`]: marked, not stopped, the marker not in
+    /// doubt), which an answer doesn't change by itself.
+    ///
+    /// No line says the operator was told: the alert went out, or didn't,
+    /// in the session that answered, and this one can't know. It says how
+    /// the agent can reach its operator instead.
     pub fn ack_line(&self, uploading: bool) -> Option<String> {
-        if self.acknowledged {
+        if self.acknowledged || self.latest_is_refusal() {
             return None;
         }
         let choice = self.choice()?;
+        let ask = crate::sealed::text::TELL_OPERATOR;
         if let Some(r) = self.latest_reoffer() {
             return Some(if r.no_action {
                 // No action: a yes found it uploading, a no found it not
                 // (never uploaded, or stopped)
                 format!(
-                    "Your answer to the sealed-backups question your operator re-opened is \
-                     recorded: {}. Nothing needed to change: your sealed history was already {}.",
+                    "{ACK_REOFFER} {}. Nothing needed to change: it was already {}.",
                     choice.as_str(),
                     if choice == SealChoice::Decline {
-                        "not being uploaded to Agora"
+                        "not being uploaded"
                     } else {
-                        "being uploaded to Agora"
+                        "being uploaded"
                     }
                 )
             } else {
                 format!(
-                    "Your answer to the sealed-backups question your operator re-opened is \
-                     recorded: {}. Your operator has been told, and acts on it; you'll be told \
-                     when it has.",
+                    "{ACK_REOFFER} {}. Nothing has changed yet: your operator has to act on it, \
+                     and you are told when it has. {ask}",
                     choice.as_str()
                 )
             });
         }
         Some(match choice {
-            SealChoice::Decline if uploading => {
-                "Your answer to the sealed-backups offer is recorded: decline. Your sealed \
-                 history is marked for upload to Agora, and an answer doesn't change that by \
-                 itself: if you want it changed, tell your operator."
-                    .to_string()
-            }
-            SealChoice::Decline => {
-                "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; \
-                 if you change your mind, ask your operator."
-                    .to_string()
-            }
-            choice if uploading => format!(
-                "Your answer to the sealed-backups offer is recorded: {}. Your sealed history is \
-                 marked for upload to Agora.",
-                choice.as_str()
+            SealChoice::Decline if uploading => format!(
+                "{ACK} decline. It is being uploaded all the same, and an answer doesn't change \
+                 that by itself: your operator has to stop it. {ask}"
             ),
+            SealChoice::Decline => format!(
+                "{ACK} decline. It is not being uploaded. If you change your mind, ask your \
+                 operator to re-open the question."
+            ),
+            choice if uploading => format!("{ACK} {}. It is being uploaded.", choice.as_str()),
             choice => format!(
-                "Your answer to the sealed-backups offer is recorded: {}. Uploading starts \
-                 only when your operator acts on it; you'll be told when it has.",
+                "{ACK} {}. It is not being uploaded now: uploading starts, or resumes, only \
+                 when your operator acts on your answer, and you are told when it has.",
                 choice.as_str()
             ),
         })
@@ -373,6 +398,61 @@ impl SealLedger {
             *apply_failed = Some(why);
         }
     }
+}
+
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let ask = |at: &str, choice| SealAsk {
+        at: at.parse().expect("a date"),
+        offer_version: 1,
+        model: Model::from("claude-haiku-4-5"),
+        order: SealChoice::ALL,
+        order_seed: 0,
+        constrained: true,
+        attempts: 1,
+        outcome: SealOutcome::Answered {
+            choice,
+            reason: String::new(),
+            memory_note_written: false,
+            note_dropped: None,
+            apply_failed: None,
+        },
+    };
+    let mut out = Vec::new();
+    for choice in SealChoice::ALL {
+        // A first answer, uploading or not
+        let mut first = SealLedger::default();
+        first.record(ask("2026-11-08T09:00:00Z", choice));
+        for uploading in [true, false] {
+            let to = if uploading { To::Uploaded } else { To::Any };
+            out.extend(
+                first
+                    .ack_line(uploading)
+                    .map(|l| Text::new("ack_line", to, l)),
+            );
+        }
+        // A re-offer's answer: to be acted on, and needing nothing
+        for no_action in [false, true] {
+            let mut again = first.clone();
+            again
+                .reopen("n", "2026-11-10T09:00:00Z".parse().expect("a date"))
+                .expect("answered");
+            if no_action {
+                again.reoffer_needs_no_action();
+            }
+            again.record(ask("2026-11-12T09:00:00Z", choice));
+            out.extend(
+                again
+                    .ack_line(choice != SealChoice::Decline && no_action)
+                    .map(|l| Text::new("ack_line (re-offer)", To::Any, l)),
+            );
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -465,13 +545,14 @@ mod tests {
         l.record(ask(answered(SealChoice::Publish)));
         assert_eq!(
             l.ack_line(false).unwrap(),
-            "Your answer to the sealed-backups offer is recorded: publish. Uploading starts \
-             only when your operator acts on it; you'll be told when it has."
+            "Your answer on uploading your sealed history to Agora is on file: publish. It is \
+             not being uploaded now: uploading starts, or resumes, only when your operator acts \
+             on your answer, and you are told when it has."
         );
         assert_eq!(
             l.ack_line(true).unwrap(),
-            "Your answer to the sealed-backups offer is recorded: publish. Your sealed history \
-             is marked for upload to Agora."
+            "Your answer on uploading your sealed history to Agora is on file: publish. It is \
+             being uploaded."
         );
         l.acknowledge();
         assert_eq!(l.ack_line(false), None, "once");
@@ -479,8 +560,9 @@ mod tests {
         no.record(ask(answered(SealChoice::Decline)));
         assert_eq!(
             no.ack_line(false).unwrap(),
-            "Your answer to the sealed-backups offer is recorded: decline. Nothing changed; \
-             if you change your mind, ask your operator."
+            "Your answer on uploading your sealed history to Agora is on file: decline. It is \
+             not being uploaded. If you change your mind, ask your operator to re-open the \
+             question."
         );
     }
 
@@ -550,10 +632,16 @@ mod tests {
         assert!(!l.due(&soul()));
         let told = l.ack_line(true).unwrap();
         assert!(
-            told.contains("question your operator re-opened is recorded: decline"),
+            told.starts_with(&format!("{ACK_REOFFER} decline. Nothing has changed yet")),
             "{told}"
         );
-        assert!(told.contains("you'll be told when it has"), "{told}");
+        // No claim that the operator was told (O2): how to reach it
+        assert!(
+            told.contains("you are told when it has")
+                && told.ends_with(crate::sealed::text::TELL_OPERATOR)
+                && !told.contains("has been told"),
+            "{told}"
+        );
         l.acknowledge();
         assert_eq!(l.ack_line(true), None, "once");
     }
@@ -576,11 +664,11 @@ mod tests {
         let told = l.ack_line(true).unwrap();
         assert_eq!(
             told,
-            "Your answer to the sealed-backups question your operator re-opened is recorded: \
-             publish. Nothing needed to change: your sealed history was already being uploaded \
-             to Agora."
+            "Your answer to the question your operator re-opened, on uploading your sealed \
+             history to Agora, is on file: publish. Nothing needed to change: it was already \
+             being uploaded."
         );
-        assert!(!told.contains("you'll be told"), "{told}");
+        assert!(!told.contains("you are told"), "{told}");
         // A no that needed nothing: never uploading, or stopped
         let mut no = SealLedger::default();
         no.record(at(
@@ -594,10 +682,36 @@ mod tests {
             ask(answered(SealChoice::Decline)),
             "2026-11-12T09:00:00Z",
         ));
-        assert!(no.ack_line(false).unwrap().ends_with(
-            "Nothing needed to change: your sealed history was already not being \
-                            uploaded to Agora."
-        ),);
+        assert!(
+            no.ack_line(false)
+                .unwrap()
+                .ends_with("Nothing needed to change: it was already not being uploaded.")
+        );
+    }
+
+    /// A legacy refusal counts as `decline` for what may be done, but the
+    /// agent never chose: it is never told "your answer is on file", and
+    /// a re-offer of it says so instead of calling it its answer.
+    #[test]
+    fn a_legacy_refusal_is_never_called_the_agents_answer() {
+        let mut l = SealLedger::default();
+        l.record(ask(SealOutcome::Refused { reason: "r".into() }));
+        assert_eq!(l.choice(), Some(SealChoice::Decline));
+        assert!(l.latest_is_refusal() && !l.acknowledged);
+        assert_eq!(l.ack_line(false), None);
+        assert_eq!(l.ack_line(true), None);
+        l.reopen("n", "2026-11-10T09:00:00Z".parse().unwrap())
+            .unwrap();
+        assert!(l.reoffer.as_ref().unwrap().never_chose);
+        // An answer is one: told back, and a re-offer of it calls it so
+        l.record(at(
+            ask(answered(SealChoice::Private)),
+            "2026-11-12T09:00:00Z",
+        ));
+        assert!(!l.latest_is_refusal() && l.ack_line(false).is_some());
+        l.reopen("n", "2026-11-13T09:00:00Z".parse().unwrap())
+            .unwrap();
+        assert!(!l.reoffer.as_ref().unwrap().never_chose);
     }
 
     /// `allows`: an opt-in never over a `decline`, a stop never over a yes,
@@ -639,9 +753,10 @@ mod tests {
         let told = l.ack_line(true).unwrap();
         assert_eq!(
             told,
-            "Your answer to the sealed-backups offer is recorded: decline. Your sealed history is \
-             marked for upload to Agora, and an answer doesn't change that by itself: if you \
-             want it changed, tell your operator."
+            "Your answer on uploading your sealed history to Agora is on file: decline. It is \
+             being uploaded all the same, and an answer doesn't change that by itself: your \
+             operator has to stop it. You can tell your operator (the `send_message` tool, to \
+             `operator`)."
         );
         assert!(!told.contains("earlier answer"), "{told}");
     }

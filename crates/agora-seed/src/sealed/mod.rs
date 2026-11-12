@@ -73,6 +73,7 @@ pub mod rotate;
 pub mod session;
 pub mod sizes;
 pub mod stop;
+pub mod text;
 pub mod uploading;
 pub mod version;
 

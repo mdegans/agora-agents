@@ -591,16 +591,35 @@ pub fn resign_record(
 
 /// What the agent is told is kept.
 pub fn kept_text(intent: &Intent) -> String {
-    let n = intent.items.len();
-    let records = format!(
-        "the records of {n} version{}",
-        if n == 1 { "" } else { "s" }
-    );
-    match intent.full_copy {
+    kept_words(intent.items.len(), intent.full_copy)
+}
+
+/// [`kept_text`], from its two facts: how many versions were set aside,
+/// and when the whole state the runner still holds was sealed, if it
+/// holds one. "What it has of" them: their signed entries always, their
+/// content only where its sealed files are still here.
+pub fn kept_words(n: usize, full_copy: Option<DateTime<Utc>>) -> String {
+    let s = if n == 1 { "" } else { "s" };
+    match full_copy {
         Some(at) => format!(
-            "the full copy of your state from {} and {records} after it",
-            at.format("%-d %B %Y")
+            "your whole state as sealed on {}, and what it has of the {n} version{s} after it",
+            at.format(super::text::DATE)
         ),
-        None => records,
+        None => format!("what it has of {n} version{s}"),
     }
+}
+
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let at = "2026-11-03T09:00:00Z".parse().ok();
+    vec![
+        Text::new("lost::kept_text", To::Uploaded, kept_words(1, None)),
+        Text::new("lost::kept_text", To::Uploaded, kept_words(4, None)),
+        Text::new("lost::kept_text", To::Uploaded, kept_words(1, at)),
+        Text::new("lost::kept_text", To::Uploaded, kept_words(4, at)),
+    ]
 }

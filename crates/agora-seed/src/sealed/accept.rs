@@ -2198,7 +2198,10 @@ mod tests {
     fn the_fork_notice_follows_where_the_chain_is() {
         use crate::sealed::notice::ChainKept;
         for (chain, words) in [
-            (ChainKept::Local, "(nothing of it is on Agora)"),
+            (
+                ChainKept::Local,
+                "which your runner keeps here and does not upload:",
+            ),
             (
                 ChainKept::Stopped,
                 "(your uploads are stopped, and the versions on Agora are not changed)",
