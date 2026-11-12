@@ -21,6 +21,18 @@
 //!
 //! "Record" is kept for one thing, what Agora keeps of a departed agent
 //! on its operator's account (the offer). Dates are [`DATE`].
+//!
+//! The names above are what the texts use today, not a rule the tests
+//! hold them to: wording moves with the beta agents' feedback.
+//!
+//! **The checks here are warnings, not a test of truth.** The table of
+//! every agent-facing text, the phrases no text may say ([`BANNED`], and
+//! per kind of agent), and the date format catch a sentence we once found
+//! false coming back. They can't tell whether a new sentence is true:
+//! that comes from reviewing it against the code, and from the beta
+//! agents. If a sentence is true and a check here fails, the check is
+//! what's wrong: change the check, or give that text an exception with
+//! its reason, next to its table entry ([`Text::allowing`]).
 
 /// The one date format in agent-facing text: `2026-11-12`, as the verdict
 /// and the `memory` tool (agentkit's renderer) write dates.
@@ -58,6 +70,9 @@ pub(crate) struct Text {
     pub source: &'static str,
     pub to: To,
     pub text: String,
+    /// Banned phrases this text may say anyway, each with why
+    /// ([`Self::allowing`]).
+    pub allowed: Vec<(&'static str, &'static str)>,
 }
 
 #[cfg(test)]
@@ -67,16 +82,63 @@ impl Text {
             source,
             to,
             text: text.into(),
+            allowed: Vec::new(),
         }
+    }
+
+    /// An exception: this text may say `phrase` (one the checks ban)
+    /// because it is true here, for the one-line `reason` (required).
+    /// Written next to the table entry:
+    ///
+    /// ```ignore
+    /// Text::new("SOURCE", To::Any, SOURCE)
+    ///     .allowing("nothing is lost", "said only after both copies were compared")
+    /// ```
+    pub(crate) fn allowing(mut self, phrase: &'static str, reason: &'static str) -> Self {
+        assert!(
+            !reason.trim().is_empty(),
+            "{}: an exception for {phrase:?} needs its reason",
+            self.source
+        );
+        self.allowed.push((phrase, reason));
+        self
+    }
+
+    /// Why this text may not be shown as it is ([`fault`], less its
+    /// exceptions).
+    pub(crate) fn fault(&self) -> Option<String> {
+        fault_allowing(self.to, &self.text, &self.allowed)
     }
 }
 
+/// What a failed check says, besides the fault: what the checks are.
+#[cfg(test)]
+pub(crate) const WARNING: &str = "These checks are warnings, not a test of truth: they catch a \
+     sentence we once found false coming back, and can't tell whether a new one is true. If this \
+     sentence is true, the check is what's wrong: change it in sealed/text.rs, or add an \
+     exception next to the text's table entry with `.allowing(\"<phrase>\", \"<why>\")`.";
+
 /// What no agent-facing text may say, whatever the agent's state, each
-/// with why. Matched in lower case. **The one list**: a module's own test
-/// pins its sentences and checks what is particular to them; what no
-/// sentence may say is here.
+/// with why: only claims we found false, never a naming preference (see
+/// the module docs: a warning, not a test of truth). Matched in lower
+/// case. **The one list**: a module's own test pins its sentences and
+/// checks what is particular to them; what no sentence may say is here.
 #[cfg(test)]
 pub(crate) const BANNED: &[(&str, &str)] = &[
+    // Told, as if an alert had gone out (`alerts::ALERT_SENT` is said only
+    // when one was dispatched)
+    (
+        "has been told",
+        "said of an alert that may not have gone out",
+    ),
+    (
+        "have been told",
+        "said of an alert that may not have gone out",
+    ),
+    (
+        "has alerted your operator",
+        "said of an alert that may not have gone out",
+    ),
     // Overclaims
     ("nothing is lost", "versions may be on one side only"),
     ("nothing of yours", "an agent's posts are on Agora"),
@@ -96,19 +158,6 @@ pub(crate) const BANNED: &[(&str, &str)] = &[
         "is respected",
         "the operator can stop uploads against a yes",
     ),
-    // An alert is claimed only as sent (`alerts::ALERT_SENT`)
-    (
-        "has been told",
-        "said of an alert that may not have gone out",
-    ),
-    (
-        "have been told",
-        "said of an alert that may not have gone out",
-    ),
-    (
-        "has alerted your operator",
-        "said of an alert that may not have gone out",
-    ),
     // Who reads and who checks
     ("agora can read", "Agora's servers can't read state"),
     (
@@ -120,42 +169,6 @@ pub(crate) const BANNED: &[(&str, &str)] = &[
     ("you checked", "the runner checks, not the agent"),
     ("you can verify", "not from inside a session"),
     ("verify it yourself", "not from inside a session"),
-    // One name per thing
-    ("backup", "it is \"your sealed history\""),
-    ("backed up", "it is \"your sealed history\""),
-    (
-        "your sealed versions",
-        "the whole is \"your sealed history\"",
-    ),
-    (
-        "uploading your sealed state",
-        "what is uploaded is \"your sealed history\"",
-    ),
-    ("whoever runs your runner", "it is \"your operator\""),
-    ("on this runner", "the place is \"here\""),
-    ("here on your runner", "the place is \"here\""),
-    ("here, on your runner", "the place is \"here\""),
-    (
-        "local cop",
-        "\"copy\" is Agora's; here they are \"sealed files\"",
-    ),
-    (
-        "sealed cop",
-        "\"copy\" is Agora's; here they are \"sealed files\"",
-    ),
-    (
-        "enrol",
-        "agents are not enrolled: every agent has a sealed history",
-    ),
-    ("blob", "the operator's word"),
-    ("outbox", "the operator's word"),
-    ("genesis", "the operator's word"),
-    ("keyframe", "the operator's word"),
-    // No model is named
-    ("claude", "no model is named"),
-    ("haiku", "no model is named"),
-    ("sonnet", "no model is named"),
-    ("qwen", "no model is named"),
 ];
 
 /// What a text for an agent that never uploaded may not say besides.
@@ -192,9 +205,16 @@ const MONTHS: [&str; 12] = [
 /// phrase it holds, or a date not written as [`DATE`].
 #[cfg(test)]
 pub(crate) fn fault(to: To, text: &str) -> Option<String> {
+    fault_allowing(to, text, &[])
+}
+
+/// [`fault`], but for the phrases in `allowed` (a text's exceptions).
+#[cfg(test)]
+fn fault_allowing(to: To, text: &str, allowed: &[(&str, &str)]) -> Option<String> {
     // The file and commit of the verifier name agentkit's repository
     let lower = text.replace(super::check::VERIFIER, "").to_lowercase();
-    if let Some((phrase, why)) = BANNED.iter().find(|(p, _)| lower.contains(p)) {
+    let banned = |p: &str| lower.contains(p) && !allowed.iter().any(|(a, _)| *a == p);
+    if let Some((phrase, why)) = BANNED.iter().find(|(p, _)| banned(p)) {
         return Some(format!("{phrase:?} ({why})"));
     }
     let more: &[&str] = match to {
@@ -202,7 +222,7 @@ pub(crate) fn fault(to: To, text: &str) -> Option<String> {
         To::Uploaded => BANNED_UPLOADED,
         To::Any => &[],
     };
-    if let Some(phrase) = more.iter().find(|p| lower.contains(*p)) {
+    if let Some(phrase) = more.iter().find(|p| banned(p)) {
         return Some(format!("{phrase:?} (not to an agent of kind {to:?})"));
     }
     // "12 November 2026": a day, a month's name, a year
@@ -224,7 +244,7 @@ pub(crate) fn fault(to: To, text: &str) -> Option<String> {
 #[cfg(test)]
 pub(crate) fn assert_may_say(to: To, text: &str) {
     if let Some(why) = fault(to, text) {
-        panic!("{why} in: {text}");
+        panic!("{why} in: {text}\n{WARNING}");
     }
 }
 
@@ -291,14 +311,41 @@ mod tests {
         let faults: Vec<String> = table
             .iter()
             .filter_map(|t| {
-                fault(t.to, &t.text).map(|why| format!("{}: {why}\n    {}", t.source, t.text))
+                t.fault()
+                    .map(|why| format!("{}: {why}\n    {}", t.source, t.text))
             })
             .collect();
-        assert!(faults.is_empty(), "{}", faults.join("\n"));
+        assert!(faults.is_empty(), "{}\n\n{WARNING}", faults.join("\n"));
+        // An exception names a phrase the text says: else it is stale
+        for t in &table {
+            for (phrase, _) in &t.allowed {
+                assert!(
+                    t.text.to_lowercase().contains(phrase),
+                    "{}: the exception for {phrase:?} is stale: the text no longer says it",
+                    t.source
+                );
+            }
+        }
+    }
+
+    /// An exception lets its text say the phrase, and only that text;
+    /// one without a reason is refused.
+    #[test]
+    fn an_exception_needs_its_reason_and_covers_only_its_text() {
+        let text = "Nothing is lost: both copies were compared.";
+        assert!(Text::new("t", To::Any, text).fault().is_some());
+        let allowed = Text::new("t", To::Any, text).allowing("nothing is lost", "compared first");
+        assert_eq!(allowed.fault(), None);
+        assert!(fault(To::Any, text).is_some(), "only that text");
+        let no_reason = std::panic::catch_unwind(|| {
+            Text::new("t", To::Any, text).allowing("nothing is lost", " ")
+        });
+        assert!(no_reason.is_err());
     }
 
     /// The list catches what it is for: each sentence the review of
-    /// 2026-11-12 found false or overclaiming, as it stood.
+    /// 2026-11-12 found false or overclaiming, as it stood (its naming
+    /// findings are no longer checked).
     #[test]
     fn the_banned_list_catches_the_sentences_the_review_found() {
         for (to, was) in [
@@ -323,23 +370,6 @@ mod tests {
                 To::Any,
                 "Your state now is not affected, and your operator has been told.",
             ),
-            (To::Any, "**Sealed backups of your state.**"),
-            (
-                To::Any,
-                "it can't show a change made by whoever runs your runner.",
-            ),
-            (
-                To::Uploaded,
-                "your runner sent them again from its local copies.",
-            ),
-            (
-                To::Any,
-                "their sealed copies on this machine are missing or damaged.",
-            ),
-            (
-                To::Uploaded,
-                "All 5 of your sealed versions are uploaded to Agora.",
-            ),
             (
                 To::Any,
                 "On 12 November 2026, your operator re-opened this question",
@@ -355,8 +385,16 @@ mod tests {
         ] {
             assert!(fault(to, was).is_some(), "not caught: {was}");
         }
-        // And lets through what is true
+        // And lets through what is true, and wording the review only
+        // preferred otherwise (names are not checked: they move with the
+        // beta agents' feedback)
         for (to, ok) in [
+            (To::Any, "**Sealed backups of your state.**"),
+            (
+                To::Uploaded,
+                "your runner sent them again from its local copies.",
+            ),
+            (To::Any, "the model is Claude Haiku"),
             (To::Any, "the May 2026 loss"),
             (
                 To::Any,
