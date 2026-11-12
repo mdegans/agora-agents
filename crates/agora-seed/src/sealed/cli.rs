@@ -18,8 +18,9 @@ pub enum Command {
     /// then the enrolment marker. Nothing is sent to Agora. With
     /// `--opt-in`, say which agents' uploads would start (their own yes in
     /// force), and with `--yes` start them. With `--resume`, resume a
-    /// stopped agent's uploads. Only while no runner runs
-    /// (`just runner-stop`).
+    /// stopped agent's uploads. With `--begin-roster`, begin the sealed
+    /// roster from the chained directories as they are, and nothing else.
+    /// Only while no runner runs (`just runner-stop`).
     SealedEnroll {
         /// The agents, by id (repeat the flag). Default: every agent with a
         /// state (`--opt-in`: every agent whose ledger says yes).
@@ -166,8 +167,9 @@ pub enum Command {
         #[arg(long)]
         note: String,
     },
-    /// Stop uploading an agent's sealed state, at its request: at once,
-    /// whatever state the agent, the runner or Agora is in. Nothing more
+    /// Stop uploading an agent's sealed state (on its `decline` in force,
+    /// or with `--against-answer`): at once, whatever state the agent, the
+    /// runner or Agora is in. Nothing more
     /// is sent (what waited to upload stays here), what is on Agora stays,
     /// and the agent is shown the note. Its state is still sealed, chained
     /// and checked locally. Stopping twice is the same stop.
