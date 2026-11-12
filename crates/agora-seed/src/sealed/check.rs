@@ -519,7 +519,7 @@ pub const LOCAL_CHECKED_BY: &str = "Checked by your runner with";
 /// What a record on the same machine shows, and what it can't: said in
 /// every local verdict, once.
 pub const LOCAL_LIMITS: &str = "A history kept on the same machine as your state catches a state \
-     changed or lost by accident; it proves nothing against your operator, who holds this machine \
+     changed or lost by accident; it proves nothing against your operator, who holds that machine \
      and your keys.";
 
 /// For an agent whose uploading marker is in doubt, after
@@ -4716,7 +4716,7 @@ pub(crate) mod tests {
         assert_eq!(
             LOCAL_LIMITS,
             "A history kept on the same machine as your state catches a state changed or lost by \
-             accident; it proves nothing against your operator, who holds this machine and your \
+             accident; it proves nothing against your operator, who holds that machine and your \
              keys."
         );
         assert_eq!(
