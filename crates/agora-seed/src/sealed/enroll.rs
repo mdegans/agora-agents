@@ -258,8 +258,6 @@ pub enum Skip {
     Chained,
     #[error("no state here")]
     NoState,
-    #[error("a session is in progress, or an interrupted one's journal is there")]
-    InSession,
     #[error("not chained yet")]
     NotChained,
     /// Uploads start or resume only on the agent's yes in force
@@ -290,7 +288,6 @@ impl Skip {
         match self {
             Self::Chained => "already_chained",
             Self::NoState => "no_state",
-            Self::InSession => "in_session",
             Self::NotChained => "not_chained",
             Self::NotOptedIn(_) => "not_opted_in",
             Self::Stopped => "stopped",
@@ -1436,9 +1433,19 @@ impl Enroller {
                  first; nothing was sent"
             )));
         }
-        if super::session::no_session(&self.state_dir, id, false).is_err() {
-            return Err(Skip::InSession);
-        }
+        // The agent's session lock for the rest of the opt-in, whatever its
+        // session journal says (`session::take_idle`'s reasoning): this
+        // command holds `runner.lock` exclusively, so the lock alone shows
+        // no session is live, and a journal an interrupted session left is
+        // not state (left untouched; the agent is still told at its next
+        // session). Its `sealed/lock` is taken where each write needs it
+        let _session =
+            super::session::agent_lock(&self.state_dir, id).map_err(|e| match e
+                .downcast_ref::<super::session::Busy>()
+            {
+                Some(_) => Skip::Busy,
+                None => Skip::Failed(e.context("taking the agent's session lock")),
+            })?;
         let head = seal
             .head()
             .await
@@ -1672,7 +1679,9 @@ impl Enroller {
             }
         }
         let uploading = super::uploading::is_uploading(&agent_dir, &self.keys, id);
-        let lock = super::session::take(&self.state_dir, id, false).await?;
+        // Whatever its journal says (`session::take_idle`): this command
+        // holds `runner.lock` exclusively, and a journal is not state
+        let lock = super::session::take_idle(&self.state_dir, id).await?;
         let head = seal.head().await?.with_context(|| {
             format!(
                 "agent {id} is stopped but its sealed/head.json is missing: nothing to resume onto"
@@ -2486,6 +2495,58 @@ pub(crate) mod tests {
             matches!(out, crate::sealed::check::Outcome::Run { hold: None, .. }),
             "{out:?}"
         );
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
+    }
+
+    /// A leftover journal strands an agent in none of the operator's
+    /// commands: `rotate-keys`, `--opt-in --yes` and `--resume` each take
+    /// its session lock and act, leaving the journal as it was (its next
+    /// session is still told). Each refused it before (`no_session`); a
+    /// live session (its lock held) is still refused.
+    #[tokio::test]
+    async fn a_leftover_journal_strands_no_operator_command() {
+        let root = crate::sealed::TestDir::new("journal-commands");
+        let api = fake::guarded(&root);
+        let (id, keys, dir) = agent(&root, &["a", "b"]).await;
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        let before = leave_journal(&root, id).await;
+        let journal = FsStorage::new(root.join("state")).journal(id);
+        // A live session holds its lock: every command refuses
+        {
+            let _live = crate::sealed::session::agent_lock(&root.join("state"), id).unwrap();
+            answer(&dir, SealChoice::Private);
+            assert!(matches!(e.opt_in(&api, id).await, Err(Skip::Busy)));
+            assert!(
+                crate::sealed::rotate::rotate_keys(
+                    &root.join("state"),
+                    &keys,
+                    &api,
+                    id,
+                    true,
+                    false
+                )
+                .await
+                .is_err()
+            );
+        }
+        crate::sealed::rotate::rotate_keys(&root.join("state"), &keys, &api, id, true, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
+        e.opt_in(&api, id).await.unwrap();
+        assert!(crate::sealed::uploads(&dir, &keys, id));
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
+        // Uploaded, then stopped
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        crate::sealed::stop::stop(&root.join("state"), &keys, id, "It asked.")
+            .await
+            .unwrap();
+        e.resume(id, None).await.unwrap();
+        assert!(crate::sealed::uploads(&dir, &keys, id));
         assert_eq!(std::fs::read(journal.path()).unwrap(), before);
     }
 

@@ -370,8 +370,10 @@ pub async fn rotate_keys(
         );
     }
     // No session in progress: one would sign with a key retired under it.
-    // An enrolled agent's lock is held for the whole command.
-    super::session::no_session(state_dir, id, false)?;
+    // The agent's session lock, held for the whole command, shows it: this
+    // command holds `runner.lock` exclusively, so a journal beside the
+    // state is one an interrupted session left, not a live one
+    // (`session::take_idle`), and is left untouched.
     let enrolled = super::is_enrolled(&agent_dir);
     // A chain `sealed-enroll` began and didn't finish (a head, no chain
     // marker): the pre-flight and the re-sign below are for chained
@@ -383,12 +385,10 @@ pub async fn rotate_keys(
          marker): a rotation now would strand the entries already sealed. Finish it first with \
          `agora-seed sealed-enroll --agent {id}`, then rotate. Nothing was written or sent"
     );
-    // The session lock either way (`take` holds it for a chained one)
+    // The session lock either way (`take_idle` holds it and `sealed/lock`
+    // for a chained one)
     let _lock = if enrolled {
-        (
-            Some(super::session::take(state_dir, id, false).await?),
-            None,
-        )
+        (Some(super::session::take_idle(state_dir, id).await?), None)
     } else {
         (None, Some(super::session::agent_lock(state_dir, id)?))
     };
@@ -1042,19 +1042,21 @@ pub(crate) mod tests {
         assert!(keys.trusted(id).unwrap().is_some());
     }
 
-    /// Never while the agent has a session journal.
+    /// Never while a session holds the agent (its session lock). A
+    /// journal alone, which an interrupted session leaves, no longer
+    /// refuses it (`session::take_idle`; the enrolment's test
+    /// `a_leftover_journal_strands_no_operator_command`).
     #[tokio::test]
-    async fn rotation_refuses_while_a_session_is_in_progress() {
+    async fn rotation_refuses_while_a_session_holds_the_agent() {
         let root = crate::sealed::TestDir::new("rotate-session");
         let (id, keys, _) = enrolled(&root).await;
         let state_dir = root.join("state");
-        let journal = FsStorage::new(&state_dir).journal(id);
-        std::fs::write(journal.path(), b"{}\n").unwrap();
+        let _live = super::super::session::agent_lock(&state_dir, id).unwrap();
         let e = rotate_keys(&state_dir, &keys, &FakeApi::new(), id, true, false)
             .await
             .unwrap_err()
             .to_string();
-        assert!(e.contains("session in progress"), "{e}");
+        assert!(e.contains("held by another process"), "{e}");
         assert!(keys.next_secrets(id).unwrap().is_none(), "nothing written");
     }
 
