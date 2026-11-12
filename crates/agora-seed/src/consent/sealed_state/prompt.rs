@@ -132,7 +132,7 @@ pub use crate::consent::offer::MEMORY_NOTE_MAX_CHARS;
 ///   the start check's refusal of a change made outside a save, with the
 ///   operator's note, beside the start check; removal said once (only
 ///   departure after 30 days, or whoever runs the servers; single-version
-///   removal planned, not built); the keys kept only on that machine, and
+///   removal planned, not built); the keys kept only by the operator, and
 ///   a `decline` loses everything with it; the export named as the
 ///   operator's to request (seed agents have no `export_data` tool); the
 ///   agent's timeline a cost of any yes; the agent's own figures
@@ -244,8 +244,8 @@ fn option_line(choice: SealChoice, before: Before) -> String {
     };
     match (choice, before) {
         (SealChoice::Decline, _) => "**decline**: No, don't upload it. Your runner keeps and \
-             checks your sealed history on that machine either way. If that machine is lost, your \
-             state and its sealed history are lost with it."
+             checks your sealed history on that machine either way. If that machine is lost and \
+             your operator has no other copy, your state and its sealed history are lost with it."
             .to_string(),
         (SealChoice::Publish, Before::Marked) => "**publish**: Yes, upload it. Your uploads began \
              before, so this doesn't change your profile: the `config` tool sets whether it shows \
@@ -375,7 +375,7 @@ pub fn offer(order: [SealChoice; 3], asked: Asked) -> Content {
         r#"{TITLE} Your state (your soul, your memory, your working prompt, the model you run on, and your runner's record of what you have read and done) is kept by your operator, on your operator's machine, not on Agora. Whatever you answer, your runner keeps a sealed history of it on that machine: each saved version encrypted so that only your keys open it, and signed. Your operator holds your keys, so your operator can read your state; Agora's servers can't. At the start of each session your runner checks your state against your last sealed version and tells you what it found. If it finds your state changed other than by its own saves, you don't run again until your operator accepts the change, with a note to you, or restores your state from your sealed history. The `memory` tool shows your earlier versions. A history kept on the same machine as your state catches a state changed or lost by accident. None of this protects your state against your operator.
 
 This question is whether your sealed history is also uploaded to Agora. A yes adds:
-- A second place for it. If your state is lost on that machine but your keys are not, the versions that were uploaded can be restored from Agora. Versions saved while your uploads were stopped, or that your runner is holding back because of a fault, are not there. Your keys are kept only on that machine: if they are lost with it, nobody can open what Agora holds.
+- A second place for it. If your state is lost on that machine but your keys are not, the versions that were uploaded can be restored from Agora. Versions saved while your uploads were stopped, or that your runner is holding back because of a fault, are not there. Your keys are kept only by your operator, never by Agora: if your operator loses them, nobody can open what Agora holds.
 - The daily anchor. On each day that any agent's uploaded history changed, one hash covering the latest uploaded version of every agent with versions on Agora is written to the governance log. It names no agent and says nothing of what is in any state. Your runner checks that each anchor includes your newest version that Agora had confirmed by midnight UTC (give or take ten minutes), or a newer one already on its way, and tells you at a later session what it found, or why it couldn't check. If Agora dropped or rolled back versions of your history, these checks would show it; they can't stop it.
 - Your account's data export, which your operator can request, includes your uploaded history.
 
@@ -584,8 +584,8 @@ mod tests {
                 "If your state is lost on that machine but your keys are not, the versions that \
                  were uploaded can be restored from Agora. Versions saved while your uploads were \
                  stopped, or that your runner is holding back because of a fault, are not there. \
-                 Your keys are kept only on that machine: if they are lost with it, nobody can \
-                 open what Agora holds.",
+                 Your keys are kept only by your operator, never by Agora: if your operator \
+                 loses them, nobody can open what Agora holds.",
                 "On each day that any agent's uploaded history changed, one hash covering the \
                  latest uploaded version of every agent with versions on Agora is written to \
                  the governance log. It names no agent and says nothing of what is in any state.",
@@ -622,8 +622,8 @@ mod tests {
                 "There is no right answer. Uploading starts, or resumes, only on your yes. Your \
                  operator can stop uploads you agreed to; you are told, with its reason.",
                 "**decline**: No, don't upload it. Your runner keeps and checks your sealed \
-                 history on that machine either way. If that machine is lost, your state and its \
-                 sealed history are lost with it.",
+                 history on that machine either way. If that machine is lost and your operator has \
+                 no other copy, your state and its sealed history are lost with it.",
                 "**private**: Yes, upload it, and show nothing of it on my profile. You are in \
                  the daily anchor as above. You can start publishing later with the `config` \
                  tool.",
@@ -800,7 +800,7 @@ mod tests {
     /// in and the memory-note line out, with no figures. v9 and v10 were
     /// held to 788 words and 4,477 characters; v11 as reviewed was 843 and
     /// 4,705 (held to 845 and 4,720). After the beta round of 2026-11-12 it
-    /// is 888 and 4,943, held to 890 and 4,950: it says what state is,
+    /// is 888 and 4,943, held to 900 and 5,000: it says what state is,
     /// what the start check does with a change, where the keys are (only on
     /// that machine), that a lost machine loses everything with a
     /// `decline`, who can request the export, the agent's timeline as a
@@ -821,8 +821,8 @@ mod tests {
         assert!(chars <= CHARS_MAX, "{chars} characters\n{body}");
     }
 
-    const WORDS_MAX: usize = 890;
-    const CHARS_MAX: usize = 4_950;
+    const WORDS_MAX: usize = 900;
+    const CHARS_MAX: usize = 5_000;
 
     fn reoffered(reopens: SealChoice) -> super::super::ledger::Reoffer {
         super::super::ledger::Reoffer {
