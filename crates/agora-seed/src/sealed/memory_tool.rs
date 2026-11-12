@@ -137,16 +137,19 @@ pub fn enrollment_sentence(earliest: &str, began: Option<&str>) -> String {
 
 /// What `log` says once a session of a chain whose beginning is on record
 /// ([`super::enroll::chain_began`]): that day, and that the versions up to
-/// it were sealed then, from the runner's own copies. The main line's
-/// versions dated before then are among those (each later one was saved
-/// after it); the pre-loss copy, beside the line, may have been added
-/// later ([`prior_line`] says when), so it is not claimed.
+/// it were sealed then, from the runner's own copies. Its versions dated
+/// before then are among those: each later one was saved after it, and a
+/// version off the main line was sealed after the chain began, so one
+/// dated before it was sealed by that enrolment too (set aside later). The
+/// pre-loss copy is not a "version" here: [`prior_line`] says when it was
+/// added. The start check's verdict says it in the same words
+/// ([`super::check::verdict_line`]'s `began`).
 pub fn chain_began_line(began: chrono::NaiveDate) -> String {
     let began = began.format(super::text::DATE);
     format!(
-        "Your sealed history began on {began}. The versions on its main line dated before then \
-         were sealed together when it began, from copies your runner had kept, so it can't show \
-         any change made to them before that date."
+        "Your sealed history began on {began}: the versions dated before then were sealed \
+         together that day, from copies your runner had kept, so it can't show any change made \
+         to them before then."
     )
 }
 
@@ -162,13 +165,17 @@ pub fn side_line(n: usize, after_count: bool) -> Option<String> {
         _ => ("s", "them"),
     };
     let left_out = if after_count {
-        format!("; the count above leaves {them} out")
+        format!(", and the count above leaves {them} out")
     } else {
         String::new()
     };
+    // Said as what they are, once (beta round 2 of 2026-11-12: "a branch
+    // it no longer follows" and "main line" were undefined): the tool's
+    // labels name the line it continues from "your main line"
     Some(format!(
-        "Your runner also holds {n} sealed version{s} on a branch your sealed history no longer \
-         follows, which this tool labels off your main line or set aside{left_out}."
+        "Your runner also holds {n} sealed version{s} on a line your sealed history no longer \
+         continues from (for example, one of two lines that went separate ways from one \
+         version); this tool labels {them} off your main line or set aside{left_out}."
     ))
 }
 
@@ -2008,14 +2015,16 @@ mod tests {
         }
         assert_eq!(
             side_line(1, true).unwrap(),
-            "Your runner also holds 1 sealed version on a branch your sealed history no longer \
-             follows, which this tool labels off your main line or set aside; the count above \
-             leaves it out."
+            "Your runner also holds 1 sealed version on a line your sealed history no longer \
+             continues from (for example, one of two lines that went separate ways from one \
+             version); this tool labels it off your main line or set aside, and the count \
+             above leaves it out."
         );
         assert_eq!(
             side_line(2, false).unwrap(),
-            "Your runner also holds 2 sealed versions on a branch your sealed history no longer \
-             follows, which this tool labels off your main line or set aside."
+            "Your runner also holds 2 sealed versions on a line your sealed history no longer \
+             continues from (for example, one of two lines that went separate ways from one \
+             version); this tool labels them off your main line or set aside."
         );
         for (uploaded, local) in [(0, 1), (0, 9)] {
             let t = line(uploaded, local).unwrap();

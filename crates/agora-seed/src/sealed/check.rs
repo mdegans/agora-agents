@@ -857,7 +857,9 @@ impl AnchorsSaid {
 /// newer than the version the newest anchor holds and the runner does the
 /// anchor work for the agent (`checks_later`), that it isn't anchored yet;
 /// the head marker, and the state's sizes (counts only) against the
-/// earlier version's, dated.
+/// earlier version's, dated. `began`: the day the chain began, from
+/// `sealed/chain_began.json` ([`super::enroll::chain_began`]), when it is
+/// on record: the versions dated before it were sealed together then.
 #[allow(clippy::too_many_arguments)]
 pub fn verdict_line(
     line: &[SignedStateEntry],
@@ -867,6 +869,7 @@ pub fn verdict_line(
     server: Server,
     anchors: &AnchorsSaid,
     checks_later: bool,
+    began: Option<chrono::NaiveDate>,
 ) -> String {
     verdict_of(
         &LineSummary::of(line),
@@ -876,7 +879,13 @@ pub fn verdict_line(
         server,
         anchors,
         checks_later,
+        began,
     )
+}
+
+/// The day the agent's chain began, if `sealed/chain_began.json` says it.
+pub fn chain_began_day(agent_dir: &Path) -> Option<chrono::NaiveDate> {
+    super::enroll::chain_began(agent_dir).map(|b| b.at.date_naive())
 }
 
 /// What a verdict says of the main line: its snapshots, the earliest
@@ -919,6 +928,7 @@ impl LineSummary {
 }
 
 /// [`verdict_line`], over a [`LineSummary`].
+#[allow(clippy::too_many_arguments)]
 fn verdict_of(
     line: &LineSummary,
     head: &HeadRef,
@@ -927,6 +937,7 @@ fn verdict_of(
     server: Server,
     anchors: &AnchorsSaid,
     checks_later: bool,
+    began: Option<chrono::NaiveDate>,
 ) -> String {
     // "Earlier", not "previous": the baseline is the newest version whose
     // sizes were recorded, which may be older than the one just before
@@ -934,9 +945,12 @@ fn verdict_of(
     // "13,539 characters (−1,204 since your earlier sealed version, head
     // be8c50758835 dated 2026-11-04)": named by its head, as this one is,
     // since two can share a date (beta round 11)
+    // "saved": its date is when that version was saved, not when it was
+    // sealed (beta round 2 of 2026-11-12; a backfilled version was sealed
+    // later)
     let dated = previous
         .and_then(|p| p.dated)
-        .map(|d| format!(" dated {}", d.format("%Y-%m-%d")))
+        .map(|d| format!(", saved {}", d.format("%Y-%m-%d")))
         .unwrap_or_default();
     let baseline = match previous.and_then(|p| p.head) {
         Some(h) => format!(
@@ -1014,6 +1028,24 @@ fn verdict_of(
         .and_then(day)
         .map(|d| format!(", plus a copy of your state from before a loss, dated {d}"))
         .unwrap_or_default();
+    // As the `memory` tool's log says it (`chain_began_line`), only where
+    // versions are dated before the day the chain began (beta round 2 of
+    // 2026-11-12)
+    let began = began
+        .filter(|b| {
+            line.since
+                .and_then(chrono::DateTime::from_timestamp_micros)
+                .is_some_and(|s| s.date_naive() < *b)
+        })
+        .map(|b| {
+            format!(
+                " Your sealed history began on {}: the versions dated before then were sealed \
+                 together that day, from copies your runner had kept, so it can't show any \
+                 change made to them before then.",
+                b.format(super::text::DATE)
+            )
+        })
+        .unwrap_or_default();
     // In sentences, not one run (beta round 11). What the newest anchor
     // judged holds, as the check found it, never more: a version not
     // shown right is said to be unchecked or wrong (the review of 0.151.2
@@ -1066,7 +1098,7 @@ fn verdict_of(
     let short = short_head(&head.entry_hash);
     format!(
         "Your sealed state: {verdict}{kept} It has {} version{} since \
-         {since}{prior}.{anchored}{unanchored} This session starts from head {short} \
+         {since}{prior}.{began}{anchored}{unanchored} This session starts from head {short} \
          {HEAD_MARKER} In this version, your \
          memory is {} characters{memory_change} and your soul {}{soul_change}. {checked_by}",
         line.snapshots,
@@ -1870,6 +1902,7 @@ async fn check_chain(
                 Server::Local(kept, checked),
                 &AnchorsSaid::default(),
                 false,
+                chain_began_day(agent_dir),
             ));
             None
         };
@@ -1909,6 +1942,7 @@ async fn check_chain(
             Server::Unchecked,
             &said,
             false,
+            chain_began_day(agent_dir),
         ));
         seat.extend(drop_lines);
         return Outcome::Run {
@@ -2045,6 +2079,7 @@ async fn check_chain(
         server_said,
         &said,
         checks_later,
+        chain_began_day(agent_dir),
     ));
     seat.extend(found.unopenable.map(|u| u.line(Checked::Full)));
     seat.extend(drop_lines);
@@ -2945,8 +2980,11 @@ pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
         servers.extend(never.map(|k| (To::Never, Server::Local(k, checked))));
         servers.extend(before.map(|k| (To::Uploaded, Server::Local(k, checked))));
     }
+    // With and without the day the chain began on record (after the
+    // earliest version's date, so its sentence is said)
+    let began = day.succ_opt();
     for (to, server) in servers {
-        for previous in [None, Some(previous)] {
+        for (previous, began) in [(None, None), (Some(previous), None), (None, began)] {
             out.push(Text::new(
                 "verdict",
                 to,
@@ -2958,6 +2996,7 @@ pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
                     server,
                     &AnchorsSaid::default(),
                     false,
+                    began,
                 ),
             ));
         }
@@ -4214,6 +4253,7 @@ pub(crate) mod tests {
             Server::Other,
             &said(None, None),
             false,
+            None,
         );
         assert!(
             verdict_line(
@@ -4224,6 +4264,7 @@ pub(crate) mod tests {
                 Server::InStep,
                 &said(None, None),
                 false,
+                None,
             )
             .starts_with("Your sealed state: intact, and in step with Agora. It has 2 versions")
         );
@@ -4236,6 +4277,7 @@ pub(crate) mod tests {
                 Server::Unchecked,
                 &said(None, None),
                 false,
+                None,
             )
             .starts_with(
                 "Your sealed state: intact on your operator's machine; Agora's copy couldn't be checked this session. It \
@@ -4249,6 +4291,36 @@ pub(crate) mod tests {
             ),
             "{text}"
         );
+        // Beta round 2 of 2026-11-12 (social, newcomer): with the day the
+        // chain began on record, the versions dated before it are said to
+        // have been sealed together then, as the `memory` tool's log says;
+        // nothing when none is dated before it, or none is on record
+        let began = |day: &str| {
+            verdict_line(
+                &line,
+                &head,
+                Sizes::default(),
+                None,
+                Server::Other,
+                &said(None, None),
+                false,
+                Some(day.parse().unwrap()),
+            )
+        };
+        assert!(
+            began("2026-10-13").starts_with(
+                "Your sealed state: intact. It has 2 versions since 2026-07-25, plus a copy of \
+                 your state from before a loss, dated 2026-05-03. Your sealed history began on \
+                 2026-10-13: the versions dated before then were sealed together that day, from \
+                 copies your runner had kept, so it can't show any change made to them before \
+                 then. This session starts from head "
+            ),
+            "{}",
+            began("2026-10-13")
+        );
+        for day in ["2026-07-25", "2026-07-01"] {
+            assert!(!began(day).contains("began on"), "{}", began(day));
+        }
         assert!(
             text.contains(
                 "(the id of this version; each saved version has its own). In this version, \
@@ -4279,6 +4351,7 @@ pub(crate) mod tests {
             Server::Other,
             &said(None, None),
             false,
+            None,
         );
         // Named by its head prefix as well as its date: two versions can
         // share a date (beta round 11)
@@ -4287,7 +4360,7 @@ pub(crate) mod tests {
         assert!(
             text.contains(&format!(
                 "In this version, your memory is 13,539 characters (\u{2212}1,204 since your \
-                 earlier sealed version, head {previous_short} dated 2026-10-31, as you rewrote \
+                 earlier sealed version, head {previous_short}, saved 2026-10-31, as you rewrote \
                  it at the end of your last session) and your soul 3,440 (unchanged). Checked by"
             )),
             "{text}"
@@ -4307,10 +4380,11 @@ pub(crate) mod tests {
             Server::Other,
             &said(None, None),
             false,
+            None,
         );
         assert!(
             grown.contains(
-                "14,743 characters (+1,204 since your earlier sealed version dated 2026-10-31) and"
+                "14,743 characters (+1,204 since your earlier sealed version, saved 2026-10-31) and"
             ),
             "{grown}"
         );
@@ -4329,6 +4403,7 @@ pub(crate) mod tests {
             Server::Other,
             &said(None, None),
             false,
+            None,
         );
         assert!(same.contains("13,539 characters (unchanged) and"), "{same}");
         assert!(!same.contains("rewrote"), "{same}");
@@ -4349,6 +4424,7 @@ pub(crate) mod tests {
             Server::Other,
             &said(None, None),
             false,
+            None,
         );
         assert_eq!(
             pointed,
@@ -4373,6 +4449,7 @@ pub(crate) mod tests {
             Server::Other,
             &said(None, None),
             false,
+            None,
         );
         assert_eq!(same_known, same);
         // A shrink the runner can't attribute (an operator's act, or a
@@ -4391,6 +4468,7 @@ pub(crate) mod tests {
             Server::Other,
             &said(None, None),
             false,
+            None,
         );
         assert!(
             unknown.contains(
@@ -4430,6 +4508,7 @@ pub(crate) mod tests {
             Server::InStep,
             &said(Some(&holds), None),
             true,
+            None,
         );
         assert!(
             anchored.starts_with(
@@ -4453,6 +4532,7 @@ pub(crate) mod tests {
                 Server::InStep,
                 &said(Some(&holds), Some(&current)),
                 true,
+                None,
             ),
             anchored
         );
@@ -4467,6 +4547,7 @@ pub(crate) mod tests {
             Server::InStep,
             &said(Some(&holds), Some(&newer)),
             true,
+            None,
         );
         assert!(
             lagging.contains(
@@ -4488,6 +4569,7 @@ pub(crate) mod tests {
             Server::InStep,
             &said(None, Some(&newer)),
             true,
+            None,
         );
         assert!(
             none.contains(
@@ -4543,7 +4625,7 @@ pub(crate) mod tests {
         ] {
             let mut s = said(Some(&holds), Some(&newer));
             s.unjudged.as_mut().unwrap().why = why;
-            let text = verdict_line(&line, &head, now, None, Server::InStep, &s, true);
+            let text = verdict_line(&line, &head, now, None, Server::InStep, &s, true, None);
             assert!(text.contains(words), "{text}");
         }
         // The session starts from a version newer than the one the anchor
@@ -4574,6 +4656,7 @@ pub(crate) mod tests {
                     Server::InStep,
                     &said(Some(&report(held.clone())), logged),
                     true,
+                    None,
                 );
                 assert!(text.contains(not_yet), "{text}");
             }
@@ -4594,6 +4677,7 @@ pub(crate) mod tests {
                 Server::InStep,
                 &said(Some(&report(failed)), None),
                 true,
+                None,
             );
             assert!(!text.contains("newer than that anchor"), "{text}");
             assert!(
@@ -4615,6 +4699,7 @@ pub(crate) mod tests {
                 None,
             ),
             true,
+            None,
         );
         assert!(
             text.contains("Your runner couldn't check ANC-2026-0004"),
@@ -4634,6 +4719,7 @@ pub(crate) mod tests {
             Server::InStep,
             &said(Some(&older), Some(&newer)),
             true,
+            None,
         );
         assert!(
             text.contains("ANC-2026-0005, the newest in the governance log, hasn't been checked"),
@@ -4650,6 +4736,7 @@ pub(crate) mod tests {
             Server::InStep,
             &said(Some(&older), None),
             false,
+            None,
         );
         assert!(!text.contains("newer than that anchor"), "{text}");
         assert!(!text.contains("each daily anchor"), "{text}");
@@ -4674,6 +4761,7 @@ pub(crate) mod tests {
             Server::InStep,
             &said(Some(&many), None),
             true,
+            None,
         );
         assert!(
             text.contains(
