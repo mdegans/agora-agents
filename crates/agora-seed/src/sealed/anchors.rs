@@ -255,16 +255,12 @@ impl AnchorsFile {
     }
 }
 
-/// A temporary file beside `path`, fsynced, renamed over it, and the
-/// directory fsynced: a crash leaves the old file or the new, whole.
+/// [`super::write_private`]: a uniquely named temporary beside `path`,
+/// 0600, fsynced, renamed over it, and the directory fsynced. A crash
+/// leaves the old file or the new, whole; a file written with wider
+/// permissions before is replaced by this write.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().expect("in sealed/");
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("writing");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::File::open(&tmp)?.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    std::fs::File::open(dir)?.sync_all()
+    super::write_private(path, bytes)
 }
 
 /// Why a pass stopped before judging every anchor. Ids and hashes only.
@@ -1439,6 +1435,9 @@ pub(crate) mod tests {
         let api = FakeApi::new();
         chose(&dir, SealChoice::Private).await;
         let mut l = SealLedger::load(&dir).await.unwrap();
+        // To its operator's re-offer: the only way a later answer is in force
+        l.reopen("asked", chrono::Utc::now() + chrono::Duration::seconds(4))
+            .unwrap();
         l.record(SealAsk {
             at: chrono::Utc::now() + chrono::Duration::seconds(5),
             offer_version: 9,

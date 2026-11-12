@@ -239,6 +239,13 @@ impl api::UploadGate for SealedEnrolment {
     fn may_read(&self, id: AgentId) -> bool {
         uploading::has_uploaded(&self.state_dir.join(id.to_string()), &self.keys, id)
     }
+
+    fn may_maintain_keys(&self, id: AgentId) -> bool {
+        matches!(
+            uploading::state(&self.state_dir.join(id.to_string()), &self.keys, id),
+            uploading::Marker::Uploading(_)
+        )
+    }
 }
 
 /// A scratch directory for tests, removed on drop. Synthetic state only.

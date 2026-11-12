@@ -355,10 +355,23 @@ pub async fn rotate_keys(
         signing || encryption,
         "name what to rotate: --signing, --encryption, or both"
     );
+    let agent_dir = state_dir.join(id.to_string());
+    // An uploading marker in doubt: the runner can't tell whether Agora
+    // holds a chain of the agent, so nothing is sent or written until its
+    // operator settles it
+    if super::check::Upload::of(&agent_dir, keys, id) == super::check::Upload::InDoubt {
+        anyhow::bail!(
+            "agent {id}'s uploading marker is in doubt (sealed/uploading and its copy in the \
+             secrets tree disagree, or can't be read): nothing was sent and nothing written. \
+             Check its answer on file (`sealed_state.json`), then settle it: `agora-seed \
+             sealed-stop --agent {id} --note \"…\"` if it is not to upload, or `agora-seed \
+             sealed-enroll --opt-in --agent {id} --yes` if its answer in force is yes; then \
+             run this again. Never copy a marker by hand"
+        );
+    }
     // No session in progress: one would sign with a key retired under it.
     // An enrolled agent's lock is held for the whole command.
     super::session::no_session(state_dir, id, false)?;
-    let agent_dir = state_dir.join(id.to_string());
     let enrolled = super::is_enrolled(&agent_dir);
     // The session lock either way (`take` holds it for a chained one)
     let _lock = if enrolled {
@@ -1373,15 +1386,9 @@ pub(crate) mod tests {
         *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
         uploaded(&dir, id, &api).await;
         let on_agora = api.chain.lock().unwrap().clone().unwrap();
-        crate::sealed::stop::stop(
-            &root.join("state"),
-            &keys,
-            id,
-            "It asked",
-            Box::pin(async { Ok(()) }),
-        )
-        .await
-        .unwrap();
+        crate::sealed::stop::stop(&root.join("state"), &keys, id, "It asked")
+            .await
+            .unwrap();
         saves(&dir, id, &keys, 2).await;
         let old = keys.signing(id).unwrap().verifying_key();
         let done = rotate_keys(&root.join("state"), &keys, &api, id, true, true)
@@ -1613,15 +1620,9 @@ pub(crate) mod tests {
             let api = crate::sealed::api::fake::guarded(&root);
             *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
             uploaded(&dir, id, &api).await;
-            crate::sealed::stop::stop(
-                &root.join("state"),
-                &keys,
-                id,
-                "It asked",
-                Box::pin(async { Ok(()) }),
-            )
-            .await
-            .unwrap();
+            crate::sealed::stop::stop(&root.join("state"), &keys, id, "It asked")
+                .await
+                .unwrap();
             saves(&dir, id, &keys, 2).await;
             let mut sent: Vec<_> = std::fs::read_dir(dir.join("sealed/sent"))
                 .unwrap()

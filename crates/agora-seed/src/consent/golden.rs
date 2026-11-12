@@ -174,7 +174,11 @@ fn the_sealed_state_ledger_loads_and_saves_back() {
         &l.asks[2].outcome,
         SealOutcome::Answered { choice: SealChoice::Private, reason, .. } if reason == "Safer."
     ));
-    assert_eq!(l.choice(), Some(SealChoice::Private));
+    // The refusal is its first answer (a `decline`). The `private` after
+    // it was given with no question open (no re-offer on file): kept, and
+    // never in force
+    assert_eq!(l.choice(), Some(SealChoice::Decline));
+    assert!(l.in_force().starts_uploads().is_err());
     assert!(l.acknowledged);
     assert!(!l.due(&soul()));
 }

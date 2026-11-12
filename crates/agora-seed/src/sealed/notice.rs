@@ -398,16 +398,10 @@ impl Unsaved {
 pub enum OperatorAct {
     /// Uploading started on the agent's yes, given then.
     OptedIn { answered: DateTime<Utc> },
-    /// Uploading started although its latest answer is `decline`.
-    OptedInAgainst,
     /// A stop cleared. `uploading`: its uploads go on (else nothing of it
-    /// is uploaded); `kept`: versions saved while stopped, kept here and
-    /// never sent; `against`: its latest answer is `decline`.
-    Resumed {
-        uploading: bool,
-        kept: usize,
-        against: bool,
-    },
+    /// is uploaded); `kept`: versions not uploaded when the stop began or
+    /// saved while stopped, kept here and never sent.
+    Resumed { uploading: bool, kept: usize },
     /// The pre-loss copy it chose to see added to its history; `sent`:
     /// uploaded with it.
     PriorAdded { sent: bool },
@@ -435,10 +429,6 @@ impl OperatorAct {
                  answered on {}.",
                 answered.format("%-d %B %Y")
             ),
-            Self::OptedInAgainst => format!(
-                "On {date}, your operator started uploading your sealed state to Agora, \
-                 although your answer on file is `decline`."
-            ),
             Self::Resumed {
                 uploading: false, ..
             } => format!(
@@ -446,26 +436,23 @@ impl OperatorAct {
                  Your sealed history is not being uploaded to Agora: it is kept and checked \
                  here, on your runner."
             ),
-            Self::Resumed { kept, against, .. } => {
+            Self::Resumed { kept, .. } => {
                 let mut line = format!(
-                    "On {date}, your operator resumed uploading your sealed state to Agora{}.",
-                    if *against {
-                        ", although your answer on file is `decline`"
-                    } else {
-                        ""
-                    }
+                    "On {date}, your operator resumed uploading your sealed state to Agora."
                 );
                 match kept {
                     0 => {}
                     1 => line.push_str(
-                        " The version of your state saved while uploads were stopped is kept \
-                         here on your runner and was not uploaded; uploading went on from your \
-                         state as it was when your operator resumed it.",
+                        " The version of your state not uploaded before the stop or saved \
+                         while uploads were stopped is kept here on your runner and was not \
+                         uploaded; uploading went on from your state as it was when your \
+                         operator resumed it.",
                     ),
                     n => line.push_str(&format!(
-                        " The {n} versions of your state saved while uploads were stopped are \
-                         kept here on your runner and were not uploaded; uploading went on from \
-                         your state as it was when your operator resumed it."
+                        " The {n} versions of your state not uploaded before the stop or saved \
+                         while uploads were stopped are kept here on your runner and were not \
+                         uploaded; uploading went on from your state as it was when your \
+                         operator resumed it."
                     )),
                 }
                 line
@@ -1084,13 +1071,11 @@ mod tests {
         let act = |a: OperatorAct| by_operator(&|n: &mut Notice| n.operator_act = Some(a.clone()));
         let mut lines = vec![
             (Kind::Uploaded, act(OperatorAct::OptedIn { answered: at })),
-            (Kind::Uploaded, act(OperatorAct::OptedInAgainst)),
             (
                 Kind::Any,
                 act(OperatorAct::Resumed {
                     uploading: false,
                     kept: 0,
-                    against: false,
                 }),
             ),
             (Kind::Local, act(OperatorAct::PriorAdded { sent: false })),
@@ -1110,7 +1095,6 @@ mod tests {
                 act(OperatorAct::Resumed {
                     uploading: true,
                     kept,
-                    against: false,
                 }),
             ));
         }
@@ -1185,7 +1169,7 @@ mod tests {
              chose to see, was added to your sealed history, whose versions are uploaded to Agora. \
              Your operator's note: n."
         );
-        assert!(line("The version of your state saved while uploads").contains(
+        assert!(line("The version of your state not uploaded before the stop").contains(
             "is kept here on your runner and was not uploaded; uploading went on from your state \
              as it was when your operator resumed it."
         ));

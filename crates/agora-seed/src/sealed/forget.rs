@@ -500,15 +500,9 @@ mod tests {
                     seal.mark_sent(item.ord).await.unwrap();
                 }
                 if stopped {
-                    crate::sealed::stop::stop(
-                        &state_dir,
-                        &keys,
-                        id,
-                        "It asked",
-                        Box::pin(async { Ok(()) }),
-                    )
-                    .await
-                    .unwrap();
+                    crate::sealed::stop::stop(&state_dir, &keys, id, "It asked")
+                        .await
+                        .unwrap();
                 }
                 let kept = root.join("kept");
                 std::fs::rename(&dir, &kept).unwrap();

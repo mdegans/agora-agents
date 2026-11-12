@@ -1295,15 +1295,9 @@ mod tests {
         let api = FakeApi::new();
         on_agora(&api, &dir, id).await;
         let state_dir = root.join("state");
-        crate::sealed::stop::stop(
-            &state_dir,
-            &keys,
-            id,
-            "It asked",
-            Box::pin(async { Ok(()) }),
-        )
-        .await
-        .unwrap();
+        crate::sealed::stop::stop(&state_dir, &keys, id, "It asked")
+            .await
+            .unwrap();
         assert!(
             keys.agent_dir(id)
                 .join(crate::sealed::stop::DURABLE)
