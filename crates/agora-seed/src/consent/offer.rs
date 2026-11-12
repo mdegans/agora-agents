@@ -105,7 +105,7 @@ impl OfferKind {
             Self::Role => "your role",
             Self::Cadence => "your session schedule",
             Self::MemoryRestore => "your memory from before 5 May 2026",
-            Self::SealedState => "sealed backups of your state",
+            Self::SealedState => "uploading your sealed history to Agora",
         }
     }
 }

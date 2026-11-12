@@ -2651,7 +2651,7 @@ async fn sealed_start_check(
             refused.insert(*id);
         }
     }
-    found.settle(&ctx).await;
+    found.settle(&ctx, &mut run).await;
     run.outstanding = scan.refused.difference(&refused).count();
     pool.retain(|(id, _)| !refused.contains(id));
     run
@@ -2684,7 +2684,9 @@ struct StartFound {
 }
 
 impl StartFound {
-    async fn settle(self, ctx: &StartCheck<'_>) {
+    /// `run`'s seats get the unopenable alert's outcome: each agent named
+    /// in it is told whether its operator was sent it.
+    async fn settle(self, ctx: &StartCheck<'_>, run: &mut SealedRun) {
         if let Err(e) = sealed::roster::vouch_all(ctx.data_dir, &self.vouches).await {
             tracing::error!(
                 event_type = "sealed_roster_unwritten",
@@ -2697,7 +2699,17 @@ impl StartFound {
             ctx.alerts.notify(alert);
         }
         if let Some(alert) = sealed::check::unopenable_summary(&self.unopenable) {
-            ctx.alerts.notify(alert);
+            // Awaited, and each agent told what came of it
+            let sent = ctx.alerts.dispatch(alert, alerts::TELL_TIMEOUT).await;
+            for (id, _, _) in &self.unopenable {
+                if let Some(seat) = run.seats.get_mut(id) {
+                    sealed::check::say_told_after(
+                        &mut seat.lines,
+                        sealed::check::UNOPENABLE_LINE,
+                        sent,
+                    );
+                }
+            }
         }
     }
 }
@@ -2854,14 +2866,23 @@ async fn check_agent(
                 }
                 found.dropped.push((id, name.clone(), drops));
             }
+            let mut seat = seat;
             if let Some(hold) = hold {
                 // Every start while held, rate-limited by the alerter
                 let held = agora_agentkit::state::storage::AgentSeal::new(&dir, id)
                     .held()
                     .await
                     .ok();
-                ctx.alerts
-                    .notify(sealed::check::hold_alert(hold, id, &name, held.as_ref()));
+                // Awaited: the agent is told what came of it, never that
+                // its operator was told when no mail went out
+                let sent = ctx
+                    .alerts
+                    .dispatch(
+                        sealed::check::hold_alert(hold, id, &name, held.as_ref()),
+                        alerts::TELL_TIMEOUT,
+                    )
+                    .await;
+                sealed::check::say_told(&mut seat, hold, sent);
                 run.held.push(id);
             }
             // Asked of Agora only for an agent that uploads
@@ -3191,7 +3212,7 @@ async fn reload_one<S: Storage>(
             skipped,
         )
         .await;
-        found.settle(ctx).await;
+        found.settle(ctx, sealed_run).await;
         if !runs {
             // The refusal rule has run: this agent's alerts go now
             for r in &sealed_run.refused[refused..] {
@@ -4552,12 +4573,11 @@ mod tests {
         );
         // The stop line's wording (`sealed/stop.rs`)
         assert!(
-            seat.lines[0].starts_with("Your operator stopped uploading your sealed state on ")
+            seat.lines[0].starts_with("Your operator stopped uploading your sealed history on ")
                 && seat.lines[0].ends_with(
                     ": It asked. The versions already uploaded stay on Agora. Your state is \
-                     still sealed and checked at the start of each session, here on your \
-                     runner; the versions not uploaded by then, and those saved from now on, \
-                     stay here."
+                     still sealed and checked at the start of each session; the versions not \
+                     uploaded by then, and those saved from now on, stay here."
                 ),
             "{:?}",
             seat.lines
@@ -4579,7 +4599,8 @@ mod tests {
         .await;
         assert!(!run.seats[&id].stop_note);
         assert!(
-            run.seats[&id].lines[0].starts_with("Uploads of your sealed state are stopped (since ")
+            run.seats[&id].lines[0]
+                .starts_with("Uploads of your sealed history are stopped (since ")
         );
         // A state changed by hand while stopped is refused, as anyone's
         FsStorage::new(&state_dir)
@@ -4977,6 +4998,59 @@ mod tests {
         assert!(api.calls.lock().unwrap().is_empty());
     }
 
+    /// An agent whose uploads are held is told its operator was sent an
+    /// alert only when the mail went out; with alerts off, or inside the
+    /// rate limit, it is told no alert was sent (O2).
+    #[tokio::test]
+    async fn a_held_agent_is_told_of_the_alert_only_as_sent() {
+        let root = sealed::TestDir::new("main-sealed-hold-told");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        sealed::anchors::tests::uploaded(&dir, id).await;
+        let state_dir = root.join("state");
+        // Agora's chain holds nothing of what was uploaded from here
+        let api = sealed::api::fake::FakeApi::new();
+        *api.chain.lock().unwrap() = Ok(Vec::new());
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let sent = alerts::testing::Recorder::default();
+        let on = alerts::testing::recording(&root, &sent);
+        let mut told = Vec::new();
+        // On; on again inside the rate limit; off
+        for alerter in [&on, &on, &alerts::Alerter::off()] {
+            let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+            let mut pool = vec![(id, tarn)];
+            let run = sealed_start_check(
+                &mut pool,
+                &loaded.sealed,
+                &root,
+                &state_dir,
+                &keys,
+                &api,
+                alerter,
+                false,
+                &mut Vec::new(),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(run.held, vec![id]);
+            let line = run.seats[&id]
+                .lines
+                .iter()
+                .find(|l| l.contains(sealed::check::HEAD_MISSING_LINE))
+                .unwrap_or_else(|| panic!("{:?}", run.seats[&id].lines))
+                .clone();
+            assert!(!line.contains("has been told"), "{line}");
+            told.push(line.ends_with(alerts::ALERT_SENT));
+            if !line.ends_with(alerts::ALERT_SENT) {
+                assert!(line.ends_with(alerts::ALERT_NOT_SENT), "{line}");
+            }
+        }
+        assert_eq!(told, [true, false, false]);
+        assert_eq!(sent.sent().len(), 1, "one mail, awaited");
+    }
+
     /// The start check judges an in-step agent's anchors before any
     /// session (beta round 12), and a failure it finds goes to the
     /// operator then, once; the verdict seated says it
@@ -5368,8 +5442,9 @@ mod tests {
         assert!(!left_dir.exists(), "nothing recreated for leftover keys");
         assert!(
             run.seats[&id].lines[0].starts_with(
-                "Your sealed state: intact, checked against the record your runner keeps on this \
-                 machine. Nothing of your state is on Agora."
+                "Your sealed state: intact, checked against your sealed history, which your \
+                 runner keeps here, on your operator's machine. Your runner does not upload it, \
+                 and its files show no version of it ever uploaded to Agora."
             ),
             "{:?}",
             run.seats[&id].lines
@@ -6478,8 +6553,8 @@ mod session_lock_tests {
         assert!(
             line.starts_with("Your state from your session on ")
                 && line.ends_with(
-                    "could not be saved; your operator keeps a copy of it, and this session \
-                     starts from your state as it was before that session."
+                    "could not be saved; your runner kept it in a file for your operator, and \
+                     this session starts from your state as it was before that session."
                 ),
             "{line}"
         );

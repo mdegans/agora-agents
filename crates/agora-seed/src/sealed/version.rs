@@ -574,6 +574,15 @@ pub async fn drop_acknowledged_blobs(seal: &AgentSeal) {
     }
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    vec![Text::new("version::UNREACHABLE", To::Uploaded, UNREACHABLE)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

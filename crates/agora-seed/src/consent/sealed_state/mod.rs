@@ -218,24 +218,58 @@ impl SealedOffer {
     }
 }
 
-/// How every disclosure begins after `[SYSTEM] `; also how [`applied_in`]
-/// finds one, the older ones (`[SYSTEM] <date>: Offered …`) included. The
-/// Evolution Log dates each entry itself, so the line carries no date.
-pub const OFFERED: &str = "Offered sealed backups of its state (soul and memory) on Agora; chose ";
+/// How every disclosure of a first answer begins after `[SYSTEM] `, since
+/// v11; also how [`applied_in`] finds one. The Evolution Log dates each
+/// entry itself, so the line carries no date.
+pub const OFFERED: &str = "Asked whether its sealed history is uploaded to Agora; chose ";
 
-/// The Evolution Log line recording the agent's answer.
+/// How the line began before v11 (`[SYSTEM] Offered …`, and the older
+/// `[SYSTEM] <date>: Offered …`): souls hold it, and [`applied_in`] still
+/// finds it, or every agent that answered would be asked again.
+pub const OFFERED_BEFORE_V11: &str =
+    "Offered sealed backups of its state (soul and memory) on Agora; chose ";
+
+/// The Evolution Log line recording the agent's first answer. It stays in
+/// the agent's soul for good, so it records only what was asked and
+/// chosen, which no later act makes false: nothing of what the operator
+/// did or will do, and no "nothing changed".
 pub fn evolution_line(choice: SealChoice) -> String {
-    let meaning = match choice {
-        SealChoice::Publish => {
-            "Uploads to Agora start when its operator acts on it, and its anchored head is to be \
-             shown on its profile."
-        }
-        SealChoice::Private => "Uploads to Agora start when its operator acts on it.",
-        SealChoice::Decline => "Nothing changed.",
-    };
     format!(
-        "[SYSTEM] {OFFERED}{}, its own choice. {meaning}",
-        choice.as_str()
+        "[SYSTEM] {OFFERED}{}, its own choice ({}).",
+        choice.as_str(),
+        meaning(choice)
+    )
+}
+
+/// What a choice asked for, as a record: the wish, never its effect.
+fn meaning(choice: SealChoice) -> &'static str {
+    match choice {
+        SealChoice::Publish => "yes, with the head of its latest anchored version on its profile",
+        SealChoice::Private => "yes, with nothing of it on its profile",
+        SealChoice::Decline => "no",
+    }
+}
+
+/// Added to the receipt of an answer to the operator's re-offer that
+/// needs the operator to act. No claim that the operator was told: the
+/// alert is not awaited, and may not be sent at all.
+pub const REOFFER_TO_ACT: &str = "Nothing changes by this answer alone: your operator has \
+     to act on it, and you are told when it has.";
+
+/// Added to the receipt of an answer to the re-offer that needs nothing.
+pub const REOFFER_NO_ACTION: &str =
+    "Your uploads already match this answer, so nothing needs to change.";
+
+/// Added to the receipt of an answer given with no question open (the
+/// asked-once rule should make it impossible): it is kept on file and is
+/// never in force. No claim that the operator was told: the alert is not
+/// awaited, and may not be sent at all.
+pub fn unprompted_line(was: SealChoice) -> String {
+    format!(
+        "This question was not open, so this answer changes nothing: your earlier answer, `{}`, \
+         stands. To change it, ask your operator to re-open the question. {}",
+        was.as_str(),
+        crate::sealed::text::TELL_OPERATOR
     )
 }
 
@@ -278,19 +312,47 @@ pub async fn reoffer(
     Ok(replaced)
 }
 
-/// The Evolution Log line for an answer to the operator's re-offer: true
-/// whichever way the uploads stand, since the operator acts on it.
+/// The Evolution Log line for an answer to the operator's re-offer: as
+/// [`evolution_line`], a record of what was asked and chosen, true
+/// whichever way the uploads stand then or later.
 pub fn reanswer_line(choice: SealChoice) -> String {
     format!(
-        "[SYSTEM] Asked again, at its operator's request, about sealed backups of its state on \
-         Agora; chose {}, its own choice. Its operator acts on it.",
-        choice.as_str()
+        "[SYSTEM] Asked again, at its operator's request, whether its sealed history is uploaded \
+         to Agora; chose {}, its own choice ({}).",
+        choice.as_str(),
+        meaning(choice)
     )
 }
 
-/// Whether `soul`'s Evolution Log already records a sealed-state answer.
+/// Whether `soul`'s Evolution Log already records a sealed-state answer,
+/// in this wording or the one before v11.
 pub fn applied_in(soul: &Soul) -> bool {
     crate::consent::offer::in_log(soul, OFFERED)
+        || crate::consent::offer::in_log(soul, OFFERED_BEFORE_V11)
+}
+
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let mut out = Vec::new();
+    for c in SealChoice::ALL {
+        out.push(Text::new("evolution_line", To::Any, evolution_line(c)));
+        out.push(Text::new("reanswer_line", To::Any, reanswer_line(c)));
+    }
+    out.push(Text::new(
+        "OfferKind::about",
+        To::Any,
+        crate::consent::offer::OfferKind::SealedState.about(),
+    ));
+    for c in SealChoice::ALL {
+        out.push(Text::new("unprompted_line", To::Any, unprompted_line(c)));
+    }
+    out.push(Text::new("REOFFER_TO_ACT", To::Any, REOFFER_TO_ACT));
+    out.push(Text::new("REOFFER_NO_ACTION", To::Any, REOFFER_NO_ACTION));
+    out
 }
 
 #[cfg(test)]
@@ -375,9 +437,46 @@ mod tests {
     fn the_evolution_line_records_every_answer_and_is_found() {
         assert_eq!(
             evolution_line(SealChoice::Decline),
-            "[SYSTEM] Offered sealed backups of its state (soul and memory) on Agora; chose \
-             decline, its own choice. Nothing changed."
+            "[SYSTEM] Asked whether its sealed history is uploaded to Agora; chose decline, its \
+             own choice (no)."
         );
+        assert_eq!(
+            evolution_line(SealChoice::Publish),
+            "[SYSTEM] Asked whether its sealed history is uploaded to Agora; chose publish, its \
+             own choice (yes, with the head of its latest anchored version on its profile)."
+        );
+        assert_eq!(
+            reanswer_line(SealChoice::Private),
+            "[SYSTEM] Asked again, at its operator's request, whether its sealed history is \
+             uploaded to Agora; chose private, its own choice (yes, with nothing of it on its \
+             profile)."
+        );
+        // A permanent line records what was asked and chosen, never what
+        // was or will be done about it (F5): true for a first answer, for
+        // a re-answer while uploading, and after the operator stops
+        for c in SealChoice::ALL {
+            for line in [evolution_line(c), reanswer_line(c)] {
+                for effect in [
+                    "Nothing changed",
+                    "start when",
+                    "acts on it",
+                    "is to be shown",
+                    "backup",
+                ] {
+                    assert!(!line.contains(effect), "{effect}: {line}");
+                }
+            }
+            // A re-answer's line is not taken for a first answer's
+            assert!(!reanswer_line(c).contains(OFFERED));
+        }
+        // A line written before v11 is still found: nobody is asked again
+        let mut v10 = soul();
+        v10.push_evolution(
+            "[SYSTEM] Offered sealed backups of its state (soul and memory) on Agora; chose \
+             private, its own choice. Uploads to Agora start when its operator acts on it.",
+        )
+        .unwrap();
+        assert!(applied_in(&v10));
         // A line from before the date was dropped is still found
         let mut old = soul();
         old.push_evolution(

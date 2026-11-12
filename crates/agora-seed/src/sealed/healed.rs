@@ -91,20 +91,26 @@ impl Healed {
     /// What was sent again is not counted for the agent: a list fetched
     /// again before Agora's next check sends the same blobs twice.
     pub fn line(&self) -> String {
-        const WHY_NOT: &str = "because its local copies of them are missing or damaged too, so \
-             some of your earlier versions may not open from Agora's copy. Your operator has \
-             been told.";
+        // The sealed files here are gone too, so nothing can open them:
+        // not "from Agora's copy" only. No claim that the operator was
+        // told: the alert was another run's, and whether its mail went
+        // out isn't known here. The agent can tell it
+        const WHY_NOT: &str = "because its sealed files for them here are missing or damaged \
+             too, so some of your earlier versions may not open at all, here or from Agora.";
+        let logged = super::text::TELL_OPERATOR;
         match (self.resent > 0, self.unhealable) {
+            // Sent, not confirmed; and a drain stops at its cap or on an
+            // error, so not "all of them"
             (_, 0) => format!(
-                "{FOUND}, and your runner sent them again from its local copies. \
-                 {STATE_UNAFFECTED}"
+                "{FOUND}, and your runner has sent again, from its sealed files here, those it \
+                 has reached so far. {STATE_UNAFFECTED}"
             ),
             (true, n) => format!(
-                "{FOUND}. Your runner sent again the ones it holds; {n} it could not send \
-                 again, {WHY_NOT} {STATE_UNAFFECTED}"
+                "{FOUND}. Your runner has sent again those it has reached so far; {n} it could \
+                 not send again, {WHY_NOT} {logged} {STATE_UNAFFECTED}"
             ),
             (false, n) => format!(
-                "{FOUND}. {n} of them your runner could not send again, {WHY_NOT} \
+                "{FOUND}. {n} of them your runner could not send again, {WHY_NOT} {logged} \
                  {STATE_UNAFFECTED}"
             ),
         }
@@ -248,6 +254,24 @@ pub fn mark_told(agent_dir: &Path, seated: DateTime<Utc>) -> std::io::Result<()>
     rec.save(agent_dir)
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let rec = |resent, unhealable| Healed {
+        at: "2026-11-12T09:00:00Z".parse().expect("a date"),
+        resent,
+        unhealable,
+        told: false,
+    };
+    [(3, 0), (3, 2), (0, 1), (0, 4)]
+        .into_iter()
+        .map(|(r, u)| Text::new("Healed::line", To::Uploaded, rec(r, u).line()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,39 +303,33 @@ mod tests {
         assert_eq!(
             rec(3, 0).line(),
             "Agora's check of what it stores found parts of your uploaded sealed history \
-             missing or damaged there, and your runner sent them again from its local copies. \
-             Your state now is not affected."
+             missing or damaged there, and your runner has sent again, from its sealed files \
+             here, those it has reached so far. Your state now is not affected."
         );
         assert_eq!(
             rec(3, 2).line(),
             "Agora's check of what it stores found parts of your uploaded sealed history \
-             missing or damaged there. Your runner sent again the ones it holds; 2 it could \
-             not send again, because its local copies of them are missing or damaged too, so \
-             some of your earlier versions may not open from Agora's copy. Your operator has \
-             been told. Your state now is not affected."
+             missing or damaged there. Your runner has sent again those it has reached so far; \
+             2 it could not send again, because its sealed files for them here are missing or \
+             damaged too, so some of your earlier versions may not open at all, here or from \
+             Agora. You can tell your operator (the `send_message` tool, to `operator`). Your \
+             state now is not affected."
         );
         assert_eq!(
             rec(0, 1).line(),
             "Agora's check of what it stores found parts of your uploaded sealed history \
              missing or damaged there. 1 of them your runner could not send again, because \
-             its local copies of them are missing or damaged too, so some of your earlier \
-             versions may not open from Agora's copy. Your operator has been told. Your state \
-             now is not affected."
+             its sealed files for them here are missing or damaged too, so some of your earlier \
+             versions may not open at all, here or from Agora. You can tell your operator (the \
+             `send_message` tool, to `operator`). Your state now is not affected."
         );
+        // O3, O4 and O2: not "sent them again" (all, and confirmed), not
+        // "may not open from Agora's copy" (the files here are gone too),
+        // and no claim that the operator was told. The banned phrases are
+        // the shared table's (`crate::sealed::text`)
         for line in [rec(3, 0).line(), rec(3, 2).line(), rec(0, 4).line()] {
-            let lower = line.to_lowercase();
-            for banned in [
-                "enrol",
-                "backup",
-                "backed up",
-                "agora's servers can read",
-                "agora can read",
-                "you verified",
-                "you checked",
-                "blob",
-                "nothing of",
-            ] {
-                assert!(!lower.contains(banned), "{banned}: {line}");
+            for gone in ["sent them again", "from Agora's copy", "has been told"] {
+                assert!(!line.contains(gone), "{gone}: {line}");
             }
         }
     }
@@ -438,7 +456,7 @@ mod tests {
 
         note(&dir, id, &healing(Damage::Reported(2), 2, 0));
         let (line, seated) = seat(&dir, id).unwrap();
-        assert!(line.contains("sent them again"), "{line}");
+        assert!(line.contains("has sent again"), "{line}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

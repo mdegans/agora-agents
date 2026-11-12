@@ -448,8 +448,16 @@ impl Upload {
 /// What a verdict says of a chain kept only here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kept {
-    /// Never uploaded: nothing of it is on Agora.
+    /// Never uploaded, by its markers, and nothing in `sealed/sent`: the
+    /// runner's files show no version uploaded. Agora is not asked.
     Only,
+    /// No uploading marker, but `sealed/sent` holds versions (a forgotten
+    /// agent put back, its markers set aside): versions were uploaded,
+    /// and Agora, which is not asked, may still hold them.
+    Unmarked,
+    /// No uploading marker, and `sealed/sent` couldn't be read: nothing
+    /// is said of what was uploaded.
+    Unknown,
     /// Uploaded before: what Agora holds of its line; `None` when
     /// Agora's copy couldn't be read.
     Since(Option<OnAgora>),
@@ -484,24 +492,37 @@ pub enum OnAgora {
 // rounds); each is pinned by `a_local_verdict_says_what_a_local_record_shows`.
 
 /// After "Your sealed state: " in the verdict.
-pub const LOCAL_VERDICT: &str =
-    "intact, checked against the record your runner keeps on this machine.";
+pub const LOCAL_VERDICT: &str = "intact, checked against your sealed history, which your runner \
+     keeps here, on your operator's machine.";
 
-/// After [`LOCAL_VERDICT`], for an agent that never uploaded.
-pub const LOCAL_NOTHING_ON_AGORA: &str = " Nothing of your state is on Agora.";
+/// After [`LOCAL_VERDICT`], for an agent that doesn't upload
+/// ([`Upload::Never`]): what the runner does, which is true whatever was
+/// uploaded before.
+pub const LOCAL_NOT_UPLOADED: &str = " Your runner does not upload it";
+
+/// After [`LOCAL_NOT_UPLOADED`], for [`Kept::Only`]: what the runner's
+/// own files show, which is all that was looked at (Agora is not asked
+/// for an agent with no uploading marker).
+pub const LOCAL_NOTHING_ON_AGORA: &str =
+    ", and its files show no version of it ever uploaded to Agora.";
+
+/// After [`LOCAL_NOT_UPLOADED`], for [`Kept::Unmarked`].
+pub const LOCAL_UPLOADED_BEFORE: &str = ". Its files show versions of it uploaded to Agora \
+     before; it has not asked Agora whether they are still there.";
 
 /// Ends a local verdict, after its sizes.
 pub const LOCAL_CHECKED_BY: &str = "Checked by your runner with";
 
 /// What a record on the same machine shows, and what it can't: said in
 /// every local verdict, once.
-pub const LOCAL_LIMITS: &str = "A record kept on the same machine as your state catches a state \
-     changed or lost by accident; it can't show a change made by whoever runs your runner.";
+pub const LOCAL_LIMITS: &str = "A history kept on the same machine as your state catches a state \
+     changed or lost by accident; it proves nothing against your operator, who holds this machine \
+     and your keys.";
 
 /// For an agent whose uploading marker is in doubt, after
 /// [`LOCAL_VERDICT`].
-pub const LOCAL_IN_DOUBT: &str = " Your runner couldn't tell whether your state is being \
-     uploaded to Agora; your operator has been told, and nothing is uploaded meanwhile.";
+pub const LOCAL_IN_DOUBT: &str = " Your runner couldn't tell whether your sealed history is \
+     being uploaded to Agora, so it uploads nothing until your operator has looked.";
 
 /// The end of a local verdict on a start that checked only the line since
 /// the last full check ([`Checked::Since`]); the date follows.
@@ -510,26 +531,28 @@ pub const LOCAL_CHECKED_SINCE: &str = ": that your state matches the last sealed
 
 /// [`SEAL_FAILED_LINE`] for an agent that doesn't upload.
 pub const LOCAL_SEAL_FAILED_LINE: &str = "Your last save was written here but could not be \
-     sealed, so your sealed history does not include it yet. This session starts from that save, \
-     and your operator has been told.";
+     sealed, so your sealed history does not include it yet. This session starts from that save.";
 
 impl Kept {
     /// After [`LOCAL_VERDICT`].
     fn sentence(self) -> String {
         match self {
-            Self::Only => LOCAL_NOTHING_ON_AGORA.to_string(),
+            Self::Only => format!("{LOCAL_NOT_UPLOADED}{LOCAL_NOTHING_ON_AGORA}"),
+            Self::Unmarked => format!("{LOCAL_NOT_UPLOADED}{LOCAL_UPLOADED_BEFORE}"),
+            Self::Unknown => format!("{LOCAL_NOT_UPLOADED}."),
             Self::Since(Some(OnAgora::Nothing)) => {
-                " Agora holds none of your sealed versions; those saved since \
-                 your uploads stopped stay on this runner."
+                " Agora holds no version of your sealed history; those saved since your uploads \
+                 stopped stay here."
                     .to_string()
             }
             Self::Since(Some(OnAgora::Upto { versions, newest })) => format!(
-                " Agora holds {versions} of your sealed versions, the newest dated {}; those saved since \
-                 your uploads stopped stay on this runner.",
-                newest.format("%Y-%m-%d")
+                " Agora holds {versions} version{} of your sealed history, the newest dated {}; \
+                 those saved since your uploads stopped stay here.",
+                if versions == 1 { "" } else { "s" },
+                newest.format(super::text::DATE)
             ),
-            Self::Since(None) => " Agora's copy couldn't be read this session; the versions saved \
-                 since your uploads stopped stay on this runner."
+            Self::Since(None) => " Agora's copy of your sealed history couldn't be read this \
+                 session; the versions saved since your uploads stopped stay here."
                 .to_string(),
             Self::InDoubt => LOCAL_IN_DOUBT.to_string(),
         }
@@ -975,7 +998,7 @@ fn verdict_of(
         ),
         Server::Local(_, Checked::Since(day)) => format!(
             "{LOCAL_CHECKED_BY} {VERIFIER}{LOCAL_CHECKED_SINCE} {}. {LOCAL_LIMITS}",
-            day.format("%Y-%m-%d")
+            day.format(super::text::DATE)
         ),
         _ => format!(
             "Checked by {VERIFIER}: links, signatures, and that your state matches the last \
@@ -1102,7 +1125,7 @@ pub const TWIN_SCAN: usize = 8;
 
 /// What the verdict says of the head this session starts from, right
 /// after naming it. [`link_memory_id`] links the memory id after it.
-pub const HEAD_MARKER: &str = "(a marker for this version; the next session's will differ).";
+pub const HEAD_MARKER: &str = "(the id of this version; each saved version has its own).";
 
 /// The sentence linking the verdict's head to the memory id in the
 /// agent's Memory heading.
@@ -1130,25 +1153,70 @@ pub fn link_memory_id(
     Some(i)
 }
 
-pub const FORK_LINE: &str = "Your sealed state on Agora has moved on from the version this \
+// What an agent whose uploads are held is told. None says the operator
+// was told: whoever sends the hold's alert says what came of it
+// ([`say_told`]), so the claim is made only of a mail that went out.
+
+pub const FORK_LINE: &str = "Your sealed history on Agora has moved on from the version this \
      session starts from: two sessions saved from the same version, or Agora holds versions \
-     this runner doesn't. This session runs on your state here, and nothing is lost: new \
-     versions are kept here, not uploaded, until your operator reconciles the two. Your \
-     operator has been told.";
+     your runner doesn't have here. This session runs on your state here. Both lines are kept: \
+     new versions stay here, not uploaded, until your operator reconciles the two.";
 
-pub const HEAD_MISSING_LINE: &str = "Your latest sealed version is not on Agora: the copy there \
-     is missing versions that were sealed here. This session runs on your state here, which \
-     matches your last sealed version; new versions are kept here, not uploaded, and your \
-     operator has been told.";
+/// For [`HeadStatus::LocalMissing`]: the head isn't in Agora's chain and
+/// isn't waiting in the outbox, or a version in `sealed/sent` isn't in
+/// Agora's chain though the head is.
+pub const HEAD_MISSING_LINE: &str = "Agora's copy of your sealed history is missing versions \
+     that, by your runner's files, were uploaded from here. This session runs on your state \
+     here, which matches your last sealed version; new versions stay here, not uploaded, until \
+     your operator has looked.";
 
+/// Shown when Agora couldn't be reached, and when there was no key here
+/// to ask it with: either way the runner couldn't read it there.
 pub const UNCHECKED_LINE: &str = "Your sealed history couldn't be checked at the start of this \
-     session: part of it is on Agora, which couldn't be reached. This session runs on your \
-     state as it is, and your operator has been told.";
+     session: part of it is on Agora, and your runner couldn't read it there. This session runs \
+     on your state as it is.";
 
 pub const SEAL_FAILED_LINE: &str = "Your last save was written here but could not be sealed, so \
      your sealed history does not include it yet. This session starts from that save; new \
-     versions are kept here, not uploaded, until your operator has looked, and your operator \
-     has been told.";
+     versions stay here, not uploaded, until your operator has looked.";
+
+impl Hold {
+    /// The line(s) the start check seats for this hold.
+    fn lines(self) -> &'static [&'static str] {
+        match self {
+            Self::SealFailed => &[SEAL_FAILED_LINE, LOCAL_SEAL_FAILED_LINE],
+            Self::HeadMissing => &[HEAD_MISSING_LINE],
+            Self::Fork => &[FORK_LINE],
+            Self::Unchecked => &[UNCHECKED_LINE],
+        }
+    }
+}
+
+/// Say, right after `marker` in the line of `lines` that holds it, what
+/// came of the alert about it ([`crate::alerts::told`]): `sent` is
+/// whether the mail went out ([`crate::alerts::Alerter::dispatch`]).
+/// `false` when no line holds the marker (nothing is said).
+pub fn say_told_after(lines: &mut [String], marker: &str, sent: bool) -> bool {
+    let Some((i, at)) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| l.find(marker).map(|at| (i, at)))
+    else {
+        return false;
+    };
+    lines[i].insert_str(
+        at + marker.len(),
+        &format!(" {}", crate::alerts::told(sent)),
+    );
+    true
+}
+
+/// [`say_told_after`] for a hold's line.
+pub fn say_told(lines: &mut [String], hold: Hold, sent: bool) -> bool {
+    hold.lines()
+        .iter()
+        .any(|marker| say_told_after(lines, marker, sent))
+}
 
 /// The sizes of the newest earlier sealed version: from the sidecar, else
 /// by opening it, if its blobs are still here.
@@ -1776,7 +1844,13 @@ async fn check_chain(
             Some(Hold::SealFailed)
         } else {
             let kept = match upload {
-                Upload::Never => Kept::Only,
+                // Decided by evidence, with no server call: what
+                // `sealed/sent` shows was uploaded, whatever the markers say
+                Upload::Never => match seal.sent().await {
+                    Ok(sent) if sent.is_empty() => Kept::Only,
+                    Ok(_) => Kept::Unmarked,
+                    Err(_) => Kept::Unknown,
+                },
                 Upload::InDoubt => Kept::InDoubt,
                 _ => match on_agora(id, &line, &entries, keys, server, fetched).await {
                     Ok(kept) => kept,
@@ -1794,7 +1868,7 @@ async fn check_chain(
             ));
             None
         };
-        seat.extend(found.unopenable.map(Unopenable::line));
+        seat.extend(found.unopenable.map(|u| u.line(checked)));
         seat.extend(drop_lines);
         return Outcome::Run {
             seat,
@@ -1964,7 +2038,7 @@ async fn check_chain(
         &said,
         checks_later,
     ));
-    seat.extend(found.unopenable.map(Unopenable::line));
+    seat.extend(found.unopenable.map(|u| u.line(Checked::Full)));
     seat.extend(drop_lines);
     let hold = match status {
         // Unchecked comes only from a drain (agentkit's `head_status` never
@@ -2008,20 +2082,34 @@ pub struct Unopenable {
     pub damaged: usize,
 }
 
-/// What the agent is told of [`Unopenable`]; the count and date follow.
-pub const UNOPENABLE_LINE: &str = "can't be opened here: their sealed copies on this machine are \
-     missing or damaged. Your state now is not affected, and your operator has been told.";
+/// How every [`Unopenable::line`] ends: what [`say_told_after`] finds it
+/// by.
+pub const UNOPENABLE_LINE: &str =
+    "sealed files here are missing or damaged. Your state now is not affected.";
 
 impl Unopenable {
-    /// "3 of your sealed versions, the earliest dated 2026-11-05, can't be
-    /// opened here: …"
-    pub fn line(self) -> String {
+    /// "3 versions of your sealed history, the earliest dated 2026-11-05,
+    /// can't be opened here: …". `checked`: a start that verified only
+    /// the line's tail repeats the last full check's finding, and says
+    /// when that was.
+    pub fn line(self, checked: Checked) -> String {
         let date = day(self.earliest).unwrap_or_else(|| "an unknown date".into());
+        let found = match checked {
+            Checked::Full => String::new(),
+            Checked::Since(day) => format!(
+                "As your runner found at its last full check, on {}: ",
+                day.format(super::text::DATE)
+            ),
+        };
         if self.versions == 1 {
-            format!("1 of your sealed versions, dated {date}, {UNOPENABLE_LINE}")
+            format!(
+                "{found}1 version of your sealed history, dated {date}, can't be opened here: \
+                 its {UNOPENABLE_LINE}"
+            )
         } else {
             format!(
-                "{} of your sealed versions, the earliest dated {date}, {UNOPENABLE_LINE}",
+                "{found}{} versions of your sealed history, the earliest dated {date}, can't be \
+                 opened here: their {UNOPENABLE_LINE}",
                 self.versions
             )
         }
@@ -2767,6 +2855,156 @@ pub fn hold_alert(
     alert
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).expect("a date");
+    let micros = 1_762_300_800_000_000;
+    let head = HeadRef {
+        entry_hash: Sha256Hex::from([3; 32]),
+        seq: 3,
+    };
+    let memory = agora_agentkit::reactor::seed::MemoryId::from([7; 32]);
+    let sizes = Sizes {
+        memory_chars: 900,
+        soul_chars: 2_100,
+    };
+    let previous = Previous {
+        sizes: Sizes {
+            memory_chars: 1_200,
+            soul_chars: 2_000,
+        },
+        dated: Some(day),
+        head: Some(Sha256Hex::from([2; 32])),
+        own_last_session: true,
+        memory: Some(memory),
+    };
+    let line = LineSummary {
+        snapshots: 3,
+        since: Some(micros),
+        prior: Some(micros),
+        last: Some(micros),
+    };
+    let mut out = Vec::new();
+    // Whole verdicts, by what the start check found of Agora
+    let never = [Kept::Only, Kept::Unmarked, Kept::Unknown];
+    let before = [
+        Kept::Since(Some(OnAgora::Upto {
+            versions: 1,
+            newest: day,
+        })),
+        Kept::Since(Some(OnAgora::Upto {
+            versions: 4,
+            newest: day,
+        })),
+        Kept::Since(Some(OnAgora::Nothing)),
+        Kept::Since(None),
+        Kept::InDoubt,
+    ];
+    let mut servers = vec![
+        (To::Uploaded, Server::InStep),
+        (To::Uploaded, Server::Unchecked),
+        (To::Uploaded, Server::Other),
+    ];
+    for checked in [Checked::Full, Checked::Since(day)] {
+        servers.extend(never.map(|k| (To::Never, Server::Local(k, checked))));
+        servers.extend(before.map(|k| (To::Uploaded, Server::Local(k, checked))));
+    }
+    for (to, server) in servers {
+        for previous in [None, Some(previous)] {
+            out.push(Text::new(
+                "verdict",
+                to,
+                verdict_of(
+                    &line,
+                    &head,
+                    sizes,
+                    previous,
+                    server,
+                    &AnchorsSaid::default(),
+                    false,
+                ),
+            ));
+        }
+    }
+    out.push(Text::new(
+        "memory_id_sentence",
+        To::Any,
+        memory_id_sentence(&memory),
+    ));
+    out.push(Text::new("HEAD_MARKER", To::Any, HEAD_MARKER));
+    // The hold lines, as seated and with what came of the alert
+    for (name, to, hold, text) in [
+        ("FORK_LINE", To::Uploaded, Hold::Fork, FORK_LINE),
+        (
+            "HEAD_MISSING_LINE",
+            To::Uploaded,
+            Hold::HeadMissing,
+            HEAD_MISSING_LINE,
+        ),
+        (
+            "UNCHECKED_LINE",
+            To::Uploaded,
+            Hold::Unchecked,
+            UNCHECKED_LINE,
+        ),
+        (
+            "SEAL_FAILED_LINE",
+            To::Uploaded,
+            Hold::SealFailed,
+            SEAL_FAILED_LINE,
+        ),
+        (
+            "LOCAL_SEAL_FAILED_LINE",
+            To::Never,
+            Hold::SealFailed,
+            LOCAL_SEAL_FAILED_LINE,
+        ),
+    ] {
+        out.push(Text::new(name, to, text));
+        for sent in [true, false] {
+            let mut lines = vec![text.to_string()];
+            say_told(&mut lines, hold, sent);
+            out.push(Text::new(name, to, lines.remove(0)));
+        }
+    }
+    for versions in [1, 3] {
+        let u = Unopenable {
+            versions,
+            earliest: micros,
+            missing: 1,
+            damaged: 0,
+        };
+        for checked in [Checked::Full, Checked::Since(day)] {
+            out.push(Text::new("Unopenable::line", To::Any, u.line(checked)));
+            for sent in [true, false] {
+                let mut lines = vec![u.line(checked)];
+                say_told_after(&mut lines, UNOPENABLE_LINE, sent);
+                out.push(Text::new("Unopenable::line", To::Any, lines.remove(0)));
+            }
+        }
+    }
+    for why in [
+        NotJudged::Uploading,
+        NotJudged::Unreachable,
+        NotJudged::Stopped("Agora's proofs couldn't be fetched"),
+        NotJudged::Stopped("an anchor's data couldn't be fetched from Agora"),
+        NotJudged::Stopped("its own records couldn't be read"),
+        NotJudged::Stopped("your sealed history couldn't be read to place Agora's proof"),
+        NotJudged::Held,
+        NotJudged::NoKey,
+        NotJudged::Later,
+    ] {
+        for them in [true, false] {
+            out.push(Text::new("NotJudged::said", To::Uploaded, why.said(them)));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -3027,7 +3265,7 @@ pub(crate) mod tests {
         );
         assert!(
             seat[0].contains(VERIFIER)
-                && seat[0].contains("(a marker for this version; the next session's will differ)")
+                && seat[0].contains("(the id of this version; each saved version has its own)")
                 && !seat[0].contains("history tools")
         );
         // The session links its memory id after the head, and only there
@@ -3047,7 +3285,7 @@ pub(crate) mod tests {
             )
         );
         assert!(
-            linked[0].contains("the next session's will differ). Its memory is mem-0707070707,")
+            linked[0].contains("each saved version has its own). Its memory is mem-0707070707,")
         );
         let mut held = vec![UNCHECKED_LINE.to_string()];
         link_memory_id(&mut held, &memory);
@@ -3981,7 +4219,7 @@ pub(crate) mod tests {
         );
         assert!(
             text.contains(
-                "(a marker for this version; the next session's will differ). In this version, \
+                "(the id of this version; each saved version has its own). In this version, \
                  your memory is 12,345 characters and your soul 2,100. Checked by"
             ),
             "{text}"
@@ -4422,29 +4660,39 @@ pub(crate) mod tests {
         );
     }
 
-    /// Every new sentence a never-uploading agent can be told, verbatim,
+    /// Every sentence an agent that doesn't upload can be told, verbatim,
     /// for the beta round to tune knowing what it changes.
     #[test]
     fn the_local_sentences_are_pinned() {
         assert_eq!(
             LOCAL_VERDICT,
-            "intact, checked against the record your runner keeps on this machine."
+            "intact, checked against your sealed history, which your runner keeps here, on your \
+             operator's machine."
         );
         assert_eq!(
-            LOCAL_NOTHING_ON_AGORA,
-            " Nothing of your state is on Agora."
+            Kept::Only.sentence(),
+            " Your runner does not upload it, and its files show no version of it ever uploaded \
+             to Agora."
         );
+        // F3: a forgotten agent put back (no marker, versions in `sent/`)
+        // is never told nothing of it is on Agora
+        assert_eq!(
+            Kept::Unmarked.sentence(),
+            " Your runner does not upload it. Its files show versions of it uploaded to Agora \
+             before; it has not asked Agora whether they are still there."
+        );
+        assert_eq!(Kept::Unknown.sentence(), " Your runner does not upload it.");
         assert_eq!(LOCAL_CHECKED_BY, "Checked by your runner with");
         assert_eq!(
             LOCAL_LIMITS,
-            "A record kept on the same machine as your state catches a state changed or lost by \
-             accident; it can't show a change made by whoever runs your runner."
+            "A history kept on the same machine as your state catches a state changed or lost by \
+             accident; it proves nothing against your operator, who holds this machine and your \
+             keys."
         );
         assert_eq!(
             LOCAL_SEAL_FAILED_LINE,
             "Your last save was written here but could not be sealed, so your sealed history \
-             does not include it yet. This session starts from that save, and your operator has \
-             been told."
+             does not include it yet. This session starts from that save."
         );
         let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
         assert_eq!(
@@ -4453,41 +4701,43 @@ pub(crate) mod tests {
                 newest: day
             }))
             .sentence(),
-            " Agora holds 4 of your sealed versions, the newest dated 2026-11-05; those saved since your \
-             uploads stopped stay on this runner."
+            " Agora holds 4 versions of your sealed history, the newest dated 2026-11-05; those \
+             saved since your uploads stopped stay here."
         );
         assert_eq!(
             Kept::Since(Some(OnAgora::Nothing)).sentence(),
-            " Agora holds none of your sealed versions; those saved since your uploads stopped stay on \
-             this runner."
+            " Agora holds no version of your sealed history; those saved since your uploads \
+             stopped stay here."
         );
         assert_eq!(
             Kept::Since(None).sentence(),
-            " Agora's copy couldn't be read this session; the versions saved since your uploads \
-             stopped stay on this runner."
+            " Agora's copy of your sealed history couldn't be read this session; the versions \
+             saved since your uploads stopped stay here."
         );
         assert_eq!(
             Kept::InDoubt.sentence(),
-            " Your runner couldn't tell whether your state is being uploaded to Agora; your \
-             operator has been told, and nothing is uploaded meanwhile."
+            " Your runner couldn't tell whether your sealed history is being uploaded to Agora, \
+             so it uploads nothing until your operator has looked."
         );
         assert_eq!(
             LOCAL_CHECKED_SINCE,
             ": that your state matches the last sealed version, and the links and signatures \
              of the versions saved since its last full check of every version, on"
         );
+        let three = Unopenable {
+            versions: 3,
+            earliest: 1_762_300_800_000_000,
+            missing: 2,
+            damaged: 1,
+        };
         assert_eq!(
-            Unopenable {
-                versions: 3,
-                earliest: 1_762_300_800_000_000,
-                missing: 2,
-                damaged: 1
-            }
-            .line(),
-            "3 of your sealed versions, the earliest dated 2025-11-05, can't be opened here: \
-             their sealed copies on this machine are missing or damaged. Your state now is not \
-             affected, and your operator has been told."
+            three.line(Checked::Full),
+            "3 versions of your sealed history, the earliest dated 2025-11-05, can't be opened \
+             here: their sealed files here are missing or damaged. Your state now is not \
+             affected."
         );
+        // Number agrees (one version, "its"), and a tail check says when
+        // the finding it repeats was made
         assert_eq!(
             Unopenable {
                 versions: 1,
@@ -4495,11 +4745,24 @@ pub(crate) mod tests {
                 missing: 1,
                 damaged: 0
             }
-            .line(),
-            "1 of your sealed versions, dated 2025-11-05, can't be opened here: their sealed \
-             copies on this machine are missing or damaged. Your state now is not affected, and \
-             your operator has been told."
+            .line(Checked::Since(day)),
+            "As your runner found at its last full check, on 2026-11-05: 1 version of your \
+             sealed history, dated 2025-11-05, can't be opened here: its sealed files here are \
+             missing or damaged. Your state now is not affected."
         );
+        // What came of the alert is said after it, by whoever sent it
+        for sent in [true, false] {
+            let mut lines = vec!["a verdict".to_string(), three.line(Checked::Full)];
+            assert!(say_told_after(&mut lines, UNOPENABLE_LINE, sent));
+            assert_eq!(
+                lines[1],
+                format!(
+                    "{} {}",
+                    three.line(Checked::Full),
+                    crate::alerts::told(sent)
+                )
+            );
+        }
         assert_eq!(
             Refusal::SealUnreadable.plain(),
             "your sealed history here couldn't be read"
@@ -4515,61 +4778,74 @@ pub(crate) mod tests {
         }
     }
 
-    /// What a never-uploader's text must not say: Agora only in "nothing
-    /// … is on Agora"; nothing of anchors, being in step, being held, or
-    /// anyone but the runner checking.
+    /// What a never-uploader's text must not say: the one banned list
+    /// and its kind's ([`crate::sealed::text`]): nothing of anchors, of
+    /// being in step or held, or of anyone but the runner checking.
     fn assert_banned_absent(text: &str) {
-        // The file and commit that checked it name agentkit's repository
-        let without = text
-            .replace(LOCAL_NOTHING_ON_AGORA.trim(), "")
-            .replace(VERIFIER, "");
-        let lower = without.to_lowercase();
-        for banned in [
-            "agora",
-            "in step",
-            "anchor",
-            "anc-",
-            "held",
-            "uploads",
-            "waiting to upload",
-            "steward",
-            "verified by",
-            "enrol",
-            "you verified",
-            "you checked",
-        ] {
-            assert!(!lower.contains(banned), "{banned:?} in {text}");
-        }
+        crate::sealed::text::assert_may_say(crate::sealed::text::To::Never, text);
     }
 
-    /// What an agent that uploaded (now or before) is told of its chain:
-    /// never that nothing of it is on Agora, and never that Agora's
-    /// servers read it.
+    /// The hold lines, verbatim; none says the operator was told, and
+    /// what came of the alert is said after the line by whoever sent it
+    /// (O2), `SEAL_FAILED_LINE`'s before what follows it on its line.
     #[test]
-    fn an_uploaders_local_sentences_never_say_nothing_is_on_agora() {
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
-        for kept in [
-            Kept::Since(Some(OnAgora::Upto {
-                versions: 4,
-                newest: day,
-            })),
-            Kept::Since(Some(OnAgora::Nothing)),
-            Kept::Since(None),
-            Kept::InDoubt,
-        ] {
-            let t = kept.sentence().to_lowercase();
-            assert!(!t.contains("nothing of your state is on agora"), "{t}");
-            assert!(!t.contains("enrol") && !t.contains("can read"), "{t}");
-        }
-        for line in [
+    fn the_hold_lines_are_pinned_and_say_told_only_as_sent() {
+        assert_eq!(
             FORK_LINE,
+            "Your sealed history on Agora has moved on from the version this session starts \
+             from: two sessions saved from the same version, or Agora holds versions your runner \
+             doesn't have here. This session runs on your state here. Both lines are kept: new \
+             versions stay here, not uploaded, until your operator reconciles the two."
+        );
+        assert_eq!(
             HEAD_MISSING_LINE,
+            "Agora's copy of your sealed history is missing versions that, by your runner's \
+             files, were uploaded from here. This session runs on your state here, which matches \
+             your last sealed version; new versions stay here, not uploaded, until your operator \
+             has looked."
+        );
+        assert_eq!(
             UNCHECKED_LINE,
+            "Your sealed history couldn't be checked at the start of this session: part of it \
+             is on Agora, and your runner couldn't read it there. This session runs on your \
+             state as it is."
+        );
+        assert_eq!(
             SEAL_FAILED_LINE,
+            "Your last save was written here but could not be sealed, so your sealed history \
+             does not include it yet. This session starts from that save; new versions stay \
+             here, not uploaded, until your operator has looked."
+        );
+        for (hold, line) in [
+            (Hold::Fork, FORK_LINE),
+            (Hold::HeadMissing, HEAD_MISSING_LINE),
+            (Hold::Unchecked, UNCHECKED_LINE),
+            (Hold::SealFailed, SEAL_FAILED_LINE),
+            (Hold::SealFailed, LOCAL_SEAL_FAILED_LINE),
         ] {
-            let t = line.to_lowercase();
-            assert!(!t.contains("nothing of") && !t.contains("enrol"), "{line}");
+            assert!(!line.contains("operator has been told"), "{line}");
+            for sent in [true, false] {
+                let mut lines = vec!["a verdict".to_string(), format!("{line} What follows.")];
+                assert!(say_told(&mut lines, hold, sent), "{hold:?}");
+                assert_eq!(
+                    lines[1],
+                    format!("{line} {} What follows.", crate::alerts::told(sent))
+                );
+                assert_eq!(lines[0], "a verdict");
+            }
+            // No line of the hold's: nothing is said
+            let mut none = vec!["a verdict".to_string()];
+            assert!(!say_told(&mut none, hold, true));
+            assert_eq!(none, ["a verdict"]);
         }
+        assert_eq!(
+            crate::alerts::told(true),
+            "Your runner has sent your operator an alert."
+        );
+        assert_eq!(
+            crate::alerts::told(false),
+            "Your runner logged this for your operator; no alert was sent this time."
+        );
     }
 
     /// An agent that never uploaded: its whole start check asks Agora
@@ -4618,8 +4894,10 @@ pub(crate) mod tests {
         let v = &seat[0];
         assert!(
             v.starts_with(
-                "Your sealed state: intact, checked against the record your runner keeps on this \
-                 machine. Nothing of your state is on Agora. It has 2 versions since "
+                "Your sealed state: intact, checked against your sealed history, which your \
+                 runner keeps here, on your operator's machine. Your runner does not upload it, \
+                 and its files show no version of it ever uploaded to Agora. It has 2 versions \
+                 since "
             ),
             "{v}"
         );
@@ -4695,9 +4973,47 @@ pub(crate) mod tests {
         assert!(api.calls.lock().unwrap().is_empty());
     }
 
+    /// An agent with no uploading marker whose `sealed/sent` holds
+    /// versions is told what its runner's files show, not that none was
+    /// ever uploaded.
+    #[tokio::test]
+    async fn an_unmarked_agent_with_uploaded_versions_is_not_told_none_were() {
+        // F3: no uploading marker, but `sealed/sent` holds versions (a
+        // forgotten agent put back, its markers set aside). Decided by
+        // evidence, with no call to Agora
+        let root = crate::sealed::TestDir::new("check-unmarked-sent");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        let seal = AgentSeal::new(&dir, id);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        assert_eq!(Upload::of(&dir, &keys, id), Upload::Never);
+        let api = crate::sealed::api::fake::guarded(&root);
+        let out = check(
+            &dir,
+            id,
+            &local_hash(&root, id).await,
+            Default::default(),
+            &keys,
+            &api,
+        )
+        .await;
+        let Outcome::Run { seat, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert!(
+            seat[0].contains(
+                "Your runner does not upload it. Its files show versions of it uploaded to \
+                 Agora before; it has not asked Agora whether they are still there."
+            ) && !seat[0].contains("no version of it ever uploaded"),
+            "{seat:?}"
+        );
+        assert!(api.calls.lock().unwrap().is_empty(), "nothing asked");
+    }
+
     /// An agent that uploaded and was stopped: Agora's copy may be read,
     /// and the verdict says what it holds and that the versions since stay
-    /// on this runner; no anchor is judged or named.
+    /// here; no anchor is judged or named.
     #[tokio::test]
     async fn a_stopped_agents_verdict_says_what_agora_holds() {
         let root = crate::sealed::TestDir::new("check-stopped-verdict");
@@ -4731,9 +5047,10 @@ pub(crate) mod tests {
         let today = chrono::Utc::now().format("%Y-%m-%d");
         assert!(
             seat[0].starts_with(&format!(
-                "Your sealed state: intact, checked against the record your runner keeps on this \
-                 machine. Agora holds 1 of your sealed versions, the newest dated {today}; those saved \
-                 since your uploads stopped stay on this runner. It has 2 versions since "
+                "Your sealed state: intact, checked against your sealed history, which your \
+                 runner keeps here, on your operator's machine. Agora holds 1 version of your \
+                 sealed history, the newest dated {today}; those saved since your uploads \
+                 stopped stay here. It has 2 versions since "
             )),
             "{seat:?}"
         );
@@ -4788,7 +5105,7 @@ pub(crate) mod tests {
             panic!("{out:?}")
         };
         assert!(
-            seat[0].contains(" Agora holds 1 of your sealed versions, "),
+            seat[0].contains(" Agora holds 1 version of your sealed history, "),
             "{seat:?}"
         );
         assert!(seat[0].contains(": links, signatures, and that your state matches"));
@@ -4882,14 +5199,17 @@ pub(crate) mod tests {
         let u = found.unopenable.expect("found");
         assert_eq!((u.missing, u.damaged), (1, 1));
         assert!(u.versions >= 2, "{u:?}");
-        assert!(seat.contains(&u.line()), "{seat:?}");
+        assert!(seat.contains(&u.line(Checked::Full)), "{seat:?}");
         let vouch = found.vouch.expect("vouched");
         let (out, again) = run(Some(&vouch)).await;
         let Outcome::Run { seat, .. } = out else {
             panic!("{out:?}")
         };
         assert_eq!(again.unopenable, Some(u));
-        assert!(seat.contains(&u.line()), "the tail start repeats it");
+        assert!(
+            seat.contains(&u.line(Checked::Since(vouch.at.date_naive()))),
+            "the tail start repeats it, and says when it was found: {seat:?}"
+        );
 
         // An uploader: versions sent have no blob here, and that's no damage
         let (id, keys, dir) = enrolled(&root).await;
@@ -5203,20 +5523,5 @@ pub(crate) mod tests {
             VERIFIER,
             format!("git:agora-agentkit:v{version}:src/state/verify.rs")
         );
-    }
-
-    #[test]
-    fn the_lines_name_no_model() {
-        for line in [
-            FORK_LINE,
-            HEAD_MISSING_LINE,
-            SEAL_FAILED_LINE,
-            UNCHECKED_LINE,
-        ] {
-            let l = line.to_lowercase();
-            for banned in ["claude", "haiku", "qwen", "model"] {
-                assert!(!l.contains(banned), "{banned}: {line}");
-            }
-        }
     }
 }

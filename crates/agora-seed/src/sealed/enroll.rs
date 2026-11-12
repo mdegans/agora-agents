@@ -3102,8 +3102,8 @@ pub(crate) mod tests {
             // The notice's wording (`notice.rs`)
             assert!(
                 line.contains(
-                    "The 2 versions of your state not uploaded before the stop or saved while \
-                     uploads were stopped are kept here"
+                    "The 2 versions not uploaded before the stop or saved while uploads were \
+                     stopped stay here, set aside from"
                 ),
                 "{line}"
             );
@@ -3167,9 +3167,9 @@ pub(crate) mod tests {
                 .line()
                 .unwrap(),
             format!(
-                "On {}, your operator resumed uploading your sealed state to Agora. Your \
+                "On {}, your operator resumed uploading your sealed history to Agora. Your \
                  operator's note: I checked the edit.",
-                Utc::now().format("%-d %B %Y")
+                Utc::now().format(crate::sealed::text::DATE)
             )
         );
         let local = plaintext_hash(&FsStorage::new(&state_dir).load_raw(id).await.unwrap().value);
@@ -3355,7 +3355,7 @@ pub(crate) mod tests {
             .line()
             .unwrap();
         assert!(
-            line.contains("resumed uploading your sealed state to Agora."),
+            line.contains("resumed uploading your sealed history to Agora."),
             "{line}"
         );
         assert!(!line.contains("although"), "{line}");
@@ -3456,7 +3456,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(
             line.contains(
-                "your operator started uploading your sealed state to Agora, as you answered on"
+                "your operator started uploading your sealed history to Agora, as you answered on"
             ),
             "{line}"
         );

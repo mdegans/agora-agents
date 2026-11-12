@@ -1218,3 +1218,48 @@ continue from): it stays stopped. **Known gap**, see the report.
   so this answer changes nothing: your earlier answer, `<choice>`,
   stands. Your operator has been told. To change it, ask your operator to
   re-open the question."
+
+## Review round, 2026-11-12: TEXT
+
+**What it is.** Wording, and the plumbing three sentences needed to be true. Offer v10 → v11
+(`consent/sealed_state/prompt.rs`); every sentence an agent is told about its sealed history reworded
+to be true in each state it can be shown in; one table of agent-facing text and one banned list
+(`sealed/text.rs`) in place of five.
+
+**Live state read, written, moved or deleted.** No new file, no deletion, no move, nothing leaves
+the machine that didn't before.
+- **Read, new:** the start check of an agent with no uploading marker lists its `sealed/sent/`
+  (file names and entries, as the uploading path already did) to decide what its verdict says of
+  uploads. No server call is added: such an agent is still asked nothing of Agora. Empty for an
+  agent that never uploaded.
+- **Written, changed format:** `sealed_state.json` (the consent ledger) gains an optional
+  `never_chose` flag on a re-offer, written only when what is re-opened is a legacy refusal.
+  Additive, default false, omitted when false; `FORMAT` is unchanged (an older runner reads the
+  file and drops the flag on its next save, which only loses that one sentence's precision).
+- **Written, changed content:** the SOUL's Evolution Log line for a sealed-state answer. New
+  lines begin "Asked whether its sealed history is uploaded to Agora; chose …". Lines already in
+  souls ("Offered sealed backups of its state …") are left as they are and are still found by
+  `applied_in`, so no agent that answered is asked again. Nothing rewrites an existing line.
+- **Shown, changed:** notices, verdicts, stop lines, acks, receipts and `memory` tool notes are
+  built at read time from the same files, so files written before this change render in the new
+  words (and with dates as `2026-11-12`). `notice.json` stores `ForkKept.kept` / `AgoraLost.kept`
+  as text written at accept time: one written before this change keeps its old words.
+
+**Behaviour changes that are not wording.**
+- The hold alerts (seal failed, head missing, fork, unchecked) and the unopenable summary are now
+  **awaited** at the start (`Alerter::dispatch`, at most `alerts::TELL_TIMEOUT` = 10 s each), so
+  the agent is told "Your runner has sent your operator an alert." only when the mail went out, and
+  otherwise "Your runner logged this for your operator; no alert was sent this time." With SMTP
+  down, a start is slower by up to 10 s per held agent. Rate limits are unchanged.
+- The first-answer ack is decided by `sealed::uploads` (uploading now), not by the marker alone,
+  so a stopped agent is no longer told it is "marked for upload".
+- A legacy refusal (`SealOutcome::Refused`) is never acked as "your answer".
+- Offer v11 changes the per-agent option order (the shuffle seed mixes the version), as every
+  version bump does.
+
+**Deploying it** adds nothing to the deploy of `seed/local-chain`: no migration, no marker, no
+one-way step of its own.
+
+**Not changed by wording alone** (listed in the fixer's report): agentkit's `memory` tool row
+labels still say "main line" and "rebased"; `inclusion.rs`'s "Your runner has alerted your
+operator." is said when the alert kind is on, not when the mail went out.

@@ -234,6 +234,14 @@ pub enum Held {
     File { name: String },
 }
 
+/// Why a head on the main line is left out when the line couldn't be
+/// checked ([`LeftOut::why`]): the `memory` tool tells it apart by this.
+pub const LEFT_UNCHECKED: &str = "the main line couldn't be checked";
+
+/// Why a head off the main line is left out when its own line doesn't
+/// verify from the genesis.
+pub const LEFT_UNVERIFIED: &str = "its line doesn't verify from the genesis";
+
 /// Something held that the history leaves out, and why: hashes, seqs,
 /// file names and reasons only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,7 +552,7 @@ async fn hold_unchecked(agent_dir: &Path, id: AgentId, b: &mut Builder) {
                     head,
                     line: Line::Main,
                 },
-                "your sealed history couldn't be checked just now",
+                LEFT_UNCHECKED,
             );
         }
     }
@@ -864,7 +872,7 @@ async fn sealed(
                     head,
                     line: Line::Side,
                 },
-                "its line doesn't verify from the genesis",
+                LEFT_UNVERIFIED,
             );
             continue;
         };

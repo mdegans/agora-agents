@@ -1072,6 +1072,25 @@ impl Smtp {
     }
 }
 
+/// What an agent is told came of an alert about it: said only of a mail
+/// that went out ([`Alerter::dispatch`] returned `true`).
+pub const ALERT_SENT: &str = "Your runner has sent your operator an alert.";
+
+/// What an agent is told when no mail went out this time (alerts off, the
+/// kind not listed, inside the rate limit, or the send failed). The
+/// caller logs the event itself, whatever the alerter does.
+pub const ALERT_NOT_SENT: &str =
+    "Your runner logged this for your operator; no alert was sent this time.";
+
+/// How long a start waits for the mail whose outcome an agent is told
+/// ([`Alerter::dispatch`]).
+pub const TELL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The sentence for an alert whose mail went out (`sent`) or didn't.
+pub fn told(sent: bool) -> &'static str {
+    if sent { ALERT_SENT } else { ALERT_NOT_SENT }
+}
+
 /// Sends alerts, or does nothing when `[alerts]` is absent. Cheap to clone.
 #[derive(Clone, Default)]
 pub struct Alerter(Option<Arc<Inner>>);

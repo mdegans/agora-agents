@@ -95,7 +95,7 @@ pub const NEW_TOOL_LINE: &str = "New: the `memory` tool shows your memory's earl
 
 /// What the tool says when the session has no memory-id key.
 pub const NO_KEY: &str = "Your memory ids couldn't be worked out this session, so this tool \
-     can't name your memory's versions. Your operator has been told.";
+     can't name your memory's versions. Your runner logged this for your operator.";
 
 /// What the tool says when the history couldn't be read at all.
 pub const UNREADABLE: &str = "Your memory's history couldn't be read just now. Ask again later.";
@@ -170,7 +170,7 @@ pub async fn enrollment_note(agent_dir: &Path, id: AgentId) -> Option<String> {
         .min()
         .and_then(DateTime::<Utc>::from_timestamp_micros)?;
     Some(enrollment_sentence(
-        &earliest.format("%Y-%m-%d").to_string(),
+        &earliest.format(super::text::DATE).to_string(),
     ))
 }
 
@@ -192,11 +192,11 @@ pub const LEFT_OUT_TOLD: &str = "left_out_told.json";
 /// include.
 pub fn left_out_line(n: usize) -> String {
     if n == 1 {
-        "1 of your runner's local copies couldn't be read and is not in your sealed history."
+        "1 older file of your state here couldn't be read, and is not in your sealed history."
             .to_string()
     } else {
         format!(
-            "{n} of your runner's local copies couldn't be read and are not in your sealed \
+            "{n} older files of your state here couldn't be read, and are not in your sealed \
              history."
         )
     }
@@ -242,18 +242,46 @@ async fn mark_left_out_told(agent_dir: &Path, n: usize) -> std::io::Result<()> {
 /// What `log` says once a session of where the main line's sealed
 /// versions are: uploaded to Agora (acknowledged, or read from Agora's
 /// chain), or kept only by the runner. `None` with none to say.
-pub fn uploads_line(u: Uploads) -> Option<String> {
+///
+/// It counts the versions of the history's own line, never those set
+/// aside from it, which `log` lists too: so it says which it counts.
+/// `uploading`: the agent uploads now ([`super::uploads`]), so what isn't
+/// uploaded isn't uploaded *yet*; for one that doesn't, it stays here.
+pub fn uploads_line(u: Uploads, uploading: bool) -> Option<String> {
+    /// Said after every count: `log` lists versions the count leaves out.
+    const COUNTED: &str = "This counts your sealed history itself, not versions set aside from it.";
     let n = u.uploaded + u.local;
+    let s = if n == 1 { "" } else { "s" };
+    let yet = if uploading { " yet" } else { "" };
     Some(match (u.uploaded, u.local) {
         (0, 0) => return None,
-        (0, _) => "None of your sealed versions has been uploaded to Agora: your runner keeps \
-                   them, on this machine."
-            .to_string(),
-        (1, 0) => "Your sealed version is uploaded to Agora.".to_string(),
-        (_, 0) => format!("All {n} of your sealed versions are uploaded to Agora."),
+        // As the verdict says it of an agent that doesn't upload: what
+        // the runner's files show
+        (0, _) if !uploading => format!(
+            "Your runner does not upload your sealed history, and its files show none of its \
+             {n} version{s} uploaded to Agora: {} here. {COUNTED}",
+            if n == 1 { "it is" } else { "they are" }
+        ),
+        (0, 1) => format!(
+            "The 1 version of your sealed history is not uploaded to Agora yet: it is here. \
+             {COUNTED}"
+        ),
+        (0, _) => format!(
+            "None of the {n} versions of your sealed history is uploaded to Agora yet: they \
+             are here. {COUNTED}"
+        ),
+        (_, 0) => format!(
+            "{} of your sealed history {} uploaded to Agora. {COUNTED}",
+            if n == 1 {
+                "The 1 version".to_string()
+            } else {
+                format!("All {n} versions")
+            },
+            if n == 1 { "is" } else { "are" },
+        ),
         (up, local) => format!(
-            "{up} of your {n} sealed versions {} uploaded to Agora; the other {local} {} kept by \
-             your runner and not uploaded.",
+            "{up} of the {n} versions of your sealed history {} uploaded to Agora; the other \
+             {local} {} here, not uploaded{yet}. {COUNTED}",
             if up == 1 { "is" } else { "are" },
             if local == 1 { "is" } else { "are" },
         ),
@@ -385,7 +413,8 @@ impl MemoryReader {
                 // the pre-loss copy was added (agentkit's row labels say
                 // neither)
                 if !self.told_where && view.seal == SealCheck::Checked {
-                    let said: Vec<String> = view.where_lines();
+                    let uploading = super::uploads(&self.agent_dir(), &self.keys, self.id);
+                    let said: Vec<String> = view.where_lines(uploading);
                     if !said.is_empty() {
                         self.told_where = true;
                         text = compose(&said, &text);
@@ -514,11 +543,42 @@ fn is_local(source: &Source) -> bool {
 
 /// Why a sealed version couldn't be opened, in the agent's words (the
 /// resolver's reason is the operator's: kept for the log).
-const NOT_FETCHED: &str = "its sealed copy couldn't be fetched";
+const NOT_FETCHED: &str = "its sealed files couldn't be fetched";
 
 /// Why a sealed version of an agent whose chain isn't uploaded couldn't
 /// be opened: its blob isn't here whole, and nothing is asked of Agora.
-const NOT_HERE: &str = "its sealed copy on this machine is missing or damaged";
+const NOT_HERE: &str = "its sealed files here are missing or damaged";
+
+/// What `show` says of a head the runner holds but left out of the
+/// history, after "Head {short} ": where the reason is not one below.
+const HELD_NOT_SHOWN: &str =
+    "is in your runner's files here, but can't be shown: your runner couldn't read or open it.";
+
+/// What `show` says of a head the runner doesn't hold, after "Head
+/// {short} ".
+const NOT_HELD: &str = "isn't in your runner's files here.";
+
+/// [`HELD_NOT_SHOWN`], when the history couldn't be checked at all.
+const HELD_UNCHECKED: &str = "is in your runner's files here, but your sealed history couldn't \
+     be checked just now, so it isn't shown; ask again later.";
+
+/// [`HELD_NOT_SHOWN`], for a version set aside whose own links don't
+/// verify.
+const HELD_UNVERIFIED: &str = "is in your runner's files here, set aside from your sealed \
+     history, but can't be shown: its links back to your first version don't verify.";
+
+/// What `show` says of a head held but left out, by the resolver's
+/// reason, in the agent's words. The reason itself is the operator's
+/// (it may carry paths or error text): logged, never shown.
+fn held_not_shown(why: &str) -> &'static str {
+    if why == super::history::LEFT_UNCHECKED {
+        HELD_UNCHECKED
+    } else if why == super::history::LEFT_UNVERIFIED {
+        HELD_UNVERIFIED
+    } else {
+        HELD_NOT_SHOWN
+    }
+}
 
 /// Why a sealed version wasn't tried, past the resolver's deadline.
 const PAST_DEADLINE: &str = "gathering your history took too long";
@@ -531,6 +591,60 @@ fn push_block(out: &mut String, block: &str) {
         out.push_str("\n\n");
     }
     out.push_str(block);
+}
+
+/// What `show` by head says of a version that is not on the line the
+/// agent's sealed history goes on: where it is, and why where the
+/// runner's files say. `None` for a version on it. `its`: "; its memory
+/// is <id>", or nothing.
+fn head_note(source: &Source, short: &str, its: &str) -> Option<String> {
+    let on = |d: &Option<DateTime<Utc>>| {
+        d.map(|d| format!(" on {}", d.format(super::text::DATE)))
+            .unwrap_or_default()
+    };
+    Some(match source {
+        Source::SideLine {
+            resumed: Some(at), ..
+        } => format!(
+            "Head {short} was saved while your uploads were stopped, and set aside from your \
+             sealed history on {} when your operator resumed them; it was not uploaded{its}.",
+            at.format(super::text::DATE)
+        ),
+        Source::SideLine { resumed: None, .. } => format!(
+            "Head {short} is sealed, but set aside from your sealed history: your history goes \
+             on from another version{its}."
+        ),
+        Source::SetAside {
+            on: at,
+            by: SetAsideBy::Rebase,
+            ..
+        } => format!(
+            "Head {short} was set aside from your sealed history{} when your operator had your \
+             history go on from another version{its}.",
+            on(at)
+        ),
+        Source::SetAside {
+            on: at,
+            by: SetAsideBy::Fork,
+            ..
+        } => format!(
+            "Head {short} was set aside from your sealed history{} when your operator resolved \
+             a fork in it, choosing the other line{its}.",
+            on(at)
+        ),
+        Source::ArchivedPrior {
+            added: Some(added), ..
+        } => format!(
+            "Head {short} is the copy of your memory from before the May 2026 loss, added to \
+             your sealed history on {}{its}.",
+            added.format(super::text::DATE)
+        ),
+        Source::OffLine { .. } => format!(
+            "Head {short} is sealed, but set aside from your sealed history; your runner's \
+             files don't say why{its}."
+        ),
+        _ => return None,
+    })
 }
 
 /// Where a ref led: a row, with notes, or only words.
@@ -671,11 +785,11 @@ impl View {
 
     /// [`uploads_line`] and, if the pre-loss copy is shown, [`prior_line`]:
     /// what `log` says once a session.
-    fn where_lines(&self) -> Vec<String> {
+    fn where_lines(&self, uploading: bool) -> Vec<String> {
         let mut said: Vec<String> = self
             .history
             .uploads
-            .and_then(uploads_line)
+            .and_then(|u| uploads_line(u, uploading))
             .into_iter()
             .collect();
         let added = self.history.versions.iter().find_map(|v| {
@@ -742,65 +856,26 @@ impl View {
                 let Some(row) = i.and_then(|i| self.placed[i]) else {
                     // Only when the main line couldn't be checked: its
                     // sealed versions aren't rows
-                    return Pick::Say(format!(
-                        "Head {short} is held by your runner, but your sealed history couldn't \
-                         be checked just now, so it isn't shown; ask again later."
-                    ));
+                    return Pick::Say(format!("Head {short} {HELD_UNCHECKED}"));
                 };
                 let its = match self.rows[row].id() {
                     Some(id) => format!("; its memory is {id}"),
                     None => String::new(),
                 };
-                let on = |d: &Option<DateTime<Utc>>| {
-                    d.map(|d| format!(" on {}", d.date_naive()))
-                        .unwrap_or_default()
-                };
-                match source {
-                    Source::SideLine {
-                        resumed: Some(at), ..
-                    } => notes.push(format!(
-                        "Head {short} was saved while your uploads were stopped, and set aside \
-                         on {} when your operator resumed them; it was not uploaded{its}.",
-                        at.date_naive()
-                    )),
-                    Source::SideLine { resumed: None, .. } => notes.push(format!(
-                        "Head {short} is sealed on a side line, off your main line{its}."
-                    )),
-                    Source::SetAside {
-                        on: at,
-                        by: SetAsideBy::Rebase,
-                        ..
-                    } => notes.push(format!(
-                        "Head {short} was set aside{} when your line was rebased{its}.",
-                        on(at)
-                    )),
-                    Source::SetAside {
-                        on: at,
-                        by: SetAsideBy::Fork,
-                        ..
-                    } => notes.push(format!(
-                        "Head {short} was set aside{} when your operator resolved a fork in your \
-                         sealed history, choosing the other line{its}.",
-                        on(at)
-                    )),
-                    Source::ArchivedPrior {
-                        added: Some(added), ..
-                    } => notes.push(format!(
-                        "Head {short} is the copy of your memory from before the May 2026 loss, \
-                         added to your sealed history on {}{its}.",
-                        added.date_naive()
-                    )),
-                    Source::OffLine { .. } => notes.push(format!(
-                        "Head {short} is sealed off your main line, with no record of why{its}."
-                    )),
-                    _ => {}
-                }
+                notes.extend(head_note(source, &short, &its));
                 Pick::At(row, notes)
             }
-            HeadMatch::Held(left) => Pick::Say(format!(
-                "Head {short} is held by your runner, but can't be shown: {}.",
-                left.why
-            )),
+            // The resolver's reason is the operator's (paths, error
+            // text): logged when it was left out, never shown
+            HeadMatch::Held(left) => {
+                tracing::info!(
+                    event_type = "memory_tool_head_not_shown",
+                    head = %short,
+                    why = %left.why,
+                    "a head the runner holds was asked for, and is left out of the history"
+                );
+                Pick::Say(format!("Head {short} {}", held_not_shown(&left.why)))
+            }
             HeadMatch::Ambiguous(heads) => Pick::Say(format!(
                 "\"{short}\" could mean any of these heads; give more digits:\n{}",
                 heads
@@ -810,7 +885,7 @@ impl View {
                     .join("\n")
             )),
             HeadMatch::NotHeld | HeadMatch::NotAHead => {
-                Pick::Say(format!("Head {short} isn't held by your runner."))
+                Pick::Say(format!("Head {short} {NOT_HELD}"))
             }
         }
     }
@@ -1101,6 +1176,100 @@ impl Tool for MemoryTool {
     }
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    use agora_agentkit::state::verify::HeadRef;
+    let head = HeadRef {
+        entry_hash: Sha256Hex::from([3; 32]),
+        seq: 3,
+    };
+    let at: Option<DateTime<Utc>> = "2026-11-05T09:00:00Z".parse().ok();
+    let day = at.expect("a date").date_naive();
+    let mut out = vec![
+        Text::new("NEW_TOOL_LINE", To::Any, NEW_TOOL_LINE),
+        Text::new("NO_KEY", To::Any, NO_KEY),
+        Text::new("UNREADABLE", To::Any, UNREADABLE),
+        Text::new("left_out_line", To::Any, left_out_line(1)),
+        Text::new("left_out_line", To::Any, left_out_line(3)),
+        Text::new("prior_line", To::Any, prior_line(day)),
+        Text::new(
+            "enrollment_sentence",
+            To::Any,
+            enrollment_sentence("2026-07-24"),
+        ),
+        Text::new("NOT_FETCHED", To::Uploaded, NOT_FETCHED),
+        Text::new("NOT_HERE", To::Any, NOT_HERE),
+        Text::new("PAST_DEADLINE", To::Any, PAST_DEADLINE),
+        Text::new(
+            "at_head (not held)",
+            To::Any,
+            format!("Head 030303030303 {NOT_HELD}"),
+        ),
+    ];
+    for why in [
+        super::history::LEFT_UNCHECKED,
+        super::history::LEFT_UNVERIFIED,
+        "reading blob: No such file or directory (os error 2)",
+    ] {
+        out.push(Text::new(
+            "at_head (held, not shown)",
+            To::Any,
+            format!("Head 030303030303 {}", held_not_shown(why)),
+        ));
+    }
+    for (uploaded, local) in [(0, 1), (0, 4), (1, 0), (5, 0), (1, 1), (4, 2)] {
+        for uploading in [true, false] {
+            // An agent that doesn't upload with versions uploaded: stopped
+            let to = match (uploading, uploaded) {
+                (false, 0) => To::Never,
+                _ => To::Uploaded,
+            };
+            out.extend(
+                uploads_line(Uploads { uploaded, local }, uploading)
+                    .map(|l| Text::new("uploads_line", to, l)),
+            );
+        }
+    }
+    for source in [
+        Source::SideLine { head, resumed: at },
+        Source::SideLine {
+            head,
+            resumed: None,
+        },
+        Source::SetAside {
+            head,
+            on: at,
+            by: SetAsideBy::Rebase,
+        },
+        Source::SetAside {
+            head,
+            on: None,
+            by: SetAsideBy::Fork,
+        },
+        Source::ArchivedPrior { head, added: at },
+        Source::OffLine { head },
+    ] {
+        for its in ["", "; its memory is mem-3f9a1c07be"] {
+            out.extend(
+                head_note(&source, "030303030303", its)
+                    .map(|l| Text::new("at_head notes", To::Any, l)),
+            );
+        }
+    }
+    for (r, sealed) in [("mem-3f9a1c07be", false), ("030303030303", true)] {
+        out.extend(
+            r.parse::<HistoryRef>()
+                .ok()
+                .map(|r| Text::new("not_found", To::Any, not_found(&r, sealed))),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,7 +1537,8 @@ mod tests {
         let out = rd.answer(show(vec![r(&short)]), &b.api).await.text;
         assert!(
             out.starts_with(&format!(
-                "Head {short} is sealed on a side line, off your main line; its memory is mem-"
+                "Head {short} is sealed, but set aside from your sealed history: your history \
+                 goes on from another version; its memory is mem-"
             )),
             "{out}"
         );
@@ -1700,12 +1870,12 @@ mod tests {
         write(2);
         let text = log(&mut r).await;
         assert!(text.starts_with(&left_out_line(2)), "{text}");
-        assert!(!log(&mut r).await.contains("couldn't be read and"), "once");
+        assert!(!log(&mut r).await.contains("couldn't be read, and"), "once");
         write(3);
         assert!(log(&mut r).await.starts_with(&left_out_line(3)));
         assert_eq!(
             left_out_line(1),
-            "1 of your runner's local copies couldn't be read and is not in your sealed history."
+            "1 older file of your state here couldn't be read, and is not in your sealed history."
         );
     }
 
@@ -1714,42 +1884,59 @@ mod tests {
     /// an uploader never that nothing is on Agora.
     #[test]
     fn the_uploads_line_by_kind_of_agent() {
-        let line = |uploaded, local| uploads_line(Uploads { uploaded, local });
+        let line = |uploaded, local| uploads_line(Uploads { uploaded, local }, false);
+        let up = |uploaded, local| uploads_line(Uploads { uploaded, local }, true);
+        const COUNTED: &str =
+            "This counts your sealed history itself, not versions set aside from it.";
         assert_eq!(line(0, 0), None);
+        // An agent that doesn't upload: as its verdict says it
         assert_eq!(
             line(0, 4).unwrap(),
-            "None of your sealed versions has been uploaded to Agora: your runner keeps them, \
-             on this machine."
+            format!(
+                "Your runner does not upload your sealed history, and its files show none of \
+                 its 4 versions uploaded to Agora: they are here. {COUNTED}"
+            )
+        );
+        // One that uploads, nothing sent yet
+        assert_eq!(
+            up(0, 1).unwrap(),
+            format!(
+                "The 1 version of your sealed history is not uploaded to Agora yet: it is here. \
+                 {COUNTED}"
+            )
         );
         assert_eq!(
-            line(1, 0).unwrap(),
-            "Your sealed version is uploaded to Agora."
+            up(1, 0).unwrap(),
+            format!("The 1 version of your sealed history is uploaded to Agora. {COUNTED}")
         );
+        // The count is of the history itself, and says so: `log` lists
+        // versions set aside from it too
         assert_eq!(
-            line(5, 0).unwrap(),
-            "All 5 of your sealed versions are uploaded to Agora."
+            up(5, 0).unwrap(),
+            format!("All 5 versions of your sealed history are uploaded to Agora. {COUNTED}")
         );
+        // "Not uploaded yet" only for an agent that uploads; a stopped
+        // one's stay here
         assert_eq!(
-            line(1, 1).unwrap(),
-            "1 of your 2 sealed versions is uploaded to Agora; the other 1 is kept by your \
-             runner and not uploaded."
+            up(1, 1).unwrap(),
+            format!(
+                "1 of the 2 versions of your sealed history is uploaded to Agora; the other 1 \
+                 is here, not uploaded yet. {COUNTED}"
+            )
         );
         assert_eq!(
             line(4, 2).unwrap(),
-            "4 of your 6 sealed versions are uploaded to Agora; the other 2 are kept by your \
-             runner and not uploaded."
+            format!(
+                "4 of the 6 versions of your sealed history are uploaded to Agora; the other 2 \
+                 are here, not uploaded. {COUNTED}"
+            )
         );
         for (uploaded, local) in [(0, 1), (0, 9)] {
             let t = line(uploaded, local).unwrap();
-            for banned in [
-                "in step with Agora",
-                "anchor",
-                "ANC-",
-                "enrol",
-                "are uploaded",
-            ] {
-                assert!(!t.contains(banned), "{banned}: {t}");
-            }
+            // Particular to this line; the rest is the one banned list's
+            // (`crate::sealed::text`)
+            assert!(!t.contains("are uploaded"), "{t}");
+            crate::sealed::text::assert_may_say(crate::sealed::text::To::Never, &t);
         }
         for (uploaded, local) in [(1, 0), (3, 0), (1, 1), (4, 2)] {
             let t = line(uploaded, local).unwrap().to_lowercase();
@@ -1818,12 +2005,15 @@ mod tests {
         let now = "two\n";
         let current = || view.current(MemoryId::of(&k.current, agent, now), now);
         assert_eq!(
-            view.where_lines(),
+            view.where_lines(false),
             [
-                uploads_line(Uploads {
-                    uploaded: 0,
-                    local: 2
-                })
+                uploads_line(
+                    Uploads {
+                        uploaded: 0,
+                        local: 2
+                    },
+                    false
+                )
                 .unwrap(),
                 prior_line(stamp(9).date_naive()),
             ]
@@ -1834,22 +2024,26 @@ mod tests {
         let said = view.show(&[r("030303030303")], None, current());
         assert!(
             said.starts_with(
-                "Head 030303030303 was saved while your uploads were stopped, and set aside on \
-                 2026-11-05 when your operator resumed them; it was not uploaded; its memory is"
+                "Head 030303030303 was saved while your uploads were stopped, and set aside from \
+                 your sealed history on 2026-11-05 when your operator resumed them; it was not \
+                 uploaded; its memory is"
             ),
             "{said}"
         );
         let said = view.show(&[r("040404040404")], None, current());
         assert!(
             said.starts_with(
-                "Head 040404040404 was set aside on 2026-11-06 when your operator resolved a \
-                 fork in your sealed history, choosing the other line; its memory is"
+                "Head 040404040404 was set aside from your sealed history on 2026-11-06 when your \
+                 operator resolved a fork in it, choosing the other line; its memory is"
             ),
             "{said}"
         );
         let said = view.show(&[r("070707070707")], None, current());
         assert!(
-            said.starts_with("Head 070707070707 is sealed on a side line, off your main line;"),
+            said.starts_with(
+                "Head 070707070707 is sealed, but set aside from your sealed history: your \
+                 history goes on from another version;"
+            ),
             "{said}"
         );
         let said = view.show(&[r("010101010101")], None, current());
@@ -1995,13 +2189,20 @@ mod tests {
         let said = view.show(&[r("050505050505")], None, current);
         assert!(
             said.starts_with(&format!(
-                "Head 050505050505 was set aside when your line was rebased; its memory is {}.",
+                "Head 050505050505 was set aside from your sealed history when your operator had \
+                 your history go on from another version; its memory is {}.",
                 MemoryId::of(&k.current, agent, "five\n")
             )),
             "{said}"
         );
         let said = view.show(&[r("020202020202")], None, current);
-        assert!(said.starts_with("Head 020202020202 is sealed off your main line, with no record of why; its memory is mem-"), "{said}");
+        assert!(
+            said.starts_with(
+                "Head 020202020202 is sealed, but set aside from your sealed history; your \
+                 runner's files don't say why; its memory is mem-"
+            ),
+            "{said}"
+        );
 
         // The memory in context whose sealed version couldn't be opened,
         // named by its local twin: still placed, still reachable by id

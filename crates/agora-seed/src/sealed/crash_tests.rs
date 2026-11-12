@@ -693,7 +693,7 @@ async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
             assert!(hold.is_none(), "{nothing_left} {point:?}: {out:?}");
             assert!(
                 seat[0].contains("Agora had lost")
-                    && seat[0].contains("Kept by your runner: the full copy of your state from "),
+                    && seat[0].contains("Kept by your runner: your whole state as sealed on "),
                 "{seat:?}"
             );
             // Kept past a prune: the old keyframe opens

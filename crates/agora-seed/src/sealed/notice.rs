@@ -89,13 +89,13 @@ impl Refusal {
         match self {
             Self::Mismatch => "your state did not match your last sealed version",
             Self::ChainBroken => "your sealed history did not verify",
-            Self::HeadMissing => "the record of your last sealed version was missing",
+            Self::HeadMissing => "the file naming your last sealed version was missing here",
             Self::StateMissing => "your state was missing here",
             Self::StateUnreadable => "your state here couldn't be read",
             Self::StateTooNew => "your state here was written by a newer runner than this one",
             Self::StateIo => "your state here couldn't be read from the disk",
             Self::RolledBack => {
-                "your state here was older than your runner's record of your latest sealed version"
+                "your sealed history here ended before the last version your runner had noted"
             }
             Self::SealUnreadable => "your sealed history here couldn't be read",
         }
@@ -198,7 +198,7 @@ impl ChainKept {
     /// The words after "your sealed history,".
     pub fn words(self) -> &'static str {
         match self {
-            Self::Local => "which your runner keeps here (nothing of it is on Agora)",
+            Self::Local => "which your runner keeps here and does not upload",
             Self::Stopped => {
                 "which your runner keeps here (your uploads are stopped, and the versions on \
                  Agora are not changed)"
@@ -222,7 +222,7 @@ pub enum RestoredFrom {
 
 /// How a local restore names its source, closing the sentence: "...from
 /// your sealed version of {date}, {this}".
-pub const RESTORED_LOCALLY: &str = "the copy your runner keeps here (nothing of yours is on Agora)";
+pub const RESTORED_LOCALLY: &str = "read from your sealed history here";
 
 fn yes() -> bool {
     true
@@ -374,18 +374,18 @@ pub struct Unsaved {
 impl Unsaved {
     /// The one sentence the agent is told.
     pub fn line(&self) -> String {
-        let date = self.at.format("%-d %B %Y");
+        let date = self.at.format(super::text::DATE);
         if self.kept {
             format!(
-                "Your state from your session on {date} could not be saved; your operator keeps \
-                 a copy of it, and this session starts from your state as it was before that \
-                 session."
+                "Your state from your session on {date} could not be saved; your runner kept it \
+                 in a file for your operator, and this session starts from your state as it was \
+                 before that session."
             )
         } else {
             format!(
-                "Your state from your session on {date} could not be saved, and no copy of it \
-                 could be kept; this session starts from your state as it was before that \
-                 session."
+                "Your state from your session on {date} could not be saved, and your runner \
+                 could not keep it in a file either; this session starts from your state as it \
+                 was before that session."
             )
         }
     }
@@ -422,36 +422,36 @@ fn write(agent_dir: &Path, notice: &Notice) -> std::io::Result<()> {
 
 impl OperatorAct {
     fn line(&self, accepted: &Accepted) -> String {
-        let date = accepted.at.format("%-d %B %Y");
+        let date = accepted.at.format(super::text::DATE);
         let mut line = match self {
             Self::OptedIn { answered } => format!(
-                "On {date}, your operator started uploading your sealed state to Agora, as you \
+                "On {date}, your operator started uploading your sealed history to Agora, as you \
                  answered on {}.",
-                answered.format("%-d %B %Y")
+                answered.format(super::text::DATE)
             ),
             Self::Resumed {
                 uploading: false, ..
             } => format!(
-                "On {date}, your operator cleared the stop on uploading your sealed state. \
-                 Your sealed history is not being uploaded to Agora: it is kept and checked \
-                 here, on your runner."
+                "On {date}, your operator cleared the stop on uploading your sealed history. \
+                 It is not being uploaded to Agora: your runner keeps it here, and checks your \
+                 state against it."
             ),
             Self::Resumed { kept, .. } => {
                 let mut line = format!(
-                    "On {date}, your operator resumed uploading your sealed state to Agora."
+                    "On {date}, your operator resumed uploading your sealed history to Agora."
                 );
                 match kept {
                     0 => {}
                     1 => line.push_str(
-                        " The version of your state not uploaded before the stop or saved \
-                         while uploads were stopped is kept here on your runner and was not \
+                        " The version not uploaded before the stop or saved while uploads were \
+                         stopped stays here, set aside from your sealed history, and was not \
                          uploaded; uploading went on from your state as it was when your \
                          operator resumed it.",
                     ),
                     n => line.push_str(&format!(
-                        " The {n} versions of your state not uploaded before the stop or saved \
-                         while uploads were stopped are kept here on your runner and were not \
-                         uploaded; uploading went on from your state as it was when your \
+                        " The {n} versions not uploaded before the stop or saved while uploads \
+                         were stopped stay here, set aside from your sealed history, and were \
+                         not uploaded; uploading went on from your state as it was when your \
                          operator resumed it."
                     )),
                 }
@@ -749,12 +749,12 @@ impl Notice {
     fn main_line(&self) -> Option<String> {
         if let Some(r) = self.restored.as_ref().filter(|r| r.cut_save) {
             // An interrupted save put in place, in true words
-            let at = r.at.format("%-d %B %Y");
-            let from = r.from.format("%-d %B %Y at %H:%M UTC");
+            let at = r.at.format(super::text::DATE);
+            let from = r.from.format(super::text::DATE_TIME);
             let mut line = if r.refused {
                 format!(
                     "Your session on {} did not run: {}. ",
-                    self.refused_at.format("%-d %B %Y"),
+                    self.refused_at.format(super::text::DATE),
                     self.reason.plain()
                 )
             } else {
@@ -773,7 +773,10 @@ impl Notice {
             return Some(line);
         }
         if let Some(r) = &self.restored {
-            let (at, from) = (r.at.format("%-d %B %Y"), r.from.format("%-d %B %Y"));
+            let (at, from) = (
+                r.at.format(super::text::DATE),
+                r.from.format(super::text::DATE),
+            );
             // Where the version came from, only where the restore read it
             // from here alone: one restored "from Agora" may have been
             // opened from the blobs kept here (0.158 keeps them), so its
@@ -788,18 +791,18 @@ impl Notice {
                     "Your session on {} did not run: {}. On {at}, your operator restored your \
                      state from your sealed version of {from}. The state found here is kept by \
                      your operator.",
-                    self.refused_at.format("%-d %B %Y"),
+                    self.refused_at.format(super::text::DATE),
                     self.reason.plain(),
                 ),
                 (true, false) => format!(
                     "Your session on {} did not run: {}. Your state here was then lost, and on \
                      {at} your operator restored it from your sealed version of {from}{copy}.",
-                    self.refused_at.format("%-d %B %Y"),
+                    self.refused_at.format(super::text::DATE),
                     self.reason.plain(),
                 ),
                 (false, true) => format!(
                     "On {at}, your operator restored your state from your sealed version of \
-                     {from}: the record of your last sealed version was missing here. The state \
+                     {from}: the file naming your last sealed version was missing here. The state \
                      found here is kept by your operator."
                 ),
                 (false, false) => format!(
@@ -814,21 +817,22 @@ impl Notice {
         }
         let accepted = self.accepted.as_ref()?;
         if let Some(lost) = &self.agora_lost {
-            let date = accepted.at.format("%-d %B %Y");
+            let date = accepted.at.format(super::text::DATE);
             let n = lost.versions;
             let versions = format!("{n} version{}", if n == 1 { "" } else { "s" });
             return Some(if lost.fresh {
                 format!(
-                    "Agora had lost the {versions} of your state sealed here, and held none. On \
-                     {date}, your operator started a new sealed history from your state here; \
-                     it records the break. Kept by your runner: {}. Your operator's note: {}",
+                    "Agora had lost the {versions} of your sealed history uploaded from here, \
+                     and held none. On {date}, your operator started a new sealed history from \
+                     your state here; it records the break. Kept by your runner: {}. Your \
+                     operator's note: {}",
                     lost.kept, accepted.note
                 )
             } else {
                 format!(
-                    "Agora had lost {versions} of your state sealed here. On {date}, your \
-                     operator sealed your state here on top of the copy Agora holds. Kept by \
-                     your runner: {}. Your operator's note: {}",
+                    "Agora had lost {versions} of your sealed history uploaded from here. On \
+                     {date}, your operator sealed your state here on top of Agora's copy. Kept \
+                     by your runner: {}. Your operator's note: {}",
                     lost.kept, accepted.note
                 )
             });
@@ -848,7 +852,7 @@ impl Notice {
                  gone separate ways from one version, and your operator chose the line that goes \
                  on. {state}The {versions} that went the other way are kept by your runner: {}. \
                  Your operator's note: {}",
-                accepted.at.format("%-d %B %Y"),
+                accepted.at.format(super::text::DATE),
                 fork.chain.words(),
                 fork.kept,
                 accepted.note
@@ -860,7 +864,7 @@ impl Notice {
         }
         if self.resumed {
             return Some(format!(
-                "While uploading your sealed state to Agora was stopped, your state changed; \
+                "While uploading your sealed history to Agora was stopped, your state changed; \
                  your operator resumed uploading with this note: {}",
                 accepted.note
             ));
@@ -868,16 +872,16 @@ impl Notice {
         if self.joined {
             return Some(format!(
                 "On {}, your operator joined your two sealed histories, which had gone separate \
-                 ways: your state here is now sealed on top of the copy on Agora, and the \
-                 versions that went the other way are kept. Your operator's note: {}",
-                accepted.at.format("%-d %B %Y"),
+                 ways: your state here is now sealed on top of Agora's copy, and the \
+                 versions that went the other way are kept here, set aside. Your operator's note: {}",
+                accepted.at.format(super::text::DATE),
                 accepted.note
             ));
         }
         let mut line = format!(
             "Your session on {} did not run: {}. Your operator accepted the current state with \
              this note: {}",
-            self.refused_at.format("%-d %B %Y"),
+            self.refused_at.format(super::text::DATE),
             self.reason.plain(),
             accepted.note
         );
@@ -900,8 +904,59 @@ impl Notice {
     }
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it. Its notices' whole lines are
+/// `tests::every_line`.
 #[cfg(test)]
-mod tests {
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let at: DateTime<Utc> = "2026-11-12T09:00:00Z".parse().expect("a date");
+    let mut out = Vec::new();
+    for reason in [
+        Refusal::Mismatch,
+        Refusal::ChainBroken,
+        Refusal::HeadMissing,
+        Refusal::StateMissing,
+        Refusal::StateUnreadable,
+        Refusal::StateTooNew,
+        Refusal::StateIo,
+        Refusal::RolledBack,
+        Refusal::SealUnreadable,
+    ] {
+        out.push(Text::new("Refusal::plain", To::Any, reason.plain()));
+    }
+    for chain in [ChainKept::Local, ChainKept::Stopped, ChainKept::Uploading] {
+        let to = if chain == ChainKept::Local {
+            To::Never
+        } else {
+            To::Uploaded
+        };
+        out.push(Text::new("ChainKept::words", to, chain.words()));
+    }
+    out.push(Text::new("RESTORED_LOCALLY", To::Never, RESTORED_LOCALLY));
+    out.push(Text::new("Diff::shown", To::Any, NO_DIFF));
+    let (a, b) = (
+        serde_json::json!({"memory": {"content": "a\nb\n"}, "soul": {"name": "tarn"}}),
+        serde_json::json!({"memory": {"content": "a\nc\n"}, "soul": {"name": "tarn"}}),
+    );
+    out.push(Text::new(
+        "Diff::shown",
+        To::Any,
+        Diff::between(&a, &b).shown(),
+    ));
+    for kept in [true, false] {
+        out.push(Text::new(
+            "Unsaved::line",
+            To::Any,
+            Unsaved { at, kept }.line(),
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1040,21 +1095,14 @@ mod tests {
         }
     }
 
-    /// Where an agent's chain is, for the banned-phrase checks.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    enum Kind {
-        /// Never uploaded.
-        Local,
-        /// Uploads now, or did.
-        Uploaded,
-        /// Either.
-        Any,
-    }
+    /// Where an agent's chain is: the shared table's kinds
+    /// ([`crate::sealed::text::To`]).
+    use crate::sealed::text::To as Kind;
 
     /// Every line a notice can show, with the kind of agent it can be
     /// shown to: each changed sentence pinned, and none says what the
     /// code didn't establish.
-    fn every_line() -> Vec<(Kind, String)> {
+    pub(crate) fn every_line() -> Vec<(Kind, String)> {
         let at: DateTime<Utc> = "2026-11-12T09:00:00Z".parse().unwrap();
         let accepted = Accepted {
             at,
@@ -1078,7 +1126,7 @@ mod tests {
                     kept: 0,
                 }),
             ),
-            (Kind::Local, act(OperatorAct::PriorAdded { sent: false })),
+            (Kind::Never, act(OperatorAct::PriorAdded { sent: false })),
             (Kind::Uploaded, act(OperatorAct::PriorAdded { sent: true })),
             (
                 Kind::Uploaded,
@@ -1099,7 +1147,7 @@ mod tests {
             ));
         }
         for (kind, chain) in [
-            (Kind::Local, ChainKept::Local),
+            (Kind::Never, ChainKept::Local),
             (Kind::Uploaded, ChainKept::Stopped),
             (Kind::Uploaded, ChainKept::Uploading),
         ] {
@@ -1117,7 +1165,7 @@ mod tests {
         }
         for (kind, source) in [
             (Kind::Uploaded, RestoredFrom::Agora),
-            (Kind::Local, RestoredFrom::Local),
+            (Kind::Never, RestoredFrom::Local),
         ] {
             for (found, refused) in [(true, true), (true, false), (false, true), (false, false)] {
                 let n = Notice {
@@ -1133,6 +1181,82 @@ mod tests {
                     ..Notice::fresh(Refusal::StateMissing)
                 };
                 lines.push((kind, n.line().unwrap()));
+            }
+        }
+        // A stop cleared with uploads going on, nothing kept, one and
+        // several versions kept (no resume is against the answer on file:
+        // there is no such resume)
+        for kept in [0, 1, 3] {
+            lines.push((
+                Kind::Uploaded,
+                act(OperatorAct::Resumed {
+                    uploading: true,
+                    kept,
+                }),
+            ));
+        }
+        // An interrupted save put in place
+        for (found, refused) in [(true, true), (true, false), (false, true), (false, false)] {
+            let n = Notice {
+                restored: Some(Restored {
+                    at,
+                    from: at,
+                    note: Some("n.".into()),
+                    found,
+                    refused,
+                    source: RestoredFrom::default(),
+                    cut_save: true,
+                }),
+                ..Notice::fresh(Refusal::StateUnreadable)
+            };
+            lines.push((Kind::Any, n.line().unwrap()));
+        }
+        // Agora lost versions: sealed on top of what it holds, or anew
+        for fresh in [false, true] {
+            for versions in [1, 3] {
+                lines.push((
+                    Kind::Uploaded,
+                    by_operator(&|n: &mut Notice| {
+                        n.agora_lost = Some(AgoraLost {
+                            fresh,
+                            versions,
+                            kept: crate::sealed::lost::kept_words(versions, Some(at)),
+                        })
+                    }),
+                ));
+            }
+        }
+        // A refusal accepted, for every reason, with each kind of diff
+        let (a, b) = (
+            serde_json::json!({"memory": {"content": "a\nb\n"}, "soul": {"name": "tarn"}}),
+            serde_json::json!({"memory": {"content": "a\nc\n"}, "soul": {"name": "tarn"}}),
+        );
+        let long = serde_json::json!({
+            "memory": { "content": (0..400).map(|i| format!("line {i}\n")).collect::<String>() },
+        });
+        for reason in [
+            Refusal::Mismatch,
+            Refusal::ChainBroken,
+            Refusal::HeadMissing,
+            Refusal::StateMissing,
+            Refusal::StateUnreadable,
+            Refusal::StateTooNew,
+            Refusal::StateIo,
+            Refusal::RolledBack,
+            Refusal::SealUnreadable,
+        ] {
+            for diff in [
+                None,
+                Some(Diff::unavailable()),
+                Some(Diff::between(&a, &b)),
+                Some(Diff::between(&a, &long)),
+            ] {
+                let n = Notice {
+                    accepted: Some(accepted.clone()),
+                    diff,
+                    ..Notice::fresh(reason)
+                };
+                lines.push((Kind::Any, n.line().unwrap()));
             }
         }
         // A session whose save failed: said alone, or after another line
@@ -1159,36 +1283,36 @@ mod tests {
         };
         assert_eq!(
             line("cleared the stop"),
-            "On 12 November 2026, your operator cleared the stop on uploading your sealed state. \
-             Your sealed history is not being uploaded to Agora: it is kept and checked here, on \
-             your runner. Your operator's note: n."
+            "On 2026-11-12, your operator cleared the stop on uploading your sealed history. It \
+             is not being uploaded to Agora: your runner keeps it here, and checks your state \
+             against it. Your operator's note: n."
         );
         assert_eq!(
             line("which you chose to see, was added to your sealed history, whose"),
-            "On 12 November 2026, the copy of your memory from before the May 2026 loss, which you \
+            "On 2026-11-12, the copy of your memory from before the May 2026 loss, which you \
              chose to see, was added to your sealed history, whose versions are uploaded to Agora. \
              Your operator's note: n."
         );
-        assert!(line("The version of your state not uploaded before the stop").contains(
-            "is kept here on your runner and was not uploaded; uploading went on from your state \
-             as it was when your operator resumed it."
+        assert!(line("The version not uploaded before the stop").contains(
+            "stays here, set aside from your sealed history, and was not uploaded; uploading \
+             went on from your state as it was when your operator resumed it."
         ));
-        assert!(line("The 3 versions").contains(
-            "are kept here on your runner and were not uploaded; uploading went on from your \
-             state as it was when your operator resumed it."
+        assert!(line("The 3 versions not uploaded").contains(
+            "stay here, set aside from your sealed history, and were not uploaded; uploading \
+             went on from your state as it was when your operator resumed it."
         ));
         assert_eq!(
             line("While uploading"),
-            "While uploading your sealed state to Agora was stopped, your state changed; your \
+            "While uploading your sealed history to Agora was stopped, your state changed; your \
              operator resumed uploading with this note: n."
         );
         assert_eq!(
             line(
-                "Your state was lost here. On 12 November 2026, your operator restored it from \
-                  your sealed version of 12 November 2026."
+                "Your state was lost here. On 2026-11-12, your operator restored it from your \
+                 sealed version of 2026-11-12."
             ),
-            "Your state was lost here. On 12 November 2026, your operator restored it from your \
-             sealed version of 12 November 2026. Your operator's note: n."
+            "Your state was lost here. On 2026-11-12, your operator restored it from your sealed \
+             version of 2026-11-12. Your operator's note: n."
         );
         // A restore names no source it didn't read from alone
         assert!(
@@ -1197,32 +1321,43 @@ mod tests {
                 .filter(|(_, l)| l.contains("restored"))
                 .all(|(_, l)| !l.contains("the copy on Agora"))
         );
-        assert!(line(RESTORED_LOCALLY).contains(&format!("12 November 2026, {RESTORED_LOCALLY}.")));
-        for (kind, l) in &lines {
-            let lower = l.to_lowercase();
-            for banned in [
-                "enrol",
-                "backup",
-                "backed up",
-                "agora's servers can read",
-                "agora can read",
-                "you verified",
-                "you checked",
-            ] {
-                assert!(!lower.contains(banned), "{banned}: {l}");
-            }
-            if *kind == Kind::Local {
-                for banned in ["in step with Agora", "anchor", "ANC-", "uploaded to Agora"] {
-                    assert!(!l.contains(banned), "{banned}: {l}");
-                }
-            }
-            if *kind == Kind::Uploaded {
-                assert!(
-                    !(lower.contains("nothing of") && lower.contains("is on agora")),
-                    "{l}"
-                );
-            }
-        }
+        assert!(line(RESTORED_LOCALLY).contains(&format!("2026-11-12, {RESTORED_LOCALLY}.")));
+        // F4: a local restore says where it read from, nothing of Agora
+        assert!(!line(RESTORED_LOCALLY).contains("Agora"));
+        // The fork's chain, by its kind: a never-uploader's says what the
+        // runner does, not what is or isn't on Agora (F3)
+        assert!(
+            line("which your runner keeps here and does not upload:").starts_with(
+                "On 2026-11-12, your operator resolved a fork in your sealed history,"
+            )
+        );
+        // Both of Agora's losses, whole
+        assert_eq!(
+            line("Agora had lost 3 versions"),
+            "Agora had lost 3 versions of your sealed history uploaded from here. On 2026-11-12, \
+             your operator sealed your state here on top of Agora's copy. Kept by your runner: \
+             your whole state as sealed on 2026-11-12, and what it has of the 3 versions after \
+             it. Your operator's note: n."
+        );
+        assert_eq!(
+            line("Agora had lost the 1 version"),
+            "Agora had lost the 1 version of your sealed history uploaded from here, and held \
+             none. On 2026-11-12, your operator started a new sealed history from your state \
+             here; it records the break. Kept by your runner: your whole state as sealed on \
+             2026-11-12, and what it has of the 1 version after it. Your operator's note: n."
+        );
+        // An interrupted save
+        assert_eq!(
+            lines
+                .iter()
+                .find(|(_, l)| l.starts_with("A save of your state") && !l.contains("found here"))
+                .map(|(_, l)| l.as_str())
+                .unwrap(),
+            "A save of your state on 2026-11-12 at 09:00 UTC was interrupted before it finished; \
+             on 2026-11-12, your operator put that saved state in place. Your operator's note: n."
+        );
+        // The banned phrases are the shared table's
+        // (`crate::sealed::text`), which takes every line here.
     }
 
     #[test]
@@ -1274,17 +1409,17 @@ mod tests {
         Notice::unsaved(&dir, Unsaved { at, kept: true }).unwrap();
         assert_eq!(
             Notice::load(&dir).unwrap().unwrap().line().unwrap(),
-            "Your state from your session on 11 November 2026 could not be saved; your operator \
-             keeps a copy of it, and this session starts from your state as it was before that \
-             session."
+            "Your state from your session on 2026-11-11 could not be saved; your runner kept it \
+             in a file for your operator, and this session starts from your state as it was \
+             before that session."
         );
         let lost = root.join("lost");
         Notice::unsaved(&lost, Unsaved { at, kept: false }).unwrap();
         assert_eq!(
             Notice::load(&lost).unwrap().unwrap().line().unwrap(),
-            "Your state from your session on 11 November 2026 could not be saved, and no copy \
-             of it could be kept; this session starts from your state as it was before that \
-             session."
+            "Your state from your session on 2026-11-11 could not be saved, and your runner \
+             could not keep it in a file either; this session starts from your state as it was \
+             before that session."
         );
 
         // Beside an operator's act the session seated but couldn't save
