@@ -13,7 +13,9 @@
 //! two stop markers first and always: `<secrets>/<id>/sealed_stopped`,
 //! then `sealed/stopped` (`{at, note, shown}`; the note is shown to the
 //! agent, not uploaded in v1). It needs only the uploading marker's lock
-//! (so it can't interleave with an opt-in's write): not the session lock,
+//! (an opt-in or resume holds it to its end, so a stop issued during one
+//! waits for it and then stops the agent; neither can undo it): not the
+//! session lock,
 //! not a reachable Agora, not a stopped runner, not an agent whose state
 //! is in order. A refused agent, a save that went unsealed, a state that
 //! isn't its head's, a session in progress or one interrupted are all
@@ -269,10 +271,22 @@ pub async fn stop(
     let durable_path = keys.agent_dir(id).join(DURABLE);
     let mut later = Vec::new();
     let (stopped, already) = {
-        // An opt-in's write of the uploading marker waits for this, and
-        // this for it: the stop is decided on a marker that isn't moving
-        let _marker = super::uploading::lock(keys, id)
-            .map_err(|e| anyhow::anyhow!("taking the uploading marker's lock: {e}"))?;
+        // An opt-in or a resume holds the marker's lock from its first
+        // reading of the stop to its last write: this waits for it, then
+        // stops the agent it leaves (so a stop issued during one wins). The
+        // stop is decided on a marker that isn't moving
+        let _marker = super::uploading::lock_or_wait(keys, id, || {
+            tracing::info!(
+                event_type = "sealed_state_stop_waits",
+                agent_id = %id,
+                "an opt-in or resume of the agent is in progress; the stop waits for it, then stops it"
+            );
+            eprintln!(
+                "{id}: an opt-in or resume of this agent is in progress; the stop waits for it to \
+                 finish, then stops the agent"
+            );
+        })
+        .map_err(|e| anyhow::anyhow!("taking the uploading marker's lock: {e}"))?;
         let on_file = match (found(&durable_path), found(&path(&agent_dir))) {
             (Found::Stop(s), _) | (_, Found::Stop(s)) => Some(s),
             _ => None,

@@ -43,7 +43,13 @@
 //! processes (the runner's start and a `sealed-*` command) can't each
 //! write one copy. It is a leaf: nothing else is locked while it is held,
 //! so whoever takes it inside the agent's `sealed/lock` or agentkit's
-//! directory lock can't deadlock with them.
+//! directory lock can't deadlock with them. Two exceptions, the opt-in and
+//! the resume, take it first and hold it to their last write (sealing,
+//! network calls and the agent's session lock included), so that a
+//! `sealed-stop` issued meanwhile waits and then stops the agent rather
+//! than being undone by them. Both run only under the runner lock held
+//! exclusively, so no runner (the only other taker of those locks) exists
+//! meanwhile, and `sealed-stop` takes this lock alone.
 //!
 //! [`migrate`]: the one-time migration of agents that uploaded before
 //! the marker existed. **Tied to the old chain marker** (`sealed/enrolled`,
@@ -235,21 +241,46 @@ fn read_copy(path: &Path, id: AgentId) -> Copy {
     }
 }
 
-/// The marker's lock, held until the file is dropped. Blocking, briefly:
-/// every holder only reads and writes the two small copies.
+/// The marker's lock, held until the file is dropped. Blocking: briefly
+/// for most holders, which only read and write the two small copies; for
+/// as long as an opt-in or a resume of the agent runs (the module's docs).
 // Public for `sealed-forget`, which sets the secrets copy aside
 // under it.
 pub fn lock(keys: &KeyStore, id: AgentId) -> std::io::Result<std::fs::File> {
+    let file = lock_file(keys, id)?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn lock_file(keys: &KeyStore, id: AgentId) -> std::io::Result<std::fs::File> {
     let dir = keys.agent_dir(id);
     std::fs::create_dir_all(&dir)?;
-    let file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(dir.join(LOCK))?;
-    file.lock()?;
-    Ok(file)
+        .open(dir.join(LOCK))
+}
+
+/// [`lock`], saying so first when an opt-in or a resume of the agent holds
+/// it (they hold it to their end, network calls and sealing included):
+/// `waiting` is called once, before the wait.
+pub fn lock_or_wait(
+    keys: &KeyStore,
+    id: AgentId,
+    waiting: impl FnOnce(),
+) -> std::io::Result<std::fs::File> {
+    let file = lock_file(keys, id)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            waiting();
+            file.lock()?;
+            Ok(file)
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 /// Both copies, read and judged. Never logs.
@@ -370,13 +401,31 @@ fn commit(keys: &KeyStore, id: AgentId) -> std::io::Result<()> {
 /// aside, each copy as `<name>.doubt.<utc>` (kept, never read again), and
 /// a new one written. The one way a marker in doubt becomes a marker:
 /// nothing does it from the copies themselves.
+#[cfg(test)]
 pub fn set_replacing_doubt(
     agent_dir: &Path,
     keys: &KeyStore,
     id: AgentId,
     by: UploadingBy,
 ) -> std::io::Result<Uploading> {
-    let _lock = lock(keys, id)?;
+    let lock = lock(keys, id)?;
+    set_replacing_doubt_locked(agent_dir, keys, id, by, &lock)
+}
+
+/// [`set_replacing_doubt`] under the marker's lock, held by the caller
+/// (`lock`) from before it read what it acts on: the opt-in and the resume
+/// hold it from their first reading of the stop to their last write, so a
+/// `sealed-stop` issued meanwhile waits for them and then stops the agent.
+/// A second `flock` on a new open of the same file in one process would
+/// wait for itself, hence this variant.
+pub fn set_replacing_doubt_locked(
+    agent_dir: &Path,
+    keys: &KeyStore,
+    id: AgentId,
+    by: UploadingBy,
+    lock: &std::fs::File,
+) -> std::io::Result<Uploading> {
+    let _ = lock;
     if matches!(
         state(agent_dir, keys, id),
         Marker::Contradictory(_) | Marker::Unreadable(_)

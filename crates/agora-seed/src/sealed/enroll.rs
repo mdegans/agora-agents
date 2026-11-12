@@ -1385,6 +1385,13 @@ impl Enroller {
         {
             return Err(Skip::NotChained);
         }
+        // The marker's lock from before the stop is read until the marker
+        // is written: a `sealed-stop` issued meanwhile waits for this
+        // opt-in, then finds the agent marked and stops it. Without it, the
+        // stop would find no marker, be refused, and this would mark it
+        let marker_lock = uploading::lock(&self.keys, id).map_err(|e| {
+            Skip::Failed(anyhow::Error::new(e).context("the uploading marker's lock"))
+        })?;
         if super::stop::is_stopped(&agent_dir)
             || super::stop::durable(&self.keys, id).map_or(true, |d| d.is_some())
         {
@@ -1404,6 +1411,7 @@ impl Enroller {
             .context("the agent has no signing key")?;
         match uploading::state(&agent_dir, &self.keys, id) {
             Marker::Uploading(_) => {
+                drop(marker_lock);
                 let held_by_agora = self.file_as_sent(guard, &seal, id, &signing).await?;
                 return Ok(OptedIn {
                     already: true,
@@ -1557,8 +1565,15 @@ impl Enroller {
         super::notice::Notice::operator_act(&agent_dir, "", act).context("writing the notice")?;
         super::crash::point("opt_in:noticed")?;
         // The record is on Agora: only now may an entry follow it
-        uploading::set_replacing_doubt(&agent_dir, &self.keys, id, uploading::UploadingBy::OptIn)
-            .context("marking it uploading")?;
+        uploading::set_replacing_doubt_locked(
+            &agent_dir,
+            &self.keys,
+            id,
+            uploading::UploadingBy::OptIn,
+            &marker_lock,
+        )
+        .context("marking it uploading")?;
+        drop(marker_lock);
         drop(hold);
         super::crash::point("opt_in:marked")?;
         let held_by_agora = self.file_as_sent(guard, &seal, id, &signing).await?;
@@ -1643,6 +1658,13 @@ impl Enroller {
             seal.is_enrolled().await?,
             "agent {id} is not chained: nothing to resume"
         );
+        // The marker's lock from before the stop is read until it is
+        // cleared: a `sealed-stop` issued meanwhile waits for this resume,
+        // then finds the agent unstopped and stops it again. Without it, the
+        // stop would find this one's stop on file, write nothing, and this
+        // would set that stop aside after it
+        let marker_lock =
+            super::uploading::lock(&self.keys, id).context("the uploading marker's lock")?;
         // A stop kept in the secrets tree stands for a lost sealed/stopped
         super::stop::reconcile(&agent_dir, &self.keys, id)
             .context("putting back the stop kept in the secrets tree")?;
@@ -1669,11 +1691,12 @@ impl Enroller {
             }
             // In doubt: settled here, on its yes (the copies set aside)
             if !matches!(marker, super::uploading::Marker::Uploading(_)) {
-                super::uploading::set_replacing_doubt(
+                super::uploading::set_replacing_doubt_locked(
                     &agent_dir,
                     &self.keys,
                     id,
                     super::uploading::UploadingBy::OptIn,
+                    &marker_lock,
                 )
                 .context("replacing the uploading marker in doubt")?;
             }
@@ -1813,12 +1836,26 @@ impl Enroller {
             )?;
         }
         super::crash::point("resume:done")?;
+        // Only the stop this resume began on is cleared: nothing can write
+        // another while the marker's lock is held, but a stop on file that
+        // isn't the one loaded (a copy restored by hand, say) is never set
+        // aside by this
+        let on_file = [
+            super::stop::durable(&self.keys, id).context("reading the stop in the secrets tree")?,
+            super::stop::Stopped::load(&agent_dir).context("reading sealed/stopped")?,
+        ];
+        anyhow::ensure!(
+            on_file.iter().flatten().all(|s| s.at == stop.at),
+            "agent {id}: the stop on file is no longer the one this resume began on: it stays \
+             stopped. Run the resume again if that stop should end too"
+        );
         // The durable copy first: left behind, it would put the stop back
         super::stop::clear_durable(&self.keys, id)
             .context("setting the stop in the secrets tree aside")?;
         if super::stop::is_stopped(&agent_dir) {
             super::stop::Stopped::clear(&agent_dir).context("setting sealed/stopped aside")?;
         }
+        drop(marker_lock);
         tracing::warn!(
             event_type = "sealed_state_resumed",
             agent_id = %id,
@@ -3031,6 +3068,132 @@ pub(crate) mod tests {
         .unwrap();
         assert!(matches!(e.opt_in(&api, id).await, Err(Skip::Stopped)));
         assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    /// Run `step` on its own thread (its own runtime), paused at `point`:
+    /// returns once it is there, with its handle and its release.
+    fn paused<T: Send + 'static>(
+        point: &'static str,
+        step: impl FnOnce() -> T + Send + 'static,
+    ) -> (std::thread::JoinHandle<T>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            crate::sealed::crash::pause_at(point, reached_tx, release_rx);
+            step()
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the step reached its pause");
+        (handle, release)
+    }
+
+    /// `sealed-stop` on its own thread, as a second process would run it;
+    /// it must still be waiting for the step that holds the marker's lock.
+    fn stop_meanwhile(
+        state_dir: &Path,
+        keys: &KeyStore,
+        id: AgentId,
+    ) -> std::thread::JoinHandle<anyhow::Result<crate::sealed::stop::Stop>> {
+        let (state_dir, keys) = (state_dir.to_path_buf(), keys.clone());
+        let handle = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(crate::sealed::stop::stop(&state_dir, &keys, id, "stop now"))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "the stop waits for the step in progress"
+        );
+        handle
+    }
+
+    /// A stop issued while a resume is in progress (paused after its seal,
+    /// before it clears the stop) waits for it, then stops the agent the
+    /// resume left: the resume can't set the new stop aside, and nothing
+    /// uploads after it.
+    #[tokio::test]
+    async fn a_stop_during_a_resume_wins() {
+        let root = crate::sealed::TestDir::new("resume-stop-race");
+        let api = fake::guarded(&root);
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        let state_dir = root.join("state");
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        answer(&dir, SealChoice::Private);
+        e.opt_in(&api, id).await.unwrap();
+        upload(&api, &dir, id).await;
+        let first = crate::sealed::stop::stop(&state_dir, &keys, id, "asked to")
+            .await
+            .unwrap()
+            .stopped;
+        let (resume, release) = {
+            let (root, keys) = (root.to_path_buf(), keys.clone());
+            paused("resume:sealed", move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(enroller(&root, &keys).resume(id, None))
+            })
+        };
+        let stop = stop_meanwhile(&state_dir, &keys, id);
+        release.send(()).unwrap();
+        resume.join().unwrap().expect("the resume finishes");
+        let stop = stop.join().unwrap().unwrap();
+        assert!(!stop.already, "a new stop, not the one the resume ended");
+        assert_ne!(stop.stopped.at, first.at);
+        assert!(crate::sealed::stop::is_stopped(&dir));
+        assert_eq!(
+            crate::sealed::stop::durable(&keys, id).unwrap(),
+            Some(stop.stopped.clone())
+        );
+        assert!(
+            !crate::sealed::uploads(&dir, &keys, id),
+            "stopped after the resume"
+        );
+    }
+
+    /// A stop issued while an opt-in is in progress (paused after the key
+    /// record's post, before the marker) is not refused for want of a
+    /// marker: it waits, then stops the agent the opt-in marked.
+    #[tokio::test]
+    async fn a_stop_during_an_opt_in_wins() {
+        let root = crate::sealed::TestDir::new("opt-in-stop-race");
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        let state_dir = root.join("state");
+        enroller(&root, &keys).chain(id, false).await.unwrap();
+        answer(&dir, SealChoice::Private);
+        let (opt_in, release) = {
+            let (root, keys) = (root.to_path_buf(), keys.clone());
+            paused("opt_in:posted", move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let api = fake::guarded(&root);
+                        enroller(&root, &keys)
+                            .opt_in(&api, id)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+            })
+        };
+        let stop = stop_meanwhile(&state_dir, &keys, id);
+        release.send(()).unwrap();
+        opt_in.join().unwrap().expect("the opt-in finishes");
+        let stop = stop
+            .join()
+            .unwrap()
+            .expect("not refused for want of a marker");
+        assert!(!stop.already);
+        assert!(crate::sealed::stop::is_stopped(&dir));
+        assert!(
+            !crate::sealed::uploads(&dir, &keys, id),
+            "stopped after the opt-in"
+        );
     }
 
     /// Upload what waits to the fake Agora, as the drainer would.
