@@ -542,7 +542,12 @@ impl AlertKind {
                  their state is not checked at the start. The count and the \
                  first few ids are below; one mail a run. Enrol them with \
                  `agora-seed sealed-enroll`; the runner never enrols them on \
-                 its own."
+                 its own. Agents on the could-not-chain record \
+                 (sealed-unchainable.json in the data directory, which \
+                 `sealed-enroll` writes) are counted here too, as `left_out`: \
+                 they don't run until repaired and chained; the record names \
+                 each one's class and remedy, and the next `sealed-enroll` \
+                 that chains one takes it off."
             }
             Self::SealedStateBlobsMissing => {
                 "At their full check (every 7 to 14 days), chained agents were \
@@ -1512,6 +1517,17 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    /// The unchained-agents mail says why some agents are left out: the
+    /// could-not-chain record, by its file's name.
+    #[test]
+    fn the_unchained_mail_names_the_could_not_chain_record() {
+        let m = super::AlertKind::SealedStateUnchainedAgents.meaning();
+        assert!(
+            m.contains(crate::sealed::unchainable::RECORD) && m.contains("left_out"),
+            "{m}"
+        );
+    }
+
     use super::testing::Recorder;
     use super::*;
 
