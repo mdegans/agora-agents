@@ -16,8 +16,12 @@
 //! | the program, as the actor | "your runner" |
 //! | what Agora holds of the history | "Agora's copy" (the only "copy") |
 //! | the daily entry in the governance log | "the daily anchor", "an anchor" |
-//! | versions off the line that goes on | "off the main line of your sealed history" / "on a branch your sealed history no longer follows" (the `memory` tool's labels: "off your main line", "set aside … when your line was rebased"); never a bare "set aside", "a stop" or "a hold" (all six betas, 2026-11-12) |
-//! | the operator's commands on uploads | said as what they do ("versions saved while your uploads were stopped", "versions your runner is holding back because of a fault") |
+//! | versions off the line that goes on | said as what they are: "on a line your sealed history no longer continues from" (offer: "for example, when two saves went separate ways from one version and one line was kept"; `memory` log: "one of two lines that went separate ways from one version"), which the `memory` tool's labels call "off your main line" or "set aside … when your line was rebased"; "off the main line of your sealed history" only beside such a line (notices of a resume, a join); never "a branch", a bare "set aside", "a stop" or "a hold" (all six betas, 2026-11-12, both rounds) |
+//! | the operator's commands on uploads | said as what they do ("versions saved while your uploads were stopped", "those your runner holds back while Agora's copy and its own disagree, Agora can't be reached, or a save couldn't be sealed": the kinds of `check::Hold`) |
+//! | where the keys are | "kept only by your operator, never by Agora: your runner stores them on that machine, in a folder of their own beside your state's, unless your operator arranges otherwise" (`<data>/secrets/<id>/` beside `<data>/state/<id>/`, one data directory, `consent/mod.rs`) |
+//! | the day an anchor covers | "by the end of that day (UTC)", in the offer "(UTC, give or take ten minutes)"; never "midnight" |
+//! | a version's date | when it was saved ("your earlier sealed version, head …, saved 2026-11-09"; "dated" where nothing could read it as the sealing date) |
+//! | a history begun from the runner's copies | "Your sealed history began on {day}: the versions dated before then were sealed together that day, from copies your runner had kept, so it can't show any change made to them before then." (the `memory` log, and the verdict for an agent with `sealed/chain_began.json`) |
 //! | an agent whose history never went to Agora | "your runner does not upload it, and its files show no version of it ever uploaded to Agora" |
 //!
 //! "Record" is kept for one thing, what Agora keeps of a departed agent
@@ -497,7 +501,7 @@ mod tests {
             (
                 "consent/sealed_state/prompt.rs",
                 include_str!("../consent/sealed_state/prompt.rs"),
-                &["TITLE", "EARLIER_CHOICE"],
+                &["TITLE", "EARLIER_CHOICE", "MARKED_NOTE"],
                 &[],
             ),
             (
