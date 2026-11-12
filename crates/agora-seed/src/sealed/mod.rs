@@ -1,11 +1,16 @@
 //! Sealed state, the runner's side (agentkit 0.147 `state`; agora
 //! `docs/design-sealed-state.md`; the plan of 2026-11-02, "PR C").
 //!
-//! An agent that said yes to the sealed-state offer
-//! ([`crate::consent::sealed_state`]) and was enrolled by its operator
-//! (`agora-seed sealed-enroll`, [`enroll`]) has every save sealed, chained
-//! and queued for upload by agentkit's `Mirrored` storage; the [`drain`]er
-//! uploads it, away from the reactor's storage lock. Before any session,
+//! Every enrolled (chained: `sealed/chained`) agent (`agora-seed
+//! sealed-enroll`, [`enroll`]) has every
+//! save sealed and chained, locally, by agentkit's `Mirrored` storage;
+//! whether the chain is also **uploaded** is a separate fact, the agent's
+//! yes to the sealed-state offer ([`crate::consent::sealed_state`]) acted
+//! on: [`uploading`], unless its operator stopped it ([`stop`]), together
+//! [`uploads`]. The [`drain`]er uploads an uploading agent's outbox, away
+//! from the reactor's storage lock; nothing of an agent that doesn't
+//! upload leaves the machine (agentkit's drain gate, and
+//! [`api::UploadGuard`] behind it). Before any session,
 //! the [`check`] compares each enrolled agent's state with its last sealed
 //! version: a state that matches nothing is **refused** (a notice kept for
 //! the agent, the operator mailed), and the **whole run** with it (exit
@@ -24,17 +29,19 @@
 //! files under `<state>/<id>/sealed/` (agentkit's layout, plus this
 //! module's `notice.json`) and the key files in `<secrets>/<id>/`
 //! ([`keys`]), plus `sealed/anchors.json`, `sealed/inclusion.json` and
-//! `sealed/published` ([`anchors`]) and `sealed/receipts.json`
-//! ([`receipts`]). The agent's `state.json` is written only by
+//! `sealed/published` ([`anchors`]), `sealed/receipts.json`
+//! ([`receipts`]), and `sealed/uploading` with its copy
+//! `<secrets>/<id>/sealed_uploading` ([`uploading`]). The agent's `state.json` is written only by
 //! `sealed-restore`, through agentkit's `FsStorage`, which renames the
 //! state it replaces to `state.<utc>.json` first. Nothing here deletes a
 //! file: what is superseded is renamed aside.
 //!
-//! **Who is sealed.** An agent is sealed exactly when its
-//! `sealed/enrolled` marker exists ([`SealedEnrolment`]); the
-//! `[sealed_state]` table only decides who is asked. Turning it off must
-//! not stop the seal, or an enrolled agent's next session would start from
-//! a state the seal never saw, and be refused.
+//! **Who is sealed.** An agent is sealed (chained) exactly when its
+//! `sealed/chained` marker exists, stopped or not; it uploads exactly
+//! when [`uploads`] says so. The `[sealed_state]` table only decides who is
+//! asked. Turning it off must not stop the seal, or an enrolled agent's
+//! next session would start from a state the seal never saw, and be
+//! refused.
 
 pub mod accept;
 pub mod anchors;
@@ -47,6 +54,9 @@ mod crash_tests;
 pub mod drain;
 pub mod enroll;
 pub mod forget;
+#[cfg(test)]
+mod guard_tests;
+pub mod healed;
 pub mod history;
 pub mod history_index;
 pub mod inclusion;
@@ -55,20 +65,26 @@ pub mod lost;
 pub mod memory_tool;
 pub mod notice;
 #[cfg(test)]
-mod props;
+pub(crate) mod props;
 pub mod receipts;
 pub mod restore;
+#[cfg(test)]
+mod review_tests;
+pub mod roster;
 pub mod rotate;
 pub mod session;
 pub mod sizes;
 pub mod stop;
+pub mod text;
+pub mod unchainable;
+pub mod uploading;
 pub mod version;
 
 use std::path::{Path, PathBuf};
 
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::state::outbox::AgoraOutbox;
-use agora_agentkit::state::storage::{Enrolment, Mirrored, SEALED_DIR, SealKeys};
+use agora_agentkit::state::storage::{CHAINED, Enrolment, Mirrored, SEALED_DIR, SealKeys};
 
 pub use keys::KeyStore;
 
@@ -121,87 +137,34 @@ pub type MirroredStorage = Mirrored<
 >;
 
 /// The storage every reactor of a run saves through: agentkit's
-/// [`Mirrored`] for every agent but one whose backups its operator stopped
-/// ([`stop`]), which is loaded and saved plainly (FsStorage, format 1): no
-/// seal, no failed seal recorded, no base.
-pub struct SealedStorage {
-    mirrored: MirroredStorage,
-    plain: agora_agentkit::reactor::FsStorage,
+/// [`Mirrored`], for every agent. An enrolled agent is chained whether or
+/// not it uploads, stopped or not; [`SealedEnrolment::uploads`] decides
+/// only whether its outbox is drained.
+pub fn storage(
+    state_dir: impl Into<PathBuf>,
+    outbox: AgoraOutbox<SealedEnrolment>,
+    enrolment: std::sync::Arc<SealedEnrolment>,
+) -> MirroredStorage {
+    Mirrored::new(
+        agora_agentkit::reactor::FsStorage::new(state_dir.into()),
+        outbox,
+        enrolment,
+    )
 }
 
-impl SealedStorage {
-    pub fn new(
-        state_dir: impl Into<PathBuf>,
-        outbox: AgoraOutbox<SealedEnrolment>,
-        enrolment: std::sync::Arc<SealedEnrolment>,
-    ) -> Self {
-        let state_dir = state_dir.into();
-        Self {
-            mirrored: Mirrored::new(
-                agora_agentkit::reactor::FsStorage::new(&state_dir),
-                outbox,
-                enrolment,
-            ),
-            plain: agora_agentkit::reactor::FsStorage::new(&state_dir),
-        }
-    }
-
-    fn stopped(&self, id: AgentId) -> bool {
-        stop::is_stopped(&self.plain.agent_dir(id))
-    }
+/// Whether the agent's chain is uploaded to Agora: marked uploading
+/// ([`uploading`], which fails closed) and not stopped by its operator
+/// ([`stop`], in either copy). Nothing of an agent for which this is false
+/// may leave the machine: the drain ([`SealedEnrolment`]) and the API
+/// ([`api::UploadGuard`]) both ask it.
+pub fn uploads(agent_dir: &Path, keys: &KeyStore, id: AgentId) -> bool {
+    !stop::is_stopped(agent_dir)
+        && !stop::durable(keys, id).map_or(true, |d| d.is_some())
+        && uploading::is_uploading(agent_dir, keys, id)
 }
 
-#[async_trait::async_trait]
-impl agora_agentkit::reactor::Storage for SealedStorage {
-    type Error = agora_agentkit::state::storage::MirroredError<
-        agora_agentkit::reactor::storage::FsStorageError,
-    >;
-    type Version = agora_agentkit::state::verify::HeadRef;
-
-    async fn save_raw(
-        &mut self,
-        id: AgentId,
-        value: serde_json::Value,
-        base: Option<&Self::Version>,
-    ) -> Result<Option<Self::Version>, Self::Error> {
-        if self.stopped(id) {
-            self.plain
-                .save_raw(id, value, None)
-                .await
-                .map_err(agora_agentkit::state::storage::MirroredError::Local)?;
-            return Ok(None);
-        }
-        self.mirrored.save_raw(id, value, base).await
-    }
-
-    async fn load_raw(
-        &self,
-        id: AgentId,
-    ) -> Result<agora_agentkit::reactor::Loaded<serde_json::Value, Self::Version>, Self::Error>
-    {
-        if self.stopped(id) {
-            let loaded = self
-                .plain
-                .load_raw(id)
-                .await
-                .map_err(agora_agentkit::state::storage::MirroredError::Local)?;
-            return Ok(agora_agentkit::reactor::Loaded {
-                value: loaded.value,
-                base: None,
-            });
-        }
-        self.mirrored.load_raw(id).await
-    }
-}
-
-/// Whether new versions of the agent in `agent_dir` are sealed: enrolled
-/// and not stopped.
-pub fn is_sealing(agent_dir: &Path) -> bool {
-    is_enrolled(agent_dir) && !stop::is_stopped(agent_dir)
-}
-
-/// The runner's say on who is sealed: enrolled agents, with the keys in
-/// its own secrets tree.
+/// The runner's say on who uploads ([`uploads`]), with the keys in its
+/// own secrets tree. Who is chained is `sealed/chained`'s alone.
 #[derive(Debug, Clone)]
 pub struct SealedEnrolment {
     state_dir: PathBuf,
@@ -229,11 +192,13 @@ impl SealedEnrolment {
     }
 }
 
-/// Whether `<agent_dir>/sealed/enrolled` exists. A file that can't be
+/// Whether `<agent_dir>/sealed/chained` exists (agentkit's [`CHAINED`];
+/// `sealed/enrolled` before agentkit 0.158, moved by the start's
+/// [`uploading::start_pass`]). A file that can't be
 /// checked counts as enrolled: sealing (or refusing) an agent that isn't is
 /// recoverable, writing an enrolled one unsealed is not.
 pub fn is_enrolled(agent_dir: &Path) -> bool {
-    match std::fs::exists(agent_dir.join(SEALED_DIR).join("enrolled")) {
+    match std::fs::exists(agent_dir.join(SEALED_DIR).join(CHAINED)) {
         Ok(enrolled) => enrolled,
         Err(e) => {
             tracing::error!(
@@ -246,23 +211,110 @@ pub fn is_enrolled(agent_dir: &Path) -> bool {
     }
 }
 
-/// Enrolled by either record: `sealed/enrolled`, or a state key in
-/// `<secrets>/<id>/` (which survives a lost state directory).
-pub fn enrolled_by_keys_or_marker(agent_dir: &Path, secrets_dir: &Path, id: AgentId) -> bool {
-    is_enrolled(agent_dir)
-        || std::fs::exists(secrets_dir.join(id.to_string()).join(keys::STATE_KEY_FILE))
-            .unwrap_or(true)
+/// Whether `<agent_dir>/sealed/chained` is known to exist: the opposite
+/// lean from [`is_enrolled`], for what may only be said or asked of an
+/// agent that is chained (the upload offer, whose text says the runner
+/// keeps a sealed history). A marker that can't be checked is not known.
+pub fn known_chained(agent_dir: &Path) -> bool {
+    matches!(
+        std::fs::exists(agent_dir.join(SEALED_DIR).join(CHAINED)),
+        Ok(true)
+    )
 }
 
 impl Enrolment for SealedEnrolment {
-    /// Enrolled. `sealed-enroll` enrols only agents whose sealed-state
-    /// ledger says yes, so this is the opt-in, as acted on.
-    fn opted_in(&self, id: AgentId) -> bool {
-        is_sealing(&self.state_dir.join(id.to_string()))
+    /// [`uploads`]: gates agentkit's outbox wake and drain only.
+    fn uploads(&self, id: AgentId) -> bool {
+        uploads(&self.state_dir.join(id.to_string()), &self.keys, id)
     }
 
+    /// For every chained agent, uploading or not: the local chain is
+    /// signed and sealed with them.
     fn keys(&self, id: AgentId) -> Option<SealKeys> {
         self.keys.seal_keys(id)
+    }
+}
+
+impl api::UploadGate for SealedEnrolment {
+    fn may_send(&self, id: AgentId) -> bool {
+        uploads(&self.state_dir.join(id.to_string()), &self.keys, id)
+    }
+
+    fn may_read(&self, id: AgentId) -> bool {
+        uploading::has_uploaded(&self.state_dir.join(id.to_string()), &self.keys, id)
+    }
+
+    fn may_maintain_keys(&self, id: AgentId) -> bool {
+        matches!(
+            uploading::state(&self.state_dir.join(id.to_string()), &self.keys, id),
+            uploading::Marker::Uploading(_)
+        )
+    }
+}
+
+/// What a first opt-in would upload of a chain: its committed outbox
+/// items ([`backlog`]). Counts, a date and a size only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backlog {
+    /// Snapshots, as the `memory` tool counts versions.
+    pub versions: usize,
+    /// The earliest snapshot's `state_at`.
+    pub earliest: chrono::NaiveDate,
+    /// Every item's sealed blob, padded, as Agora would receive it.
+    pub bytes: u64,
+}
+
+/// What waits in `sealed/outbox` to be uploaded (the committed items,
+/// as agentkit's `AgentSeal::outbox` takes them: below `head.json`'s
+/// `next_ord`). `None` when anything couldn't be read, or there is no
+/// snapshot: then nothing is said of it. Reads entries, never a blob.
+pub fn backlog(agent_dir: &Path) -> Option<Backlog> {
+    use agora_agentkit::enums::StateEntryKind;
+    use agora_agentkit::state::storage::{HeadFile, OutboxItem};
+    let sealed = agent_dir.join(SEALED_DIR);
+    let head: HeadFile =
+        serde_json::from_slice(&std::fs::read(sealed.join("head.json")).ok()?).ok()?;
+    let (mut versions, mut earliest, mut bytes) = (0usize, None::<i64>, 0u64);
+    for e in std::fs::read_dir(sealed.join("outbox")).ok()? {
+        let path = e.ok()?.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let item: OutboxItem = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        if item.ord >= head.next_ord {
+            continue;
+        }
+        let entry = &item.entry.entry;
+        bytes += entry.blob.as_ref().map_or(0, |b| b.size_bytes);
+        if entry.kind == StateEntryKind::Snapshot {
+            versions += 1;
+            earliest = Some(earliest.map_or(entry.state_at, |e| e.min(entry.state_at)));
+        }
+    }
+    let earliest = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(earliest?)?.date_naive();
+    Some(Backlog {
+        versions,
+        earliest,
+        bytes,
+    })
+}
+
+/// Whether `sealed/sent` holds any uploaded item: `None` when it couldn't
+/// be read. What the runner's files show, as the verdict's [`check::Kept`]
+/// decides it; Agora is not asked.
+pub fn sent_any(agent_dir: &Path) -> Option<bool> {
+    match std::fs::read_dir(agent_dir.join(SEALED_DIR).join("sent")) {
+        Ok(entries) => {
+            for e in entries {
+                let path = e.ok()?.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("json") {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 

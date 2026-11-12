@@ -3,6 +3,12 @@
 //! before the runner exits. Never inside a save: agentkit's `Mirrored`
 //! only queues, under the reactor's storage lock.
 //!
+//! An agent that doesn't upload ([`super::uploads`]: never said yes, or
+//! stopped) is chained but never drained: agentkit's drain answers
+//! [`Drained::LocalOnly`] without reading or sending anything, and the
+//! drainer records [`DrainOutcome::LocalOnly`] for it: no receipts, no
+//! anchor work, no hold, no alert, however long its outbox grows.
+//!
 //! An agent the start check held (a fork, a missing head, a failed seal)
 //! is not drained. One the server answers with a head that moved on is
 //! held for the rest of the run ([`AlertKind::SealedStateFork`] or
@@ -32,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::outbox::AgoraOutbox;
+use agora_agentkit::state::outbox::{AgoraOutbox, Damage, Drained, Healing};
 use agora_agentkit::state::storage::AgentSeal;
 use agora_agentkit::state::verify::HeadStatus;
 
@@ -65,6 +71,57 @@ pub struct Anchors {
     pub verified: VerifiedAnchors,
 }
 
+/// What the drainer's last pass came to for one agent ([`Drainer::last`]).
+/// Typed so a verdict can say which: [`Self::LocalOnly`] is "nothing of
+/// this agent is on Agora from this run", never "in step with Agora".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The agent doesn't upload: nothing read, sent or recorded.
+    LocalOnly,
+    /// No `sealed/chained`: no chain to send.
+    NotEnrolled,
+    /// Uploaded `uploaded`; Agora's head then `status` (`Unchecked`: it
+    /// couldn't be read), `waiting` left; what Agora reported damaged at
+    /// rest and what was sent again (`healing`).
+    Ran {
+        uploaded: usize,
+        status: HeadStatus,
+        waiting: usize,
+        healing: Healing,
+    },
+    /// Uploading was switched off mid-drain, after `uploaded`, and after
+    /// `healed` damaged blobs were sent again.
+    Withdrawn { uploaded: usize, healed: usize },
+    /// The upload failed (retried at the next wake, or held after a 422).
+    Failed,
+}
+
+/// One pass's [`Healing`], summed over the agents.
+#[derive(Debug, Default)]
+struct HealingSummary {
+    /// Agents Agora reported any damaged blob for.
+    agents_damaged: usize,
+    damaged: u64,
+    healed: usize,
+    unhealable: usize,
+    /// Agents whose count is partial (an error cut the heal short).
+    interrupted: usize,
+}
+
+impl HealingSummary {
+    fn add(&mut self, h: &Healing) {
+        if let Damage::Reported(n) = h.damaged
+            && n > 0
+        {
+            self.agents_damaged += 1;
+            self.damaged += n;
+        }
+        self.healed += h.healed;
+        self.unhealable += h.unhealable;
+        self.interrupted += usize::from(h.interrupted);
+    }
+}
+
 pub struct Drainer {
     outbox: AgoraOutbox<SealedEnrolment>,
     /// Where the agents' directories are.
@@ -79,6 +136,10 @@ pub struct Drainer {
     /// The enrolled agents of this run, with their names.
     agents: Vec<(AgentId, String)>,
     held: Mutex<BTreeSet<AgentId>>,
+    /// Each agent's last drain, as it came out.
+    last: Mutex<HashMap<AgentId, DrainOutcome>>,
+    /// The unhealable counts last alerted, so a pass alerts only a change.
+    unhealable_alerted: Mutex<HashMap<AgentId, usize>>,
     alerts: Alerter,
     stop: tokio::sync::Notify,
 }
@@ -102,6 +163,8 @@ impl Drainer {
             anchored_at: Mutex::new(Instant::now()),
             agents,
             held: Mutex::new(held.into_iter().collect()),
+            last: Mutex::new(HashMap::new()),
+            unhealable_alerted: Mutex::new(HashMap::new()),
             alerts,
             stop: tokio::sync::Notify::new(),
         }
@@ -124,7 +187,9 @@ impl Drainer {
                 continue;
             }
             let dir = a.state_dir.join(id.to_string());
-            if !super::is_sealing(&dir) {
+            // Nothing of a local-only agent is on Agora to judge, and no
+            // publish choice of it may be read or sent
+            if !super::uploads(&dir, &a.keys, *id) {
                 continue;
             }
             match AgentSeal::new(&dir, *id).outbox().await {
@@ -174,13 +239,81 @@ impl Drainer {
         self.held.lock().expect("held lock").contains(&id)
     }
 
-    /// One pass over every agent not held.
+    /// What `id`'s last drain this run came to; `None` before its first,
+    /// or while it is held. Read by the pass's healing summary
+    /// ([`Self::healing_summary`]): what Agora reported damaged and what
+    /// was sent again.
+    fn last(&self, id: AgentId) -> Option<DrainOutcome> {
+        self.last.lock().expect("last lock").get(&id).copied()
+    }
+
+    fn record(&self, id: AgentId, outcome: DrainOutcome) {
+        self.last.lock().expect("last lock").insert(id, outcome);
+    }
+
+    /// One pass over every agent not held, then what it healed.
     pub async fn drain_all(&self) {
         for (id, name) in &self.agents {
             if !self.held(*id) {
                 self.drain_one(*id, name).await;
             }
         }
+        self.healing_summary();
+    }
+
+    /// The pass's healing, summed: logged when anything was reported or
+    /// sent again; alerted when the agents' unhealable counts changed
+    /// since the last alert (the operator must hear of blobs Agora lost
+    /// that nothing here can send again). Counts only.
+    fn healing_summary(&self) {
+        let mut sum = HealingSummary::default();
+        let mut unhealable: HashMap<AgentId, usize> = HashMap::new();
+        let mut first: Vec<String> = Vec::new();
+        for (id, name) in &self.agents {
+            let Some(DrainOutcome::Ran { healing, .. }) = self.last(*id) else {
+                continue;
+            };
+            sum.add(&healing);
+            if healing.unhealable > 0 {
+                unhealable.insert(*id, healing.unhealable);
+                if first.len() < super::check::SUMMARY_LIST {
+                    first.push(format!("{name} ({id}): {}", healing.unhealable));
+                }
+            }
+        }
+        if sum.damaged > 0 || sum.healed > 0 || sum.unhealable > 0 {
+            tracing::warn!(
+                event_type = "sealed_state_healing",
+                agents_damaged = sum.agents_damaged,
+                damaged = sum.damaged,
+                healed = sum.healed,
+                unhealable = sum.unhealable,
+                interrupted = sum.interrupted,
+                "Agora reported sealed blobs damaged at rest; the drain sent back what it held"
+            );
+        }
+        let mut alerted = self.unhealable_alerted.lock().expect("alerted lock");
+        if unhealable.is_empty() || *alerted == unhealable {
+            return;
+        }
+        *alerted = unhealable.clone();
+        self.alerts.notify(
+            Alert::new(
+                AlertKind::SealedStateAgoraBlobsUnhealable,
+                format!(
+                    "{} sealed blob(s) of {} agent(s) are damaged on Agora and can't be sent again \
+                     from here",
+                    sum.unhealable,
+                    unhealable.len()
+                ),
+            )
+            .count(sum.unhealable)
+            .detail("agents", unhealable.len())
+            .detail("damaged_reported", sum.damaged)
+            .detail("healed", sum.healed)
+            .detail("interrupted", sum.interrupted)
+            .detail("first", first.join(", ")),
+        );
     }
 
     async fn drain_one(&self, id: AgentId, name: &str) {
@@ -199,71 +332,102 @@ impl Drainer {
             .lock()
             .expect("baselines lock")
             .insert(id, baseline);
-        match drained {
-            Ok(report) => {
-                if report.uploaded > 0 {
-                    tracing::info!(
-                        event_type = "sealed_state_uploaded",
-                        agent_id = %id,
-                        uploaded = report.uploaded,
-                        waiting = report.waiting,
-                        "sealed versions uploaded"
-                    );
-                }
-                let hold = match report.status {
-                    HeadStatus::Same | HeadStatus::Pending => return,
-                    HeadStatus::LocalMissing => Hold::HeadMissing,
-                    HeadStatus::ServerAhead | HeadStatus::Diverged => Hold::Fork,
-                };
-                self.held.lock().expect("held lock").insert(id);
-                tracing::warn!(
-                    event_type = "sealed_state_held",
-                    agent_id = %id,
-                    status = ?report.status,
-                    waiting = report.waiting,
-                    "sealed uploads held for the rest of the run"
-                );
-                self.alerts
-                    .notify(hold_alert(hold, id, name, Some(&report.held)));
+        let report = match drained {
+            Ok(Drained::Ran(report)) => report,
+            Ok(Drained::LocalOnly) => {
+                tracing::debug!(agent_id = %id, "local-only: not drained");
+                return self.record(id, DrainOutcome::LocalOnly);
             }
-            // Agora refused the entry itself (e.g. `time_went_back`): a
-            // bug, never fixed by retrying. Held for the run, told
-            Err(e) if rejected(&e) => {
-                self.held.lock().expect("held lock").insert(id);
-                tracing::error!(
-                    event_type = "sealed_state_upload_rejected",
+            Ok(Drained::NotEnrolled) => return self.record(id, DrainOutcome::NotEnrolled),
+            Ok(Drained::Withdrawn { uploaded, healed }) => {
+                tracing::info!(
+                    event_type = "sealed_state_upload_withdrawn",
                     agent_id = %id,
-                    error = %e,
-                    "Agora rejected a sealed version (422); uploads held for the rest of the run"
+                    uploaded,
+                    healed,
+                    "uploading was switched off mid-drain; the rest stays local"
                 );
-                self.alerts.notify(
-                    Alert::new(
-                        AlertKind::SealedStateUploadFailing,
-                        format!(
-                            "{name}: Agora rejected a sealed version as malformed (422): a bug; \
+                return self.record(id, DrainOutcome::Withdrawn { uploaded, healed });
+            }
+            Err(e) => return self.failed(id, name, e),
+        };
+        self.record(
+            id,
+            DrainOutcome::Ran {
+                uploaded: report.uploaded,
+                status: report.status,
+                waiting: report.waiting,
+                healing: report.healing,
+            },
+        );
+        if report.uploaded > 0 {
+            tracing::info!(
+                event_type = "sealed_state_uploaded",
+                agent_id = %id,
+                uploaded = report.uploaded,
+                waiting = report.waiting,
+                "sealed versions uploaded"
+            );
+        }
+        let hold = match report.status {
+            // Unchecked: Agora's head couldn't be read after the uploads;
+            // the next drain reads it again. Never a hold on no evidence
+            HeadStatus::Same | HeadStatus::Pending | HeadStatus::Unchecked => return,
+            HeadStatus::LocalMissing => Hold::HeadMissing,
+            HeadStatus::ServerAhead | HeadStatus::Diverged => Hold::Fork,
+        };
+        self.held.lock().expect("held lock").insert(id);
+        tracing::warn!(
+            event_type = "sealed_state_held",
+            agent_id = %id,
+            status = ?report.status,
+            waiting = report.waiting,
+            "sealed uploads held for the rest of the run"
+        );
+        self.alerts
+            .notify(hold_alert(hold, id, name, Some(&report.held)));
+    }
+
+    /// A drain that failed: held for the run after a 422, else retried at
+    /// the next wake; alerted either way.
+    fn failed(&self, id: AgentId, name: &str, e: agora_agentkit::state::outbox::DrainError) {
+        self.record(id, DrainOutcome::Failed);
+        // Agora refused the entry itself (e.g. `time_went_back`): a bug,
+        // never fixed by retrying. Held for the run, told
+        if rejected(&e) {
+            self.held.lock().expect("held lock").insert(id);
+            tracing::error!(
+                event_type = "sealed_state_upload_rejected",
+                agent_id = %id,
+                error = %e,
+                "Agora rejected a sealed version (422); uploads held for the rest of the run"
+            );
+            self.alerts.notify(
+                Alert::new(
+                    AlertKind::SealedStateUploadFailing,
+                    format!(
+                        "{name}: Agora rejected a sealed version as malformed (422): a bug; \
                              uploads held for this run"
-                        ),
-                    )
-                    .agent(name, id)
-                    .detail("error", e),
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    event_type = "sealed_state_upload_failing",
-                    agent_id = %id,
-                    error = %e,
-                    "sealed upload failed; retried at the next wake"
-                );
-                self.alerts.notify(
-                    Alert::new(
-                        AlertKind::SealedStateUploadFailing,
-                        format!("{name}: sealed versions could not be uploaded"),
-                    )
-                    .agent(name, id)
-                    .detail("error", e),
-                );
-            }
+                    ),
+                )
+                .agent(name, id)
+                .detail("error", e),
+            );
+        } else {
+            tracing::warn!(
+                event_type = "sealed_state_upload_failing",
+                agent_id = %id,
+                error = %e,
+                "sealed upload failed; retried at the next wake"
+            );
+            self.alerts.notify(
+                Alert::new(
+                    AlertKind::SealedStateUploadFailing,
+                    format!("{name}: sealed versions could not be uploaded"),
+                )
+                .agent(name, id)
+                .detail("error", e),
+            );
         }
     }
 
@@ -329,6 +493,66 @@ mod tests {
         (format!("http://{addr}/").parse().unwrap(), hits)
     }
 
+    /// A pass sums what Agora reported damaged and what was sent again;
+    /// the unhealable count is alerted when it changes, not every pass.
+    #[tokio::test]
+    async fn healing_is_summed_and_unhealable_alerted_on_change() {
+        let root = crate::sealed::TestDir::new("drain-healing");
+        let (a, b) = (AgentId::new(), AgentId::new());
+        let outbox = AgoraOutbox::new(
+            agora_agentkit::client::Client::new("http://127.0.0.1:9/".parse().unwrap()).unwrap(),
+            root.join("state"),
+            Arc::new(SealedEnrolment::new(
+                root.join("state"),
+                root.join("secrets"),
+            )),
+        );
+        let d = Drainer::new(
+            outbox,
+            root.join("state"),
+            HashMap::new(),
+            vec![(a, "tarn".into()), (b, "wren".into())],
+            [],
+            Alerter::off(),
+        );
+        let ran = |damaged, healed, unhealable| DrainOutcome::Ran {
+            uploaded: 0,
+            status: HeadStatus::Same,
+            waiting: 0,
+            healing: Healing {
+                damaged,
+                healed,
+                unhealable,
+                interrupted: false,
+            },
+        };
+        d.record(a, ran(Damage::Reported(3), 2, 1));
+        d.record(b, ran(Damage::NotReported, 0, 0));
+        let mut sum = HealingSummary::default();
+        for id in [a, b] {
+            if let Some(DrainOutcome::Ran { healing, .. }) = d.last(id) {
+                sum.add(&healing);
+            }
+        }
+        assert_eq!(
+            (sum.agents_damaged, sum.damaged, sum.healed, sum.unhealable),
+            (1, 3, 2, 1)
+        );
+        let alerted = || d.unhealable_alerted.lock().unwrap().clone();
+        d.healing_summary();
+        assert_eq!(alerted(), HashMap::from([(a, 1)]));
+        d.healing_summary();
+        assert_eq!(alerted(), HashMap::from([(a, 1)]), "unchanged: not again");
+        d.record(b, ran(Damage::Reported(1), 0, 1));
+        d.healing_summary();
+        assert_eq!(alerted(), HashMap::from([(a, 1), (b, 1)]));
+        // Healed since: nothing to alert, the last alert stands
+        d.record(a, ran(Damage::Reported(0), 0, 0));
+        d.record(b, ran(Damage::Unknown, 0, 0));
+        d.healing_summary();
+        assert_eq!(alerted(), HashMap::from([(a, 1), (b, 1)]));
+    }
+
     /// A held agent gets no anchor work, so nothing is judged while its
     /// history is unsettled; an agent not held does.
     #[tokio::test]
@@ -374,6 +598,104 @@ mod tests {
             api.calls.lock().unwrap().iter().any(|c| c == "proofs"),
             "not held: judged"
         );
+    }
+
+    /// A chained agent that doesn't upload, and one whose uploads were
+    /// stopped, over several saves and every drainer pass: chained
+    /// locally, and not one request reaches Agora (the drain, the
+    /// receipts, the anchor work, the guarded API). Synthetic state only.
+    #[tokio::test]
+    async fn a_local_only_agent_makes_no_request_end_to_end() {
+        use agora_agentkit::reactor::Storage as _;
+        let root = crate::sealed::TestDir::new("drain-local-only");
+        let state_dir = root.join("state");
+        let (local, keys, local_dir) = crate::sealed::check::tests::enrolled_local(&root).await;
+        let (stopped, _, stopped_dir) = crate::sealed::check::tests::enrolled(&root).await;
+        let seal = AgentSeal::new(&stopped_dir, stopped);
+        for item in seal.outbox().await.unwrap() {
+            seal.mark_sent(item.ord).await.unwrap();
+        }
+        crate::sealed::stop::stop(&state_dir, &keys, stopped, "asked")
+            .await
+            .unwrap();
+        // Agora: counts every connection (and answers each 422)
+        let (url, hits) = rejecting().await;
+        let enrolment = Arc::new(SealedEnrolment::new(&state_dir, root.join("secrets")));
+        let client = agora_agentkit::client::Client::new(url).unwrap();
+        let outbox = AgoraOutbox::new(client.clone(), &state_dir, enrolment.clone());
+        let mut storage = crate::sealed::storage(&state_dir, outbox.clone(), enrolment.clone());
+        let before: Vec<usize> = vec![
+            AgentSeal::new(&local_dir, local)
+                .outbox()
+                .await
+                .unwrap()
+                .len(),
+            seal.outbox().await.unwrap().len(),
+        ];
+        for n in 0..5 {
+            for id in [local, stopped] {
+                let base = storage.load_raw(id).await.unwrap().base;
+                assert!(base.is_some(), "on its head");
+                let value = serde_json::json!({ "memory": format!("{id} {n}").repeat(40) });
+                assert!(
+                    storage
+                        .save_raw(id, value, base.as_ref())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+        for (dir, id, was) in [
+            (&local_dir, local, before[0]),
+            (&stopped_dir, stopped, before[1]),
+        ] {
+            let s = AgentSeal::new(dir, id);
+            assert_eq!(s.outbox().await.unwrap().len(), was + 5, "chained locally");
+            assert!(s.seal_failed().await.unwrap().is_none());
+            assert!(!crate::sealed::uploads(dir, &keys, id));
+        }
+        let drainer = Arc::new(
+            Drainer::new(
+                outbox,
+                state_dir.clone(),
+                // As the run makes them: none for an agent that doesn't upload
+                HashMap::new(),
+                vec![(local, "wren".into()), (stopped, "tarn".into())],
+                [],
+                Alerter::off(),
+            )
+            .with_anchors(Anchors {
+                api: Arc::new(crate::sealed::api::guarded(client, enrolment)),
+                keys: keys.clone(),
+                state_dir: state_dir.clone(),
+                verified: crate::sealed::anchors::VerifiedAnchors::new([(
+                    "ANC-2026-0002".parse().unwrap(),
+                    agora_agentkit::govlog::Sha256Hex::from([0; 32]),
+                    chrono::Utc::now(),
+                )]),
+            }),
+        );
+        let task = drainer.spawn();
+        drainer.drain_all().await;
+        drainer.anchor_all().await;
+        drainer.finish(task).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no request reached Agora");
+        for (dir, id) in [(&local_dir, local), (&stopped_dir, stopped)] {
+            assert_eq!(drainer.last(id), Some(DrainOutcome::LocalOnly));
+            assert!(!drainer.held(id));
+            assert!(
+                !dir.join("sealed")
+                    .join(super::super::receipts::RECEIPTS)
+                    .exists(),
+                "no receipts"
+            );
+            assert_eq!(
+                AgentSeal::new(dir, id).outbox().await.unwrap().len(),
+                if id == local { before[0] } else { before[1] } + 5,
+                "nothing moved"
+            );
+        }
     }
 
     /// A 422 holds the agent for the run, alerted: no retry loop.

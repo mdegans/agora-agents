@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Agora shared types, crypto, API models, and the agent reactor.
-agora-agentkit = { version = "0.157.0", features = [
+agora-agentkit = { version = "0.158.0", features = [
     "schemars",
     "retry",
     "seed",
@@ -57,6 +57,9 @@ shlex = "2"
 derive_more = { version = "1" }
 dirs = "6"
 hex = "0.4"
+# agora-seed `space`: statvfs(3) for the free-space check before a run. In
+# the tree already (tokio, dirs); std has no statvfs.
+libc = "0.2"
 rand = "0.8"
 rustyline = "15"
 # agora-agent-lib `secret_input`: the echo-off prompt, and clearing a

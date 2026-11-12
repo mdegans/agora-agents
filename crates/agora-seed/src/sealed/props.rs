@@ -26,7 +26,6 @@ use agora_agentkit::state::storage::{AgentSeal, Mirrored, plaintext_hash};
 use proptest::prelude::*;
 
 use super::KeyStore;
-use super::api::fake::FakeApi;
 use super::check::{self, FaultKind, Hold, Outcome, local_entries};
 use super::notice::Refusal;
 use super::sizes::Sizes;
@@ -79,7 +78,8 @@ pub struct Built {
     pub id: AgentId,
     pub keys: KeyStore,
     pub dir: PathBuf,
-    pub api: FakeApi,
+    /// Strict: a call for an agent that doesn't upload fails the test.
+    pub api: super::api::fake::Guarded,
     pub rotated: bool,
     pub mode: Mode,
 }
@@ -202,7 +202,7 @@ fn copy_blobs(b: &Built) {
 pub async fn build(h: &History) -> Built {
     let root = super::TestDir::in_memory("props");
     let (id, keys, dir) = check::tests::enrolled(&root).await;
-    let api = FakeApi::new();
+    let api = super::api::fake::guarded(&root);
     *api.public_key.lock().unwrap() = Some(keys.signing(id).unwrap().verifying_key());
     let mut b = Built {
         root,
@@ -648,8 +648,10 @@ proptest! {
                     &b.keys,
                     &b.api,
                     &crate::alerts::Alerter::off(),
+                    &Default::default(),
                 )
-                .await;
+                .await
+                .unwrap().refused;
                 let want: Vec<_> = reason.map(|r| (b.id, r)).into_iter().collect();
                 prop_assert_eq!(missing, want, "{:?} {:?}", h, f);
                 return Ok(());

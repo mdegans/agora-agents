@@ -255,16 +255,12 @@ impl AnchorsFile {
     }
 }
 
-/// A temporary file beside `path`, fsynced, renamed over it, and the
-/// directory fsynced: a crash leaves the old file or the new, whole.
+/// [`super::write_private`]: a uniquely named temporary beside `path`,
+/// 0600, fsynced, renamed over it, and the directory fsynced. A crash
+/// leaves the old file or the new, whole; a file written with wider
+/// permissions before is replaced by this write.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().expect("in sealed/");
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("writing");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::File::open(&tmp)?.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    std::fs::File::open(dir)?.sync_all()
+    super::write_private(path, bytes)
 }
 
 /// Why a pass stopped before judging every anchor. Ids and hashes only.
@@ -574,7 +570,18 @@ pub async fn publish_if_chosen(
     let ledger = SealLedger::load(agent_dir)
         .await
         .map_err(|e| format!("sealed-state ledger unreadable: {e}"))?;
-    if ledger.choice() != Some(SealChoice::Publish) {
+    // The choice in force is the one acted on when it began uploading
+    // (the marker's `since`), never a later re-answer, which changes nothing
+    // by itself; the agent's own `config` tool changes it directly
+    // (the local copy: absent or unreadable, nothing is published)
+    let since = match std::fs::read(agent_dir.join(SEALED_DIR).join(super::uploading::UPLOADING))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<super::uploading::Uploading>(&b).ok())
+    {
+        Some(u) if u.agent_id == id => u.since,
+        _ => return Ok(false),
+    };
+    if ledger.choice_as_of(since) != Some(SealChoice::Publish) {
         return Ok(false);
     }
     // A choice already on record is the agent's own (`config`, while this
@@ -680,11 +687,12 @@ pub(crate) mod tests {
     use agora_agentkit::state::anchor::{anchor_leaf, inclusion_proof, merkle_root};
 
     /// A ledger on file with `choice`.
+    // Answered before the opt-in (the marker's `since`), as in life
     pub(crate) async fn chose(dir: &Path, choice: SealChoice) {
         use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
         let mut l = SealLedger::default();
         l.record(SealAsk {
-            at: chrono::Utc::now(),
+            at: "2026-11-01T00:00:00Z".parse().unwrap(),
             offer_version: 1,
             model: "m".into(),
             order: SealChoice::ALL,
@@ -1414,6 +1422,42 @@ pub(crate) mod tests {
         assert_eq!((pass.judged, pass.kept), (1, 1));
         assert_eq!(findings(&dir), vec![(anc.to_string(), "holds_unchecked")]);
         assert_eq!(AnchorsFile::load(&dir).unwrap().proofs, vec![proof]);
+    }
+
+    /// A re-answer after the opt-in changes nothing by itself: a later
+    /// `publish` over the `private` acted on publishes nothing.
+    #[tokio::test]
+    async fn a_later_publish_answer_publishes_nothing_by_itself() {
+        use crate::consent::sealed_state::ledger::{SealAsk, SealOutcome};
+        let root = crate::sealed::TestDir::new("anchors-reanswer");
+        let (id, keys, dir) = enrolled(&root).await;
+        let signing = keys.signing(id).unwrap();
+        let api = FakeApi::new();
+        chose(&dir, SealChoice::Private).await;
+        let mut l = SealLedger::load(&dir).await.unwrap();
+        // To its operator's re-offer: the only way a later answer is in force
+        l.reopen("asked", chrono::Utc::now() + chrono::Duration::seconds(4))
+            .unwrap();
+        l.record(SealAsk {
+            at: chrono::Utc::now() + chrono::Duration::seconds(5),
+            offer_version: 9,
+            model: "m".into(),
+            order: SealChoice::ALL,
+            order_seed: 0,
+            constrained: true,
+            attempts: 1,
+            outcome: SealOutcome::Answered {
+                choice: SealChoice::Publish,
+                reason: String::new(),
+                memory_note_written: false,
+                note_dropped: None,
+                apply_failed: None,
+            },
+        });
+        l.save(&dir).await.unwrap();
+        assert_eq!(l.choice(), Some(SealChoice::Publish));
+        assert_eq!(publish_if_chosen(&dir, id, &signing, &api).await, Ok(false));
+        assert!(api.anchored.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

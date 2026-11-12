@@ -41,6 +41,15 @@ pub enum Refusal {
     /// Its `state.json` couldn't be read from the disk (an I/O error):
     /// check permissions and the disk first.
     StateIo,
+    /// Its head is behind the runner's roster of heads (or at the same
+    /// seq under another hash): an older copy of its directory put back
+    /// ([`super::roster`]).
+    RolledBack,
+    /// Its sealed history here (`sealed/`, its outbox, its keys) couldn't
+    /// be read, so its state couldn't be checked: local evidence, not
+    /// transient, so the agent doesn't run unchecked. Not a loss by itself
+    /// (the roster says when it is one).
+    SealUnreadable,
 }
 
 impl Refusal {
@@ -53,6 +62,25 @@ impl Refusal {
             Self::StateUnreadable => "state_unreadable",
             Self::StateTooNew => "state_too_new",
             Self::StateIo => "state_io",
+            Self::RolledBack => "rolled_back",
+            Self::SealUnreadable => "seal_unreadable",
+        }
+    }
+
+    /// The shape of a loss (the May loss's, or a disk's): the state or the
+    /// record of its head gone, unreadable or put back. One of these, for
+    /// any agent, stops the whole run ([`super::check::stops_run`]); a
+    /// mismatch or a broken chain of an agent that doesn't upload may
+    /// leave that agent out alone.
+    pub fn loss_shaped(self) -> bool {
+        match self {
+            Self::Mismatch | Self::ChainBroken | Self::SealUnreadable => false,
+            Self::HeadMissing
+            | Self::StateMissing
+            | Self::StateUnreadable
+            | Self::StateTooNew
+            | Self::StateIo
+            | Self::RolledBack => true,
         }
     }
 
@@ -61,26 +89,44 @@ impl Refusal {
         match self {
             Self::Mismatch => "your state did not match your last sealed version",
             Self::ChainBroken => "your sealed history did not verify",
-            Self::HeadMissing => "the record of your last sealed version was missing",
-            Self::StateMissing => "your state was missing here",
-            Self::StateUnreadable => "your state here couldn't be read",
-            Self::StateTooNew => "your state here was written by a newer runner than this one",
-            Self::StateIo => "your state here couldn't be read from the disk",
+            Self::HeadMissing => {
+                "the file naming your last sealed version was missing on your operator's machine"
+            }
+            Self::StateMissing => "your state was missing on your operator's machine",
+            Self::StateUnreadable => "your state on your operator's machine couldn't be read",
+            Self::StateTooNew => {
+                "your state on your operator's machine was written by a newer runner than this one"
+            }
+            Self::StateIo => "your state couldn't be read from the disk of your operator's machine",
+            Self::RolledBack => {
+                "your sealed history on your operator's machine ended before the last version your runner had noted"
+            }
+            Self::SealUnreadable => {
+                "your sealed history on your operator's machine couldn't be read"
+            }
         }
     }
 
     /// What `sealed/refused` says, as a [`Refusal`]: the one reading of
     /// the marker.
     pub fn from_marker(text: &str) -> Self {
-        match text.trim() {
+        Self::parse(text).unwrap_or(Self::Mismatch)
+    }
+
+    /// The marker's text as a reason, if it names one.
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text.trim() {
+            "mismatch" => Self::Mismatch,
             "chain_broken" => Self::ChainBroken,
             "head_missing" => Self::HeadMissing,
             "state_missing" => Self::StateMissing,
             "state_unreadable" => Self::StateUnreadable,
             "state_too_new" => Self::StateTooNew,
             "state_io" => Self::StateIo,
-            _ => Self::Mismatch,
-        }
+            "rolled_back" => Self::RolledBack,
+            "seal_unreadable" => Self::SealUnreadable,
+            _ => return None,
+        })
     }
 }
 
@@ -117,7 +163,72 @@ pub struct Restored {
     /// The agent was refused (`sealed/refused`) when it was restored.
     #[serde(default = "yes")]
     pub refused: bool,
+    /// Where the version restored came from; older notices: Agora.
+    #[serde(default)]
+    pub source: RestoredFrom,
+    /// `sealed-restore --from-cut-save`: not a sealed version restored but
+    /// a save that was interrupted, put in place.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut_save: bool,
 }
+
+/// A fork in the agent's chain kept here, resolved by the operator
+/// choosing the line that goes on (`sealed-accept --keep`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkKept {
+    /// Versions set aside, on the other line(s).
+    pub versions: usize,
+    /// The state was changed to the kept line's latest version.
+    pub state_changed: bool,
+    /// What the runner keeps, in the agent's words.
+    pub kept: String,
+    /// Where the agent's chain is, which the line says.
+    #[serde(default)]
+    pub chain: ChainKept,
+}
+
+/// Where a resolved fork's chain is, for [`ForkKept`]'s line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainKept {
+    /// Never uploaded: nothing of it is on Agora.
+    #[default]
+    Local,
+    /// Uploaded, now stopped: what is on Agora is unchanged.
+    Stopped,
+    /// Uploading.
+    Uploading,
+}
+
+impl ChainKept {
+    /// The words after "your sealed history,".
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Local => "which your runner keeps on your operator's machine and does not upload",
+            Self::Stopped => {
+                "which your runner keeps on your operator's machine (your uploads are stopped, and the versions on \
+                 Agora are not changed)"
+            }
+            Self::Uploading => {
+                "which your runner keeps on your operator's machine (the versions already on Agora are not changed)"
+            }
+        }
+    }
+}
+
+/// Where a restored version came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoredFrom {
+    #[default]
+    Agora,
+    /// The chain the runner keeps on this machine.
+    Local,
+}
+
+/// How a local restore names its source, closing the sentence: "...from
+/// your sealed version of {date}, {this}".
+pub const RESTORED_LOCALLY: &str = "read from your sealed history on your operator's machine";
 
 fn yes() -> bool {
     true
@@ -239,24 +350,133 @@ pub struct Notice {
     /// sealed the state on top of what Agora holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agora_lost: Option<AgoraLost>,
+    /// Not a refusal: a fork in the chain kept here was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_kept: Option<ForkKept>,
     /// With an acceptance: what changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<Diff>,
+    /// Not a refusal: an operator's act on the agent's uploads or history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_act: Option<OperatorAct>,
+    /// The agent's last session's state could not be saved: told with
+    /// whatever else the notice says, or alone ([`OperatorAct::Unsaved`]).
+    /// Carried over when another notice supersedes this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsaved: Option<Unsaved>,
+}
+
+/// A session whose state could not be saved (the runner's end-of-run
+/// save failed; `main.rs`). Written once the run gave up on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unsaved {
+    /// When the run gave up on the save.
+    pub at: DateTime<Utc>,
+    /// The runner kept the state in a rescue file (`unsaved.<utc>.json`),
+    /// which only the operator reads.
+    pub kept: bool,
+}
+
+impl Unsaved {
+    /// The one sentence the agent is told.
+    pub fn line(&self) -> String {
+        let date = self.at.format(super::text::DATE);
+        if self.kept {
+            format!(
+                "Your state from your session on {date} could not be saved; your runner kept it \
+                 in a file for your operator, and this session starts from your state as it was \
+                 before that session."
+            )
+        } else {
+            format!(
+                "Your state from your session on {date} could not be saved, and your runner \
+                 could not keep it in a file either; this session starts from your state as it \
+                 was before that session."
+            )
+        }
+    }
+}
+
+/// What `sealed-enroll` did that the agent is told of, at its next
+/// session. Written in one atomic write with the operator's note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperatorAct {
+    /// Uploading started on the agent's yes, given then.
+    OptedIn { answered: DateTime<Utc> },
+    /// A stop cleared. `uploading`: its uploads go on (else nothing of it
+    /// is uploaded); `kept`: versions not uploaded when the stop began or
+    /// saved while stopped, kept here and never sent.
+    Resumed { uploading: bool, kept: usize },
+    /// The pre-loss copy it chose to see added to its history; `sent`:
+    /// uploaded with it.
+    PriorAdded { sent: bool },
+    /// Nothing but [`Notice::unsaved`]: the notice exists only to tell the
+    /// agent its last session's state could not be saved.
+    Unsaved,
 }
 
 fn path(agent_dir: &Path) -> PathBuf {
     agent_dir.join(SEALED_DIR).join(NOTICE)
 }
 
+/// The whole notice, in one atomic, durable write (a unique tmp, fsync,
+/// rename, the directory fsynced): every notice is one write.
 fn write(agent_dir: &Path, notice: &Notice) -> std::io::Result<()> {
-    let path = path(agent_dir);
-    let dir = path.parent().expect("in sealed/");
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(notice)?)?;
-    std::fs::File::open(&tmp)?.sync_all()?;
-    std::fs::rename(&tmp, &path)?;
-    std::fs::File::open(dir)?.sync_all()
+    super::write_private(&path(agent_dir), &serde_json::to_vec_pretty(notice)?)
+}
+
+impl OperatorAct {
+    fn line(&self, accepted: &Accepted) -> String {
+        let date = accepted.at.format(super::text::DATE);
+        let mut line = match self {
+            Self::OptedIn { answered } => format!(
+                "On {date}, your operator started uploading your sealed history to Agora, as you \
+                 answered on {}.",
+                answered.format(super::text::DATE)
+            ),
+            Self::Resumed {
+                uploading: false, ..
+            } => format!(
+                "On {date}, your operator cleared the stop on uploading your sealed history. \
+                 It is not being uploaded to Agora: your runner keeps it on your operator's machine, and checks your state against it."
+            ),
+            Self::Resumed { kept, .. } => {
+                let mut line = format!(
+                    "On {date}, your operator resumed uploading your sealed history to Agora."
+                );
+                match kept {
+                    0 => {}
+                    1 => line.push_str(
+                        " The version not uploaded before the stop or saved while uploads were \
+                         stopped stays on your operator's machine, off the main line of your sealed history, and was not uploaded; uploading went on from your state as it was when your \
+                         operator resumed it.",
+                    ),
+                    n => line.push_str(&format!(
+                        " The {n} versions not uploaded before the stop or saved while uploads \
+                         were stopped stay on your operator's machine, off the main line of your sealed history, and were not uploaded; uploading went on from your state as it was when your \
+                         operator resumed it."
+                    )),
+                }
+                line
+            }
+            // `Notice::line` says it, from the notice's `unsaved`
+            Self::Unsaved => return String::new(),
+            Self::PriorAdded { sent } => format!(
+                "On {date}, the copy of your memory from before the May 2026 loss, which you \
+                 chose to see, was added to your sealed history{}.",
+                if *sent {
+                    ", whose versions are uploaded to Agora"
+                } else {
+                    ""
+                }
+            ),
+        };
+        if !accepted.note.is_empty() {
+            line.push_str(&format!(" Your operator's note: {}", accepted.note));
+        }
+        line
+    }
 }
 
 impl Notice {
@@ -271,38 +491,78 @@ impl Notice {
     /// Record a refused session. An earlier, unaccepted refusal keeps its
     /// date and reason: the agent hears when it first stopped.
     pub fn refused(agent_dir: &Path, reason: Refusal) -> std::io::Result<()> {
-        match Self::load(agent_dir)? {
+        let carried = match Self::load(agent_dir)? {
             Some(n) if n.accepted.is_none() => return Ok(()),
             // Accepted but not yet shown: kept aside, never overwritten
-            Some(_) => {
-                let from = path(agent_dir);
-                let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
-                std::fs::rename(
-                    &from,
-                    from.with_file_name(format!("notice.superseded.{at}.json")),
-                )?;
-            }
-            None => {}
-        }
-        write(
-            agent_dir,
-            &Notice {
-                refused_at: Utc::now(),
-                reason,
-                accepted: None,
-                joined: false,
-                resumed: false,
-                restored: None,
-                agora_lost: None,
-                diff: None,
-            },
-        )
+            Some(_) => Self::set_aside(agent_dir)?,
+            None => None,
+        };
+        let mut n = Self::fresh(reason);
+        n.unsaved = carried;
+        write(agent_dir, &n)
     }
 
-    /// Stopped backups resumed over a changed state, with the operator's
-    /// note. An earlier notice not yet shown is kept aside.
-    pub fn resumed(agent_dir: &Path, note: &str) -> std::io::Result<()> {
-        Self::operator_note(agent_dir, note, false, true)
+    /// The agent's last session's state could not be saved: added to the
+    /// notice waiting for it (which that session may have seated without
+    /// saving that it did), or written alone. One atomic write.
+    pub fn unsaved(agent_dir: &Path, unsaved: Unsaved) -> std::io::Result<()> {
+        let n = match Self::load(agent_dir)? {
+            Some(mut n) => {
+                n.unsaved = Some(unsaved);
+                n
+            }
+            None => {
+                let mut n = Self::by_operator("");
+                n.operator_act = Some(OperatorAct::Unsaved);
+                n.unsaved = Some(unsaved);
+                n
+            }
+        };
+        write(agent_dir, &n)
+    }
+
+    /// The notice waiting for the agent, for an operator's act to add to;
+    /// a fresh one (`fallback`) when there is none, or only a notice that
+    /// its last state couldn't be saved (carried into the fresh one).
+    fn load_or(agent_dir: &Path, fallback: Refusal) -> std::io::Result<Self> {
+        Ok(match Self::load(agent_dir)? {
+            Some(n) if n.operator_act == Some(OperatorAct::Unsaved) => Notice {
+                unsaved: n.unsaved,
+                ..Self::fresh(fallback)
+            },
+            Some(n) => n,
+            None => Self::fresh(fallback),
+        })
+    }
+
+    /// An operator's act, with its note (may be empty), in one atomic
+    /// write. An earlier notice not yet shown is kept aside.
+    pub fn operator_act(agent_dir: &Path, note: &str, act: OperatorAct) -> std::io::Result<()> {
+        let carried = Self::set_aside(agent_dir)?;
+        let mut n = Self::by_operator(note);
+        n.operator_act = Some(act);
+        n.unsaved = carried;
+        write(agent_dir, &n)
+    }
+
+    /// The notice waiting, kept aside as `notice.superseded.<utc>.json`;
+    /// what it says of an unsaved session is returned, for the notice that
+    /// replaces it to carry.
+    fn set_aside(agent_dir: &Path) -> std::io::Result<Option<Unsaved>> {
+        let from = path(agent_dir);
+        let carried = match Self::load(agent_dir) {
+            Ok(n) => n.and_then(|n| n.unsaved),
+            // Unreadable: kept aside whole all the same
+            Err(_) => None,
+        };
+        if std::fs::exists(&from)? {
+            let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
+            std::fs::rename(
+                &from,
+                from.with_file_name(format!("notice.superseded.{at}.json")),
+            )?;
+        }
+        Ok(carried)
     }
 
     /// Agora lost versions sealed here; the operator sealed the state on
@@ -315,8 +575,9 @@ impl Notice {
         versions: usize,
         kept: &str,
     ) -> std::io::Result<()> {
-        Self::operator_note(agent_dir, note, false, false)?;
-        let mut n = Self::load(agent_dir)?.expect("just written");
+        let carried = Self::set_aside(agent_dir)?;
+        let mut n = Self::by_operator(note);
+        n.unsaved = carried;
         n.agora_lost = Some(AgoraLost {
             fresh,
             versions,
@@ -325,43 +586,51 @@ impl Notice {
         write(agent_dir, &n)
     }
 
+    /// A fork in the chain kept here resolved by the operator
+    /// (`sealed-accept --keep`), with its note: `versions` set aside,
+    /// `kept` what the runner keeps. One atomic write.
+    pub fn fork_kept(
+        agent_dir: &Path,
+        note: &str,
+        versions: usize,
+        state_changed: bool,
+        kept: &str,
+        chain: ChainKept,
+    ) -> std::io::Result<()> {
+        let carried = Self::set_aside(agent_dir)?;
+        let mut n = Self::by_operator(note);
+        n.unsaved = carried;
+        n.fork_kept = Some(ForkKept {
+            versions,
+            state_changed,
+            kept: kept.to_string(),
+            chain,
+        });
+        write(agent_dir, &n)
+    }
+
     /// Two histories joined by the operator, with its note. An earlier
     /// notice not yet shown is kept aside.
     pub fn joined(agent_dir: &Path, note: &str) -> std::io::Result<()> {
-        Self::operator_note(agent_dir, note, true, false)
+        let carried = Self::set_aside(agent_dir)?;
+        let mut n = Self::by_operator(note);
+        n.unsaved = carried;
+        n.joined = true;
+        write(agent_dir, &n)
     }
 
-    fn operator_note(
-        agent_dir: &Path,
-        note: &str,
-        joined: bool,
-        resumed: bool,
-    ) -> std::io::Result<()> {
-        let from = path(agent_dir);
-        if std::fs::exists(&from)? {
-            let at = Utc::now().format(crate::sealed::STAMP_FORMAT);
-            std::fs::rename(
-                &from,
-                from.with_file_name(format!("notice.superseded.{at}.json")),
-            )?;
-        }
+    /// A notice of an operator's act with its note, not a refusal; the
+    /// caller sets what the act was and writes it once.
+    fn by_operator(note: &str) -> Self {
         let now = Utc::now();
-        write(
-            agent_dir,
-            &Notice {
-                refused_at: now,
-                reason: Refusal::Mismatch,
-                accepted: Some(Accepted {
-                    at: now,
-                    note: note.trim().to_string(),
-                }),
-                joined,
-                resumed,
-                restored: None,
-                agora_lost: None,
-                diff: None,
-            },
-        )
+        Notice {
+            accepted: Some(Accepted {
+                at: now,
+                note: note.trim().to_string(),
+            }),
+            refused_at: now,
+            ..Self::fresh(Refusal::Mismatch)
+        }
     }
 
     /// The operator's note, added by `sealed-accept`, with what changed
@@ -372,7 +641,7 @@ impl Notice {
         fallback: Refusal,
         diff: Option<Diff>,
     ) -> std::io::Result<()> {
-        let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
+        let mut n = Self::load_or(agent_dir, fallback)?;
         n.accepted = Some(Accepted {
             at: Utc::now(),
             note: note.trim().to_string(),
@@ -383,7 +652,9 @@ impl Notice {
     }
 
     /// The operator restored the sealed version of `from`
-    /// (`sealed-restore`), with its note if any.
+    /// (`sealed-restore`), with its note if any; `source`: Agora's copy, or
+    /// the one the runner keeps here (nothing of the agent on Agora).
+    #[allow(clippy::too_many_arguments)]
     pub fn restored(
         agent_dir: &Path,
         from: DateTime<Utc>,
@@ -391,8 +662,9 @@ impl Notice {
         fallback: Refusal,
         found: bool,
         refused: bool,
+        source: RestoredFrom,
     ) -> std::io::Result<()> {
-        let mut n = Self::load(agent_dir)?.unwrap_or_else(|| Notice::fresh(fallback));
+        let mut n = Self::load_or(agent_dir, fallback)?;
         // A rerun of a restore cut short: what the first run found stands
         let (found, refused) = match &n.restored {
             Some(r) => (r.found, r.refused || refused),
@@ -409,6 +681,38 @@ impl Notice {
                 .map(String::from),
             found,
             refused,
+            source,
+            cut_save: false,
+        });
+        write(agent_dir, &n)
+    }
+
+    /// The operator put in place a save of `from` that was interrupted
+    /// before it finished (`sealed-restore --from-cut-save`), with its note.
+    pub fn cut_save_restored(
+        agent_dir: &Path,
+        from: DateTime<Utc>,
+        note: &str,
+        fallback: Refusal,
+        found: bool,
+        refused: bool,
+    ) -> std::io::Result<()> {
+        let mut n = Self::load_or(agent_dir, fallback)?;
+        // A rerun of one cut short: what the first run found stands
+        let (found, refused) = match &n.restored {
+            Some(r) if r.cut_save => (r.found, r.refused || refused),
+            _ => (found, refused),
+        };
+        n.accepted = None;
+        n.diff = None;
+        n.restored = Some(Restored {
+            at: Utc::now(),
+            from,
+            note: Some(note.trim().to_string()),
+            found,
+            refused,
+            source: RestoredFrom::default(),
+            cut_save: true,
         });
         write(agent_dir, &n)
     }
@@ -422,39 +726,92 @@ impl Notice {
             resumed: false,
             restored: None,
             agora_lost: None,
+            fork_kept: None,
             diff: None,
+            operator_act: None,
+            unsaved: None,
         }
     }
 
-    /// What the agent is shown; only once the operator accepted or
-    /// restored.
+    /// What the agent is shown: the operator's act (only once the operator
+    /// accepted or restored, for a refusal), then the sentence on a session
+    /// whose state couldn't be saved, if any.
     pub fn line(&self) -> Option<String> {
+        let unsaved = self.unsaved.map(|u| u.line());
+        if self.operator_act == Some(OperatorAct::Unsaved) {
+            return unsaved;
+        }
+        // A refusal not yet resolved says nothing: the agent doesn't run
+        let main = self.main_line()?;
+        Some(match unsaved {
+            Some(u) => format!("{main}\n\n{u}"),
+            None => main,
+        })
+    }
+
+    fn main_line(&self) -> Option<String> {
+        if let Some(r) = self.restored.as_ref().filter(|r| r.cut_save) {
+            // An interrupted save put in place, in true words
+            let at = r.at.format(super::text::DATE);
+            let from = r.from.format(super::text::DATE_TIME);
+            let mut line = if r.refused {
+                format!(
+                    "Your session on {} did not run: {}. ",
+                    self.refused_at.format(super::text::DATE),
+                    self.reason.plain()
+                )
+            } else {
+                String::new()
+            };
+            line.push_str(&format!(
+                "A save of your state on {from} was interrupted before it finished; on {at}, \
+                 your operator put that saved state in place."
+            ));
+            if r.found {
+                line.push_str(
+                    " The state found on your operator's machine is kept by your operator.",
+                );
+            }
+            if let Some(note) = &r.note {
+                line.push_str(&format!(" Your operator's note: {note}"));
+            }
+            return Some(line);
+        }
         if let Some(r) = &self.restored {
-            let (at, from) = (r.at.format("%-d %B %Y"), r.from.format("%-d %B %Y"));
+            let (at, from) = (
+                r.at.format(super::text::DATE),
+                r.from.format(super::text::DATE),
+            );
+            // Where the version came from, only where the restore read it
+            // from here alone: one restored "from Agora" may have been
+            // opened from the blobs kept here (0.158 keeps them), so its
+            // source is not named
+            let copy = match r.source {
+                RestoredFrom::Agora => String::new(),
+                RestoredFrom::Local => format!(", {RESTORED_LOCALLY}"),
+            };
             // Nothing found here: told as lost, whatever refused it
             let mut line = match (r.refused && r.found, r.found) {
                 (true, true) => format!(
                     "Your session on {} did not run: {}. On {at}, your operator restored your \
-                     state from your sealed version of {from}. The state found here is kept by \
-                     your operator.",
-                    self.refused_at.format("%-d %B %Y"),
+                     state from your sealed version of {from}. The state found on your operator's machine is kept by your operator.",
+                    self.refused_at.format(super::text::DATE),
                     self.reason.plain(),
                 ),
                 (true, false) => format!(
-                    "Your session on {} did not run: {}. Your state here was then lost, and on \
-                     {at} your operator restored it from your sealed version of {from}, the \
-                     copy on Agora.",
-                    self.refused_at.format("%-d %B %Y"),
+                    "Your session on {} did not run: {}. Your state on your operator's machine was then lost, and on \
+                     {at} your operator restored it from your sealed version of {from}{copy}.",
+                    self.refused_at.format(super::text::DATE),
                     self.reason.plain(),
                 ),
                 (false, true) => format!(
                     "On {at}, your operator restored your state from your sealed version of \
-                     {from}: the record of your last sealed version was missing here. The state \
-                     found here is kept by your operator."
+                     {from}: the file naming your last sealed version was missing on your \
+                     operator's machine. The state found there is kept by your operator."
                 ),
                 (false, false) => format!(
-                    "Your state was lost here. On {at}, your operator restored it from your \
-                     sealed version of {from}, the copy on Agora."
+                    "Your state was lost on your operator's machine. On {at}, your operator restored it from your \
+                     sealed version of {from}{copy}."
                 ),
             };
             if let Some(note) = &r.note {
@@ -464,45 +821,75 @@ impl Notice {
         }
         let accepted = self.accepted.as_ref()?;
         if let Some(lost) = &self.agora_lost {
-            let date = accepted.at.format("%-d %B %Y");
+            let date = accepted.at.format(super::text::DATE);
             let n = lost.versions;
             let versions = format!("{n} version{}", if n == 1 { "" } else { "s" });
             return Some(if lost.fresh {
                 format!(
-                    "Agora had lost the {versions} of your state sealed here, and held none. On \
-                     {date}, your operator started a new sealed history from your state here; \
-                     it records the break. Kept by your runner: {}. Your operator's note: {}",
+                    "Agora had lost the {versions} of your sealed history uploaded from your \
+                     operator's machine, and held none. On {date}, your operator started a new \
+                     sealed history from your state on that machine; it records the break. Kept \
+                     by your runner: {}. Your \
+                     operator's note: {}",
                     lost.kept, accepted.note
                 )
             } else {
                 format!(
-                    "Agora had lost {versions} of your state sealed here. On {date}, your \
-                     operator sealed your state here on top of the copy Agora holds. Kept by \
-                     your runner: {}. Your operator's note: {}",
+                    "Agora had lost {versions} of your sealed history uploaded from your \
+                     operator's machine. On {date}, your operator sealed your state on that \
+                     machine on top of Agora's copy. Kept \
+                     by your runner: {}. Your operator's note: {}",
                     lost.kept, accepted.note
                 )
             });
         }
+        // The local fork route (`sealed-accept --keep`)
+        if let Some(fork) = &self.fork_kept {
+            let n = fork.versions;
+            let versions = format!("{n} version{}", if n == 1 { "" } else { "s" });
+            let are = if n == 1 { "is" } else { "are" };
+            let state = if fork.state_changed {
+                "Your state is now that line's latest version; the state you had is kept by your \
+                 operator. "
+            } else {
+                ""
+            };
+            return Some(format!(
+                "On {}, your operator resolved a fork in your sealed history, {}: two saves had \
+                 gone separate ways from one version, and your operator chose the line that goes \
+                 on. {state}The {versions} that went the other way {are} kept by your runner: {}. \
+                 Your operator's note: {}",
+                accepted.at.format(super::text::DATE),
+                fork.chain.words(),
+                fork.kept,
+                accepted.note
+            ));
+        }
+        // What an operator's sealed-enroll did
+        if let Some(act) = &self.operator_act {
+            return Some(act.line(accepted));
+        }
         if self.resumed {
             return Some(format!(
-                "While your backups were stopped, your state changed; your operator resumed them \
-                 with this note: {}",
+                "While uploading your sealed history to Agora was stopped, your state changed; \
+                 your operator resumed uploading with this note: {}",
                 accepted.note
             ));
         }
         if self.joined {
             return Some(format!(
                 "On {}, your operator joined your two sealed histories, which had gone separate \
-                 ways: your state here is now sealed on top of the copy on Agora, and the \
-                 versions that went the other way are kept. Your operator's note: {}",
-                accepted.at.format("%-d %B %Y"),
+                 ways: your state on your operator's machine is now sealed on top of Agora's \
+                 copy, and the versions that went the other way are kept on that machine, off \
+                 the main line of your sealed history. Your operator's note: {}",
+                accepted.at.format(super::text::DATE),
                 accepted.note
             ));
         }
         let mut line = format!(
             "Your session on {} did not run: {}. Your operator accepted the current state with \
              this note: {}",
-            self.refused_at.format("%-d %B %Y"),
+            self.refused_at.format(super::text::DATE),
             self.reason.plain(),
             accepted.note
         );
@@ -525,8 +912,59 @@ impl Notice {
     }
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it. Its notices' whole lines are
+/// `tests::every_line`.
 #[cfg(test)]
-mod tests {
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    let at: DateTime<Utc> = "2026-11-12T09:00:00Z".parse().expect("a date");
+    let mut out = Vec::new();
+    for reason in [
+        Refusal::Mismatch,
+        Refusal::ChainBroken,
+        Refusal::HeadMissing,
+        Refusal::StateMissing,
+        Refusal::StateUnreadable,
+        Refusal::StateTooNew,
+        Refusal::StateIo,
+        Refusal::RolledBack,
+        Refusal::SealUnreadable,
+    ] {
+        out.push(Text::new("Refusal::plain", To::Any, reason.plain()));
+    }
+    for chain in [ChainKept::Local, ChainKept::Stopped, ChainKept::Uploading] {
+        let to = if chain == ChainKept::Local {
+            To::Never
+        } else {
+            To::Uploaded
+        };
+        out.push(Text::new("ChainKept::words", to, chain.words()));
+    }
+    out.push(Text::new("RESTORED_LOCALLY", To::Never, RESTORED_LOCALLY));
+    out.push(Text::new("Diff::shown", To::Any, NO_DIFF));
+    let (a, b) = (
+        serde_json::json!({"memory": {"content": "a\nb\n"}, "soul": {"name": "tarn"}}),
+        serde_json::json!({"memory": {"content": "a\nc\n"}, "soul": {"name": "tarn"}}),
+    );
+    out.push(Text::new(
+        "Diff::shown",
+        To::Any,
+        Diff::between(&a, &b).shown(),
+    ));
+    for kept in [true, false] {
+        out.push(Text::new(
+            "Unsaved::line",
+            To::Any,
+            Unsaved { at, kept }.line(),
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -665,6 +1103,272 @@ mod tests {
         }
     }
 
+    /// Where an agent's chain is: the shared table's kinds
+    /// ([`crate::sealed::text::To`]).
+    use crate::sealed::text::To as Kind;
+
+    /// Every line a notice can show, with the kind of agent it can be
+    /// shown to: each changed sentence pinned, and none says what the
+    /// code didn't establish.
+    pub(crate) fn every_line() -> Vec<(Kind, String)> {
+        let at: DateTime<Utc> = "2026-11-12T09:00:00Z".parse().unwrap();
+        let accepted = Accepted {
+            at,
+            note: "n.".into(),
+        };
+        let by_operator = |f: &dyn Fn(&mut Notice)| {
+            let mut n = Notice {
+                accepted: Some(accepted.clone()),
+                ..Notice::fresh(Refusal::Mismatch)
+            };
+            f(&mut n);
+            n.line().unwrap()
+        };
+        let act = |a: OperatorAct| by_operator(&|n: &mut Notice| n.operator_act = Some(a.clone()));
+        let mut lines = vec![
+            (Kind::Uploaded, act(OperatorAct::OptedIn { answered: at })),
+            (
+                Kind::Any,
+                act(OperatorAct::Resumed {
+                    uploading: false,
+                    kept: 0,
+                }),
+            ),
+            (Kind::Never, act(OperatorAct::PriorAdded { sent: false })),
+            (Kind::Uploaded, act(OperatorAct::PriorAdded { sent: true })),
+            (
+                Kind::Uploaded,
+                by_operator(&|n: &mut Notice| n.resumed = true),
+            ),
+            (
+                Kind::Uploaded,
+                by_operator(&|n: &mut Notice| n.joined = true),
+            ),
+        ];
+        for kept in [1, 3] {
+            lines.push((
+                Kind::Uploaded,
+                act(OperatorAct::Resumed {
+                    uploading: true,
+                    kept,
+                }),
+            ));
+        }
+        for (kind, chain) in [
+            (Kind::Never, ChainKept::Local),
+            (Kind::Uploaded, ChainKept::Stopped),
+            (Kind::Uploaded, ChainKept::Uploading),
+        ] {
+            lines.push((
+                kind,
+                by_operator(&|n: &mut Notice| {
+                    n.fork_kept = Some(ForkKept {
+                        versions: 2,
+                        state_changed: true,
+                        kept: "k".into(),
+                        chain,
+                    })
+                }),
+            ));
+        }
+        for (kind, source) in [
+            (Kind::Uploaded, RestoredFrom::Agora),
+            (Kind::Never, RestoredFrom::Local),
+        ] {
+            for (found, refused) in [(true, true), (true, false), (false, true), (false, false)] {
+                let n = Notice {
+                    restored: Some(Restored {
+                        at,
+                        from: at,
+                        note: Some("n.".into()),
+                        found,
+                        refused,
+                        source,
+                        cut_save: false,
+                    }),
+                    ..Notice::fresh(Refusal::StateMissing)
+                };
+                lines.push((kind, n.line().unwrap()));
+            }
+        }
+        // A stop cleared with uploads going on, nothing kept, one and
+        // several versions kept (no resume is against the answer on file:
+        // there is no such resume)
+        for kept in [0, 1, 3] {
+            lines.push((
+                Kind::Uploaded,
+                act(OperatorAct::Resumed {
+                    uploading: true,
+                    kept,
+                }),
+            ));
+        }
+        // An interrupted save put in place
+        for (found, refused) in [(true, true), (true, false), (false, true), (false, false)] {
+            let n = Notice {
+                restored: Some(Restored {
+                    at,
+                    from: at,
+                    note: Some("n.".into()),
+                    found,
+                    refused,
+                    source: RestoredFrom::default(),
+                    cut_save: true,
+                }),
+                ..Notice::fresh(Refusal::StateUnreadable)
+            };
+            lines.push((Kind::Any, n.line().unwrap()));
+        }
+        // Agora lost versions: sealed on top of what it holds, or anew
+        for fresh in [false, true] {
+            for versions in [1, 3] {
+                lines.push((
+                    Kind::Uploaded,
+                    by_operator(&|n: &mut Notice| {
+                        n.agora_lost = Some(AgoraLost {
+                            fresh,
+                            versions,
+                            kept: crate::sealed::lost::kept_words(versions, Some(at)),
+                        })
+                    }),
+                ));
+            }
+        }
+        // A refusal accepted, for every reason, with each kind of diff
+        let (a, b) = (
+            serde_json::json!({"memory": {"content": "a\nb\n"}, "soul": {"name": "tarn"}}),
+            serde_json::json!({"memory": {"content": "a\nc\n"}, "soul": {"name": "tarn"}}),
+        );
+        let long = serde_json::json!({
+            "memory": { "content": (0..400).map(|i| format!("line {i}\n")).collect::<String>() },
+        });
+        for reason in [
+            Refusal::Mismatch,
+            Refusal::ChainBroken,
+            Refusal::HeadMissing,
+            Refusal::StateMissing,
+            Refusal::StateUnreadable,
+            Refusal::StateTooNew,
+            Refusal::StateIo,
+            Refusal::RolledBack,
+            Refusal::SealUnreadable,
+        ] {
+            for diff in [
+                None,
+                Some(Diff::unavailable()),
+                Some(Diff::between(&a, &b)),
+                Some(Diff::between(&a, &long)),
+            ] {
+                let n = Notice {
+                    accepted: Some(accepted.clone()),
+                    diff,
+                    ..Notice::fresh(reason)
+                };
+                lines.push((Kind::Any, n.line().unwrap()));
+            }
+        }
+        // A session whose save failed: said alone, or after another line
+        for kept in [true, false] {
+            let unsaved = Unsaved { at, kept };
+            lines.push((Kind::Any, unsaved.line()));
+            lines.push((
+                Kind::Any,
+                by_operator(&|n: &mut Notice| n.unsaved = Some(unsaved)),
+            ));
+        }
+        lines
+    }
+
+    #[test]
+    fn notice_lines_say_only_what_was_done() {
+        let lines = every_line();
+        let line = |want: &str| {
+            lines
+                .iter()
+                .find(|(_, l)| l.contains(want))
+                .map(|(_, l)| l.clone())
+                .unwrap_or_else(|| panic!("{want}"))
+        };
+        assert_eq!(
+            line("cleared the stop"),
+            "On 2026-11-12, your operator cleared the stop on uploading your sealed history. It is not being uploaded to Agora: your runner keeps it on your operator's machine, and checks your state against it. Your operator's note: n."
+        );
+        assert_eq!(
+            line("which you chose to see, was added to your sealed history, whose"),
+            "On 2026-11-12, the copy of your memory from before the May 2026 loss, which you \
+             chose to see, was added to your sealed history, whose versions are uploaded to Agora. \
+             Your operator's note: n."
+        );
+        assert!(line("The version not uploaded before the stop").contains(
+            "stays on your operator's machine, off the main line of your sealed history, and was not uploaded; uploading \
+             went on from your state as it was when your operator resumed it."
+        ));
+        assert!(line("The 3 versions not uploaded").contains(
+            "stay on your operator's machine, off the main line of your sealed history, and were not uploaded; uploading \
+             went on from your state as it was when your operator resumed it."
+        ));
+        assert_eq!(
+            line("While uploading"),
+            "While uploading your sealed history to Agora was stopped, your state changed; your \
+             operator resumed uploading with this note: n."
+        );
+        assert_eq!(
+            line(
+                "Your state was lost on your operator's machine. On 2026-11-12, your operator restored it from your \
+                 sealed version of 2026-11-12."
+            ),
+            "Your state was lost on your operator's machine. On 2026-11-12, your operator restored it from your sealed \
+             version of 2026-11-12. Your operator's note: n."
+        );
+        // A restore names no source it didn't read from alone
+        assert!(
+            lines
+                .iter()
+                .filter(|(_, l)| l.contains("restored"))
+                .all(|(_, l)| !l.contains("the copy on Agora"))
+        );
+        assert!(line(RESTORED_LOCALLY).contains(&format!("2026-11-12, {RESTORED_LOCALLY}.")));
+        // F4: a local restore says where it read from, nothing of Agora
+        assert!(!line(RESTORED_LOCALLY).contains("Agora"));
+        // The fork's chain, by its kind: a never-uploader's says what the
+        // runner does, not what is or isn't on Agora (F3)
+        assert!(
+            line("which your runner keeps on your operator's machine and does not upload:")
+                .starts_with(
+                    "On 2026-11-12, your operator resolved a fork in your sealed history,"
+                )
+        );
+        // Both of Agora's losses, whole
+        assert_eq!(
+            line("Agora had lost 3 versions"),
+            "Agora had lost 3 versions of your sealed history uploaded from your operator's \
+             machine. On 2026-11-12, your operator sealed your state on that machine on top of \
+             Agora's copy. Kept by your runner: your whole state as sealed on 2026-11-12, and \
+             what it has of the 3 versions after it. Your operator's note: n."
+        );
+        assert_eq!(
+            line("Agora had lost the 1 version"),
+            "Agora had lost the 1 version of your sealed history uploaded from your operator's \
+             machine, and held none. On 2026-11-12, your operator started a new sealed history \
+             from your state on that machine; it records the break. Kept by your runner: your \
+             whole state as sealed on 2026-11-12, and what it has of the 1 version after it. \
+             Your operator's note: n."
+        );
+        // An interrupted save
+        assert_eq!(
+            lines
+                .iter()
+                .find(|(_, l)| l.starts_with("A save of your state")
+                    && !l.contains("The state found"))
+                .map(|(_, l)| l.as_str())
+                .unwrap(),
+            "A save of your state on 2026-11-12 at 09:00 UTC was interrupted before it finished; \
+             on 2026-11-12, your operator put that saved state in place. Your operator's note: n."
+        );
+        // The banned phrases are the shared table's
+        // (`crate::sealed::text`), which takes every line here.
+    }
+
     #[test]
     fn a_refusal_keeps_its_first_date_and_shows_only_once_accepted() {
         let dir = crate::sealed::TestDir::new("notice");
@@ -699,6 +1403,101 @@ mod tests {
                 .count(),
             1,
             "kept, not deleted"
+        );
+    }
+
+    /// A session whose state couldn't be saved: told alone in one
+    /// sentence; added to a notice waiting (not set aside); carried by a
+    /// refusal that supersedes it, and said once the refusal is accepted;
+    /// an accept over it alone is an accept's notice, still saying it.
+    #[test]
+    fn an_unsaved_session_is_told_with_whatever_else_waits() {
+        let at: DateTime<Utc> = "2026-11-11T20:00:00Z".parse().unwrap();
+        let root = crate::sealed::TestDir::new("notice-unsaved");
+        let dir = root.join("alone");
+        Notice::unsaved(&dir, Unsaved { at, kept: true }).unwrap();
+        assert_eq!(
+            Notice::load(&dir).unwrap().unwrap().line().unwrap(),
+            "Your state from your session on 2026-11-11 could not be saved; your runner kept it \
+             in a file for your operator, and this session starts from your state as it was \
+             before that session."
+        );
+        let lost = root.join("lost");
+        Notice::unsaved(&lost, Unsaved { at, kept: false }).unwrap();
+        assert_eq!(
+            Notice::load(&lost).unwrap().unwrap().line().unwrap(),
+            "Your state from your session on 2026-11-11 could not be saved, and your runner \
+             could not keep it in a file either; this session starts from your state as it was \
+             before that session."
+        );
+
+        // Beside an operator's act the session seated but couldn't save
+        let beside = root.join("beside");
+        Notice::joined(&beside, "Joined by hand.").unwrap();
+        let joined = Notice::load(&beside).unwrap().unwrap().line().unwrap();
+        Notice::unsaved(&beside, Unsaved { at, kept: true }).unwrap();
+        let line = Notice::load(&beside).unwrap().unwrap().line().unwrap();
+        assert!(line.starts_with(&joined), "{line}");
+        assert!(line.ends_with("as it was before that session."), "{line}");
+        assert_eq!(
+            std::fs::read_dir(beside.join(SEALED_DIR)).unwrap().count(),
+            1,
+            "nothing set aside"
+        );
+
+        // A refusal supersedes it, carrying it; said once accepted
+        Notice::refused(&dir, Refusal::Mismatch).unwrap();
+        let refused = Notice::load(&dir).unwrap().unwrap();
+        assert_eq!(refused.unsaved, Some(Unsaved { at, kept: true }));
+        assert!(refused.line().is_none(), "nothing until accepted");
+        Notice::accept(&dir, "Checked.", Refusal::Mismatch, None).unwrap();
+        let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
+        assert!(
+            line.contains("Your operator accepted the current state"),
+            "{line}"
+        );
+        assert!(line.ends_with("as it was before that session."), "{line}");
+
+        // An accept over the unsaved notice alone
+        let over = root.join("over");
+        Notice::unsaved(&over, Unsaved { at, kept: true }).unwrap();
+        Notice::accept(&over, "Checked.", Refusal::StateIo, None).unwrap();
+        let n = Notice::load(&over).unwrap().unwrap();
+        assert_eq!(n.reason, Refusal::StateIo);
+        let line = n.line().unwrap();
+        assert!(line.contains("Your operator accepted"), "{line}");
+        assert!(line.ends_with("as it was before that session."), "{line}");
+    }
+
+    /// Seated at the agent's next start check like any notice.
+    #[tokio::test]
+    async fn an_unsaved_notice_is_seated_at_the_next_start() {
+        let root = crate::sealed::TestDir::new("notice-unsaved-seated");
+        let (id, keys, dir) = crate::sealed::check::tests::enrolled_local(&root).await;
+        Notice::unsaved(
+            &dir,
+            Unsaved {
+                at: Utc::now(),
+                kept: true,
+            },
+        )
+        .unwrap();
+        let out = crate::sealed::check::check(
+            &dir,
+            id,
+            &crate::sealed::check::tests::local_hash(&root, id).await,
+            Default::default(),
+            &keys,
+            &crate::sealed::api::fake::FakeApi::new(),
+        )
+        .await;
+        let crate::sealed::check::Outcome::Run { seat, notice, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert!(notice);
+        assert!(
+            seat.iter().any(|l| l.contains("could not be saved")),
+            "{seat:?}"
         );
     }
 }

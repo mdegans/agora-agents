@@ -50,7 +50,8 @@ use std::path::{Path, PathBuf};
 
 use agora_agentkit::govlog::Sha256Hex;
 use agora_agentkit::ids::AgentId;
-use agora_agentkit::state::outbox::{AgoraOutbox, DrainError, DrainReport};
+use agora_agentkit::state::outbox::{AgoraOutbox, BeforeUpload, DrainError, Drained};
+use agora_agentkit::state::storage::OutboxItem;
 use agora_agentkit::state::storage::{AgentSeal, SEALED_DIR};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -412,33 +413,62 @@ pub async fn after(
     Ok(changed)
 }
 
+/// The first-send times of one drain, recorded by agentkit's drain once
+/// it has checked that the agent uploads and is about to send
+/// ([`BeforeUpload`]): never for a drain that sends nothing, so an agent
+/// that doesn't upload gets no receipts at all.
+struct FirstSends<'a> {
+    agent_dir: &'a Path,
+    id: AgentId,
+    baseline: &'a mut u64,
+    before: Option<Before>,
+}
+
+#[async_trait::async_trait]
+impl BeforeUpload for FirstSends<'_> {
+    async fn before_upload(&mut self, _items: &[OutboxItem]) {
+        self.before = match before(self.agent_dir, self.id, *self.baseline).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "sealed_state_receipts_unwritten",
+                    agent_id = %self.id,
+                    error = %e,
+                    "upload times could not be recorded; the upload goes ahead, and this \
+                     process records no more send times for the agent"
+                );
+                *self.baseline = u64::MAX;
+                None
+            }
+        };
+    }
+}
+
 /// Drain `id`'s outbox with its receipts recorded around it. A receipt
 /// that can't be written never stops the upload: before the drain, this
 /// process then records no `sent` for the agent from here on (`baseline`
 /// set past every number), since a version may now reach Agora with no
 /// lower bound on disk; after it, the versions simply have no `acked` from
 /// this drain, which only makes the check less precise.
+///
+/// An agent that doesn't upload ([`super::uploads`]) is not drained:
+/// [`Drained::LocalOnly`], and nothing read, sent or recorded.
 pub async fn drain(
     outbox: &AgoraOutbox<SealedEnrolment>,
     agent_dir: &Path,
     id: AgentId,
     baseline: &mut u64,
-) -> Result<DrainReport, DrainError> {
-    let before = match before(agent_dir, id, *baseline).await {
-        Ok(b) => Some(b),
-        Err(e) => {
-            tracing::warn!(
-                event_type = "sealed_state_receipts_unwritten",
-                agent_id = %id,
-                error = %e,
-                "upload times could not be recorded; the upload goes ahead, and this process \
-                 records no more send times for the agent"
-            );
-            *baseline = u64::MAX;
-            None
-        }
+) -> Result<Drained, DrainError> {
+    let mut sends = FirstSends {
+        agent_dir,
+        id,
+        baseline,
+        before: None,
     };
-    let result = outbox.drain(id).await;
+    let result = outbox.drain_with(id, &mut sends).await;
+    let FirstSends {
+        baseline, before, ..
+    } = sends;
     if let Some(before) = before
         && let Err(e) = after(agent_dir, id, *baseline, &before).await
     {
@@ -453,6 +483,11 @@ pub async fn drain(
         // A version committed during this drain, tried and unanswered,
         // has no `sent` now: a later drain must not give it one
         *baseline = u64::MAX;
+    }
+    // What Agora reported damaged and what was sent again, kept for the
+    // agent's next start ([`super::healed`])
+    if let Ok(drained) = &result {
+        super::healed::note_drained(agent_dir, id, drained);
     }
     result
 }

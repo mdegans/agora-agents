@@ -105,7 +105,7 @@ impl OfferKind {
             Self::Role => "your role",
             Self::Cadence => "your session schedule",
             Self::MemoryRestore => "your memory from before 5 May 2026",
-            Self::SealedState => "sealed backups of your state",
+            Self::SealedState => "uploading your sealed history to Agora",
         }
     }
 }
@@ -562,22 +562,22 @@ pub trait Stored: serde::Serialize + serde::de::DeserializeOwned + Default + Sen
         }
     }
 
-    /// Atomic save (tmp + fsync + rename), in this binary's
-    /// [`Self::FORMAT`] (a file loaded in an older one is written in this).
+    /// Atomic, durable save, readable by the runner's user only (0600, as
+    /// every file beside an agent's keys and chain: a ledger holds the
+    /// agent's answers and its own notes), in this binary's
+    /// [`Self::FORMAT`] (a file loaded in an older one is written in
+    /// this). [`crate::sealed::write_private`]: a uniquely named
+    /// temporary, fsync, rename, fsync of the directory. A ledger written
+    /// with wider permissions before is replaced by this write, not
+    /// chmodded in place.
     async fn save(&self, agent_dir: &Path) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        tokio::fs::create_dir_all(agent_dir).await?;
         let mut value = serde_json::to_value(self)?;
         value["format"] = self.format().max(Self::FORMAT).into();
         let bytes = serde_json::to_vec_pretty(&value)?;
         let path = Self::path(agent_dir);
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &path).await
+        tokio::task::spawn_blocking(move || crate::sealed::write_private(&path, &bytes))
+            .await
+            .map_err(std::io::Error::other)?
     }
 }
 
@@ -691,6 +691,12 @@ impl<L: OfferLedger> Slot<L> {
     /// What this session's answer writes at teardown.
     pub fn stage(&mut self, write: Write) {
         self.pending = write;
+    }
+
+    /// Take the SOUL edit back out of what is staged, keeping the agent's
+    /// own memory note: for an answer that is recorded but changes nothing.
+    pub fn drop_edit(&mut self) {
+        self.pending.edit = None;
     }
 }
 

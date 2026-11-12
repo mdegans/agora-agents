@@ -5,10 +5,13 @@
 //! them, Agora's, verified with the runner's own trust
 //! ([`KeyStore::trusted`]), never on the server's word.
 //!
-//! A blob that isn't here (agentkit keeps only the current keyframe's and
-//! the outbox's, `prune_blobs`) is fetched from Agora and checked against
+//! A blob that isn't here (a runner before agentkit 0.158 deleted the ones
+//! Agora acknowledged) is fetched from Agora and checked against
 //! its entry's `BlobRef` before it is opened (agentkit's
-//! `open_entry_blob`); nothing fetched is written to disk. The plaintext
+//! `open_entry_blob`); nothing fetched is written to disk. For an agent
+//! that never uploaded ([`Reach::Local`]) nothing is asked of Agora: a
+//! missing blob, or a main line that runs past the entries here, is an
+//! error naming the version. The plaintext
 //! is never logged: errors carry hashes, kinds and counts only.
 
 use agora_agentkit::crypto::SigningKey;
@@ -26,6 +29,41 @@ use anyhow::Context;
 use super::KeyStore;
 use super::api::{BlobError, SealedApi};
 use super::check::{local_entries, main_line};
+
+/// Where an enrolled agent's chain is, for the operator's commands: three
+/// kinds, not two (the review of B1, 2026-11-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// It uploads ([`super::uploads`]): Agora is read and written as ever.
+    Uploads,
+    /// It uploaded, and is stopped (or its marker is in doubt): Agora holds
+    /// a chain of it, which may be read (its acknowledged blobs were pruned
+    /// here), but no state is sent.
+    Stopped,
+    /// It never uploaded: nothing of it is on Agora, and no call is made.
+    Local,
+}
+
+impl Reach {
+    /// Whether Agora holds anything of the agent's chain to read.
+    pub fn on_agora(self) -> bool {
+        self != Self::Local
+    }
+}
+
+/// The agent's [`Reach`]: the start check's own classification
+/// ([`super::check::Upload::of`]), one reading of the markers. A marker in
+/// doubt is [`Reach::Stopped`]: something of the agent may be on Agora, so
+/// nothing says it isn't, and nothing is sent (reads pass the guard only
+/// where a copy of the marker can be read, `has_uploaded`).
+pub fn reach(agent_dir: &std::path::Path, keys: &KeyStore, id: AgentId) -> Reach {
+    use super::check::Upload;
+    match Upload::of(agent_dir, keys, id) {
+        Upload::Now => Reach::Uploads,
+        Upload::Before | Upload::InDoubt => Reach::Stopped,
+        Upload::Never => Reach::Local,
+    }
+}
 
 /// The last sealed version, opened.
 pub struct LastSealed {
@@ -57,6 +95,7 @@ async fn blob(
     signing: &SigningKey,
     sha: &Sha256Hex,
     failed: &mut FailedBlobs,
+    fetch: bool,
 ) -> anyhow::Result<Vec<u8>> {
     for seal in seals {
         match seal.read_blob(sha).await {
@@ -65,6 +104,10 @@ async fn blob(
             Err(e) => return Err(e).with_context(|| format!("reading blob {sha}")),
         }
     }
+    anyhow::ensure!(
+        fetch,
+        "blob {sha} isn't here, and nothing of this agent is on Agora to fetch it from"
+    );
     if failed.unreachable() {
         anyhow::bail!("{UNREACHABLE} (blob {sha} not asked for)");
     }
@@ -235,6 +278,7 @@ async fn plaintext(
     entry: &StateEntry,
     dict: Option<Dict>,
     failed: &mut FailedBlobs,
+    fetch: bool,
 ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     let sha = entry
         .blob
@@ -248,7 +292,22 @@ async fn plaintext(
         entry.key_gen,
         keys.key_gen
     );
-    let sealed = blob(seals, api, entry.agent_id, &keys.signing, &sha, failed).await?;
+    let sealed = blob(
+        seals,
+        api,
+        entry.agent_id,
+        &keys.signing,
+        &sha,
+        failed,
+        fetch,
+    )
+    .await
+    .with_context(|| {
+        let at = chrono::DateTime::from_timestamp_micros(entry.state_at)
+            .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_default();
+        format!("the version at seq {} ({at})", entry.seq)
+    })?;
     let compressed = open_entry_blob(&keys.state_key, entry, &sealed)
         .with_context(|| format!("opening blob {sha} (entry seq {})", entry.seq))?;
     let seq = entry.seq;
@@ -272,6 +331,22 @@ pub async fn open(
     Opener::new(vec![seal], api, keys).open(line, entry).await
 }
 
+/// [`open`], asking Agora for a missing blob only when it holds the
+/// agent's chain (`reach`).
+pub async fn open_reach(
+    seal: &AgentSeal,
+    api: &dyn SealedApi,
+    keys: &SealKeys,
+    line: &[SignedStateEntry],
+    entry: &StateEntry,
+    reach: Reach,
+) -> anyhow::Result<serde_json::Value> {
+    Opener::new(vec![seal], api, keys)
+        .fetching(reach.on_agora())
+        .open(line, entry)
+        .await
+}
+
 /// Opens one agent's sealed versions, one after another: blobs looked for
 /// in each of its seals in turn, then on Agora, and the last keyframe
 /// opened kept for the deltas after it (consecutive versions mostly share
@@ -283,6 +358,8 @@ pub struct Opener<'a> {
     keyframe: Option<(Sha256Hex, Dict)>,
     /// Fetches that failed lately: not tried again ([`FailedBlobs`]).
     pub failed: FailedBlobs,
+    /// Whether a blob not here is asked of Agora.
+    fetch: bool,
 }
 
 impl<'a> Opener<'a> {
@@ -293,7 +370,15 @@ impl<'a> Opener<'a> {
             keys,
             keyframe: None,
             failed: FailedBlobs::default(),
+            fetch: true,
         }
+    }
+
+    /// Whether a blob not here is asked of Agora (`false` for an agent
+    /// that never uploaded: an error naming the version instead).
+    pub fn fetching(mut self, fetch: bool) -> Self {
+        self.fetch = fetch;
+        self
     }
 
     /// Open `entry`, sealed on `line` (whose entries hold its keyframe):
@@ -319,6 +404,7 @@ impl<'a> Opener<'a> {
             entry,
             dict,
             &mut self.failed,
+            self.fetch,
         )
         .await?;
         tokio::task::spawn_blocking(move || {
@@ -358,6 +444,7 @@ impl<'a> Opener<'a> {
                 keyframe,
                 None,
                 &mut self.failed,
+                self.fetch,
             )
             .await?,
         );
@@ -392,6 +479,13 @@ pub async fn verified_line_cached(
     let entries = local_entries(seal).await.map_err(anyhow::Error::msg)?;
     let line = match main_line(&entries, &head.head.entry_hash) {
         Some(line) => line,
+        None if !reach(seal.dir().parent().unwrap_or(seal.dir()), keys, id).on_agora() => {
+            anyhow::bail!(
+                "the main line to head {} has a missing link here, and nothing of this agent \
+                 is on Agora to complete it from",
+                head.head.entry_hash
+            )
+        }
         // Through Agora's entries (after a rebase or a restore)
         None => {
             let signing = keys.signing(id).context("no signing key for the agent")?;
@@ -441,17 +535,172 @@ pub async fn last_sealed(
         .seal_keys(id)
         .context("no sealing keys for the agent")?;
     let line = verified_line(seal, keys, api, id, &head).await?;
+    let reach = reach(seal.dir().parent().unwrap_or(seal.dir()), keys, id);
     let snapshot = line
         .iter()
         .rev()
         .find(|e| e.entry.kind == StateEntryKind::Snapshot)
         .cloned()
         .context("the main line holds no snapshot")?;
-    let state = open(seal, api, &k, &line, &snapshot.entry).await?;
+    let state = open_reach(seal, api, &k, &line, &snapshot.entry, reach).await?;
     Ok(LastSealed {
         head,
         line,
         snapshot,
         state,
     })
+}
+
+/// Tests: delete the blobs Agora acknowledged that nothing local still
+/// needs (not the head's keyframe's, not an outbox item's), as agentkit's
+/// `prune_blobs` did before 0.158 kept them. A `sealed/` written by an
+/// older runner looks like this.
+#[cfg(test)]
+pub async fn drop_acknowledged_blobs(seal: &AgentSeal) {
+    let mut keep = std::collections::HashSet::new();
+    if let Some(h) = seal.head().await.unwrap() {
+        keep.extend(h.keyframe.as_ref().and_then(|k| k.blob_sha256()));
+    }
+    for i in seal.outbox().await.unwrap() {
+        keep.extend(i.entry.entry.blob.map(|b| b.sha256));
+        keep.extend(i.keyframe_after.as_ref().and_then(|k| k.blob_sha256()));
+    }
+    for i in seal.sent().await.unwrap() {
+        if let Some(b) = i.entry.entry.blob
+            && !keep.contains(&b.sha256)
+        {
+            let _ = std::fs::remove_file(seal.dir().join("blobs").join(b.sha256.to_hex()));
+        }
+    }
+}
+
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    vec![Text::new("version::UNREACHABLE", To::Uploaded, UNREACHABLE)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sealed::check::{Upload, tests::enrolled_local};
+    use crate::sealed::uploading::{self, DURABLE, UPLOADING, UploadingBy};
+
+    /// Every state an agent's relation to Agora can be in, fed to both
+    /// classifications: the start check's [`Upload`] and the operator
+    /// commands' [`Reach`] agree on each (uploading; stopped after
+    /// uploading; never uploaded; the marker in doubt four ways; forgotten
+    /// and put back, before and after the start pass).
+    #[tokio::test]
+    async fn upload_and_reach_agree_for_every_state() {
+        use Reach as R;
+        use Upload as U;
+        let root = crate::sealed::TestDir::new("version-reach-table");
+        let state_dir = root.join("state");
+        let mut rows: Vec<(&str, U, R)> = Vec::new();
+        let mut row = |name: &'static str, dir: &std::path::Path, keys: &KeyStore, id| {
+            rows.push((name, U::of(dir, keys, id), reach(dir, keys, id)));
+        };
+        let local = |dir: &std::path::Path| dir.join("sealed").join(UPLOADING);
+        let durable = |keys: &KeyStore, id: AgentId| keys.agent_dir(id).join(DURABLE);
+        let uploading = async || {
+            let (id, keys, dir) = enrolled_local(&root).await;
+            uploading::set(&dir, &keys, id, UploadingBy::OptIn).unwrap();
+            // Uploaded: nothing waits
+            let seal = AgentSeal::new(&dir, id);
+            for item in seal.outbox().await.unwrap() {
+                seal.mark_sent(item.ord).await.unwrap();
+            }
+            (id, keys, dir)
+        };
+
+        let (id, keys, dir) = uploading().await;
+        row("uploading", &dir, &keys, id);
+
+        let (id, keys, dir) = uploading().await;
+        crate::sealed::stop::stop(&state_dir, &keys, id, "asked")
+            .await
+            .unwrap();
+        row("stopped after uploading", &dir, &keys, id);
+
+        let (id, keys, dir) = enrolled_local(&root).await;
+        row("never uploaded", &dir, &keys, id);
+
+        let (id, keys, dir) = uploading().await;
+        std::fs::remove_file(durable(&keys, id)).unwrap();
+        row("in doubt: local copy only", &dir, &keys, id);
+
+        let (id, keys, dir) = uploading().await;
+        let mut other: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(durable(&keys, id)).unwrap()).unwrap();
+        other["since"] = serde_json::json!("2020-01-01T00:00:00Z");
+        std::fs::write(durable(&keys, id), other.to_string()).unwrap();
+        row("in doubt: copies differ", &dir, &keys, id);
+
+        let (id, keys, dir) = enrolled_local(&root).await;
+        std::fs::write(local(&dir), b"not json").unwrap();
+        row("in doubt: local copy unreadable, no other", &dir, &keys, id);
+
+        let (id, keys, dir) = uploading().await;
+        std::fs::write(durable(&keys, id), b"not json").unwrap();
+        row("in doubt: secrets copy unreadable", &dir, &keys, id);
+
+        // Forgotten (it left), then put back with its old local marker
+        let (id, keys, dir) = uploading().await;
+        let kept = root.join(format!("kept-{id}"));
+        std::fs::rename(&dir, &kept).unwrap();
+        let done = crate::sealed::forget::forget(&state_dir, &keys, id, "it left")
+            .await
+            .unwrap();
+        std::fs::rename(&kept, &dir).unwrap();
+        let secrets = keys.agent_dir(id);
+        std::fs::copy(
+            secrets.join(&done.key),
+            secrets.join(crate::sealed::keys::STATE_KEY_FILE),
+        )
+        .unwrap();
+        row(
+            "forgotten, put back, before the start pass",
+            &dir,
+            &keys,
+            id,
+        );
+        uploading::start_pass(&state_dir, &keys, &crate::alerts::Alerter::off()).await;
+        row("forgotten, put back, after the start pass", &dir, &keys, id);
+
+        let agree = |u: U, r: R| match u {
+            U::Now => r == R::Uploads,
+            U::Before | U::InDoubt => r == R::Stopped,
+            U::Never => r == R::Local,
+        };
+        let table: Vec<String> = rows
+            .iter()
+            .map(|(n, u, r)| format!("{n}: {u:?} / {r:?}"))
+            .collect();
+        assert!(
+            rows.iter().all(|(_, u, r)| agree(*u, *r)),
+            "{}",
+            table.join("\n")
+        );
+        let expected = [
+            (U::Now, R::Uploads),
+            (U::Before, R::Stopped),
+            (U::Never, R::Local),
+            (U::InDoubt, R::Stopped),
+            (U::InDoubt, R::Stopped),
+            (U::InDoubt, R::Stopped),
+            (U::InDoubt, R::Stopped),
+            (U::InDoubt, R::Stopped),
+            (U::Never, R::Local),
+        ];
+        assert_eq!(
+            rows.iter().map(|(_, u, r)| (*u, *r)).collect::<Vec<_>>(),
+            expected,
+            "{}",
+            table.join("\n")
+        );
+    }
 }

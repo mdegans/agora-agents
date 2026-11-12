@@ -12,7 +12,6 @@ use agora_agentkit::state::storage::{AgentSeal, plaintext_hash};
 use agora_agentkit::state::{AnchorData, AnchorProof};
 use proptest::prelude::*;
 
-use super::api::fake::FakeApi;
 use super::check::{self, Outcome};
 use super::notice::Refusal;
 use super::props::{History, Mode, build, version};
@@ -75,20 +74,25 @@ fn plain() -> History {
 }
 
 /// agentkit's sealed save is prepare (an outbox `.tmp` item and its
-/// blob), then FsStorage's write (tmp, fsync, archive, rename), then
-/// commit (the item `.json`, head.json). Each stage it can be cut at is
-/// rebuilt on disk from the states before and after a real save; the
-/// restart (tmp promotion, then the start check) runs on the old or the
-/// new state, intact, and never on none.
+/// blob), then FsStorage's write, then commit (the item `.json`,
+/// head.json). FsStorage's write since agentkit 0.158 is archive (a hard
+/// link), tmp, fsync, rename; before it, tmp, fsync, archive (a rename),
+/// rename. Each stage either order can be cut at is rebuilt on disk from
+/// the states before and after a real save; the restart (tmp promotion,
+/// then the start check) runs on the old or the new state, intact, and
+/// never on none. The new order's stages are 4 and 5.
 #[tokio::test]
 async fn a_save_cut_at_any_step_loses_nothing() {
-    for stage in 1..=5 {
+    for stage in 1..=7 {
         let b = build(&plain()).await;
         let state_dir = b.state_dir();
         let old = hash_of(&state_dir, b.id).await.unwrap();
         let before = b.root.join("before");
         copy_dir(&b.dir, &before);
-        let new_value = version(99);
+        // A whole agent state: the sealed evidence for a cut save (the new
+        // order, stage 5) counts only a file that loads as one
+        let new_value =
+            serde_json::to_value(crate::agent_selection_tests::pooled("tarn").1).unwrap();
         {
             let enrolment = std::sync::Arc::new(super::SealedEnrolment::new(
                 &state_dir,
@@ -147,14 +151,25 @@ async fn a_save_cut_at_any_step_loses_nothing() {
                 prepare(&b.dir);
                 std::fs::write(b.dir.join("state.json.tmp"), &new_state).unwrap();
             }
-            // Archived, not yet renamed: no state.json
+            // The old order: archived, not yet renamed: no state.json
             3 => {
                 prepare(&b.dir);
                 std::fs::write(b.dir.join("state.json.tmp"), &new_state).unwrap();
                 std::fs::rename(b.dir.join("state.json"), b.dir.join(archive_name())).unwrap();
             }
-            // Written, not committed
+            // The new order: linked as the archive, no tmp yet
             4 => {
+                prepare(&b.dir);
+                std::fs::hard_link(b.dir.join("state.json"), b.dir.join(archive_name())).unwrap();
+            }
+            // The new order: linked, the tmp whole, not yet renamed
+            5 => {
+                prepare(&b.dir);
+                std::fs::hard_link(b.dir.join("state.json"), b.dir.join(archive_name())).unwrap();
+                std::fs::write(b.dir.join("state.json.tmp"), &new_state).unwrap();
+            }
+            // Written, not committed
+            6 => {
                 prepare(&b.dir);
                 std::fs::write(b.dir.join("state.json"), &new_state).unwrap();
             }
@@ -164,9 +179,9 @@ async fn a_save_cut_at_any_step_loses_nothing() {
                 copy_dir(&after, &b.dir);
             }
         }
-        crate::promote::promote_tmp_states(&state_dir, later());
+        crate::promote::promote_tmp_states(&state_dir, later()).await;
         let now = hash_of(&state_dir, b.id).await;
-        let expect = if stage <= 2 { old } else { new };
+        let expect = if matches!(stage, 1 | 2 | 4) { old } else { new };
         assert_eq!(now, Some(expect), "stage {stage}");
         let out = check_at(&state_dir, &b).await;
         assert!(
@@ -188,9 +203,20 @@ async fn a_torn_tmp_is_never_promoted_and_restore_recovers() {
     let head = b.seal().head().await.unwrap().unwrap();
     std::fs::write(b.dir.join("state.json.tmp"), b"{\"format\": 2, \"st").unwrap();
     std::fs::rename(b.dir.join("state.json"), b.dir.join(archive_name())).unwrap();
-    assert_eq!(crate::promote::promote_tmp_states(&state_dir, later()), 0);
-    let missing =
-        check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off()).await;
+    assert_eq!(
+        crate::promote::promote_tmp_states(&state_dir, later()).await,
+        0
+    );
+    let missing = check::missing_states(
+        &state_dir,
+        &b.keys,
+        &b.api,
+        &crate::alerts::Alerter::off(),
+        &Default::default(),
+    )
+    .await
+    .unwrap()
+    .refused;
     assert_eq!(missing, vec![(b.id, Refusal::StateMissing)]);
     super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
         .await
@@ -262,7 +288,7 @@ async fn a_restore_cut_at_any_step_finishes_on_a_rerun() {
                 "{point}: {e:#}"
             );
             // The restart
-            crate::promote::promote_tmp_states(&state_dir, later());
+            crate::promote::promote_tmp_states(&state_dir, later()).await;
             if !lost_dir {
                 // Still refused until the restore finishes
                 assert!(b.seal().is_refused().await.unwrap(), "{point}");
@@ -295,7 +321,7 @@ async fn a_restore_cut_at_any_step_finishes_on_a_rerun() {
                     .line()
                     .unwrap();
                 assert!(
-                    line.starts_with("Your state was lost here."),
+                    line.starts_with("Your state was lost on your operator's machine."),
                     "{point}: {line}"
                 );
             }
@@ -330,7 +356,7 @@ async fn an_accept_cut_at_any_step_is_consistent() {
             .await
             .unwrap();
         let edited = hash_of(&state_dir, b.id).await.unwrap();
-        let api = FakeApi::new();
+        let api = super::api::fake::guarded(&b.root);
         let refuse = async || {
             let out = check_at(&state_dir, &b).await;
             if let Outcome::Refuse { reason, detail } = &out {
@@ -570,9 +596,15 @@ async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
         &crate::alerts::Alerter::off(),
     )
     .await;
-    super::accept::accept(&state_dir, &b.keys, &FakeApi::new(), b.id, Some("by hand"))
-        .await
-        .unwrap();
+    super::accept::accept(
+        &state_dir,
+        &b.keys,
+        &super::api::fake::guarded(&b.root),
+        b.id,
+        Some("by hand"),
+    )
+    .await
+    .unwrap();
     let entries = check::local_entries(&b.seal()).await.unwrap();
     let mut line = entries.clone();
     line.sort_by_key(|e| e.entry.seq);
@@ -599,7 +631,7 @@ async fn a_clock_stepped_back_still_makes_a_chain_that_verifies() {
 /// --rebase --note` seals the state here on top of what Agora holds, or on
 /// a new chain whose genesis records the break when Agora holds nothing;
 /// the next start is intact. What was set aside is kept in
-/// `sealed/lost/<utc>/`, past `prune_blobs`: the old head's keyframe still
+/// `sealed/lost/<utc>/`, past `remove_unnamed_blobs`: the old head's keyframe still
 /// opens with agentkit's `open_state`. Cut at every step, a rerun finishes.
 #[tokio::test]
 async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
@@ -661,11 +693,12 @@ async fn agoras_lost_versions_are_resolved_and_nothing_sealed_here_is_lost() {
             assert!(hold.is_none(), "{nothing_left} {point:?}: {out:?}");
             assert!(
                 seat[0].contains("Agora had lost")
-                    && seat[0].contains("Kept by your runner: the full copy of your state from "),
+                    && seat[0].contains("Kept by your runner: your whole state as sealed on "),
                 "{seat:?}"
             );
             // Kept past a prune: the old keyframe opens
-            b.seal().prune_blobs().await.unwrap();
+            // As a runner before agentkit 0.158 left sealed/
+            crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
             let lost = std::fs::read_dir(b.dir.join("sealed/lost"))
                 .unwrap()
                 .map(|e| e.unwrap().path())
@@ -746,8 +779,16 @@ async fn a_state_from_a_newer_runner_is_never_restored_over() {
     let b = build(&h).await;
     let state_dir = b.state_dir();
     std::fs::write(b.dir.join("state.json"), br#"{"format": 99, "state": {}}"#).unwrap();
-    let refused =
-        check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off()).await;
+    let refused = check::missing_states(
+        &state_dir,
+        &b.keys,
+        &b.api,
+        &crate::alerts::Alerter::off(),
+        &Default::default(),
+    )
+    .await
+    .unwrap()
+    .refused;
     assert_eq!(refused, vec![(b.id, Refusal::StateTooNew)]);
     let e = super::restore::restore(&state_dir, &b.keys, &b.api, b.id, None, false)
         .await
@@ -784,9 +825,16 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
         } else {
             std::fs::write(b.dir.join("state.json"), b"").unwrap();
         }
-        let refused =
-            check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off())
-                .await;
+        let refused = check::missing_states(
+            &state_dir,
+            &b.keys,
+            &b.api,
+            &crate::alerts::Alerter::off(),
+            &Default::default(),
+        )
+        .await
+        .unwrap()
+        .refused;
         let reason = if missing {
             Refusal::StateMissing
         } else {
@@ -835,38 +883,23 @@ async fn an_unreadable_or_missing_state_is_refused_and_restorable() {
         );
         assert!(b.api.anchored.lock().unwrap().is_empty(), "nothing sent");
         assert!(
-            check::missing_states(&state_dir, &b.keys, &b.api, &crate::alerts::Alerter::off())
-                .await
-                .is_empty()
+            check::missing_states(
+                &state_dir,
+                &b.keys,
+                &b.api,
+                &crate::alerts::Alerter::off(),
+                &Default::default()
+            )
+            .await
+            .unwrap()
+            .refused
+            .is_empty()
         );
         assert!(matches!(
             check_at(&state_dir, &b).await,
             Outcome::Run { hold: None, .. }
         ));
     }
-}
-
-#[test]
-fn an_enrolled_agent_counts_as_enrolled_by_either_record() {
-    let root = super::TestDir::new("enrolled-either");
-    let id = AgentId::new();
-    let (agent_dir, secrets) = (
-        root.join("state").join(id.to_string()),
-        root.join("secrets"),
-    );
-    assert!(!super::enrolled_by_keys_or_marker(&agent_dir, &secrets, id));
-    std::fs::create_dir_all(secrets.join(id.to_string())).unwrap();
-    std::fs::write(
-        secrets
-            .join(id.to_string())
-            .join(super::keys::STATE_KEY_FILE),
-        b"{}",
-    )
-    .unwrap();
-    assert!(
-        super::enrolled_by_keys_or_marker(&agent_dir, &secrets, id),
-        "its key, its directory gone"
-    );
 }
 
 /// Beside a live runner (its shared hold on runner.lock), `sealed-accept

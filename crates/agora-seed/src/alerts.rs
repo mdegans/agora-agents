@@ -142,10 +142,32 @@ pub enum AlertKind {
     /// nothing to restore it from: skipped (`sealed-forget` sets the key
     /// aside).
     SealedStateKeysWithoutState,
+    /// An agent answered the sealed-state question again: its operator's
+    /// re-offer (`sealed-reoffer`), or, a bug, with none pending. Nothing
+    /// changed by the answer; the operator acts on it.
+    SealedStateAnsweredAgain,
+    /// Agents whose uploading marker is contradictory or unreadable after
+    /// the start's repair pass: treated as not uploading. One summary a run.
+    SealedStateUploadingInDoubt,
     /// An agent's sealed entries are signed by a key the runner doesn't
     /// recognise (its record of past keys lost, or a forgery): the run is
     /// refused, nothing marked. Never rate-limited.
     SealedStateUntrustedKey,
+    /// Agent directories with a state but no local chain, and not on the
+    /// roster: never enrolled. One alert a run, with the count.
+    SealedStateUnchainedAgents,
+    /// Chained agents have sealed versions whose blob files here are
+    /// missing or damaged: those versions can't be opened here. One alert
+    /// a run.
+    SealedStateBlobsMissing,
+    /// Agora reported sealed blobs of uploading agents missing or damaged
+    /// at rest that this runner can't send again (not here, or not hashing
+    /// to their names here): those versions can't be opened from Agora.
+    /// Alerted when the count changes.
+    SealedStateAgoraBlobsUnhealable,
+    /// The sealed roster was last written long before the newest chained
+    /// state: possibly a data directory restored from an older backup.
+    SealedStateRosterStale,
     /// An agent's memory-id key couldn't be had: a key `sealed-forget` set
     /// aside that can't be read, its secrets not in the secrets tree, or a
     /// key there that isn't the one its state directory's fingerprint
@@ -170,6 +192,18 @@ pub enum AlertKind {
     /// unusable replies, out of context room, or an error. The agent is
     /// told at its next session.
     SessionFailed,
+    /// Agents' sessions ended but their states could not be saved: each
+    /// kept in a rescue file (`unsaved.<utc>.json`) where it could be,
+    /// and told at its next session. One summary a run.
+    StateUnsaved,
+    /// The runner could not claim every agent routed to it: its open-file
+    /// limit leaves too few descriptors for one session lock each. The
+    /// rest stay due. One a run.
+    SessionLocksCapped,
+    /// The filesystem holding the state root (or the secrets root) has
+    /// less free space than the floor ([`crate::space::floor`]): the run
+    /// started no session. One a run.
+    DiskSpaceLow,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -178,7 +212,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 40] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -204,12 +238,21 @@ impl AlertKind {
         Self::SealedStateAnchorWrong,
         Self::SealedStateServerChainBroken,
         Self::SealedStateKeysWithoutState,
+        Self::SealedStateAnsweredAgain,
+        Self::SealedStateUploadingInDoubt,
         Self::SealedStateUntrustedKey,
+        Self::SealedStateUnchainedAgents,
+        Self::SealedStateBlobsMissing,
+        Self::SealedStateAgoraBlobsUnhealable,
+        Self::SealedStateRosterStale,
         Self::MemoryIdKeyRefused,
         Self::QuestionUnanswered,
         Self::ApiRefusal,
         Self::QuestionUnusableCap,
         Self::SessionFailed,
+        Self::StateUnsaved,
+        Self::SessionLocksCapped,
+        Self::DiskSpaceLow,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -253,12 +296,21 @@ impl AlertKind {
             Self::SealedStateAnchorWrong => "sealed_state_anchor_wrong",
             Self::SealedStateServerChainBroken => "sealed_state_server_chain_broken",
             Self::SealedStateKeysWithoutState => "sealed_state_keys_without_state",
+            Self::SealedStateAnsweredAgain => "sealed_state_answered_again",
+            Self::SealedStateUploadingInDoubt => "sealed_state_uploading_in_doubt",
             Self::SealedStateUntrustedKey => "sealed_state_untrusted_key",
+            Self::SealedStateUnchainedAgents => "sealed_state_unchained_agents",
+            Self::SealedStateBlobsMissing => "sealed_state_unopenable",
+            Self::SealedStateAgoraBlobsUnhealable => "sealed_state_agora_blobs_unhealable",
+            Self::SealedStateRosterStale => "sealed_roster_stale",
             Self::MemoryIdKeyRefused => "memory_id_key_refused",
             Self::QuestionUnanswered => "question_unanswered",
             Self::ApiRefusal => "api_refusal_alert",
             Self::QuestionUnusableCap => "question_unusable_cap",
             Self::SessionFailed => "session_failed",
+            Self::StateUnsaved => "state_unsaved",
+            Self::SessionLocksCapped => "session_locks_capped",
+            Self::DiskSpaceLow => "disk_space_low",
             Self::Test => "test_alert",
         }
     }
@@ -386,20 +438,25 @@ impl AlertKind {
                  fixed. Agents already enrolled stay sealed and checked."
             }
             Self::SealedStateDrop => {
-                "An enrolled agent's memory or soul is less than half the \
-                 size it was at its previous sealed version (sizes below, in \
-                 characters). The agent was told and runs as usual: it may \
-                 have condensed its own memory. If it didn't, its earlier \
-                 versions are sealed and can be restored. Look at counts and \
-                 sizes, not content."
+                "Chained agents' memories or souls are less than half the \
+                 size they were at their previous sealed versions (the first \
+                 few below, by how much; one mail for the run, each one a \
+                 `sealed_state_drop` event in the run log). Each agent was \
+                 told and runs as usual: most condensed their own memory. If \
+                 one didn't, its earlier versions are sealed and can be \
+                 restored. Many at once that didn't run a session is \
+                 fleet-shaped. Look at counts and sizes, not content."
             }
             Self::SealedStateUnreadable => {
-                "An enrolled agent's sealed/ directory could not be read at \
-                 the start of its session (permissions, a malformed file, a \
-                 lock). Its state could not be checked; it runs anyway, its \
-                 saves are written locally but not sealed (recorded in \
-                 sealed/seal_failed.json), and its uploads are held. Fix the \
-                 directory; the next start checks again."
+                "Chained agents' sealed/ directories or keys could not be read \
+                 at the start (permissions, a malformed file, a lock): one \
+                 mail for the run, the first few agents below; many at once \
+                 points at the secrets tree or a disk. (Sent per agent when \
+                 an uploading agent's chain runs through Agora, which \
+                 couldn't be reached.) Their states could not be checked; \
+                 they run anyway, their saves are written locally but not \
+                 sealed (recorded in sealed/seal_failed.json), and uploads \
+                 are held. Fix the directory; the next start checks again."
             }
             Self::SealedStateRotationUnknown => {
                 "Agora lists a rotation of this agent's signing key that the \
@@ -418,18 +475,23 @@ impl AlertKind {
             }
             Self::SealedStateRefusedRun => {
                 "The seed runner refused to run: the sealed-state start check \
-                 refused the agents listed below (a state that matches no \
-                 sealed version, a chain that doesn't verify, or a lost \
-                 head), and a state that matches nothing is likely \
-                 fleet-wide, so no agent runs. The unit does not restart on \
-                 this exit (75). For each agent: `agora-seed sealed-restore \
-                 --agent <id>` puts its last sealed version back (damage), or \
-                 `agora-seed sealed-accept --agent <id> --note \"…\"` keeps \
-                 its state (a deliberate change). For a missing state \
-                 (state_missing) of an agent that left, `agora-seed \
-                 sealed-forget --agent <id> --note \"…\"` sets its key \
-                 aside instead. Then start the runner. Look \
-                 at counts and sizes, not content."
+                 refused the agents listed below, or the runner's own records \
+                 failed (the sealed roster missing or unreadable, the secrets \
+                 tree unlistable). The whole run stops for a loss (a state, \
+                 its directory or its head gone, unreadable, or older than \
+                 the roster's record), any refused agent that uploads, or \
+                 three or more refused agents, counting those still refused \
+                 from earlier runs; one or two agents that don't upload, \
+                 refused for a mismatch or a broken chain, are left out \
+                 alone instead (`sealed_state_refused`). The unit does not \
+                 restart on this exit (75). For each agent: `agora-seed \
+                 sealed-restore --agent <id>` puts its last sealed version \
+                 back (damage), or `agora-seed sealed-accept --agent <id> \
+                 --note \"…\"` keeps its state (a deliberate change). For a \
+                 missing state (state_missing) of an agent that left, \
+                 `agora-seed sealed-forget --agent <id> --note \"…\"` sets its \
+                 key aside instead. Then start the runner. Look at counts \
+                 and sizes, not content."
             }
             Self::SealedStateAnchorFailed => {
                 "The runner's anchor check for an agent stopped before it \
@@ -462,7 +524,10 @@ impl AlertKind {
                  next start checks again and runs once Agora serves \
                  histories that verify. To run an agent regardless, stop \
                  its backups with `agora-seed sealed-stop --agent <id> \
-                 --note \"…\"`. This alert is never rate-limited."
+                 --note \"…\"`, adding `--against-answer` when its answer \
+                 in force is yes or a re-offer waits for its answer (the \
+                 note then says why; the agent is shown it). This alert is \
+                 never rate-limited."
             }
             Self::SealedStateUntrustedKey => {
                 "The seed runner refused to run: the sealed entries of the \
@@ -473,14 +538,92 @@ impl AlertKind {
                  backup, then start again. Nothing was marked against the \
                  agents. This alert is never rate-limited."
             }
+            Self::SealedStateUnchainedAgents => {
+                "Agent directories hold a state.json but no local chain, and \
+                 the sealed roster doesn't list them: they were never \
+                 enrolled (every agent is chained since the local chain), so \
+                 their state is not checked at the start. The count and the \
+                 first few ids are below; one mail a run. Enrol them with \
+                 `agora-seed sealed-enroll`; the runner never enrols them on \
+                 its own. Agents on the could-not-chain record \
+                 (sealed-unchainable.json in the data directory, which \
+                 `sealed-enroll` writes) are counted here too, as `left_out`: \
+                 they don't run until repaired and chained; the record names \
+                 each one's class and remedy, and the next `sealed-enroll` \
+                 that chains one takes it off."
+            }
+            Self::SealedStateBlobsMissing => {
+                "At their full check (every 7 to 14 days), chained agents were \
+                 found with sealed versions whose blob files in sealed/blobs \
+                 are missing or don't hash to their names, so those versions \
+                 can't be opened here (the memory tool's history, a restore). \
+                 Their current states are fine and they run; each agent was \
+                 told how many and since when. Versions already uploaded are \
+                 not looked at (they are on Agora). Look at the disk and the \
+                 backups; counts and sizes, not content."
+            }
+            Self::SealedStateAgoraBlobsUnhealable => {
+                "Agora's check at rest found sealed blobs of the agents below \
+                 missing or damaged, and the drain could not send them again: \
+                 this runner doesn't hold them (agentkit before 0.158 deleted \
+                 the ones Agora had acknowledged) or holds copies that don't \
+                 hash to their names. Those versions can't be opened from \
+                 Agora. The counts are below (partial where a drain was \
+                 interrupted); the drain sent back every blob it could. Look \
+                 at the server's blob store and its backups, and this \
+                 runner's backups of state/<id>/sealed/blobs; counts only."
+            }
+            Self::SealedStateRosterStale => {
+                "The sealed roster (<data_dir>/sealed-roster.json) was last \
+                 written long before the newest chained agent's state.json: \
+                 the data directory may have been restored from an older \
+                 backup, which every witness inside it can't tell. Nothing \
+                 was refused. Check where the data directory came from before \
+                 the runner goes on."
+            }
             Self::SealedStateKeysWithoutState => {
-                "An agent has a state key in the secrets tree, and Agora \
-                 holds no sealed head for it (or doesn't know it). If its \
+                "Agents have a state key in the secrets tree but no chained \
+                 state, and neither the sealed roster nor Agora holds a head \
+                 for them (Agora is asked only of an agent that uploaded). \
+                 One mail for the run, the first few below. If an agent's \
                  state is here, its enrolment was cut after its key was \
                  cached: `agora-seed sealed-enroll --agent <id>` resumes it. \
                  If not, nothing can be restored: if it left, `agora-seed \
                  sealed-forget --agent <id> --note \"…\"` sets its key aside \
-                 (nothing is deleted). It was skipped either way."
+                 (nothing is deleted). They were skipped either way."
+            }
+            Self::SealedStateAnsweredAgain => {
+                "An agent answered the sealed-backups question again, normally \
+                 the one you re-opened with `agora-seed sealed-reoffer`; both \
+                 answers are below, with the command that acts on the new one \
+                 (`act`). The answer changed nothing by itself: no upload was \
+                 started or stopped, and the agent was told that you have to act \
+                 on it and that it is told when you have. With `reoffered: false` no re-offer was pending, \
+                 which the offer's asked-once rule should prevent: a bug to \
+                 report. That answer is kept on file but is not in force: no \
+                 command acts on it, and the agent was told its earlier \
+                 answer stands. To let it change its answer, re-open the \
+                 question (`agora-seed sealed-reoffer`)."
+            }
+            Self::SealedStateUploadingInDoubt => {
+                "The uploading marker of each agent below \
+                 (<state>/<id>/sealed/uploading and its copy \
+                 <secrets>/<id>/sealed_uploading) is contradictory or \
+                 unreadable, so the runner can't tell whether it uploads, \
+                 and nothing of it is uploaded: the runner fails closed. Its \
+                 chain is kept locally. This says nothing about what the \
+                 agent answered: read its answer on file \
+                 (<state>/<id>/sealed_state.json; `agora-seed sealed-enroll \
+                 --opt-in --agent <id>` without `--yes` prints whether its \
+                 answer in force is a yes). Then settle it with a command, \
+                 never by copying a marker by hand: `agora-seed sealed-stop \
+                 --agent <id> --note \"…\"` if it is not to upload (it then \
+                 stays stopped, and this alert ends; add `--against-answer` \
+                 when its answer in force is yes or a re-offer waits, the \
+                 note saying why), or `agora-seed \
+                 sealed-enroll --opt-in --agent <id> --yes` if its answer in \
+                 force is yes (the copies in doubt are set aside and a new \
+                 marker written). No start rewrites a marker in doubt."
             }
             Self::MemoryIdKeyRefused => {
                 "An agent's memory-id key (<secrets>/<id>/memory_id_key.json) \
@@ -534,6 +677,38 @@ impl AlertKind {
                  its operator was told. Many at once means a fleet-wide cause \
                  (an endpoint down, a release)."
             }
+            Self::StateUnsaved => {
+                "Agents' sessions ended but their states could not be saved \
+                 (the reason class, the agents and the counts are below; \
+                 never any content). Each one's state was written to a rescue \
+                 file, state/<id>/unsaved.<utc>.json (0600), where that \
+                 could be done; nothing reads it back. Its next session \
+                 starts from its state as it was before, and it is told so \
+                 in one sentence, and that you keep a copy where one was \
+                 kept. A failed rescue write (rescue_failed) means that \
+                 session's state is gone: the runner never prints it to the \
+                 log. Fix the cause (disk space, permissions) before the next \
+                 sweep. Putting a rescue file back waits for mid-session \
+                 suspend and restore; until then leave it where it is."
+            }
+            Self::SessionLocksCapped => {
+                "The runner's open-file limit left too few descriptors to \
+                 hold a session lock for every agent routed to it, so it \
+                 claimed as many as fit and left the rest due for a later \
+                 sweep. Raise the unit's limit (LimitNOFILE=65536 in the \
+                 agora-seed units; systemd's default soft limit is 1024) and \
+                 daemon-reload."
+            }
+            Self::DiskSpaceLow => {
+                "The runner started no session: the filesystem holding its \
+                 state directory (or its secrets directory) has less free \
+                 space than the floor, 2 GiB or 1% of the filesystem, \
+                 whichever is larger. The path, the bytes free and the \
+                 floor are below. Free space, then start the unit (the continuous unit tries again \
+                 by itself at its next restart). A session whose save fails \
+                 on a full disk is kept only in a rescue file on the same \
+                 disk, which is why the run does not start."
+            }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \
                  you are reading it, the runner's [alerts.email] settings \
@@ -561,6 +736,10 @@ pub struct Alert {
     pub model: Option<String>,
     /// Further fields, in order (`error`, `from`, `to`, …).
     pub details: Vec<(&'static str, String)>,
+    /// For a run's summary of many agents: how many. One with more than
+    /// the last one sent under its key goes out inside the rate limit, so
+    /// a sweep of one can't hide the next sweep's thousand.
+    pub count: Option<usize>,
 }
 
 impl Alert {
@@ -573,7 +752,14 @@ impl Alert {
             agent_id: None,
             model: None,
             details: Vec::new(),
+            count: None,
         }
+    }
+
+    /// A summary of `n` agents ([`Self::count`]).
+    pub fn count(mut self, n: usize) -> Self {
+        self.count = Some(n);
+        self
     }
 
     pub fn agent(mut self, name: impl Into<String>, id: AgentId) -> Self {
@@ -896,9 +1082,81 @@ impl Smtp {
     }
 }
 
+/// What an agent is told came of an alert about it: said only of a mail
+/// that went out ([`Alerter::dispatch`] returned `true`).
+pub const ALERT_SENT: &str = "Your runner has sent your operator an alert.";
+
+/// What an agent is told when no mail went out this time (alerts off, the
+/// kind not listed, inside the rate limit, or the send failed). The
+/// caller logs the event itself, whatever the alerter does.
+pub const ALERT_NOT_SENT: &str =
+    "Your runner logged this for your operator; no alert was sent this time.";
+
+/// How long a start waits for the mail whose outcome an agent is told
+/// ([`Alerter::dispatch`]).
+pub const TELL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one start may spend in all awaiting the alerts whose outcome
+/// agents are told ([`Alerter::budgeted`]). Each awaited send waits up to
+/// [`TELL_TIMEOUT`]; with SMTP black-holed and every agent held, one per
+/// agent would hold the start for hours (1,667 × 10 s ≈ 4.6 h) before any
+/// session. Past it, an alert is logged, not mailed, and the agent is told
+/// no alert was sent; one mail per kind then says how many weren't
+/// ([`unsent_summary`]).
+pub const START_ALERT_BUDGET: Duration = Duration::from_secs(60);
+
+/// From this many agents with the same alert at one start, one mail names
+/// them all instead of one each (a fleet-wide hold is one event, and 1,667
+/// mails in sequence would be the start's whole budget).
+pub const ONE_BY_ONE_MAX: usize = 5;
+
+/// What came of an awaited alert ([`Alerter::dispatch_within`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatched {
+    /// The mail went out.
+    Sent,
+    /// Not configured, inside its rate limit, or the send failed.
+    NotSent,
+    /// The start's time for awaited alerts was spent: logged, not mailed.
+    OverBudget,
+}
+
+impl Dispatched {
+    pub fn sent(self) -> bool {
+        self == Self::Sent
+    }
+}
+
+/// The one mail for the alerts of `kind` that a start logged but didn't
+/// mail, its time for them spent: the count, never the agents (each of
+/// them was told no alert was sent; the log names them).
+pub fn unsent_summary(kind: AlertKind, n: usize) -> Alert {
+    Alert::new(
+        kind,
+        format!(
+            "{n} more {kind} alert(s) at this start were logged but not mailed: the start's time \
+             for awaited alerts ({} s) was spent",
+            START_ALERT_BUDGET.as_secs()
+        ),
+    )
+    .count(n)
+    .detail("agents", n)
+    .detail(
+        "where",
+        "each is an alert_over_budget event in the run log, with its agent_id",
+    )
+}
+
+/// The sentence for an alert whose mail went out (`sent`) or didn't.
+pub fn told(sent: bool) -> &'static str {
+    if sent { ALERT_SENT } else { ALERT_NOT_SENT }
+}
+
 /// Sends alerts, or does nothing when `[alerts]` is absent. Cheap to clone.
+/// The second field: the time left for awaited alerts, for an alerter a
+/// start made ([`Self::budgeted`]); `None` is unbounded.
 #[derive(Clone, Default)]
-pub struct Alerter(Option<Arc<Inner>>);
+pub struct Alerter(Option<Arc<Inner>>, Option<Arc<Mutex<Duration>>>);
 
 impl std::fmt::Debug for Alerter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -929,7 +1187,14 @@ struct Inner {
 impl Alerter {
     /// No alerts.
     pub fn off() -> Self {
-        Self(None)
+        Self(None, None)
+    }
+
+    /// This alerter, sending through the same channel, with `budget` in
+    /// all for what [`Self::dispatch`] awaits ([`START_ALERT_BUDGET`]): one
+    /// per start, shared by its clones. [`Self::notify`] is unaffected.
+    pub fn budgeted(&self, budget: Duration) -> Self {
+        Self(self.0.clone(), Some(Arc::new(Mutex::new(budget))))
     }
 
     /// From `[alerts]`: validates, reads the password file and builds the
@@ -958,21 +1223,24 @@ impl Alerter {
     ) -> Self {
         let email = config.email.as_ref().expect("validated");
         let (from, to) = email.validate().expect("validated");
-        Self(Some(Arc::new(Inner {
-            mailer,
-            from,
-            to,
-            events: config.events(),
-            min_interval: Duration::from_secs(config.min_interval_secs),
-            instance: config.instance.clone(),
-            // The SMTP timeout bounds the exchange; this bounds the whole
-            // attempt, state file included.
-            send_timeout: email.timeout() + Duration::from_secs(5),
-            state_path: data_dir.join(STATE_FILE),
-            log_path,
-            state_lock: tokio::sync::Mutex::new(()),
-            pending: Mutex::new(JoinSet::new()),
-        })))
+        Self(
+            Some(Arc::new(Inner {
+                mailer,
+                from,
+                to,
+                events: config.events(),
+                min_interval: Duration::from_secs(config.min_interval_secs),
+                instance: config.instance.clone(),
+                // The SMTP timeout bounds the exchange; this bounds the whole
+                // attempt, state file included.
+                send_timeout: email.timeout() + Duration::from_secs(5),
+                state_path: data_dir.join(STATE_FILE),
+                log_path,
+                state_lock: tokio::sync::Mutex::new(()),
+                pending: Mutex::new(JoinSet::new()),
+            })),
+            None,
+        )
     }
 
     /// Whether alerts of `kind` are sent at all (configured, and the
@@ -1015,9 +1283,43 @@ impl Alerter {
     /// tells an agent its operator was told
     /// ([`crate::interrupted`]): only a mail that went out does.
     pub async fn dispatch(&self, alert: Alert, timeout: Duration) -> bool {
-        match self.configured(&alert) {
-            Some(inner) => inner.deliver(alert, timeout.min(inner.send_timeout)).await,
-            None => false,
+        self.dispatch_within(alert, timeout).await.sent()
+    }
+
+    /// [`Self::dispatch`], saying why a mail didn't go out when it was
+    /// because the budget ([`Self::budgeted`]) was spent: the alert is then
+    /// logged (`alert_over_budget`), not mailed, now or later, so an agent
+    /// told no alert was sent is told the truth. Each awaited send is cut to
+    /// what is left of the budget, and what it took is taken from it.
+    pub async fn dispatch_within(&self, alert: Alert, timeout: Duration) -> Dispatched {
+        let Some(inner) = self.configured(&alert) else {
+            return Dispatched::NotSent;
+        };
+        let timeout = timeout.min(inner.send_timeout);
+        let Some(budget) = &self.1 else {
+            return match inner.deliver(alert, timeout).await {
+                true => Dispatched::Sent,
+                false => Dispatched::NotSent,
+            };
+        };
+        let left = *budget.lock().expect("alert budget lock");
+        if left.is_zero() {
+            tracing::warn!(
+                event_type = "alert_over_budget",
+                alert = %alert.kind,
+                agent_id = ?alert.agent_id,
+                budget_secs = START_ALERT_BUDGET.as_secs(),
+                "the start's time for awaited alerts is spent: logged, not mailed"
+            );
+            return Dispatched::OverBudget;
+        }
+        let started = std::time::Instant::now();
+        let sent = inner.deliver(alert, timeout.min(left)).await;
+        let mut left = budget.lock().expect("alert budget lock");
+        *left = left.saturating_sub(started.elapsed());
+        match sent {
+            true => Dispatched::Sent,
+            false => Dispatched::NotSent,
         }
     }
 
@@ -1086,7 +1388,7 @@ impl Inner {
         let reserved = if alert.kind.unlimited() {
             Ok(true)
         } else {
-            self.reserve(&key, now).await
+            self.reserve(&key, now, alert.count).await
         };
         match reserved {
             Ok(true) => true,
@@ -1158,14 +1460,19 @@ impl Inner {
 
     /// Claim the send slot for `key`: `true` if it may send now (and the
     /// time is recorded), `false` inside the rate limit.
-    async fn reserve(&self, key: &str, now: DateTime<Utc>) -> anyhow::Result<bool> {
+    async fn reserve(
+        &self,
+        key: &str,
+        now: DateTime<Utc>,
+        count: Option<usize>,
+    ) -> anyhow::Result<bool> {
         if self.min_interval.is_zero() {
             return Ok(true);
         }
         let _guard = self.state_lock.lock().await;
         let mut state = RateState::load(&self.state_path).await?;
         state.prune(now, self.min_interval);
-        let allowed = state.allow(key, now, self.min_interval);
+        let allowed = state.allow(key, now, self.min_interval, count);
         if allowed {
             state.save(&self.state_path).await?;
         }
@@ -1190,6 +1497,9 @@ impl Inner {
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 struct RateState {
     last_sent: BTreeMap<String, DateTime<Utc>>,
+    /// The count of the last summary sent under a key ([`Alert::count`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    counts: BTreeMap<String, usize>,
 }
 
 impl RateState {
@@ -1218,15 +1528,27 @@ impl RateState {
     }
 
     /// `true` (and recorded) if `key` last sent at least `min_interval`
-    /// ago, or never.
-    fn allow(&mut self, key: &str, now: DateTime<Utc>, min_interval: Duration) -> bool {
+    /// ago, or never, or `count` is more than the last one sent under it.
+    fn allow(
+        &mut self,
+        key: &str,
+        now: DateTime<Utc>,
+        min_interval: Duration,
+        count: Option<usize>,
+    ) -> bool {
         let interval = chrono::Duration::from_std(min_interval).unwrap_or(chrono::Duration::MAX);
+        let more = count.is_some_and(|n| self.counts.get(key).is_none_or(|last| n > *last));
         if let Some(last) = self.last_sent.get(key)
             && now.signed_duration_since(*last) < interval
+            && !more
         {
             return false;
         }
         self.last_sent.insert(key.to_string(), now);
+        match count {
+            Some(n) => self.counts.insert(key.to_string(), n),
+            None => self.counts.remove(key),
+        };
         true
     }
 
@@ -1234,6 +1556,7 @@ impl RateState {
     fn release(&mut self, key: &str, at: DateTime<Utc>) -> bool {
         if self.last_sent.get(key) == Some(&at) {
             self.last_sent.remove(key);
+            self.counts.remove(key);
             true
         } else {
             false
@@ -1245,6 +1568,8 @@ impl RateState {
         let interval = chrono::Duration::from_std(min_interval).unwrap_or(chrono::Duration::MAX);
         self.last_sent
             .retain(|_, last| now.signed_duration_since(*last) < interval);
+        let kept = &self.last_sent;
+        self.counts.retain(|key, _| kept.contains_key(key));
     }
 }
 
@@ -1275,6 +1600,30 @@ pub(crate) mod testing {
         }
     }
 
+    /// A server that never answers (SMTP black-holed).
+    struct BlackHole;
+
+    #[async_trait::async_trait]
+    impl Mailer for BlackHole {
+        async fn send(&self, _: Message) -> anyhow::Result<()> {
+            std::future::pending().await
+        }
+    }
+
+    /// [`recording`]'s config, mailed into a black hole.
+    pub(crate) fn black_hole(data_dir: &Path) -> Alerter {
+        let config: AlertsConfig = toml::from_str(
+            r#"
+            [email]
+            smtp_host = "localhost"
+            from = "a@example.com"
+            to = ["b@example.com"]
+            "#,
+        )
+        .unwrap();
+        Alerter::with_mailer(&config, Box::new(BlackHole), data_dir, None)
+    }
+
     /// Every configurable kind, rate state under `data_dir`, mailed to
     /// `sent`
     pub(crate) fn recording(data_dir: &Path, sent: &Recorder) -> Alerter {
@@ -1294,6 +1643,34 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    /// Where a mail tells the operator to stop an agent, it says what a
+    /// stop over an answer of yes (or a waiting re-offer) needs: without
+    /// `--against-answer` that stop is refused.
+    #[test]
+    fn a_suggested_stop_names_the_override_it_may_need() {
+        for kind in [
+            super::AlertKind::SealedStateUploadingInDoubt,
+            super::AlertKind::SealedStateServerChainBroken,
+        ] {
+            let m = kind.meaning();
+            assert!(
+                m.contains("sealed-stop") && m.contains("--against-answer"),
+                "{m}"
+            );
+        }
+    }
+
+    /// The unchained-agents mail says why some agents are left out: the
+    /// could-not-chain record, by its file's name.
+    #[test]
+    fn the_unchained_mail_names_the_could_not_chain_record() {
+        let m = super::AlertKind::SealedStateUnchainedAgents.meaning();
+        assert!(
+            m.contains(crate::sealed::unchainable::RECORD) && m.contains("left_out"),
+            "{m}"
+        );
+    }
+
     use super::testing::Recorder;
     use super::*;
 
@@ -1447,16 +1824,40 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let mut s = RateState::default();
-        assert!(s.allow("a|1", t0, hour));
-        assert!(!s.allow("a|1", t0 + chrono::Duration::minutes(59), hour));
-        assert!(s.allow("a|2", t0, hour), "keys are independent");
-        assert!(s.allow("a|1", t0 + chrono::Duration::minutes(60), hour));
+        assert!(s.allow("a|1", t0, hour, None));
+        assert!(!s.allow("a|1", t0 + chrono::Duration::minutes(59), hour, None));
+        assert!(s.allow("a|2", t0, hour, None), "keys are independent");
+        assert!(s.allow("a|1", t0 + chrono::Duration::minutes(60), hour, None));
         s.prune(t0 + chrono::Duration::minutes(90), hour);
         assert_eq!(s.last_sent.len(), 1, "a|2 aged out, a|1 (at 60) did not");
         // Releasing only undoes the matching reservation.
         assert!(!s.release("a|1", t0));
         assert!(s.release("a|1", t0 + chrono::Duration::minutes(60)));
         assert!(s.last_sent.is_empty());
+    }
+
+    /// A summary of more agents than the last one sent under its key goes
+    /// out inside the limit: one drop can't hide the next sweep's 1,500.
+    #[test]
+    fn a_larger_summary_passes_the_rate_limit() {
+        let hour = Duration::from_secs(3600);
+        let t0 = DateTime::parse_from_rfc3339("2026-11-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let m = |n| t0 + chrono::Duration::minutes(n);
+        let mut s = RateState::default();
+        assert!(s.allow("drop|-", t0, hour, Some(1)));
+        assert!(
+            !s.allow("drop|-", m(10), hour, Some(1)),
+            "the same count waits"
+        );
+        assert!(s.allow("drop|-", m(20), hour, Some(1_500)), "a jump passes");
+        assert!(!s.allow("drop|-", m(30), hour, Some(1_400)), "fewer waits");
+        assert!(!s.allow("drop|-", m(40), hour, None));
+        assert!(
+            s.allow("drop|-", m(81), hour, Some(3)),
+            "after the hour, any"
+        );
     }
 
     /// `dispatch` says whether the mail went out: not when the send fails

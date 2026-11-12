@@ -42,7 +42,9 @@ use zeroize::Zeroizing;
 
 use super::KeyStore;
 use super::api::SealedApi;
-use super::history::{HeadMatch, Held, History, HistoryCache, Source, Version};
+use super::history::{
+    HeadMatch, Held, History, HistoryCache, SetAsideBy, Source, Uploads, Version,
+};
 use super::keys::MemoryIdKeys;
 
 /// What the runner needs of a session's agent for the `memory` tool: its
@@ -93,7 +95,7 @@ pub const NEW_TOOL_LINE: &str = "New: the `memory` tool shows your memory's earl
 
 /// What the tool says when the session has no memory-id key.
 pub const NO_KEY: &str = "Your memory ids couldn't be worked out this session, so this tool \
-     can't name your memory's versions. Your operator has been told.";
+     can't name your memory's versions. Your runner logged this for your operator.";
 
 /// What the tool says when the history couldn't be read at all.
 pub const UNREADABLE: &str = "Your memory's history couldn't be read just now. Ask again later.";
@@ -113,16 +115,65 @@ pub fn memory_ids_told_path(agent_dir: &Path) -> PathBuf {
 }
 
 /// The sentence enrolment's first verdict adds, the earliest sealed
-/// version's date in it.
-pub fn enrollment_sentence(earliest: &str) -> String {
+/// version's date in it, and, where the chain's record of its beginning
+/// can be read ([`super::enroll::chain_began`]), the day it began: the
+/// versions up to then were sealed by that enrolment, from the runner's
+/// own copies (`sealed/enroll.rs`, `chain_all`), so the history attests
+/// nothing about them before it. A chain begun before that record existed
+/// is told no date.
+pub fn enrollment_sentence(earliest: &str, began: Option<&str>) -> String {
+    match began {
+        Some(began) => format!(
+            "Your earlier versions, back to {earliest}, were sealed together on {began}, from \
+             copies your runner had kept, so each has a head now; your sealed history can't show \
+             any change made to them before that date. Your memory ids haven't changed."
+        ),
+        None => format!(
+            "Your earlier versions back to {earliest} are sealed, so each has a head too. Your \
+             memory ids haven't changed."
+        ),
+    }
+}
+
+/// What `log` says once a session of a chain whose beginning is on record
+/// ([`super::enroll::chain_began`]): that day, and that the versions up to
+/// it were sealed then, from the runner's own copies. The main line's
+/// versions dated before then are among those (each later one was saved
+/// after it); the pre-loss copy, beside the line, may have been added
+/// later ([`prior_line`] says when), so it is not claimed.
+pub fn chain_began_line(began: chrono::NaiveDate) -> String {
+    let began = began.format(super::text::DATE);
     format!(
-        "Your earlier versions back to {earliest} are sealed now, so each has a head too. Your \
-         memory ids haven't changed."
+        "Your sealed history began on {began}. The versions on its main line dated before then \
+         were sealed together when it began, from copies your runner had kept, so it can't show \
+         any change made to them before that date."
     )
 }
 
+/// What `log` says once a session of the versions it lists off the main
+/// line (agentkit labels them "sealed, off your main line" or "set aside
+/// … when your line was rebased"): how many, what they are, and, after
+/// [`uploads_line`], that its count leaves them out. Said only when there
+/// are some.
+pub fn side_line(n: usize, after_count: bool) -> Option<String> {
+    let (s, them) = match n {
+        0 => return None,
+        1 => ("", "it"),
+        _ => ("s", "them"),
+    };
+    let left_out = if after_count {
+        format!("; the count above leaves {them} out")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Your runner also holds {n} sealed version{s} on a branch your sealed history no longer \
+         follows, which this tool labels off your main line or set aside{left_out}."
+    ))
+}
+
 /// Whether the agent is due the enrolment sentence: enrolled, its
-/// memory-id key's fingerprint written before its `sealed/enrolled` marker
+/// memory-id key's fingerprint written before its `sealed/chained` marker
 /// (it had memory ids before its versions were sealed; an agent enrolled
 /// before it had a key has no ids to keep), and not told yet. Anything
 /// unreadable is "not due": the sentence is never worth a guess.
@@ -130,7 +181,7 @@ fn enrollment_due(agent_dir: &Path) -> bool {
     let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let sealed = agent_dir.join(agora_agentkit::state::storage::SEALED_DIR);
     let (Some(enrolled), Some(fingerprint)) = (
-        mtime(sealed.join("enrolled")),
+        mtime(sealed.join(agora_agentkit::state::storage::CHAINED)),
         mtime(agent_dir.join(super::keys::MEMORY_ID_FINGERPRINT_FILE)),
     ) else {
         return false;
@@ -167,8 +218,15 @@ pub async fn enrollment_note(agent_dir: &Path, id: AgentId) -> Option<String> {
         .map(|e| e.entry.state_at)
         .min()
         .and_then(DateTime::<Utc>::from_timestamp_micros)?;
+    let dir = agent_dir.to_path_buf();
+    let began = tokio::task::spawn_blocking(move || super::enroll::chain_began(&dir))
+        .await
+        .ok()
+        .flatten()
+        .map(|b| b.at.format(super::text::DATE).to_string());
     Some(enrollment_sentence(
-        &earliest.format("%Y-%m-%d").to_string(),
+        &earliest.format(super::text::DATE).to_string(),
+        began.as_deref(),
     ))
 }
 
@@ -180,6 +238,113 @@ pub async fn mark_memory_ids_told(agent_dir: &Path) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || super::write_private(&path, &body))
         .await
         .map_err(std::io::Error::other)?
+}
+
+/// `sealed/left_out_told.json`: how many of the copies its chain left out
+/// ([`super::enroll::left_out`]) the agent has been told of, by `log`.
+pub const LEFT_OUT_TOLD: &str = "left_out_told.json";
+
+/// What `log` says, once, of the runner's local copies the chain couldn't
+/// include.
+pub fn left_out_line(n: usize) -> String {
+    if n == 1 {
+        "1 older file of your state on your operator's machine couldn't be read, and is not in \
+         your sealed history."
+            .to_string()
+    } else {
+        format!(
+            "{n} older files of your state on your operator's machine couldn't be read, and are \
+             not in your sealed history."
+        )
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct LeftOutTold {
+    told: usize,
+}
+
+/// The left-out line, with the count to mark told, if `log` hasn't said
+/// this many yet. Anything unreadable says nothing: never worth a guess.
+async fn left_out_note(agent_dir: &Path) -> Option<(String, usize)> {
+    let dir = agent_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let n = super::enroll::left_out(&dir).ok()?.len();
+        let told = match std::fs::read(
+            dir.join(agora_agentkit::state::storage::SEALED_DIR)
+                .join(LEFT_OUT_TOLD),
+        ) {
+            Ok(bytes) => serde_json::from_slice::<LeftOutTold>(&bytes).ok()?.told,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return None,
+        };
+        (n > told).then(|| (left_out_line(n), n))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Mark `n` left-out copies told. Atomic, 0600.
+async fn mark_left_out_told(agent_dir: &Path, n: usize) -> std::io::Result<()> {
+    let path = agent_dir
+        .join(agora_agentkit::state::storage::SEALED_DIR)
+        .join(LEFT_OUT_TOLD);
+    let body = serde_json::to_vec_pretty(&LeftOutTold { told: n })?;
+    tokio::task::spawn_blocking(move || super::write_private(&path, &body))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+/// What `log` says once a session of where the main line's sealed
+/// versions are: uploaded to Agora (acknowledged, or read from Agora's
+/// chain), or not. `None` with none to say.
+///
+/// It counts the versions of the history's own line; `log` lists those
+/// off it too, and [`side_line`] says so, when there are some.
+/// `uploading`: the agent uploads now ([`super::uploads`]), so what isn't
+/// uploaded isn't uploaded *yet*.
+pub fn uploads_line(u: Uploads, uploading: bool) -> Option<String> {
+    let n = u.uploaded + u.local;
+    let s = if n == 1 { "" } else { "s" };
+    let yet = if uploading { " yet" } else { "" };
+    Some(match (u.uploaded, u.local) {
+        (0, 0) => return None,
+        // As the verdict says it of an agent that doesn't upload: what
+        // the runner's files show
+        (0, _) if !uploading => format!(
+            "Your runner does not upload your sealed history, and its files show none of its \
+             {n} version{s} uploaded to Agora."
+        ),
+        (0, 1) => "The 1 version of your sealed history is not uploaded to Agora yet.".to_string(),
+        (0, _) => {
+            format!("None of the {n} versions of your sealed history is uploaded to Agora yet.")
+        }
+        (_, 0) => format!(
+            "{} of your sealed history {} uploaded to Agora.",
+            if n == 1 {
+                "The 1 version".to_string()
+            } else {
+                format!("All {n} versions")
+            },
+            if n == 1 { "is" } else { "are" },
+        ),
+        (up, local) => format!(
+            "{up} of the {n} versions of your sealed history {} uploaded to Agora; the other \
+             {local} {} not uploaded{yet}.",
+            if up == 1 { "is" } else { "are" },
+            if local == 1 { "is" } else { "are" },
+        ),
+    })
+}
+
+/// What `log` says once a session of the pre-loss copy: listed at the
+/// date the copy stood, but sealed later, on `added`.
+pub fn prior_line(added: chrono::NaiveDate) -> String {
+    format!(
+        "The copy of your memory from before the May 2026 loss is listed at the date the copy \
+         stood; it was added to your sealed history on {added}."
+    )
 }
 
 /// One answer: its text, and whether it is a refusal.
@@ -210,6 +375,8 @@ pub struct MemoryReader {
     /// The memory in the agent's context and its id (the heading's).
     current: Option<(MemoryId, Zeroizing<String>)>,
     cache: HistoryCache,
+    /// `log` said where the sealed versions are, this session.
+    told_where: bool,
 }
 
 impl std::fmt::Debug for MemoryReader {
@@ -239,6 +406,7 @@ impl MemoryReader {
             ids,
             current: current.map(|(m, c)| (m, Zeroizing::new(c.to_string()))),
             cache: HistoryCache::default(),
+            told_where: false,
         }
     }
 
@@ -289,7 +457,42 @@ impl MemoryReader {
         let view = View::new(history, ids, self.id, &anchors);
         let current = view.current(current_id, &current);
         let text = match action {
-            MemoryAction::Log { before, limit } => view.log(before.as_ref(), limit, &current),
+            MemoryAction::Log { before, limit } => {
+                let mut text = view.log(before.as_ref(), limit, &current);
+                // Once a session: where the sealed versions are, and when
+                // the pre-loss copy was added (agentkit's row labels say
+                // neither)
+                if !self.told_where && view.seal == SealCheck::Checked {
+                    let uploading = super::uploads(&self.agent_dir(), &self.keys, self.id);
+                    let dir = self.agent_dir();
+                    let began = tokio::task::spawn_blocking(move || {
+                        super::enroll::chain_began(&dir).map(|b| b.at.date_naive())
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    let said: Vec<String> = view.where_lines(uploading, began);
+                    if !said.is_empty() {
+                        self.told_where = true;
+                        text = compose(&said, &text);
+                    }
+                }
+                // Once: the local copies the chain couldn't include
+                match left_out_note(&self.agent_dir()).await {
+                    Some((line, n)) => {
+                        if let Err(e) = mark_left_out_told(&self.agent_dir(), n).await {
+                            tracing::warn!(
+                                event_type = "memory_tool_left_out_not_marked",
+                                agent_id = %self.id,
+                                error = %e,
+                                "the left-out line not marked told; the next log repeats it"
+                            );
+                        }
+                        compose(&[line], &text)
+                    }
+                    None => text,
+                }
+            }
             MemoryAction::Show { id, budget } => view.show(id.as_slice(), budget, current),
             MemoryAction::Diff { a, b } => view.diff(&a, b.as_ref(), current),
             MemoryAction::Search { query, limit } => {
@@ -367,11 +570,21 @@ fn version_source(source: &Source) -> VersionSource {
     match source {
         Source::Sealed { .. } => VersionSource::Sealed,
         Source::ArchivedPrior { .. } => VersionSource::PriorCopy,
-        Source::SideLine { .. } => VersionSource::SideLine,
-        Source::OffLine { .. } => VersionSource::OffLine,
-        Source::SetAside { on, .. } => VersionSource::SetAside {
+        // agentkit's `SideLine` label says the operator rebased it, which
+        // a fork, a restore or a resume didn't: "off your main line" is
+        // true of each, and `memory show` by head says which, where known
+        Source::SideLine { .. } | Source::OffLine { .. } => VersionSource::OffLine,
+        Source::SetAside {
+            on,
+            by: SetAsideBy::Rebase,
+            ..
+        } => VersionSource::SetAside {
             on: on.map(|on| on.date_naive()),
         },
+        Source::SetAside {
+            by: SetAsideBy::Fork,
+            ..
+        } => VersionSource::OffLine,
         Source::LocalCopy { .. } | Source::Current => VersionSource::LocalCopy,
         Source::KeptAtExit { .. } => VersionSource::NeverSaved,
     }
@@ -387,7 +600,41 @@ fn is_local(source: &Source) -> bool {
 
 /// Why a sealed version couldn't be opened, in the agent's words (the
 /// resolver's reason is the operator's: kept for the log).
-const NOT_FETCHED: &str = "its sealed copy couldn't be fetched";
+const NOT_FETCHED: &str = "its sealed files couldn't be fetched";
+
+/// Why a sealed version of an agent whose chain isn't uploaded couldn't
+/// be opened: its blob isn't here whole, and nothing is asked of Agora.
+const NOT_HERE: &str = "its sealed files on your operator's machine are missing or damaged";
+
+/// What `show` says of a head the runner holds but left out of the
+/// history, after "Head {short} ": where the reason is not one below.
+const HELD_NOT_SHOWN: &str =
+    "is in your runner's files, but can't be shown: your runner couldn't read or open it.";
+
+/// What `show` says of a head the runner doesn't hold, after "Head
+/// {short} ".
+const NOT_HELD: &str = "isn't in your runner's files.";
+
+/// [`HELD_NOT_SHOWN`], when the history couldn't be checked at all.
+const HELD_UNCHECKED: &str = "is in your runner's files, but your sealed history couldn't \
+     be checked just now, so it isn't shown; ask again later.";
+
+/// [`HELD_NOT_SHOWN`], for a version set aside whose own links don't
+/// verify.
+const HELD_UNVERIFIED: &str = "is in your runner's files, off the main line of your sealed history, but can't be shown: its links back to your first version don't verify.";
+
+/// What `show` says of a head held but left out, by the resolver's
+/// reason, in the agent's words. The reason itself is the operator's
+/// (it may carry paths or error text): logged, never shown.
+fn held_not_shown(why: &str) -> &'static str {
+    if why == super::history::LEFT_UNCHECKED {
+        HELD_UNCHECKED
+    } else if why == super::history::LEFT_UNVERIFIED {
+        HELD_UNVERIFIED
+    } else {
+        HELD_NOT_SHOWN
+    }
+}
 
 /// Why a sealed version wasn't tried, past the resolver's deadline.
 const PAST_DEADLINE: &str = "gathering your history took too long";
@@ -400,6 +647,61 @@ fn push_block(out: &mut String, block: &str) {
         out.push_str("\n\n");
     }
     out.push_str(block);
+}
+
+/// What `show` by head says of a version that is not on the line the
+/// agent's sealed history goes on: where it is, and why where the
+/// runner's files say. `None` for a version on it. `its`: "; its memory
+/// is <id>", or nothing.
+fn head_note(source: &Source, short: &str, its: &str) -> Option<String> {
+    let on = |d: &Option<DateTime<Utc>>| {
+        d.map(|d| format!(" on {}", d.format(super::text::DATE)))
+            .unwrap_or_default()
+    };
+    Some(match source {
+        Source::SideLine {
+            resumed: Some(at), ..
+        } => format!(
+            "Head {short} was not uploaded before your uploads were stopped, or was saved \
+             while they were, and was set aside from your sealed history on {} when your \
+             operator resumed them; it was not uploaded{its}.",
+            at.format(super::text::DATE)
+        ),
+        Source::SideLine { resumed: None, .. } => format!(
+            "Head {short} is sealed, but set aside from your sealed history: your history goes \
+             on from another version{its}."
+        ),
+        Source::SetAside {
+            on: at,
+            by: SetAsideBy::Rebase,
+            ..
+        } => format!(
+            "Head {short} was set aside from your sealed history{} when your operator had your \
+             history go on from another version{its}.",
+            on(at)
+        ),
+        Source::SetAside {
+            on: at,
+            by: SetAsideBy::Fork,
+            ..
+        } => format!(
+            "Head {short} was set aside from your sealed history{} when your operator resolved \
+             a fork in it, choosing the other line{its}.",
+            on(at)
+        ),
+        Source::ArchivedPrior {
+            added: Some(added), ..
+        } => format!(
+            "Head {short} is the copy of your memory from before the May 2026 loss, added to \
+             your sealed history on {}{its}.",
+            added.format(super::text::DATE)
+        ),
+        Source::OffLine { .. } => format!(
+            "Head {short} is sealed, but set aside from your sealed history; your runner's \
+             files don't say why{its}."
+        ),
+        _ => return None,
+    })
 }
 
 /// Where a ref led: a row, with notes, or only words.
@@ -474,6 +776,8 @@ impl View {
                         super::version::UNREACHABLE
                     } else if why.contains(super::history::PAST_DEADLINE) {
                         PAST_DEADLINE
+                    } else if why.contains(super::api::LOCAL_ONLY) {
+                        NOT_HERE
                     } else {
                         NOT_FETCHED
                     };
@@ -536,6 +840,44 @@ impl View {
         }
     }
 
+    /// What `log` says once a session: when the chain began, if that is
+    /// on record ([`chain_began_line`]); [`uploads_line`]; the versions it
+    /// lists off the main line, if any ([`side_line`]); and, if the
+    /// pre-loss copy is shown, [`prior_line`].
+    fn where_lines(&self, uploading: bool, began: Option<chrono::NaiveDate>) -> Vec<String> {
+        let mut said: Vec<String> = began.map(chain_began_line).into_iter().collect();
+        let count = self
+            .history
+            .uploads
+            .and_then(|u| uploads_line(u, uploading));
+        let counted = count.is_some();
+        said.extend(count);
+        let side = self
+            .history
+            .versions
+            .iter()
+            .filter(|v| {
+                matches!(
+                    v.sources.first(),
+                    Some(
+                        Source::SideLine { .. } | Source::OffLine { .. } | Source::SetAside { .. }
+                    )
+                )
+            })
+            .count();
+        said.extend(side_line(side, counted));
+        let added = self.history.versions.iter().find_map(|v| {
+            v.sources.iter().find_map(|s| match s {
+                Source::ArchivedPrior {
+                    added: Some(added), ..
+                } => Some(added.date_naive()),
+                _ => None,
+            })
+        });
+        said.extend(added.map(prior_line));
+        said
+    }
+
     /// Every head held here: each version's and each left out.
     fn heads(&self) -> Vec<Sha256Hex> {
         self.history
@@ -588,35 +930,26 @@ impl View {
                 let Some(row) = i.and_then(|i| self.placed[i]) else {
                     // Only when the main line couldn't be checked: its
                     // sealed versions aren't rows
-                    return Pick::Say(format!(
-                        "Head {short} is held by your runner, but your sealed history couldn't \
-                         be checked just now, so it isn't shown; ask again later."
-                    ));
+                    return Pick::Say(format!("Head {short} {HELD_UNCHECKED}"));
                 };
                 let its = match self.rows[row].id() {
                     Some(id) => format!("; its memory is {id}"),
                     None => String::new(),
                 };
-                match source {
-                    Source::SideLine { .. } => notes.push(format!(
-                        "Head {short} is on a side line your operator rebased{its}."
-                    )),
-                    Source::SetAside { on, .. } => notes.push(format!(
-                        "Head {short} was set aside{} when your line was rebased{its}.",
-                        on.map(|d| format!(" on {}", d.date_naive()))
-                            .unwrap_or_default()
-                    )),
-                    Source::OffLine { .. } => notes.push(format!(
-                        "Head {short} is sealed off your main line, with no record of why{its}."
-                    )),
-                    _ => {}
-                }
+                notes.extend(head_note(source, &short, &its));
                 Pick::At(row, notes)
             }
-            HeadMatch::Held(left) => Pick::Say(format!(
-                "Head {short} is held by your runner, but can't be shown: {}.",
-                left.why
-            )),
+            // The resolver's reason is the operator's (paths, error
+            // text): logged when it was left out, never shown
+            HeadMatch::Held(left) => {
+                tracing::info!(
+                    event_type = "memory_tool_head_not_shown",
+                    head = %short,
+                    why = %left.why,
+                    "a head the runner holds was asked for, and is left out of the history"
+                );
+                Pick::Say(format!("Head {short} {}", held_not_shown(&left.why)))
+            }
             HeadMatch::Ambiguous(heads) => Pick::Say(format!(
                 "\"{short}\" could mean any of these heads; give more digits:\n{}",
                 heads
@@ -626,7 +959,7 @@ impl View {
                     .join("\n")
             )),
             HeadMatch::NotHeld | HeadMatch::NotAHead => {
-                Pick::Say(format!("Head {short} isn't held by your runner."))
+                Pick::Say(format!("Head {short} {NOT_HELD}"))
             }
         }
     }
@@ -917,6 +1250,109 @@ impl Tool for MemoryTool {
     }
 }
 
+/// Every sentence this module can tell an agent, for the one table of
+/// agent-facing text ([`crate::sealed::text`]): add a new one here, or
+/// its banned-phrase test never sees it.
+#[cfg(test)]
+pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
+    use crate::sealed::text::{Text, To};
+    use agora_agentkit::state::verify::HeadRef;
+    let head = HeadRef {
+        entry_hash: Sha256Hex::from([3; 32]),
+        seq: 3,
+    };
+    let at: Option<DateTime<Utc>> = "2026-11-05T09:00:00Z".parse().ok();
+    let day = at.expect("a date").date_naive();
+    let mut out = vec![
+        Text::new("NEW_TOOL_LINE", To::Any, NEW_TOOL_LINE),
+        Text::new("NO_KEY", To::Any, NO_KEY),
+        Text::new("UNREADABLE", To::Any, UNREADABLE),
+        Text::new("left_out_line", To::Any, left_out_line(1)),
+        Text::new("left_out_line", To::Any, left_out_line(3)),
+        Text::new("prior_line", To::Any, prior_line(day)),
+        Text::new(
+            "enrollment_sentence",
+            To::Any,
+            enrollment_sentence("2026-07-24", Some("2026-11-12")),
+        ),
+        Text::new(
+            "enrollment_sentence",
+            To::Any,
+            enrollment_sentence("2026-07-24", None),
+        ),
+        Text::new("chain_began_line", To::Any, chain_began_line(day)),
+        Text::new("NOT_FETCHED", To::Uploaded, NOT_FETCHED),
+        Text::new("NOT_HERE", To::Any, NOT_HERE),
+        Text::new("PAST_DEADLINE", To::Any, PAST_DEADLINE),
+        Text::new(
+            "at_head (not held)",
+            To::Any,
+            format!("Head 030303030303 {NOT_HELD}"),
+        ),
+    ];
+    for why in [
+        super::history::LEFT_UNCHECKED,
+        super::history::LEFT_UNVERIFIED,
+        "reading blob: No such file or directory (os error 2)",
+    ] {
+        out.push(Text::new(
+            "at_head (held, not shown)",
+            To::Any,
+            format!("Head 030303030303 {}", held_not_shown(why)),
+        ));
+    }
+    for (n, after_count) in [(1, true), (3, true), (2, false)] {
+        out.extend(side_line(n, after_count).map(|l| Text::new("side_line", To::Any, l)));
+    }
+    for (uploaded, local) in [(0, 1), (0, 4), (1, 0), (5, 0), (1, 1), (4, 2)] {
+        for uploading in [true, false] {
+            // An agent that doesn't upload with versions uploaded: stopped
+            let to = match (uploading, uploaded) {
+                (false, 0) => To::Never,
+                _ => To::Uploaded,
+            };
+            out.extend(
+                uploads_line(Uploads { uploaded, local }, uploading)
+                    .map(|l| Text::new("uploads_line", to, l)),
+            );
+        }
+    }
+    for source in [
+        Source::SideLine { head, resumed: at },
+        Source::SideLine {
+            head,
+            resumed: None,
+        },
+        Source::SetAside {
+            head,
+            on: at,
+            by: SetAsideBy::Rebase,
+        },
+        Source::SetAside {
+            head,
+            on: None,
+            by: SetAsideBy::Fork,
+        },
+        Source::ArchivedPrior { head, added: at },
+        Source::OffLine { head },
+    ] {
+        for its in ["", "; its memory is mem-3f9a1c07be"] {
+            out.extend(
+                head_note(&source, "030303030303", its)
+                    .map(|l| Text::new("at_head notes", To::Any, l)),
+            );
+        }
+    }
+    for (r, sealed) in [("mem-3f9a1c07be", false), ("030303030303", true)] {
+        out.extend(
+            r.parse::<HistoryRef>()
+                .ok()
+                .map(|r| Text::new("not_found", To::Any, not_found(&r, sealed))),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,11 +1608,20 @@ mod tests {
         let out = rd.answer(log(), &b.api).await.text;
         assert!(out.contains("  head "), "{out}");
         assert!(!out.starts_with(LOCAL_ONLY), "{out}");
+        // Where its versions are, said once a session, first
+        assert!(
+            out.starts_with("All ")
+                || out.contains(" of your ") && out.contains("uploaded to Agora"),
+            "{out}"
+        );
+        let again = rd.answer(log(), &b.api).await.text;
+        assert!(!again.contains("uploaded to Agora"), "once: {again}");
         let short = short_head(&head);
         let out = rd.answer(show(vec![r(&short)]), &b.api).await.text;
         assert!(
             out.starts_with(&format!(
-                "Head {short} is on a side line your operator rebased; its memory is mem-"
+                "Head {short} is sealed, but set aside from your sealed history: your history \
+                 goes on from another version; its memory is mem-"
             )),
             "{out}"
         );
@@ -1203,7 +1648,8 @@ mod tests {
             upload_rebased: false,
         })
         .await;
-        b.seal().prune_blobs().await.unwrap();
+        // As a runner before agentkit 0.158 left sealed/
+        crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         *b.api.fail.lock().unwrap() = Some("blob");
         let mut rd = reader(&b.state_dir(), &b.keys, b.id, 4, None);
         let mut cache = HistoryCache::default();
@@ -1253,7 +1699,8 @@ mod tests {
             upload_rebased: false,
         })
         .await;
-        b.seal().prune_blobs().await.unwrap();
+        // As a runner before agentkit 0.158 left sealed/
+        crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         *b.api.blob_delay.lock().unwrap() = Some(std::time::Duration::from_secs(3600));
         let mut rd = reader(&b.state_dir(), &b.keys, b.id, 4, None);
         let out = rd.answer(search("synthetic"), &b.api).await.text;
@@ -1275,7 +1722,8 @@ mod tests {
             upload_rebased: false,
         })
         .await;
-        b.seal().prune_blobs().await.unwrap();
+        // As a runner before agentkit 0.158 left sealed/
+        crate::sealed::version::drop_acknowledged_blobs(&b.seal()).await;
         let mut rd = reader(&b.state_dir(), &b.keys, b.id, 4, None);
         let out = rd.answer(search("synthetic"), &b.api).await.text;
         assert!(out.starts_with(INDEX_BUILT), "{out}");
@@ -1456,6 +1904,252 @@ mod tests {
         assert!(format!("{:?}", result.content).contains("couldn't be worked out"));
     }
 
+    /// The local copies the chain left out are told once, by `log`: the
+    /// count, never which; told again only when more are left out.
+    #[tokio::test]
+    async fn log_says_once_how_many_local_copies_were_left_out() {
+        use crate::sealed::enroll::{LEFT_OUT, LeftOut, LeftOutFile, Unreadable};
+        let root = crate::sealed::TestDir::new("memory-tool-left-out");
+        let state_dir = root.join("state");
+        let id = AgentId::new();
+        let mut fs = FsStorage::new(&state_dir);
+        fs.save_raw(id, version(1), None).await.unwrap();
+        let ks = KeyStore::new(root.join("secrets"));
+        let api: Arc<dyn SealedApi> = Arc::new(FakeApi::new());
+        let mut r = reader(&state_dir, &ks, id, 1, None);
+        let log = async |r: &mut MemoryReader| {
+            let a = r
+                .answer(
+                    MemoryAction::Log {
+                        before: None,
+                        limit: None,
+                    },
+                    api.as_ref(),
+                )
+                .await;
+            assert!(!a.error, "{}", a.text);
+            a.text
+        };
+        assert!(
+            !log(&mut r).await.contains("couldn't be read and"),
+            "none left out"
+        );
+        let write = |n: usize| {
+            let file = LeftOutFile {
+                archives: (0..n)
+                    .map(|i| LeftOut {
+                        name: format!("state.2026010{i}T000000000Z.json"),
+                        reason: Unreadable::NotJson,
+                    })
+                    .collect(),
+            };
+            std::fs::write(
+                state_dir.join(id.to_string()).join("sealed").join(LEFT_OUT),
+                serde_json::to_vec(&file).unwrap(),
+            )
+            .unwrap();
+        };
+        std::fs::create_dir_all(state_dir.join(id.to_string()).join("sealed")).unwrap();
+        write(2);
+        let text = log(&mut r).await;
+        assert!(text.starts_with(&left_out_line(2)), "{text}");
+        assert!(!log(&mut r).await.contains("couldn't be read, and"), "once");
+        write(3);
+        assert!(log(&mut r).await.starts_with(&left_out_line(3)));
+        assert_eq!(
+            left_out_line(1),
+            "1 older file of your state on your operator's machine couldn't be read, and is not in \
+         your sealed history."
+        );
+    }
+
+    /// Where the sealed versions are, said in words true of each kind of
+    /// agent: a never-uploader is never told of Agora holding anything,
+    /// an uploader never that nothing is on Agora.
+    #[test]
+    fn the_uploads_line_by_kind_of_agent() {
+        let line = |uploaded, local| uploads_line(Uploads { uploaded, local }, false);
+        let up = |uploaded, local| uploads_line(Uploads { uploaded, local }, true);
+        assert_eq!(line(0, 0), None);
+        // An agent that doesn't upload: as its verdict says it
+        assert_eq!(
+            line(0, 4).unwrap(),
+            "Your runner does not upload your sealed history, and its files show none of its 4 \
+             versions uploaded to Agora."
+        );
+        // One that uploads, nothing sent yet
+        assert_eq!(
+            up(0, 1).unwrap(),
+            "The 1 version of your sealed history is not uploaded to Agora yet."
+        );
+        assert_eq!(
+            up(1, 0).unwrap(),
+            "The 1 version of your sealed history is uploaded to Agora."
+        );
+        // The count no longer speaks of what it leaves out: `side_line`
+        // does, only when there is some
+        assert_eq!(
+            up(5, 0).unwrap(),
+            "All 5 versions of your sealed history are uploaded to Agora."
+        );
+        // "Not uploaded yet" only for an agent that uploads
+        assert_eq!(
+            up(1, 1).unwrap(),
+            "1 of the 2 versions of your sealed history is uploaded to Agora; the other 1 is not \
+             uploaded yet."
+        );
+        assert_eq!(
+            line(4, 2).unwrap(),
+            "4 of the 6 versions of your sealed history are uploaded to Agora; the other 2 are \
+             not uploaded."
+        );
+        for (n, after) in [(0, true), (0, false)] {
+            assert_eq!(side_line(n, after), None);
+        }
+        assert_eq!(
+            side_line(1, true).unwrap(),
+            "Your runner also holds 1 sealed version on a branch your sealed history no longer \
+             follows, which this tool labels off your main line or set aside; the count above \
+             leaves it out."
+        );
+        assert_eq!(
+            side_line(2, false).unwrap(),
+            "Your runner also holds 2 sealed versions on a branch your sealed history no longer \
+             follows, which this tool labels off your main line or set aside."
+        );
+        for (uploaded, local) in [(0, 1), (0, 9)] {
+            let t = line(uploaded, local).unwrap();
+            // Particular to this line; the rest is the one banned list's
+            // (`crate::sealed::text`)
+            assert!(!t.contains("are uploaded"), "{t}");
+            crate::sealed::text::assert_may_say(crate::sealed::text::To::Never, &t);
+        }
+        for (uploaded, local) in [(1, 0), (3, 0), (1, 1), (4, 2)] {
+            let t = line(uploaded, local).unwrap().to_lowercase();
+            assert!(!t.contains("none of") && !t.contains("nothing"), "{t}");
+        }
+        assert_eq!(
+            prior_line(chrono::NaiveDate::from_ymd_opt(2026, 11, 12).unwrap()),
+            "The copy of your memory from before the May 2026 loss is listed at the date the \
+             copy stood; it was added to your sealed history on 2026-11-12."
+        );
+    }
+
+    /// What `log` says once a session of where the versions are and when
+    /// the pre-loss copy was added; what a head names of a fork resolved,
+    /// a resume's aside and the pre-loss copy; a side line no longer said
+    /// to be one "your operator rebased" when no rebase made it.
+    #[test]
+    fn sources_are_named_by_what_set_them_aside() {
+        let agent = AgentId::new();
+        let k = keys(1);
+        let stamp = |day| at(day).unwrap();
+        let h = History {
+            versions: vec![
+                held(
+                    at(1),
+                    vec![Source::ArchivedPrior {
+                        head: head(1),
+                        added: Some(stamp(9)),
+                    }],
+                    Some("before the loss\n"),
+                ),
+                held(at(2), vec![Source::Sealed { head: head(2) }], Some("two\n")),
+                held(
+                    at(3),
+                    vec![Source::SideLine {
+                        head: head(3),
+                        resumed: Some(stamp(5)),
+                    }],
+                    Some("three\n"),
+                ),
+                held(
+                    at(4),
+                    vec![Source::SetAside {
+                        head: head(4),
+                        on: at(6),
+                        by: SetAsideBy::Fork,
+                    }],
+                    Some("four\n"),
+                ),
+                held(
+                    at(7),
+                    vec![Source::SideLine {
+                        head: head(7),
+                        resumed: None,
+                    }],
+                    Some("seven\n"),
+                ),
+            ],
+            left_out: Vec::new(),
+            uploads: Some(Uploads {
+                uploaded: 0,
+                local: 2,
+            }),
+        };
+        let view = View::new(h, &k, agent, &HashMap::new());
+        let now = "two\n";
+        let current = || view.current(MemoryId::of(&k.current, agent, now), now);
+        // The count, then the three versions listed off the main line
+        // (two side lines and one set aside), then the pre-loss copy
+        assert_eq!(
+            view.where_lines(false, None),
+            [
+                uploads_line(
+                    Uploads {
+                        uploaded: 0,
+                        local: 2
+                    },
+                    false
+                )
+                .unwrap(),
+                side_line(3, true).unwrap(),
+                prior_line(stamp(9).date_naive()),
+            ]
+        );
+        // A chain whose beginning is on record says when, first
+        let began = stamp(1).date_naive();
+        let said = view.where_lines(false, Some(began));
+        assert_eq!(said.len(), 4);
+        assert_eq!(said[0], chain_began_line(began));
+        let out = view.log(None, None, &current());
+        assert!(!out.contains("your operator rebased"), "{out}");
+        assert!(out.contains("sealed, off your main line"), "{out}");
+        let said = view.show(&[r("030303030303")], None, current());
+        assert!(
+            said.starts_with(
+                "Head 030303030303 was not uploaded before your uploads were stopped, or was \
+                 saved while they were, and was set aside from your sealed history on \
+                 2026-11-05 when your operator resumed them; it was not uploaded; its memory is"
+            ),
+            "{said}"
+        );
+        let said = view.show(&[r("040404040404")], None, current());
+        assert!(
+            said.starts_with(
+                "Head 040404040404 was set aside from your sealed history on 2026-11-06 when your \
+                 operator resolved a fork in it, choosing the other line; its memory is"
+            ),
+            "{said}"
+        );
+        let said = view.show(&[r("070707070707")], None, current());
+        assert!(
+            said.starts_with(
+                "Head 070707070707 is sealed, but set aside from your sealed history: your \
+                 history goes on from another version;"
+            ),
+            "{said}"
+        );
+        let said = view.show(&[r("010101010101")], None, current());
+        assert!(
+            said.starts_with(
+                "Head 010101010101 is the copy of your memory from before the May 2026 loss, \
+                 added to your sealed history on 2026-11-09; its memory is"
+            ),
+            "{said}"
+        );
+    }
+
     fn head(n: u8) -> agora_agentkit::state::verify::HeadRef {
         agora_agentkit::state::verify::HeadRef {
             entry_hash: Sha256Hex::from([n; 32]),
@@ -1504,11 +2198,13 @@ mod tests {
                     vec![Source::SetAside {
                         head: head(5),
                         on: None,
+                        by: SetAsideBy::Rebase,
                     }],
                     Some("five\n"),
                 ),
             ],
             left_out: Vec::new(),
+            uploads: None,
         }
     }
 
@@ -1523,7 +2219,10 @@ mod tests {
             versions: vec![
                 held(
                     at(1),
-                    vec![Source::ArchivedPrior { head: head(1) }],
+                    vec![Source::ArchivedPrior {
+                        head: head(1),
+                        added: None,
+                    }],
                     Some("a much longer memory from before the loss\n"),
                 ),
                 held(
@@ -1533,6 +2232,7 @@ mod tests {
                 ),
             ],
             left_out: Vec::new(),
+            uploads: None,
         };
         let view = View::new(h, &k, agent, &HashMap::new());
         let now = "first\n";
@@ -1583,13 +2283,20 @@ mod tests {
         let said = view.show(&[r("050505050505")], None, current);
         assert!(
             said.starts_with(&format!(
-                "Head 050505050505 was set aside when your line was rebased; its memory is {}.",
+                "Head 050505050505 was set aside from your sealed history when your operator had \
+                 your history go on from another version; its memory is {}.",
                 MemoryId::of(&k.current, agent, "five\n")
             )),
             "{said}"
         );
         let said = view.show(&[r("020202020202")], None, current);
-        assert!(said.starts_with("Head 020202020202 is sealed off your main line, with no record of why; its memory is mem-"), "{said}");
+        assert!(
+            said.starts_with(
+                "Head 020202020202 is sealed, but set aside from your sealed history; your \
+                 runner's files don't say why; its memory is mem-"
+            ),
+            "{said}"
+        );
 
         // The memory in context whose sealed version couldn't be opened,
         // named by its local twin: still placed, still reachable by id
