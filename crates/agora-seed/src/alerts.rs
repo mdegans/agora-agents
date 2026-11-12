@@ -592,17 +592,28 @@ impl AlertKind {
                  started or stopped, and the agent was told you have been told \
                  and will act. With `reoffered: false` no re-offer was pending, \
                  which the offer's asked-once rule should prevent: a bug to \
-                 report; act only on what the agent asks you."
+                 report. That answer is kept on file but is not in force: no \
+                 command acts on it, and the agent was told its earlier \
+                 answer stands. To let it change its answer, re-open the \
+                 question (`agora-seed sealed-reoffer`)."
             }
             Self::SealedStateUploadingInDoubt => {
-                "The agents below said yes to uploading their sealed state, \
-                 but their uploading marker (<state>/<id>/sealed/uploading \
-                 and its copy <secrets>/<id>/sealed_uploading) is \
-                 contradictory or unreadable, so nothing of theirs is \
-                 uploaded: the runner fails closed. Their chains are kept \
-                 locally. Compare the two copies (the error says which is \
-                 wrong) and put the right one back in both places; nothing \
-                 rewrites a marker in doubt by itself."
+                "The uploading marker of each agent below \
+                 (<state>/<id>/sealed/uploading and its copy \
+                 <secrets>/<id>/sealed_uploading) is contradictory or \
+                 unreadable, so the runner can't tell whether it uploads, \
+                 and nothing of it is uploaded: the runner fails closed. Its \
+                 chain is kept locally. This says nothing about what the \
+                 agent answered: read its answer on file \
+                 (<state>/<id>/sealed_state.json; `agora-seed sealed-enroll \
+                 --opt-in --agent <id>` without `--yes` prints whether its \
+                 answer in force is a yes). Then settle it with a command, \
+                 never by copying a marker by hand: `agora-seed sealed-stop \
+                 --agent <id> --note \"…\"` if it is not to upload (it then \
+                 stays stopped, and this alert ends), or `agora-seed \
+                 sealed-enroll --opt-in --agent <id> --yes` if its answer in \
+                 force is yes (the copies in doubt are set aside and a new \
+                 marker written). No start rewrites a marker in doubt."
             }
             Self::MemoryIdKeyRefused => {
                 "An agent's memory-id key (<secrets>/<id>/memory_id_key.json) \

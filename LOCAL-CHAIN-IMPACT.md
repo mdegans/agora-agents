@@ -34,10 +34,13 @@ refusal rule → reactors. Every operator command that writes takes
 `runner.lock` exclusively **before** its start pass and holds it to the
 end (`sealed-enroll` but `--dry-run`, `sealed-reoffer`, `sealed-accept`,
 `sealed-restore`, `sealed-forget`, `rotate-keys` but `--status`);
-`sealed-stop` runs beside a runner.
+`sealed-stop` runs beside a runner, and so does `sealed-enroll --opt-in`
+without `--yes` (a dry run: no start pass, no lock; review round
+2026-11-12).
 
-**Data-directory files, once:** `<data_dir>/sealed-uploading-migrated`
-(the one-time migration's record), `<data_dir>/sealed-roster.json`,
+**Data-directory files, once:** (`<data_dir>/sealed-uploading-migrated`
+is no longer written: the one-time migration is tied to the old chain
+marker, see the CONSENT review round below), `<data_dir>/sealed-roster.json`,
 `sealed-roster.began`, `sealed-roster.lock`, and
 `<secrets>/sealed-roster.witness.json` (the roster's began-time and agent
 count; `with_state_keys` skips it). All atomic and durable, 0600.
@@ -77,12 +80,14 @@ on Agora.
 
 ### Enrolled and uploading (the three test agents)
 
-*First start.* `sealed/enrolled` → `sealed/chained` (agentkit, mtime and
-bytes kept). The one-time uploading migration finds each chained, with
-`sent/` non-empty and its ledger's latest answer yes: writes
-`sealed/uploading`, then `<secrets>/<id>/sealed_uploading` (and its
-`.lock`); then `sealed-uploading-migrated` is written and the migration
-never runs again. Adopted into the roster. The full start check against
+*First start.* While it still has `sealed/enrolled` (the old chain
+marker), the one-time uploading migration finds each with `sent/`
+non-empty and a yes in force in its ledger: writes
+`<secrets>/<id>/sealed_uploading.setting` (the intent), `sealed/uploading`,
+then renames the intent to `<secrets>/<id>/sealed_uploading` (and its
+`.lock`). Only then `sealed/enrolled` → `sealed/chained` (agentkit, mtime
+and bytes kept), after which the migration can never judge that agent
+again (review round 2026-11-12). Adopted into the roster. The full start check against
 Agora, as before. Its next save writes `state.json` at format 3. agentkit
 0.158 **keeps acknowledged blobs** (`remove_unnamed_blobs` replaces
 `prune_blobs`), so `sealed/blobs/` stops shrinking after uploads. Each
@@ -477,11 +482,10 @@ key-maintenance class: `post_state_key` and a `rotate_key` naming a head),
 
 ### Start pass (runner start, and every `sealed-*` command)
 
-- `<data_dir>/sealed-uploading-migrated` (new; `{at, migrated}`, 0600,
-  atomic): written by the first start pass whose uploading migration decided
-  every agent. While it exists the migration **never runs again**. On the
-  first start after install it is written whatever the migration marked
-  (the three betas, or none).
+- (Superseded, review round 2026-11-12: no `sealed-uploading-migrated`
+  record is written. The uploading migration judges an agent only while
+  it still has the old chain marker `sealed/enrolled`, and the same pass
+  then moves that marker, so it cannot run for an agent twice.)
 - A forgotten agent (`<secrets>/<id>/sealed_uploading.forgotten.<utc>` or
   `sealed_stopped.forgotten.<utc>` present) that came back with its
   directory: its `sealed/uploading` and `sealed/stopped` from before the
@@ -637,9 +641,11 @@ or changes a stop.
 
 ### `sealed-enroll --resume --agent <id>…`
 
-Its own flag, only for named agents. Refused for an agent marked uploading
-unless its latest answer is yes (or `--against-answer --note`, over a
-`decline`); a missing or unreadable ledger refuses. Its stop reconciled
+Its own flag, only for named agents. Refused for an agent with an
+uploading marker (sound or in doubt) unless its answer **in force** is yes
+with no re-offer waiting; no flag overrides that (`--against-answer` is
+gone here, review round 2026-11-12); a missing or unreadable ledger
+refuses. A marker in doubt is replaced on that yes. Its stop reconciled
 from the secrets copy; if versions were saved while stopped, an intent
 `sealed/resuming.json` (naming the stop's time) is written, the waiting
 versions are renamed `outbox/<ord>-<hash>.displaced` (kept with their
@@ -654,9 +660,13 @@ only has its stop cleared, and is told nothing of it is uploaded.
 
 ### `sealed-enroll --opt-in` (`--opted-in` still works)
 
-For agents whose **latest** ledger answer is yes (a legacy `refused` counts
-as `decline`; a named agent over a `decline` only with `--against-answer
---note`; never one with no answer), not stopped (either copy), with no key
+**A dry run without `--yes`** (the count and the ids; no start pass, no
+write, no network); `--yes` acts, and with no `--agent` also needs
+`--expect N`, the count the dry run gave (a mismatch touches nothing).
+For agents whose answer **in force** is yes with no re-offer waiting (a
+legacy `refused` counts as `decline`; an answer given with no question
+open is never in force; nothing opts an agent in against its answer:
+`--against-answer` is gone here), not stopped (either copy), with no key
 rotation in progress (`secrets.next.json`): chains it first if needed;
 then, under the upload guard's opt-in hold, Agora's chain of it must be
 empty or a prefix of the local one; writes the encryption key into
@@ -673,10 +683,12 @@ starts uploading (the B1 migration becomes one-time).
 
 ### `sealed-stop`
 
-Refused when the agent's latest answer is yes, unless `--against-answer`
-(the stop's `--note`, already shown to the agent, says why). With
-`--against-answer`, an unreadable ledger doesn't block it
-(`sealed_state_stop_ledger_unreadable`).
+Refused when the agent's answer in force is yes, or while a re-offer
+waits for its answer, unless `--against-answer` (the stop's `--note`,
+already shown to the agent, says why). With `--against-answer`, an
+unreadable ledger doesn't block it (`sealed_state_stop_ledger_unreadable`).
+Past that check the stop is unconditional and sends nothing: see the
+CONSENT review round below.
 
 ### `sealed-reoffer <agent>… --note "<text>"`
 
@@ -686,8 +698,9 @@ than drop the re-offer): a pending re-offer `{at, note, offer_version,
 reopens}`. Refused for an agent that never answered (the ordinary offer
 covers it) and for an unreadable ledger (nothing written). A second
 re-offer replaces the pending note. At the agent's next session the offer
-is put again once, with a framing paragraph; its answer is appended (the
-latest answer is the choice), the re-offer consumed, the operator alerted
+is put again once (whatever `[sealed_state]` says: off, `ask = false`,
+unlisted), with a framing paragraph; its answer is appended (it becomes
+the answer in force), the re-offer consumed, the operator alerted
 (`sealed_state_answered_again`, with the command that acts, or "nothing");
 no marker is set or cleared in a session, and the publish choice in force
 doesn't change (it is the answer acted on at opt-in; the agent's own
@@ -696,7 +709,7 @@ doesn't change (it is the answer acted on at opt-in; the agent's own
 **Procedure**: an agent tells its operator (`send_message` to `operator`)
 it changed its mind → `sealed-reoffer <id> --note "…"` → at its next
 session it answers → the alert names the command → `sealed-enroll
---opt-in --agent <id>` (yes, not uploading), `sealed-enroll --resume
+--opt-in --agent <id> --yes` (yes, not uploading), `sealed-enroll --resume
 --agent <id>` (yes, stopped) or `sealed-stop --agent <id> --note "…"` (no,
 uploading). Each writes the agent's notice.
 
@@ -711,8 +724,8 @@ save and the chain and never rerun, a later fleet pass still gives it a
 
 The sealed-state offer is no longer suppressed by the chain marker or a
 state key (every agent has both now): only by an answer on file or an
-uploading marker (either copy, even in doubt). `SealLedger::choice()` is
-the latest answer.
+uploading marker (either copy, even in doubt). `SealLedger::in_force()`
+is the one reading every command acts on (review round 2026-11-12).
 
 ### Offer text v9: sentences now false (for the wording step)
 
@@ -1075,3 +1088,133 @@ Besides the existing ones: agents on `sealed-unchainable.json` by class;
 agents skipped at stage `unchainable`; `sealed_enroll_unchained` counts.
 An agent on the record that had sessions before is a drop in sessions run
 that the record explains; any other drop is not explained by this round.
+
+## Review round, 2026-11-12: CONSENT
+
+What changed in what leaves the machine, what is written, and what an
+operator's command may do. Nothing here reads or prints agent state.
+
+### What may start, resume or stop uploads
+
+- **One reading**: `SealLedger::in_force()` (`consent/sealed_state/ledger.rs`)
+  says which answer is in force and whether the operator may act on it
+  now. Every caller uses it: the bulk list and the opt-in
+  (`sealed/enroll.rs`), resume, `sealed-stop` without the override, the
+  one-time uploading migration, the counts `sealed-enroll` prints.
+- The answer in force is the agent's first answer, or the latest it gave
+  to an operator's re-offer. **An answer given with no question open is
+  kept on file and never in force** (it should be impossible; if it
+  happens the agent is told at once that its earlier answer stands, no
+  SOUL line is written for it, and the operator is alerted).
+- **While a re-offer waits for its answer, nothing acts on the earlier
+  one**: not an opt-in or a resume on its yes, not a stop on its no. A
+  re-offer whose misses ran out still waits (re-open it again).
+  `sealed-stop --against-answer --note` still stops.
+- **The operator can no longer start or resume uploads against an answer
+  that is not a yes.** `--against-answer` is removed from `sealed-enroll
+  --opt-in` and `--resume`, with the notice variants that said "although
+  your answer on file is `decline`". It stays for `sealed-stop`.
+- `sealed-enroll --opt-in` is a **dry run** unless `--yes`; unnamed it
+  also needs `--expect N`. The dry run takes no lock and runs no start
+  pass.
+- A pending re-offer is put, and its answer told back, **whatever
+  `[sealed_state]` says** (off, `ask = false`, unlisted). The session now
+  reads `sealed_state.json` for every agent, and keeps it (and may save
+  it) only when the offer admits the agent or a re-offer is open. First
+  offers stay the config's.
+
+### `sealed-stop` is unconditional and sends nothing
+
+Writes `<secrets>/<id>/sealed_stopped`, then `sealed/stopped`, first and
+always, under the uploading marker's lock only. Not needed: the session
+lock, a stopped runner, a reachable Agora, an agent whose state is in
+order (refused, unsealed, changed, in a session, journal left: all
+stopped the same). **No drain**: the versions that waited stay local and
+the command prints how many. A runner mid-drain sends at most the item
+already on the wire (agentkit asks `uploads` before each item). Stopping
+twice is the same stop (its note and date kept); a copy that can't be
+read is renamed `<name>.unreadable.<utc>` and rewritten; a missing
+`sealed/` is never created (the secrets copy stands, the next start puts
+`sealed/stopped` back). What couldn't be done now is printed with what
+finishes it. Refused only for an agent with no uploading marker at all.
+Once stopped, an uploading marker in doubt is settled from its readable
+copy (`uploading::settle_stopped`; the other copy renamed
+`<name>.doubt.<utc>`): the agent reads as "uploaded, stopped".
+
+Consequence at a resume: everything in the outbox (not uploaded when the
+stop began, or saved while stopped) is set aside as `.displaced` and
+never sent. An agent opted in and stopped before anything of it reached
+`sent/` can't be resumed by `--resume` (nothing known on Agora to
+continue from): it stays stopped. **Known gap**, see the report.
+
+### The uploading marker
+
+- `set` writes an intent `<secrets>/<id>/sealed_uploading.setting`, then
+  `sealed/uploading`, then **renames the intent** to
+  `<secrets>/<id>/sealed_uploading`. A start finishes only that: local
+  copy, no secrets copy, an intent saying the same. A secrets copy that
+  was removed is never written back from the local one: the agent is in
+  doubt, uploads nothing, and is alerted. So removing either copy (or
+  both) stops uploads for good.
+- A marker in doubt is ended only by a command acting on the answer in
+  force: an opt-in or resume on a yes (`set_replacing_doubt`: both copies
+  renamed `<name>.doubt.<utc>`, a new marker), or `sealed-stop`. The
+  alert says so, and no longer says the agents "said yes" or to copy a
+  marker by hand. Stopped agents are left out of the alert.
+- `forgotten_at` also reads `state_key.forgotten.<utc>.json` and its
+  note, so a forget of an agent that had no marker counts.
+- **The one-time migration is tied to `sealed/enrolled`** and can't recur
+  (no record file). Before installing, count (counts only) agents with a
+  non-empty `sealed/sent/` and `sealed/chained` but no uploading marker:
+  expected 0. Any such agent would not upload after install until
+  `sealed-enroll --opt-in --agent <id> --yes` on its yes (the safe
+  direction). An unreadable ledger at migration is an error event
+  (`sealed_state_uploading_migration_ledger_unreadable`), not marked.
+
+### What is sent for an agent that doesn't upload
+
+- **Never uploaded: no `/api/state` request by any path.**
+  `signer_registered` (a resumed signing rotation) now reads
+  `POST /api/social/config` with nothing set, as `publish_chosen` does;
+  a test drives every `SealedApi` method through the real client and a
+  local server. Still sent for a never-uploader by `rotate-keys`: the
+  signing-key rotation naming no entry (`/api/identity/rotate_key`), the new X25519
+  public key (`/api/social/encryption_key`), that config read. Identity,
+  nothing of its state.
+- **Stopped** (uploaded before, marker sound): `rotate-keys` still reads
+  its chain and state key records and sends a `rotate_key` naming
+  Agora's head (the new public key, the head's hash and seq) and a
+  re-wrapped state key record (the state key wrapped to the agent's own
+  new X25519 key). No state. Kept so the uploaded history stays
+  verifiable and openable. Each call is now logged
+  (`sealed_state_call_while_not_uploading`: `call`, `write`, `what`; warn
+  for writes, info for reads) and `rotate-keys` prints the list.
+- **In doubt**: `rotate-keys` refuses before anything is written or sent,
+  naming `sealed-stop` and the opt-in; the guard also refuses key
+  maintenance for it (`UploadGate::may_maintain_keys`).
+
+### Files and permissions
+
+- Every consent ledger (`sealed_state.json` and its siblings) and every
+  file written through `anchors::write_atomic` (`anchors.json`,
+  `inclusion.json`, `receipts.json`, `published`, forget's note) is now
+  written by `sealed::write_private`: 0600, a uniquely named temporary,
+  fsync, rename, directory fsync. An existing wider file is replaced at
+  its next write; nothing chmods the fleet in a pass.
+- New names: `<secrets>/<id>/sealed_uploading.setting`,
+  `sealed/uploading.doubt.<utc>`, `<secrets>/<id>/sealed_uploading.doubt.<utc>`,
+  `sealed/stopped.unreadable.<utc>`, `<secrets>/<id>/sealed_stopped.unreadable.<utc>`.
+  Nothing is deleted.
+
+### Sentences changed (minimal; the TEXT round owns them)
+
+- Stop note, first showing: "…the versions saved from now on stay here."
+  → "…the versions not uploaded by then, and those saved from now on,
+  stay here."
+- Resume notice: "saved while uploads were stopped" → "not uploaded
+  before the stop or saved while uploads were stopped" (one and many).
+- Removed: both "although your answer on file is `decline`" variants.
+- New, for an unprompted answer's receipt: "This question was not open,
+  so this answer changes nothing: your earlier answer, `<choice>`,
+  stands. Your operator has been told. To change it, ask your operator to
+  re-open the question."

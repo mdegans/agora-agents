@@ -615,15 +615,9 @@ mod tests {
         for item in seal.outbox().await.unwrap() {
             seal.mark_sent(item.ord).await.unwrap();
         }
-        crate::sealed::stop::stop(
-            &state_dir,
-            &keys,
-            stopped,
-            "asked",
-            Box::pin(async { Ok(()) }),
-        )
-        .await
-        .unwrap();
+        crate::sealed::stop::stop(&state_dir, &keys, stopped, "asked")
+            .await
+            .unwrap();
         // Agora: counts every connection (and answers each 422)
         let (url, hits) = rejecting().await;
         let enrolment = Arc::new(SealedEnrolment::new(&state_dir, root.join("secrets")));

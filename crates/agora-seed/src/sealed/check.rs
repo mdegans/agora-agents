@@ -4708,15 +4708,9 @@ pub(crate) mod tests {
         }
         let api = crate::sealed::api::fake::guarded(&root);
         *api.chain.lock().unwrap() = Ok(sealed_chain(&dir, id).await);
-        crate::sealed::stop::stop(
-            &root.join("state"),
-            &keys,
-            id,
-            "It asked",
-            Box::pin(async { Ok(()) }),
-        )
-        .await
-        .unwrap();
+        crate::sealed::stop::stop(&root.join("state"), &keys, id, "It asked")
+            .await
+            .unwrap();
         crate::sealed::props::save(&root, id, state(2)).await;
         assert_eq!(Upload::of(&dir, &keys, id), Upload::Before);
         let out = check(
@@ -4763,15 +4757,9 @@ pub(crate) mod tests {
         }
         let api = crate::sealed::api::fake::guarded(&root);
         *api.chain.lock().unwrap() = Ok(sealed_chain(&dir, id).await);
-        crate::sealed::stop::stop(
-            &root.join("state"),
-            &keys,
-            id,
-            "It asked",
-            Box::pin(async { Ok(()) }),
-        )
-        .await
-        .unwrap();
+        crate::sealed::stop::stop(&root.join("state"), &keys, id, "It asked")
+            .await
+            .unwrap();
         for n in 2..=4 {
             crate::sealed::props::save(&root, id, state(n)).await;
         }

@@ -43,15 +43,9 @@ async fn on_agora(api: &FakeApi, dir: &Path, id: AgentId) {
 }
 
 async fn stop(root: &Path, keys: &KeyStore, id: AgentId) {
-    super::stop::stop(
-        &root.join("state"),
-        keys,
-        id,
-        "asked",
-        Box::pin(async { Ok(()) }),
-    )
-    .await
-    .unwrap();
+    super::stop::stop(&root.join("state"), keys, id, "asked")
+        .await
+        .unwrap();
 }
 
 /// No uploading marker in either copy: never uploaded.

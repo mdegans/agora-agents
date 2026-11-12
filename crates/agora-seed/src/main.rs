@@ -4489,15 +4489,9 @@ mod tests {
         for item in seal.outbox().await.unwrap() {
             seal.mark_sent(item.ord).await.unwrap();
         }
-        sealed::stop::stop(
-            &state_dir,
-            &keys,
-            id,
-            "It asked",
-            Box::pin(async { Ok(()) }),
-        )
-        .await
-        .unwrap();
+        sealed::stop::stop(&state_dir, &keys, id, "It asked")
+            .await
+            .unwrap();
         let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
             .await
             .unwrap();
@@ -4562,7 +4556,8 @@ mod tests {
                 && seat.lines[0].ends_with(
                     ": It asked. The versions already uploaded stay on Agora. Your state is \
                      still sealed and checked at the start of each session, here on your \
-                     runner; the versions saved from now on stay here."
+                     runner; the versions not uploaded by then, and those saved from now on, \
+                     stay here."
                 ),
             "{:?}",
             seat.lines
@@ -4775,11 +4770,12 @@ mod tests {
             sealed::cli::Command::SealedEnroll {
                 agents: Vec::new(),
                 opt_in: false,
+                yes: false,
+                expect: None,
                 dry_run: false,
                 jobs: Some(2),
                 note: None,
                 resume: false,
-                against_answer: false,
                 begin_roster: false,
             },
             &root,

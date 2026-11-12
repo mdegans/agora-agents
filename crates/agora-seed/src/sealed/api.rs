@@ -44,7 +44,9 @@ pub trait SealedApi: Send + Sync {
         public: &EncryptionPublicKey,
     ) -> Result<(), String>;
     /// Whether the server takes `key` as the agent's signing key now: a
-    /// signed read with it. For a rotation whose answer was lost.
+    /// signed read with it, of the agent's account settings and never of
+    /// `/api/state` (an agent that never uploaded has nothing there, and
+    /// asks nothing there). For a rotation whose answer was lost.
     async fn signer_registered(&self, id: AgentId, key: &SigningKey) -> Result<bool, String>;
     /// The rotations the server lists. Advisory: never trusted.
     async fn rotations(&self, id: AgentId, key: &SigningKey) -> Result<Vec<KeyRotation>, String>;
@@ -190,7 +192,13 @@ impl SealedApi for Client {
     }
 
     async fn signer_registered(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
-        match self.get_state_head(auth(id, key)).await {
+        // `config` with nothing set: a signed read that changes nothing
+        // and names nothing of the agent's sealed state, as
+        // `publish_chosen` uses it
+        match self
+            .config(id, key, &agora_agentkit::requests::ConfigInput::default())
+            .await
+        {
             Ok(_) => Ok(true),
             Err(agora_agentkit::client::Error::Status { status, .. })
                 if matches!(status.as_u16(), 401 | 403) =>
@@ -363,7 +371,9 @@ impl Call {
     /// head, and a wrap of the state key to the agent's own X25519 key.
     /// Sends no state and no choice, and without them a stopped agent's
     /// chain on Agora could not be verified (a rotation) or opened (a
-    /// re-wrap after an X25519 rotation). Passes as a read does.
+    /// re-wrap after an X25519 rotation). Passes for an agent that
+    /// uploads or is stopped ([`UploadGate::may_maintain_keys`]); never
+    /// for one whose uploading marker is in doubt.
     pub fn is_key_maintenance(self) -> bool {
         matches!(self, Self::RotateKeyAtHead | Self::PostStateKey)
     }
@@ -393,6 +403,11 @@ pub trait UploadGate: Send + Sync {
     /// ([`super::uploading::has_uploaded`]: a marker naming it in either
     /// copy, stopped or not, contradictory or not).
     fn may_read(&self, id: AgentId) -> bool;
+    /// May send key maintenance ([`Call::is_key_maintenance`]) for the
+    /// chain it has on Agora: its uploading marker is sound (both copies
+    /// agree, or the secrets copy stands alone), stopped or not. A marker
+    /// in doubt sends nothing: its operator settles it first.
+    fn may_maintain_keys(&self, id: AgentId) -> bool;
 }
 
 impl<G: UploadGate> UploadGate for std::sync::Arc<G> {
@@ -401,6 +416,9 @@ impl<G: UploadGate> UploadGate for std::sync::Arc<G> {
     }
     fn may_read(&self, id: AgentId) -> bool {
         (**self).may_read(id)
+    }
+    fn may_maintain_keys(&self, id: AgentId) -> bool {
+        (**self).may_maintain_keys(id)
     }
 }
 
@@ -445,8 +463,14 @@ impl From<LocalOnly> for BlobError {
 /// |---|---|
 /// | **write**: `publish_chosen`, `post_anchor` | the agent uploads ([`UploadGate::may_send`]: marked uploading, not stopped) |
 /// | **read**: `chain`, `head`, `head_known`, `state_keys`, `rotations`, `blob`, `proofs` ([`Call::is_read`]) | the agent has ever uploaded ([`UploadGate::may_read`]: a marker naming it in either copy; stopped or in doubt, it can still be restored from, and read back, what is on Agora) |
-/// | **key maintenance**: `post_state_key`, a `rotate_key` naming a head ([`Call::is_key_maintenance`]) | as a read: `rotate-keys` on a stopped agent keeps its chain on Agora verifiable and openable; no state or choice is sent |
-/// | `anchor_data`, `register_encryption_key`, `signer_registered`, a `rotate_key` naming no head | always: the public governance log, and the agent's identity on Agora, which every agent has |
+/// | **key maintenance**: `post_state_key`, a `rotate_key` naming a head ([`Call::is_key_maintenance`]) | the agent uploads or is stopped, its marker sound ([`UploadGate::may_maintain_keys`]): `rotate-keys` on a stopped agent keeps its chain on Agora verifiable and openable; no state or choice is sent. Never for a marker in doubt |
+/// | `anchor_data`, `register_encryption_key`, `signer_registered`, a `rotate_key` naming no head | always: the public governance log, and the agent's identity on Agora, which every agent has. None of them touches `/api/state` |
+///
+/// **What is sent for an agent that doesn't upload** (stopped, or never
+/// uploaded: a read, key maintenance, an identity call) is logged, one
+/// `sealed_state_call_while_not_uploading` event each saying what went,
+/// and kept for the command to print ([`Self::recording`],
+/// [`Self::sent_while_not_uploading`]).
 ///
 /// An agent with no marker in either copy makes no sealed-state call at
 /// all: nothing of it is on Agora to read.
@@ -461,6 +485,9 @@ pub struct UploadGuard<A, E> {
     inner: A,
     enrolment: E,
     opting_in: std::sync::Mutex<std::collections::HashSet<AgentId>>,
+    /// The calls that went for agents that don't upload, when a command
+    /// asked for them to be kept ([`Self::recording`]).
+    quiet: Option<std::sync::Mutex<Vec<Sent>>>,
     /// Tests: a refused call panics, failing the test that made it.
     #[cfg(test)]
     strict: bool,
@@ -472,8 +499,71 @@ impl<A, E: UploadGate> UploadGuard<A, E> {
             inner,
             enrolment,
             opting_in: Default::default(),
+            quiet: None,
             #[cfg(test)]
             strict: false,
+        }
+    }
+
+    /// Keep what goes to Agora for agents that don't upload, for the
+    /// command to print ([`Self::sent_while_not_uploading`]). For the
+    /// one-shot commands: a runner only logs them.
+    pub fn recording(mut self) -> Self {
+        self.quiet = Some(Default::default());
+        self
+    }
+
+    /// What went to Agora for `id` while it didn't upload, in order.
+    pub fn sent_while_not_uploading(&self, id: AgentId) -> Vec<Sent> {
+        self.quiet.as_ref().map_or_else(Vec::new, |q| {
+            q.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|s| s.id == id)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// `call` is about to go to Agora for `id`: if the agent doesn't
+    /// upload (and isn't being opted in), say exactly what goes.
+    fn sending(&self, id: AgentId, call: &'static str, write: bool, what: impl FnOnce() -> String) {
+        if self.enrolment.may_send(id)
+            || self
+                .opting_in
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&id)
+        {
+            return;
+        }
+        let what = what();
+        if write {
+            tracing::warn!(
+                event_type = "sealed_state_call_while_not_uploading",
+                agent_id = %id,
+                call,
+                write,
+                what = %what,
+                "sent to Agora for an agent that doesn't upload: no state, no choice"
+            );
+        } else {
+            tracing::info!(
+                event_type = "sealed_state_call_while_not_uploading",
+                agent_id = %id,
+                call,
+                write,
+                what = %what,
+                "asked of Agora for an agent that doesn't upload: a read"
+            );
+        }
+        if let Some(q) = &self.quiet {
+            q.lock().unwrap_or_else(|e| e.into_inner()).push(Sent {
+                id,
+                call,
+                write,
+                what,
+            });
         }
     }
 
@@ -492,7 +582,9 @@ impl<A, E: UploadGate> UploadGuard<A, E> {
 
     /// Whether `call` for `id` may go to Agora.
     pub fn check(&self, id: AgentId, call: Call) -> Result<(), LocalOnly> {
-        let allowed = if call.is_read() || call.is_key_maintenance() {
+        let allowed = if call.is_key_maintenance() {
+            self.enrolment.may_send(id) || self.enrolment.may_maintain_keys(id)
+        } else if call.is_read() {
             self.enrolment.may_read(id)
         } else {
             self.enrolment.may_send(id)
@@ -537,6 +629,17 @@ impl<A, E: UploadGate> UploadGuard<A, E> {
     }
 }
 
+/// One call that went to Agora for an agent that doesn't upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sent {
+    pub id: AgentId,
+    pub call: &'static str,
+    /// Whether it wrote anything on Agora (else a read).
+    pub write: bool,
+    /// Exactly what went, for the operator. Never state.
+    pub what: String,
+}
+
 /// Tests read the fake behind the guard as the fake.
 #[cfg(test)]
 impl<A, E> std::ops::Deref for UploadGuard<A, E> {
@@ -570,6 +673,9 @@ where
 {
     async fn chain(&self, id: AgentId, key: &SigningKey) -> Result<Vec<SignedStateEntry>, String> {
         self.check(id, Call::Chain)?;
+        self.sending(id, "chain", false, || {
+            "a signed read of the entries Agora holds for the agent".into()
+        });
         self.inner.chain(id, key).await
     }
 
@@ -579,6 +685,9 @@ where
         key: &SigningKey,
     ) -> Result<Vec<StateKeyRecord>, String> {
         self.check(id, Call::StateKeys)?;
+        self.sending(id, "state_keys", false, || {
+            "a signed read of the agent's state key records on Agora".into()
+        });
         self.inner.state_keys(id, key).await
     }
 
@@ -589,6 +698,13 @@ where
         record: &StateKeyRecord,
     ) -> Result<(), String> {
         self.check(id, Call::PostStateKey)?;
+        self.sending(id, "post_state_key", true, || {
+            format!(
+                "a state key record (key generation {}, wrap {}): the agent's state key wrapped \
+                 to its own X25519 key, signed by it; no state",
+                record.key_gen, record.wrap_seq
+            )
+        });
         self.inner.post_state_key(id, key, record).await
     }
 
@@ -601,6 +717,18 @@ where
         if rotation.old_key_last.is_some() {
             self.check(id, Call::RotateKeyAtHead)?;
         }
+        self.sending(id, "rotate_key", true, || match &rotation.old_key_last {
+            Some(last) => format!(
+                "a signing-key rotation (seq {}): the new public key, and the last entry the \
+                 old key signed on Agora (head {} at seq {}); no state",
+                rotation.seq, last.entry_hash, last.seq
+            ),
+            None => format!(
+                "a signing-key rotation (seq {}): the new public key, naming no entry (the \
+                 agent's identity on Agora; nothing of its sealed state)",
+                rotation.seq
+            ),
+        });
         self.inner.rotate_key(id, old, rotation).await
     }
 
@@ -610,15 +738,28 @@ where
         key: &SigningKey,
         public: &EncryptionPublicKey,
     ) -> Result<(), String> {
+        self.sending(id, "register_encryption_key", true, || {
+            "the agent's new X25519 public key, signed (its identity on Agora; nothing of its \
+             sealed state)"
+                .into()
+        });
         self.inner.register_encryption_key(id, key, public).await
     }
 
     async fn signer_registered(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
+        self.sending(id, "signer_registered", false, || {
+            "a signed read of the agent's account settings, to learn which signing key Agora \
+             holds (nothing of its sealed state)"
+                .into()
+        });
         self.inner.signer_registered(id, key).await
     }
 
     async fn rotations(&self, id: AgentId, key: &SigningKey) -> Result<Vec<KeyRotation>, String> {
         self.check(id, Call::Rotations)?;
+        self.sending(id, "rotations", false, || {
+            "a signed read of the agent's key rotations on Agora".into()
+        });
         self.inner.rotations(id, key).await
     }
 
@@ -629,6 +770,9 @@ where
         sha256: &agora_agentkit::govlog::Sha256Hex,
     ) -> Result<Vec<u8>, BlobError> {
         self.check(id, Call::Blob)?;
+        self.sending(id, "blob", false, || {
+            format!("a signed read of the agent's sealed blob {sha256} from Agora")
+        });
         self.inner.blob(id, key, sha256).await
     }
 
@@ -639,6 +783,9 @@ where
         after: Option<GovernanceLogId>,
     ) -> Result<Vec<AnchorProof>, String> {
         self.check(id, Call::Proofs)?;
+        self.sending(id, "proofs", false, || {
+            "a signed read of the agent's anchor proofs".into()
+        });
         self.inner.proofs(id, key, after).await
     }
 
@@ -652,11 +799,17 @@ where
         key: &SigningKey,
     ) -> Result<Option<agora_agentkit::govlog::Sha256Hex>, String> {
         self.check(id, Call::Head)?;
+        self.sending(id, "head", false, || {
+            "a signed read of the agent's head on Agora".into()
+        });
         self.inner.head(id, key).await
     }
 
     async fn head_known(&self, id: AgentId, key: &SigningKey) -> Result<bool, String> {
         self.check(id, Call::HeadKnown)?;
+        self.sending(id, "head_known", false, || {
+            "a signed read of the agent's head on Agora".into()
+        });
         self.inner.head_known(id, key).await
     }
 
@@ -782,6 +935,37 @@ pub mod fake {
             )),
         )
         .strict()
+    }
+
+    /// A local server that records each request's line and answers 200
+    /// with an empty JSON object.
+    pub async fn recording_server() -> (url::Url, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]);
+                    if let Some(line) = head.lines().next() {
+                        record.lock().unwrap().push(line.to_string());
+                    }
+                    let body = "{}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
+                         {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/").parse().unwrap(), seen)
     }
 
     #[async_trait::async_trait]
@@ -972,10 +1156,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// One switch for every agent: whether it uploads (`.0`), and whether
-    /// it ever did (`.1`).
+    /// One switch for every agent: whether it uploads (`.0`), whether it
+    /// ever did (`.1`), and whether its marker is in doubt (`.2`).
     #[derive(Default)]
-    struct Switch(AtomicBool, AtomicBool);
+    struct Switch(AtomicBool, AtomicBool, AtomicBool);
 
     impl UploadGate for &Switch {
         fn may_send(&self, _: AgentId) -> bool {
@@ -983,6 +1167,9 @@ mod tests {
         }
         fn may_read(&self, _: AgentId) -> bool {
             self.1.load(Ordering::SeqCst)
+        }
+        fn may_maintain_keys(&self, _: AgentId) -> bool {
+            self.1.load(Ordering::SeqCst) && !self.2.load(Ordering::SeqCst)
         }
     }
 
@@ -1118,10 +1305,27 @@ mod tests {
             ]
         );
 
-        // Uploaded once, stopped (or a marker in doubt): reads, and key
-        // maintenance (a re-wrap, a rotation naming the head)
+        // Uploaded once, its marker in doubt: reads only. No key record,
+        // no rotation naming its head
         guard.calls.lock().unwrap().clear();
         switch.1.store(true, Ordering::SeqCst);
+        switch.2.store(true, Ordering::SeqCst);
+        let only_reads = [
+            "chain",
+            "state_keys",
+            "rotations",
+            "blob",
+            "proofs",
+            "head",
+            "head_known",
+        ];
+        assert_eq!(passed(&every_call(&guard, id, &key).await), only_reads);
+        assert_eq!(*guard.calls.lock().unwrap(), only_reads);
+
+        // Uploaded once, stopped, its marker sound: reads, and key
+        // maintenance (a re-wrap, a rotation naming the head)
+        guard.calls.lock().unwrap().clear();
+        switch.2.store(false, Ordering::SeqCst);
         let reads = [
             "chain",
             "state_keys",
@@ -1200,5 +1404,133 @@ mod tests {
         let guard = UploadGuard::new(FakeApi::new(), &switch).strict();
         let key = agora_agentkit::crypto::generate_keypair().0;
         let _ = guard.head(AgentId::new(), &key).await;
+    }
+
+    /// Every [`SealedApi`] method, through the real [`Client`] behind the
+    /// guard, for an agent that never uploaded: no request reaches any
+    /// `/api/state` path. What the guard lets through for it (its identity
+    /// on Agora, the public log) goes elsewhere.
+    #[tokio::test]
+    async fn no_api_state_path_is_reachable_for_an_agent_that_never_uploaded() {
+        let (url, seen) = super::fake::recording_server().await;
+        let switch = Switch::default();
+        let guard = UploadGuard::new(Client::new(url).unwrap(), &switch).recording();
+        let id = AgentId::new();
+        let key = agora_agentkit::crypto::generate_keypair().0;
+        // Each guarded call, then the ones the guard never refuses
+        let results = every_call(&guard, id, &key).await;
+        assert!(
+            results
+                .iter()
+                .all(|r| r.as_ref().is_err_and(|e| is_local_only(e))),
+            "{results:?}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        guard
+            .rotate_key(id, &key, &rotation(id, &key, false))
+            .await
+            .ok();
+        guard
+            .register_encryption_key(
+                id,
+                &key,
+                &agora_agentkit::envelope::EncryptionPublicKey::from(
+                    &agora_agentkit::envelope::generate_encryption_keypair().0,
+                ),
+            )
+            .await
+            .ok();
+        guard.signer_registered(id, &key).await.ok();
+        guard
+            .anchor_data(&"ANC-2026-0001".parse().unwrap())
+            .await
+            .ok();
+        let lines = seen.lock().unwrap().clone();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        for line in &lines {
+            assert!(!line.contains("/api/state"), "{line}");
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("/api/social/config")),
+            "the signer is asked of the account settings: {lines:?}"
+        );
+        // And each of those three per-agent calls was told
+        let told: Vec<&'static str> = guard
+            .sent_while_not_uploading(id)
+            .iter()
+            .map(|s| s.call)
+            .collect();
+        assert_eq!(
+            told,
+            ["rotate_key", "register_encryption_key", "signer_registered"]
+        );
+        // The same agent uploading: the state paths are reached (the
+        // server above is what proves the test can see them)
+        switch.0.store(true, Ordering::SeqCst);
+        switch.1.store(true, Ordering::SeqCst);
+        seen.lock().unwrap().clear();
+        guard.head(id, &key).await.ok();
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("/api/state")),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    /// What goes to Agora for a stopped agent is said exactly, call by
+    /// call; nothing is said for one that uploads, or one being opted in.
+    #[tokio::test]
+    async fn what_is_sent_for_a_stopped_agent_is_told() {
+        let switch = Switch::default();
+        let guard = UploadGuard::new(FakeApi::new(), &switch).recording();
+        let id = AgentId::new();
+        let key = agora_agentkit::crypto::generate_keypair().0;
+        switch.1.store(true, Ordering::SeqCst);
+        every_call(&guard, id, &key).await;
+        let sent = guard.sent_while_not_uploading(id);
+        let calls: Vec<&str> = sent.iter().map(|s| s.call).collect();
+        assert_eq!(
+            calls,
+            [
+                "chain",
+                "state_keys",
+                "post_state_key",
+                "rotate_key",
+                "rotations",
+                "blob",
+                "proofs",
+                "head",
+                "head_known"
+            ]
+        );
+        let writes: Vec<&Sent> = sent.iter().filter(|s| s.write).collect();
+        assert_eq!(writes.len(), 2);
+        assert!(writes[0].what.contains("wrap 0"), "{}", writes[0].what);
+        assert!(
+            writes[1].what.contains("at seq 3") && writes[1].what.contains("no state"),
+            "{}",
+            writes[1].what
+        );
+        assert!(guard.sent_while_not_uploading(AgentId::new()).is_empty());
+        // Uploading: nothing to tell
+        let other = AgentId::new();
+        switch.0.store(true, Ordering::SeqCst);
+        every_call(&guard, other, &key).await;
+        assert!(guard.sent_while_not_uploading(other).is_empty());
+        switch.0.store(false, Ordering::SeqCst);
+        switch.1.store(false, Ordering::SeqCst);
+        let opting = AgentId::new();
+        {
+            let _hold = guard.opting_in(opting);
+            every_call(&guard, opting, &key).await;
+        }
+        assert!(guard.sent_while_not_uploading(opting).is_empty());
     }
 }

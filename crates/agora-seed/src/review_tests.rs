@@ -15,11 +15,12 @@ fn enroll_command(dry_run: bool) -> sealed::cli::Command {
     sealed::cli::Command::SealedEnroll {
         agents: Vec::new(),
         opt_in: false,
+        yes: false,
+        expect: None,
         dry_run,
         jobs: Some(2),
         note: None,
         resume: false,
-        against_answer: false,
         begin_roster: false,
     }
 }

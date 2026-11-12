@@ -191,11 +191,14 @@ where
     /// The sealed-state answer about to be recorded, when it is not the
     /// agent's first: to its operator's re-offer, or (defensively) with
     /// none pending, which the offer's asked-once rule should make
-    /// impossible. Either way the operator is alerted with both answers and
-    /// what would act on the new one, and nothing changes here: no marker
-    /// is set or cleared in a session. The line added to the agent's
-    /// receipt, for a re-offer.
-    pub(super) fn sealed_answered_again(&mut self, choice: SealChoice) -> Option<&'static str> {
+    /// impossible. Either way the operator is alerted with both answers,
+    /// and nothing changes here: no marker is set or cleared in a session.
+    /// An answer to a re-offer becomes the answer in force, and the alert
+    /// names the command that acts on it. One with no question open is
+    /// kept on file and never in force (`SealLedger::in_force`): no
+    /// command acts on it, no SOUL line is written for it, and the agent
+    /// is told so. The line added to the agent's receipt.
+    pub(super) fn sealed_answered_again(&mut self, choice: SealChoice) -> Option<String> {
         let ledger = self.sealed.ledger.as_ref()?;
         let reoffered = ledger.reoffer.is_some();
         let was = match &ledger.reoffer {
@@ -214,7 +217,10 @@ where
         // `publish` against `private` is not the operator's: the agent's own
         // `config` tool changes it
         let act = match (yes, marked, stopped) {
-            (true, false, _) => Some(format!("agora-seed sealed-enroll --opt-in --agent {id}")),
+            _ if !reoffered => None,
+            (true, false, _) => Some(format!(
+                "agora-seed sealed-enroll --opt-in --agent {id} --yes"
+            )),
             (true, true, true) => Some(format!("agora-seed sealed-enroll --resume --agent {id}")),
             (false, true, false) => {
                 Some(format!("agora-seed sealed-stop --agent {id} --note \"…\""))
@@ -243,8 +249,10 @@ where
                 agent_id = %id,
                 was = was.as_str(),
                 now = choice.as_str(),
-                "a second sealed-state answer with no re-offer pending; recorded, nothing acts on it"
+                "a second sealed-state answer with no re-offer pending; kept on file, never in force: no command acts on it"
             );
+            // No SOUL line says the agent chose what is not in force
+            self.sealed.drop_edit();
         }
         self.rt.alerts.notify(
             Alert::new(
@@ -261,19 +269,32 @@ where
             .detail("reoffered", reoffered)
             .detail(
                 "act",
-                act.as_deref()
-                    .unwrap_or("nothing: its uploads already match the answer"),
+                match (&act, reoffered) {
+                    (Some(act), _) => act.as_str(),
+                    (None, true) => "nothing: its uploads already match the answer",
+                    (None, false) => {
+                        "nothing: this answer is not in force (no question was open); the \
+                         earlier answer stands"
+                    }
+                },
             ),
         );
         match (reoffered, act.is_some()) {
-            (false, _) => None,
+            (false, _) => Some(format!(
+                "This question was not open, so this answer changes nothing: your earlier \
+                 answer, `{}`, stands. Your operator has been told. To change it, ask your \
+                 operator to re-open the question.",
+                was.as_str()
+            )),
             (true, true) => Some(
                 "Your operator has been told, and acts on your answer; you'll be told when it \
-                 has. Nothing changes by this answer alone.",
+                 has. Nothing changes by this answer alone."
+                    .to_string(),
             ),
             (true, false) => Some(
                 "Your uploads already match this answer, so nothing needs to change; your \
-                 operator has been told.",
+                 operator has been told."
+                    .to_string(),
             ),
         }
     }
@@ -706,7 +727,7 @@ trait NotedOffer: Offering<Answer = Reply<Self::Choice>> {
     }
     /// Before `choice` is recorded over what the ledger holds: a line
     /// added to the receipt, if any.
-    fn before_record<A>(_agent: &mut ConsentAgent<A>, _choice: Self::Choice) -> Option<&'static str>
+    fn before_record<A>(_agent: &mut ConsentAgent<A>, _choice: Self::Choice) -> Option<String>
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
     {
@@ -759,7 +780,7 @@ impl NotedOffer for OfferQuestion<SealChoice, 3> {
     fn line(choice: SealChoice, _: chrono::NaiveDate) -> String {
         sealed_state::evolution_line(choice)
     }
-    fn before_record<A>(agent: &mut ConsentAgent<A>, choice: SealChoice) -> Option<&'static str>
+    fn before_record<A>(agent: &mut ConsentAgent<A>, choice: SealChoice) -> Option<String>
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
     {
@@ -861,7 +882,7 @@ where
             (None, Some(_)) => NoteFate::Added,
             (None, None) => NoteFate::None,
         };
-        self.seat_receipt_with(Q::KIND, choice.as_str(), fate, extra)?;
+        self.seat_receipt_with(Q::KIND, choice.as_str(), fate, extra.as_deref())?;
         Ok(Next::Continue)
     }
 

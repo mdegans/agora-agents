@@ -612,7 +612,7 @@ mod tests {
         row("uploading", &dir, &keys, id);
 
         let (id, keys, dir) = uploading().await;
-        crate::sealed::stop::stop(&state_dir, &keys, id, "asked", Box::pin(async { Ok(()) }))
+        crate::sealed::stop::stop(&state_dir, &keys, id, "asked")
             .await
             .unwrap();
         row("stopped after uploading", &dir, &keys, id);

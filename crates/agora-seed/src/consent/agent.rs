@@ -1959,24 +1959,29 @@ where
                 event_type = "sealed_state_not_listed",
                 agent = %self.inner.state().soul.name,
                 agent_id = %self.inner.id(),
-                "not on the sealed-state list (or ask = false); not asked"
+                "not on the sealed-state list (or ask = false); not asked, but for its operator's re-offer"
             );
         }
-        if self
+        // The ordinary offer is the config's: only a listed agent is asked.
+        // The operator's re-offer is its own act for this one agent: put
+        // (and its answer told back) whatever `[sealed_state]` says, off,
+        // `ask = false` and unlisted included. So the ledger is read for
+        // every agent, and kept for the session when either holds
+        let admitted = self
             .rt
             .sealed_state
             .as_ref()
-            .is_some_and(|o| o.admits(self.inner.id()))
-        {
-            match SealLedger::load(&dir).await {
-                Ok(ledger) => self.sealed.ledger = Some(ledger),
-                Err(e) => tracing::warn!(
-                    agent_id = %self.inner.id(),
-                    path = %SealLedger::path(&dir).display(),
-                    error = %e,
-                    "sealed-state ledger unreadable; not asking or saving this session"
-                ),
-            }
+            .is_some_and(|o| o.admits(self.inner.id()));
+        match SealLedger::load(&dir).await {
+            Ok(ledger) if admitted || ledger.reoffer_open() => self.sealed.ledger = Some(ledger),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                agent_id = %self.inner.id(),
+                path = %SealLedger::path(&dir).display(),
+                error = %e,
+                admitted,
+                "sealed-state ledger unreadable; not asking or saving this session"
+            ),
         }
         let interrupted = self.open_journal().await;
         let early = set_model.is_some();
@@ -8332,7 +8337,7 @@ mod tests {
         assert_eq!(agent.state().memory.content, memory);
         let ledger = sealed_ledger(&h).await;
         assert_eq!(ledger.choice(), Some(SealChoice::Private));
-        assert!(ledger.opted_in());
+        assert!(ledger.in_force().starts_uploads().is_ok());
         let seed = sealed_state::prompt::seed_for(h.id);
         assert_eq!(ledger.asks[0].order, sealed_state::prompt::order_for(seed));
 
@@ -8744,6 +8749,191 @@ mod tests {
             later.handle(reply("closing phase done")).await.unwrap(),
             Control::Continue,
             "put once"
+        );
+    }
+
+    /// The operator's re-offer is put, and its answer told back, whatever
+    /// `[sealed_state]` says: off, `ask = false`, or the agent unlisted.
+    /// The ordinary first offer stays the config's: an agent that never
+    /// answered is not asked while the offer doesn't admit it.
+    #[tokio::test]
+    async fn a_reoffer_is_put_whatever_the_offer_config_says() {
+        for config in ["off", "quiet", "unlisted"] {
+            let mut h = with_sealed(&format!("sealed-reoffer-{config}"), None);
+            let dir = h.rt.state_dir.join(h.id.to_string());
+            let mut agent = seated(&h).await;
+            agent
+                .handle(answer_call("sealed_state", "private", "", ""))
+                .await
+                .unwrap();
+            agent.on_teardown().await.unwrap();
+            let mut told = next_session(&h, &agent);
+            told.on_init().await.unwrap();
+            told.handle(reply("done")).await.unwrap();
+            told.on_teardown().await.unwrap();
+            assert!(sealed_ledger(&h).await.acknowledged);
+            sealed_state::reoffer(&dir, h.id, "Asked to by DM.")
+                .await
+                .unwrap();
+            // The offer no longer admits the agent
+            let state: SeedState =
+                serde_json::from_value(serde_json::to_value(told.state()).unwrap()).unwrap();
+            drop((agent, told));
+            let rt = Arc::get_mut(&mut h.rt).unwrap();
+            rt.sealed_state = match config {
+                "off" => None,
+                "quiet" => {
+                    let c: sealed_state::SealedStateConfig = toml::from_str(&format!(
+                        "enabled = true\nask = false\nagents = [\"{}\"]\n",
+                        h.id
+                    ))
+                    .unwrap();
+                    Some(c.resolve().unwrap().unwrap())
+                }
+                _ => Some(sealed_state::SealedOffer::for_agents(&[AgentId::new()])),
+            };
+            assert!(
+                !h.rt.sealed_state.as_ref().is_some_and(|o| o.admits(h.id)),
+                "{config}"
+            );
+            let mut again = {
+                let mut state = state;
+                state.prompt.messages.clear();
+                ConsentAgent::new(
+                    h.id,
+                    state,
+                    ConsentContext {
+                        inner: Quirks::default(),
+                        consent: h.rt.clone(),
+                    },
+                )
+                .unwrap()
+            };
+            again.on_init().await.unwrap();
+            assert_eq!(
+                again.handle(reply("closing phase done")).await.unwrap(),
+                Control::Continue,
+                "{config}: the re-offer is put"
+            );
+            let q = last_user_text(&again);
+            assert!(
+                q.contains("**Asked again, at your operator's request.**"),
+                "{config}: {q}"
+            );
+            again
+                .handle(answer_call("sealed_state", "decline", "", ""))
+                .await
+                .unwrap();
+            again.on_teardown().await.unwrap();
+            let ledger = sealed_ledger(&h).await;
+            assert!(ledger.reoffer.is_none(), "{config}: consumed");
+            assert_eq!(
+                ledger.in_force().stops_uploads(),
+                Ok(()),
+                "{config}: its answer is in force"
+            );
+            // Its answer told back at the next session, the config as it is
+            let mut later = next_session(&h, &again);
+            later.on_init().await.unwrap();
+            let seen = serde_json::to_string(&later.prompt().messages).unwrap();
+            assert!(
+                seen.contains("question your operator re-opened is recorded: decline"),
+                "{config}: {seen}"
+            );
+            later.handle(reply("done")).await.unwrap();
+            later.on_teardown().await.unwrap();
+            assert!(sealed_ledger(&h).await.acknowledged, "{config}");
+            // Nothing more of the re-offer: the ledger is left alone again
+            let mut quiet = next_session(&h, &later);
+            quiet.on_init().await.unwrap();
+            assert!(quiet.sealed.ledger.is_none(), "{config}");
+            assert_ne!(
+                quiet.handle(reply("closing phase done")).await.unwrap(),
+                Control::Continue,
+                "{config}: not asked again"
+            );
+        }
+        // Never answered, not admitted: the first offer is the config's
+        let mut h = with_sealed("sealed-first-offer-off", None);
+        Arc::get_mut(&mut h.rt).unwrap().sealed_state = None;
+        let mut agent = anthropic_agent(&h);
+        agent.on_init().await.unwrap();
+        assert!(agent.sealed.ledger.is_none());
+        assert_ne!(
+            agent.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "no first offer while the config is off"
+        );
+    }
+
+    /// An answer that arrives with no question open (which nothing should
+    /// let happen) is kept on file and changes nothing: the answer in
+    /// force stands, no SOUL line claims otherwise, the agent is told so
+    /// at once, and its operator is alerted.
+    #[tokio::test]
+    async fn an_unprompted_second_answer_is_never_in_force() {
+        let mut h = with_sealed("sealed-unprompted", None);
+        let sent = crate::alerts::testing::Recorder::default();
+        Arc::get_mut(&mut h.rt).unwrap().alerts = crate::alerts::testing::recording(&h.root, &sent);
+        let mut agent = seated(&h).await;
+        agent
+            .handle(answer_call("sealed_state", "decline", "", ""))
+            .await
+            .unwrap();
+        agent.on_teardown().await.unwrap();
+        let first = sealed_ledger(&h).await.in_force();
+        // The same question seated again, as only a bug could: the ledger
+        // as it was before the answer, then the answer on file loaded
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        let answered = std::fs::read(SealLedger::path(&dir)).unwrap();
+        std::fs::remove_file(SealLedger::path(&dir)).unwrap();
+        let mut state: SeedState =
+            serde_json::from_value(serde_json::to_value(agent.state()).unwrap()).unwrap();
+        state.prompt.messages.clear();
+        state.soul.evolution_log.clear();
+        let mut again = ConsentAgent::new(
+            h.id,
+            state,
+            ConsentContext {
+                inner: Quirks::default(),
+                consent: h.rt.clone(),
+            },
+        )
+        .unwrap();
+        again.on_init().await.unwrap();
+        assert_eq!(
+            again.handle(reply("closing phase done")).await.unwrap(),
+            Control::Continue,
+            "seated"
+        );
+        again.sealed.ledger = Some(SealLedger::from_slice(&answered).unwrap());
+        let lines = evolution_notes(&again).len();
+        again
+            .handle(answer_call("sealed_state", "private", "", ""))
+            .await
+            .unwrap();
+        let told = receipt(&again);
+        assert!(
+            told.contains("changes nothing") && told.contains("`decline`"),
+            "{told}"
+        );
+        again.on_teardown().await.unwrap();
+        let ledger = sealed_ledger(&h).await;
+        assert_eq!(ledger.asks.len(), 2, "kept on file");
+        assert_eq!(ledger.in_force(), first, "the first answer stands");
+        assert!(ledger.in_force().starts_uploads().is_err());
+        assert_eq!(
+            evolution_notes(&again).len(),
+            lines,
+            "no SOUL line for an answer that isn't in force"
+        );
+        h.rt.alerts.flush(std::time::Duration::from_secs(5)).await;
+        let mails = sent.sent();
+        assert!(
+            mails
+                .iter()
+                .any(|m| m.contains("sealed_state_answered_again") && m.contains("not in force")),
+            "{mails:?}"
         );
     }
 
