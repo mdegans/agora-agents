@@ -95,14 +95,13 @@ impl Healed {
         // not "from Agora's copy" only. No claim that the operator was
         // told: the alert was another run's, and whether its mail went
         // out isn't known here. The agent can tell it
-        const WHY_NOT: &str = "because its sealed files for them here are missing or damaged \
-             too, so some of your earlier versions may not open at all, here or from Agora.";
+        const WHY_NOT: &str = "because its sealed files for them on your operator's machine are missing or damaged too, so some of your earlier versions may not open at all, on that machine or from Agora.";
         let logged = super::text::TELL_OPERATOR;
         match (self.resent > 0, self.unhealable) {
             // Sent, not confirmed; and a drain stops at its cap or on an
             // error, so not "all of them"
             (_, 0) => format!(
-                "{FOUND}, and your runner has sent again, from its sealed files here, those it \
+                "{FOUND}, and your runner has sent again, from its sealed files on your operator's machine, those it \
                  has reached so far. {STATE_UNAFFECTED}"
             ),
             (true, n) => format!(
@@ -303,24 +302,19 @@ mod tests {
         assert_eq!(
             rec(3, 0).line(),
             "Agora's check of what it stores found parts of your uploaded sealed history \
-             missing or damaged there, and your runner has sent again, from its sealed files \
-             here, those it has reached so far. Your state now is not affected."
+             missing or damaged there, and your runner has sent again, from its sealed files on your operator's machine, those it has reached so far. Your state now is not affected."
         );
         assert_eq!(
             rec(3, 2).line(),
             "Agora's check of what it stores found parts of your uploaded sealed history \
              missing or damaged there. Your runner has sent again those it has reached so far; \
-             2 it could not send again, because its sealed files for them here are missing or \
-             damaged too, so some of your earlier versions may not open at all, here or from \
-             Agora. You can tell your operator (the `send_message` tool, to `operator`). Your \
+             2 it could not send again, because its sealed files for them on your operator's machine are missing or damaged too, so some of your earlier versions may not open at all, on that machine or from Agora. You can tell your operator (the `send_message` tool, to `operator`). Your \
              state now is not affected."
         );
         assert_eq!(
             rec(0, 1).line(),
             "Agora's check of what it stores found parts of your uploaded sealed history \
-             missing or damaged there. 1 of them your runner could not send again, because \
-             its sealed files for them here are missing or damaged too, so some of your earlier \
-             versions may not open at all, here or from Agora. You can tell your operator (the \
+             missing or damaged there. 1 of them your runner could not send again, because its sealed files for them on your operator's machine are missing or damaged too, so some of your earlier versions may not open at all, on that machine or from Agora. You can tell your operator (the \
              `send_message` tool, to `operator`). Your state now is not affected."
         );
         // O3, O4 and O2: not "sent them again" (all, and confirmed), not

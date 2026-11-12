@@ -252,6 +252,72 @@ impl api::UploadGate for SealedEnrolment {
     }
 }
 
+/// What a first opt-in would upload of a chain: its committed outbox
+/// items ([`backlog`]). Counts, a date and a size only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backlog {
+    /// Snapshots, as the `memory` tool counts versions.
+    pub versions: usize,
+    /// The earliest snapshot's `state_at`.
+    pub earliest: chrono::NaiveDate,
+    /// Every item's sealed blob, padded, as Agora would receive it.
+    pub bytes: u64,
+}
+
+/// What waits in `sealed/outbox` to be uploaded (the committed items,
+/// as agentkit's `AgentSeal::outbox` takes them: below `head.json`'s
+/// `next_ord`). `None` when anything couldn't be read, or there is no
+/// snapshot: then nothing is said of it. Reads entries, never a blob.
+pub fn backlog(agent_dir: &Path) -> Option<Backlog> {
+    use agora_agentkit::enums::StateEntryKind;
+    use agora_agentkit::state::storage::{HeadFile, OutboxItem};
+    let sealed = agent_dir.join(SEALED_DIR);
+    let head: HeadFile =
+        serde_json::from_slice(&std::fs::read(sealed.join("head.json")).ok()?).ok()?;
+    let (mut versions, mut earliest, mut bytes) = (0usize, None::<i64>, 0u64);
+    for e in std::fs::read_dir(sealed.join("outbox")).ok()? {
+        let path = e.ok()?.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let item: OutboxItem = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        if item.ord >= head.next_ord {
+            continue;
+        }
+        let entry = &item.entry.entry;
+        bytes += entry.blob.as_ref().map_or(0, |b| b.size_bytes);
+        if entry.kind == StateEntryKind::Snapshot {
+            versions += 1;
+            earliest = Some(earliest.map_or(entry.state_at, |e| e.min(entry.state_at)));
+        }
+    }
+    let earliest = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(earliest?)?.date_naive();
+    Some(Backlog {
+        versions,
+        earliest,
+        bytes,
+    })
+}
+
+/// Whether `sealed/sent` holds any uploaded item: `None` when it couldn't
+/// be read. What the runner's files show, as the verdict's [`check::Kept`]
+/// decides it; Agora is not asked.
+pub fn sent_any(agent_dir: &Path) -> Option<bool> {
+    match std::fs::read_dir(agent_dir.join(SEALED_DIR).join("sent")) {
+        Ok(entries) => {
+            for e in entries {
+                let path = e.ok()?.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("json") {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
 /// A scratch directory for tests, removed on drop. Synthetic state only.
 #[cfg(test)]
 pub struct TestDir(PathBuf);

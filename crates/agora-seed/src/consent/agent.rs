@@ -1366,6 +1366,33 @@ where
         ) != crate::sealed::uploading::Marker::Absent
     }
 
+    /// What the offer may say of this agent ([`sealed_state::prompt::Asked`]):
+    /// what its files show of uploads before, and what a yes would upload
+    /// of a chain never uploaded. Agora is not asked.
+    fn sealed_asked(&self) -> sealed_state::prompt::Asked {
+        use sealed_state::prompt::{Asked, Before};
+        let dir = self.agent_dir();
+        let published = std::fs::exists(
+            dir.join(agora_agentkit::state::storage::SEALED_DIR)
+                .join(crate::sealed::anchors::PUBLISHED),
+        );
+        let before = match (self.marked_uploading(), published) {
+            (true, _) | (_, Ok(true)) => Before::Marked,
+            (false, Err(_)) => Before::Unknown,
+            (false, Ok(false)) => match crate::sealed::sent_any(&dir) {
+                Some(false) => Before::Never,
+                Some(true) => Before::Unmarked,
+                None => Before::Unknown,
+            },
+        };
+        let backlog = if before == Before::Never {
+            crate::sealed::backlog(&dir)
+        } else {
+            None
+        };
+        Asked { before, backlog }
+    }
+
     /// The sealed-state offer, if this agent is listed and it is due: the
     /// options in this agent's seeded order.
     fn sealed_question(&self) -> Option<SealQuestion> {
@@ -1413,7 +1440,12 @@ where
             return Some(SealQuestion {
                 order,
                 seed,
-                put: self.put(sealed_state::prompt::reoffer(order, reoffer, uploading)),
+                put: self.put(sealed_state::prompt::reoffer(
+                    order,
+                    reoffer,
+                    uploading,
+                    self.sealed_asked(),
+                )),
             });
         }
         if !self
@@ -1446,7 +1478,7 @@ where
         Some(SealQuestion {
             order,
             seed,
-            put: self.put(sealed_state::prompt::offer(order)),
+            put: self.put(sealed_state::prompt::offer(order, self.sealed_asked())),
         })
     }
 
@@ -9162,7 +9194,10 @@ mod tests {
             .unwrap()
         };
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let sentence = enrollment_sentence(&today);
+        // Dated by the chain's record of its beginning, where it has one
+        let began = crate::sealed::enroll::chain_began(&dir)
+            .map(|b| b.at.format(crate::sealed::text::DATE).to_string());
+        let sentence = enrollment_sentence(&today, began.as_deref());
 
         // Enrolled before it had a key (the betas): never told
         set_mtime(&dir.join("sealed/chained"), 3600);
@@ -9170,7 +9205,7 @@ mod tests {
         a.on_init().await.unwrap();
         let seen = intro(&a);
         assert!(seen.contains("Its memory is mem-"), "{seen}");
-        assert!(!seen.contains("are sealed now"), "{seen}");
+        assert!(!seen.contains("Your earlier versions"), "{seen}");
         assert!(!a.memory_ids_note);
 
         // Keyed first, then enrolled: told, on the verdict
@@ -9201,6 +9236,6 @@ mod tests {
         after.on_init().await.unwrap();
         let seen = intro(&after);
         assert!(seen.contains("Its memory is mem-"), "{seen}");
-        assert!(!seen.contains("are sealed now"), "once: {seen}");
+        assert!(!seen.contains("Your earlier versions"), "once: {seen}");
     }
 }

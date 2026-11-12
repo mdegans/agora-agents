@@ -6,17 +6,18 @@
 //!
 //! | Thing | Name |
 //! |---|---|
-//! | the agent's soul, memory and the rest, as it is now | "your state" |
+//! | the agent's soul, memory, working prompt, model and the runner's record of what it read and did, as it is now | "your state" (the offer names its parts once) |
 //! | the signed chain of sealed saves | "your sealed history" |
 //! | one entry of it | "a version" ("a sealed version" where no "sealed history" stands near) |
 //! | a version's short hash | its "head" |
 //! | the latest version | "your last sealed version" |
-//! | the operator's machine | "here" ("here, on your operator's machine" where a text may be read alone) |
+//! | the operator's machine | "on your operator's machine", then "on that machine" (or "there") later in the same text; never a bare "here", which means nothing to a model (beta-critic, 2026-11-12) |
 //! | who runs the runner | "your operator" |
 //! | the program, as the actor | "your runner" |
 //! | what Agora holds of the history | "Agora's copy" (the only "copy") |
 //! | the daily entry in the governance log | "the daily anchor", "an anchor" |
-//! | versions off the line that goes on | "set aside" (said with why) |
+//! | versions off the line that goes on | "off the main line of your sealed history" / "on a branch your sealed history no longer follows" (the `memory` tool's labels: "off your main line", "set aside … when your line was rebased"); never a bare "set aside", "a stop" or "a hold" (all six betas, 2026-11-12) |
+//! | the operator's commands on uploads | said as what they do ("versions saved while your uploads were stopped", "versions your runner is holding back because of a fault") |
 //! | an agent whose history never went to Agora | "your runner does not upload it, and its files show no version of it ever uploaded to Agora" |
 //!
 //! "Record" is kept for one thing, what Agora keeps of a departed agent
@@ -284,6 +285,18 @@ mod tests {
             crate::alerts::told(false),
         ));
         all.push(Text::new("TELL_OPERATOR", To::Any, TELL_OPERATOR));
+        // The notes `sealed-accept` writes for the agent when its operator
+        // gave none
+        all.push(Text::new(
+            "accept::REBUILT_LOCAL_NOTE",
+            To::Never,
+            crate::sealed::accept::REBUILT_LOCAL_NOTE,
+        ));
+        all.push(Text::new(
+            "accept::REBUILT_NOTE",
+            To::Uploaded,
+            crate::sealed::accept::REBUILT_NOTE,
+        ));
         all
     }
 
@@ -442,6 +455,10 @@ mod tests {
             "left_out_line",
             "prior_line",
             "enrollment_sentence",
+            "chain_began_line",
+            "side_line",
+            "accept::REBUILT_LOCAL_NOTE",
+            "accept::REBUILT_NOTE",
             "uploads_line",
             "at_head notes",
             "at_head (held, not shown)",
@@ -476,11 +493,11 @@ mod tests {
     #[test]
     fn every_string_constant_is_classified() {
         // (file, its source, agent-facing constants, the rest)
-        let files: [(&str, &str, &[&str], &[&str]); 14] = [
+        let files: [(&str, &str, &[&str], &[&str]); 15] = [
             (
                 "consent/sealed_state/prompt.rs",
                 include_str!("../consent/sealed_state/prompt.rs"),
-                &["TITLE"],
+                &["TITLE", "EARLIER_CHOICE"],
                 &[],
             ),
             (
@@ -539,7 +556,6 @@ mod tests {
                     "NEW_TOOL_LINE",
                     "NO_KEY",
                     "UNREADABLE",
-                    "COUNTED",
                     "NOT_FETCHED",
                     "NOT_HERE",
                     "NOT_HELD",
@@ -549,6 +565,12 @@ mod tests {
                     "PAST_DEADLINE",
                 ],
                 &["MEMORY_IDS_TOLD", "LEFT_OUT_TOLD"],
+            ),
+            (
+                "sealed/accept.rs",
+                include_str!("accept.rs"),
+                &["REBUILT_LOCAL_NOTE", "REBUILT_NOTE"],
+                &[],
             ),
             (
                 "sealed/version.rs",

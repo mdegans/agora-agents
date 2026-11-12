@@ -4916,7 +4916,7 @@ mod tests {
                 && seat.lines[0].ends_with(
                     ": It asked. The versions already uploaded stay on Agora. Your state is \
                      still sealed and checked at the start of each session; the versions not \
-                     uploaded by then, and those saved from now on, stay here."
+                     uploaded by then, and those saved from now on, stay on your operator's machine."
                 ),
             "{:?}",
             seat.lines
@@ -5785,7 +5785,7 @@ mod tests {
         assert!(
             run.seats[&id].lines[0].starts_with(
                 "Your sealed state: intact, checked against your sealed history, which your \
-                 runner keeps here, on your operator's machine. Your runner does not upload it, \
+                 runner keeps on your operator's machine. Your runner does not upload it, \
                  and its files show no version of it ever uploaded to Agora."
             ),
             "{:?}",

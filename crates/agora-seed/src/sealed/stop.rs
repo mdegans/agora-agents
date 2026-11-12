@@ -169,14 +169,13 @@ impl Stopped {
         if self.shown {
             format!(
                 "Uploads of your sealed history are stopped (since {date}); the versions \
-                 already uploaded stay on Agora; your state is still sealed and checked here."
+                 already uploaded stay on Agora; your state is still sealed and checked on your operator's machine."
             )
         } else {
             format!(
                 "Your operator stopped uploading your sealed history on {date}: {}. The \
                  versions already uploaded stay on Agora. Your state is still sealed and checked \
-                 at the start of each session; the versions not uploaded by then, and those \
-                 saved from now on, stay here.",
+                 at the start of each session; the versions not uploaded by then, and those saved from now on, stay on your operator's machine.",
                 self.note.trim_end_matches('.')
             )
         }
@@ -433,7 +432,7 @@ mod tests {
                 && s.line().ends_with(
                     ": It asked me to. The versions already uploaded stay on Agora. Your state \
                      is still sealed and checked at the start of each session; the versions \
-                     not uploaded by then, and those saved from now on, stay here."
+                     not uploaded by then, and those saved from now on, stay on your operator's machine."
                 ),
             "{}",
             s.line()
@@ -448,8 +447,7 @@ mod tests {
         assert!(
             later.starts_with("Uploads of your sealed history are stopped (since ")
                 && later.ends_with(
-                    "); the versions already uploaded stay on Agora; your state is still \
-                     sealed and checked here."
+                    "); the versions already uploaded stay on Agora; your state is still sealed and checked on your operator's machine."
                 ),
             "{later}"
         );

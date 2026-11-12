@@ -321,7 +321,7 @@ async fn a_restore_cut_at_any_step_finishes_on_a_rerun() {
                     .line()
                     .unwrap();
                 assert!(
-                    line.starts_with("Your state was lost here."),
+                    line.starts_with("Your state was lost on your operator's machine."),
                     "{point}: {line}"
                 );
             }

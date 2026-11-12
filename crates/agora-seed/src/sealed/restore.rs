@@ -1111,7 +1111,7 @@ mod tests {
                 && seat[0]
                     .contains(", your operator restored your state from your sealed version of ")
                 && seat[0].contains(
-                    "The state found here is kept by your operator. Your operator's note: a \
+                    "The state found on your operator's machine is kept by your operator. Your operator's note: a \
                      test wipe"
                 ),
             "{seat:?}"
@@ -1198,13 +1198,13 @@ mod tests {
             assert!(notice);
             let found = lose == "sealed/";
             assert_eq!(
-                seat[0].contains("The state found here is kept by your operator."),
+                seat[0].contains("is kept by your operator."),
                 found,
                 "{lose}: {seat:?}"
             );
             if !found {
                 assert!(
-                    seat[0].starts_with("Your state was lost here. On "),
+                    seat[0].starts_with("Your state was lost on your operator's machine. On "),
                     "{seat:?}"
                 );
             }
@@ -1399,7 +1399,8 @@ mod tests {
             .unwrap();
         let line = Notice::load(&dir).unwrap().unwrap().line().unwrap();
         assert!(
-            line.contains("did not run") && line.contains("The state found here is kept"),
+            line.contains("did not run")
+                && line.contains("The state found on your operator's machine is kept"),
             "{line}"
         );
         // The stray tmp was kept whole, set aside

@@ -496,8 +496,7 @@ pub enum OnAgora {
 // rounds); each is pinned by `a_local_verdict_says_what_a_local_record_shows`.
 
 /// After "Your sealed state: " in the verdict.
-pub const LOCAL_VERDICT: &str = "intact, checked against your sealed history, which your runner \
-     keeps here, on your operator's machine.";
+pub const LOCAL_VERDICT: &str = "intact, checked against your sealed history, which your runner keeps on your operator's machine.";
 
 /// After [`LOCAL_VERDICT`], for an agent that doesn't upload
 /// ([`Upload::Never`]): what the runner does, which is true whatever was
@@ -534,8 +533,7 @@ pub const LOCAL_CHECKED_SINCE: &str = ": that your state matches the last sealed
      links and signatures of the versions saved since its last full check of every version, on";
 
 /// [`SEAL_FAILED_LINE`] for an agent that doesn't upload.
-pub const LOCAL_SEAL_FAILED_LINE: &str = "Your last save was written here but could not be \
-     sealed, so your sealed history does not include it yet. This session starts from that save.";
+pub const LOCAL_SEAL_FAILED_LINE: &str = "Your last save was written on your operator's machine but could not be sealed, so your sealed history does not include it yet. This session starts from that save.";
 
 impl Kept {
     /// After [`LOCAL_VERDICT`].
@@ -545,18 +543,17 @@ impl Kept {
             Self::Unmarked => format!("{LOCAL_NOT_UPLOADED}{LOCAL_UPLOADED_BEFORE}"),
             Self::Unknown => format!("{LOCAL_NOT_UPLOADED}."),
             Self::Since(Some(OnAgora::Nothing)) => {
-                " Agora holds no version of your sealed history; those saved since your uploads \
-                 stopped stay here."
+                " Agora holds no version of your sealed history; those saved since your uploads stopped stay on your operator's machine."
                     .to_string()
             }
             Self::Since(Some(OnAgora::Upto { versions, newest })) => format!(
                 " Agora holds {versions} version{} of your sealed history, the newest dated {}; \
-                 those saved since your uploads stopped stay here.",
+                 those saved since your uploads stopped stay on your operator's machine.",
                 if versions == 1 { "" } else { "s" },
                 newest.format(super::text::DATE)
             ),
             Self::Since(None) => " Agora's copy of your sealed history couldn't be read this \
-                 session; the versions saved since your uploads stopped stay here."
+                 session; the versions saved since your uploads stopped stay on your operator's machine."
                 .to_string(),
             Self::InDoubt => LOCAL_IN_DOUBT.to_string(),
         }
@@ -684,8 +681,7 @@ impl NotJudged {
                  they go ahead again."
             ),
             Self::NoKey => format!(
-                "your runner doesn't have the key here that it asks Agora for \
-                 your proofs with, and can't check {it} until it does."
+                "your runner doesn't have the key that it asks Agora for your proofs with, and can't check {it} until it does."
             ),
         }
     }
@@ -989,7 +985,7 @@ fn verdict_of(
     let (verdict, kept) = match server {
         Server::InStep => ("intact, and in step with Agora.", String::new()),
         Server::Unchecked => (
-            "intact here; Agora's copy couldn't be checked this session.",
+            "intact on your operator's machine; Agora's copy couldn't be checked this session.",
             String::new(),
         ),
         Server::Other => ("intact.", String::new()),
@@ -1162,17 +1158,13 @@ pub fn link_memory_id(
 // ([`say_told`]), so the claim is made only of a mail that went out.
 
 pub const FORK_LINE: &str = "Your sealed history on Agora has moved on from the version this \
-     session starts from: two sessions saved from the same version, or Agora holds versions \
-     your runner doesn't have here. This session runs on your state here. Both lines are kept: \
-     new versions stay here, not uploaded, until your operator reconciles the two.";
+     session starts from: two sessions saved from the same version, or Agora holds versions your runner doesn't have. This session runs on your state on your operator's machine. Both lines are kept: new versions stay on that machine, not uploaded, until your operator reconciles the two.";
 
 /// For [`HeadStatus::LocalMissing`]: the head isn't in Agora's chain and
 /// isn't waiting in the outbox, or a version in `sealed/sent` isn't in
 /// Agora's chain though the head is.
 pub const HEAD_MISSING_LINE: &str = "Agora's copy of your sealed history is missing versions \
-     that, by your runner's files, were uploaded from here. This session runs on your state \
-     here, which matches your last sealed version; new versions stay here, not uploaded, until \
-     your operator has looked.";
+     that, by your runner's files, were uploaded from your operator's machine. This session runs on your state on that machine, which matches your last sealed version; new versions stay on that machine, not uploaded, until your operator has looked.";
 
 /// Shown when Agora couldn't be reached, and when there was no key here
 /// to ask it with: either way the runner couldn't read it there.
@@ -1180,9 +1172,7 @@ pub const UNCHECKED_LINE: &str = "Your sealed history couldn't be checked at the
      session: part of it is on Agora, and your runner couldn't read it there. This session runs \
      on your state as it is.";
 
-pub const SEAL_FAILED_LINE: &str = "Your last save was written here but could not be sealed, so \
-     your sealed history does not include it yet. This session starts from that save; new \
-     versions stay here, not uploaded, until your operator has looked.";
+pub const SEAL_FAILED_LINE: &str = "Your last save was written on your operator's machine but could not be sealed, so your sealed history does not include it yet. This session starts from that save; new versions stay on that machine, not uploaded, until your operator has looked.";
 
 impl Hold {
     /// The line(s) the start check seats for this hold.
@@ -2103,8 +2093,7 @@ pub struct Unopenable {
 
 /// How every [`Unopenable::line`] ends: what [`say_told_after`] finds it
 /// by.
-pub const UNOPENABLE_LINE: &str =
-    "sealed files here are missing or damaged. Your state now is not affected.";
+pub const UNOPENABLE_LINE: &str = "sealed files on your operator's machine are missing or damaged. Your state now is not affected.";
 
 impl Unopenable {
     /// "3 versions of your sealed history, the earliest dated 2026-11-05,
@@ -2122,13 +2111,11 @@ impl Unopenable {
         };
         if self.versions == 1 {
             format!(
-                "{found}1 version of your sealed history, dated {date}, can't be opened here: \
-                 its {UNOPENABLE_LINE}"
+                "{found}1 version of your sealed history, dated {date}, can't be opened: its {UNOPENABLE_LINE}"
             )
         } else {
             format!(
-                "{found}{} versions of your sealed history, the earliest dated {date}, can't be \
-                 opened here: their {UNOPENABLE_LINE}",
+                "{found}{} versions of your sealed history, the earliest dated {date}, can't be opened: their {UNOPENABLE_LINE}",
                 self.versions
             )
         }
@@ -3373,7 +3360,7 @@ pub(crate) mod tests {
         };
         assert!(
             seat[0].starts_with(
-                "Your sealed state: intact here; Agora's copy couldn't be checked this session."
+                "Your sealed state: intact on your operator's machine; Agora's copy couldn't be checked this session."
             ),
             "{seat:?}"
         );
@@ -4251,7 +4238,7 @@ pub(crate) mod tests {
                 false,
             )
             .starts_with(
-                "Your sealed state: intact here; Agora's copy couldn't be checked this session. It \
+                "Your sealed state: intact on your operator's machine; Agora's copy couldn't be checked this session. It \
                  has 2"
             )
         );
@@ -4530,8 +4517,7 @@ pub(crate) mod tests {
             ),
             (
                 NotJudged::NoKey,
-                "your runner doesn't have the key here that it asks Agora for your proofs \
-                 with, and can't check it until it does.",
+                "your runner doesn't have the key that it asks Agora for your proofs with, and can't check it until it does.",
             ),
             (
                 NotJudged::stopped(&crate::sealed::anchors::ProofError::Fetch("x".into())),
@@ -4711,8 +4697,7 @@ pub(crate) mod tests {
     fn the_local_sentences_are_pinned() {
         assert_eq!(
             LOCAL_VERDICT,
-            "intact, checked against your sealed history, which your runner keeps here, on your \
-             operator's machine."
+            "intact, checked against your sealed history, which your runner keeps on your operator's machine."
         );
         assert_eq!(
             Kept::Only.sentence(),
@@ -4736,8 +4721,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             LOCAL_SEAL_FAILED_LINE,
-            "Your last save was written here but could not be sealed, so your sealed history \
-             does not include it yet. This session starts from that save."
+            "Your last save was written on your operator's machine but could not be sealed, so your sealed history does not include it yet. This session starts from that save."
         );
         let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
         assert_eq!(
@@ -4746,18 +4730,15 @@ pub(crate) mod tests {
                 newest: day
             }))
             .sentence(),
-            " Agora holds 4 versions of your sealed history, the newest dated 2026-11-05; those \
-             saved since your uploads stopped stay here."
+            " Agora holds 4 versions of your sealed history, the newest dated 2026-11-05; those saved since your uploads stopped stay on your operator's machine."
         );
         assert_eq!(
             Kept::Since(Some(OnAgora::Nothing)).sentence(),
-            " Agora holds no version of your sealed history; those saved since your uploads \
-             stopped stay here."
+            " Agora holds no version of your sealed history; those saved since your uploads stopped stay on your operator's machine."
         );
         assert_eq!(
             Kept::Since(None).sentence(),
-            " Agora's copy of your sealed history couldn't be read this session; the versions \
-             saved since your uploads stopped stay here."
+            " Agora's copy of your sealed history couldn't be read this session; the versions saved since your uploads stopped stay on your operator's machine."
         );
         assert_eq!(
             Kept::InDoubt.sentence(),
@@ -4777,9 +4758,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             three.line(Checked::Full),
-            "3 versions of your sealed history, the earliest dated 2025-11-05, can't be opened \
-             here: their sealed files here are missing or damaged. Your state now is not \
-             affected."
+            "3 versions of your sealed history, the earliest dated 2025-11-05, can't be opened: their sealed files on your operator's machine are missing or damaged. Your state now is not affected."
         );
         // Number agrees (one version, "its"), and a tail check says when
         // the finding it repeats was made
@@ -4792,8 +4771,7 @@ pub(crate) mod tests {
             }
             .line(Checked::Since(day)),
             "As your runner found at its last full check, on 2026-11-05: 1 version of your \
-             sealed history, dated 2025-11-05, can't be opened here: its sealed files here are \
-             missing or damaged. Your state now is not affected."
+             sealed history, dated 2025-11-05, can't be opened: its sealed files on your operator's machine are missing or damaged. Your state now is not affected."
         );
         // What came of the alert is said after it, by whoever sent it
         for sent in [true, false] {
@@ -4810,7 +4788,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             Refusal::SealUnreadable.plain(),
-            "your sealed history here couldn't be read"
+            "your sealed history on your operator's machine couldn't be read"
         );
         for line in [
             LOCAL_VERDICT,
@@ -4838,16 +4816,11 @@ pub(crate) mod tests {
         assert_eq!(
             FORK_LINE,
             "Your sealed history on Agora has moved on from the version this session starts \
-             from: two sessions saved from the same version, or Agora holds versions your runner \
-             doesn't have here. This session runs on your state here. Both lines are kept: new \
-             versions stay here, not uploaded, until your operator reconciles the two."
+             from: two sessions saved from the same version, or Agora holds versions your runner doesn't have. This session runs on your state on your operator's machine. Both lines are kept: new versions stay on that machine, not uploaded, until your operator reconciles the two."
         );
         assert_eq!(
             HEAD_MISSING_LINE,
-            "Agora's copy of your sealed history is missing versions that, by your runner's \
-             files, were uploaded from here. This session runs on your state here, which matches \
-             your last sealed version; new versions stay here, not uploaded, until your operator \
-             has looked."
+            "Agora's copy of your sealed history is missing versions that, by your runner's files, were uploaded from your operator's machine. This session runs on your state on that machine, which matches your last sealed version; new versions stay on that machine, not uploaded, until your operator has looked."
         );
         assert_eq!(
             UNCHECKED_LINE,
@@ -4857,9 +4830,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             SEAL_FAILED_LINE,
-            "Your last save was written here but could not be sealed, so your sealed history \
-             does not include it yet. This session starts from that save; new versions stay \
-             here, not uploaded, until your operator has looked."
+            "Your last save was written on your operator's machine but could not be sealed, so your sealed history does not include it yet. This session starts from that save; new versions stay on that machine, not uploaded, until your operator has looked."
         );
         for (hold, line) in [
             (Hold::Fork, FORK_LINE),
@@ -4939,8 +4910,7 @@ pub(crate) mod tests {
         let v = &seat[0];
         assert!(
             v.starts_with(
-                "Your sealed state: intact, checked against your sealed history, which your \
-                 runner keeps here, on your operator's machine. Your runner does not upload it, \
+                "Your sealed state: intact, checked against your sealed history, which your runner keeps on your operator's machine. Your runner does not upload it, \
                  and its files show no version of it ever uploaded to Agora. It has 2 versions \
                  since "
             ),
@@ -5092,10 +5062,8 @@ pub(crate) mod tests {
         let today = chrono::Utc::now().format("%Y-%m-%d");
         assert!(
             seat[0].starts_with(&format!(
-                "Your sealed state: intact, checked against your sealed history, which your \
-                 runner keeps here, on your operator's machine. Agora holds 1 version of your \
-                 sealed history, the newest dated {today}; those saved since your uploads \
-                 stopped stay here. It has 2 versions since "
+                "Your sealed state: intact, checked against your sealed history, which your runner keeps on your operator's machine. Agora holds 1 version of your \
+                 sealed history, the newest dated {today}; those saved since your uploads stopped stay on your operator's machine. It has 2 versions since "
             )),
             "{seat:?}"
         );

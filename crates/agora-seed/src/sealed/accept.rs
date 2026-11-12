@@ -58,15 +58,15 @@ pub struct Accepted {
 
 /// The note when a head rebuilt from the chain kept here (an agent that
 /// never uploaded) matched and the operator gave none.
-pub const REBUILT_LOCAL_NOTE: &str = "the record of your last sealed version was missing \
-     here and was rebuilt from your chain as your runner keeps it here (nothing of yours is on \
-     Agora), after checking it with your runner's own keys; your state matched it, so nothing \
-     about your state changed.";
+pub const REBUILT_LOCAL_NOTE: &str = "the record of your last sealed version was missing on your \
+     operator's machine and was rebuilt from your sealed history as your runner keeps it there, \
+     after checking it with your runner's own keys; your state matched it, so nothing about your \
+     state changed.";
 
 /// The note when the rebuilt head matched and the operator gave none.
-pub const REBUILT_NOTE: &str = "the record of your last sealed version was missing here and \
-     was rebuilt from your chain on Agora, after checking it; your state matched it, so \
-     nothing about your state changed.";
+pub const REBUILT_NOTE: &str = "the record of your last sealed version was missing on your \
+     operator's machine and was rebuilt from your sealed history on Agora, after checking it; \
+     your state matched it, so nothing about your state changed.";
 
 /// Accept `id`'s current state. A lost `head.json` is first rebuilt from
 /// Agora's chain ([`AgentSeal::adopt_server_head`]): if the state matches
@@ -2339,7 +2339,7 @@ mod tests {
         for (chain, words) in [
             (
                 ChainKept::Local,
-                "which your runner keeps here and does not upload:",
+                "which your runner keeps on your operator's machine and does not upload:",
             ),
             (
                 ChainKept::Stopped,

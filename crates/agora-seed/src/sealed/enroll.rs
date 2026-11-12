@@ -3548,7 +3548,7 @@ pub(crate) mod tests {
             assert!(
                 line.contains(
                     "The 2 versions not uploaded before the stop or saved while uploads were \
-                     stopped stay here, set aside from"
+                     stopped stay on your operator's machine, off the main line of"
                 ),
                 "{line}"
             );
