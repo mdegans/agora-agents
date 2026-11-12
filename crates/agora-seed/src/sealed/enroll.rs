@@ -185,9 +185,21 @@ pub enum Genesis {
     New,
 }
 
+/// A pre-loss copy's pair finished ([`Enroller::finish_prior`]): the new
+/// head, and what the agent's files were once it was written, taken under
+/// its lock, so a runner that loaded the agent before carries both forward
+/// rather than reading its own write as another process's save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorDone {
+    pub head: HeadRef,
+    pub seen: super::session::Seen,
+}
+
 /// What one chaining did, or would do: counts and sizes only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
+    /// A pre-loss copy appended after the chain began: the head it left.
+    pub carried: Option<PriorDone>,
     pub archives: usize,
     pub archive_bytes: u64,
     /// Archives sealed by this run.
@@ -1127,10 +1139,11 @@ impl Enroller {
     /// seals while stopped would be set aside at its resume as saved while
     /// stopped, so the copy waits for the resume. `None`: nothing to do.
     pub async fn append_prior(&self, id: AgentId) -> anyhow::Result<Option<Report>> {
-        if self.finish_prior(id).await?.is_some() {
+        if let Some(done) = self.finish_prior(id).await? {
             return Ok(Some(Report {
                 prior: true,
                 prior_later: true,
+                carried: Some(done),
                 ..Report::default()
             }));
         }
@@ -1205,11 +1218,12 @@ impl Enroller {
         .context("sealing the pre-loss copy")?;
         super::crash::point("prior:appended")?;
         drop(lock);
-        let head = self
+        let done = self
             .finish_prior(id)
             .await?
             .context("the pre-loss copy was sealed but isn't the head")?;
-        tracing::warn!(
+        let head = done.head;
+        tracing::info!(
             event_type = "sealed_prior_appended",
             agent_id = %id,
             head = %head.entry_hash,
@@ -1220,6 +1234,7 @@ impl Enroller {
         Ok(Some(Report {
             prior: true,
             prior_later: true,
+            carried: Some(done),
             entries: super::check::local_entries(&seal)
                 .await
                 .map_err(anyhow::Error::msg)?
@@ -1235,7 +1250,7 @@ impl Enroller {
     /// `Some(head)`: finished now.
     /// At run start `main.rs`'s start check calls it (through
     /// [`Self::append_prior`]) before the agent is judged.
-    pub async fn finish_prior(&self, id: AgentId) -> anyhow::Result<Option<HeadRef>> {
+    pub async fn finish_prior(&self, id: AgentId) -> anyhow::Result<Option<PriorDone>> {
         let agent_dir = self.state_dir.join(id.to_string());
         let seal = AgentSeal::new(&agent_dir, id);
         if !seal.is_enrolled().await? {
@@ -1285,10 +1300,12 @@ impl Enroller {
         )
         .await
         .context("sealing the current state after the pre-loss copy")?;
+        // Still under the lock: no one else's save can be in it
+        let seen = super::session::Seen::of(&agent_dir);
         drop(lock);
         record_sizes(&agent_dir, head, now, &current);
         self.roster(id, head).await;
-        Ok(Some(head))
+        Ok(Some(PriorDone { head, seen }))
     }
 
     /// Chain `ids`, up to `jobs` at once (each seal is two brotli

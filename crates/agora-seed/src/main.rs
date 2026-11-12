@@ -1918,6 +1918,11 @@ struct SealedRun {
     /// Agents still marked refused from earlier runs and not refused in
     /// this one: they count toward [`sealed::check::REFUSED_AGENTS_STOP_RUN`].
     outstanding: usize,
+    /// The agents whose pre-loss copy this start appended (or whose pair
+    /// it finished): their new head and files, carried into the run's
+    /// bases and what it saw, so the runner's own write isn't read as
+    /// another process's save and reloaded.
+    carried: BTreeMap<AgentId, sealed::enroll::PriorDone>,
 }
 
 /// One agent the start check refused.
@@ -2255,34 +2260,37 @@ async fn prior_step(
     id: AgentId,
     name: &agora_agentkit::reactor::seed::ShortString<64>,
     hash: &agora_agentkit::govlog::Sha256Hex,
-) {
+) -> Option<sealed::enroll::PriorDone> {
     let dir = enroller.state_dir.join(id.to_string());
     let head = agora_agentkit::state::storage::AgentSeal::new(&dir, id)
         .head()
         .await;
     let done = match head {
-        Ok(Some(h)) if h.plaintext_sha256.as_ref() != Some(hash) => {
-            enroller.finish_prior(id).await.map(|h| h.is_some())
-        }
-        _ => Ok(false),
+        Ok(Some(h)) if h.plaintext_sha256.as_ref() != Some(hash) => enroller.finish_prior(id).await,
+        _ => Ok(None),
     };
     let done = match done {
-        Ok(false) => {
-            match sealed::enroll::origin(enroller.restore.as_ref(), name, id, &dir).await {
-                Ok(o) if o.prior.is_some() => enroller.append_prior(id).await.map(|r| r.is_some()),
-                Ok(_) => Ok(false),
-                Err(e) => Err(e),
-            }
-        }
+        Ok(None) => match sealed::enroll::origin(enroller.restore.as_ref(), name, id, &dir).await {
+            Ok(o) if o.prior.is_some() => enroller
+                .append_prior(id)
+                .await
+                .map(|r| r.and_then(|r| r.carried)),
+            Ok(_) => Ok(None),
+            Err(e) => Err(e),
+        },
         other => other,
     };
     match done {
-        Ok(true) => tracing::warn!(
-            event_type = "sealed_prior_at_start",
-            agent_id = %id,
-            "the pre-loss copy's pair finished or appended at run start"
-        ),
-        Ok(false) => {}
+        Ok(Some(done)) => {
+            // Expected: the copies agents chose to see since they were chained
+            tracing::info!(
+                event_type = "sealed_prior_at_start",
+                agent_id = %id,
+                "the pre-loss copy's pair finished or appended at run start"
+            );
+            return Some(done);
+        }
+        Ok(None) => {}
         // Another runner has the agent (a session there, or queued): its
         // copy waits for a start that finds it free
         Err(e) if e.is::<sealed::session::Busy>() => tracing::debug!(
@@ -2296,6 +2304,22 @@ async fn prior_step(
             error = %format!("{e:#}"),
             "the pre-loss copy couldn't be finished or appended; the start check judges the agent"
         ),
+    }
+    None
+}
+
+/// The heads the start's pre-loss step wrote ([`SealedRun::carried`]),
+/// carried into the run's bases and what it saw of the agents' files:
+/// the runner's own write is not another process's save, and a session
+/// saves against the new head without reading the agent again.
+fn carry_prior(
+    carried: &BTreeMap<AgentId, sealed::enroll::PriorDone>,
+    bases: &mut BTreeMap<AgentId, agora_agentkit::state::verify::HeadRef>,
+    seen: &mut BTreeMap<AgentId, sealed::session::Seen>,
+) {
+    for (id, done) in carried {
+        bases.insert(*id, done.head);
+        seen.insert(*id, done.seen);
     }
 }
 
@@ -2604,7 +2628,9 @@ async fn sealed_start_check(
             if refused.contains(id) || scan.refused.contains(id) {
                 continue;
             }
-            prior_step(enroller, *id, &state.soul.name, hash).await;
+            if let Some(done) = prior_step(enroller, *id, &state.soul.name, hash).await {
+                run.carried.insert(*id, done);
+            }
         }
     }
     // The anchors not yet judged are judged here where they can be, so a
@@ -3805,7 +3831,7 @@ async fn run(held: &mut Held) -> Result<()> {
         mut bases,
         sealed: enrolled,
         mut skipped,
-        seen,
+        mut seen,
     } = loaded;
     // An agent mid-rotation (`secrets.next.json`) is left out, unrefused:
     // its keys and the server's may disagree until `rotate-keys` finishes
@@ -3858,6 +3884,7 @@ async fn run(held: &mut Held) -> Result<()> {
         prior.as_ref(),
     )
     .await;
+    carry_prior(&sealed_run.carried, &mut bases, &mut seen);
     // Before any reactor is built. A dry run checks nothing, so refuses
     // nothing
     refuse_run(&sealed_run, &held.alerts)?;
@@ -6422,6 +6449,97 @@ mod session_lock_tests {
             .iter()
             .flat_map(|c| c.values().flatten().map(|(id, _)| *id))
             .collect()
+    }
+
+    /// A pre-loss copy the start appended (its new head written by this
+    /// runner, after the states were loaded) is carried forward: the claim
+    /// reloads nobody, and the session saves against the new head.
+    #[tokio::test]
+    async fn a_first_start_after_enrolment_reloads_nobody() {
+        let root = sealed::TestDir::new("claim-prior");
+        let (id, keys, dir) = chained(&root).await;
+        let state_dir = root.join("state");
+        let recovered = root.join("recovered");
+        std::fs::create_dir_all(recovered.join("tarn")).unwrap();
+        std::fs::write(
+            recovered.join("tarn/MEMORY.json"),
+            r#"{"content":"synthetic"}"#,
+        )
+        .unwrap();
+        let e = sealed::enroll::Enroller {
+            restore: Some(consent::memory_restore::RestoreOffer::for_agents(
+                &[("tarn", None, id)],
+                &recovered,
+                None,
+            )),
+            ..sealed::enroll::tests::enroller(&root, &keys)
+        };
+        let ledger = serde_json::json!({
+            "format": 1,
+            "asks": [{"at": "2026-10-12T09:00:00Z", "offer_version": 1, "model": "m",
+                "chars": 9, "order": ["show", "decline"], "order_seed": 0,
+                "constrained": true, "attempts": 1,
+                "outcome": {"kind": "answered", "choice": "show", "reason": "",
+                    "memory_note_written": false}}],
+        });
+        std::fs::write(
+            consent::memory_restore::ledger::RestoreLedger::path(&dir),
+            ledger.to_string(),
+        )
+        .unwrap();
+        let storage = storage(&root);
+        let loaded = load_states(&storage, &state_dir).await.unwrap();
+        let (mut bases, mut seen) = (loaded.bases.clone(), loaded.seen.clone());
+        let api = sealed::api::fake::guarded(&root);
+        let off = alerts::Alerter::off();
+        let mut pool = vec![(id, crate::agent_selection_tests::pooled("tarn").1)];
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            root.path(),
+            &state_dir,
+            &keys,
+            &api,
+            &off,
+            false,
+            &mut Vec::new(),
+            None,
+            Some(&e),
+        )
+        .await;
+        assert!(run.refused.is_empty(), "{:?}", run.refused);
+        assert_eq!(run.carried.len(), 1, "the copy was appended at the start");
+        carry_prior(&run.carried, &mut bases, &mut seen);
+        let was_chained: BTreeSet<AgentId> = loaded.sealed.keys().copied().collect();
+        let reload = Reload {
+            storage: &storage,
+            check: StartCheck {
+                data_dir: root.path(),
+                state_dir: &state_dir,
+                keys: &keys,
+                api: &api,
+                alerts: &off,
+                start: None,
+            },
+            chained: &was_chained,
+            min_cycle: &|_, _, _| None,
+        };
+        let mut cohorts = cohort(&loaded.states);
+        let claimed = claim_sessions(
+            &mut cohorts,
+            &seen,
+            None,
+            &reload,
+            &mut SealedRun::default(),
+            &mut bases,
+            &mut Vec::new(),
+            &off,
+        )
+        .await;
+        assert_eq!(claimed.locks.len(), 1);
+        assert_eq!(claimed.reloaded, 0, "its own write is not reloaded");
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
+        assert_eq!(bases.get(&id), Some(&head), "saved against the new head");
     }
 
     /// Two runners (separate descriptors) contend for one agent: exactly
