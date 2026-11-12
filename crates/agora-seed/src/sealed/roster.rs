@@ -207,9 +207,40 @@ pub enum RosterError {
     },
     #[error("{} reads and matches its witness: nothing to begin again (one agent is resolved with sealed-accept, sealed-restore or sealed-forget)", path.display())]
     Healthy { path: PathBuf },
+    #[error(
+        "{} agent(s) are behind the old roster (id: seq found, seq on the old roster): {}. \
+         Begun again, each would be adopted as found, and its rollback no longer told apart",
+        behind.len(),
+        behind
+            .iter()
+            .map(|b| format!("{}: {}, {}", b.id, b.found, b.roster))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )]
+    Behind { behind: Vec<Behind> },
     #[error("the roster couldn't be locked or written: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// An agent whose head, as found, is behind (or beside) what the roster
+/// being set aside recorded: what beginning the roster again would adopt
+/// as if nothing happened ([`begin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Behind {
+    pub id: AgentId,
+    /// The head's seq as found.
+    pub found: u64,
+    /// The seq the old roster recorded.
+    pub roster: u64,
+}
+
+/// What `--begin-roster` gives up, said before it acts: for the operator
+/// and the log.
+pub const BEGIN_TRADE_OFF: &str = "Beginning the roster again adopts every chained agent's \
+     head exactly as it is found now. A rollback or loss made before this (a directory put back \
+     from an older backup, a head moved back) can no longer be told apart afterwards: the \
+     roster then catches only what goes backwards from here. Agents whose sealed/ is gone are \
+     still found by their state keys.";
 
 /// The one command that begins a roster deliberately ([`begin`]).
 pub const BEGIN_COMMAND: &str = "agora-seed sealed-enroll --begin-roster --note \"<why>\"";
@@ -245,6 +276,11 @@ impl RosterError {
                 "check permissions and the disk; the next start tries again".to_string()
             }
             Self::Healthy { .. } => "nothing to do".to_string(),
+            Self::Behind { .. } => format!(
+                "put each agent listed back to its newer head first (from a backup; \
+                 `sealed-restore` puts back a state from its chain), or, having checked them, \
+                 adopt them as found: {BEGIN_COMMAND} --yes"
+            ),
         }
     }
 }
@@ -444,6 +480,8 @@ pub struct Begun {
     pub adopted: usize,
     /// The roster and witness it found, renamed aside (never deleted).
     pub set_aside: Vec<PathBuf>,
+    /// Agents adopted behind what the old roster recorded (with `yes`).
+    pub behind: Vec<Behind>,
 }
 
 /// Begin the roster deliberately (`sealed-enroll --begin-roster --note`,
@@ -459,20 +497,74 @@ pub struct Begun {
 /// found, so a directory rolled back or emptied *before* this is no
 /// longer told apart by the roster (agents whose `sealed/` is gone are
 /// still found by their state keys, `check::missing_states`).
-pub async fn begin(data_dir: &Path, state_dir: &Path, note: &str) -> Result<Begun, RosterError> {
+///
+/// When the old roster can still be read (`shrunk`, or a witness that
+/// can't), each head found is compared with it first: any behind it (a
+/// lower seq, or the same seq and another entry) are listed, and the
+/// roster is begun over them only with `yes` ([`RosterError::Behind`];
+/// nothing is set aside or written without it).
+pub async fn begin(
+    data_dir: &Path,
+    state_dir: &Path,
+    note: &str,
+    yes: bool,
+) -> Result<Begun, RosterError> {
     let _lock = lock(data_dir).await?;
     let roster_path = path(data_dir);
     let witness = Witness::load(data_dir);
-    let was = match load(data_dir) {
+    let old = load(data_dir);
+    let was = match &old {
         Ok(None) => "missing",
         Ok(Some(r)) => match &witness {
             Ok(Some(w)) if w.agents > r.agents.len() => "shrunk",
             Err(_) => "unreadable",
             Ok(_) => return Err(RosterError::Healthy { path: roster_path }),
         },
-        Err(e @ RosterError::Newer { .. }) => return Err(e),
+        Err(RosterError::Newer { path, format }) => {
+            return Err(RosterError::Newer {
+                path: path.clone(),
+                format: *format,
+            });
+        }
         Err(_) => "unreadable",
     };
+    let mut roster = Roster::default();
+    for id in agent_dirs(state_dir)? {
+        if let Found::Head { head, state: true } = look(&state_dir.join(id.to_string()), id).await?
+        {
+            roster.merge(id, head);
+        }
+    }
+    // Before anything is set aside: what adopting would hide
+    let behind: Vec<Behind> = match &old {
+        Ok(Some(old)) => roster
+            .agents
+            .iter()
+            .filter_map(|(id, now)| {
+                let was = old.agents.get(id)?;
+                (now.seq < was.seq || (now.seq == was.seq && now.entry_hash != was.entry_hash))
+                    .then_some(Behind {
+                        id: *id,
+                        found: now.seq,
+                        roster: was.seq,
+                    })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for b in &behind {
+        tracing::warn!(
+            event_type = "sealed_roster_begin_behind",
+            agent_id = %b.id,
+            found = b.found,
+            roster = b.roster,
+            adopted = yes,
+            "an agent's head as found is behind the roster being set aside"
+        );
+    }
+    if !behind.is_empty() && !yes {
+        return Err(RosterError::Behind { behind });
+    }
     let at = Utc::now().format(super::STAMP_FORMAT).to_string();
     let mut set_aside = Vec::new();
     for (file, name) in [
@@ -489,13 +581,6 @@ pub async fn begin(data_dir: &Path, state_dir: &Path, note: &str) -> Result<Begu
             let aside = file.with_file_name(name);
             std::fs::rename(&file, &aside)?;
             set_aside.push(aside);
-        }
-    }
-    let mut roster = Roster::default();
-    for id in agent_dirs(state_dir)? {
-        if let Found::Head { head, state: true } = look(&state_dir.join(id.to_string()), id).await?
-        {
-            roster.merge(id, head);
         }
     }
     save(data_dir, &mut roster)?;
@@ -516,6 +601,7 @@ pub async fn begin(data_dir: &Path, state_dir: &Path, note: &str) -> Result<Begu
         event_type = "sealed_roster_begun",
         was,
         adopted = roster.agents.len(),
+        behind = behind.len(),
         set_aside = set_aside.len(),
         note = %note.trim(),
         "the operator began the sealed roster again from the chained directories as they are"
@@ -524,6 +610,7 @@ pub async fn begin(data_dir: &Path, state_dir: &Path, note: &str) -> Result<Begu
         was,
         adopted: roster.agents.len(),
         set_aside,
+        behind,
     })
 }
 
@@ -1091,7 +1178,7 @@ mod tests {
         // Healthy: nothing to begin again
         check(&root, &state_dir).await.unwrap();
         assert!(matches!(
-            begin(&root, &state_dir, "why").await,
+            begin(&root, &state_dir, "why", false).await,
             Err(RosterError::Healthy { .. })
         ));
         // Every trace of the roster lost
@@ -1121,9 +1208,14 @@ mod tests {
         assert!(replace(&root, *id, Some(h)).await.is_err());
         assert!(!root.join(ROSTER).exists() && !root.join(BEGAN).exists());
         // The operator's deliberate begin
-        let begun = begin(&root, &state_dir, "the top level was lost\nand found")
-            .await
-            .unwrap();
+        let begun = begin(
+            &root,
+            &state_dir,
+            "the top level was lost\nand found",
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!((begun.was, begun.adopted), ("missing", 2));
         let roster = load(&root).unwrap().unwrap();
         assert_eq!(roster.agents.len(), 2);
@@ -1173,7 +1265,9 @@ mod tests {
         let e = check(&root, &state_dir).await.unwrap_err();
         assert!(matches!(e, RosterError::Shrunk { .. }), "{e}");
         assert!(e.way_out().contains("--begin-roster"));
-        let begun = begin(&root, &state_dir, "edited by mistake").await.unwrap();
+        let begun = begin(&root, &state_dir, "edited by mistake", false)
+            .await
+            .unwrap();
         assert_eq!(
             (begun.was, begun.adopted, begun.set_aside.len()),
             ("shrunk", 3, 2)
@@ -1187,16 +1281,58 @@ mod tests {
         std::fs::write(root.join(ROSTER), b"{ torn").unwrap();
         let e = check(&root, &state_dir).await.unwrap_err();
         assert!(matches!(e, RosterError::Unreadable { .. }), "{e}");
-        let begun = begin(&root, &state_dir, "torn write").await.unwrap();
+        let begun = begin(&root, &state_dir, "torn write", false).await.unwrap();
         assert_eq!((begun.was, begun.adopted), ("unreadable", 3));
         check(&root, &state_dir).await.unwrap();
         // Newer: only an upgrade
         let mut newer: serde_json::Value = serde_json::from_slice(&good).unwrap();
         newer["format"] = serde_json::json!(FORMAT + 1);
         std::fs::write(root.join(ROSTER), serde_json::to_vec(&newer).unwrap()).unwrap();
-        let e = begin(&root, &state_dir, "x").await.unwrap_err();
+        let e = begin(&root, &state_dir, "x", false).await.unwrap_err();
         assert!(matches!(e, RosterError::Newer { .. }), "{e}");
         assert!(e.way_out().contains("upgrade"));
+    }
+
+    /// Begun again over a roster that still reads (shrunk), an agent whose
+    /// head is behind it is named, and nothing is touched without `yes`;
+    /// with it, adopted as found and listed.
+    #[tokio::test]
+    async fn begin_names_heads_behind_the_old_roster_and_needs_yes() {
+        let root = crate::sealed::TestDir::new("roster-begin-behind");
+        let state_dir = root.join("state");
+        let agents = fleet(&root, 3).await;
+        check(&root, &state_dir).await.unwrap();
+        let mut roster = load(&root).unwrap().unwrap();
+        roster.agents.remove(&agents[0].0);
+        // As if agents[1]'s directory had been put back from an older copy
+        let (rolled, dir) = &agents[1];
+        let found = head(dir, *rolled).await.seq;
+        roster.agents.get_mut(rolled).unwrap().seq = found + 4;
+        let edited = serde_json::to_vec(&roster).unwrap();
+        std::fs::write(root.join(ROSTER), &edited).unwrap();
+        let e = begin(&root, &state_dir, "edited", false).await.unwrap_err();
+        let RosterError::Behind { behind } = &e else {
+            panic!("{e}")
+        };
+        assert_eq!(
+            behind,
+            &vec![Behind {
+                id: *rolled,
+                found,
+                roster: found + 4
+            }]
+        );
+        assert!(e.to_string().contains(&rolled.to_string()), "{e}");
+        assert!(e.way_out().contains("--yes"), "{}", e.way_out());
+        assert_eq!(
+            std::fs::read(root.join(ROSTER)).unwrap(),
+            edited,
+            "nothing touched"
+        );
+        let begun = begin(&root, &state_dir, "edited", true).await.unwrap();
+        assert_eq!((begun.was, begun.adopted), ("shrunk", 3));
+        assert_eq!(begun.behind.len(), 1);
+        assert_eq!(load(&root).unwrap().unwrap().agents[rolled].seq, found);
     }
 
     /// A directory put back to an older consistent copy reads as fine to

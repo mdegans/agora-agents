@@ -38,8 +38,9 @@ pub enum Command {
         opt_in: bool,
         /// With `--opt-in`: do it. With `--agent`, for the agents named;
         /// without, for every agent the dry run lists, and then `--expect`
-        /// is required.
-        #[arg(long, requires = "opt_in", conflicts_with = "dry_run")]
+        /// is required. With `--begin-roster`: adopt as found the agents
+        /// it lists as behind the old roster.
+        #[arg(long, conflicts_with = "dry_run")]
         yes: bool,
         /// With `--opt-in --yes`: how many agents the dry run listed. A
         /// mismatch touches nothing.
@@ -70,6 +71,9 @@ pub enum Command {
         /// unreadable or holds fewer agents than its witness says (the
         /// start refuses each, naming this). What it finds is set aside,
         /// never deleted. Needs `--note` (why), which is logged and kept.
+        /// Every head is adopted as found, so a rollback made before this
+        /// can no longer be told apart; agents behind a roster that still
+        /// reads are named first, and adopted only with `--yes`.
         #[arg(
             long,
             requires = "note",
@@ -273,10 +277,30 @@ pub async fn run(
             resume,
             begin_roster,
         } => {
+            anyhow::ensure!(
+                !yes || opt_in || begin_roster,
+                "--yes goes with --opt-in or --begin-roster"
+            );
+            anyhow::ensure!(
+                expect.is_none() || opt_in,
+                "--expect goes with --opt-in --yes"
+            );
             if begin_roster {
                 let note = note.as_deref().map(str::trim).unwrap_or_default();
                 anyhow::ensure!(!note.is_empty(), "--begin-roster needs --note \"<why>\"");
-                let begun = super::roster::begin(data_dir, &state_dir, note).await?;
+                // What it gives up, said before it acts
+                println!("{}", super::roster::BEGIN_TRADE_OFF);
+                tracing::warn!(
+                    event_type = "sealed_roster_begin_trade_off",
+                    "{}",
+                    super::roster::BEGIN_TRADE_OFF
+                );
+                let begun = match super::roster::begin(data_dir, &state_dir, note, yes).await {
+                    Err(e @ super::roster::RosterError::Behind { .. }) => {
+                        anyhow::bail!("not begun, nothing changed: {e}. {}", e.way_out())
+                    }
+                    other => other?,
+                };
                 println!(
                     "sealed roster begun again (it was {}): {} chained agent(s) adopted as found; \
                      {} file(s) set aside{}",
@@ -289,6 +313,12 @@ pub async fn run(
                         .map(|p| format!(" {}", p.display()))
                         .collect::<String>()
                 );
+                for b in &begun.behind {
+                    println!(
+                        "{}: adopted at seq {}, behind the old roster's seq {} (--yes)",
+                        b.id, b.found, b.roster
+                    );
+                }
                 return Ok(());
             }
             anyhow::ensure!(
