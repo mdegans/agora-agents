@@ -168,6 +168,56 @@ which that refusal doesn't block. With chained agents and no roster the
 start refuses at once, naming `--begin-roster` (review round,
 2026-11-12). Integration tests both sequences.
 
+## Upgrading a data directory that already has uploading agents
+
+For a data directory where an older runner chained and uploaded agents
+(agentkit's old chain marker `sealed/enrolled`, a non-empty `sealed/sent/`,
+a yes on file in the ledger, no uploading marker, and no
+`sealed-roster.json`): the three test agents are in exactly this state.
+Integration (2026-11-12) checked the order end to end on synthetic state
+(`review_tests::an_agent_uploading_under_the_old_build_upgrades_by_the_documented_steps`);
+nothing in the order was changed.
+
+What happens, in order, whichever command runs first:
+
+- The start pass (every runner start and every non-dry `sealed-*`
+  command, `--begin-roster` included) judges each agent with the old
+  marker *while the marker is there* (`uploading::migrate`): `sent/`
+  non-empty and an answer in force of yes, with no re-offer waiting →
+  marked uploading (`UploadingBy::Migration`). Then agentkit's
+  `migrate_marker` moves `enrolled` to `chained`. Once the old marker is
+  gone the agent is never judged again: one that didn't qualify (no yes
+  in force, a re-offer waiting, an unreadable ledger) stays not
+  uploading until `sealed-enroll --opt-in` on a yes. It fails toward not
+  uploading, never toward stuck.
+- A migration that failed on I/O keeps the old marker and is tried at the
+  next start; meanwhile `sealed-enroll` (chain) refuses that agent rather
+  than chain it a second time.
+- With chained directories and no roster, the runner's start refuses the
+  whole run and plain `sealed-enroll` refuses before chaining anything;
+  both name `--begin-roster`. Nothing is marked refused for it.
+
+The operator's steps (the runner stopped throughout, `just runner-stop`):
+
+1. `agora-seed sealed-enroll --begin-roster --note "upgrade: agents
+   uploading under the build before the roster"`. Its start pass marks and
+   moves (above); then the roster is begun from the chained directories
+   as they are, each adopted at its head; the note is kept in
+   `sealed-roster.began`.
+2. `agora-seed sealed-enroll --jobs 16`: chains every other agent with a
+   state; the upgraded agents are already chained and are left as they
+   are.
+3. Optional: `agora-seed sealed-enroll --opt-in` (a dry run) lists any
+   agent with a yes in force that is not uploading (for example one that
+   had a re-offer waiting at the migration); `--yes --expect N` starts
+   them.
+4. Start the runner. Each upgraded agent is checked against Agora's copy
+   and drained as an uploader: nothing in `sent/` is sent again, its head
+   and state are unchanged.
+
+If the runner is started before step 1, the start does the marking and
+moving and then refuses; step 1 then works the same way.
+
 ## Integrated: the one-way door
 
 Once the start pass moves `sealed/enrolled` to `sealed/chained`, or a

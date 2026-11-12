@@ -492,6 +492,132 @@ async fn a_failed_reactor_is_alerted() {
     );
 }
 
+/// The upgrade of a data directory with agents that already upload under
+/// the build before the local chain (`LOCAL-CHAIN-IMPACT.md`, "Upgrading a
+/// data directory that already has uploading agents"): agentkit's old
+/// chain marker `sealed/enrolled`, a non-empty `sealed/sent/`, a yes on
+/// file, no uploading marker and no roster. The first start's pass judges
+/// it while the old marker is there (marked uploading) and then moves the
+/// marker (chained); the start is refused, as it is over any chained
+/// agents with no roster, and so is plain enrolment, both naming
+/// `--begin-roster`; the operator's begin adopts it; the next start runs
+/// it, still uploading, on the roster, with nothing sent again and
+/// nothing lost.
+#[tokio::test]
+async fn an_agent_uploading_under_the_old_build_upgrades_by_the_documented_steps() {
+    let root = sealed::TestDir::new("review-upgrade-legacy");
+    let state_dir = root.join("state");
+    let (id, keys, dir) = sealed::check::tests::chained_local(&root).await;
+    let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
+    // As the old build left it: everything uploaded, then the old marker
+    for item in seal.outbox().await.unwrap() {
+        seal.mark_sent(item.ord).await.unwrap();
+    }
+    sealed::uploading::tests::old_marker(&dir);
+    sealed::uploading::tests::ledger(&dir, true);
+    let sent = |seal: &agora_agentkit::state::storage::AgentSeal| {
+        let seal = seal.clone();
+        async move {
+            let mut ords: Vec<u64> = seal.sent().await.unwrap().iter().map(|i| i.ord).collect();
+            ords.sort_unstable();
+            ords
+        }
+    };
+    let sent_before = sent(&seal).await;
+    assert!(!sent_before.is_empty(), "it uploaded");
+    let head_before = seal.head().await.unwrap().unwrap().head;
+    let state_before = sealed::check::tests::local_hash(&root, id).await;
+    assert!(!sealed::is_enrolled(&dir) && !sealed::uploads(&dir, &keys, id));
+    for file in [
+        root.join(sealed::roster::ROSTER),
+        root.join(sealed::roster::BEGAN),
+        root.join("secrets").join(sealed::roster::WITNESS),
+    ] {
+        assert!(!file.exists(), "no roster yet: {}", file.display());
+    }
+    let api = sealed::api::fake::guarded(&root);
+    *api.chain.lock().unwrap() = Ok(sealed::check::local_entries(&seal).await.unwrap());
+
+    // Step 1, the first start: its pass marks and moves; the start check
+    // refuses the run over chained agents with no roster
+    sealed::uploading::start_pass(&state_dir, &keys, &alerts::Alerter::off()).await;
+    assert!(!seal.has_legacy_marker().await.unwrap(), "moved");
+    assert!(sealed::is_enrolled(&dir), "chained");
+    assert!(sealed::uploads(&dir, &keys, id), "marked uploading");
+    let (run, _, _) = start_run(&root, &[id], &api).await;
+    assert!(
+        run.fleet.len() == 1 && run.fleet[0].contains("--begin-roster --note"),
+        "{:?}",
+        run.fleet
+    );
+    assert!(
+        run.refused.is_empty() && run.held.is_empty(),
+        "no agent marked"
+    );
+    refuse_run(&run, &alerts::Alerter::off()).unwrap_err();
+    // Plain enrolment refuses the same way, before it chains anything
+    let e = enroll(&root, false).await.unwrap_err().to_string();
+    assert!(e.contains("--begin-roster --note"), "{e}");
+
+    // Step 2, the operator: the runner stopped, the roster begun from the
+    // chained directories as they are
+    let mut begin = enroll_command(false);
+    if let sealed::cli::Command::SealedEnroll {
+        begin_roster, note, ..
+    } = &mut begin
+    {
+        *begin_roster = true;
+        *note = Some("upgrade: agents uploading under the build before the roster".to_string());
+    }
+    sealed::cli::run(
+        begin,
+        &root,
+        url::Url::parse("http://127.0.0.1:9").unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    let roster = sealed::roster::load(&root).unwrap().unwrap();
+    assert_eq!(
+        (roster.agents[&id].seq, roster.agents[&id].entry_hash),
+        (head_before.seq, head_before.entry_hash),
+        "adopted at its head"
+    );
+    // Step 3: enrolment, as for the rest of the fleet: nothing to do here
+    enroll(&root, false).await.unwrap();
+
+    // Step 4, the next start: it runs, uploading, nothing sent again
+    let (run, pool, _) = start_run(&root, &[id], &api).await;
+    refuse_run(&run, &alerts::Alerter::off()).unwrap();
+    assert_eq!(pool, vec![id]);
+    assert!(
+        run.held.is_empty() && run.refused.is_empty(),
+        "{:?}",
+        run.held
+    );
+    assert_eq!(run.drained.len(), 1, "drained as an uploader");
+    assert!(sealed::uploads(&dir, &keys, id), "still uploading");
+    assert_eq!(sent(&seal).await, sent_before, "nothing re-uploaded");
+    assert!(seal.outbox().await.unwrap().is_empty(), "nothing waits");
+    assert_eq!(seal.head().await.unwrap().unwrap().head, head_before);
+    assert_eq!(
+        sealed::check::tests::local_hash(&root, id).await,
+        state_before,
+        "nothing lost"
+    );
+    let calls = api.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| [
+            "post_state_key",
+            "post_anchor",
+            "publish_chosen",
+            "rotate_key"
+        ]
+        .contains(&c.as_str())),
+        "{calls:?}"
+    );
+}
+
 mod reload {
     use super::*;
     use agora_agentkit::state::storage::{AgentSeal, Mirrored};
