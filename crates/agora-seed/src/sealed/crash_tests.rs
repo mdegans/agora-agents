@@ -80,7 +80,7 @@ fn plain() -> History {
 /// rename. Each stage either order can be cut at is rebuilt on disk from
 /// the states before and after a real save; the restart (tmp promotion,
 /// then the start check) runs on the old or the new state, intact, and
-/// never on none. B6: the new order's stages (4, 5) added.
+/// never on none. The new order's stages are 4 and 5.
 #[tokio::test]
 async fn a_save_cut_at_any_step_loses_nothing() {
     for stage in 1..=7 {

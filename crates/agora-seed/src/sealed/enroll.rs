@@ -449,8 +449,8 @@ struct Resuming {
 
 const RESUMING: &str = "resuming.json";
 
-// B7: read-only, for the `memory` tool's labels (`history.rs`): which
-// versions a resume set aside, and when. Owned by the resume's builder.
+// Read-only, for the `memory` tool's labels (`history.rs`): which
+// versions a resume set aside, and when.
 /// The versions each resume set aside as saved while uploads were
 /// stopped, with when it ran: `resuming.json` (a resume under way) and
 /// every `resuming.done.*.json`. Hashes only; an unreadable record is
@@ -2591,7 +2591,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .line()
                 .unwrap();
-            // B7: the notice's wording (`notice.rs`)
+            // The notice's wording (`notice.rs`)
             assert!(
                 line.contains(
                     "The 2 versions of your state saved while uploads were stopped are kept here"

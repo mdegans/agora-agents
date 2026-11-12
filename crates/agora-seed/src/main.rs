@@ -4221,7 +4221,7 @@ mod tests {
             "the stop, then the verdict: {:?}",
             seat.lines
         );
-        // B7: the stop line's wording (`sealed/stop.rs`)
+        // The stop line's wording (`sealed/stop.rs`)
         assert!(
             seat.lines[0].starts_with("Your operator stopped uploading your sealed state on ")
                 && seat.lines[0].ends_with(
