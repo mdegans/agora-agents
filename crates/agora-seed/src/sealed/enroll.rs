@@ -211,6 +211,10 @@ pub struct Report {
     pub kept_local: usize,
     /// Entries in the chain at the end (genesis included).
     pub entries: usize,
+    /// A session journal is beside the state (an interrupted or failed
+    /// session's, kept for the agent's next session): left untouched; the
+    /// agent is chained all the same.
+    pub journal: bool,
 }
 
 impl std::fmt::Display for Report {
@@ -235,7 +239,14 @@ impl std::fmt::Display for Report {
             if self.prior { "yes" } else { "no" },
             self.current_bytes,
             self.entries,
-        )
+        )?;
+        if self.journal {
+            write!(
+                f,
+                ", an unfinished session's journal is there (left as it is for its next session)"
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -254,6 +265,18 @@ pub enum Skip {
     NotOptedIn,
     #[error("its uploads are stopped; `sealed-enroll --agent <id>` resumes them")]
     Stopped,
+    /// Another process holds the agent (an operator's command; a runner's
+    /// session in a dry run): not chained this time, a rerun chains it.
+    #[error("held by another process; run `sealed-enroll` again when it has finished")]
+    Busy,
+    /// It can't be chained until the operator repairs something
+    /// ([`super::unchainable`]): recorded, and left out of every run until
+    /// a later `sealed-enroll` chains it.
+    #[error("can't be chained ({}): {error:#}", class.as_str())]
+    Cannot {
+        class: super::unchainable::Class,
+        error: anyhow::Error,
+    },
     #[error(transparent)]
     Failed(#[from] anyhow::Error),
 }
@@ -268,8 +291,105 @@ impl Skip {
             Self::NotChained => "not_chained",
             Self::NotOptedIn => "not_opted_in",
             Self::Stopped => "stopped",
+            Self::Busy => "busy",
+            Self::Cannot { class, .. } => class.as_str(),
             Self::Failed(_) => "failed",
         }
+    }
+
+    fn cannot(class: super::unchainable::Class, error: anyhow::Error) -> Self {
+        Self::Cannot { class, error }
+    }
+
+    /// What the record of agents that can't be chained
+    /// ([`super::unchainable`]) takes from this outcome of a chain.
+    pub fn found(&self) -> super::unchainable::Found {
+        use super::unchainable::Found;
+        match self {
+            Self::Chained | Self::NoState => Found::Settled,
+            Self::Cannot { class, .. } => Found::Cannot(*class),
+            _ => Found::Unknown,
+        }
+    }
+}
+
+/// The agents with a state that a chain pass left without a chain
+/// ([`Enroller::settle_pass`]): ids by why, never anything of a state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unchained {
+    /// By [`Skip::as_str`]: a class of [`super::unchainable::Class`],
+    /// `busy` or `failed`.
+    pub by_class: std::collections::BTreeMap<&'static str, Vec<AgentId>>,
+    /// Those that can't be chained until repaired: on the record
+    /// ([`super::unchainable`]), left out of every run with an alert, not
+    /// counted by the start's strays rule.
+    pub recorded: usize,
+    /// The rest (held by another process, a failure a rerun may get
+    /// past): three or more refuse the runner's start.
+    pub strays: usize,
+    remedies: std::collections::BTreeMap<&'static str, &'static str>,
+    dry_run: bool,
+}
+
+impl Unchained {
+    pub fn is_empty(&self) -> bool {
+        self.by_class.is_empty()
+    }
+
+    pub fn agents(&self) -> usize {
+        self.by_class.values().map(Vec::len).sum()
+    }
+}
+
+impl std::fmt::Display for Unchained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "{} agent(s) with a state {} without a chain:",
+            self.agents(),
+            if self.dry_run {
+                "would be left"
+            } else {
+                "are left"
+            }
+        )?;
+        for (class, ids) in &self.by_class {
+            let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+            writeln!(f, "  {class} ({}): {}", ids.len(), ids.join(" "))?;
+            if let Some(remedy) = self.remedies.get(class) {
+                writeln!(f, "    to chain: {remedy}")?;
+            }
+        }
+        if self.recorded > 0 {
+            writeln!(
+                f,
+                "{} of them can't be chained until repaired: {} in {} beside the roster, left out \
+                 of every run (never run unchained), with an alert each run, until a later \
+                 `sealed-enroll` chains them.",
+                self.recorded,
+                if self.dry_run {
+                    "a run would record them"
+                } else {
+                    "recorded"
+                },
+                super::unchainable::RECORD,
+            )?;
+        }
+        if self.strays > 0 {
+            writeln!(
+                f,
+                "{} of them were not reached or failed: run `sealed-enroll` again. They count at \
+                 the runner's start, which refuses to run (exit {}) while {} or more agents have \
+                 a state and no chain.",
+                self.strays,
+                super::REFUSED_RUN_EXIT,
+                super::check::REFUSED_AGENTS_STOP_RUN,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -538,6 +658,7 @@ impl Enroller {
         dry_run: bool,
         genesis: Genesis,
     ) -> Result<Report, Skip> {
+        use super::unchainable::Class;
         let agent_dir = self.state_dir.join(id.to_string());
         let seal = AgentSeal::new(&agent_dir, id);
         if seal
@@ -548,17 +669,37 @@ impl Enroller {
             if dry_run {
                 return Err(Skip::Chained);
             }
-            return match self.append_prior(id).await? {
-                Some(report) => Ok(report),
-                None => Err(Skip::Chained),
+            return match self.append_prior(id).await {
+                Ok(Some(report)) => Ok(report),
+                Ok(None) => Err(Skip::Chained),
+                Err(e) if e.is::<super::session::Busy>() => Err(Skip::Busy),
+                Err(e) => Err(e.into()),
             };
+        }
+        // An older runner's chain marker the start pass couldn't move
+        // (`uploading::migrate_markers` logs the failure and goes on): the
+        // agent is chained, and may upload. Chained again from here its
+        // chain would be read as one cut short and added to
+        if !dry_run
+            && seal
+                .has_legacy_marker()
+                .await
+                .context("reading the older chain marker")?
+        {
+            return Err(Skip::Failed(anyhow::anyhow!(
+                "an older runner's chain marker (sealed/enrolled) is still here: it couldn't be \
+                 moved to sealed/chained (a sealed_state_marker_migration_failed event says \
+                 why). The agent is chained already and is not chained again; fix what stopped \
+                 the move (permissions, the disk) and run this again"
+            )));
         }
         let storage = FsStorage::new(&self.state_dir);
         let current = match storage.load_raw(id).await {
             Ok(loaded) => loaded.value,
             Err(FsStorageError::NotFound(_)) => return Err(Skip::NoState),
             Err(e) => {
-                return Err(Skip::Failed(
+                return Err(Skip::cannot(
+                    Class::StateUnloadable,
                     anyhow::Error::new(e).context("the agent's state won't load"),
                 ));
             }
@@ -588,7 +729,11 @@ impl Enroller {
             }
             Genesis::FromRecord => match self.restore.as_ref() {
                 // The name matters only to the memory-restore listing
-                Some(offer) => origin(Some(offer), &name_of(&current)?, id, &agent_dir).await?,
+                Some(offer) => {
+                    let name =
+                        name_of(&current).map_err(|e| Skip::cannot(Class::StateUnloadable, e))?;
+                    origin(Some(offer), &name, id, &agent_dir).await?
+                }
                 None => Origin {
                     origin: GenesisOrigin {
                         class: GenesisClass::Unknown,
@@ -612,32 +757,71 @@ impl Enroller {
                 .unwrap_or(0),
             ..Report::default()
         };
-        if super::session::no_session(&self.state_dir, id, false).is_err() {
-            return Err(Skip::InSession);
+        // A journal beside the state is an interrupted or failed session's,
+        // kept until the agent's next session completes (`interrupted`). It
+        // is not state: the state on disk is the last one saved, and that
+        // is what is chained. The journal is left untouched, so the agent
+        // is still told at its next session. No session can be live: the
+        // caller holds `runner.lock` exclusively, and the agent's session
+        // lock is taken below (a dry run only reads)
+        report.journal =
+            std::fs::exists(FsStorage::new(&self.state_dir).journal(id).path()).unwrap_or(false);
+        // What no rerun can chain until the operator repairs it, found
+        // before anything is written, and by a dry run too
+        if self.keys.signing(id).is_none() {
+            return Err(Skip::cannot(
+                Class::NoSigningKey,
+                anyhow::anyhow!("the agent has no signing key"),
+            ));
         }
+        let has_key = |keys: &KeyStore| -> anyhow::Result<bool> {
+            Ok(keys
+                .state_key_file(id)
+                .context("the state key cache")?
+                .is_some())
+        };
+        // A chain begun before (a head) whose state key is gone: a new key
+        // would leave every version already sealed unopenable, with nothing
+        // the start check (which compares hashes) could tell
+        let key_lost = || {
+            Skip::cannot(
+                Class::StateKeyLost,
+                anyhow::anyhow!(
+                    "a chain was begun (sealed/head.json) but its state key                      (state_key.json) is gone; no new key is made over it"
+                ),
+            )
+        };
         if dry_run {
+            if seal
+                .head()
+                .await
+                .context("reading the sealed head")?
+                .is_some()
+                && !has_key(&self.keys)?
+            {
+                return Err(key_lost());
+            }
+            if let Some(prior) = &origin.prior {
+                read_prior(prior).map_err(|e| Skip::cannot(Class::PriorCopyUnreadable, e))?;
+            }
             return Ok(report);
         }
-        if self.keys.signing(id).is_none() {
-            return Err(Skip::Failed(anyhow::anyhow!(
-                "the agent has no signing key"
-            )));
-        }
-        // No session in progress, and the agent's lock for the whole chain:
-        // every write below goes through it
-        let lock = super::session::take(&self.state_dir, id, false)
+        // The agent's session lock and its `sealed/lock` for the whole
+        // chain: every write below goes through it
+        let lock = super::session::take_idle(&self.state_dir, id)
             .await
-            .map_err(|_| Skip::InSession)?;
+            .map_err(|e| match e.downcast_ref::<super::session::Busy>() {
+                Some(_) => Skip::Busy,
+                None => Skip::Failed(e.context("taking the agent's locks")),
+            })?;
         // A chain begun before but never finished is resumed
         let partial = seal.head().await.context("reading the sealed head")?;
         // The state key, cached here; nothing of it leaves the machine
-        // until the agent opts in
-        if self
-            .keys
-            .state_key_file(id)
-            .context("the state key cache")?
-            .is_none()
-        {
+        // until the agent opts in. Made only for a chain not yet begun
+        if !has_key(&self.keys)? {
+            if partial.is_some() {
+                return Err(key_lost());
+            }
             self.keys
                 .write_state_key(id, &StateKeyFile::new(&StateKey::generate(), 0, 0))
                 .context("caching the state key")?;
@@ -654,47 +838,53 @@ impl Enroller {
         // and whether the pre-loss copy is in
         let mut sealed_before: Vec<Sha256Hex> = Vec::new();
         let mut prior_done = false;
-        match &partial {
-            Some(_) => {
-                let mut items = seal.sent().await.context("reading sent/")?;
-                items.extend(seal.outbox().await.context("reading the outbox")?);
-                items.sort_by_key(|i| i.entry.entry.seq);
-                sealed_before = items
-                    .iter()
-                    .filter(|i| i.entry.entry.kind == StateEntryKind::Snapshot)
-                    .filter_map(|i| i.plaintext_sha256)
-                    .collect();
-                prior_done = items
-                    .iter()
-                    .any(|i| i.entry.entry.kind == StateEntryKind::ArchivedPrior);
-                report.resumed = true;
-                tracing::warn!(
-                    event_type = "sealed_chain_resumed",
-                    agent_id = %id,
-                    entries = items.len(),
-                    "resuming a partial chain"
-                );
+        if partial.is_some() {
+            let mut items = seal.sent().await.context("reading sent/")?;
+            items.extend(seal.outbox().await.context("reading the outbox")?);
+            items.sort_by_key(|i| i.entry.entry.seq);
+            sealed_before = items
+                .iter()
+                .filter(|i| i.entry.entry.kind == StateEntryKind::Snapshot)
+                .filter_map(|i| i.plaintext_sha256)
+                .collect();
+            prior_done = items
+                .iter()
+                .any(|i| i.entry.entry.kind == StateEntryKind::ArchivedPrior);
+            report.resumed = true;
+            tracing::warn!(
+                event_type = "sealed_chain_resumed",
+                agent_id = %id,
+                entries = items.len(),
+                "resuming a partial chain"
+            );
+        }
+        // The pre-loss copy is read before the genesis is sealed: one that
+        // can't be read leaves no chain begun
+        let prior = match origin.prior.as_ref().filter(|_| !prior_done) {
+            Some(path) => {
+                Some(read_prior(path).map_err(|e| Skip::cannot(Class::PriorCopyUnreadable, e))?)
             }
-            None => {
-                let first_at = archives
-                    .first()
-                    .map(|a| a.mtime)
-                    .or_else(|| mtime(&current_path).ok())
-                    .unwrap_or_else(Utc::now);
-                super::session::genesis(&seal, &lock, &keys, &origin.origin, first_at)
-                    .await
-                    .context("sealing the genesis")?;
-            }
+            None => None,
+        };
+        if partial.is_none() {
+            let first_at = archives
+                .first()
+                .map(|a| a.mtime)
+                .or_else(|| mtime(&current_path).ok())
+                .unwrap_or_else(Utc::now);
+            super::session::genesis(&seal, &lock, &keys, &origin.origin, first_at)
+                .await
+                .context("sealing the genesis")?;
         }
         super::crash::point("chain:genesis")?;
-        if let Some(prior) = origin.prior.as_ref().filter(|_| !prior_done) {
+        if let Some(prior) = &prior {
             super::session::append(
                 &seal,
                 &lock,
                 &keys,
                 &policy,
                 StateEntryKind::ArchivedPrior,
-                &read_prior(prior)?,
+                prior,
                 prior_copy_at(),
             )
             .await
@@ -887,7 +1077,9 @@ impl Enroller {
         {
             return Ok(None);
         }
-        let lock = super::session::take(&self.state_dir, id, false).await?;
+        // Whatever its journal says (`session::take_idle`): the session
+        // lock proves no session is live
+        let lock = super::session::take_idle(&self.state_dir, id).await?;
         let current = FsStorage::new(&self.state_dir)
             .load_raw(id)
             .await
@@ -918,6 +1110,9 @@ impl Enroller {
             .seal_keys(id)
             .context("sealing keys for the agent")?;
         let policy = KeyframePolicy::default();
+        // Read before the agent is told: a copy that can't be read leaves
+        // no notice saying it was added
+        let prior = read_prior(&prior)?;
         // Told first, in one write: a cut after it is finished by
         // `finish_prior`, so the notice is never false for long
         let sent = super::uploads(&agent_dir, &self.keys, id);
@@ -933,7 +1128,7 @@ impl Enroller {
             &keys,
             &policy,
             StateEntryKind::ArchivedPrior,
-            &read_prior(&prior)?,
+            &prior,
             prior_copy_at(),
         )
         .await
@@ -988,7 +1183,7 @@ impl Enroller {
         if head_kind != Some(StateEntryKind::ArchivedPrior) {
             return Ok(None);
         }
-        let lock = super::session::take(&self.state_dir, id, false).await?;
+        let lock = super::session::take_idle(&self.state_dir, id).await?;
         let current = FsStorage::new(&self.state_dir)
             .load_raw(id)
             .await
@@ -1079,6 +1274,72 @@ impl Enroller {
                 (id, r)
             })
             .collect()
+    }
+
+    /// What a chain pass ([`Self::chain_all`]) left without a chain, and
+    /// (not in a dry run) the record of agents that can't be chained
+    /// brought up to it ([`super::unchainable::settle`]). `sealed-enroll`
+    /// prints it and exits nonzero unless it is empty.
+    pub fn settle_pass(
+        &self,
+        results: &[(AgentId, Result<Report, Skip>)],
+        dry_run: bool,
+    ) -> anyhow::Result<Unchained> {
+        use super::unchainable::Found;
+        let mut left = Unchained {
+            dry_run,
+            ..Unchained::default()
+        };
+        let mut found = Vec::with_capacity(results.len());
+        for (id, result) in results {
+            let f = match result {
+                Ok(_) => Found::Settled,
+                Err(e) => e.found(),
+            };
+            found.push((*id, f));
+            match result {
+                Ok(_) | Err(Skip::Chained | Skip::NoState) => {}
+                Err(e) => {
+                    left.by_class.entry(e.as_str()).or_default().push(*id);
+                    match f {
+                        Found::Cannot(class) => {
+                            left.recorded += 1;
+                            left.remedies.insert(class.as_str(), class.remedy());
+                        }
+                        _ => left.strays += 1,
+                    }
+                }
+            }
+        }
+        if !dry_run {
+            super::unchainable::settle(self.data_dir()?, found)
+                .context("recording the agents that can't be chained")?;
+        }
+        if !left.by_class.is_empty() {
+            let classes: std::collections::BTreeMap<&str, usize> = left
+                .by_class
+                .iter()
+                .map(|(c, ids)| (*c, ids.len()))
+                .collect();
+            let ids: Vec<String> = left
+                .by_class
+                .values()
+                .flatten()
+                .map(ToString::to_string)
+                .collect();
+            tracing::error!(
+                event_type = "sealed_enroll_unchained",
+                agents = ids.len(),
+                recorded = left.recorded,
+                strays = left.strays,
+                classes = ?classes,
+                agent_ids = %ids.join(","),
+                dry_run,
+                "agents with a state are left without a chain; three or more not on the \
+                 unchainable record refuse the runner's start"
+            );
+        }
+        Ok(left)
     }
 
     /// Start uploading a chained agent whose latest sealed-state answer is
@@ -1518,7 +1779,12 @@ impl Enroller {
             .mark(id)
             .await
             .context("marking the state as sealed again")?;
-        self.roster(id, marked).await;
+        // Set, not merged: the uploaded line resumed from the last entry
+        // Agora holds, so the head's seq may be below the one the roster
+        // saw while stopped; "higher seq wins" would keep the old one and
+        // the next start would refuse the agent as rolled back. `head.json`
+        // is written already (the order `roster::replace` asks for)
+        super::roster::replace_for(&self.state_dir, id, Some(marked)).await?;
         // Always told, in one write, before the stop is cleared
         super::notice::Notice::operator_act(
             &agent_dir,
@@ -2141,18 +2407,194 @@ pub(crate) mod tests {
         assert_eq!(opened_memories(&dir, id, &keys).await, ["only"]);
     }
 
-    /// A session journal: skipped, nothing written.
-    #[tokio::test]
-    async fn an_agent_in_a_session_is_skipped() {
-        let root = crate::sealed::TestDir::new("chain-session");
-        let (id, keys, dir) = agent(&root, &["a"]).await;
+    /// A real leftover journal: a session that wrote a post and never
+    /// finished.
+    pub(crate) async fn leave_journal(root: &Path, id: AgentId) -> Vec<u8> {
+        use agora_agentkit::reactor::journal::{Journal, PostWrite, SessionHeader, Written};
         let journal = FsStorage::new(root.join("state")).journal(id);
-        std::fs::write(journal.path(), b"{}\n").unwrap();
-        assert!(matches!(
-            enroller(&root, &keys).chain(id, false).await,
-            Err(Skip::InSession)
-        ));
+        journal
+            .begin(
+                SessionHeader {
+                    started_at: Utc::now(),
+                    model: "claude-test".into(),
+                },
+                &Journal::default(),
+            )
+            .await
+            .unwrap();
+        journal
+            .append(
+                &Written::Post(PostWrite {
+                    at: Utc::now(),
+                    id: agora_agentkit::ids::PostId::new(),
+                })
+                .into(),
+            )
+            .await
+            .unwrap();
+        std::fs::read(journal.path()).unwrap()
+    }
+
+    /// B1 (review of 2026-11-12). A journal an interrupted or failed
+    /// session left is not state: the agent is chained from its last saved
+    /// state, the journal is untouched (so its next session still shows
+    /// the notice), and the start check lets it run. Before, such an agent
+    /// was skipped (`Skip::InSession`) by every enrolment, and three of
+    /// them refused the run that would have cleared their journals.
+    #[tokio::test]
+    async fn an_agent_with_a_leftover_journal_is_chained_and_still_told() {
+        let root = crate::sealed::TestDir::new("chain-journal");
+        let (id, keys, dir) = agent(&root, &["a", "b"]).await;
+        let before = leave_journal(&root, id).await;
+        let e = enroller(&root, &keys);
+        let dry = e.chain(id, true).await.unwrap();
+        assert!(dry.journal, "a dry run says the journal is there");
+        assert!(!dir.join(SEALED_DIR).exists(), "and writes nothing");
+        let report = e.chain(id, false).await.unwrap();
+        assert!(report.journal);
+        assert!(report.to_string().contains("journal"), "{report}");
+        assert!(AgentSeal::new(&dir, id).is_enrolled().await.unwrap());
+        assert_eq!(opened_memories(&dir, id, &keys).await, ["a", "b"]);
+        // The journal as it was: the next session's notice is still due
+        let journal = FsStorage::new(root.join("state")).journal(id);
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
+        let notice = crate::interrupted::notice(&journal.read().await.unwrap()).unwrap();
+        assert!(
+            notice.starts_with(crate::interrupted::NOTICE_PREFIX),
+            "{notice}"
+        );
+        // And the now-chained agent's start check lets that session start
+        let hash = crate::sealed::check::tests::local_hash(&root, id).await;
+        let out = crate::sealed::check::check(
+            &dir,
+            id,
+            &hash,
+            Default::default(),
+            &keys,
+            &fake::FakeApi::new(),
+        )
+        .await;
+        assert!(
+            matches!(out, crate::sealed::check::Outcome::Run { hold: None, .. }),
+            "{out:?}"
+        );
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
+    }
+
+    /// An agent another process holds (its session lock) is not chained
+    /// this time, and says so apart from a failure: a rerun chains it.
+    #[tokio::test]
+    async fn an_agent_held_by_another_process_is_busy_not_failed() {
+        let root = crate::sealed::TestDir::new("chain-busy");
+        let (id, keys, dir) = agent(&root, &["a"]).await;
+        let e = enroller(&root, &keys);
+        let held = crate::sealed::session::try_session(&root.join("state"), id)
+            .unwrap()
+            .unwrap();
+        let skip = e.chain(id, false).await.unwrap_err();
+        assert!(matches!(skip, Skip::Busy), "{skip:?}");
+        assert_eq!(skip.found(), crate::sealed::unchainable::Found::Unknown);
         assert!(!dir.join(SEALED_DIR).exists());
+        drop(held);
+        e.chain(id, false).await.unwrap();
+    }
+
+    /// What no rerun can chain is named by class, by a dry run too, with
+    /// nothing written: no signing key, a state that won't load, an
+    /// unreadable pre-loss copy.
+    #[tokio::test]
+    async fn what_cant_be_chained_is_classed_and_a_dry_run_says_the_same() {
+        use crate::sealed::unchainable::{Class, Found};
+        let root = crate::sealed::TestDir::new("chain-cannot");
+        let (keyless, keys, keyless_dir) = agent(&root, &["a"]).await;
+        std::fs::rename(
+            root.join("secrets").join(keyless.to_string()),
+            root.join("secrets").join(format!("{keyless}.aside")),
+        )
+        .unwrap();
+        let (broken, _, broken_dir) = agent(&root, &["a"]).await;
+        std::fs::write(broken_dir.join("state.json"), b"{ not json").unwrap();
+        let e = enroller(&root, &keys);
+        for dry in [true, false] {
+            for (id, dir, class) in [
+                (keyless, &keyless_dir, Class::NoSigningKey),
+                (broken, &broken_dir, Class::StateUnloadable),
+            ] {
+                let skip = e.chain(id, dry).await.unwrap_err();
+                assert_eq!(skip.found(), Found::Cannot(class), "dry {dry}: {skip:?}");
+                assert_eq!(skip.as_str(), class.as_str());
+                assert!(!dir.join(SEALED_DIR).exists(), "nothing written");
+                assert!(
+                    keys.state_key_file(id).unwrap().is_none(),
+                    "no state key made"
+                );
+            }
+        }
+    }
+
+    /// S3. A chain cut short whose state key then goes missing is never
+    /// given a new key: the versions already sealed would be unopenable,
+    /// and the start check (hashes only) couldn't tell. Refused, classed,
+    /// nothing written; with the key back, the rerun finishes the chain.
+    #[tokio::test]
+    async fn a_partial_chain_whose_state_key_is_gone_gets_no_new_key() {
+        use crate::sealed::unchainable::{Class, Found};
+        let root = crate::sealed::TestDir::new("chain-key-lost");
+        let memories = ["a", "b", "c"];
+        let (id, keys, dir) = agent(&root, &memories).await;
+        let e = enroller(&root, &keys);
+        crate::sealed::crash::at("chain:archive");
+        assert!(e.chain(id, false).await.is_err());
+        let key = root
+            .join("secrets")
+            .join(id.to_string())
+            .join("state_key.json");
+        let aside = key.with_extension("json.aside");
+        std::fs::rename(&key, &aside).unwrap();
+        let head = std::fs::read(dir.join(SEALED_DIR).join("head.json")).unwrap();
+        for dry in [true, false] {
+            let skip = e.chain(id, dry).await.unwrap_err();
+            assert_eq!(
+                skip.found(),
+                Found::Cannot(Class::StateKeyLost),
+                "dry {dry}: {skip:?}"
+            );
+            assert!(!key.exists(), "no new key over a chain begun");
+            assert_eq!(
+                std::fs::read(dir.join(SEALED_DIR).join("head.json")).unwrap(),
+                head
+            );
+        }
+        std::fs::rename(&aside, &key).unwrap();
+        let report = e.chain(id, false).await.unwrap();
+        assert!(report.resumed);
+        assert_eq!(opened_memories(&dir, id, &keys).await, memories);
+    }
+
+    /// An older runner's chain marker the start pass couldn't move: the
+    /// agent is chained already, and is never chained again as if its
+    /// chain had been cut short (which would add to it).
+    #[tokio::test]
+    async fn an_unmoved_older_marker_is_not_chained_again() {
+        let root = crate::sealed::TestDir::new("chain-legacy");
+        let (id, keys, dir) = agent(&root, &["a", "b"]).await;
+        let e = enroller(&root, &keys);
+        e.chain(id, false).await.unwrap();
+        let before = shape(&dir, id).await;
+        std::fs::rename(
+            dir.join(SEALED_DIR)
+                .join(agora_agentkit::state::storage::CHAINED),
+            dir.join(SEALED_DIR).join("enrolled"),
+        )
+        .unwrap();
+        let seal = AgentSeal::new(&dir, id);
+        assert!(seal.has_legacy_marker().await.unwrap());
+        let skip = e.chain(id, false).await.unwrap_err();
+        assert!(
+            matches!(&skip, Skip::Failed(e) if e.to_string().contains("older runner's chain marker")),
+            "{skip:?}"
+        );
+        assert_eq!(shape(&dir, id).await, before, "nothing added");
     }
 
     /// A chain cut after its genesis, its first archive or its current
@@ -2545,12 +2987,33 @@ pub(crate) mod tests {
                 .map(|i| i.entry.entry_hash())
                 .collect();
             assert_eq!(aside.len(), 2);
+            // As the runner's keeper did while it ran stopped: the roster
+            // holds the head of the stopped interval
+            crate::sealed::roster::record_heads(&root, &state_dir, &[id])
+                .await
+                .unwrap();
+            let stopped_seq = seal.head().await.unwrap().unwrap().head.seq;
             if let Some(point) = cut {
                 crate::sealed::crash::at(point);
                 assert!(e.resume(id, None, false).await.is_err(), "{point}");
             }
             let report = e.resume(id, None, false).await.unwrap();
             assert_eq!(report.kept_local, 2, "{cut:?}");
+            // S4: the uploaded line resumed below the stopped interval's
+            // head, and the roster follows it (set, not "higher seq wins"):
+            // the next start doesn't refuse the agent as rolled back
+            let head = seal.head().await.unwrap().unwrap().head;
+            assert!(head.seq < stopped_seq, "{cut:?}");
+            let roster = crate::sealed::roster::load(&root).unwrap().unwrap();
+            assert_eq!(
+                (roster.agents[&id].seq, roster.agents[&id].entry_hash),
+                (head.seq, head.entry_hash),
+                "{cut:?}"
+            );
+            let scan = crate::sealed::roster::check(&root, &state_dir)
+                .await
+                .unwrap();
+            assert!(scan.losses.is_empty(), "{cut:?}: {:?}", scan.losses);
             assert!(!crate::sealed::stop::is_stopped(&dir));
             assert!(crate::sealed::uploads(&dir, &keys, id));
             let waiting = seal.outbox().await.unwrap();

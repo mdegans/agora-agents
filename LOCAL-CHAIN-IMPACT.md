@@ -145,14 +145,23 @@ next start.
 4. Stop both units and the timer.
 5. Install the runner.
 6. `agora-seed sealed-enroll --jobs 16`, before any start. It runs the
-   start pass itself (marker move, migration) and begins the roster.
+   start pass itself (marker move, migration) and begins the roster with
+   the first agent it chains. **Review round, 2026-11-12:** if the data
+   directory already holds chained agents and no roster (agents chained
+   by an older runner, as the test agents' own data directories are), it
+   refuses before chaining anything and names `agora-seed sealed-enroll
+   --begin-roster --note "<why>"`: run that once first, then this. It
+   exits nonzero while any agent with a state is left without a chain,
+   naming each by id and why (see "Review round, 2026-11-12: STATE").
    Estimated 7-12 minutes (synthetic: about 0.3 s a version).
 7. Fleet metrics again; start the units; compare after the first sweep.
 
-If a unit starts before step 6, the first start runs (adopting the test
-agents and alerting the unchained count) and every later start refuses,
-naming `sealed-enroll`, which that refusal doesn't block. Integration
-tests that sequence.
+If a unit starts before step 6: with no chained agent in the data
+directory the first start runs (beginning an empty roster and alerting the
+unchained count) and every later start refuses, naming `sealed-enroll`,
+which that refusal doesn't block. With chained agents and no roster the
+start refuses at once, naming `--begin-roster` (review round,
+2026-11-12). Integration tests both sequences.
 
 ## Integrated: the one-way door
 
@@ -174,8 +183,11 @@ rather than drop the re-offer.
 - A whole data directory restored from an older backup with its file times
   kept passes every witness inside it (roster, `began`, the secrets
   witness, the chains). A roster written a day before the newest state is
-  one alert. Deleting the roster, `began` and the witness together reads as
-  a first run.
+  one alert. ~~Deleting the roster, `began` and the witness together reads as
+  a first run.~~ **Review round, 2026-11-12:** closed while any chained
+  directory remains: the start refuses (`NotBegun`). It still reads as a
+  first run when every agent's chain marker went with them, where the
+  state keys left in `secrets/` make three or more of them a refusal.
 - A state lost before the roster first recorded its agent is found only by
   its keys (`missing_states`), not by the roster: a chained directory
   without a state is not adopted.
@@ -387,6 +399,9 @@ From then on a roster missing while `began` exists, unreadable, or in a
 newer format refuses the run (exit 75). Deleting both files together reads
 as a first run: the stated gap.
 
+**Superseded, review round 2026-11-12:** a start no longer adopts chained
+directories when there is no roster. See "Review round, 2026-11-12: STATE".
+
 ### What changes for the run
 
 - An agent that never uploaded: its start check makes no server call at
@@ -587,8 +602,9 @@ or changes a stop.
   agentkit's FsStorage reads (its state, and its mtime as the version's
   date), `sealed/` (head, sent/, outbox/, chain marker), `provisioned`,
   the memory-restore ledger and the recovered copy (`[memory_restore]`, an
-  agent that chose `show`), the session journal's existence (an agent with
-  one is skipped, `in_session`), its signing key.
+  agent that chose `show`), the session journal's existence (**review
+  round, 2026-11-12:** no longer a skip; the agent is chained from its
+  last saved state and the journal is left untouched), its signing key.
 - **Writes**: `<secrets>/<id>/state_key.json` (a new state key, cached;
   nothing wrapped or posted); `<state>/<id>/sealed/` (genesis, the
   pre-loss copy, one entry and blob per distinct archive in (mtime, name)
@@ -933,3 +949,129 @@ No `healed.json` exists; none is written until Agora reports damage for
 an uploading agent (its check at rest is in the server's hardening
 release). The free-space gate reads statistics at every start. The offer
 gate reads one marker's existence per closing question.
+
+## Review round, 2026-11-12: STATE
+
+Fixes for the independent review of state loss, stranding and wrongful
+fleet stops. Synthetic states only in tests; nothing here was run against
+live data.
+
+### New file: `<data_dir>/sealed-unchainable.json`
+
+Written **only** by `sealed-enroll` (not a dry run), under the exclusive
+runner lock, at the end of a chain pass, atomically and 0600
+(`write_private`); never created empty. Ids, a reason class and a date
+per agent; nothing of any state. Classes: `no_signing_key`,
+`state_unloadable`, `prior_copy_unreadable`, `state_key_lost`. An agent
+enters it when enrolment finds it can't chain it for one of those, and
+leaves it when a later enrolment chains it (or finds no state); one that
+was merely not reached (`busy`, `failed`) neither enters nor leaves.
+
+**Read at every start.** Agents on it that are still unchained are left
+out of the run (they never run unchained), with one alert a run
+(`sealed_state_unchained_agents`, details `left_out*`) and an
+`agent_skipped` event each (stage `unchainable`), and are **not** counted
+by the strays rule. Every other unchained state counts as before: three
+or more refuse the run. An unreadable record excuses nobody.
+
+Why: before, an agent enrolment could never chain was a stray at every
+start, and three of them parked the fleet behind agents no rerun could
+fix. What it costs: an agent on the record doesn't run until the operator
+repairs it. That is deliberate (the alternative is running it with no
+check), and the alert repeats every run.
+
+### `sealed-enroll` (chain)
+
+- An agent with a **session journal** is chained from its last saved
+  state. The journal is not read, changed or removed: the agent's next
+  session still shows its interrupted-session notice. No session can be
+  live: the command holds `runner.lock` exclusively and takes each
+  agent's session lock.
+- Nothing is written for an agent it can't chain: the signing key, the
+  state's loading and the pre-loss copy are all read before the state key
+  is made or the genesis sealed.
+- **No new state key over a chain already begun** (a `head.json` with no
+  `state_key.json`): refused, class `state_key_lost`.
+- An older runner's marker (`sealed/enrolled`) that couldn't be moved:
+  the agent is not chained again.
+- Exits nonzero while any agent with a state is left unchained, printing
+  and logging (`sealed_enroll_unchained`) the count, the classes and the
+  ids, and saying which count at the start. `--dry-run` reports the same
+  classes and writes nothing (not the record either).
+- `--resume` sets the roster to the resumed head (`roster::replace`), which
+  may be below the head the roster saw while stopped.
+
+### The roster: no silent begin, and the ways out
+
+A roster is begun only (a) by the first agent enrolment chains in a data
+directory with no other chained agent, (b) by a start that finds no
+chained directory at all, or (c) by the operator:
+
+    agora-seed sealed-enroll --begin-roster --note "<why>"
+
+(runner stopped). It adopts every directory that is chained and has a
+readable head and a `state.json`, as found; renames aside (never deletes)
+the roster and witness it found (`sealed-roster.<was>.<utc>.json`,
+`secrets/sealed-roster.witness.<was>.<utc>.json`); appends the note to
+`sealed-roster.began`; logs `sealed_roster_begun`. It refuses a roster
+that reads and matches its witness, and one in a newer format. What it
+gives up: every head is taken as found, so a rollback made before it is
+no longer told apart by the roster.
+
+| The start says | What it means | Way out |
+|---|---|---|
+| `NotBegun` | no roster and no trace of one, but chained directories | the first install over agents an older runner chained, or everything at the data directory's top level lost: put the roster back from a backup, or `--begin-roster --note` |
+| `Missing` | no roster, but `began` or the witness says there was one | put it back from a backup, or `--begin-roster --note` |
+| `Shrunk` | the roster holds fewer agents than the witness says | put the newer roster back from a backup, or `--begin-roster --note` (both files set aside). Not by deleting the witness: it is the only record of the count |
+| `Unreadable` | the roster or the witness can't be read or parsed | permissions and the disk first (the next start reads it again); then a backup, or `--begin-roster --note` (the damaged file set aside) |
+| `Newer` | written by a newer runner | upgrade the runner; `--begin-roster` refuses |
+
+The refusal's own text carries the same way out (`RosterError::way_out`).
+
+New field: a roster entry may carry `pending: true`, set by
+`sealed-accept` before it clears a refusal and cleared when it records
+the head. An accept cut in between is finished by running it again.
+
+### The start
+
+- A refusal for sealed history that **can't be read** (`seal_unreadable`)
+  writes no `sealed/refused` and no notice: the agent is left out of that
+  run and judged afresh at the next. (A marker of that reason written by
+  an earlier build of this branch still needs `sealed-accept`.)
+- When one of the runner's own records fails (roster, secrets tree), the
+  run is refused and **no agent is checked or marked**.
+- An agent read again under its session lock (changed on disk since the
+  load) goes through the start's own check: a refusal is marked, told
+  and alerted; a chain marker gone since the load is a refusal
+  (`head_missing`), never a session saved outside the chain; a session it
+  had elsewhere counts for `min_cycle_secs`.
+- A marker for a reason that isn't loss-shaped is **rewritten** with a
+  loss found later (`sealed/refused`, atomically; the notice keeps its
+  first date and reason).
+- Unsaved sessions are rescued before the last drain and the roster's
+  last pass; a reactor that ends with an error is alerted
+  (`state_unsaved`, keyed by endpoint).
+- Every routed agent busy in another process: exit 0,
+  `all_routed_agents_busy`.
+- A starting runner waits up to 20 s for `runner.lock` (another runner's
+  cut-save promotion holds it exclusively for a moment).
+
+### `sealed-restore`, `sealed-accept`, `rotate-keys`
+
+- `sealed-restore` refuses a chain that was begun and never finished (a
+  head, no chain marker, nothing on Agora, not refused, never on the
+  roster), naming `sealed-enroll`: its head is an old archive's version.
+- `sealed-restore` records the head in the roster **before** the chain
+  marker and the refusal go, and no longer writes `sealed/published` for
+  an agent that never uploaded (`write_private` where it does).
+- `sealed-accept --keep` records the roster before marking the
+  resolution done.
+- `rotate-keys` refuses an agent whose chain was begun and never
+  finished, naming `sealed-enroll`.
+
+### Fleet metrics to compare in the dry run (counts only)
+
+Besides the existing ones: agents on `sealed-unchainable.json` by class;
+agents skipped at stage `unchainable`; `sealed_enroll_unchained` counts.
+An agent on the record that had sessions before is a drop in sessions run
+that the record explains; any other drop is not explained by this round.

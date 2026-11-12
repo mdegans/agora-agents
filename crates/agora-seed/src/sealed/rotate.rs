@@ -360,6 +360,16 @@ pub async fn rotate_keys(
     super::session::no_session(state_dir, id, false)?;
     let agent_dir = state_dir.join(id.to_string());
     let enrolled = super::is_enrolled(&agent_dir);
+    // A chain `sealed-enroll` began and didn't finish (a head, no chain
+    // marker): the pre-flight and the re-sign below are for chained
+    // agents, so a rotation here would leave its entries signed by a key
+    // the finished chain no longer leads from. Finished first
+    anyhow::ensure!(
+        enrolled || AgentSeal::new(&agent_dir, id).head().await?.is_none(),
+        "agent {id} has a chain that was begun and never finished (sealed/head.json, no chain \
+         marker): a rotation now would strand the entries already sealed. Finish it first with \
+         `agora-seed sealed-enroll --agent {id}`, then rotate. Nothing was written or sent"
+    );
     // The session lock either way (`take` holds it for a chained one)
     let _lock = if enrolled {
         (

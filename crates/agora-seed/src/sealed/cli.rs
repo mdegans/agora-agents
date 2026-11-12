@@ -53,6 +53,17 @@ pub enum Command {
         /// for an opt-in). Needs `--note`, which the agent is shown.
         #[arg(long, requires = "note")]
         against_answer: bool,
+        /// Begin the sealed roster again from the chained directories as
+        /// they are, and do nothing else: for a roster that is missing,
+        /// unreadable or holds fewer agents than its witness says (the
+        /// start refuses each, naming this). What it finds is set aside,
+        /// never deleted. Needs `--note` (why), which is logged and kept.
+        #[arg(
+            long,
+            requires = "note",
+            conflicts_with_all = ["opt_in", "resume", "dry_run", "agents", "against_answer"]
+        )]
+        begin_roster: bool,
     },
     /// Re-open the sealed-state question for agents that answered it: put
     /// again, once, at each one's next session, with the note. Their answer
@@ -229,7 +240,26 @@ pub async fn run(
             note,
             resume,
             against_answer,
+            begin_roster,
         } => {
+            if begin_roster {
+                let note = note.as_deref().map(str::trim).unwrap_or_default();
+                anyhow::ensure!(!note.is_empty(), "--begin-roster needs --note \"<why>\"");
+                let begun = super::roster::begin(data_dir, &state_dir, note).await?;
+                println!(
+                    "sealed roster begun again (it was {}): {} chained agent(s) adopted as found; \
+                     {} file(s) set aside{}",
+                    begun.was,
+                    begun.adopted,
+                    begun.set_aside.len(),
+                    begun
+                        .set_aside
+                        .iter()
+                        .map(|p| format!(" {}", p.display()))
+                        .collect::<String>()
+                );
+                return Ok(());
+            }
             anyhow::ensure!(
                 !against_answer || opt_in || resume,
                 "--against-answer goes with --opt-in or --resume"
@@ -252,9 +282,14 @@ pub async fn run(
             } else {
                 anyhow::ensure!(
                     note.is_none(),
-                    "--note goes with --resume or --opt-in --against-answer"
+                    "--note goes with --resume, --opt-in --against-answer or --begin-roster"
                 );
                 let jobs = jobs.map_or_else(default_jobs, usize::from);
+                // Before anything is chained: a roster the start would
+                // refuse can't record what is chained here
+                if !dry_run && let Err(e) = super::roster::ready(data_dir, &state_dir).await {
+                    anyhow::bail!("the sealed roster: {e}. Way out: {}", e.way_out());
+                }
                 chain_pass(&enroller, agents, dry_run, jobs).await?;
             }
         }
@@ -659,7 +694,11 @@ async fn chain_pass(
     };
     let chain = ids;
     let mut says_yes = 0;
-    for (id, result) in enroller.chain_all(&chain, dry_run, jobs).await {
+    let results = enroller.chain_all(&chain, dry_run, jobs).await;
+    // What is left without a chain, by why; the record of agents that
+    // can't be chained brought up to it (`sealed::unchainable`)
+    let left = enroller.settle_pass(&results, dry_run)?;
+    for (id, result) in results {
         match result {
             Ok(report) => {
                 tally.add_n("archives_sealed", report.sealed);
@@ -683,14 +722,15 @@ async fn chain_pass(
                 }
             }
             Err(Skip::Chained) => tally.add(Skip::Chained.as_str()),
-            Err(e @ Skip::Failed(_)) => {
-                tally.add(e.as_str());
-                tracing::error!(event_type = "sealed_chain_failed", agent_id = %id, error = %e, "chaining failed");
-                println!("{id}: failed: {e:#}");
-            }
-            Err(e) => {
+            Err(e @ Skip::NoState) => {
                 tally.add(e.as_str());
                 println!("{id}: skipped: {e}");
+            }
+            // Anything else leaves an agent with a state unchained
+            Err(e) => {
+                tally.add(e.as_str());
+                tracing::error!(event_type = "sealed_chain_failed", agent_id = %id, class = e.as_str(), error = %e, "not chained");
+                println!("{id}: not chained ({}): {e:#}", e.as_str());
             }
         }
     }
@@ -720,11 +760,16 @@ async fn chain_pass(
              starts their uploads"
         );
     }
-    let (failed, unreadable) = (tally.get("failed"), tally.get("unreadable_left_out"));
+    print!("{left}");
+    let unreadable = tally.get("unreadable_left_out");
     anyhow::ensure!(
-        failed == 0 && unreadable == 0,
-        "{failed} agent(s) failed, {unreadable} archive(s) unreadable and left out (recorded in \
-         each agent's sealed/left_out.json)"
+        left.is_empty() && unreadable == 0,
+        "{} agent(s) with a state left without a chain ({} can't be chained until repaired, {} \
+         to run again), {unreadable} archive(s) unreadable and left out (recorded in each \
+         agent's sealed/left_out.json)",
+        left.agents(),
+        left.recorded,
+        left.strays,
     );
     Ok(())
 }
@@ -933,6 +978,7 @@ mod tests {
             note: None,
             resume: false,
             against_answer: false,
+            begin_roster: false,
         }
     }
 

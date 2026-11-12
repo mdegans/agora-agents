@@ -785,6 +785,22 @@ pub async fn restore_with(
         Refusal::HeadMissing
     };
     if had_head {
+        // A head.json without the chain marker, for an agent with nothing
+        // on Agora, that no start refused and the roster never held: a
+        // chain `sealed-enroll` began and didn't finish. Its head is an old
+        // archive's version, not the agent's state: restoring it would
+        // write that archive over the current state and call the agent
+        // chained. (Refused, or on the roster: it was chained, and lost its
+        // marker; a restore cut after it rebuilt the head is one of those)
+        if !seal.is_enrolled().await? && !reach.on_agora() && !refused && !on_roster(state_dir, id)
+        {
+            anyhow::bail!(
+                "agent {id} has a chain that was begun and never finished (sealed/head.json, no \
+                 chain marker, nothing on Agora, never on the roster): its sealed head is an \
+                 older archive's version, not its state, so there is nothing to restore. \
+                 `agora-seed sealed-enroll --agent {id}` finishes the chain. Nothing was written"
+            );
+        }
         // A head.json without the marker: a restore cut after it adopted
         // Agora's head. Enrolled, if Agora's chain holds that head (the
         // line to it is verified below)
@@ -927,11 +943,21 @@ pub async fn restore_with(
     // anchor can't tell "turned off" from "never told", so a restore never
     // re-sends `publish: true`, and fails private in the rare second case.
     // The agent's own profile says how to publish with `config`
+    // Only for an agent with something on Agora: one that never uploaded
+    // has no profile anchor to have published, and the marker would say
+    // it had
     let published = agent_dir.join(SEALED_DIR).join(super::anchors::PUBLISHED);
-    if !std::fs::exists(&published)? {
-        std::fs::write(&published, Utc::now().to_rfc3339().as_bytes())
+    if reach.on_agora() && !std::fs::exists(&published)? {
+        super::write_private(&published, Utc::now().to_rfc3339().as_bytes())
             .context("writing sealed/published")?;
     }
+    // The roster takes the head restored, whatever it held (head.json is
+    // written above), before the marker and the refusal: those two go
+    // last, so a cut anywhere (or a roster that can't be written) leaves
+    // the agent refused or unchained, and a rerun does this again. After
+    // them, a rerun would find "not refused" and nothing to do
+    super::roster::replace_for(state_dir, id, Some(last.head.head)).await?;
+    super::crash::point("restore:rostered")?;
     if !seal.is_enrolled().await? {
         seal.enroll()
             .await
@@ -941,9 +967,6 @@ pub async fn restore_with(
     if refused && seal.is_refused().await? {
         seal.clear_refusal().await.context("clearing the refusal")?;
     }
-    // The roster takes the head restored, whatever it held (head.json is
-    // written above)
-    super::roster::replace_for(state_dir, id, Some(last.head.head)).await?;
     drop(lock);
     let head = last.head.head;
     tracing::warn!(
@@ -969,6 +992,15 @@ pub async fn restore_with(
         cut_save: None,
         recovered_key,
     })
+}
+
+/// Whether the sealed roster beside `state_dir` holds `id`: it was chained
+/// once. `false` when there is no roster, or it can't be read.
+fn on_roster(state_dir: &Path, id: AgentId) -> bool {
+    state_dir
+        .parent()
+        .and_then(|data_dir| super::roster::load(data_dir).ok().flatten())
+        .is_some_and(|r| r.agents.contains_key(&id))
 }
 
 #[cfg(test)]

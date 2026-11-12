@@ -20,20 +20,33 @@
 //! Operator commands that set a head back on purpose use [`replace`].
 //!
 //! **The roster itself lost.** `sealed-roster.began` is written beside it
-//! the first time it is. A roster missing while `began` exists refuses the
-//! run, whether or not chained agents are found: a wiped `state/` would
-//! take them with it. Both gone together reads as a first run (the gap:
-//! the whole data directory's top level lost at once, which a wiped
-//! `state/` is not). A roster that can't be read, or is in a newer format,
-//! refuses the run.
+//! the first time it is, and a witness in the secrets root ([`Witness`]).
+//! A roster missing while either exists refuses the run, whether or not
+//! chained agents are found: a wiped `state/` would take them with it. A
+//! roster that can't be read, is in a newer format, or holds fewer agents
+//! than its witness says refuses the run.
 //!
-//! **First run.** With neither file, every directory that is chained
-//! (agentkit's `AgentSeal::is_enrolled`) and has a readable head and a
-//! `state.json` is adopted; nothing else is (a chained directory without a
-//! state is a forgotten agent's, or a loss `missing_states` finds by its
-//! keys). A directory with a `state.json` that is
-//! neither chained nor on the roster is counted for one alert a run
-//! ([`Scan::unchained`]), never enrolled from here.
+//! **No roster and no trace of one** (the roster, `began` and the witness
+//! all gone, or never there). Enrolment begins the roster: the first
+//! agent `sealed-enroll` chains is its first entry ([`record`]). So with
+//! no chained directory under `state/` this is a true first run, and a
+//! roster begins empty. With **any** chained directory it is never one (a
+//! chained agent was recorded when it was chained): the runner's start
+//! refuses ([`RosterError::NotBegun`]) rather than begin anew, adopt every
+//! directory as it finds it and switch the strays rule off; and no other
+//! writer begins one over chained agents either. The operator begins it
+//! deliberately, with a note that is logged and kept: `agora-seed
+//! sealed-enroll --begin-roster --note "<why>"` ([`begin`]), which adopts
+//! every directory that is chained and has a readable head and a
+//! `state.json`, and nothing else (a chained directory without a state is
+//! a forgotten agent's, or a loss `missing_states` finds by its keys).
+//! The same command is the deliberate way out of a roster that is
+//! missing, unreadable or shrunk ([`RosterError::way_out`]); it refuses a
+//! roster that reads and matches its witness.
+//!
+//! A directory with a `state.json` that is neither chained nor on the
+//! roster is counted for one alert a run ([`Scan::unchained`]), never
+//! enrolled from here.
 //!
 //! Reads only directory listings, the chain marker's existence,
 //! `sealed/head.json`, the existence of `state.json` and `sealed/refused`.
@@ -68,6 +81,12 @@ pub struct Entry {
     /// doesn't upload ([`Vouch`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vouched: Option<Vouch>,
+    /// An operator's command that will set this head ([`replace`]) has
+    /// begun and not yet done so ([`expect`]): if it is cut after it
+    /// cleared the agent's refusal, its rerun finds this and finishes the
+    /// roster step rather than finding "nothing to accept".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
 }
 
 impl Entry {
@@ -77,6 +96,7 @@ impl Entry {
             entry_hash: head.entry_hash,
             updated_at: Utc::now(),
             vouched: None,
+            pending: false,
         }
     }
 }
@@ -140,6 +160,7 @@ impl Roster {
             Some(e) => {
                 *e = Entry {
                     vouched: e.vouched,
+                    pending: e.pending,
                     ..Entry::of(head)
                 };
                 true
@@ -172,8 +193,60 @@ pub enum RosterError {
         path: PathBuf,
         error: std::io::Error,
     },
+    #[error(
+        "{} is missing and nothing says one was ever begun, but {chained} chained agent \
+         director(ies) are under {}: a roster is begun by enrolment, never over agents \
+         already chained",
+        path.display(),
+        state_dir.display()
+    )]
+    NotBegun {
+        path: PathBuf,
+        state_dir: PathBuf,
+        chained: usize,
+    },
+    #[error("{} reads and matches its witness: nothing to begin again (one agent is resolved with sealed-accept, sealed-restore or sealed-forget)", path.display())]
+    Healthy { path: PathBuf },
     #[error("the roster couldn't be locked or written: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// The one command that begins a roster deliberately ([`begin`]).
+pub const BEGIN_COMMAND: &str = "agora-seed sealed-enroll --begin-roster --note \"<why>\"";
+
+impl RosterError {
+    /// What the operator does about it, for the refusal's text and
+    /// `LOCAL-CHAIN-IMPACT.md`. Every way that isn't "put the file back"
+    /// goes through [`begin`], which needs a note and is logged.
+    pub fn way_out(&self) -> String {
+        match self {
+            Self::Missing { .. } | Self::NotBegun { .. } => format!(
+                "put sealed-roster.json back from a backup if there was one (the next start \
+                 then compares every agent with it); otherwise, the runner stopped, begin one \
+                 deliberately from the chained directories as they are: {BEGIN_COMMAND}"
+            ),
+            Self::Shrunk { .. } => format!(
+                "an older or edited roster is in place: put the newer sealed-roster.json back \
+                 from a backup; or, the runner stopped, begin it again from the chained \
+                 directories as they are (the roster and the witness are set aside, not \
+                 deleted): {BEGIN_COMMAND}. Deleting the witness by hand is not the way: it \
+                 is the only record of how many agents the roster held"
+            ),
+            Self::Unreadable { .. } => format!(
+                "check permissions and the disk first (the next start reads it again); if the \
+                 file is damaged, put it back from a backup, or, the runner stopped, begin it \
+                 again from the chained directories as they are (the damaged file is set \
+                 aside): {BEGIN_COMMAND}"
+            ),
+            Self::Newer { .. } => "written by a newer runner than this one: upgrade the runner; \
+                 don't begin it again (this runner can't read what the newer one recorded)"
+                .to_string(),
+            Self::StateDir { .. } | Self::Io(_) => {
+                "check permissions and the disk; the next start tries again".to_string()
+            }
+            Self::Healthy { .. } => "nothing to do".to_string(),
+        }
+    }
 }
 
 /// What a roster agent's directory shows.
@@ -315,9 +388,25 @@ pub fn load(data_dir: &Path) -> Result<Option<Roster>, RosterError> {
         })
 }
 
-/// Read under the lock: the roster, or a new one when neither it nor
-/// `began` exists (`true`: a first one).
-fn load_or_begin(data_dir: &Path) -> Result<(Roster, bool), RosterError> {
+/// The chained agent directories under `state_dir`, but `own`.
+fn chained_dirs(state_dir: &Path, own: &[AgentId]) -> Result<usize, RosterError> {
+    Ok(agent_dirs(state_dir)?
+        .into_iter()
+        .filter(|id| !own.contains(id))
+        .filter(|id| super::is_enrolled(&state_dir.join(id.to_string())))
+        .count())
+}
+
+/// Read under the lock: the roster, or a new one when there is neither
+/// it nor any trace of one (`true`: a first one). A first one is begun
+/// only while no agent directory but `own` (the agents the caller is
+/// recording as it chains them) is chained: over chained agents it is
+/// [`RosterError::NotBegun`], for every caller.
+fn load_or_begin(
+    data_dir: &Path,
+    state_dir: &Path,
+    own: &[AgentId],
+) -> Result<(Roster, bool), RosterError> {
     let witness = Witness::load(data_dir)?;
     match load(data_dir)? {
         Some(r) => match witness {
@@ -335,8 +424,122 @@ fn load_or_begin(data_dir: &Path) -> Result<(Roster, bool), RosterError> {
                 path: path(data_dir),
             })
         }
-        None => Ok((Roster::default(), true)),
+        None => match chained_dirs(state_dir, own)? {
+            0 => Ok((Roster::default(), true)),
+            chained => Err(RosterError::NotBegun {
+                path: path(data_dir),
+                state_dir: state_dir.to_path_buf(),
+                chained,
+            }),
+        },
     }
+}
+
+/// What [`begin`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Begun {
+    /// What it found: `missing`, `unreadable` or `shrunk`.
+    pub was: &'static str,
+    /// Chained directories with a head and a state, now on the roster.
+    pub adopted: usize,
+    /// The roster and witness it found, renamed aside (never deleted).
+    pub set_aside: Vec<PathBuf>,
+}
+
+/// Begin the roster deliberately (`sealed-enroll --begin-roster --note`,
+/// under the exclusive runner lock): when it is missing (with or without
+/// a trace of an earlier one), unreadable, or holds fewer agents than its
+/// witness says. Every directory that is chained and has a readable head
+/// and a `state.json` is adopted as it is found; what it finds of an
+/// earlier roster or witness is renamed aside; `note` is logged and kept
+/// in `sealed-roster.began`. Refused for a roster that reads and matches
+/// its witness ([`RosterError::Healthy`]) and for one in a newer format.
+///
+/// What it gives up, and why it takes a note: every head is taken as
+/// found, so a directory rolled back or emptied *before* this is no
+/// longer told apart by the roster (agents whose `sealed/` is gone are
+/// still found by their state keys, `check::missing_states`).
+pub async fn begin(data_dir: &Path, state_dir: &Path, note: &str) -> Result<Begun, RosterError> {
+    let _lock = lock(data_dir).await?;
+    let roster_path = path(data_dir);
+    let witness = Witness::load(data_dir);
+    let was = match load(data_dir) {
+        Ok(None) => "missing",
+        Ok(Some(r)) => match &witness {
+            Ok(Some(w)) if w.agents > r.agents.len() => "shrunk",
+            Err(_) => "unreadable",
+            Ok(_) => return Err(RosterError::Healthy { path: roster_path }),
+        },
+        Err(e @ RosterError::Newer { .. }) => return Err(e),
+        Err(_) => "unreadable",
+    };
+    let at = Utc::now().format(super::STAMP_FORMAT).to_string();
+    let mut set_aside = Vec::new();
+    for (file, name) in [
+        (
+            roster_path.clone(),
+            format!("sealed-roster.{was}.{at}.json"),
+        ),
+        (
+            Witness::path(data_dir),
+            format!("sealed-roster.witness.{was}.{at}.json"),
+        ),
+    ] {
+        if std::fs::exists(&file)? {
+            let aside = file.with_file_name(name);
+            std::fs::rename(&file, &aside)?;
+            set_aside.push(aside);
+        }
+    }
+    let mut roster = Roster::default();
+    for id in agent_dirs(state_dir)? {
+        if let Found::Head { head, state: true } = look(&state_dir.join(id.to_string()), id).await?
+        {
+            roster.merge(id, head);
+        }
+    }
+    save(data_dir, &mut roster)?;
+    // The note kept beside the roster, after what `began` already says
+    let began = data_dir.join(BEGAN);
+    let mut text = std::fs::read_to_string(&began).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "{} begun again by the operator (was {was}; {} agents adopted): {}\n",
+        Utc::now().to_rfc3339(),
+        roster.agents.len(),
+        note.trim().replace('\n', " ")
+    ));
+    super::write_private(&began, text.as_bytes())?;
+    tracing::warn!(
+        event_type = "sealed_roster_begun",
+        was,
+        adopted = roster.agents.len(),
+        set_aside = set_aside.len(),
+        note = %note.trim(),
+        "the operator began the sealed roster again from the chained directories as they are"
+    );
+    Ok(Begun {
+        was,
+        adopted: roster.agents.len(),
+        set_aside,
+    })
+}
+
+/// Before `sealed-enroll` chains anything: `Err`
+/// ([`RosterError::NotBegun`] and the rest) when the start would refuse
+/// the roster as it is, so the command says so first. With no roster and
+/// no chained directory (a true first enrolment) the roster is begun here,
+/// empty: agents chained side by side (`--jobs`) then each find it there,
+/// rather than each finding the others chained beside no roster.
+pub async fn ready(data_dir: &Path, state_dir: &Path) -> Result<(), RosterError> {
+    let _lock = lock(data_dir).await?;
+    let (mut roster, first) = load_or_begin(data_dir, state_dir, &[])?;
+    if first {
+        save(data_dir, &mut roster)?;
+    }
+    Ok(())
 }
 
 /// The roster's second witness, in the secrets root (a tree the start
@@ -425,7 +628,9 @@ pub async fn record_all(
     heads: impl IntoIterator<Item = (AgentId, HeadRef)>,
 ) -> Result<(), RosterError> {
     let _lock = lock(data_dir).await?;
-    let (mut roster, first) = load_or_begin(data_dir)?;
+    let heads: Vec<(AgentId, HeadRef)> = heads.into_iter().collect();
+    let own: Vec<AgentId> = heads.iter().map(|(id, _)| *id).collect();
+    let (mut roster, first) = load_or_begin(data_dir, &data_dir.join("state"), &own)?;
     let mut changed = first;
     for (id, head) in heads {
         changed |= roster.merge(id, head);
@@ -445,7 +650,7 @@ pub async fn record_heads(
     ids: &[AgentId],
 ) -> Result<Vec<(AgentId, HeadRef)>, RosterError> {
     let _lock = lock(data_dir).await?;
-    let (mut roster, first) = load_or_begin(data_dir)?;
+    let (mut roster, first) = load_or_begin(data_dir, state_dir, &[])?;
     let mut changed = first;
     let mut read = Vec::new();
     for id in ids {
@@ -468,7 +673,7 @@ pub async fn vouch_all(data_dir: &Path, vouches: &[(AgentId, Vouch)]) -> Result<
         return Ok(());
     }
     let _lock = lock(data_dir).await?;
-    let (mut roster, _) = load_or_begin(data_dir)?;
+    let (mut roster, _) = load_or_begin(data_dir, &data_dir.join("state"), &[])?;
     let mut changed = false;
     for (id, v) in vouches {
         if let Some(e) = roster.agents.get_mut(id)
@@ -503,7 +708,7 @@ pub async fn replace(
     head: Option<HeadRef>,
 ) -> Result<(), RosterError> {
     let _lock = lock(data_dir).await?;
-    let (mut roster, first) = load_or_begin(data_dir)?;
+    let (mut roster, first) = load_or_begin(data_dir, &data_dir.join("state"), &[id])?;
     match head {
         Some(head) => roster.agents.insert(id, Entry::of(head)),
         // No roster yet: nothing to take it off, and none begun for it (a
@@ -512,6 +717,44 @@ pub async fn replace(
         None => roster.agents.remove(&id),
     };
     save(data_dir, &mut roster)
+}
+
+/// Before an operator's command clears an agent's refusal on its way to
+/// [`replace`]: the agent's entry, if it has one, is marked
+/// [`Entry::pending`], which only `replace` clears. Nothing is added for an
+/// agent not on the roster (the next start adopts it once chained).
+pub async fn expect(data_dir: &Path, id: AgentId) -> Result<(), RosterError> {
+    let _lock = lock(data_dir).await?;
+    let (mut roster, _) = load_or_begin(data_dir, &data_dir.join("state"), &[id])?;
+    match roster.agents.get_mut(&id) {
+        Some(e) if !e.pending => {
+            e.pending = true;
+            save(data_dir, &mut roster)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`expect`] for an operator's command, which knows the state directory.
+pub async fn expect_for(state_dir: &Path, id: AgentId) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let data_dir = state_dir
+        .parent()
+        .context("the state directory has no parent data directory")?;
+    expect(data_dir, id).await.with_context(|| {
+        format!("marking agent {id}'s entry in the sealed roster (nothing was changed)")
+    })
+}
+
+/// Whether an operator's command left `id`'s roster step unfinished
+/// ([`expect`] without its [`replace`]). `false` when the roster can't be
+/// read.
+pub fn is_pending(state_dir: &Path, id: AgentId) -> bool {
+    state_dir
+        .parent()
+        .and_then(|data_dir| load(data_dir).ok().flatten())
+        .and_then(|r| r.agents.get(&id).map(|e| e.pending))
+        .unwrap_or(false)
 }
 
 /// [`replace`] for an operator's command, which knows the state directory
@@ -611,10 +854,11 @@ async fn look(dir: &Path, id: AgentId) -> std::io::Result<Found> {
 /// The start's scan, under the lock: every roster agent's directory
 /// against its entry, chained directories not on it added, heads ahead
 /// recorded, unchained states counted, refused markers listed. Writes the
-/// roster when anything was added or moved on (and on a first run).
+/// roster when anything was added or moved on (and on a first run, which
+/// is one only with no chained directory: [`RosterError::NotBegun`]).
 pub async fn check(data_dir: &Path, state_dir: &Path) -> Result<Scan, RosterError> {
     let _lock = lock(data_dir).await?;
-    let (mut roster, first) = load_or_begin(data_dir)?;
+    let (mut roster, first) = load_or_begin(data_dir, state_dir, &[])?;
     let dirs = agent_dirs(state_dir)?;
     let mut scan = Scan {
         first,
@@ -826,35 +1070,133 @@ mod tests {
         AgentSeal::new(dir, id).head().await.unwrap().unwrap().head
     }
 
-    /// The first run adopts every chained directory and nothing else;
-    /// writes the roster and `began`.
+    /// S8 (review of 2026-11-12). With the roster, `began` and the witness
+    /// all gone, chained directories are never a first run: the start's
+    /// scan refuses rather than begin anew (it used to adopt every
+    /// directory as found and switch the strays rule off), and so does
+    /// every other writer. The operator's `begin` adopts chained
+    /// directories with a head and a state, and nothing else, keeps the
+    /// note, and refuses a roster that is healthy.
     #[tokio::test]
-    async fn the_first_run_adopts_chained_directories_only() {
+    async fn a_roster_is_never_begun_over_chained_directories_but_by_the_operator() {
         let root = crate::sealed::TestDir::new("roster-first");
+        let state_dir = root.join("state");
         let agents = fleet(&root, 2).await;
         // A state never chained, and leftover keys with no directory
         let plain = AgentId::new();
-        let mut fs = agora_agentkit::reactor::FsStorage::new(root.join("state"));
+        let mut fs = agora_agentkit::reactor::FsStorage::new(&state_dir);
         use agora_agentkit::reactor::Storage as _;
         fs.save_raw(plain, state(1), None).await.unwrap();
         std::fs::create_dir_all(root.join("secrets").join(AgentId::new().to_string())).unwrap();
-        let scan = check(&root, &root.join("state")).await.unwrap();
-        assert!(scan.losses.is_empty(), "{:?}", scan.losses);
-        let mut added = scan.added.clone();
-        added.sort();
-        let mut want: Vec<_> = agents.iter().map(|a| a.0).collect();
-        want.sort();
-        assert_eq!(added, want);
-        assert_eq!(scan.unchained, vec![plain]);
-        assert!(root.join(ROSTER).exists() && root.join(BEGAN).exists());
+        // Healthy: nothing to begin again
+        check(&root, &state_dir).await.unwrap();
+        assert!(matches!(
+            begin(&root, &state_dir, "why").await,
+            Err(RosterError::Healthy { .. })
+        ));
+        // Every trace of the roster lost
+        for (n, file) in [root.join(ROSTER), root.join(BEGAN), Witness::path(&root)]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::rename(&file, root.join(format!("lost-{n}"))).unwrap();
+        }
+        let e = check(&root, &state_dir).await.unwrap_err();
+        assert!(matches!(e, RosterError::NotBegun { chained: 2, .. }), "{e}");
+        assert!(
+            e.way_out().contains("--begin-roster --note"),
+            "{}",
+            e.way_out()
+        );
+        assert!(matches!(
+            ready(&root, &state_dir).await,
+            Err(RosterError::NotBegun { .. })
+        ));
+        // No writer begins one either: not the keeper's, a vouch, or a
+        // record or replace of one agent beside another chained one
+        let (id, dir) = &agents[0];
+        let h = head(dir, *id).await;
+        assert!(record_heads(&root, &state_dir, &[*id]).await.is_err());
+        assert!(record(&root, *id, h).await.is_err());
+        assert!(replace(&root, *id, Some(h)).await.is_err());
+        assert!(!root.join(ROSTER).exists() && !root.join(BEGAN).exists());
+        // The operator's deliberate begin
+        let begun = begin(&root, &state_dir, "the top level was lost\nand found")
+            .await
+            .unwrap();
+        assert_eq!((begun.was, begun.adopted), ("missing", 2));
         let roster = load(&root).unwrap().unwrap();
         assert_eq!(roster.agents.len(), 2);
         for (id, dir) in &agents {
             assert_eq!(roster.agents[id].seq, head(dir, *id).await.seq);
         }
-        // Again: nothing new
+        let kept = std::fs::read_to_string(root.join(BEGAN)).unwrap();
+        assert!(
+            kept.contains("the top level was lost and found") && kept.contains("was missing"),
+            "{kept}"
+        );
+        assert_eq!(Witness::load(&root).unwrap().unwrap().agents, 2);
+        let scan = check(&root, &state_dir).await.unwrap();
+        assert!(!scan.first && scan.added.is_empty() && scan.losses.is_empty());
+        assert_eq!(scan.unchained, vec![plain]);
+    }
+
+    /// A true first run: no roster and no chained directory. The scan
+    /// begins an empty one, and enrolment's record of the first agent it
+    /// chains begins one too.
+    #[tokio::test]
+    async fn a_first_run_with_nothing_chained_begins_the_roster() {
+        let root = crate::sealed::TestDir::new("roster-true-first");
         let scan = check(&root, &root.join("state")).await.unwrap();
-        assert!(scan.added.is_empty() && scan.losses.is_empty());
+        assert!(scan.first && scan.on_roster.is_empty());
+        assert!(root.join(ROSTER).exists() && root.join(BEGAN).exists());
+        let other = crate::sealed::TestDir::new("roster-true-first-enrol");
+        let (id, _, dir) = crate::sealed::check::tests::chained_local(&other).await;
+        record(&other, id, head(&dir, id).await).await.unwrap();
+        assert_eq!(load(&other).unwrap().unwrap().agents.len(), 1);
+    }
+
+    /// The ways out of a roster the start refuses, each through `begin`
+    /// (what it finds set aside, never deleted) or not at all: unreadable
+    /// and shrunk are begun again; a newer format is not.
+    #[tokio::test]
+    async fn begin_is_the_way_out_of_unreadable_and_shrunk_never_of_newer() {
+        let root = crate::sealed::TestDir::new("roster-ways-out");
+        let state_dir = root.join("state");
+        let agents = fleet(&root, 3).await;
+        check(&root, &state_dir).await.unwrap();
+        let good = std::fs::read(root.join(ROSTER)).unwrap();
+        // Shrunk: an agent edited out
+        let mut roster = load(&root).unwrap().unwrap();
+        roster.agents.remove(&agents[0].0);
+        std::fs::write(root.join(ROSTER), serde_json::to_vec(&roster).unwrap()).unwrap();
+        let e = check(&root, &state_dir).await.unwrap_err();
+        assert!(matches!(e, RosterError::Shrunk { .. }), "{e}");
+        assert!(e.way_out().contains("--begin-roster"));
+        let begun = begin(&root, &state_dir, "edited by mistake").await.unwrap();
+        assert_eq!(
+            (begun.was, begun.adopted, begun.set_aside.len()),
+            ("shrunk", 3, 2)
+        );
+        assert!(
+            begun.set_aside.iter().all(|p| p.exists()),
+            "set aside, kept"
+        );
+        check(&root, &state_dir).await.unwrap();
+        // Unreadable
+        std::fs::write(root.join(ROSTER), b"{ torn").unwrap();
+        let e = check(&root, &state_dir).await.unwrap_err();
+        assert!(matches!(e, RosterError::Unreadable { .. }), "{e}");
+        let begun = begin(&root, &state_dir, "torn write").await.unwrap();
+        assert_eq!((begun.was, begun.adopted), ("unreadable", 3));
+        check(&root, &state_dir).await.unwrap();
+        // Newer: only an upgrade
+        let mut newer: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        newer["format"] = serde_json::json!(FORMAT + 1);
+        std::fs::write(root.join(ROSTER), serde_json::to_vec(&newer).unwrap()).unwrap();
+        let e = begin(&root, &state_dir, "x").await.unwrap_err();
+        assert!(matches!(e, RosterError::Newer { .. }), "{e}");
+        assert!(e.way_out().contains("upgrade"));
     }
 
     /// A directory put back to an older consistent copy reads as fine to

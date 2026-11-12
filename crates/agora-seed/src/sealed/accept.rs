@@ -109,10 +109,23 @@ pub async fn accept(
         lost_seal || seal.is_enrolled().await?,
         "agent {id} is not enrolled in sealed state"
     );
-    anyhow::ensure!(
-        lost_seal || seal.is_refused().await?,
-        "agent {id} is not refused; nothing to accept"
-    );
+    if !lost_seal && !seal.is_refused().await? {
+        // An accept cut after it cleared the refusal and sealed the state,
+        // before the roster took the head (its error said to run this
+        // again): the rerun finishes that step
+        if let Some(head) = finish_roster_step(state_dir, id, &seal).await? {
+            let reason = Notice::load(&agent_dir)
+                .ok()
+                .flatten()
+                .map_or(Refusal::Mismatch, |n| n.reason);
+            return Ok(Accepted {
+                reason,
+                head,
+                adopted: false,
+            });
+        }
+        anyhow::bail!("agent {id} is not refused; nothing to accept");
+    }
     let reason = if lost_seal && !seal.is_refused().await? {
         Refusal::HeadMissing
     } else {
@@ -186,6 +199,7 @@ pub async fn accept(
     let now = Utc::now();
     let head = match (adopted, note) {
         (Some(Adopted::Intact(head)), note) => {
+            super::roster::expect_for(state_dir, id).await?;
             if seal.is_refused().await? {
                 seal.clear_refusal().await.context("clearing the refusal")?;
             }
@@ -235,6 +249,9 @@ pub async fn accept(
             // refusal at the next start sets an unshown acceptance aside
             Notice::accept(&agent_dir, note, reason, Some(diff)).context("writing the notice")?;
             super::crash::point("accept:noticed")?;
+            // Before the refusal goes: a cut from here to the roster's own
+            // step leaves the entry pending, and a rerun finishes it
+            super::roster::expect_for(state_dir, id).await?;
             if seal.is_refused().await? {
                 seal.clear_refusal().await.context("clearing the refusal")?;
             }
@@ -281,6 +298,40 @@ pub async fn accept(
         head,
         adopted: adopted.is_some(),
     })
+}
+
+/// The roster step of an accept that was cut before it
+/// ([`super::roster::expect`] without its `replace`): done now, if the
+/// state here is the head's (the accept sealed it). `None`: no accept was
+/// cut there, or the state isn't the head's (the next start judges it).
+async fn finish_roster_step(
+    state_dir: &Path,
+    id: AgentId,
+    seal: &AgentSeal,
+) -> anyhow::Result<Option<HeadRef>> {
+    if !super::roster::is_pending(state_dir, id) {
+        return Ok(None);
+    }
+    let Some(head) = seal.head().await? else {
+        return Ok(None);
+    };
+    let current = FsStorage::new(state_dir)
+        .load_raw(id)
+        .await
+        .context("the agent's state won't load")?
+        .value;
+    if head.plaintext_sha256 != Some(agora_agentkit::state::storage::plaintext_hash(&current)) {
+        return Ok(None);
+    }
+    super::roster::replace_for(state_dir, id, Some(head.head)).await?;
+    tracing::warn!(
+        event_type = "sealed_state_accept_roster_finished",
+        agent_id = %id,
+        head = %head.head.entry_hash,
+        seq = head.head.seq,
+        "an accept cut before the roster took its head was finished"
+    );
+    Ok(Some(head.head))
 }
 
 /// What `sealed-accept --rebase` did: hashes and counts only.
@@ -844,8 +895,11 @@ pub async fn keep_line(
         chain,
     )
     .context("writing the notice")?;
-    super::lost::done(&dir)?;
+    // The roster before the resolution is marked done: cut in between, the
+    // rerun finds it unfinished and comes here again
     super::roster::replace_for(state_dir, id, Some(fork.keep)).await?;
+    super::crash::point("fork:rostered")?;
+    super::lost::done(&dir)?;
     drop(lock);
     tracing::warn!(
         event_type = "sealed_state_fork_kept",

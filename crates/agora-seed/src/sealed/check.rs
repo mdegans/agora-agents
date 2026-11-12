@@ -2464,7 +2464,7 @@ pub async fn missing_states(
                 ),
             }
         }
-        let reason = marked_reason(&dir).unwrap_or(reason);
+        let reason = rejudged(&dir, reason);
         refuse(
             &dir,
             id,
@@ -2587,7 +2587,12 @@ pub async fn refuse(
 /// agent).
 pub async fn mark(agent_dir: &Path, id: AgentId, name: &str, reason: Refusal, detail: &str) {
     let seal = AgentSeal::new(agent_dir, id);
-    if !seal.is_refused().await.unwrap_or(false)
+    // A marker for a reason that isn't loss-shaped takes a loss found
+    // since ([`rejudged`]): what resolves it, and what the agent is told
+    // when it is, follow the marker
+    let escalated =
+        reason.loss_shaped() && marked_reason(agent_dir).is_some_and(|m| !m.loss_shaped());
+    if (escalated || !seal.is_refused().await.unwrap_or(false))
         && let Err(e) = seal.refuse(reason.as_str()).await
     {
         tracing::error!(agent_id = %id, error = %e, "could not write the refusal marker");
@@ -2624,6 +2629,20 @@ pub fn marked_reason(agent_dir: &Path) -> Option<Refusal> {
         .join(agora_agentkit::state::storage::SEALED_DIR)
         .join("refused");
     Refusal::parse(&std::fs::read_to_string(marker).ok()?)
+}
+
+/// The reason to refuse an agent for now, `found` being what this start
+/// found: the reason it is already marked with (a later start that finds
+/// a different face of the same loss, a directory recreated to hold the
+/// marker, keeps the first), **unless** what is found now is loss-shaped
+/// and the marked reason isn't. An agent left out alone for a mismatch
+/// whose state is deleted afterwards has suffered a loss since: judged
+/// as one, it stops the run as any other loss does.
+pub fn rejudged(agent_dir: &Path, found: Refusal) -> Refusal {
+    match marked_reason(agent_dir) {
+        Some(marked) if marked.loss_shaped() || !found.loss_shaped() => marked,
+        _ => found,
+    }
 }
 
 /// One agent's shrink, for [`drop_summary`]: its id, name, and what shrank
@@ -2806,8 +2825,32 @@ pub(crate) mod tests {
         (id, keys, dir)
     }
 
-    /// An enrolled agent that doesn't upload: chained locally only.
+    /// [`enrolled`], but never recorded in the roster: what an agent
+    /// chained before the roster existed, or leftover from one, looks like.
+    pub async fn enrolled_off_roster(root: &Path) -> (AgentId, KeyStore, std::path::PathBuf) {
+        let (id, keys, dir) = chained_local(root).await;
+        crate::sealed::uploading::set(
+            &dir,
+            &keys,
+            id,
+            crate::sealed::uploading::UploadingBy::OptIn,
+        )
+        .unwrap();
+        (id, keys, dir)
+    }
+
+    /// An enrolled agent that doesn't upload: chained locally only, and
+    /// recorded in the roster as enrolment records it (which begins the
+    /// roster with the first agent chained).
     pub async fn enrolled_local(root: &Path) -> (AgentId, KeyStore, std::path::PathBuf) {
+        let (id, keys, dir) = chained_local(root).await;
+        let head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
+        crate::sealed::roster::record(root, id, head).await.unwrap();
+        (id, keys, dir)
+    }
+
+    /// [`enrolled_local`], but never recorded in the roster.
+    pub async fn chained_local(root: &Path) -> (AgentId, KeyStore, std::path::PathBuf) {
         let id = AgentId::new();
         let keys = KeyStore::new(root.join("secrets"));
         keys.ring()
