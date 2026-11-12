@@ -1370,16 +1370,27 @@ where
     /// what its files show of uploads before, and what a yes would upload
     /// of a chain never uploaded. Agora is not asked.
     fn sealed_asked(&self) -> sealed_state::prompt::Asked {
+        use crate::sealed::uploading::Marker;
         use sealed_state::prompt::{Asked, Before};
         let dir = self.agent_dir();
         let published = std::fs::exists(
             dir.join(agora_agentkit::state::storage::SEALED_DIR)
                 .join(crate::sealed::anchors::PUBLISHED),
         );
-        let before = match (self.marked_uploading(), published) {
-            (true, _) | (_, Ok(true)) => Before::Marked,
-            (false, Err(_)) => Before::Unknown,
-            (false, Ok(false)) => match crate::sealed::sent_any(&dir) {
+        let keys = crate::sealed::KeyStore::new(&self.rt.secrets_dir);
+        let id = self.inner.id();
+        let stopped = crate::sealed::stop::is_stopped(&dir)
+            || crate::sealed::stop::durable(&keys, id).map_or(true, |d| d.is_some());
+        let before = match (crate::sealed::uploading::state(&dir, &keys, id), published) {
+            (Marker::Uploading(_), _) | (_, Ok(true)) => Before::Marked,
+            // In doubt: a stop settles it from its readable copy, keeping
+            // its `since`; an opt-in replaces it with a new one, whose
+            // answer the profile then follows, unless Agora already holds
+            // a choice (`sealed/enroll.rs`, `opt_in`; `uploading.rs`)
+            (Marker::Contradictory(_) | Marker::Unreadable(_), _) if stopped => Before::Marked,
+            (Marker::Contradictory(_) | Marker::Unreadable(_), _) => Before::Unknown,
+            (Marker::Absent, Err(_)) => Before::Unknown,
+            (Marker::Absent, Ok(false)) => match crate::sealed::sent_any(&dir) {
                 Some(false) => Before::Never,
                 Some(true) => Before::Unmarked,
                 None => Before::Unknown,
@@ -2057,13 +2068,14 @@ where
         let mut sealed_lines = Vec::new();
         // Uploading now (marked, not stopped, the marker not in doubt): a
         // marker alone would tell a stopped agent it is being uploaded
-        let uploading = crate::sealed::uploads(
-            &self.agent_dir(),
-            &crate::sealed::KeyStore::new(&self.rt.secrets_dir),
-            self.inner.id(),
-        );
+        let keys = crate::sealed::KeyStore::new(&self.rt.secrets_dir);
+        let uploading = crate::sealed::uploads(&self.agent_dir(), &keys, self.inner.id());
+        // Stopped, either marker, as `sealed_answered_again` decides what
+        // a `decline` asks of the operator
+        let stopped = crate::sealed::stop::is_stopped(&self.agent_dir())
+            || crate::sealed::stop::durable(&keys, self.inner.id()).map_or(true, |d| d.is_some());
         if let Some(ledger) = self.sealed.ledger.as_mut()
-            && let Some(line) = ledger.ack_line(uploading)
+            && let Some(line) = ledger.ack_line(uploading, stopped)
         {
             ledger.acknowledge();
             self.sealed.dirty = true;
@@ -8795,6 +8807,114 @@ mod tests {
             Control::Continue,
             "put once"
         );
+    }
+
+    /// Beta round 2 of 2026-11-12 (critic, governance; harness, social),
+    /// in the real sequence: the earlier answer is not told back in the
+    /// session that puts the re-opened question; the answer to it is told
+    /// back as waiting for the operator at the next session; the operator
+    /// opts it in; the session after shows no answer line, only the
+    /// notice of the act. And when the operator acts before the first
+    /// session after the answer, that session says what was done, never
+    /// "Nothing has changed yet".
+    #[tokio::test]
+    async fn a_reoffer_answer_acted_on_is_never_told_as_waiting() {
+        const WAITING: &str = "Nothing has changed yet";
+        const REOPENED: &str = "question your operator re-opened, on uploading your sealed \
+             history to Agora, is on file";
+        let seen = |a: &ConsentAgent<Fake>| serde_json::to_string(&a.prompt().messages).unwrap();
+        for acted_first in [false, true] {
+            let h = with_sealed(&format!("sealed-reoffer-acted-{acted_first}"), None);
+            let dir = h.rt.state_dir.join(h.id.to_string());
+            let keys = crate::sealed::KeyStore::new(&h.rt.secrets_dir);
+            let mut agent = seated(&h).await;
+            agent
+                .handle(answer_call("sealed_state", "decline", "", ""))
+                .await
+                .unwrap();
+            agent.on_teardown().await.unwrap();
+            // Re-opened before the first answer was told back
+            sealed_state::reoffer(&dir, h.id, "Asked to by DM.")
+                .await
+                .unwrap();
+            let mut again = next_session(&h, &agent);
+            again.on_init().await.unwrap();
+            let intro = seen(&again);
+            assert!(
+                !intro.contains("is on file: decline"),
+                "the earlier answer, told back in the session that asks again: {intro}"
+            );
+            assert_eq!(
+                again.handle(reply("closing phase done")).await.unwrap(),
+                Control::Continue
+            );
+            again
+                .handle(answer_call("sealed_state", "private", "", ""))
+                .await
+                .unwrap();
+            again.on_teardown().await.unwrap();
+            let answered = sealed_ledger(&h).await.answered_at().unwrap();
+            let opt_in = || {
+                std::fs::create_dir_all(dir.join(agora_agentkit::state::storage::SEALED_DIR))
+                    .unwrap();
+                crate::sealed::notice::Notice::operator_act(
+                    &dir,
+                    "",
+                    crate::sealed::notice::OperatorAct::OptedIn {
+                        answered,
+                        uploaded: Some(72),
+                    },
+                )
+                .unwrap();
+                crate::sealed::uploading::set(
+                    &dir,
+                    &keys,
+                    h.id,
+                    crate::sealed::uploading::UploadingBy::OptIn,
+                )
+                .unwrap();
+            };
+            let mut last = again;
+            if !acted_first {
+                // Told back as waiting
+                let mut told = next_session(&h, &last);
+                told.on_init().await.unwrap();
+                let intro = seen(&told);
+                assert!(
+                    intro.contains(&format!("{REOPENED}: private. {WAITING}")),
+                    "{intro}"
+                );
+                told.handle(reply("done")).await.unwrap();
+                told.on_teardown().await.unwrap();
+                last = told;
+            }
+            opt_in();
+            let mut after = next_session(&h, &last);
+            after.on_init().await.unwrap();
+            let intro = seen(&after);
+            assert!(!intro.contains(WAITING), "{intro}");
+            if acted_first {
+                assert!(
+                    intro.contains(&format!(
+                        "{REOPENED}: private. Your operator has acted on it: your sealed \
+                         history is being uploaded."
+                    )),
+                    "{intro}"
+                );
+            } else {
+                assert!(!intro.contains(REOPENED), "told once: {intro}");
+            }
+            // What the start check seats beside it
+            let notice = crate::sealed::notice::Notice::load(&dir)
+                .unwrap()
+                .unwrap()
+                .line()
+                .unwrap();
+            assert!(
+                notice.contains("your operator started uploading your sealed history to Agora"),
+                "{notice}"
+            );
+        }
     }
 
     /// The operator's re-offer is put, and its answer told back, whatever
