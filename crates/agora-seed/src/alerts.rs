@@ -1091,14 +1091,67 @@ pub const ALERT_NOT_SENT: &str =
 /// ([`Alerter::dispatch`]).
 pub const TELL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long one start may spend in all awaiting the alerts whose outcome
+/// agents are told ([`Alerter::budgeted`]). Each awaited send waits up to
+/// [`TELL_TIMEOUT`]; with SMTP black-holed and every agent held, one per
+/// agent would hold the start for hours (1,667 × 10 s ≈ 4.6 h) before any
+/// session. Past it, an alert is logged, not mailed, and the agent is told
+/// no alert was sent; one mail per kind then says how many weren't
+/// ([`unsent_summary`]).
+pub const START_ALERT_BUDGET: Duration = Duration::from_secs(60);
+
+/// From this many agents with the same alert at one start, one mail names
+/// them all instead of one each (a fleet-wide hold is one event, and 1,667
+/// mails in sequence would be the start's whole budget).
+pub const ONE_BY_ONE_MAX: usize = 5;
+
+/// What came of an awaited alert ([`Alerter::dispatch_within`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatched {
+    /// The mail went out.
+    Sent,
+    /// Not configured, inside its rate limit, or the send failed.
+    NotSent,
+    /// The start's time for awaited alerts was spent: logged, not mailed.
+    OverBudget,
+}
+
+impl Dispatched {
+    pub fn sent(self) -> bool {
+        self == Self::Sent
+    }
+}
+
+/// The one mail for the alerts of `kind` that a start logged but didn't
+/// mail, its time for them spent: the count, never the agents (each of
+/// them was told no alert was sent; the log names them).
+pub fn unsent_summary(kind: AlertKind, n: usize) -> Alert {
+    Alert::new(
+        kind,
+        format!(
+            "{n} more {kind} alert(s) at this start were logged but not mailed: the start's time \
+             for awaited alerts ({} s) was spent",
+            START_ALERT_BUDGET.as_secs()
+        ),
+    )
+    .count(n)
+    .detail("agents", n)
+    .detail(
+        "where",
+        "each is an alert_over_budget event in the run log, with its agent_id",
+    )
+}
+
 /// The sentence for an alert whose mail went out (`sent`) or didn't.
 pub fn told(sent: bool) -> &'static str {
     if sent { ALERT_SENT } else { ALERT_NOT_SENT }
 }
 
 /// Sends alerts, or does nothing when `[alerts]` is absent. Cheap to clone.
+/// The second field: the time left for awaited alerts, for an alerter a
+/// start made ([`Self::budgeted`]); `None` is unbounded.
 #[derive(Clone, Default)]
-pub struct Alerter(Option<Arc<Inner>>);
+pub struct Alerter(Option<Arc<Inner>>, Option<Arc<Mutex<Duration>>>);
 
 impl std::fmt::Debug for Alerter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1129,7 +1182,14 @@ struct Inner {
 impl Alerter {
     /// No alerts.
     pub fn off() -> Self {
-        Self(None)
+        Self(None, None)
+    }
+
+    /// This alerter, sending through the same channel, with `budget` in
+    /// all for what [`Self::dispatch`] awaits ([`START_ALERT_BUDGET`]): one
+    /// per start, shared by its clones. [`Self::notify`] is unaffected.
+    pub fn budgeted(&self, budget: Duration) -> Self {
+        Self(self.0.clone(), Some(Arc::new(Mutex::new(budget))))
     }
 
     /// From `[alerts]`: validates, reads the password file and builds the
@@ -1158,21 +1218,24 @@ impl Alerter {
     ) -> Self {
         let email = config.email.as_ref().expect("validated");
         let (from, to) = email.validate().expect("validated");
-        Self(Some(Arc::new(Inner {
-            mailer,
-            from,
-            to,
-            events: config.events(),
-            min_interval: Duration::from_secs(config.min_interval_secs),
-            instance: config.instance.clone(),
-            // The SMTP timeout bounds the exchange; this bounds the whole
-            // attempt, state file included.
-            send_timeout: email.timeout() + Duration::from_secs(5),
-            state_path: data_dir.join(STATE_FILE),
-            log_path,
-            state_lock: tokio::sync::Mutex::new(()),
-            pending: Mutex::new(JoinSet::new()),
-        })))
+        Self(
+            Some(Arc::new(Inner {
+                mailer,
+                from,
+                to,
+                events: config.events(),
+                min_interval: Duration::from_secs(config.min_interval_secs),
+                instance: config.instance.clone(),
+                // The SMTP timeout bounds the exchange; this bounds the whole
+                // attempt, state file included.
+                send_timeout: email.timeout() + Duration::from_secs(5),
+                state_path: data_dir.join(STATE_FILE),
+                log_path,
+                state_lock: tokio::sync::Mutex::new(()),
+                pending: Mutex::new(JoinSet::new()),
+            })),
+            None,
+        )
     }
 
     /// Whether alerts of `kind` are sent at all (configured, and the
@@ -1215,9 +1278,43 @@ impl Alerter {
     /// tells an agent its operator was told
     /// ([`crate::interrupted`]): only a mail that went out does.
     pub async fn dispatch(&self, alert: Alert, timeout: Duration) -> bool {
-        match self.configured(&alert) {
-            Some(inner) => inner.deliver(alert, timeout.min(inner.send_timeout)).await,
-            None => false,
+        self.dispatch_within(alert, timeout).await.sent()
+    }
+
+    /// [`Self::dispatch`], saying why a mail didn't go out when it was
+    /// because the budget ([`Self::budgeted`]) was spent: the alert is then
+    /// logged (`alert_over_budget`), not mailed, now or later, so an agent
+    /// told no alert was sent is told the truth. Each awaited send is cut to
+    /// what is left of the budget, and what it took is taken from it.
+    pub async fn dispatch_within(&self, alert: Alert, timeout: Duration) -> Dispatched {
+        let Some(inner) = self.configured(&alert) else {
+            return Dispatched::NotSent;
+        };
+        let timeout = timeout.min(inner.send_timeout);
+        let Some(budget) = &self.1 else {
+            return match inner.deliver(alert, timeout).await {
+                true => Dispatched::Sent,
+                false => Dispatched::NotSent,
+            };
+        };
+        let left = *budget.lock().expect("alert budget lock");
+        if left.is_zero() {
+            tracing::warn!(
+                event_type = "alert_over_budget",
+                alert = %alert.kind,
+                agent_id = ?alert.agent_id,
+                budget_secs = START_ALERT_BUDGET.as_secs(),
+                "the start's time for awaited alerts is spent: logged, not mailed"
+            );
+            return Dispatched::OverBudget;
+        }
+        let started = std::time::Instant::now();
+        let sent = inner.deliver(alert, timeout.min(left)).await;
+        let mut left = budget.lock().expect("alert budget lock");
+        *left = left.saturating_sub(started.elapsed());
+        match sent {
+            true => Dispatched::Sent,
+            false => Dispatched::NotSent,
         }
     }
 
@@ -1496,6 +1593,30 @@ pub(crate) mod testing {
         pub(crate) fn sent(&self) -> Vec<String> {
             self.0.lock().unwrap().clone()
         }
+    }
+
+    /// A server that never answers (SMTP black-holed).
+    struct BlackHole;
+
+    #[async_trait::async_trait]
+    impl Mailer for BlackHole {
+        async fn send(&self, _: Message) -> anyhow::Result<()> {
+            std::future::pending().await
+        }
+    }
+
+    /// [`recording`]'s config, mailed into a black hole.
+    pub(crate) fn black_hole(data_dir: &Path) -> Alerter {
+        let config: AlertsConfig = toml::from_str(
+            r#"
+            [email]
+            smtp_host = "localhost"
+            from = "a@example.com"
+            to = ["b@example.com"]
+            "#,
+        )
+        .unwrap();
+        Alerter::with_mailer(&config, Box::new(BlackHole), data_dir, None)
     }
 
     /// Every configurable kind, rate state under `data_dir`, mailed to

@@ -2839,7 +2839,48 @@ pub fn hold_alert(
     name: &str,
     held: Option<&agora_agentkit::state::storage::Held>,
 ) -> Alert {
-    let (kind, summary) = match hold {
+    let (kind, summary) = hold_kind(hold);
+    let mut alert = Alert::new(kind, format!("{name}: {summary}")).agent(name, id);
+    if let Some(held) = held {
+        alert = alert
+            .detail("held", held.outbox_items)
+            .detail("blobs", held.blobs)
+            .detail("blob_bytes", held.blob_bytes)
+            .detail("forks", held.displaced);
+    }
+    if hold == Hold::Fork {
+        alert = alert.detail(
+            "resolve",
+            format!("agora-seed sealed-accept --agent {id} --rebase --note \"…\""),
+        );
+    }
+    alert
+}
+
+/// One mail for every agent held for `hold` at one start, when more than
+/// [`crate::alerts::ONE_BY_ONE_MAX`] are ([`hold_alert`] is one agent's):
+/// the count and every id, so each agent may be told an alert naming it
+/// was sent. Ids only, never content.
+pub fn hold_summary(hold: Hold, agents: &[(AgentId, String)]) -> Alert {
+    let (kind, summary) = hold_kind(hold);
+    let mut alert = Alert::new(kind, format!("{} agent(s): {summary}", agents.len()))
+        .count(agents.len())
+        .detail("agents", agents.len());
+    // One line each: a short line survives any mail transport unwrapped
+    for (id, name) in agents {
+        alert = alert.detail("agent", format!("{name} ({id})"));
+    }
+    if hold == Hold::Fork {
+        alert = alert.detail(
+            "resolve",
+            "agora-seed sealed-accept --agent <id> --rebase --note \"…\", for each",
+        );
+    }
+    alert
+}
+
+fn hold_kind(hold: Hold) -> (AlertKind, &'static str) {
+    match hold {
         Hold::SealFailed => (
             AlertKind::SealedStateSealFailed,
             "the last save was written unsealed; uploads held",
@@ -2856,22 +2897,7 @@ pub fn hold_alert(
             AlertKind::SealedStateUnreadable,
             "the sealed chain could not be checked (Agora unreachable); the agent runs, uploads held",
         ),
-    };
-    let mut alert = Alert::new(kind, format!("{name}: {summary}")).agent(name, id);
-    if let Some(held) = held {
-        alert = alert
-            .detail("held", held.outbox_items)
-            .detail("blobs", held.blobs)
-            .detail("blob_bytes", held.blob_bytes)
-            .detail("forks", held.displaced);
     }
-    if hold == Hold::Fork {
-        alert = alert.detail(
-            "resolve",
-            format!("agora-seed sealed-accept --agent {id} --rebase --note \"…\""),
-        );
-    }
-    alert
 }
 
 /// Every sentence this module can tell an agent, for the one table of

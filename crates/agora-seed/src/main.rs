@@ -2681,6 +2681,9 @@ struct StartFound {
     /// Full verifications made, kept in the roster.
     vouches: Vec<(AgentId, sealed::roster::Vouch)>,
     unopenable: Vec<(AgentId, String, sealed::check::Unopenable)>,
+    /// The agents held, with their hold and its alert, sent at
+    /// [`StartFound::settle`].
+    held: Vec<(AgentId, String, sealed::check::Hold, alerts::Alert)>,
     /// Agents whose shrink is between two versions the enrolment sealed
     /// (it predates their chain): counted, logged once, not alerted.
     dropped_before_chain: usize,
@@ -2710,18 +2713,77 @@ impl StartFound {
         if let Some(alert) = sealed::check::drop_summary(&self.dropped) {
             ctx.alerts.notify(alert);
         }
+        // The alerts more than one agent is told of come last, each awaited
+        // within the start's budget (`alerts::START_ALERT_BUDGET`, when the
+        // alerter is budgeted): past it, logged, not mailed, and one mail per
+        // kind says how many
+        let mut over_budget: BTreeMap<alerts::AlertKind, usize> = BTreeMap::new();
+        let tell = |run: &mut SealedRun, id: &AgentId, hold: sealed::check::Hold, sent| {
+            if let Some(seat) = run.seats.get_mut(id) {
+                sealed::check::say_told(&mut seat.lines, hold, sent);
+            }
+        };
+        let mut holds: Vec<sealed::check::Hold> = Vec::new();
+        for (_, _, hold, _) in &self.held {
+            if !holds.contains(hold) {
+                holds.push(*hold);
+            }
+        }
+        for hold in holds {
+            let of: Vec<&(AgentId, String, sealed::check::Hold, alerts::Alert)> =
+                self.held.iter().filter(|h| h.2 == hold).collect();
+            if of.len() > alerts::ONE_BY_ONE_MAX {
+                // One mail naming every one of them
+                let agents: Vec<(AgentId, String)> =
+                    of.iter().map(|h| (h.0, h.1.clone())).collect();
+                let alert = sealed::check::hold_summary(hold, &agents);
+                let kind = alert.kind;
+                let done = ctx
+                    .alerts
+                    .dispatch_within(alert, alerts::TELL_TIMEOUT)
+                    .await;
+                if done == alerts::Dispatched::OverBudget {
+                    *over_budget.entry(kind).or_default() += of.len();
+                }
+                for (id, _, _, _) in &of {
+                    tell(run, id, hold, done.sent());
+                }
+            } else {
+                for (id, _, _, alert) in of {
+                    let kind = alert.kind;
+                    let done = ctx
+                        .alerts
+                        .dispatch_within(alert.clone(), alerts::TELL_TIMEOUT)
+                        .await;
+                    if done == alerts::Dispatched::OverBudget {
+                        *over_budget.entry(kind).or_default() += 1;
+                    }
+                    tell(run, id, hold, done.sent());
+                }
+            }
+        }
         if let Some(alert) = sealed::check::unopenable_summary(&self.unopenable) {
             // Awaited, and each agent told what came of it
-            let sent = ctx.alerts.dispatch(alert, alerts::TELL_TIMEOUT).await;
+            let kind = alert.kind;
+            let done = ctx
+                .alerts
+                .dispatch_within(alert, alerts::TELL_TIMEOUT)
+                .await;
+            if done == alerts::Dispatched::OverBudget {
+                *over_budget.entry(kind).or_default() += self.unopenable.len();
+            }
             for (id, _, _) in &self.unopenable {
                 if let Some(seat) = run.seats.get_mut(id) {
                     sealed::check::say_told_after(
                         &mut seat.lines,
                         sealed::check::UNOPENABLE_LINE,
-                        sent,
+                        done.sent(),
                     );
                 }
             }
+        }
+        for (kind, n) in over_budget {
+            ctx.alerts.notify(alerts::unsent_summary(kind, n));
         }
     }
 }
@@ -2883,23 +2945,20 @@ async fn check_agent(
                 }
                 found.dropped.push((id, name.clone(), drops));
             }
-            let mut seat = seat;
             if let Some(hold) = hold {
-                // Every start while held, rate-limited by the alerter
+                // Every start while held, rate-limited by the alerter; sent
+                // when the start's checks are done ([`StartFound::settle`]),
+                // one mail for many, and the agent told what came of it
                 let held = agora_agentkit::state::storage::AgentSeal::new(&dir, id)
                     .held()
                     .await
                     .ok();
-                // Awaited: the agent is told what came of it, never that
-                // its operator was told when no mail went out
-                let sent = ctx
-                    .alerts
-                    .dispatch(
-                        sealed::check::hold_alert(hold, id, &name, held.as_ref()),
-                        alerts::TELL_TIMEOUT,
-                    )
-                    .await;
-                sealed::check::say_told(&mut seat, hold, sent);
+                found.held.push((
+                    id,
+                    name.clone(),
+                    hold,
+                    sealed::check::hold_alert(hold, id, &name, held.as_ref()),
+                ));
                 run.held.push(id);
             }
             // Asked of Agora only for an agent that uploads
@@ -3782,6 +3841,9 @@ async fn run(held: &mut Held) -> Result<()> {
     });
     // The sealed-state start check, for enrolled agents: before anyone is
     // built, so a refused agent is never run, saved or sealed.
+    // One budget for every alert the start awaits to tell an agent of,
+    // here and at the reloads under the session locks
+    let start_alerts = held.alerts.budgeted(alerts::START_ALERT_BUDGET);
     let mut sealed_run = sealed_start_check(
         &mut pool,
         &enrolled,
@@ -3789,7 +3851,7 @@ async fn run(held: &mut Held) -> Result<()> {
         &state_dir,
         enrolment.keys_store(),
         sealed_api.as_ref(),
-        &held.alerts,
+        &start_alerts,
         args.dry_run,
         &mut skipped,
         Some(&verified_anchors),
@@ -3892,7 +3954,7 @@ async fn run(held: &mut Held) -> Result<()> {
                 state_dir: &state_dir,
                 keys: enrolment.keys_store(),
                 api: sealed_api.as_ref(),
-                alerts: &held.alerts,
+                alerts: &start_alerts,
                 start: Some(sealed::check::StartAnchors {
                     verified: &verified_anchors,
                     alerted: held.alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
@@ -4513,6 +4575,145 @@ mod tests {
         assert!(s.contains("done 1, failed 1, unsaved 1"), "{s}");
         assert!(s.contains(&format!("error {id}: Storage")), "{s}");
         assert!(s.contains(&format!("unsaved {id}: ")), "{s}");
+    }
+
+    /// `n` local agents whose last save went unsealed, ready for a start.
+    async fn held_agents(
+        root: &std::path::Path,
+        n: usize,
+    ) -> (sealed::KeyStore, Vec<(AgentId, SeedState)>) {
+        let state_dir = root.join("state");
+        let mut keys = None;
+        let mut pool = Vec::new();
+        for i in 0..n {
+            let (id, k, dir) = sealed::check::tests::enrolled_local(root).await;
+            FsStorage::new(&state_dir)
+                .save_raw(
+                    id,
+                    serde_json::json!({ "memory": { "content": "unsealed" } }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let loaded = FsStorage::new(&state_dir).load_raw(id).await.unwrap().value;
+            agora_agentkit::state::storage::AgentSeal::new(&dir, id)
+                .record_seal_failed(
+                    agora_agentkit::state::storage::plaintext_hash(&loaded),
+                    agora_agentkit::state::storage::SealFailureKind::Io,
+                )
+                .await
+                .unwrap();
+            let (_, state) = crate::agent_selection_tests::pooled(&format!("held{i}"));
+            pool.push((id, state));
+            keys = Some(k);
+        }
+        (keys.unwrap(), pool)
+    }
+
+    /// Many agents held for one reason at one start: one mail names them
+    /// all, and each is told an alert was sent.
+    #[tokio::test]
+    async fn many_agents_held_alike_get_one_mail_naming_each() {
+        let root = sealed::TestDir::new("main-held-many");
+        let state_dir = root.join("state");
+        let n = alerts::ONE_BY_ONE_MAX + 2;
+        let (keys, mut pool) = held_agents(&root, n).await;
+        let ids: Vec<AgentId> = pool.iter().map(|(id, _)| *id).collect();
+        let sent = alerts::testing::Recorder::default();
+        let alerter = alerts::testing::recording(&root, &sent).budgeted(alerts::START_ALERT_BUDGET);
+        let api = sealed::api::UploadGuard::new(
+            sealed::api::fake::FakeApi::new(),
+            Arc::new(sealed::SealedEnrolment::with_keys(&state_dir, keys.clone())),
+        );
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &root,
+            &state_dir,
+            &keys,
+            &api,
+            &alerter,
+            false,
+            &mut Vec::new(),
+            None,
+            None,
+        )
+        .await;
+        alerter.flush(std::time::Duration::from_secs(10)).await;
+        assert_eq!(run.held.len(), n);
+        let mails: Vec<String> = sent
+            .sent()
+            .into_iter()
+            .filter(|m| m.contains("sealed_state_seal_failed"))
+            .collect();
+        assert_eq!(mails.len(), 1, "one mail for all of them");
+        for id in &ids {
+            assert!(mails[0].contains(&id.to_string()), "{id} named");
+            assert!(
+                run.seats[id]
+                    .lines
+                    .iter()
+                    .any(|l| l.contains(alerts::ALERT_SENT)),
+                "{:?}",
+                run.seats[id].lines
+            );
+        }
+    }
+
+    /// SMTP black-holed: the start waits for alerts no longer than its
+    /// budget, then tells the rest truthfully that no alert was sent.
+    #[tokio::test]
+    async fn a_start_waits_for_alerts_no_longer_than_its_budget() {
+        let root = sealed::TestDir::new("main-held-budget");
+        let state_dir = root.join("state");
+        let (keys, mut pool) = held_agents(&root, alerts::ONE_BY_ONE_MAX).await;
+        let ids: Vec<AgentId> = pool.iter().map(|(id, _)| *id).collect();
+        let alerter =
+            alerts::testing::black_hole(&root).budgeted(std::time::Duration::from_millis(500));
+        let api = sealed::api::UploadGuard::new(
+            sealed::api::fake::FakeApi::new(),
+            Arc::new(sealed::SealedEnrolment::with_keys(&state_dir, keys.clone())),
+        );
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &root,
+            &state_dir,
+            &keys,
+            &api,
+            &alerter,
+            false,
+            &mut Vec::new(),
+            None,
+            None,
+        )
+        .await;
+        // One send cut to the budget, the rest not awaited (unbounded, it
+        // would be ONE_BY_ONE_MAX × TELL_TIMEOUT)
+        assert!(
+            started.elapsed() < alerts::TELL_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(run.held.len(), ids.len(), "they all run, held");
+        for id in &ids {
+            assert!(
+                run.seats[id]
+                    .lines
+                    .iter()
+                    .any(|l| l.contains(alerts::ALERT_NOT_SENT)),
+                "{:?}",
+                run.seats[id].lines
+            );
+        }
+        alerter.flush(std::time::Duration::from_millis(100)).await;
     }
 
     /// A shrink the enrolment sealed from the archives (the last archive
