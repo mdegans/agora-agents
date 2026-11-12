@@ -425,6 +425,9 @@ pub struct ConsentAgent<A> {
     sealed_stop_note: bool,
     /// The anchors the seated verdict told of, marked told after the save.
     sealed_anchors_told: Vec<agora_agentkit::ids::GovernanceLogId>,
+    /// The healing record this session was told of
+    /// ([`crate::sealed::healed`]): marked told once the session saves.
+    sealed_healing_told: Option<DateTime<Utc>>,
     /// The verdict told that enrolment kept the memory ids: marked told
     /// after the save.
     memory_ids_note: bool,
@@ -1821,6 +1824,7 @@ where
             sealed_notice: false,
             sealed_stop_note: false,
             sealed_anchors_told: Vec::new(),
+            sealed_healing_told: None,
             memory_ids_note: false,
             closed: false,
             epilogue: false,
@@ -2026,6 +2030,7 @@ where
             self.sealed_notice = seat.notice;
             self.sealed_stop_note = seat.stop_note;
             self.sealed_anchors_told = seat.anchors_told;
+            self.sealed_healing_told = seat.healing_told;
             let mut lines = seat.lines;
             // The verdict's head, linked to the heading's memory id; and,
             // once after enrolment, that the ids stayed as they were
@@ -2173,6 +2178,15 @@ where
                 agent_id = %self.inner.id(),
                 error = %e,
                 "anchor findings not marked told after the save; the next verdict repeats them"
+            );
+        }
+        if let Some(seated) = self.sealed_healing_told
+            && let Err(e) = crate::sealed::healed::mark_told(&self.agent_dir(), seated)
+        {
+            tracing::warn!(
+                agent_id = %self.inner.id(),
+                error = %e,
+                "what was sent to Agora again not marked told after the save; it is told again"
             );
         }
         if self.memory_ids_note
@@ -8408,6 +8422,7 @@ mod tests {
                 notice: true,
                 stop_note: false,
                 anchors_told: vec![anc],
+                healing_told: None,
             },
         );
         let mut agent = anthropic_agent(&h);
@@ -8425,6 +8440,54 @@ mod tests {
             "set aside"
         );
         assert!(InclusionFile::load(&dir).unwrap().checked[0].told, "told");
+    }
+
+    /// What Agora found damaged and what was sent again is told once: the
+    /// record the seat read is marked told when the session saves, and not
+    /// before.
+    #[tokio::test]
+    async fn the_healing_sentence_is_marked_told_after_the_save() {
+        use agora_agentkit::state::outbox::{Damage, Healing};
+        let mut h = Harness::new("sealed-healed");
+        let dir = h.rt.state_dir.join(h.id.to_string());
+        std::fs::create_dir_all(dir.join(agora_agentkit::state::storage::SEALED_DIR)).unwrap();
+        crate::sealed::healed::note(
+            &dir,
+            h.id,
+            &Healing {
+                damaged: Damage::Reported(2),
+                healed: 2,
+                unhealable: 0,
+                interrupted: false,
+            },
+        );
+        let mut lines = vec!["VERDICT LINE".to_string()];
+        let healing_told = crate::sealed::healed::seat_into(&dir, h.id, &mut lines);
+        assert!(healing_told.is_some());
+        Arc::get_mut(&mut h.rt).unwrap().sealed_seats.insert(
+            h.id,
+            crate::consent::SealedSeat {
+                lines,
+                healing_told,
+                ..Default::default()
+            },
+        );
+        let mut agent = anthropic_agent(&h);
+        agent.on_init().await.unwrap();
+        let intro = serde_json::to_string(&agent.prompt().messages).unwrap();
+        assert!(
+            intro.contains(
+                "VERDICT LINE\\n\\nAgora's check of what it stores found parts of your uploaded \
+                 sealed history missing or damaged there, and your runner sent them again"
+            ),
+            "{intro}"
+        );
+        assert!(
+            crate::sealed::healed::seat(&dir, h.id).is_some(),
+            "not told until the session saves"
+        );
+        agent.on_saved().await.unwrap();
+        assert_eq!(crate::sealed::healed::seat(&dir, h.id), None, "told once");
     }
 
     /// Beta round 1: an agent listed only in `[sealed_state]`, no other

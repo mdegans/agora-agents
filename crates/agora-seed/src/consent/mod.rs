@@ -231,6 +231,10 @@ pub struct SealedSeat {
     /// ([`crate::sealed::inclusion::mark_told`]), so a verdict seated for a
     /// session that never runs doesn't use them up.
     pub anchors_told: Vec<agora_agentkit::ids::GovernanceLogId>,
+    /// One line is what Agora found damaged and what was sent again
+    /// ([`crate::sealed::healed`]): the time of the record it was read
+    /// from, marked told once the session saves.
+    pub healing_told: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ConsentRuntime {

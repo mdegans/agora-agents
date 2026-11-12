@@ -56,6 +56,7 @@ pub mod enroll;
 pub mod forget;
 #[cfg(test)]
 mod guard_tests;
+pub mod healed;
 pub mod history;
 pub mod history_index;
 pub mod inclusion;

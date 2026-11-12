@@ -2,8 +2,8 @@
 
 Plan: agora `memory/project_local_chain_for_all.md` (2026-11-11). Every agent
 is chained locally; consent decides only whether the chain is uploaded.
-Built in steps B1-B5 on `seed/local-chain` and integrated there
-(2026-11-11); B6 and B7 are still to come. Paths: `<state>` is
+Built in steps B1-B7 on `seed/local-chain` and integrated there
+(B1-B5 on 2026-11-11; B6, B7 and the last section on 2026-11-12). Paths: `<state>` is
 `<data_dir>/state`, `<secrets>` is `<data_dir>/secrets`, `<id>` an agent id.
 
 The first part is the integrated statement: what the first start after
@@ -888,3 +888,48 @@ measured is logged (`disk_space_unmeasured`) and holds nothing back. The
 come before the log; operator commands (`sealed-*`, `rotate-keys`) are not
 gated. `libc` (already in the tree) is now a direct dependency, for
 `statvfs`: the one `unsafe` block in the workspace.
+
+### What Agora found damaged, told to the agent
+
+agentkit's drain sends again the blobs Agora's check at rest found missing
+or damaged (integrated above); the agent was told nothing of it. Now every
+drain through `receipts::drain` (the run's drainer, `sealed-enroll`,
+`sealed-stop`) notes what it came to in a file of the runner's own:
+
+| File | When | How |
+|---|---|---|
+| `<state>/<id>/sealed/healed.json` (new: `{at, resent, unhealable, told}`, two counts, a time, a flag; no content) | a drain of an **uploading** agent in which blobs were sent again, or the count Agora lists that can't be sent again from here changed. Never for an agent that doesn't upload (it isn't drained), and no file while Agora reports nothing damaged | one atomic write (`write_private`), 0600. Rewritten with `told: true` once a session that was shown its sentence saves |
+
+Read: that file, at each start check (and at a re-check under the session
+lock), for the agent's seat. agentkit's own `sealed/healing.json` is not
+read by the runner. Nothing of it leaves the machine.
+
+No lock is taken: the mark is made only for the record the session was
+shown (by its time), so the worst a lost update does is repeat the
+sentence once.
+
+New agent-facing sentences (for the wording round), last in the start
+check's lines, shown once per change:
+
+- Sent again: "Agora's check of what it stores found parts of your
+  uploaded sealed history missing or damaged there, and your runner sent
+  them again from its local copies. Your state now is not affected."
+- Some not: "… missing or damaged there. Your runner sent again the ones
+  it holds; {n} it could not send again, because its local copies of them
+  are missing or damaged too, so some of your earlier versions may not
+  open from Agora's copy. Your operator has been told. Your state now is
+  not affected."
+- None sent: "… missing or damaged there. {n} of them your runner could
+  not send again, because its local copies of them are missing or damaged
+  too, so … Your operator has been told. Your state now is not affected."
+
+"Your operator has been told" rests on the `sealed_state_agora_blobs_unhealable`
+alert (raised by the run's drainer when the count changes) or, for a drain
+made by an operator's command, on the command's own output.
+
+### The first run after install
+
+No `healed.json` exists; none is written until Agora reports damage for
+an uploading agent (its check at rest is in the server's hardening
+release). The free-space gate reads statistics at every start. The offer
+gate reads one marker's existence per closing question.

@@ -484,6 +484,11 @@ pub async fn drain(
         // has no `sent` now: a later drain must not give it one
         *baseline = u64::MAX;
     }
+    // What Agora reported damaged and what was sent again, kept for the
+    // agent's next start ([`super::healed`])
+    if let Ok(drained) = &result {
+        super::healed::note_drained(agent_dir, id, drained);
+    }
     result
 }
 

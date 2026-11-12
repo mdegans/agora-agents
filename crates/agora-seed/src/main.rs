@@ -2281,6 +2281,7 @@ async fn sealed_start_check(
                         notice: false,
                         stop_note: !stopped.shown,
                         anchors_told: Vec::new(),
+                        healing_told: None,
                     },
                 );
             }
@@ -2627,6 +2628,9 @@ async fn sealed_start_check(
                     Some((line, first)) => (std::iter::once(line).chain(seat).collect(), first),
                     None => (seat, false),
                 };
+                // Last: what Agora found damaged and what was sent again
+                let mut lines: Vec<String> = lines;
+                let healing_told = sealed::healed::seat_into(&dir, *id, &mut lines);
                 run.seats.insert(
                     *id,
                     consent::SealedSeat {
@@ -2634,6 +2638,7 @@ async fn sealed_start_check(
                         lines,
                         notice,
                         anchors_told: told,
+                        healing_told,
                     },
                 );
                 run.drained.push((*id, name));
@@ -2882,6 +2887,8 @@ async fn reload_one<S: Storage>(
                     ),
                     None => (seat, false),
                 };
+                let mut lines: Vec<String> = lines;
+                let healing_told = sealed::healed::seat_into(&dir, id, &mut lines);
                 sealed_run.seats.insert(
                     id,
                     consent::SealedSeat {
@@ -2889,6 +2896,7 @@ async fn reload_one<S: Storage>(
                         notice,
                         stop_note,
                         anchors_told: Vec::new(),
+                        healing_told,
                     },
                 );
                 sealed_run.held.retain(|a| *a != id);
@@ -4509,6 +4517,70 @@ mod tests {
         assert!(run.seats[&ok].lines[0].starts_with("Your sealed state: "));
         assert_eq!(run.drained.len(), 1);
         assert!(run.held.is_empty());
+    }
+
+    /// What a drain of an earlier run noted (Agora found copies damaged,
+    /// the runner sent them again) is the last line of the agent's seat at
+    /// the next start, with the record's time for the mark; an agent with
+    /// no record gets no such line.
+    #[tokio::test]
+    async fn the_start_check_seats_what_was_sent_to_agora_again() {
+        use agora_agentkit::state::outbox::{Damage, Healing};
+        let root = sealed::TestDir::new("main-sealed-healed");
+        let (healed, keys, healed_dir) = sealed::check::tests::enrolled(&root).await;
+        let (plain, _, _) = sealed::check::tests::enrolled(&root).await;
+        let state_dir = root.join("state");
+        sealed::healed::note(
+            &healed_dir,
+            healed,
+            &Healing {
+                damaged: Damage::Reported(3),
+                healed: 2,
+                unhealable: 1,
+                interrupted: false,
+            },
+        );
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+        let (_, wren) = crate::agent_selection_tests::pooled("wren");
+        let mut pool = vec![(healed, tarn), (plain, wren)];
+        let api = sealed::api::fake::FakeApi::new();
+        let run = sealed_start_check(
+            &mut pool,
+            &loaded.sealed,
+            &root,
+            &state_dir,
+            &keys,
+            &api,
+            &alerts::Alerter::off(),
+            false,
+            &mut Vec::new(),
+            None,
+            None,
+        )
+        .await;
+        let seat = &run.seats[&healed];
+        assert!(seat.lines[0].starts_with("Your sealed state: "), "{seat:?}");
+        let last = seat.lines.last().unwrap();
+        assert!(
+            last.starts_with("Agora's check of what it stores found parts of your uploaded")
+                && last.contains("1 it could not send again"),
+            "{last}"
+        );
+        assert!(seat.healing_told.is_some());
+        // Seated, not yet told: the session's save marks it
+        assert!(sealed::healed::seat(&healed_dir, healed).is_some());
+        let other = &run.seats[&plain];
+        assert_eq!(other.healing_told, None);
+        assert!(
+            other
+                .lines
+                .iter()
+                .all(|l| !l.contains("missing or damaged there")),
+            "{other:?}"
+        );
     }
 
     /// A dry run checks nothing: an anchor failure not yet told stays
