@@ -665,6 +665,11 @@ pub struct OptedIn {
     pub posted: bool,
     /// Entries Agora already held, filed as sent here.
     pub held_by_agora: usize,
+    /// The versions on its main line at the opt-in (snapshots, as the
+    /// `memory` tool counts them): all uploaded once the outbox is empty
+    /// after the command's drain, which the agent's notice then says
+    /// ([`super::notice::Notice::opted_in_uploaded`]).
+    pub versions: usize,
 }
 
 /// `sealed/resuming.json`: a resume's intent, written before it sets
@@ -1570,7 +1575,10 @@ impl Enroller {
             .in_force()
             .starts_uploads()
             .map_err(Skip::NotOptedIn)?;
-        let act = super::notice::OperatorAct::OptedIn { answered };
+        let act = super::notice::OperatorAct::OptedIn {
+            answered,
+            uploaded: None,
+        };
         let signing = self
             .keys
             .signing(id)
@@ -1754,6 +1762,10 @@ impl Enroller {
             already: false,
             posted: !posted,
             held_by_agora,
+            versions: line
+                .iter()
+                .filter(|e| e.entry.kind == agora_agentkit::enums::StateEntryKind::Snapshot)
+                .count(),
         })
     }
 
@@ -3905,8 +3917,14 @@ pub(crate) mod tests {
             ),
             "{line}"
         );
-        e.opt_in(&api, id).await.unwrap();
+        let waiting = crate::sealed::backlog(&dir).unwrap().versions;
+        let opted = e.opt_in(&api, id).await.unwrap();
         assert!(crate::sealed::uploads(&dir, &keys, id));
+        // The main line's versions, as the `memory` tool counts them: what
+        // waited to go up, for the notice to say once they are all up
+        // (`cli.rs`, `Notice::opted_in_uploaded`)
+        assert_eq!(opted.versions, waiting);
+        assert!(waiting > 0);
     }
 
     /// Never during a key rotation; a rotation's own key record is posted

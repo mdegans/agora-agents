@@ -999,6 +999,20 @@ async fn opt_in_pass(
         });
         let uploaded = match super::receipts::drain(outbox, &dir, id, &mut baseline).await {
             Ok(Drained::Ran(d)) => {
+                // Everything it had is on Agora: its notice says how many
+                // (nothing written to the notice of an earlier opt-in)
+                if !opted.already
+                    && d.waiting == 0
+                    && d.status == agora_agentkit::state::verify::HeadStatus::Same
+                    && let Err(e) = super::notice::Notice::opted_in_uploaded(&dir, opted.versions)
+                {
+                    tracing::warn!(
+                        event_type = "sealed_opt_in_notice_count_failed",
+                        agent_id = %id,
+                        error = %e,
+                        "the opt-in's notice wasn't told how many versions went up; it says the runner uploads them"
+                    );
+                }
                 // Its own choice: the anchor on its profile, once its head
                 // is on Agora (else the runner's drainer does it)
                 let published = match enroller.keys.signing(id) {

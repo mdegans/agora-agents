@@ -402,8 +402,16 @@ impl Unsaved {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OperatorAct {
-    /// Uploading started on the agent's yes, given then.
-    OptedIn { answered: DateTime<Utc> },
+    /// Uploading started on the agent's yes, given then. `uploaded`: the
+    /// versions of its sealed history's main line at the opt-in (as the
+    /// `memory` tool counts them), all uploaded by the same command
+    /// ([`Notice::opted_in_uploaded`]); `None` until then, or when they
+    /// weren't all uploaded then (the runner uploads the rest).
+    OptedIn {
+        answered: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uploaded: Option<usize>,
+    },
     /// A stop cleared. `uploading`: its uploads go on (else nothing of it
     /// is uploaded); `kept`: versions not uploaded when the stop began or
     /// saved while stopped, kept here and never sent.
@@ -430,10 +438,17 @@ impl OperatorAct {
     fn line(&self, accepted: &Accepted) -> String {
         let date = accepted.at.format(super::text::DATE);
         let mut line = match self {
-            Self::OptedIn { answered } => format!(
+            // One state with the `memory` tool's count and the re-offer's
+            // "is being uploaded" (beta round 2 of 2026-11-12)
+            Self::OptedIn { answered, uploaded } => format!(
                 "On {date}, your operator started uploading your sealed history to Agora, as you \
-                 answered on {}.",
-                answered.format(super::text::DATE)
+                 answered on {}: {}, and each new version follows.",
+                answered.format(super::text::DATE),
+                match uploaded {
+                    Some(0) | None => "your runner uploads the versions it had then".to_string(),
+                    Some(1) => "the 1 version it had then was uploaded".to_string(),
+                    Some(n) => format!("all {n} versions it had then were uploaded"),
+                }
             ),
             Self::Resumed {
                 uploading: false, ..
@@ -563,6 +578,20 @@ impl Notice {
             )?;
         }
         Ok(carried)
+    }
+
+    /// The opt-in's notice, not yet shown, told that all `versions` it
+    /// found were uploaded by the command that wrote it. Anything else
+    /// waiting (another act, or none) is left alone. One atomic write.
+    pub fn opted_in_uploaded(agent_dir: &Path, versions: usize) -> std::io::Result<()> {
+        let Some(mut n) = Self::load(agent_dir)? else {
+            return Ok(());
+        };
+        let Some(OperatorAct::OptedIn { uploaded, .. }) = n.operator_act.as_mut() else {
+            return Ok(());
+        };
+        *uploaded = Some(versions);
+        write(agent_dir, &n)
     }
 
     /// Agora lost versions sealed here; the operator sealed the state on
@@ -967,6 +996,65 @@ pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
 pub(crate) mod tests {
     use super::*;
 
+    /// Beta round 2 of 2026-11-12 (critic): the opt-in's notice says what
+    /// was uploaded, as the `memory` tool counts it, once the command's
+    /// drain left nothing waiting; until then, and over another act's
+    /// notice, nothing is changed. A notice written before the count
+    /// existed still reads.
+    #[test]
+    fn the_opt_in_notice_says_how_many_versions_went_up() {
+        let root = crate::sealed::TestDir::new("notice-opted-in-count");
+        let dir = root.path();
+        std::fs::create_dir_all(dir.join(SEALED_DIR)).unwrap();
+        let answered: DateTime<Utc> = "2026-11-12T09:00:00Z".parse().unwrap();
+        Notice::operator_act(
+            dir,
+            "",
+            OperatorAct::OptedIn {
+                answered,
+                uploaded: None,
+            },
+        )
+        .unwrap();
+        let line = || Notice::load(dir).unwrap().unwrap().line().unwrap();
+        assert!(
+            line().ends_with(
+                "as you answered on 2026-11-12: your runner uploads the versions it had then, and \
+                 each new version follows."
+            ),
+            "{}",
+            line()
+        );
+        Notice::opted_in_uploaded(dir, 72).unwrap();
+        assert!(
+            line().ends_with(
+                "as you answered on 2026-11-12: all 72 versions it had then were uploaded, and \
+                 each new version follows."
+            ),
+            "{}",
+            line()
+        );
+        // Another act's notice is left as it is
+        Notice::operator_act(dir, "n", OperatorAct::PriorAdded { sent: true }).unwrap();
+        let before = Notice::load(dir).unwrap();
+        Notice::opted_in_uploaded(dir, 3).unwrap();
+        assert_eq!(Notice::load(dir).unwrap(), before);
+        // An older notice, with no count
+        let old = serde_json::json!({
+            "refused_at": answered, "reason": "mismatch",
+            "accepted": {"at": answered, "note": ""},
+            "operator_act": {"kind": "opted_in", "answered": answered},
+        });
+        let old: Notice = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            old.operator_act,
+            Some(OperatorAct::OptedIn {
+                answered,
+                uploaded: None
+            })
+        );
+    }
+
     #[test]
     fn a_long_diff_is_cut_and_counted() {
         let before = serde_json::json!({
@@ -1126,7 +1214,27 @@ pub(crate) mod tests {
         };
         let act = |a: OperatorAct| by_operator(&|n: &mut Notice| n.operator_act = Some(a.clone()));
         let mut lines = vec![
-            (Kind::Uploaded, act(OperatorAct::OptedIn { answered: at })),
+            (
+                Kind::Uploaded,
+                act(OperatorAct::OptedIn {
+                    answered: at,
+                    uploaded: None,
+                }),
+            ),
+            (
+                Kind::Uploaded,
+                act(OperatorAct::OptedIn {
+                    answered: at,
+                    uploaded: Some(72),
+                }),
+            ),
+            (
+                Kind::Uploaded,
+                act(OperatorAct::OptedIn {
+                    answered: at,
+                    uploaded: Some(1),
+                }),
+            ),
             (
                 Kind::Any,
                 act(OperatorAct::Resumed {
