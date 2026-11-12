@@ -2159,7 +2159,8 @@ pub const SERVER_FAULT_TEXT: &str = "Agora's copy of these agents' sealed histor
      verification while their local states are intact: likely a server-side fault (a bug, a \
      bad database restore, or tampering). No agent runs until Agora serves histories that \
      verify. To run an agent regardless, stop its backups with `agora-seed sealed-stop --agent \
-     <id> --note \"…\"`.";
+     <id> --note \"…\"`, adding `--against-answer` when its answer in force is yes or a \
+     re-offer waits for its answer (the note then says why; the agent is shown it).";
 
 /// From this many agents at once, the alert says a platform fault is
 /// likely.
@@ -5716,7 +5717,10 @@ mod tests {
         let run = check(&api).await;
         assert!(run.server_faults.is_empty() && run.refused.is_empty());
         assert!(refuse_run(&run, &alerts::Alerter::off()).is_ok());
-        assert!(SERVER_FAULT_TEXT.contains("sealed-stop"));
+        assert!(
+            SERVER_FAULT_TEXT.contains("sealed-stop")
+                && SERVER_FAULT_TEXT.contains("--against-answer")
+        );
     }
 
     /// The start check of `pool` over `root` (its `state/`, `secrets/`

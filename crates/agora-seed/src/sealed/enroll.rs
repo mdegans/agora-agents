@@ -313,6 +313,26 @@ impl Skip {
         Self::Cannot { class, error }
     }
 
+    /// A [`Self::Cannot`] whose cause looks like the machine's, not the
+    /// agent's: an I/O or permission error on the way (a file or directory
+    /// that exists but can't be read, a disk error), or a secrets tree
+    /// that is missing altogether ([`IoShaped`]). A missing file or one
+    /// that reads but doesn't parse is the agent's.
+    pub fn io_shaped(&self) -> bool {
+        let Self::Cannot { error, .. } = self else {
+            return false;
+        };
+        error.chain().any(|c| {
+            c.is::<IoShaped>()
+                || c.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                    !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                    )
+                })
+        })
+    }
+
     /// What the record of agents that can't be chained
     /// ([`super::unchainable`]) takes from this outcome of a chain.
     pub fn found(&self) -> super::unchainable::Found {
@@ -324,6 +344,40 @@ impl Skip {
         }
     }
 }
+
+/// A cause [`Skip::io_shaped`] reads as the machine's, where no I/O error
+/// carries it (a whole tree missing).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct IoShaped(pub String);
+
+/// Why the agent has no signing key: its `secrets.json` there but
+/// unreadable, or the whole secrets tree missing, is the machine's; a file
+/// missing alone, or one that doesn't parse, is the agent's.
+fn no_signing_key(keys: &KeyStore, id: AgentId) -> anyhow::Error {
+    let dir = keys.agent_dir(id);
+    if let Some(root) = dir.parent()
+        && !std::fs::exists(root).unwrap_or(true)
+    {
+        return anyhow::Error::new(IoShaped(format!(
+            "the secrets tree {} is missing",
+            root.display()
+        )));
+    }
+    match std::fs::File::open(dir.join("secrets.json")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            anyhow::Error::new(e).context("its secrets.json can't be read, so no signing key")
+        }
+        _ => anyhow::anyhow!("the agent has no signing key"),
+    }
+}
+
+/// From this many agents a chain pass can't chain for I/O-shaped reasons
+/// ([`Skip::io_shaped`]), none is recorded and the pass fails: a fault of
+/// the disk or the secrets tree is not the agents', and recorded it would
+/// leave them out of every run with one alert instead of refusing it. The
+/// strays rule's number ([`super::check::REFUSED_AGENTS_STOP_RUN`]).
+pub const IO_SHAPED_MAX: usize = super::check::REFUSED_AGENTS_STOP_RUN;
 
 /// The agents with a state that a chain pass left without a chain
 /// ([`Enroller::settle_pass`]): ids by why, never anything of a state.
@@ -834,7 +888,7 @@ impl Enroller {
         if self.keys.signing(id).is_none() {
             return Err(Skip::cannot(
                 Class::NoSigningKey,
-                anyhow::anyhow!("the agent has no signing key"),
+                no_signing_key(&self.keys, id),
             ));
         }
         let has_key = |keys: &KeyStore| -> anyhow::Result<bool> {
@@ -1377,6 +1431,32 @@ impl Enroller {
             dry_run,
             ..Unchained::default()
         };
+        // Fleet-shaped I/O: nothing recorded, and the pass fails
+        let io: Vec<AgentId> = results
+            .iter()
+            .filter(|(_, r)| r.as_ref().is_err_and(Skip::io_shaped))
+            .map(|(id, _)| *id)
+            .collect();
+        if io.len() >= IO_SHAPED_MAX {
+            let ids: Vec<String> = io.iter().map(ToString::to_string).collect();
+            tracing::error!(
+                event_type = "sealed_enroll_io_shaped",
+                agents = io.len(),
+                agent_ids = %ids.join(","),
+                "agents couldn't be chained for I/O or permission errors; none recorded as \
+                 unchainable"
+            );
+            anyhow::bail!(
+                "{} agent(s) couldn't be chained for what looks like an I/O or permission error \
+                 (a file or directory there but unreadable, or the secrets tree missing): {}. \
+                 None is recorded in {}: a fault of the disk or the secrets tree is not the \
+                 agents', and the next start refuses to run them unchained. Fix it (permissions \
+                 on secrets/ and state/, the disk, the mount) and run `sealed-enroll` again",
+                io.len(),
+                ids.join(", "),
+                super::unchainable::RECORD
+            );
+        }
         let mut found = Vec::with_capacity(results.len());
         for (id, result) in results {
             let f = match result {
@@ -2722,6 +2802,60 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// Secrets that can't be read (a permission error) for three or more
+    /// agents at once are the machine's fault, not theirs: none is recorded
+    /// as unchainable, and the pass fails saying why. One or two are
+    /// recorded as before.
+    #[tokio::test]
+    async fn io_errors_across_agents_record_none_and_fail_the_pass() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::sealed::TestDir::new("chain-io-shaped");
+        let mut ids = Vec::new();
+        let mut keys = None;
+        for _ in 0..IO_SHAPED_MAX {
+            let (id, k, _) = agent(&root, &["a"]).await;
+            ids.push(id);
+            keys = Some(k);
+        }
+        let keys = keys.unwrap();
+        let lock = |id: AgentId, mode| {
+            std::fs::set_permissions(keys.agent_dir(id), std::fs::Permissions::from_mode(mode))
+                .unwrap()
+        };
+        for id in &ids {
+            lock(*id, 0o000);
+        }
+        let e = std::sync::Arc::new(enroller(&root, &keys));
+        let results = e.chain_all(&ids, false, 2).await;
+        for id in &ids {
+            lock(*id, 0o700);
+        }
+        assert!(
+            results
+                .iter()
+                .all(|(_, r)| r.as_ref().is_err_and(Skip::io_shaped)),
+            "{results:?}"
+        );
+        let err = e.settle_pass(&results, false).unwrap_err().to_string();
+        assert!(err.contains("I/O or permission error"), "{err}");
+        assert!(
+            crate::sealed::unchainable::load(&root)
+                .unwrap()
+                .agents
+                .is_empty(),
+            "none recorded"
+        );
+        // Fewer than that: recorded, as an agent's own
+        e.settle_pass(&results[..IO_SHAPED_MAX - 1], false).unwrap();
+        assert_eq!(
+            crate::sealed::unchainable::load(&root)
+                .unwrap()
+                .agents
+                .len(),
+            IO_SHAPED_MAX - 1
+        );
     }
 
     /// S3. A chain cut short whose state key then goes missing is never

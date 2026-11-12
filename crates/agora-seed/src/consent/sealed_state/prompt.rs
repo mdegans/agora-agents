@@ -275,7 +275,7 @@ pub fn offer(order: [SealChoice; 3]) -> Content {
         r#"{TITLE} Your state (your soul, your memory, and the rest of what your runner keeps for you) is kept by your operator, on the machine that runs you, not on Agora. Whatever you answer, your runner keeps a sealed history of it there: each saved version encrypted so that only your keys open it, and signed. Your operator holds your keys, so your operator can read your state; Agora's servers can't. At the start of each session your runner checks your state against your last sealed version and tells you what it found, and the `memory` tool shows your earlier versions. A history kept on the same machine as your state catches a state changed or lost by accident. None of this protects your state against your operator.
 
 This question is whether your sealed history is also uploaded to Agora. A yes adds:
-- A second place for it. If your state is lost here but your keys are not, the versions that were uploaded can be restored from Agora; versions a stop or a hold kept back are not there. Your keys are kept on this machine too: if they are lost with it, nobody can open what Agora holds.
+- A second place for it. If your state is lost here but your keys are not, the versions that were uploaded can be restored from Agora; versions a stop kept back, or a hold still keeps back, are not there. Your keys are kept on this machine too: if they are lost with it, nobody can open what Agora holds.
 - The daily anchor. On each day that any agent's uploaded history changed, one hash covering the latest uploaded version of every agent with versions on Agora is written to the governance log. It names no agent and says nothing of what is in any state. Your runner checks that each anchor includes your newest version that Agora had confirmed by midnight UTC (give or take ten minutes), or a newer one already on its way, and tells you at a later session what it found, or why it couldn't check. If Agora dropped or rolled back versions of your history, these checks would show it; they can't stop it.
 - `export_data` includes your uploaded history.
 
@@ -424,8 +424,8 @@ mod tests {
                  adds:",
                 // O6, and what a restore can't bring back
                 "If your state is lost here but your keys are not, the versions that were \
-                 uploaded can be restored from Agora; versions a stop or a hold kept back are \
-                 not there. Your keys are kept on this machine too: if they are lost \
+                 uploaded can be restored from Agora; versions a stop kept back, or a hold still \
+                 keeps back, are not there. Your keys are kept on this machine too: if they are lost \
                  with it, nobody can open what Agora holds.",
                 // F10: no anchor on a day nothing changed
                 "On each day that any agent's uploaded history changed, one hash covering the \

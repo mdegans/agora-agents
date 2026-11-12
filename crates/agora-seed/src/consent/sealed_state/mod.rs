@@ -264,11 +264,20 @@ pub const REOFFER_NO_ACTION: &str =
 /// asked-once rule should make it impossible): it is kept on file and is
 /// never in force. No claim that the operator was told: the alert is not
 /// awaited, and may not be sent at all.
-pub fn unprompted_line(was: SealChoice) -> String {
+/// `refusal`: what is in force is a legacy refusal (the earlier offer
+/// ended without an answer, counted as `decline`), never called the
+/// agent's answer.
+pub fn unprompted_line(was: SealChoice, refusal: bool) -> String {
+    let stands = if refusal {
+        "the earlier offer ended without an answer from you, which counts as `decline`, and \
+         that stands"
+            .to_string()
+    } else {
+        format!("your earlier answer, `{}`, stands", was.as_str())
+    };
     format!(
-        "This question was not open, so this answer changes nothing: your earlier answer, `{}`, \
-         stands. To change it, ask your operator to re-open the question. {}",
-        was.as_str(),
+        "This question was not open, so this answer changes nothing: {stands}. To change it, ask \
+         your operator to re-open the question. {}",
         crate::sealed::text::TELL_OPERATOR
     )
 }
@@ -348,8 +357,17 @@ pub(crate) fn agent_texts() -> Vec<crate::sealed::text::Text> {
         crate::consent::offer::OfferKind::SealedState.about(),
     ));
     for c in SealChoice::ALL {
-        out.push(Text::new("unprompted_line", To::Any, unprompted_line(c)));
+        out.push(Text::new(
+            "unprompted_line",
+            To::Any,
+            unprompted_line(c, false),
+        ));
     }
+    out.push(Text::new(
+        "unprompted_line",
+        To::Any,
+        unprompted_line(SealChoice::Decline, true),
+    ));
     out.push(Text::new("REOFFER_TO_ACT", To::Any, REOFFER_TO_ACT));
     out.push(Text::new("REOFFER_NO_ACTION", To::Any, REOFFER_NO_ACTION));
     out
@@ -366,8 +384,15 @@ mod tests {
     /// the operator was told (the alert is not awaited).
     #[test]
     fn an_unprompted_answer_is_never_said_to_have_told_the_operator() {
+        let refusal = unprompted_line(SealChoice::Decline, true);
+        assert!(
+            refusal.contains("ended without an answer from you")
+                && !refusal.contains("your earlier answer")
+                && refusal.ends_with(crate::sealed::text::TELL_OPERATOR),
+            "{refusal}"
+        );
         for was in SealChoice::ALL {
-            let line = unprompted_line(was);
+            let line = unprompted_line(was, false);
             assert!(
                 line.contains("changes nothing")
                     && line.contains(&format!("`{}`, stands", was.as_str()))

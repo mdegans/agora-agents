@@ -524,7 +524,10 @@ impl AlertKind {
                  next start checks again and runs once Agora serves \
                  histories that verify. To run an agent regardless, stop \
                  its backups with `agora-seed sealed-stop --agent <id> \
-                 --note \"…\"`. This alert is never rate-limited."
+                 --note \"…\"`, adding `--against-answer` when its answer \
+                 in force is yes or a re-offer waits for its answer (the \
+                 note then says why; the agent is shown it). This alert is \
+                 never rate-limited."
             }
             Self::SealedStateUntrustedKey => {
                 "The seed runner refused to run: the sealed entries of the \
@@ -615,7 +618,9 @@ impl AlertKind {
                  answer in force is a yes). Then settle it with a command, \
                  never by copying a marker by hand: `agora-seed sealed-stop \
                  --agent <id> --note \"…\"` if it is not to upload (it then \
-                 stays stopped, and this alert ends), or `agora-seed \
+                 stays stopped, and this alert ends; add `--against-answer` \
+                 when its answer in force is yes or a re-offer waits, the \
+                 note saying why), or `agora-seed \
                  sealed-enroll --opt-in --agent <id> --yes` if its answer in \
                  force is yes (the copies in doubt are set aside and a new \
                  marker written). No start rewrites a marker in doubt."
@@ -1638,6 +1643,23 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
+    /// Where a mail tells the operator to stop an agent, it says what a
+    /// stop over an answer of yes (or a waiting re-offer) needs: without
+    /// `--against-answer` that stop is refused.
+    #[test]
+    fn a_suggested_stop_names_the_override_it_may_need() {
+        for kind in [
+            super::AlertKind::SealedStateUploadingInDoubt,
+            super::AlertKind::SealedStateServerChainBroken,
+        ] {
+            let m = kind.meaning();
+            assert!(
+                m.contains("sealed-stop") && m.contains("--against-answer"),
+                "{m}"
+            );
+        }
+    }
+
     /// The unchained-agents mail says why some agents are left out: the
     /// could-not-chain record, by its file's name.
     #[test]

@@ -190,9 +190,11 @@ pub enum Command {
         #[arg(long)]
         against_answer: bool,
     },
-    /// Rotate an agent's keys: new ones written first, the server told,
-    /// the state key re-wrapped, `secrets.json` replaced last. Old keys are
-    /// kept in `past_keys.json`.
+    /// Rotate an agent's keys: new ones written first, then Agora told of
+    /// the new public keys (the agent's identity there), the state key
+    /// re-wrapped (posted to Agora only for an agent that uploads; for one
+    /// that never did, kept here, and nothing of its sealed state is sent),
+    /// `secrets.json` replaced last. Old keys are kept in `past_keys.json`.
     RotateKeys {
         #[arg(long)]
         agent: AgentId,
@@ -777,10 +779,8 @@ async fn chain_pass(
     let chain = ids;
     let mut says_yes = 0;
     let results = enroller.chain_all(&chain, dry_run, jobs).await;
-    // What is left without a chain, by why; the record of agents that
-    // can't be chained brought up to it (`sealed::unchainable`)
-    let left = enroller.settle_pass(&results, dry_run)?;
-    for (id, result) in results {
+    for (id, result) in &results {
+        let (id, result) = (*id, result);
         match result {
             Ok(report) => {
                 tally.add_n("archives_sealed", report.sealed);
@@ -817,6 +817,10 @@ async fn chain_pass(
         }
     }
     tally.print(if dry_run { "chain (dry run)" } else { "chain" });
+    // What is left without a chain, by why; the record of agents that
+    // can't be chained brought up to it (`sealed::unchainable`), after each
+    // agent's line is printed
+    let left = enroller.settle_pass(&results, dry_run)?;
     if dry_run {
         // A dry run moves no old marker (the start pass does, first, in any
         // other command): a chain whose marker has agentkit's old name reads
@@ -1253,6 +1257,25 @@ mod tests {
         assert_eq!(seal.outbox().await.unwrap().len(), waiting, "nothing sent");
         // Again: the same stop
         run(stop(true), &root, url(), None).await.unwrap();
+    }
+
+    /// `rotate-keys --help` says what Agora is told, and that an agent that
+    /// never uploaded sends nothing of its sealed state.
+    #[test]
+    fn rotate_keys_help_qualifies_what_agora_is_told() {
+        use clap::Subcommand as _;
+        let cmd = Command::augment_subcommands(clap::Command::new("agora-seed"));
+        let rotate = cmd.find_subcommand("rotate-keys").expect("rotate-keys");
+        let help = rotate
+            .get_long_about()
+            .or(rotate.get_about())
+            .expect("its help")
+            .to_string();
+        assert!(!help.contains("the server told"), "{help}");
+        assert!(
+            help.contains("new public keys") && help.contains("never did"),
+            "{help}"
+        );
     }
 
     fn opt_in(agents: Vec<AgentId>, yes: bool, expect: Option<usize>) -> Command {

@@ -364,9 +364,10 @@ pub async fn rotate_keys(
             "agent {id}'s uploading marker is in doubt (sealed/uploading and its copy in the \
              secrets tree disagree, or can't be read): nothing was sent and nothing written. \
              Check its answer on file (`sealed_state.json`), then settle it: `agora-seed \
-             sealed-stop --agent {id} --note \"…\"` if it is not to upload, or `agora-seed \
-             sealed-enroll --opt-in --agent {id} --yes` if its answer in force is yes; then \
-             run this again. Never copy a marker by hand"
+             sealed-stop --agent {id} --note \"…\"` if it is not to upload (with \
+             `--against-answer` when its answer in force is yes or a re-offer waits, the note \
+             saying why), or `agora-seed sealed-enroll --opt-in --agent {id} --yes` if its \
+             answer in force is yes; then run this again. Never copy a marker by hand"
         );
     }
     // No session in progress: one would sign with a key retired under it.
@@ -892,6 +893,25 @@ pub(crate) mod tests {
             seal.mark_sent(item.ord).await.unwrap();
         }
         *api.chain.lock().unwrap() = Ok(chain);
+    }
+
+    /// A marker in doubt refuses the rotation, naming the commands that
+    /// settle it, the stop with the override it needs over an answer of yes.
+    #[tokio::test]
+    async fn a_marker_in_doubt_refuses_and_names_the_stop_it_may_need() {
+        let root = crate::sealed::TestDir::new("rotate-doubt");
+        let (id, keys, _) = enrolled(&root).await;
+        std::fs::remove_file(keys.agent_dir(id).join(crate::sealed::uploading::DURABLE)).unwrap();
+        let api = FakeApi::new();
+        let e = rotate_keys(&root.join("state"), &keys, &api, id, true, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("in doubt") && e.contains("--against-answer"),
+            "{e}"
+        );
+        assert!(api.calls.lock().unwrap().is_empty(), "nothing sent");
     }
 
     #[tokio::test]

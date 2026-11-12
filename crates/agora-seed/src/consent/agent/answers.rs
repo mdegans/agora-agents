@@ -201,6 +201,9 @@ where
     pub(super) fn sealed_answered_again(&mut self, choice: SealChoice) -> Option<String> {
         let ledger = self.sealed.ledger.as_ref()?;
         let reoffered = ledger.reoffer.is_some();
+        // A legacy refusal in force: the agent never chose, and is never
+        // told the refusal was its answer
+        let was_refusal = ledger.latest_is_refusal();
         let was = match &ledger.reoffer {
             Some(r) => r.reopens,
             None if ledger.unprompted_answer() => ledger.choice()?,
@@ -280,7 +283,7 @@ where
             ),
         );
         match (reoffered, act.is_some()) {
-            (false, _) => Some(sealed_state::unprompted_line(was)),
+            (false, _) => Some(sealed_state::unprompted_line(was, was_refusal)),
             // No claim that the operator was told: the alert above is
             // not awaited, and may not be sent at all
             (true, true) => Some(sealed_state::REOFFER_TO_ACT.to_string()),
