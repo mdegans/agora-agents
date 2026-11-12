@@ -68,11 +68,14 @@ pub mod notice;
 pub(crate) mod props;
 pub mod receipts;
 pub mod restore;
+#[cfg(test)]
+mod review_tests;
 pub mod roster;
 pub mod rotate;
 pub mod session;
 pub mod sizes;
 pub mod stop;
+pub mod unchainable;
 pub mod uploading;
 pub mod version;
 

@@ -102,17 +102,43 @@ fn runner_lock_file(data_dir: &Path) -> anyhow::Result<std::fs::File> {
         .open(data_dir.join(RUNNER_LOCK))?)
 }
 
-/// The runner's shared hold, for as long as the returned file lives.
+/// How long a starting runner tries for its shared hold: another runner
+/// starting at the same moment holds the lock exclusively only while it
+/// promotes cut saves (`crate::promote::promote_if_alone`), which is
+/// brief.
+pub const RUNNER_START_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The runner's shared hold, for as long as the returned file lives:
+/// tried for [`RUNNER_START_WAIT`] ([`runner_shared_within`]).
 pub fn runner_shared(data_dir: &Path) -> anyhow::Result<std::fs::File> {
+    runner_shared_within(data_dir, RUNNER_START_WAIT)
+}
+
+/// [`runner_shared`], tried for `wait` (a blocking wait: only at a
+/// process's start, before anything runs). Held exclusively past that, an
+/// operator's command is at work, and the runner doesn't start.
+pub fn runner_shared_within(
+    data_dir: &Path,
+    wait: std::time::Duration,
+) -> anyhow::Result<std::fs::File> {
     let file = runner_lock_file(data_dir)?;
-    match file.try_lock_shared() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "{} is held exclusively: `agora-seed rotate-keys` is running; start the runner \
-             when it has finished",
-            data_dir.join(RUNNER_LOCK).display()
-        ),
-        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    let began = std::time::Instant::now();
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if began.elapsed() < wait => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "{} is held exclusively: an operator's command is running (`sealed-enroll`, \
+                 `sealed-reoffer`, `sealed-accept`, `sealed-restore`, `sealed-forget` or \
+                 `rotate-keys`), or another runner has been starting for more than {} s (its \
+                 promotion of saves cut short); start the runner when it has finished",
+                data_dir.join(RUNNER_LOCK).display(),
+                wait.as_secs()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
     }
 }
 
@@ -193,17 +219,33 @@ pub fn claim(state_dir: &Path, id: AgentId) -> std::io::Result<Claim> {
     })
 }
 
-/// An operator command's hold on `id`'s session lock: refused while a
-/// runner (or another command) holds it. An agent with no directory has
-/// no session to exclude, and its directory isn't made for the lock.
+/// Another process holds an agent's session lock ([`agent_lock`]): the
+/// agent is busy, not broken. A caller that can wait for a later run
+/// (the start's pre-loss copy step, `sealed-enroll`) tells it apart from a
+/// failure by this type.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "agent {id} is held by another process ({}): a runner has it in a session or queued for \
+     one, or another command is working on it; run this when it has finished",
+    path.display()
+)]
+pub struct Busy {
+    pub id: AgentId,
+    pub path: std::path::PathBuf,
+}
+
+/// An operator command's hold on `id`'s session lock: refused ([`Busy`])
+/// while a runner (or another command) holds it. An agent with no
+/// directory has no session to exclude, and its directory isn't made for
+/// the lock.
 pub fn agent_lock(state_dir: &Path, id: AgentId) -> anyhow::Result<SessionLock> {
     match try_session(state_dir, id) {
         Ok(Some(lock)) => Ok(lock),
-        Ok(None) => anyhow::bail!(
-            "agent {id} is held by another process ({}): a runner has it in a session or queued \
-             for one, or another command is working on it; run this when it has finished",
-            state_dir.join(id.to_string()).join(SESSION_LOCK).display()
-        ),
+        Ok(None) => Err(Busy {
+            id,
+            path: state_dir.join(id.to_string()).join(SESSION_LOCK),
+        }
+        .into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SessionLock { _file: None }),
         Err(e) => Err(e.into()),
     }
@@ -264,6 +306,32 @@ pub async fn take(state_dir: &Path, id: AgentId, refused_ok: bool) -> anyhow::Re
         .await?;
     // A session that began while we waited
     no_session(state_dir, id, refused_ok)?;
+    Ok(Taken {
+        seal,
+        _session: session,
+    })
+}
+
+/// The agent's session lock ([`agent_lock`]) and its `sealed/lock`,
+/// **whatever its session journal says**: for a caller that knows no
+/// session of the agent is live without asking the journal.
+///
+/// A journal beside the state means a session in progress *or* one that
+/// was interrupted or ended as failed, whose journal stays until the
+/// agent's next session completes (`crate::interrupted`). Since every
+/// runner holds an agent's session lock from before its reactor is built
+/// until its state is saved, the lock alone proves no session is live; the
+/// journal then only says the agent has something to be told. It is not
+/// state, and nothing here reads or changes it. So chaining an agent
+/// (`sealed-enroll`, which also holds `runner.lock` exclusively) and the
+/// start's pre-loss copy step use this: [`take`] would refuse the agent
+/// until a session it can't have (unchained, the run refused) clears the
+/// journal.
+pub async fn take_idle(state_dir: &Path, id: AgentId) -> anyhow::Result<Taken> {
+    let session = agent_lock(state_dir, id)?;
+    let seal = AgentSeal::new(&state_dir.join(id.to_string()), id)
+        .lock()
+        .await?;
     Ok(Taken {
         seal,
         _session: session,
@@ -406,12 +474,22 @@ mod tests {
         assert!(e.contains("stop the runner"), "{e}");
         drop((runner, second));
         let rotating = runner_exclusive(&root).unwrap();
+        let e = runner_shared_within(&root, std::time::Duration::ZERO)
+            .unwrap_err()
+            .to_string();
         assert!(
-            runner_shared(&root)
-                .unwrap_err()
-                .to_string()
-                .contains("rotate-keys` is running")
+            e.contains("an operator's command is running") && e.contains("another runner"),
+            "{e}"
         );
+        // Another runner's start holds it only for a moment: waited for
+        let waiter = {
+            let root = root.path().to_path_buf();
+            std::thread::spawn(move || {
+                runner_shared_within(&root, std::time::Duration::from_secs(10)).map(drop)
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
         drop(rotating);
+        waiter.join().unwrap().unwrap();
     }
 }

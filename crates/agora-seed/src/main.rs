@@ -791,7 +791,9 @@ struct Skipped {
     /// Unknown when the state would not load.
     name: Option<String>,
     /// `load`, `construct`, `sealed` (refused by the sealed-state check),
-    /// `rotation` (a key rotation unfinished), or, under its session lock
+    /// `rotation` (a key rotation unfinished), `unchainable` (enrolment
+    /// recorded it can't chain it: [`sealed::unchainable`]), or, under its
+    /// session lock
     /// ([`claim_sessions`]), `lock` (the lock couldn't be taken), `reload`
     /// (its state, changed since it was loaded, couldn't be read again) or
     /// `recheck` (that state's start check didn't let it run).
@@ -925,6 +927,7 @@ fn report_skipped(skipped: &[Skipped], alerts: &alerts::Alerter) {
     let count = |stage| skipped.iter().filter(|s| s.stage == stage).count();
     let (load, construct, sealed) = (count("load"), count("construct"), count("sealed"));
     let rotation = count("rotation");
+    let unchainable = count("unchainable");
     let session = count("lock") + count("reload") + count("recheck");
     tracing::error!(
         event_type = "agents_skipped",
@@ -933,6 +936,7 @@ fn report_skipped(skipped: &[Skipped], alerts: &alerts::Alerter) {
         construct,
         sealed,
         rotation,
+        unchainable,
         session,
         "agents left out of this sweep; see the agent_skipped events"
     );
@@ -1239,21 +1243,19 @@ fn route(
         // forced (`--agent`, or the config's `force = true`). An agent that
         // chose every other day ([`consent::cadence`]) is gated on its own,
         // longer cycle.
-        let named = names.iter().any(|n| n == state.soul.name.as_str());
-        let usual = reactors[*idx].min_cycle_secs.or(global_min_cycle);
-        let min_cycle = match cadence.min_cycle(&id) {
-            Some(own) => Some(usual.map_or(own, |u| u.max(own))),
-            None => usual,
-        };
-        let bypass = named && force_named;
-        if !bypass && let (Some(secs), Some(last)) = (min_cycle, state.last_cycle_at) {
-            let cutoff = now - chrono::Duration::seconds(secs.min(i64::MAX as u64) as i64);
-            if last > cutoff {
-                routing.not_due += 1;
-                let due = last + (now - cutoff);
-                routing.next_due = Some(routing.next_due.map_or(due, |d| d.min(due)));
-                continue;
-            }
+        let min_cycle = min_cycle_for(
+            &reactors[*idx],
+            global_min_cycle,
+            cadence,
+            id,
+            state.soul.name.as_str(),
+            names,
+            force_named,
+        );
+        if let Some(due) = due_after(min_cycle, state.last_cycle_at, now) {
+            routing.not_due += 1;
+            routing.next_due = Some(routing.next_due.map_or(due, |d| d.min(due)));
+            continue;
         }
         state.model = offered.clone();
         state.prompt.model = offered.id.clone();
@@ -1263,6 +1265,29 @@ fn route(
             .push((id, state));
     }
     routing
+}
+
+/// The cadence gate for one agent on `reactor`: its `min_cycle_secs` (the
+/// reactor's, else the run's), raised to the agent's own cadence if it
+/// chose one ([`consent::cadence`]); `None` (not gated) when there is
+/// none, or the agent is named and the names are forced.
+fn min_cycle_for(
+    reactor: &ReactorSpec,
+    global_min_cycle: Option<u64>,
+    cadence: &consent::cadence::CadencePlan,
+    id: AgentId,
+    name: &str,
+    names: &[String],
+    force_named: bool,
+) -> Option<u64> {
+    if force_named && names.iter().any(|n| n == name) {
+        return None;
+    }
+    let usual = reactor.min_cycle_secs.or(global_min_cycle);
+    match cadence.min_cycle(&id) {
+        Some(own) => Some(usual.map_or(own, |u| u.max(own))),
+        None => usual,
+    }
 }
 
 /// Flatten one endpoint's model groups into the run order: each group is
@@ -1779,6 +1804,28 @@ fn unsaved_alert(unsaved: &[UnsavedAgent]) -> Option<alerts::Alert> {
     Some(alert)
 }
 
+/// The alert for a reactor that ended with an error rather than a report
+/// (`endpoint`: its label): its sessions' outcomes are unknown, and no
+/// state of theirs was returned to rescue. On the endpoint's own key, so
+/// the run's summary of unsaved sessions never crowds it out. The error is
+/// the reactor's own message (never state content).
+fn reactor_failed_alert(endpoint: &str, error: &str) -> alerts::Alert {
+    alerts::Alert::new(
+        alerts::AlertKind::StateUnsaved,
+        format!(
+            "the reactor on {endpoint} ended with an error: whether its agents' sessions were \
+             saved is not known, and none could be kept in a rescue file"
+        ),
+    )
+    .model(endpoint)
+    .detail("error", error)
+    .detail(
+        "check",
+        "the run log's events for this endpoint; each agent's next start check says whether \
+         its state matches its last sealed version",
+    )
+}
+
 /// A reactor's outcome for the terminal: counts, ids, error kinds and
 /// sizes. Never its `Debug`, which holds every unsaved agent's whole state
 /// (memory included) and went to stdout and journald until 2026-11-02.
@@ -1956,12 +2003,16 @@ fn refusal_options(id: AgentId, reason: sealed::notice::Refusal) -> Vec<String> 
                  deliberate rollback; the roster takes the new head)"
             ),
         ],
+        // Never marked: nothing to accept or clear, and every start
+        // judges it afresh
         R::SealUnreadable => vec![
             format!(
                 "check permissions and the disk under state/{id}/sealed/ and secrets/{id}/ first; \
-                 the next start checks again"
+                 nothing is marked against the agent, and the next start checks again"
             ),
-            format!("agora-seed sealed-restore --agent {id} (if sealed/ is damaged)"),
+            format!(
+                "if a file under state/{id}/sealed/ is damaged: put sealed/ back from a backup"
+            ),
         ],
         R::Mismatch | R::ChainBroken => vec![
             format!("agora-seed sealed-restore --agent {id} (damage)"),
@@ -2232,6 +2283,13 @@ async fn prior_step(
             "the pre-loss copy's pair finished or appended at run start"
         ),
         Ok(false) => {}
+        // Another runner has the agent (a session there, or queued): its
+        // copy waits for a start that finds it free
+        Err(e) if e.is::<sealed::session::Busy>() => tracing::debug!(
+            event_type = "sealed_prior_at_start_waits",
+            agent_id = %id,
+            "another process holds the agent; its pre-loss copy waits for a later start"
+        ),
         Err(e) => tracing::error!(
             event_type = "sealed_prior_at_start_failed",
             agent_id = %id,
@@ -2308,9 +2366,7 @@ async fn sealed_start_check(
             .cloned()
             .unwrap_or_else(|| format!("({})", reason.as_str()))
     };
-    let uploads_of = |id: AgentId| {
-        sealed::check::Upload::counts_as_uploading(&state_dir.join(id.to_string()), keys, id)
-    };
+    let uploads_of = |id: AgentId| uploads_of(state_dir, keys, id);
     let mut refused = BTreeSet::new();
     // The witness outside state/, before any agent is checked. Runs after
     // the uploading start pass, the stop reconcile and `load_states`
@@ -2324,7 +2380,8 @@ async fn sealed_start_check(
                 error = %e,
                 "the sealed roster couldn't be used; the run is refused"
             );
-            run.fleet.push(format!("sealed roster: {e}"));
+            run.fleet
+                .push(format!("sealed roster: {e}. Way out: {}", e.way_out()));
             sealed::roster::Scan::default()
         }
     };
@@ -2348,8 +2405,9 @@ async fn sealed_start_check(
     for (id, loss) in &scan.losses {
         let dir = state_dir.join(id.to_string());
         // A directory recreated to hold an earlier start's marker keeps
-        // that start's reason
-        let reason = sealed::check::marked_reason(&dir).unwrap_or_else(|| loss.refusal());
+        // that start's reason; a loss found since a marker that isn't
+        // loss-shaped is judged as the loss it is
+        let reason = sealed::check::rejudged(&dir, loss.refusal());
         let name = name_of(*id, reason);
         tracing::error!(
             event_type = "sealed_roster_loss",
@@ -2398,56 +2456,136 @@ async fn sealed_start_check(
             Vec::new()
         }
     };
+    // The agents `sealed-enroll` recorded it can't chain until repaired
+    // (`sealed::unchainable`), still unchained: left out of the run (never
+    // run unchained), one alert a run, and not strays below. An unreadable
+    // record excuses nobody
+    let recorded = match sealed::unchainable::load(data_dir) {
+        Ok(r) => r.agents,
+        Err(e) => {
+            tracing::error!(
+                event_type = "sealed_unchainable_unreadable",
+                error = %e,
+                "the record of agents that can't be chained couldn't be read; every unchained \
+                 state counts as a stray"
+            );
+            BTreeMap::new()
+        }
+    };
+    let left_out: BTreeMap<AgentId, sealed::unchainable::Class> = scan
+        .unchained
+        .iter()
+        .filter_map(|id| Some((*id, recorded.get(id)?.class)))
+        .collect();
+    pool.retain(|(id, _)| !left_out.contains_key(id));
+    for (id, class) in &left_out {
+        skipped.push(Skipped::new(
+            *id,
+            names.get(id).cloned(),
+            "unchainable",
+            format!("not chained ({}): {}", class.as_str(), class.remedy()),
+        ));
+    }
+    let unchained: Vec<AgentId> = scan
+        .unchained
+        .iter()
+        .filter(|id| !left_out.contains_key(id))
+        .copied()
+        .collect();
+    let leftover: Vec<(AgentId, bool)> = leftover
+        .into_iter()
+        .filter(|(id, _)| !left_out.contains_key(id))
+        .collect();
     // Leftover keys and unchained states: alerted, or, once a roster has
     // been kept, three or more at once is fleet-shaped (a roster lost with
-    // the agents' sealed/ would read as a first run)
-    let strays = leftover.len() + scan.unchained.len();
+    // the agents' sealed/ would read as a first run). An enrolment cut
+    // short is both (a state key, and a state with no chain): once
+    let strays = leftover
+        .iter()
+        .map(|(id, _)| *id)
+        .chain(unchained.iter().copied())
+        .collect::<BTreeSet<AgentId>>()
+        .len();
     if !scan.first && strays >= sealed::check::REFUSED_AGENTS_STOP_RUN {
         tracing::error!(
             event_type = "sealed_state_strays_refused",
             leftover = leftover.len(),
-            unchained = scan.unchained.len(),
+            unchained = unchained.len(),
+            strays,
             "agents with keys or states but no chain, beside a roster kept before; the run is refused"
         );
         run.fleet.push(format!(
-            "{} agent(s) with a state key but no chained state, and {} with a state but no \
-             chain, though a roster was kept before: if they were never chained (the first \
-             start of this runner, before the fleet's enrolment), chain them with `agora-seed \
-             sealed-enroll` (the runner stopped), then start again; otherwise their sealed/ \
-             may be gone with the roster: put it back from a backup",
+            "{strays} agent(s) without a chain though a roster was kept before ({} with a state \
+             key but no chained state, {} with a state but no chain): if they were never \
+             chained (the first start of this runner, before the fleet's enrolment), chain them \
+             with `agora-seed sealed-enroll` (the runner stopped), which names each one it \
+             can't chain and why, then start again; otherwise their sealed/ may be gone with \
+             the roster: put it back from a backup",
             leftover.len(),
-            scan.unchained.len()
+            unchained.len()
         ));
     } else {
         if let Some(alert) = sealed::check::leftover_alert(&leftover) {
             alerts.notify(alert);
         }
-        if !scan.unchained.is_empty() {
-            let first: Vec<String> = scan
-                .unchained
-                .iter()
-                .take(sealed::check::SUMMARY_LIST)
-                .map(ToString::to_string)
-                .collect();
-            tracing::warn!(
-                event_type = "sealed_state_unchained_agents",
-                agents = scan.unchained.len(),
-                first = %first.join(","),
-                "agent directories with a state but no local chain, not on the roster; never enrolled"
+        if !unchained.is_empty() || !left_out.is_empty() {
+            let list = |ids: &mut dyn Iterator<Item = String>| {
+                ids.take(sealed::check::SUMMARY_LIST)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let first = list(&mut unchained.iter().map(ToString::to_string));
+            let left = list(
+                &mut left_out
+                    .iter()
+                    .map(|(id, class)| format!("{id} ({})", class.as_str())),
             );
-            alerts.notify(
-                alerts::Alert::new(
-                    alerts::AlertKind::SealedStateUnchainedAgents,
-                    format!(
-                        "{} agent(s) have a state but no local chain; enrol them with agora-seed \
-                         sealed-enroll",
-                        scan.unchained.len()
+            if !unchained.is_empty() {
+                tracing::warn!(
+                    event_type = "sealed_state_unchained_agents",
+                    agents = unchained.len(),
+                    first = %first,
+                    "agent directories with a state but no local chain, not on the roster; never enrolled"
+                );
+            }
+            let mut alert = alerts::Alert::new(
+                alerts::AlertKind::SealedStateUnchainedAgents,
+                match (unchained.len(), left_out.len()) {
+                    (n, 0) => format!(
+                        "{n} agent(s) have a state but no local chain; enrol them with agora-seed \
+                         sealed-enroll"
                     ),
-                )
-                .count(scan.unchained.len())
-                .detail("agents", scan.unchained.len())
-                .detail("first", first.join(", ")),
-            );
+                    (0, m) => format!(
+                        "{m} agent(s) can't be chained until repaired and are left out of this \
+                         run"
+                    ),
+                    (n, m) => format!(
+                        "{n} agent(s) have a state but no local chain (enrol them with agora-seed \
+                         sealed-enroll); {m} more can't be chained until repaired and are left \
+                         out of this run"
+                    ),
+                },
+            )
+            .count(unchained.len() + left_out.len())
+            .detail("agents", unchained.len());
+            if !unchained.is_empty() {
+                alert = alert.detail("first", first);
+            }
+            if !left_out.is_empty() {
+                alert = alert
+                    .detail("left_out", left_out.len())
+                    .detail("left_out_first", left)
+                    .detail(
+                        "left_out_why",
+                        format!(
+                            "`agora-seed sealed-enroll` recorded them in {}: they don't run \
+                             (never unchained) until it chains them; it names each one's class \
+                             and remedy",
+                            sealed::unchainable::RECORD
+                        ),
+                    );
+            }
+            alerts.notify(alert);
         }
     }
     // A pre-loss copy's pair cut short is finished, so the agent isn't
@@ -2458,7 +2596,7 @@ async fn sealed_start_check(
     // roster's); never for an agent it or an earlier start refused. Each
     // under the agent's seal lock; a failure is logged and the start check
     // judges the agent as it is
-    if let Some(enroller) = prior {
+    if let Some(enroller) = prior.filter(|_| run.fleet.is_empty()) {
         for (id, state) in pool.iter() {
             let Some((hash, _)) = enrolled.get(id) else {
                 continue;
@@ -2471,197 +2609,303 @@ async fn sealed_start_check(
     }
     // The anchors not yet judged are judged here where they can be, so a
     // session's verdict says what was found for the newest (beta round 12)
-    let start = verified.map(|verified| sealed::check::StartAnchors {
-        verified,
-        alerted: alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
-    });
-    let mut dropped: Vec<sealed::check::Dropped> = Vec::new();
-    // Full verifications made this start, kept in the roster
-    let mut vouches: Vec<(AgentId, sealed::roster::Vouch)> = Vec::new();
-    let mut unopenable: Vec<(AgentId, String, sealed::check::Unopenable)> = Vec::new();
+    let ctx = StartCheck {
+        data_dir,
+        state_dir,
+        keys,
+        api,
+        alerts,
+        start: verified.map(|verified| sealed::check::StartAnchors {
+            verified,
+            alerted: alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
+        }),
+    };
+    let mut found = StartFound::default();
     for (id, state) in pool.iter() {
+        // One of the runner's own records failed: the run is refused
+        // whatever the agents' checks would say, so none is run and
+        // nothing is marked against any agent for it (secrets that can't
+        // be read for a moment would otherwise mark the whole fleet)
+        if !run.fleet.is_empty() {
+            break;
+        }
         let Some((hash, sizes)) = enrolled.get(id) else {
             continue;
         };
         if refused.contains(id) {
             continue;
         }
-        let name = state.soul.name.to_string();
-        let dir = state_dir.join(id.to_string());
-        let check = async |hash, sizes| {
-            sealed::check::check_vouched(
-                &dir,
-                *id,
-                hash,
-                sizes,
-                keys,
-                api,
-                start.as_ref(),
-                scan.vouched.get(id),
-            )
-            .await
-        };
-        let (mut outcome, mut found) = check(hash, *sizes).await;
-        // Another process may have saved the agent since its state was
-        // loaded: read it again under its seal lock and check once more
-        // before refusing a mismatch
-        if matches!(
-            outcome,
-            sealed::check::Outcome::Refuse {
-                reason: sealed::notice::Refusal::Mismatch,
-                ..
-            }
-        ) && let Some((again, sizes)) = reloaded(state_dir, *id).await
-            && again != *hash
-        {
-            tracing::info!(
-                event_type = "sealed_state_rechecked",
-                agent_id = %id,
-                "the state changed since it was loaded; checked again"
-            );
-            (outcome, found) = check(&again, sizes).await;
-        }
-        vouches.extend(found.vouch.map(|v| (*id, v)));
-        if let Some(u) = found.unopenable {
-            tracing::warn!(
-                event_type = "sealed_state_unopenable",
-                agent = %name,
-                agent_id = %id,
-                versions = u.versions,
-                missing = u.missing,
-                damaged = u.damaged,
-                "sealed versions whose copies here are missing or damaged"
-            );
-            unopenable.push((*id, name.clone(), u));
-        }
-        match outcome {
-            sealed::check::Outcome::ServerFault { kind, detail } => {
-                skipped.push(Skipped::new(
-                    *id,
-                    Some(name.clone()),
-                    "sealed",
-                    "Agora's copy of its history failed verification".to_string(),
-                ));
-                refused.insert(*id);
-                run.server_faults.push((*id, name, kind, detail));
-            }
-            sealed::check::Outcome::Refuse { reason, detail } => {
-                let reason = sealed::check::marked_reason(&dir).unwrap_or(reason);
-                sealed::check::mark(&dir, *id, &name, reason, &detail).await;
-                skipped.push(Skipped::new(
-                    *id,
-                    Some(name.clone()),
-                    "sealed",
-                    format!("refused: {}", reason.as_str()),
-                ));
-                refused.insert(*id);
-                run.refused.push(RefusedAgent {
-                    id: *id,
-                    name,
-                    reason,
-                    uploads: uploads_of(*id),
-                    detail,
-                });
-            }
-            sealed::check::Outcome::Run {
-                seat,
-                notice,
-                hold,
-                drops,
-                told,
-                judged,
-            } => {
-                if let Some(result) = &judged {
-                    sealed::anchors::alert_pass(alerts, *id, &name, result);
-                }
-                tracing::info!(
-                    event_type = "sealed_state_checked",
-                    agent = %name,
-                    agent_id = %id,
-                    hold = ?hold,
-                    notice,
-                    drops = drops.len(),
-                    "sealed state checked"
-                );
-                if !drops.is_empty() {
-                    for (what, pct) in &drops {
-                        tracing::warn!(
-                            event_type = "sealed_state_drop",
-                            agent = %name,
-                            agent_id = %id,
-                            what,
-                            percent = pct,
-                            "memory or soul much smaller than at the previous sealed version"
-                        );
-                    }
-                    dropped.push((*id, name.clone(), drops));
-                }
-                if let Some(hold) = hold {
-                    // Every start while held, rate-limited by the alerter
-                    let held = agora_agentkit::state::storage::AgentSeal::new(&dir, *id)
-                        .held()
-                        .await
-                        .ok();
-                    alerts.notify(sealed::check::hold_alert(hold, *id, &name, held.as_ref()));
-                    run.held.push(*id);
-                }
-                // Asked of Agora only for an agent that uploads
-                if sealed::check::Upload::of(&dir, keys, *id) == sealed::check::Upload::Now
-                    && let Some(n @ 1..) = sealed::check::unknown_rotations(keys, api, *id).await
-                {
-                    tracing::warn!(
-                        event_type = "sealed_state_rotation_unknown",
-                        agent_id = %id,
-                        rotations = n,
-                        "the server lists key rotations this runner never made; not trusted"
-                    );
-                    alerts.notify(
-                        alerts::Alert::new(
-                            alerts::AlertKind::SealedStateRotationUnknown,
-                            format!("{name}: the server lists {n} key rotation(s) this runner never made"),
-                        )
-                        .agent(&name, *id)
-                        .detail("rotations", n),
-                    );
-                }
-                let (lines, stop_note) = match stop_lines.remove(id) {
-                    Some((line, first)) => (std::iter::once(line).chain(seat).collect(), first),
-                    None => (seat, false),
-                };
-                // Last: what Agora found damaged and what was sent again
-                let mut lines: Vec<String> = lines;
-                let healing_told = sealed::healed::seat_into(&dir, *id, &mut lines);
-                run.seats.insert(
-                    *id,
-                    consent::SealedSeat {
-                        stop_note,
-                        lines,
-                        notice,
-                        anchors_told: told,
-                        healing_told,
-                    },
-                );
-                run.drained.push((*id, name));
-            }
+        let runs = check_agent(
+            &ctx,
+            *id,
+            state.soul.name.as_str(),
+            (hash, *sizes),
+            scan.vouched.get(id),
+            stop_lines.remove(id),
+            &mut run,
+            &mut found,
+            skipped,
+        )
+        .await;
+        if !runs {
+            refused.insert(*id);
         }
     }
-    if let Err(e) = sealed::roster::vouch_all(data_dir, &vouches).await {
-        tracing::error!(
-            event_type = "sealed_roster_unwritten",
-            agents = vouches.len(),
-            error = %e,
-            "the roster's record of full verifications couldn't be written; the next start verifies them in full again"
-        );
-    }
-    if let Some(alert) = sealed::check::drop_summary(&dropped) {
-        alerts.notify(alert);
-    }
-    if let Some(alert) = sealed::check::unopenable_summary(&unopenable) {
-        alerts.notify(alert);
-    }
+    found.settle(&ctx).await;
     run.outstanding = scan.refused.difference(&refused).count();
     pool.retain(|(id, _)| !refused.contains(id));
     run
+}
+
+/// Whether `id` counts as uploading for the refusal rule.
+fn uploads_of(state_dir: &std::path::Path, keys: &sealed::KeyStore, id: AgentId) -> bool {
+    sealed::check::Upload::counts_as_uploading(&state_dir.join(id.to_string()), keys, id)
+}
+
+/// What one chained agent's start check ([`check_agent`]) needs of the run.
+struct StartCheck<'a> {
+    data_dir: &'a std::path::Path,
+    state_dir: &'a std::path::Path,
+    keys: &'a sealed::KeyStore,
+    api: &'a dyn sealed::api::SealedApi,
+    alerts: &'a alerts::Alerter,
+    start: Option<sealed::check::StartAnchors<'a>>,
+}
+
+/// What start checks found that is settled once for all of them
+/// ([`StartFound::settle`]): the roster's vouches, and the two summary
+/// alerts.
+#[derive(Default)]
+struct StartFound {
+    dropped: Vec<sealed::check::Dropped>,
+    /// Full verifications made, kept in the roster.
+    vouches: Vec<(AgentId, sealed::roster::Vouch)>,
+    unopenable: Vec<(AgentId, String, sealed::check::Unopenable)>,
+}
+
+impl StartFound {
+    async fn settle(self, ctx: &StartCheck<'_>) {
+        if let Err(e) = sealed::roster::vouch_all(ctx.data_dir, &self.vouches).await {
+            tracing::error!(
+                event_type = "sealed_roster_unwritten",
+                agents = self.vouches.len(),
+                error = %e,
+                "the roster's record of full verifications couldn't be written; the next start verifies them in full again"
+            );
+        }
+        if let Some(alert) = sealed::check::drop_summary(&self.dropped) {
+            ctx.alerts.notify(alert);
+        }
+        if let Some(alert) = sealed::check::unopenable_summary(&self.unopenable) {
+            ctx.alerts.notify(alert);
+        }
+    }
+}
+
+/// One chained agent's start check and everything the start does with
+/// what it finds: the one path for an agent checked at the start
+/// ([`sealed_start_check`]) and for one read again under its session lock
+/// ([`reload_one`]), so neither can drift from the other.
+///
+/// `true`: it runs, seated (its lines, the stop's first), queued to drain,
+/// held if its check held it; its anchors' findings alerted, its shrink and
+/// unopenable versions noted in `found`, its vouch kept there. `false`: it
+/// doesn't run. Refused: marked and told ([`sealed::check::mark`]) and
+/// listed in `run.refused` for the refusal rule and the alerts; a
+/// [`SealUnreadable`] refusal is listed but **not marked**, so the next
+/// start judges it afresh (evidence that couldn't be read for a moment
+/// needs no `sealed-accept`). Agora's copy failing: listed in
+/// `run.server_faults`, nothing marked.
+///
+/// [`SealUnreadable`]: sealed::notice::Refusal::SealUnreadable
+#[allow(clippy::too_many_arguments)]
+async fn check_agent(
+    ctx: &StartCheck<'_>,
+    id: AgentId,
+    name: &str,
+    (hash, sizes): (&agora_agentkit::govlog::Sha256Hex, sealed::sizes::Sizes),
+    vouched: Option<&sealed::roster::Vouch>,
+    stop_line: Option<(String, bool)>,
+    run: &mut SealedRun,
+    found: &mut StartFound,
+    skipped: &mut Vec<Skipped>,
+) -> bool {
+    let name = name.to_string();
+    let dir = ctx.state_dir.join(id.to_string());
+    let check = async |hash, sizes| {
+        sealed::check::check_vouched(
+            &dir,
+            id,
+            hash,
+            sizes,
+            ctx.keys,
+            ctx.api,
+            ctx.start.as_ref(),
+            vouched,
+        )
+        .await
+    };
+    let (mut outcome, mut checked) = check(hash, sizes).await;
+    // Another process may have saved the agent since its state was
+    // loaded: read it again under its seal lock and check once more
+    // before refusing a mismatch
+    if matches!(
+        outcome,
+        sealed::check::Outcome::Refuse {
+            reason: sealed::notice::Refusal::Mismatch,
+            ..
+        }
+    ) && let Some((again, sizes)) = reloaded(ctx.state_dir, id).await
+        && again != *hash
+    {
+        tracing::info!(
+            event_type = "sealed_state_rechecked",
+            agent_id = %id,
+            "the state changed since it was loaded; checked again"
+        );
+        (outcome, checked) = check(&again, sizes).await;
+    }
+    found.vouches.extend(checked.vouch.map(|v| (id, v)));
+    if let Some(u) = checked.unopenable {
+        tracing::warn!(
+            event_type = "sealed_state_unopenable",
+            agent = %name,
+            agent_id = %id,
+            versions = u.versions,
+            missing = u.missing,
+            damaged = u.damaged,
+            "sealed versions whose copies here are missing or damaged"
+        );
+        found.unopenable.push((id, name.clone(), u));
+    }
+    match outcome {
+        sealed::check::Outcome::ServerFault { kind, detail } => {
+            skipped.push(Skipped::new(
+                id,
+                Some(name.clone()),
+                "sealed",
+                "Agora's copy of its history failed verification".to_string(),
+            ));
+            run.server_faults.push((id, name, kind, detail));
+            false
+        }
+        sealed::check::Outcome::Refuse { reason, detail } => {
+            let reason = sealed::check::rejudged(&dir, reason);
+            if reason == sealed::notice::Refusal::SealUnreadable {
+                // Not marked: judged afresh at every start
+                tracing::error!(
+                    event_type = "sealed_state_refused",
+                    agent = %name,
+                    agent_id = %id,
+                    reason = reason.as_str(),
+                    detail,
+                    marked = false,
+                    "sealed history here couldn't be read; the agent is left out of this run, \
+                     and the next start checks again"
+                );
+            } else {
+                sealed::check::mark(&dir, id, &name, reason, &detail).await;
+            }
+            skipped.push(Skipped::new(
+                id,
+                Some(name.clone()),
+                "sealed",
+                format!("refused: {}", reason.as_str()),
+            ));
+            run.refused.push(RefusedAgent {
+                id,
+                name,
+                reason,
+                uploads: uploads_of(ctx.state_dir, ctx.keys, id),
+                detail,
+            });
+            false
+        }
+        sealed::check::Outcome::Run {
+            seat,
+            notice,
+            hold,
+            drops,
+            told,
+            judged,
+        } => {
+            if let Some(result) = &judged {
+                sealed::anchors::alert_pass(ctx.alerts, id, &name, result);
+            }
+            tracing::info!(
+                event_type = "sealed_state_checked",
+                agent = %name,
+                agent_id = %id,
+                hold = ?hold,
+                notice,
+                drops = drops.len(),
+                "sealed state checked"
+            );
+            if !drops.is_empty() {
+                for (what, pct) in &drops {
+                    tracing::warn!(
+                        event_type = "sealed_state_drop",
+                        agent = %name,
+                        agent_id = %id,
+                        what,
+                        percent = pct,
+                        "memory or soul much smaller than at the previous sealed version"
+                    );
+                }
+                found.dropped.push((id, name.clone(), drops));
+            }
+            if let Some(hold) = hold {
+                // Every start while held, rate-limited by the alerter
+                let held = agora_agentkit::state::storage::AgentSeal::new(&dir, id)
+                    .held()
+                    .await
+                    .ok();
+                ctx.alerts
+                    .notify(sealed::check::hold_alert(hold, id, &name, held.as_ref()));
+                run.held.push(id);
+            }
+            // Asked of Agora only for an agent that uploads
+            if sealed::check::Upload::of(&dir, ctx.keys, id) == sealed::check::Upload::Now
+                && let Some(n @ 1..) = sealed::check::unknown_rotations(ctx.keys, ctx.api, id).await
+            {
+                tracing::warn!(
+                    event_type = "sealed_state_rotation_unknown",
+                    agent_id = %id,
+                    rotations = n,
+                    "the server lists key rotations this runner never made; not trusted"
+                );
+                ctx.alerts.notify(
+                    alerts::Alert::new(
+                        alerts::AlertKind::SealedStateRotationUnknown,
+                        format!(
+                            "{name}: the server lists {n} key rotation(s) this runner never made"
+                        ),
+                    )
+                    .agent(&name, id)
+                    .detail("rotations", n),
+                );
+            }
+            let (lines, stop_note) = match stop_line {
+                Some((line, first)) => (std::iter::once(line).chain(seat).collect(), first),
+                None => (seat, false),
+            };
+            // Last: what Agora found damaged and what was sent again
+            let mut lines: Vec<String> = lines;
+            let healing_told = sealed::healed::seat_into(&dir, id, &mut lines);
+            run.seats.insert(
+                id,
+                consent::SealedSeat {
+                    stop_note,
+                    lines,
+                    notice,
+                    anchors_told: told,
+                    healing_told,
+                },
+            );
+            run.drained.push((id, name));
+            true
+        }
+    }
 }
 
 /// `id`'s state read again under its seal lock (a save in progress
@@ -2694,12 +2938,16 @@ struct Claimed {
 
 /// What [`claim_sessions`] reads an agent with again.
 struct Reload<'a, S> {
-    state_dir: &'a std::path::Path,
     /// The run's sealed storage (a load finishes a commit a crash cut short)
     storage: &'a S,
-    keys: &'a sealed::KeyStore,
-    api: &'a dyn sealed::api::SealedApi,
-    start: Option<sealed::check::StartAnchors<'a>>,
+    /// What the start check of every agent ran with ([`check_agent`])
+    check: StartCheck<'a>,
+    /// The agents that were chained when this run loaded them: one of
+    /// them found unchained now has lost its marker.
+    chained: &'a BTreeSet<AgentId>,
+    /// The cadence gate routing applied (`min_cycle_secs`, an agent's own
+    /// cadence, the forced names), by reactor: `None` is not gated.
+    min_cycle: &'a dyn Fn(usize, AgentId, &str) -> Option<u64>,
 }
 
 /// Claim each routed agent's session ([`sealed::session::claim`]), in
@@ -2727,7 +2975,7 @@ where
 {
     let mut claimed = Claimed::default();
     let mut deferred_ids: Vec<AgentId> = Vec::new();
-    for cohort in cohorts.iter_mut() {
+    for (reactor, cohort) in cohorts.iter_mut().enumerate() {
         for agents in cohort.values_mut() {
             for (id, state) in std::mem::take(agents) {
                 if room.is_some_and(|room| claimed.locks.len() >= room) {
@@ -2736,7 +2984,7 @@ where
                     continue;
                 }
                 let name = state.soul.name.to_string();
-                let lock = match sealed::session::claim(reload.state_dir, id) {
+                let lock = match sealed::session::claim(reload.check.state_dir, id) {
                     Ok(sealed::session::Claim::Run(lock)) => lock,
                     Ok(sealed::session::Claim::Busy) => {
                         claimed.busy += 1;
@@ -2754,11 +3002,11 @@ where
                         continue;
                     }
                 };
-                let now = sealed::session::Seen::of(&reload.state_dir.join(id.to_string()));
+                let now = sealed::session::Seen::of(&reload.check.state_dir.join(id.to_string()));
                 let state = if seen.get(&id) == Some(&now) {
                     state
                 } else {
-                    match reload_one(id, state, reload, sealed_run, bases, skipped).await {
+                    match reload_one(id, state, reactor, reload, sealed_run, bases, skipped).await {
                         Some(state) => {
                             claimed.reloaded += 1;
                             state
@@ -2805,32 +3053,57 @@ where
     claimed
 }
 
+/// When an agent whose last session ended at `last` is due again under
+/// `min_cycle` seconds, if that is after `now`: the cadence gate, for
+/// routing and for an agent read again under its session lock.
+fn due_after(
+    min_cycle: Option<u64>,
+    last: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let (secs, last) = (min_cycle?, last?);
+    let cycle = chrono::Duration::seconds(secs.min(i64::MAX as u64) as i64);
+    (last > now - cycle).then(|| last + cycle)
+}
+
 /// `id`'s state read again under its session lock, because it changed
 /// since this run loaded it, and (chained) its start check run again on
-/// it, without the roster's vouch (in full). `None` leaves it out of this
-/// sweep: unreadable (`reload`), its model changed elsewhere, or its check
-/// didn't let it run (`recheck`: nothing marked here; the next start judges
-/// it in full, with the run's refusal rule). Its seat, hold and base are
-/// replaced with the new ones.
+/// it through the start's own path ([`check_agent`]), without the roster's
+/// vouch (in full): its anchors' findings alerted and told once, a shrink
+/// alerted, its vouch kept, as for every agent the start checked. `None`
+/// leaves it out of this sweep:
+///
+/// - unreadable, or its model changed elsewhere (`reload`);
+/// - it had a session in another process since routing, and isn't due
+///   again inside `min_cycle_secs` (`not_due`; no error: it stays due
+///   later);
+/// - its check didn't let it run (`sealed`). A refusal is marked, told
+///   and alerted here exactly as at the start (the refusal rule ran before
+///   routing, so the rest of this run goes on; the marker counts at the
+///   next start, where a loss-shaped one stops the run);
+/// - it was chained when loaded and its chain marker is gone now: refused
+///   as a missing head, never run unchained.
+///
+/// Its seat, hold and base are replaced with the new ones.
 async fn reload_one<S: Storage>(
     id: AgentId,
     routed: SeedState,
+    reactor: usize,
     reload: &Reload<'_, S>,
     sealed_run: &mut SealedRun,
     bases: &mut BTreeMap<AgentId, S::Version>,
     skipped: &mut Vec<Skipped>,
 ) -> Option<SeedState> {
-    let dir = reload.state_dir.join(id.to_string());
+    let ctx = &reload.check;
+    let dir = ctx.state_dir.join(id.to_string());
     let name = routed.soul.name.to_string();
-    let forget = |run: &mut SealedRun| {
-        run.seats.remove(&id);
-        run.drained.retain(|(a, _)| *a != id);
-        run.held.retain(|a| *a != id);
-    };
+    // What the start found of it is replaced by what is found now
+    sealed_run.seats.remove(&id);
+    sealed_run.drained.retain(|(a, _)| *a != id);
+    sealed_run.held.retain(|a| *a != id);
     let agora_agentkit::reactor::Loaded { value, base } = match reload.storage.load_raw(id).await {
         Ok(loaded) => loaded,
         Err(e) => {
-            forget(sealed_run);
             skipped.push(Skipped::new(id, Some(name), "reload", e.to_string()));
             return None;
         }
@@ -2840,13 +3113,11 @@ async fn reload_one<S: Storage>(
     let mut state = match serde_json::from_value::<SeedState>(value) {
         Ok(state) => state,
         Err(e) => {
-            forget(sealed_run);
             skipped.push(Skipped::new(id, Some(name), "reload", e.to_string()));
             return None;
         }
     };
     if state.model.id != routed.model.id {
-        forget(sealed_run);
         skipped.push(Skipped::new(
             id,
             Some(name),
@@ -2856,76 +3127,88 @@ async fn reload_one<S: Storage>(
         ));
         return None;
     }
+    // The session it had elsewhere since routing counts for the cadence
+    // gate as any other: not due again yet is not an error
+    if let Some(due) = due_after(
+        (reload.min_cycle)(reactor, id, &name),
+        state.last_cycle_at,
+        chrono::Utc::now(),
+    ) {
+        tracing::info!(
+            event_type = "session_reload_not_due",
+            agent_id = %id,
+            agent = %name,
+            due = %due,
+            "the agent had a session in another process since this run routed it; not due again \
+             inside min_cycle_secs"
+        );
+        return None;
+    }
     // The endpoint's offered ModelInfo, as routing set it (same id)
     state.model = routed.model;
-    if sealed::is_enrolled(&dir) {
-        let (outcome, _) = sealed::check::check_vouched(
-            &dir,
+    state.prompt.model = routed.prompt.model;
+    let chained = sealed::is_enrolled(&dir);
+    if !chained && reload.chained.contains(&id) {
+        // Chained when loaded, its marker gone since: a loss, never a
+        // session saved outside its chain
+        let reason = sealed::notice::Refusal::HeadMissing;
+        let detail = "chained when this run loaded it; its chain marker is gone since".to_string();
+        sealed::check::mark(&dir, id, &name, reason, &detail).await;
+        ctx.alerts
+            .notify(sealed::check::refused_alert(id, &name, reason, &detail));
+        skipped.push(Skipped::new(
             id,
-            &hash,
-            sizes,
-            reload.keys,
-            reload.api,
-            reload.start.as_ref(),
+            Some(name.clone()),
+            "sealed",
+            format!("refused: {}", reason.as_str()),
+        ));
+        sealed_run.refused.push(RefusedAgent {
+            id,
+            name,
+            reason,
+            uploads: uploads_of(ctx.state_dir, ctx.keys, id),
+            detail,
+        });
+        return None;
+    }
+    if chained {
+        // The stop's line first, as at the start
+        let stop = sealed::stop::is_stopped(&dir)
+            .then(|| sealed::stop::Stopped::load(&dir).ok().flatten())
+            .flatten()
+            .map(|stopped| (stopped.line(), !stopped.shown));
+        let (refused, faults) = (sealed_run.refused.len(), sealed_run.server_faults.len());
+        let mut found = StartFound::default();
+        let runs = check_agent(
+            ctx,
+            id,
+            &name,
+            (&hash, sizes),
             None,
+            stop,
+            sealed_run,
+            &mut found,
+            skipped,
         )
         .await;
-        let not_run = match outcome {
-            sealed::check::Outcome::Refuse { reason, .. } => Some(reason.as_str()),
-            sealed::check::Outcome::ServerFault { .. } => Some("server_fault"),
-            sealed::check::Outcome::Run {
-                seat, notice, hold, ..
-            } => {
-                // The stop's line first, as at the start
-                let stop = sealed::stop::is_stopped(&dir)
-                    .then(|| sealed::stop::Stopped::load(&dir).ok().flatten())
-                    .flatten();
-                let (lines, stop_note) = match stop {
-                    Some(stopped) => (
-                        std::iter::once(stopped.line()).chain(seat).collect(),
-                        !stopped.shown,
-                    ),
-                    None => (seat, false),
-                };
-                let mut lines: Vec<String> = lines;
-                let healing_told = sealed::healed::seat_into(&dir, id, &mut lines);
-                sealed_run.seats.insert(
-                    id,
-                    consent::SealedSeat {
-                        lines,
-                        notice,
-                        stop_note,
-                        anchors_told: Vec::new(),
-                        healing_told,
-                    },
-                );
-                sealed_run.held.retain(|a| *a != id);
-                if hold.is_some() {
-                    sealed_run.held.push(id);
-                }
-                if !sealed_run.drained.iter().any(|(a, _)| *a == id) {
-                    sealed_run.drained.push((id, name.clone()));
-                }
-                None
+        found.settle(ctx).await;
+        if !runs {
+            // The refusal rule has run: this agent's alerts go now
+            for r in &sealed_run.refused[refused..] {
+                ctx.alerts.notify(sealed::check::refused_alert(
+                    r.id, &r.name, r.reason, &r.detail,
+                ));
             }
-        };
-        if let Some(outcome) = not_run {
-            tracing::error!(
-                event_type = "session_recheck_not_run",
-                agent_id = %id,
-                agent = %name,
-                outcome,
-                "the agent's state changed since it was loaded, and its start check on the new \
-                 state didn't let it run; left out of this sweep, nothing marked: the next start \
-                 judges it in full"
-            );
-            forget(sealed_run);
-            skipped.push(Skipped::new(
-                id,
-                Some(name),
-                "recheck",
-                format!("its changed state's start check: {outcome}"),
-            ));
+            let faults: Vec<&Fault> = sealed_run.server_faults[faults..].iter().collect();
+            let (keys, chains): (Vec<&Fault>, Vec<&Fault>) = faults
+                .into_iter()
+                .partition(|f| f.2 == sealed::check::FaultKind::UntrustedKey);
+            if !chains.is_empty() {
+                server_fault_alert(&chains, ctx.alerts);
+            }
+            if !keys.is_empty() {
+                untrusted_key_alert(&keys, ctx.alerts);
+            }
             return None;
         }
     }
@@ -3551,15 +3834,34 @@ async fn run(held: &mut Held) -> Result<()> {
     let mut claimed = Claimed::default();
     if !args.dry_run {
         let storage = sealed::storage(&state_dir, outbox.clone(), enrolment.clone());
+        let chained: BTreeSet<AgentId> = enrolled.keys().copied().collect();
+        let force_named = !args.agents.is_empty() || config.force;
+        let min_cycle = |reactor: usize, id: AgentId, name: &str| {
+            min_cycle_for(
+                &config.reactors[reactor],
+                config.min_cycle_secs,
+                &cadence_plan,
+                id,
+                name,
+                &names,
+                force_named,
+            )
+        };
         let reload = Reload {
-            state_dir: &state_dir,
             storage: &storage,
-            keys: enrolment.keys_store(),
-            api: sealed_api.as_ref(),
-            start: Some(sealed::check::StartAnchors {
-                verified: &verified_anchors,
-                alerted: held.alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
-            }),
+            check: StartCheck {
+                data_dir: &data_dir,
+                state_dir: &state_dir,
+                keys: enrolment.keys_store(),
+                api: sealed_api.as_ref(),
+                alerts: &held.alerts,
+                start: Some(sealed::check::StartAnchors {
+                    verified: &verified_anchors,
+                    alerted: held.alerts.sends(alerts::AlertKind::SealedStateAnchorWrong),
+                }),
+            },
+            chained: &chained,
+            min_cycle: &min_cycle,
         };
         claimed = claim_sessions(
             &mut routing.cohorts,
@@ -3879,9 +4181,28 @@ async fn run(held: &mut Held) -> Result<()> {
                 " {agents_skipped} more were skipped for other reasons; the run log says why."
             ));
         }
+        // Every agent routed here is in a session (or queued for one) in
+        // another process: nothing is wrong, and they stay due
+        let all_busy = routing.not_due == 0 && claimed.busy > 0;
+        if all_busy {
+            why = format!(
+                "Nothing ran: {} routed agent(s) are held by another process (a session there, or \
+                 queued for one); they stay due.",
+                claimed.busy
+            );
+        }
         if let Some((ending, served)) = bridge {
             ending.ended(why.clone()).await;
             served.disconnected().await;
+        }
+        if all_busy {
+            tracing::info!(
+                event_type = "all_routed_agents_busy",
+                busy = claimed.busy,
+                agents_skipped,
+                "every routed agent is held by another process; exiting cleanly"
+            );
+            return Ok(());
         }
         anyhow::ensure!(routing.not_due > 0, "{why}");
         tracing::info!(
@@ -3944,23 +4265,11 @@ async fn run(held: &mut Held) -> Result<()> {
             std::process::exit(code);
         }
     };
-    drainer.finish(drain_task).await;
-    keeper.finish(keeper_task).await;
-    if restore_on {
-        // A showing marked completed whose state the reactor then couldn't
-        // save lost its memory update: it is shown again.
-        let unsaved = report
-            .report
-            .values()
-            .flatten()
-            .flat_map(|r| r.unsaved.keys().copied());
-        consent::memory_restore::reopen_unsaved(&data_dir.join("state"), unsaved, run_started)
-            .await;
-    }
-    // A session whose save failed lives only in the report: kept in a
-    // rescue file beside its state, never loaded by anything, and never
-    // printed; the agent told; one alert for the run. Under the agents'
-    // session locks, still held
+    // First, before anything that can wait on Agora (the last drain) or
+    // be cut by a second signal: a session whose save failed lives only in
+    // the report. Kept in a rescue file beside its state, never loaded by
+    // anything, and never printed; the agent told; one alert for the run.
+    // Under the agents' session locks, still held
     let unsaved: BTreeMap<AgentId, serde_json::Value> = report
         .report
         .values()
@@ -3975,6 +4284,29 @@ async fn run(held: &mut Held) -> Result<()> {
         settle_unsaved(&state_dir, &unsaved, &failures, &held.alerts, RESCUE_PAUSE).await;
     }
     drop(unsaved);
+    // A reactor that ended with an error returns no report: what its
+    // agents' sessions came to is not known here, and nothing of them can
+    // be rescued. Never only a log line
+    for (id, result) in &report.report {
+        if let Err(e) = result {
+            let label = labels.get(id).map(String::as_str).unwrap_or("?");
+            held.alerts
+                .notify(reactor_failed_alert(label, &e.to_string()));
+        }
+    }
+    drainer.finish(drain_task).await;
+    keeper.finish(keeper_task).await;
+    if restore_on {
+        // A showing marked completed whose state the reactor then couldn't
+        // save lost its memory update: it is shown again.
+        let unsaved = report
+            .report
+            .values()
+            .flatten()
+            .flat_map(|r| r.unsaved.keys().copied());
+        consent::memory_restore::reopen_unsaved(&data_dir.join("state"), unsaved, run_started)
+            .await;
+    }
     for (id, result) in &report.report {
         let label = labels.get(id).map(String::as_str).unwrap_or("?");
         if bridge.is_none() {
@@ -4047,6 +4379,9 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod review_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4445,6 +4780,7 @@ mod tests {
                 note: None,
                 resume: false,
                 against_answer: false,
+                begin_roster: false,
             },
             &root,
             url::Url::parse("http://127.0.0.1:9").unwrap(),
@@ -4838,7 +5174,9 @@ mod tests {
     #[tokio::test]
     async fn a_deleted_agent_refuses_the_run_until_restored() {
         let root = sealed::TestDir::new("main-deleted");
-        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        // Not on the roster (which would refuse its lost directory with no
+        // question asked): found by its keys alone
+        let (id, keys, dir) = sealed::check::tests::enrolled_off_roster(&root).await;
         let state_dir = root.join("state");
         let api = sealed::api::fake::FakeApi::new();
         let seal = agora_agentkit::state::storage::AgentSeal::new(&dir, id);
@@ -5013,11 +5351,11 @@ mod tests {
     #[tokio::test]
     async fn a_local_agents_start_check_asks_agora_nothing() {
         let root = sealed::TestDir::new("main-local-start");
+        // Leftover keys of a departed agent, never on the roster
+        let (left, _, left_dir) = sealed::check::tests::chained_local(&root).await;
+        std::fs::rename(&left_dir, root.join("left-aside")).unwrap();
         let (id, _, _) = sealed::check::tests::enrolled_local(&root).await;
         let (gone, _, gone_dir) = sealed::check::tests::enrolled_local(&root).await;
-        // Leftover keys of a departed agent, never on the roster
-        let (left, _, left_dir) = sealed::check::tests::enrolled_local(&root).await;
-        std::fs::rename(&left_dir, root.join("left-aside")).unwrap();
         let api = sealed::api::fake::guarded(&root);
         let mut pool = vec![
             (id, crate::agent_selection_tests::pooled("tarn").1),
@@ -5716,12 +6054,20 @@ mod session_lock_tests {
         let storage = storage(&root);
         let loaded = load_states(&storage, &state_dir).await.unwrap();
         let api = sealed::api::fake::guarded(&root);
+        let off = alerts::Alerter::off();
+        let was_chained: BTreeSet<AgentId> = loaded.sealed.keys().copied().collect();
         let reload = Reload {
-            state_dir: &state_dir,
             storage: &storage,
-            keys: &keys,
-            api: &api,
-            start: None,
+            check: StartCheck {
+                data_dir: root.path(),
+                state_dir: &state_dir,
+                keys: &keys,
+                api: &api,
+                alerts: &off,
+                start: None,
+            },
+            chained: &was_chained,
+            min_cycle: &|_, _, _| None,
         };
         let head = AgentSeal::new(&dir, id).head().await.unwrap();
         let sent = alerts::testing::Recorder::default();
@@ -5764,8 +6110,8 @@ mod session_lock_tests {
     /// A state another process saved after this run loaded it is read again
     /// under the lock and checked again; the session starts from it, saved
     /// against its new head. A state changed by hand (matching no sealed
-    /// version) is left out by its new check, nothing marked, and its lock
-    /// released.
+    /// version) is refused by its new check as the start would refuse it
+    /// (marked, listed for the alerts), and its lock released.
     #[tokio::test]
     async fn a_state_changed_since_the_load_is_read_again_and_checked() {
         let root = sealed::TestDir::new("claim-reload");
@@ -5777,12 +6123,20 @@ mod session_lock_tests {
         sealed::props::save(&root, id, changed()).await;
         let new_head = AgentSeal::new(&dir, id).head().await.unwrap().unwrap().head;
         let api = sealed::api::fake::guarded(&root);
+        let off = alerts::Alerter::off();
+        let was_chained: BTreeSet<AgentId> = loaded.sealed.keys().copied().collect();
         let reload = Reload {
-            state_dir: &state_dir,
             storage: &storage,
-            keys: &keys,
-            api: &api,
-            start: None,
+            check: StartCheck {
+                data_dir: root.path(),
+                state_dir: &state_dir,
+                keys: &keys,
+                api: &api,
+                alerts: &off,
+                start: None,
+            },
+            chained: &was_chained,
+            min_cycle: &|_, _, _| None,
         };
         let mut run = SealedRun::default();
         let mut bases = loaded.bases.clone();
@@ -5838,11 +6192,20 @@ mod session_lock_tests {
         .await;
         assert!(routed(&cohorts).is_empty(), "{skipped:?}");
         assert!(claimed.locks.is_empty());
-        assert_eq!((skipped[0].id, skipped[0].stage), (id, "recheck"));
+        assert_eq!((skipped[0].id, skipped[0].stage), (id, "sealed"));
         assert!(!run.seats.contains_key(&id) && !run.drained.iter().any(|(a, _)| *a == id));
+        // S7 (review of 2026-11-12): refused as the start refuses, so the
+        // next start counts it; it used to be left out with nothing marked
+        assert_eq!(
+            run.refused
+                .iter()
+                .map(|r| (r.id, r.reason))
+                .collect::<Vec<_>>(),
+            vec![(id, sealed::notice::Refusal::Mismatch)]
+        );
         assert!(
-            !AgentSeal::new(&dir, id).is_refused().await.unwrap(),
-            "nothing marked here"
+            AgentSeal::new(&dir, id).is_refused().await.unwrap(),
+            "marked, as at the start"
         );
         assert!(
             sealed::session::try_session(&state_dir, id)
@@ -5867,12 +6230,20 @@ mod session_lock_tests {
         let loaded = load_states(&fs, &state_dir).await.unwrap();
         let keys = sealed::KeyStore::new(root.join("secrets"));
         let api = sealed::api::fake::guarded(&root);
+        let off = alerts::Alerter::off();
+        let was_chained = BTreeSet::new();
         let reload = Reload {
-            state_dir: &state_dir,
             storage: &fs,
-            keys: &keys,
-            api: &api,
-            start: None,
+            check: StartCheck {
+                data_dir: root.path(),
+                state_dir: &state_dir,
+                keys: &keys,
+                api: &api,
+                alerts: &off,
+                start: None,
+            },
+            chained: &was_chained,
+            min_cycle: &|_, _, _| None,
         };
         let sent = alerts::testing::Recorder::default();
         let alerts = alerts::testing::recording(root.path(), &sent);

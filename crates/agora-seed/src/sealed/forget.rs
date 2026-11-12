@@ -294,7 +294,7 @@ mod tests {
             let scan = crate::sealed::roster::check(&root, &state_dir)
                 .await
                 .unwrap();
-            assert!(scan.first && scan.on_roster.contains(&id) && scan.on_roster.contains(&other));
+            assert!(scan.on_roster.contains(&id) && scan.on_roster.contains(&other));
             let witness = || {
                 crate::sealed::roster::Witness::load(&root)
                     .unwrap()

@@ -240,11 +240,10 @@ impl Drainer {
     }
 
     /// What `id`'s last drain this run came to; `None` before its first,
-    /// or while it is held. For a verdict, which must say "nothing of this
-    /// is on Agora" for [`DrainOutcome::LocalOnly`], and may say what
-    /// Agora reported damaged and what was sent again (`healing`).
-    #[allow(dead_code)]
-    pub fn last(&self, id: AgentId) -> Option<DrainOutcome> {
+    /// or while it is held. Read by the pass's healing summary
+    /// ([`Self::healing_summary`]): what Agora reported damaged and what
+    /// was sent again.
+    fn last(&self, id: AgentId) -> Option<DrainOutcome> {
         self.last.lock().expect("last lock").get(&id).copied()
     }
 
