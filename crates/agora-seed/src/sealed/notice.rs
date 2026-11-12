@@ -1151,6 +1151,15 @@ mod tests {
                 lines.push((kind, n.line().unwrap()));
             }
         }
+        // A session whose save failed: said alone, or after another line
+        for kept in [true, false] {
+            let unsaved = Unsaved { at, kept };
+            lines.push((Kind::Any, unsaved.line()));
+            lines.push((
+                Kind::Any,
+                by_operator(&|n: &mut Notice| n.unsaved = Some(unsaved)),
+            ));
+        }
         lines
     }
 
