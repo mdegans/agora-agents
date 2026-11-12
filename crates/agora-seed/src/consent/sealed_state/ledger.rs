@@ -313,13 +313,18 @@ impl SealLedger {
             .map(|(_, c)| c)
     }
 
-    /// The latest "answer" on file is a legacy refusal
+    /// The answer in force ([`Self::choice`]) is a legacy refusal
     /// ([`SealOutcome::Refused`]), counted as `decline`: the agent never
-    /// chose, and no text calls it its answer.
+    /// chose, and no text calls it its answer. An answer given later with
+    /// no question open is not in force, and doesn't change this.
     pub fn latest_is_refusal(&self) -> bool {
+        let Some((at, _)) = self.answers().last().copied() else {
+            return false;
+        };
         self.asks
             .iter()
             .rev()
+            .filter(|a| a.at == at)
             .find_map(|a| match &a.outcome {
                 SealOutcome::Answered { .. } => Some(false),
                 SealOutcome::Refused { .. } => Some(true),
@@ -834,6 +839,30 @@ mod tests {
         l.reopen("n", "2026-11-13T09:00:00Z".parse().unwrap())
             .unwrap();
         assert!(!l.reoffer.as_ref().unwrap().never_chose);
+    }
+
+    /// A legacy refusal in force stays one when an answer arrives with no
+    /// question open (kept on file, never in force): a re-offer of it
+    /// still says the agent never chose, and it is not told "your answer
+    /// is on file".
+    #[test]
+    fn an_unprompted_answer_after_a_refusal_leaves_the_refusal_in_force() {
+        let mut l = SealLedger::default();
+        l.record(at(
+            ask(SealOutcome::Refused { reason: "r".into() }),
+            "2026-11-08T09:00:00Z",
+        ));
+        l.record(at(
+            ask(answered(SealChoice::Private)),
+            "2026-11-09T09:00:00Z",
+        ));
+        assert_eq!(l.asks.len(), 2, "kept on file");
+        assert_eq!(l.choice(), Some(SealChoice::Decline));
+        assert!(l.latest_is_refusal());
+        assert_eq!(l.ack_line(false), None);
+        l.reopen("n", "2026-11-10T09:00:00Z".parse().unwrap())
+            .unwrap();
+        assert!(l.reoffer.as_ref().unwrap().never_chose);
     }
 
     /// The one reading: uploads start only on a yes in force, stop by the

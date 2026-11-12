@@ -361,6 +361,23 @@ mod tests {
 
     const ID: &str = "847e36b1-fbfc-4e6f-beb6-b1d4c9c1d169";
 
+    /// The receipt of an answer given with no question open says the
+    /// earlier answer stands and how to reach the operator; it never says
+    /// the operator was told (the alert is not awaited).
+    #[test]
+    fn an_unprompted_answer_is_never_said_to_have_told_the_operator() {
+        for was in SealChoice::ALL {
+            let line = unprompted_line(was);
+            assert!(
+                line.contains("changes nothing")
+                    && line.contains(&format!("`{}`, stands", was.as_str()))
+                    && line.ends_with(crate::sealed::text::TELL_OPERATOR),
+                "{line}"
+            );
+            assert!(!line.contains("been told"), "{line}");
+        }
+    }
+
     fn soul() -> Soul {
         serde_json::from_value(serde_json::json!({
             "name": "tarn",

@@ -381,6 +381,7 @@ mod tests {
             "OfferKind::about",
             "REOFFER_TO_ACT",
             "REOFFER_NO_ACTION",
+            "unprompted_line",
             "ack_line",
             "ack_line (re-offer)",
             "verdict",

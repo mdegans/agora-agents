@@ -606,8 +606,9 @@ fn head_note(source: &Source, short: &str, its: &str) -> Option<String> {
         Source::SideLine {
             resumed: Some(at), ..
         } => format!(
-            "Head {short} was saved while your uploads were stopped, and set aside from your \
-             sealed history on {} when your operator resumed them; it was not uploaded{its}.",
+            "Head {short} was not uploaded before your uploads were stopped, or was saved \
+             while they were, and was set aside from your sealed history on {} when your \
+             operator resumed them; it was not uploaded{its}.",
             at.format(super::text::DATE)
         ),
         Source::SideLine { resumed: None, .. } => format!(
@@ -2024,9 +2025,9 @@ mod tests {
         let said = view.show(&[r("030303030303")], None, current());
         assert!(
             said.starts_with(
-                "Head 030303030303 was saved while your uploads were stopped, and set aside from \
-                 your sealed history on 2026-11-05 when your operator resumed them; it was not \
-                 uploaded; its memory is"
+                "Head 030303030303 was not uploaded before your uploads were stopped, or was \
+                 saved while they were, and was set aside from your sealed history on \
+                 2026-11-05 when your operator resumed them; it was not uploaded; its memory is"
             ),
             "{said}"
         );

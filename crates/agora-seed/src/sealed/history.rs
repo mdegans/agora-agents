@@ -90,9 +90,9 @@ pub enum Source {
     },
     /// Sealed on a side line: one the operator rebased away from, one a
     /// later save forked from (a `.displaced` entry, or a head `head.json`
-    /// records as displaced), or saved while uploads were stopped and set
-    /// aside when they resumed (`resumed`: when; read from the resume's
-    /// record). Verified from the genesis.
+    /// records as displaced), or not uploaded before a stop or saved while
+    /// uploads were stopped, and set aside when they resumed (`resumed`:
+    /// when; read from the resume's record). Verified from the genesis.
     SideLine {
         head: HeadRef,
         resumed: Option<DateTime<Utc>>,

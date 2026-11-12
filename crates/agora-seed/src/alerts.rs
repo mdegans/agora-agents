@@ -589,8 +589,8 @@ impl AlertKind {
                  the one you re-opened with `agora-seed sealed-reoffer`; both \
                  answers are below, with the command that acts on the new one \
                  (`act`). The answer changed nothing by itself: no upload was \
-                 started or stopped, and the agent was told you have been told \
-                 and will act. With `reoffered: false` no re-offer was pending, \
+                 started or stopped, and the agent was told that you have to act \
+                 on it and that it is told when you have. With `reoffered: false` no re-offer was pending, \
                  which the offer's asked-once rule should prevent: a bug to \
                  report. That answer is kept on file but is not in force: no \
                  command acts on it, and the agent was told its earlier \

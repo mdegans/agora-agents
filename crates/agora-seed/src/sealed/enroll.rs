@@ -207,7 +207,8 @@ pub struct Report {
     pub resumed: bool,
     /// Archives a partial chain had already sealed.
     pub resumed_past: usize,
-    /// Versions saved while uploads were stopped, set aside by a resume.
+    /// Versions not uploaded before the stop or saved while uploads were
+    /// stopped, set aside by a resume.
     pub kept_local: usize,
     /// Entries in the chain at the end (genesis included).
     pub entries: usize,
