@@ -200,6 +200,10 @@ pub enum AlertKind {
     /// limit leaves too few descriptors for one session lock each. The
     /// rest stay due. One a run.
     SessionLocksCapped,
+    /// The filesystem holding the state root (or the secrets root) has
+    /// less free space than the floor ([`crate::space::floor`]): the run
+    /// started no session. One a run.
+    DiskSpaceLow,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -208,7 +212,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -248,6 +252,7 @@ impl AlertKind {
         Self::SessionFailed,
         Self::StateUnsaved,
         Self::SessionLocksCapped,
+        Self::DiskSpaceLow,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -305,6 +310,7 @@ impl AlertKind {
             Self::SessionFailed => "session_failed",
             Self::StateUnsaved => "state_unsaved",
             Self::SessionLocksCapped => "session_locks_capped",
+            Self::DiskSpaceLow => "disk_space_low",
             Self::Test => "test_alert",
         }
     }
@@ -671,6 +677,16 @@ impl AlertKind {
                  sweep. Raise the unit's limit (LimitNOFILE=65536 in the \
                  agora-seed units; systemd's default soft limit is 1024) and \
                  daemon-reload."
+            }
+            Self::DiskSpaceLow => {
+                "The runner started no session: the filesystem holding its \
+                 state directory (or its secrets directory) has less free \
+                 space than the floor, 2 GiB or 1% of the filesystem, \
+                 whichever is larger. The path, the bytes free and the \
+                 floor are below. Free space, then start the unit (the continuous unit tries again \
+                 by itself at its next restart). A session whose save fails \
+                 on a full disk is kept only in a rescue file on the same \
+                 disk, which is why the run does not start."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

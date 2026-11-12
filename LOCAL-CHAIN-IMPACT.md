@@ -856,3 +856,35 @@ options in a new order (recorded with its ask, as before).
 ### The first run after install
 
 Nothing of B7's runs at start. Its texts appear in sessions.
+
+## Integration after B6 and B7
+
+### The upload offer waits for the chain
+
+The sealed-state offer and an operator's re-offer are put only to an agent
+whose `<state>/<id>/sealed/chained` exists (read: existence only, at the
+session's closing questions). One not chained, or whose marker can't be
+checked, is not asked: nothing is written, a pending re-offer is not
+consumed, and the question is put at the first session after
+`sealed-enroll` chains it (`sealed_state_offer_waits_for_chain`). After
+the fleet's enrolment run this changes nothing for any agent; before it
+(a unit started early), no agent is told its runner keeps a sealed history
+it doesn't yet have.
+
+### Free space before a run
+
+Once per run, after the log and the alerts are up and before any state is
+loaded or any session started, the runner reads **filesystem statistics
+only** (`statvfs(3)` and the device number) of `<state>` and `<secrets>`
+(of the nearest existing ancestor when one isn't made yet); one check when
+both are on one filesystem. No file of an agent's is opened, listed or
+written. Below the floor (`space::FLOOR_BYTES`, 2 GiB, or 1% of the
+filesystem, whichever is larger) the run starts no session, raises one
+`disk_space_low` alert (the path, bytes free, the floor) and exits as
+failed (exit 1): the continuous unit tries again at its next restart, the
+daily unit fails for the day. A dry run only says so. A root that can't be
+measured is logged (`disk_space_unmeasured`) and holds nothing back. The
+`promote` step and the shared `runner.lock` come before the gate, as they
+come before the log; operator commands (`sealed-*`, `rotate-keys`) are not
+gated. `libc` (already in the tree) is now a direct dependency, for
+`statvfs`: the one `unsafe` block in the workspace.

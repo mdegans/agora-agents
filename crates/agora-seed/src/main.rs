@@ -67,6 +67,7 @@ mod provision;
 mod schedule;
 mod sealed;
 mod signals;
+mod space;
 
 use agora_agentkit::ids::{AgentId, ReactorId};
 use agora_agentkit::reactor::anthropic::{self, EndpointVariant};
@@ -3144,6 +3145,8 @@ async fn run(held: &mut Held) -> Result<()> {
     //     directory lock; it reads the chain's markers' existence, and for
     //     a chained agent the outbox items that are its evidence;
     //  2. runner.lock, shared (the operator's commands take it exclusive);
+    //     then, once the log and the alerts are up, the free-space gate
+    //     (`space`): below the floor nothing more of this list happens;
     //  3. `uploading::start_pass`: the chain's marker moved to its new name
     //     first (before anything reads it), a lost or half-written uploading
     //     marker repaired, the one-time migration, markers in doubt alerted;
@@ -3223,6 +3226,20 @@ async fn run(held: &mut Held) -> Result<()> {
                 min_interval_secs = alerts.min_interval_secs,
                 "operator alerts on"
             );
+        }
+    }
+    // Once, before anything is loaded or any session starts: a filesystem
+    // too full to take the run's saves starts none (`space`). Filesystem
+    // statistics only. A dry run says what a run would do
+    if !args.list_models {
+        let (state_root, secrets_root) = (data_dir.join("state"), data_dir.join("secrets"));
+        let roots = [state_root.as_path(), secrets_root.as_path()];
+        if args.dry_run {
+            for l in space::below_floor_with(&roots, space::stat) {
+                say!("low space: {l}; a run would start no session");
+            }
+        } else {
+            space::gate_with(&roots, space::stat, &held.alerts)?;
         }
     }
     if !config.models.is_empty() {
