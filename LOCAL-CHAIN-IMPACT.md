@@ -1094,6 +1094,9 @@ The refusal's own text carries the same way out (`RosterError::way_out`).
 New field: a roster entry may carry `pending: true`, set by
 `sealed-accept` before it clears a refusal and cleared when it records
 the head. An accept cut in between is finished by running it again.
+Since the FINAL round it carries `pending_at` too (the lowest seq the
+accept will set): a head at or past it recorded by a later run ends the
+pending, and the rerun refuses a head below it.
 
 ### The start
 
@@ -1266,8 +1269,12 @@ continue from): it stays stopped. **Known gap**, see the report.
 - Removed: both "although your answer on file is `decline`" variants.
 - New, for an unprompted answer's receipt: "This question was not open,
   so this answer changes nothing: your earlier answer, `<choice>`,
-  stands. Your operator has been told. To change it, ask your operator to
-  re-open the question."
+  stands. To change it, ask your operator to re-open the question. You can
+  tell your operator (the `send_message` tool, to `operator`)." (No claim
+  that the operator was told: the alert is not awaited. Where what is in
+  force is a legacy refusal, "your earlier answer, `<choice>`, stands" is
+  "the earlier offer ended without an answer from you, which counts as
+  `decline`, and that stands": see "Review round, 2026-11-12: FINAL".)
 
 ## Review round, 2026-11-12: TEXT
 
@@ -1299,8 +1306,11 @@ the machine that didn't before.
 - The hold alerts (seal failed, head missing, fork, unchecked) and the unopenable summary are now
   **awaited** at the start (`Alerter::dispatch`, at most `alerts::TELL_TIMEOUT` = 10 s each), so
   the agent is told "Your runner has sent your operator an alert." only when the mail went out, and
-  otherwise "Your runner logged this for your operator; no alert was sent this time." With SMTP
-  down, a start is slower by up to 10 s per held agent. Rate limits are unchanged.
+  otherwise "Your runner logged this for your operator; no alert was sent this time." Rate limits
+  are unchanged. **Bounded since the FINAL round:** all the alerts one start awaits share
+  `alerts::START_ALERT_BUDGET` (60 s), and more than `alerts::ONE_BY_ONE_MAX` (5) agents held
+  alike get one mail naming each; with SMTP down a start is slower by at most about a minute,
+  not 10 s per held agent (1,667 × 10 s ≈ 4.6 h before).
 - The first-answer ack is decided by `sealed::uploads` (uploading now), not by the marker alone,
   so a stopped agent is no longer told it is "marked for upload".
 - A legacy refusal (`SealOutcome::Refused`) is never acked as "your answer".
@@ -1313,3 +1323,70 @@ one-way step of its own.
 **Not changed by wording alone** (listed in the fixer's report): agentkit's `memory` tool row
 labels still say "main line" and "rebased"; `inclusion.rs`'s "Your runner has alerted your
 operator." is said when the alert kind is on, not when the mail went out.
+
+## Review round, 2026-11-12: FINAL
+
+One fixer, after an independent re-review and a dry run on a copy of the
+fleet (counts only). Each change has a test that fails without it.
+
+**Live state read, written, moved or deleted.**
+- **Written, new file:** `sealed/chain_began.json` (`{head: {entry_hash,
+  seq}, at}`), once per agent, by the `sealed-enroll` that chains it,
+  after the chain marker. Hashes and a date only, local, never uploaded.
+  A chain begun before this file existed has none: its shrinks are told
+  and alerted as live ones (the safe side).
+- **Written, changed format:** `sealed-roster.json` entries may carry
+  `pending_at` beside `pending` (additive, omitted when absent; an older
+  runner drops it on its next write, which only loosens the check below).
+- **Not written, newly:** `sealed-unchainable.json` is left as it was when
+  three or more agents of one `sealed-enroll` pass couldn't be chained for
+  I/O-shaped reasons (an unreadable `secrets/`, say); the pass exits
+  nonzero naming them. One or two are recorded as before.
+- **No longer read twice:** an agent whose pre-loss copy the start
+  appends is not reloaded under its session lock for that write (the dry
+  run: 306 such reloads at the first start); its new head and file stamps
+  are carried into the run.
+- Nothing is deleted, nothing new leaves the machine.
+
+**Behaviour.**
+1. **A stop issued during an opt-in or a resume wins.** Both hold the
+   uploading marker's lock from their first reading of the stop to their
+   last write; `sealed-stop` waits (saying so on stderr and in a
+   `sealed_state_stop_waits` event), then stops the agent they leave. The
+   resume clears only the stop it began on. Before, a stop during a resume
+   found the old stop, wrote nothing, and the resume then set it aside; a
+   stop during an opt-in was refused for want of a marker.
+2. **Alerts at the start are bounded** (above, "Review round: TEXT").
+   Past the budget an alert is logged (`alert_over_budget`), not mailed,
+   now or later, so the agent's "no alert was sent this time" stays true;
+   one count-only mail per kind says how many were not mailed.
+3. **A shrink sealed by the enrolment is history.** The dry run's first
+   start logged `sealed_state_drop` for 153 agents (50–75 %), all between
+   an old archive and the state as found. (They were one summary mail,
+   not 153: `drop_summary` was already one alert a run.) Now a drop
+   between two versions on the line up to the head `chain_began.json`
+   names is not a per-agent event or in the alert; one
+   `sealed_state_drop_before_chain` INFO event gives the count; the agent
+   is told it with the older version's date: "Your memory is 62% smaller
+   than in your version saved on 2026-08-03, an older copy sealed into
+   your history when your chain began; the change predates your chain.
+   Your earlier versions are sealed and kept." A drop since the chain
+   began: "Your memory is now 62% smaller than in your sealed version
+   saved on 2026-11-05. Your earlier versions are sealed and kept."
+4. `sealed_prior_appended` and `sealed_prior_at_start` log at INFO.
+5. **`--begin-roster`** prints and logs what it gives up before acting;
+   when the old roster still reads, heads found behind it are listed and
+   nothing is touched without `--yes` (which `sealed-enroll` now takes
+   with `--begin-roster` too).
+6. **`pending`** ends at the head it would set, and the rerun never sets
+   the roster to a head below it.
+7. The stop hints in the in-doubt and server-fault alerts and in
+   `rotate-keys`' in-doubt error name `--against-answer` where it is
+   needed; a legacy refusal is never called the agent's answer in the
+   unprompted receipt; the offer (still v11) says "versions a stop kept
+   back, or a hold still keeps back, are not there"; `rotate-keys --help`
+   says Agora is told of the new public keys and nothing of a
+   never-uploader's sealed state.
+
+**Deploying it** adds no step: the first `sealed-enroll` of the fleet
+writes `chain_began.json` as it chains.

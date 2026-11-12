@@ -1948,7 +1948,7 @@ mod tests {
         crate::sealed::roster::expect(&root, id, now.seq + 3)
             .await
             .unwrap();
-        let before = crate::sealed::roster::load(&root).unwrap().unwrap().agents[&id].clone();
+        let before = crate::sealed::roster::load(&root).unwrap().unwrap().agents[&id];
         let e = accept(&state_dir, &keys, &api, id, None)
             .await
             .unwrap_err()
