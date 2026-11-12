@@ -259,12 +259,16 @@ pub fn uploads_line(u: Uploads, uploading: bool) -> Option<String> {
         // the runner's files show
         (0, _) if !uploading => format!(
             "Your runner does not upload your sealed history, and its files show none of its \
-             {n} version{s} uploaded to Agora: they are here. {COUNTED}"
+             {n} version{s} uploaded to Agora: {} here. {COUNTED}",
+            if n == 1 { "it is" } else { "they are" }
+        ),
+        (0, 1) => format!(
+            "The 1 version of your sealed history is not uploaded to Agora yet: it is here. \
+             {COUNTED}"
         ),
         (0, _) => format!(
-            "None of the {n} version{s} of your sealed history is uploaded to Agora yet: \
-             {} here. {COUNTED}",
-            if n == 1 { "it is" } else { "they are" }
+            "None of the {n} versions of your sealed history is uploaded to Agora yet: they \
+             are here. {COUNTED}"
         ),
         (_, 0) => format!(
             "{} of your sealed history {} uploaded to Agora. {COUNTED}",
@@ -1897,8 +1901,8 @@ mod tests {
         assert_eq!(
             up(0, 1).unwrap(),
             format!(
-                "None of the 1 version of your sealed history is uploaded to Agora yet: it is \
-                 here. {COUNTED}"
+                "The 1 version of your sealed history is not uploaded to Agora yet: it is here. \
+                 {COUNTED}"
             )
         );
         assert_eq!(

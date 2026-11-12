@@ -4665,6 +4665,59 @@ mod tests {
         assert!(api.calls.lock().unwrap().is_empty());
     }
 
+    /// An agent whose uploads are held is told its operator was sent an
+    /// alert only when the mail went out; with alerts off, or inside the
+    /// rate limit, it is told no alert was sent (O2).
+    #[tokio::test]
+    async fn a_held_agent_is_told_of_the_alert_only_as_sent() {
+        let root = sealed::TestDir::new("main-sealed-hold-told");
+        let (id, keys, dir) = sealed::check::tests::enrolled(&root).await;
+        sealed::anchors::tests::uploaded(&dir, id).await;
+        let state_dir = root.join("state");
+        // Agora's chain holds nothing of what was uploaded from here
+        let api = sealed::api::fake::FakeApi::new();
+        *api.chain.lock().unwrap() = Ok(Vec::new());
+        let loaded = load_states(&FsStorage::new(&state_dir), &state_dir)
+            .await
+            .unwrap();
+        let sent = alerts::testing::Recorder::default();
+        let on = alerts::testing::recording(&root, &sent);
+        let mut told = Vec::new();
+        // On; on again inside the rate limit; off
+        for alerter in [&on, &on, &alerts::Alerter::off()] {
+            let (_, tarn) = crate::agent_selection_tests::pooled("tarn");
+            let mut pool = vec![(id, tarn)];
+            let run = sealed_start_check(
+                &mut pool,
+                &loaded.sealed,
+                &root,
+                &state_dir,
+                &keys,
+                &api,
+                alerter,
+                false,
+                &mut Vec::new(),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(run.held, vec![id]);
+            let line = run.seats[&id]
+                .lines
+                .iter()
+                .find(|l| l.contains(sealed::check::HEAD_MISSING_LINE))
+                .unwrap_or_else(|| panic!("{:?}", run.seats[&id].lines))
+                .clone();
+            assert!(!line.contains("has been told"), "{line}");
+            told.push(line.ends_with(alerts::ALERT_SENT));
+            if !line.ends_with(alerts::ALERT_SENT) {
+                assert!(line.ends_with(alerts::ALERT_NOT_SENT), "{line}");
+            }
+        }
+        assert_eq!(told, [true, false, false]);
+        assert_eq!(sent.sent().len(), 1, "one mail, awaited");
+    }
+
     /// The start check judges an in-step agent's anchors before any
     /// session (beta round 12), and a failure it finds goes to the
     /// operator then, once; the verdict seated says it

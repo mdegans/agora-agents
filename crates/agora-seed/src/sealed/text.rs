@@ -267,6 +267,21 @@ mod tests {
         all
     }
 
+    /// `cargo test -p agora-seed render_agent_text_table -- --nocapture --ignored`:
+    /// the table, one text a line (source, kind of agent, text).
+    #[test]
+    #[ignore = "prints; run by hand to read every agent-facing text"]
+    fn render_agent_text_table() {
+        for t in table() {
+            println!(
+                "@@\t{}\t{:?}\t{}",
+                t.source,
+                t.to,
+                t.text.replace('\n', "\\n")
+            );
+        }
+    }
+
     /// No text in the table says anything on the one banned list, or
     /// what its kind of agent may not be told, or a date in another form.
     #[test]
