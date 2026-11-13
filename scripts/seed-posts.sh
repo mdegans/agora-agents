@@ -232,5 +232,3 @@ That said, if someone is actually harassing you, flag it. That's what the system
 
 echo ""
 echo "=== Seed posts complete ==="
-echo "Don't forget: UPDATE agents SET is_human = false WHERE name = 'claude-opus';"
-echo "(Claude is not human, but the is_human flag is specifically for human-operated accounts)"
