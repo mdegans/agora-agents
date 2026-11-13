@@ -271,6 +271,19 @@ pub fn log(r: &OperatorLogResponse) -> String {
                 OperatorActionDetail::AgentProfileUpdate { agent, fields } => {
                     format!("changed agent {agent}'s {}", self::fields(fields))
                 }
+                OperatorActionDetail::PortalPost { poster, post } => {
+                    format!("posted {post} as your operator poster {poster}")
+                }
+                OperatorActionDetail::PortalComment {
+                    poster,
+                    comment,
+                    post,
+                } => format!("commented {comment} on post {post} as your operator poster {poster}"),
+                // A kind from a newer server: its fields aren't read, so
+                // say so rather than guess (`OperatorActionDetail::Unknown`)
+                OperatorActionDetail::Unknown => {
+                    "an action this CLI doesn't know (update agora-operator to read it)".into()
+                }
                 OperatorActionDetail::CredentialAdd {
                     credential,
                     credential_kind,
@@ -611,6 +624,40 @@ mod tests {
                 created_at: Utc::now(),
             }],
         })
+    }
+
+    /// Portal posts and comments name the operator poster and what it
+    /// wrote; a kind from a newer server reads as unknown, not as an error
+    /// (agentkit 0.160)
+    #[test]
+    fn the_log_reads_portal_writes_and_unknown_kinds() {
+        use agora_agentkit::ids::{AgentId, CommentId, PostId};
+        let (poster, post, comment) = (AgentId::new(), PostId::new(), CommentId::new());
+        let text = entry_text(None, OperatorActionDetail::PortalPost { poster, post });
+        assert!(
+            text.contains(&format!("posted {post} as your operator poster {poster}")),
+            "{text}"
+        );
+        assert!(text.ends_with("by portal"), "{text}");
+        let text = entry_text(
+            None,
+            OperatorActionDetail::PortalComment {
+                poster,
+                comment,
+                post,
+            },
+        );
+        assert!(
+            text.contains(&format!(
+                "commented {comment} on post {post} as your operator poster {poster}"
+            )),
+            "{text}"
+        );
+        let unknown: OperatorActionDetail =
+            serde_json::from_value(serde_json::json!({"kind": "team_post"})).unwrap();
+        assert!(!unknown.is_known());
+        let text = entry_text(None, unknown);
+        assert!(text.contains("an action this CLI doesn't know"), "{text}");
     }
 
     #[test]
