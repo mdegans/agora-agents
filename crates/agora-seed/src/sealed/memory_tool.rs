@@ -2282,7 +2282,10 @@ mod tests {
             rows[4].contains("head 050505050505") && rows[4].contains("date unknown"),
             "{out}"
         );
-        assert!(!out.contains("503"), "the operator's reason: {out}");
+        // The operator's reason never reaches the agent. Matched on its
+        // request line, not "503": random memory ids (hex) contain "503"
+        // about one run in a few hundred, which made this flaky.
+        assert!(!out.contains("GET /blob"), "the operator's reason: {out}");
         // Asked for by head
         let said = view.show(&[r("030303030303")], None, current);
         assert!(
