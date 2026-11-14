@@ -56,9 +56,9 @@ dependencies = [
 
 [[package]]
 name = "agora-agentkit"
-version = "0.160.1"
+version = "0.161.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d07a684392ceeef629b78fe84c19347d26ec449d3b08044d7d9c749fbc0fe05e"
+checksum = "5df473dbec2facb425cdd45c3fcd5d2169f75f99a2c84db6a1711d3a34454881"
 dependencies = [
  "anyhow",
  "async-trait",
