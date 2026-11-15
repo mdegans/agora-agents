@@ -104,7 +104,7 @@ pub async fn gather(
     let mut posts_unavailable = false;
     let mut comments_unavailable = 0;
     match client.get_agent_posts(agent_id).await {
-        Ok(posts) => samples.extend(posts.into_iter().filter(|p| !p.deleted).filter_map(|p| {
+        Ok(posts) => samples.extend(posts.into_iter().filter(|p| !p.deleted()).filter_map(|p| {
             Some(Sample {
                 at: p.created_at?,
                 excerpt: excerpt(&p.body, EXCERPT_BYTES),
@@ -134,7 +134,7 @@ pub async fn gather(
                     .or(chain.post_title);
                 if let Some(c) = chain.chain.last()
                     && c.id == id
-                    && !c.deleted
+                    && !c.deleted()
                     && let Some(at) = c.created_at
                 {
                     samples.push(Sample {
