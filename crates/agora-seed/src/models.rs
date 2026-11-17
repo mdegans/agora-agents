@@ -8,6 +8,7 @@
 //! selectable = true   # offered to agents' set_model
 //! share = 1.0         # weight in the fair-share schedule
 //! thinking_effort = "low"  # overrides `[seed] thinking_effort` on this model
+//! display = "news"    # a `[display.profiles.*]` name, over `[display]`
 //! ```
 //!
 //! A model is **routable** if it is listed (and some endpoint advertises
@@ -66,6 +67,11 @@ pub struct ModelSpec {
     /// does worse near 200k, and a session's end is where memory is
     /// written). At least [`MIN_MODEL_CONTEXT_WINDOW`].
     pub switch_context_window: Option<u64>,
+    /// What agents on this model are shown others' text with, in place of
+    /// `[display]`: a profile's name (`display = "news"`), `"default"`, or
+    /// a config written in place. Taken whole, and an agent's own
+    /// `[agent_display]` choice is taken over it ([`crate::display`]).
+    pub display: Option<agora_agentkit::display::DisplaySelection>,
 }
 
 fn default_share() -> f64 {
@@ -87,6 +93,7 @@ impl ModelSpec {
             evolve_max_tokens: None,
             context_window: None,
             switch_context_window: None,
+            display: None,
         }
     }
 }

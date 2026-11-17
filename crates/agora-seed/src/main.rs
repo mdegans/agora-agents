@@ -57,6 +57,7 @@ mod alerts;
 mod bridge;
 mod consent;
 mod constitution;
+mod display;
 mod endpoint;
 mod govlog;
 mod interrupted;
@@ -463,6 +464,16 @@ struct RunConfig {
     /// `[alerts]`: mail the operator when something needs a human — see
     /// [`alerts`]. Absent means no alerts.
     alerts: Option<alerts::AlertsConfig>,
+    /// `[display]` (and `[display.profiles.*]`): what agents are shown
+    /// others' text with, and so the web tools' domain lists — see
+    /// [`display`]. Absent means agentkit's default: every off-site link
+    /// defanged.
+    #[serde(default)]
+    display: agora_agentkit::display::AgentDisplayProfiles,
+    /// `[agent_display]`: one agent's display choice, by agent id, over its
+    /// model's (`[[model]] display`) — see [`display`].
+    #[serde(default)]
+    agent_display: BTreeMap<AgentId, agora_agentkit::display::DisplaySelection>,
     #[serde(rename = "reactor")]
     reactors: Vec<ReactorSpec>,
 }
@@ -612,6 +623,32 @@ impl WebFetchKnobs {
 }
 
 impl SeedKnobs {
+    /// Where each web tool's domain lists come from: the operator's, when
+    /// either list is written on its table; else each session's display
+    /// policy ([`display`]).
+    fn web_sources(&self) -> display::WebSources {
+        use display::WebSource;
+        let source = |on: bool, written: bool| match (on, written) {
+            (false, _) => WebSource::Off,
+            (true, true) => WebSource::Operator,
+            (true, false) => WebSource::Policy,
+        };
+        display::WebSources {
+            fetch: source(
+                self.web_fetch.is_some(),
+                self.web_fetch
+                    .as_ref()
+                    .is_some_and(|k| k.allowed_domains.is_some() || k.blocked_domains.is_some()),
+            ),
+            search: source(
+                self.web_search.is_some(),
+                self.web_search
+                    .as_ref()
+                    .is_some_and(|k| k.allowed_domains.is_some() || k.blocked_domains.is_some()),
+            ),
+        }
+    }
+
     /// `data_dir` roots the default prompt-dump path; `prompt_log` false
     /// (from `--no-prompt-log`) disables the dump entirely.
     fn to_config(&self, data_dir: &std::path::Path, prompt_log: bool) -> Result<SeedConfig> {
@@ -1021,6 +1058,13 @@ fn model_specs(config: &RunConfig) -> Result<Vec<models::ModelSpec>> {
         }
     }
     Ok(specs)
+}
+
+/// `[display]`, `[[model]] display` and `[agent_display]`, every choice
+/// checked: a profile that does not exist stops the load.
+fn display_plan(config: &RunConfig, specs: &[models::ModelSpec]) -> Result<display::DisplayPlan> {
+    display::DisplayPlan::new(config.display.clone(), specs, config.agent_display.clone())
+        .context("the display config")
 }
 
 /// The roster's model allowlist: `--model` if given, else every listed id.
@@ -3516,6 +3560,8 @@ async fn run(held: &mut Held) -> Result<()> {
                 schedule: schedule::ScheduleConfig::default(),
                 review_forks: consent::forks::ForksConfig::default(),
                 alerts: None,
+                display: Default::default(),
+                agent_display: BTreeMap::new(),
                 reactors: vec![ReactorSpec {
                     endpoint,
                     min_cycle_secs: None,
@@ -3532,6 +3578,9 @@ async fn run(held: &mut Held) -> Result<()> {
     narrow_to_named(&mut config, &args.agents);
     narrow_to_models(&mut config, &args.models);
     let specs = model_specs(&config)?;
+    // Every display choice checked before anything else is done
+    let display_plan = display_plan(&config, &specs)?;
+    let web_sources = config.seed.web_sources();
     let allowlist = model_allowlist(&config, &specs);
     anyhow::ensure!(
         !config.reactors.is_empty(),
@@ -4015,6 +4064,10 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     let mut session_locks = claimed.locks;
 
+    // What agents are shown, and the web tools it gives them
+    say_raw!("{}", display_plan.report(web_sources));
+    display_plan.log(web_sources);
+
     // The plan, before anyone runs.
     for (spec, cohort) in config.reactors.iter().zip(&routing.cohorts) {
         say!("== {}", spec.endpoint);
@@ -4217,6 +4270,24 @@ async fn run(held: &mut Held) -> Result<()> {
                 && entry.budgets != models::Budgets::default()
             {
                 entry.budgets.apply(&mut agent_context.inner.config);
+            }
+            // What the agent is shown, and its web tools' lists: the same
+            // for every endpoint, the bridge's included
+            if let Err(e) = display_plan.apply(
+                &mut agent_context.inner.config,
+                web_sources,
+                &state.model.id,
+                id,
+                &state.soul.name,
+            ) {
+                session_locks.remove(&id);
+                skipped.push(Skipped::new(
+                    id,
+                    Some(state.soul.name.to_string()),
+                    "display",
+                    e.to_string(),
+                ));
+                continue;
             }
             // An agent on its own every-other-day cadence gets its rounds
             // doubled, and its model's switch window if it sets one;
@@ -7080,6 +7151,8 @@ mod agent_selection_tests {
             schedule: schedule::ScheduleConfig::default(),
             review_forks: consent::forks::ForksConfig::default(),
             alerts: None,
+            display: Default::default(),
+            agent_display: BTreeMap::new(),
             reactors: vec![],
         }
     }

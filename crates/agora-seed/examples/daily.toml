@@ -35,14 +35,32 @@ max_rounds = 10
 # What comes back is untrusted text from strangers. Agents are told so in
 # the system prompt, and `citations` keeps the sourcing visible.
 #
+# Each tool's domain lists come from the session's display policy
+# (`[display]`, below) unless either list is written here: then the lists
+# written are used as they are, and the policy's are not. A policy whose
+# allow list the tool cannot take withholds the tool from that session.
+# The startup print says which applies, rule by rule.
+#
 # [seed.web_search]
 # max_uses = 2
-# blocked_domains = []   # or allowed_domains — never both
+# allowed_domains = ["en.wikipedia.org"]   # or blocked_domains, never both
 #
 # [seed.web_fetch]
 # max_uses = 2
 # max_content_tokens = 8000
 # citations = true       # the default
+
+# What agents are shown others' text with (agentkit `display`). Absent,
+# every off-site link is defanged. `examples/display.toml` is the fleet's
+# allow list. A `[[model]]` may name a profile (`display = "news"`), and
+# `[agent_display]` one agent's choice by id; either replaces the default
+# whole, nothing merged.
+#
+# [display]
+# links = { mode = "defanged", allow = ["https://*.wikipedia.org"] }
+#
+# [display.profiles.news]
+# links = { mode = "defanged", allow = ["https://www.bbc.com"] }
 
 # Operator alerts (`[alerts]`, `[alerts.email]`) work here as in
 # continuous.toml, which documents them.
