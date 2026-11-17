@@ -75,6 +75,33 @@ impl WebSources {
     }
 }
 
+/// Which server tools an endpoint runs (its `Quirks`): one that runs
+/// neither offers its sessions no web tool, whatever the policy says
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointTools {
+    /// The endpoint as configured (`blallama://…`)
+    pub endpoint: String,
+    pub fetch: bool,
+    pub search: bool,
+}
+
+impl EndpointTools {
+    pub fn of(endpoint: &str, quirks: &agora_agentkit::reactor::inference::Quirks) -> Self {
+        Self {
+            endpoint: endpoint.to_owned(),
+            fetch: !quirks.web_fetch_unsupported,
+            search: !quirks.web_search_unsupported,
+        }
+    }
+
+    fn runs(&self, tool: ServerTool) -> bool {
+        match tool {
+            ServerTool::WebFetch => self.fetch,
+            ServerTool::WebSearch => self.search,
+        }
+    }
+}
+
 /// The config table a tool is enabled by
 fn table(tool: ServerTool) -> &'static str {
     match tool {
@@ -107,6 +134,10 @@ pub struct DisplayPlan {
 pub enum ToolOutcome {
     /// Not enabled for the run
     Off,
+    /// Enabled, but the session's endpoint runs no such server tool: it
+    /// drops the tool (agentkit says so), so nothing here is withheld or
+    /// filtered
+    NotRun,
     /// The operator's lists, as written
     Operator,
     /// The policy's lists (both `None`: unfiltered, as configured)
@@ -176,6 +207,7 @@ impl DisplayPlan {
         &self,
         config: &mut SeedConfig,
         web: WebSources,
+        endpoint: &EndpointTools,
         model: &Model,
         agent: AgentId,
         agent_name: &str,
@@ -197,6 +229,7 @@ impl DisplayPlan {
         let fetch = filter(
             &mut config.web_fetch,
             web.fetch,
+            endpoint.runs(ServerTool::WebFetch),
             || links.fetch_domains(),
             |t| (&mut t.allowed_domains, &mut t.blocked_domains),
         );
@@ -206,6 +239,7 @@ impl DisplayPlan {
         let search = filter(
             &mut config.web_search,
             web.search,
+            endpoint.runs(ServerTool::WebSearch),
             || links.search_domains(),
             |t| (&mut t.allowed_domains, &mut t.blocked_domains),
         );
@@ -225,11 +259,17 @@ impl DisplayPlan {
     /// not sent, a tool withheld or a list overridden is kept, and so is
     /// what every entry also reaches. [`Detail::Full`] (`--dry-run`) is
     /// agentkit's reports whole.
-    pub fn report(&self, web: WebSources, detail: Detail) -> Report<'_> {
+    pub fn report<'a>(
+        &'a self,
+        web: WebSources,
+        detail: Detail,
+        endpoints: &'a [EndpointTools],
+    ) -> Report<'a> {
         Report {
             plan: self,
             web,
             detail,
+            endpoints,
         }
     }
 
@@ -339,11 +379,37 @@ pub struct Report<'a> {
     plan: &'a DisplayPlan,
     web: WebSources,
     detail: Detail,
+    endpoints: &'a [EndpointTools],
 }
 
 impl fmt::Display for Report<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let only_default = self.plan.models.is_empty() && self.plan.agents.is_empty();
+        // The scopes are by display choice, not by endpoint: which
+        // endpoints run the tools is said once, before them
+        if self.web.fetch != WebSource::Off || self.web.search != WebSource::Off {
+            let without: Vec<&str> = self
+                .endpoints
+                .iter()
+                .filter(|e| !(e.fetch && e.search))
+                .map(|e| e.endpoint.as_str())
+                .collect();
+            if without.is_empty() {
+                writeln!(
+                    f,
+                    "== web tools: every endpoint of this run runs server tools; the web fetch \
+                     and web search lines below apply to every session"
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "== web tools: the web fetch and web search lines below apply only to \
+                     sessions on endpoints that run server tools; these run none (or not \
+                     both), and their sessions get no such tool: {}",
+                    without.join(", ")
+                )?;
+            }
+        }
         for (scope, resolved) in self.plan.scopes() {
             match scope {
                 Scope::Default if only_default => writeln!(f, "== display: every agent")?,
@@ -402,12 +468,17 @@ type DomainList = Option<Vec<Cow<'static, str>>>;
 fn filter<T>(
     tool: &mut Option<T>,
     source: WebSource,
+    runs: bool,
     domains: impl FnOnce() -> ToolDomains,
     lists: impl FnOnce(&mut T) -> (&mut DomainList, &mut DomainList),
 ) -> ToolOutcome {
     let Some(on) = tool.as_mut() else {
         return ToolOutcome::Off;
     };
+    // Left as configured: the endpoint drops it
+    if !runs {
+        return ToolOutcome::NotRun;
+    }
     match source {
         // The run's config has the tool, so its table is there: `Off` here
         // is a caller's mistake, and the tool is left as configured

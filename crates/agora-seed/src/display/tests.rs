@@ -12,6 +12,26 @@ const REACTOR: &str = "[[reactor]]\nendpoint = \"anthropic://api.anthropic.com\"
 const HAIKU: &str = "claude-haiku-5-5";
 const OLD_HAIKU: &str = "claude-haiku-4-5-20251001";
 
+/// An endpoint that runs both server tools (Anthropic's)
+fn anthropic() -> EndpointTools {
+    EndpointTools {
+        endpoint: "anthropic://api.anthropic.com".into(),
+        fetch: true,
+        search: true,
+    }
+}
+
+/// An endpoint that runs neither (blallama, Ollama, the bridge)
+fn local() -> EndpointTools {
+    EndpointTools {
+        endpoint: "blallama://h:1".into(),
+        fetch: false,
+        search: false,
+    }
+}
+
+const ENDPOINTS: &[EndpointTools] = &[];
+
 fn agent() -> AgentId {
     AgentId::from(uuid::Uuid::from_u128(
         0x9726e530_7df8_4f5a_8705_1164fd092fdf,
@@ -41,7 +61,7 @@ fn load(src: &str) -> anyhow::Result<(DisplayPlan, SeedConfig, WebSources)> {
     let seed = config
         .seed
         .to_config(std::path::Path::new("/nonexistent"), false)?;
-    Ok((plan, seed, config.seed.web_sources()))
+    Ok((plan, seed, config.seed.web_sources()?))
 }
 
 fn allow(rules: &[&str]) -> AgentDisplayConfig {
@@ -185,7 +205,7 @@ fn an_operator_list_on_a_tool_is_used_as_written_and_the_policy_is_not() {
     assert_eq!(web.fetch, WebSource::Operator);
     assert_eq!(web.search, WebSource::Policy);
     let done = plan
-        .apply(&mut config, web, &model(HAIKU), agent(), "a")
+        .apply(&mut config, web, &anthropic(), &model(HAIKU), agent(), "a")
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Operator);
     let fetch = config.web_fetch.as_ref().unwrap();
@@ -213,7 +233,14 @@ fn the_policy_offer_sets_each_enabled_tools_lists() {
     // The default's allow list, widened as web fetch takes it
     let mut config = base.clone();
     let done = plan
-        .apply(&mut config, web, &model(OLD_HAIKU), other_agent(), "a")
+        .apply(
+            &mut config,
+            web,
+            &anthropic(),
+            &model(OLD_HAIKU),
+            other_agent(),
+            "a",
+        )
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Offered);
     let fetch = config.web_fetch.as_ref().unwrap();
@@ -241,15 +268,22 @@ fn the_policy_offer_sets_each_enabled_tools_lists() {
     );
     // A raw profile's deny rule is a blocked list
     let mut config = base.clone();
-    plan.apply(&mut config, web, &model(HAIKU), other_agent(), "b")
-        .unwrap();
+    plan.apply(
+        &mut config,
+        web,
+        &anthropic(),
+        &model(HAIKU),
+        other_agent(),
+        "b",
+    )
+    .unwrap();
     let fetch = config.web_fetch.as_ref().unwrap();
     assert_eq!(fetch.allowed_domains, None);
     assert_eq!(strings(&fetch.blocked_domains), Some(vec!["evil.example"]));
     // agentkit's default (no allow rule) leaves the tools unfiltered
     let (plan, mut config, web) = load("[seed.web_fetch]\n[seed.web_search]\n").unwrap();
     let done = plan
-        .apply(&mut config, web, &model(HAIKU), agent(), "c")
+        .apply(&mut config, web, &anthropic(), &model(HAIKU), agent(), "c")
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Offered);
     let fetch = config.web_fetch.as_ref().unwrap();
@@ -267,7 +301,14 @@ fn a_policy_that_cannot_be_sent_withholds_the_tool_from_the_session() {
     .unwrap();
     let mut config = base.clone();
     let done = plan
-        .apply(&mut config, web, &model("local"), other_agent(), "a")
+        .apply(
+            &mut config,
+            web,
+            &anthropic(),
+            &model("local"),
+            other_agent(),
+            "a",
+        )
         .unwrap();
     assert_eq!(
         done,
@@ -282,8 +323,15 @@ fn a_policy_that_cannot_be_sent_withholds_the_tool_from_the_session() {
     // model's session keeps its tools
     assert!(base.web_fetch.is_some());
     let mut config = base.clone();
-    plan.apply(&mut config, web, &model(OLD_HAIKU), other_agent(), "b")
-        .unwrap();
+    plan.apply(
+        &mut config,
+        web,
+        &anthropic(),
+        &model(OLD_HAIKU),
+        other_agent(),
+        "b",
+    )
+    .unwrap();
     assert!(config.web_fetch.is_some());
 }
 
@@ -298,7 +346,14 @@ fn a_tool_the_operator_did_not_enable_stays_off() {
         }
     );
     let done = plan
-        .apply(&mut config, web, &model(OLD_HAIKU), agent(), "a")
+        .apply(
+            &mut config,
+            web,
+            &anthropic(),
+            &model(OLD_HAIKU),
+            agent(),
+            "a",
+        )
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Off);
     assert_eq!(done.search, ToolOutcome::Off);
@@ -326,7 +381,8 @@ fn a_bridge_session_is_shown_what_a_fleet_session_is() {
     fleet_plan
         .apply(
             &mut fleet_config,
-            fleet.seed.web_sources(),
+            fleet.seed.web_sources().unwrap(),
+            &anthropic(),
             &model(HAIKU),
             agent(),
             "a",
@@ -335,7 +391,11 @@ fn a_bridge_session_is_shown_what_a_fleet_session_is() {
     bridge_plan
         .apply(
             &mut bridge_config,
-            bridge.seed.web_sources(),
+            bridge.seed.web_sources().unwrap(),
+            &EndpointTools::of(
+                "bridge://claude-code",
+                &agora_agentkit::reactor::Inference::quirks(&crate::bridge::bridge().0),
+            ),
             &crate::bridge::model_info().id,
             agent(),
             "beta",
@@ -352,7 +412,7 @@ fn the_report_says_what_each_choice_shows_and_what_the_tools_get() {
          [seed.web_fetch]\nblocked_domains = [\"x.example\"]\n[seed.web_search]\n"
     ))
     .unwrap();
-    let report = plan.report(web, Detail::Full).to_string();
+    let report = plan.report(web, Detail::Full, ENDPOINTS).to_string();
     // The default, and each model's and agent's choice
     assert!(
         report.contains("== display: the default (every agent and model not listed below)"),
@@ -456,8 +516,8 @@ fn the_summary_lists_counts_and_every_change_but_not_the_lists() {
          [seed.web_fetch]\nblocked_domains = [\"x.example\"]\n[seed.web_search]\n"
     ))
     .unwrap();
-    let full = plan.report(web, Detail::Full).to_string();
-    let summary = plan.report(web, Detail::Summary).to_string();
+    let full = plan.report(web, Detail::Full, ENDPOINTS).to_string();
+    let summary = plan.report(web, Detail::Summary, ENDPOINTS).to_string();
     summary_keeps_every_change(&full, &summary);
     // The counts and the changes
     assert!(
@@ -499,7 +559,7 @@ fn the_summary_lists_counts_and_every_change_but_not_the_lists() {
 #[test]
 fn the_report_says_when_a_tool_is_off() {
     let (plan, _, web) = load("").unwrap();
-    let report = plan.report(web, Detail::Summary).to_string();
+    let report = plan.report(web, Detail::Summary, ENDPOINTS).to_string();
     assert!(report.starts_with("== display: every agent\n"), "{report}");
     assert!(
         report.contains("   web fetch: off ([seed.web_fetch] is absent)\n"),
@@ -520,8 +580,8 @@ fn the_fleets_proposed_display_table_loads() {
     let (plan, _, web) = load(&format!("{src}\n[seed.web_fetch]\n[seed.web_search]\n")).unwrap();
     // A run's print is a summary: the counts and the 14 widened rules, not
     // 209 rules and 417 entries
-    let full = plan.report(web, Detail::Full).to_string();
-    let summary = plan.report(web, Detail::Summary).to_string();
+    let full = plan.report(web, Detail::Full, ENDPOINTS).to_string();
+    let summary = plan.report(web, Detail::Summary, ENDPOINTS).to_string();
     summary_keeps_every_change(&full, &summary);
     assert!(summary.lines().count() < 30, "{summary}");
     assert_eq!(summary.matches("widened:").count(), 14, "{summary}");
@@ -572,4 +632,175 @@ fn an_operator_list_over_a_withholding_policy_is_said_apart() {
     assert_eq!(describe(&wiki, WebSource::Operator), "operator_lists");
     assert_eq!(describe(&wiki, WebSource::Policy), "allowed_domains");
     assert_eq!(describe(&wiki, WebSource::Off), "off");
+}
+
+/// An empty list written on a tool is refused at load: its meaning to the
+/// API is undocumented, and it would switch the policy off for that tool
+#[test]
+fn an_empty_written_list_is_refused_at_load() {
+    for (table, list) in [
+        ("web_fetch", "allowed_domains"),
+        ("web_fetch", "blocked_domains"),
+        ("web_search", "allowed_domains"),
+        ("web_search", "blocked_domains"),
+    ] {
+        let e = load(&format!("[seed.{table}]\n{list} = []\n")).expect_err("refused");
+        let e = format!("{e:#}");
+        assert!(
+            e.contains(&format!("[seed.{table}]: `{list} = []` is refused")),
+            "{e}"
+        );
+    }
+    // A list with something in it is the operator's
+    let (_, _, web) = load("[seed.web_fetch]\nblocked_domains = [\"x.example\"]\n").unwrap();
+    assert_eq!(web.fetch, WebSource::Operator);
+}
+
+/// A session on an endpoint that runs no server tools (blallama, Ollama,
+/// the bridge): its endpoint drops the tools, so nothing is withheld or
+/// filtered here and no `web_tool_withheld` is said for it
+#[test]
+fn an_endpoint_without_server_tools_is_not_said_to_lose_them() {
+    let (plan, base, web) = load(&format!(
+        "{MIXED}\n[[model]]\nid = \"local\"\ndisplay = \"local\"\n[seed.web_fetch]\n[seed.web_search]\n"
+    ))
+    .unwrap();
+    let mut config = base.clone();
+    let done = plan
+        .apply(
+            &mut config,
+            web,
+            &local(),
+            &model("local"),
+            other_agent(),
+            "a",
+        )
+        .unwrap();
+    assert_eq!(
+        done,
+        SessionDisplay {
+            fetch: ToolOutcome::NotRun,
+            search: ToolOutcome::NotRun
+        }
+    );
+    // Left as configured, for agentkit to drop at the endpoint
+    assert_eq!(config.web_fetch, base.web_fetch);
+    // The same session on Anthropic is withheld
+    let mut config = base.clone();
+    let done = plan
+        .apply(
+            &mut config,
+            web,
+            &anthropic(),
+            &model("local"),
+            other_agent(),
+            "a",
+        )
+        .unwrap();
+    assert_eq!(done.fetch, ToolOutcome::Withheld);
+}
+
+#[test]
+fn the_report_says_which_endpoints_run_no_server_tools() {
+    let (plan, _, web) = load("[seed.web_fetch]\n").unwrap();
+    let mixed = [anthropic(), local()];
+    let report = plan.report(web, Detail::Summary, &mixed).to_string();
+    assert!(
+        report.starts_with(
+            "== web tools: the web fetch and web search lines below apply only to sessions on \
+             endpoints that run server tools; these run none (or not both), and their sessions \
+             get no such tool: blallama://h:1\n"
+        ),
+        "{report}"
+    );
+    let report = plan
+        .report(web, Detail::Summary, &[anthropic()])
+        .to_string();
+    assert!(
+        report.starts_with("== web tools: every endpoint of this run runs server tools"),
+        "{report}"
+    );
+    // No web line when no tool is enabled
+    let (plan, _, web) = load("").unwrap();
+    let report = plan.report(web, Detail::Summary, &mixed).to_string();
+    assert!(!report.contains("== web tools"), "{report}");
+}
+
+/// `run` makes every session's config with `crate::session_config`: the
+/// model's budgets, the display and web tools, the cadence. Dropping the
+/// display step (or any other) fails here
+#[test]
+fn a_sessions_config_has_its_budgets_display_web_tools_and_cadence() {
+    let config: crate::RunConfig = toml::from_str(&format!(
+        "[display]\nlinks = {{ mode = \"defanged\", allow = [\"https://docs.rs\"] }}\n\
+         [display.profiles.open]\nlinks = {{ mode = \"raw\", deny = [\"https://evil.example\"] }}\n\
+         [[model]]\nid = \"{HAIKU}\"\ndisplay = \"open\"\nact_max_tokens = 20000\n\
+         switch_context_window = 300000\ncontext_window = 200000\n\
+         [seed.web_fetch]\n{REACTOR}"
+    ))
+    .unwrap();
+    let specs = crate::model_specs(&config).unwrap();
+    let plan = crate::display_plan(&config, &specs).unwrap();
+    let base = config
+        .seed
+        .to_config(std::path::Path::new("/nonexistent"), false)
+        .unwrap();
+    let catalog = crate::models::Catalog::new(&specs, &[crate::models::tests::info(HAIKU)]);
+    let entry = catalog.get(&model(HAIKU));
+    let endpoint = anthropic();
+    let web = config.seed.web_sources().unwrap();
+    let inputs = |cadence| crate::SessionInputs {
+        entry,
+        display: &plan,
+        web,
+        endpoint: &endpoint,
+        cadence,
+    };
+    let made = crate::session_config(&base, inputs(None), &model(HAIKU), agent(), "a").unwrap();
+    // The model's budgets
+    assert_eq!(made.act_max_tokens, 20000);
+    assert_eq!(made.context_window, 200000);
+    // Its display: the model's profile, whole
+    assert_eq!(
+        made.display.links(),
+        &Links::Raw {
+            deny: vec!["https://evil.example".parse().unwrap()]
+        }
+    );
+    // Its web tool, from that profile
+    let fetch = made.web_fetch.as_ref().unwrap();
+    assert_eq!(strings(&fetch.blocked_domains), Some(vec!["evil.example"]));
+    // The run's config is untouched
+    assert_eq!(base.display, AgentDisplayConfig::default());
+    assert!(base.web_fetch.as_ref().unwrap().blocked_domains.is_none());
+    // An agent on its own cadence: its rounds and the switch window
+    let switched = crate::session_config(
+        &base,
+        inputs(Some((20, 158_400))),
+        &model(HAIKU),
+        agent(),
+        "a",
+    )
+    .unwrap();
+    assert_eq!(switched.max_rounds, 20);
+    assert_eq!(switched.context_window, 300000);
+    assert_eq!(switched.display, made.display);
+    // A model not in the table: the run's budgets and the default display
+    let other = crate::session_config(
+        &base,
+        crate::SessionInputs {
+            entry: None,
+            ..inputs(None)
+        },
+        &model("other"),
+        agent(),
+        "a",
+    )
+    .unwrap();
+    assert_eq!(other.act_max_tokens, base.act_max_tokens);
+    assert_eq!(other.display, allow(&["https://docs.rs"]));
+    assert_eq!(
+        strings(&other.web_fetch.as_ref().unwrap().allowed_domains),
+        Some(vec!["docs.rs"])
+    );
 }
