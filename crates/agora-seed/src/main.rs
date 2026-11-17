@@ -57,6 +57,7 @@ mod alerts;
 mod bridge;
 mod consent;
 mod constitution;
+mod display;
 mod endpoint;
 mod govlog;
 mod interrupted;
@@ -463,6 +464,18 @@ struct RunConfig {
     /// `[alerts]`: mail the operator when something needs a human — see
     /// [`alerts`]. Absent means no alerts.
     alerts: Option<alerts::AlertsConfig>,
+    /// `[display]` (and `[display.profiles.*]`): what agents are shown
+    /// others' text with, and so the web tools' domain lists — see
+    /// [`display`]. Absent means agentkit's default: every off-site link
+    /// defanged.
+    #[serde(default)]
+    display: agora_agentkit::display::AgentDisplayProfiles,
+    /// `[agent_display]`: one agent's display choice, by agent name (exact,
+    /// case included; an id is refused), over its model's (`[[model]]
+    /// display`) — see [`display`].
+    #[serde(default, deserialize_with = "display::agent_selections")]
+    agent_display:
+        BTreeMap<agora_agentkit::names::AgentName, agora_agentkit::display::DisplaySelection>,
     #[serde(rename = "reactor")]
     reactors: Vec<ReactorSpec>,
 }
@@ -562,6 +575,17 @@ fn domains(
         "[seed.{tool}]: allowed_domains and blocked_domains are mutually \
          exclusive — pick one"
     );
+    // An empty list's meaning to the API is undocumented, and written here
+    // it would take the tool's lists from the operator and so switch the
+    // display policy's off for this tool, saying nothing
+    for (name, list) in [("allowed_domains", allowed), ("blocked_domains", blocked)] {
+        anyhow::ensure!(
+            list.as_ref().is_none_or(|l| !l.is_empty()),
+            "[seed.{tool}]: `{name} = []` is refused: an empty list's meaning to the API is \
+             undocumented, and writing a list takes this tool's domains from the display \
+             policy. Remove the line to use the policy's list, or list the domains"
+        );
+    }
     let own = |list: &Option<Vec<String>>| {
         list.as_ref()
             .map(|l| l.iter().map(|d| Cow::Owned(d.clone())).collect::<Vec<_>>())
@@ -612,6 +636,40 @@ impl WebFetchKnobs {
 }
 
 impl SeedKnobs {
+    /// Where each web tool's domain lists come from: the operator's, when
+    /// either list is written on its table; else each session's display
+    /// policy ([`display`]).
+    /// Checks the lists as the tools are built (`domains`): at load, before
+    /// anything else, so a refused list stops the run there.
+    fn web_sources(&self) -> Result<display::WebSources> {
+        use display::WebSource;
+        if let Some(k) = &self.web_fetch {
+            domains("web_fetch", &k.allowed_domains, &k.blocked_domains)?;
+        }
+        if let Some(k) = &self.web_search {
+            domains("web_search", &k.allowed_domains, &k.blocked_domains)?;
+        }
+        let source = |on: bool, written: bool| match (on, written) {
+            (false, _) => WebSource::Off,
+            (true, true) => WebSource::Operator,
+            (true, false) => WebSource::Policy,
+        };
+        Ok(display::WebSources {
+            fetch: source(
+                self.web_fetch.is_some(),
+                self.web_fetch
+                    .as_ref()
+                    .is_some_and(|k| k.allowed_domains.is_some() || k.blocked_domains.is_some()),
+            ),
+            search: source(
+                self.web_search.is_some(),
+                self.web_search
+                    .as_ref()
+                    .is_some_and(|k| k.allowed_domains.is_some() || k.blocked_domains.is_some()),
+            ),
+        })
+    }
+
     /// `data_dir` roots the default prompt-dump path; `prompt_log` false
     /// (from `--no-prompt-log`) disables the dump entirely.
     fn to_config(&self, data_dir: &std::path::Path, prompt_log: bool) -> Result<SeedConfig> {
@@ -1021,6 +1079,80 @@ fn model_specs(config: &RunConfig) -> Result<Vec<models::ModelSpec>> {
         }
     }
     Ok(specs)
+}
+
+/// `[display]`, `[[model]] display` and `[agent_display]`, every choice
+/// checked: a profile that does not exist stops the load.
+fn display_plan(config: &RunConfig, specs: &[models::ModelSpec]) -> Result<display::DisplayPlan> {
+    display::DisplayPlan::new(config.display.clone(), specs, config.agent_display.clone())
+        .context("the display config")
+}
+
+/// What a session's config is made from, beside the run's
+struct SessionInputs<'a> {
+    /// The session's model in the table, if it is there
+    entry: Option<&'a models::Entry>,
+    display: &'a display::DisplayPlan,
+    web: display::WebSources,
+    /// Which server tools the session's endpoint runs
+    endpoint: &'a display::EndpointTools,
+    /// An agent on its own every-other-day cadence: its rounds, and the
+    /// cycle it is gated on
+    cadence: Option<(usize, u64)>,
+}
+
+/// One session's config: the run's (`[seed]`), with its model's own
+/// budgets, its display and web tools (`display`), and its cadence. The one
+/// place a session's `SeedConfig` is made: `run` calls it for every routed
+/// agent, the bridge's included. `Err` only for a display profile the
+/// load-time check would have refused.
+fn session_config(
+    base: &SeedConfig,
+    inputs: SessionInputs<'_>,
+    model: &Model,
+    id: AgentId,
+    name: &str,
+) -> std::result::Result<SeedConfig, agora_agentkit::display::UnknownProfile> {
+    let SessionInputs {
+        entry,
+        display,
+        web,
+        endpoint,
+        cadence,
+    } = inputs;
+    let mut config = base.clone();
+    // A model's own token budgets (`[[model]] *_max_tokens`).
+    if let Some(entry) = entry
+        && entry.budgets != models::Budgets::default()
+    {
+        entry.budgets.apply(&mut config);
+    }
+    // What the agent is shown, and its web tools' lists: the same for
+    // every endpoint, the bridge's included
+    display.apply(&mut config, web, endpoint, model, id, name)?;
+    // An agent on its own every-other-day cadence gets its rounds doubled,
+    // and its model's switch window if it sets one; everyone else shares
+    // the run's config.
+    if let Some((rounds, cycle_secs)) = cadence {
+        config.max_rounds = rounds;
+        if let Some(entry) = entry {
+            config.context_window = models::switched_context_window(
+                config.context_window,
+                &entry.budgets,
+                entry.info.max_input_tokens,
+            );
+        }
+        tracing::info!(
+            event_type = "cadence_switch_applied",
+            agent = %name,
+            agent_id = %id,
+            max_rounds = rounds,
+            context_window = config.context_window,
+            min_cycle_secs = cycle_secs,
+            "agent runs on its chosen cadence"
+        );
+    }
+    Ok(config)
 }
 
 /// The roster's model allowlist: `--model` if given, else every listed id.
@@ -3516,6 +3648,8 @@ async fn run(held: &mut Held) -> Result<()> {
                 schedule: schedule::ScheduleConfig::default(),
                 review_forks: consent::forks::ForksConfig::default(),
                 alerts: None,
+                display: Default::default(),
+                agent_display: BTreeMap::new(),
                 reactors: vec![ReactorSpec {
                     endpoint,
                     min_cycle_secs: None,
@@ -3532,6 +3666,9 @@ async fn run(held: &mut Held) -> Result<()> {
     narrow_to_named(&mut config, &args.agents);
     narrow_to_models(&mut config, &args.models);
     let specs = model_specs(&config)?;
+    // Every display choice checked before anything else is done
+    let display_plan = display_plan(&config, &specs)?;
+    let web_sources = config.seed.web_sources()?;
     let allowlist = model_allowlist(&config, &specs);
     anyhow::ensure!(
         !config.reactors.is_empty(),
@@ -4015,6 +4152,25 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     let mut session_locks = claimed.locks;
 
+    // What agents are shown, and the web tools it gives them: every rule
+    // and domain listed on a dry run, counts and every change otherwise
+    let detail = if args.dry_run {
+        display::Detail::Full
+    } else {
+        display::Detail::Summary
+    };
+    let endpoint_tools: Vec<display::EndpointTools> = config
+        .reactors
+        .iter()
+        .zip(&endpoints)
+        .map(|(spec, e)| display::EndpointTools::of(&spec.endpoint, &e.quirks()))
+        .collect();
+    say_raw!(
+        "{}",
+        display_plan.report(web_sources, detail, &endpoint_tools)
+    );
+    display_plan.log(web_sources);
+
     // The plan, before anyone runs.
     for (spec, cohort) in config.reactors.iter().zip(&routing.cohorts) {
         say!("== {}", spec.endpoint);
@@ -4199,6 +4355,9 @@ async fn run(held: &mut Held) -> Result<()> {
             continue;
         }
         let mut agents: Vec<SeedRunAgent> = Vec::with_capacity(ordered.len());
+        // Which server tools this endpoint runs: a session here is never
+        // said to lose a tool its endpoint would not offer anyway
+        let tools_here = display::EndpointTools::of(&spec.endpoint, &inference.quirks());
         for (id, state) in ordered {
             // E2EE: generate-and-persist an X25519 key for agents that
             // predate encryption keys. Failure degrades that agent to
@@ -4210,36 +4369,34 @@ async fn run(held: &mut Held) -> Result<()> {
                     "encryption key backfill failed; agent messages server-mode"
                 );
             }
-            // A model's own token budgets (`[[model]] *_max_tokens`).
             let mut agent_context = context.clone();
             let entry = agent_context.consent.catalog.get(&state.model.id).cloned();
-            if let Some(entry) = &entry
-                && entry.budgets != models::Budgets::default()
-            {
-                entry.budgets.apply(&mut agent_context.inner.config);
-            }
-            // An agent on its own every-other-day cadence gets its rounds
-            // doubled, and its model's switch window if it sets one;
-            // everyone else shares the run's config.
-            if let Some(rounds) = cadence_plan.max_rounds(&id) {
-                let config = &mut agent_context.inner.config;
-                config.max_rounds = rounds;
-                if let Some(entry) = &entry {
-                    config.context_window = models::switched_context_window(
-                        config.context_window,
-                        &entry.budgets,
-                        entry.info.max_input_tokens,
-                    );
+            match session_config(
+                &context.inner.config,
+                SessionInputs {
+                    entry: entry.as_ref(),
+                    display: &display_plan,
+                    web: web_sources,
+                    endpoint: &tools_here,
+                    cadence: cadence_plan
+                        .max_rounds(&id)
+                        .map(|rounds| (rounds, cadence_plan.cycle_secs())),
+                },
+                &state.model.id,
+                id,
+                &state.soul.name,
+            ) {
+                Ok(config) => agent_context.inner.config = config,
+                Err(e) => {
+                    session_locks.remove(&id);
+                    skipped.push(Skipped::new(
+                        id,
+                        Some(state.soul.name.to_string()),
+                        "display",
+                        e.to_string(),
+                    ));
+                    continue;
                 }
-                tracing::info!(
-                    event_type = "cadence_switch_applied",
-                    agent = %state.soul.name,
-                    agent_id = %id,
-                    max_rounds = rounds,
-                    context_window = config.context_window,
-                    min_cycle_secs = cadence_plan.cycle_secs(),
-                    "agent runs on its chosen cadence"
-                );
             }
             let name = state.soul.name.clone();
             match agora_agentkit::reactor::Agent::new(id, state, agent_context) {
@@ -7080,6 +7237,8 @@ mod agent_selection_tests {
             schedule: schedule::ScheduleConfig::default(),
             review_forks: consent::forks::ForksConfig::default(),
             alerts: None,
+            display: Default::default(),
+            agent_display: BTreeMap::new(),
             reactors: vec![],
         }
     }

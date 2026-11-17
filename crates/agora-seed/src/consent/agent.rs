@@ -171,6 +171,10 @@ use agora_agentkit::reactor::seed::Gauged;
 pub trait InnerSession: Agent {
     fn contact_request(&self) -> Option<ContactRequestId>;
 
+    /// What the session's agent is shown others' text with: the wrapper's
+    /// own text (the trial review's sample) is shown under it too
+    fn display(&self) -> &agora_agentkit::display::AgentDisplayConfig;
+
     /// Resume a paused server-tool turn in one of the wrapper's own
     /// questions, under the session's pause budget, without touching the
     /// inner session's phase (`Agent::on_pause` is for its own turns: it
@@ -216,6 +220,10 @@ pub trait InnerSession: Agent {
 }
 
 impl InnerSession for SeedAgent {
+    fn display(&self) -> &agora_agentkit::display::AgentDisplayConfig {
+        SeedAgent::display(self)
+    }
+
     fn contact_request(&self) -> Option<ContactRequestId> {
         SeedAgent::contact_request(self)
     }
@@ -1534,8 +1542,13 @@ where
             .iter()
             .copied()
             .collect();
+        // Under the session's display policy, on the server's site
+        let cx = agora_agentkit::display::DisplayContext::at(
+            self.inner.display(),
+            Some(self.rt.client.site()),
+        );
         let sample =
-            comparison::gather(&self.rt.client, self.inner.id(), comments, started_at).await;
+            comparison::gather(&self.rt.client, cx, self.inner.id(), comments, started_at).await;
         let content = text::review(
             ReviewText {
                 from_name: &from_name,
@@ -2482,6 +2495,13 @@ mod tests {
     }
 
     impl InnerSession for Fake {
+        /// agentkit's default display
+        fn display(&self) -> &agora_agentkit::display::AgentDisplayConfig {
+            static DEFAULT: std::sync::LazyLock<agora_agentkit::display::AgentDisplayConfig> =
+                std::sync::LazyLock::new(Default::default);
+            &DEFAULT
+        }
+
         fn contact_request(&self) -> Option<ContactRequestId> {
             self.contact
         }
