@@ -50,6 +50,7 @@ pub(super) fn unanswered_why(why: &Unanswered) -> String {
 impl<A> AskHost for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     fn asks(&mut self) -> &mut Asks<Self> {
         &mut self.asks
@@ -92,6 +93,7 @@ where
 impl<A> ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     /// The model that answered, else the session's.
     fn answered_by(&self, asked: &Asked) -> Model {
@@ -481,7 +483,8 @@ trait Offering: agora_agentkit::reactor::ask::Ask {
 
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<Self::Ledger>
     where
-        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds;
+        A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith;
 
     /// The outcome of a session whose every reply was unusable.
     fn unusable(failure: String) -> Self::Outcome;
@@ -513,6 +516,7 @@ impl Offering for OfferQuestion<RoleChoice, 4> {
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<RoleLedger>
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         &mut agent.role
     }
@@ -558,6 +562,7 @@ impl Offering for CadenceQuestion {
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<CadenceLedger>
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         &mut agent.cadence
     }
@@ -612,6 +617,7 @@ impl Offering for OfferQuestion<RestoreChoice, 2> {
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<RestoreLedger>
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         &mut agent.restore
     }
@@ -658,6 +664,7 @@ impl Offering for OfferQuestion<SealChoice, 3> {
     fn slot<A>(agent: &mut ConsentAgent<A>) -> &mut Slot<SealLedger>
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         &mut agent.sealed
     }
@@ -714,6 +721,7 @@ trait NotedOffer: Offering<Answer = Reply<Self::Choice>> {
     fn stage<A>(agent: &mut ConsentAgent<A>, write: Write)
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         Self::slot(agent).stage(write);
     }
@@ -722,6 +730,7 @@ trait NotedOffer: Offering<Answer = Reply<Self::Choice>> {
     fn before_record<A>(_agent: &mut ConsentAgent<A>, _choice: Self::Choice) -> Option<String>
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         None
     }
@@ -733,6 +742,7 @@ trait NotedOffer: Offering<Answer = Reply<Self::Choice>> {
     ) -> String
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         Self::line(choice, today)
     }
@@ -775,6 +785,7 @@ impl NotedOffer for OfferQuestion<SealChoice, 3> {
     fn before_record<A>(agent: &mut ConsentAgent<A>, choice: SealChoice) -> Option<String>
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         agent.sealed_answered_again(choice)
     }
@@ -783,6 +794,7 @@ impl NotedOffer for OfferQuestion<SealChoice, 3> {
     fn line_for<A>(agent: &ConsentAgent<A>, choice: SealChoice, today: chrono::NaiveDate) -> String
     where
         A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+        A::Context: ShownWith,
     {
         match agent
             .sealed
@@ -813,6 +825,7 @@ impl NotedOffer for OfferQuestion<SealChoice, 3> {
 impl<A> ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     /// Take an answer to the memory-restore or sealed-state offer. Nothing
     /// is applied here: the SOUL line and the agent's note are written at
@@ -900,6 +913,7 @@ where
 impl<A> Answer<ReviewQuestion> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     async fn answer(
         &mut self,
@@ -1020,6 +1034,7 @@ where
 impl<A> Answer<ModelSwapQuestion> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     async fn answer(
         &mut self,
@@ -1121,6 +1136,7 @@ where
 impl<A> Answer<OfferQuestion<RoleChoice, 4>> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     /// Checked against the agent's SOUL and memory first: an empty or
     /// over-long `text`, or a `memory_note` that can't be written, is asked
@@ -1227,6 +1243,7 @@ where
 impl<A> Answer<CadenceQuestion> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     /// Every attempt goes into the record, verbatim, the answering one too.
     /// **The first usable choice wins**: its question's parser took the
@@ -1360,6 +1377,7 @@ where
 impl<A> Answer<OfferQuestion<RestoreChoice, 2>> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     async fn answer(
         &mut self,
@@ -1394,6 +1412,7 @@ where
 impl<A> Answer<OfferQuestion<SealChoice, 3>> for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     async fn answer(
         &mut self,

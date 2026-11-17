@@ -12,8 +12,14 @@
 //! What could not be fetched, and the cap when it bites, are counted in
 //! the [`Comparison`] and said in the review: a short sample must not read
 //! as an agent that wrote little.
+//!
+//! Every title and body is put under the session's display policy
+//! ([`DisplayContext::linked`]) as it is fetched, before it is cut: a cut
+//! URL is not the URL the policy judged. Rendering it on a line
+//! (`threads::defang`) is the prompt's ([`super::prompt`]).
 
 use agora_agentkit::client::{Client, Error};
+use agora_agentkit::display::DisplayContext;
 use agora_agentkit::ids::{AgentId, CommentId};
 use chrono::{DateTime, Utc};
 
@@ -27,7 +33,8 @@ pub const EXCERPT_BYTES: usize = 600;
 /// Comment fetches per review, at most.
 pub const MAX_COMMENT_FETCHES: usize = 40;
 
-/// What kind of writing a [`Sample`] is.
+/// What kind of writing a [`Sample`] is. Titles are under the session's
+/// link policy ([`shown_title`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Where {
     /// A post, in a community.
@@ -41,7 +48,8 @@ pub enum Where {
 pub struct Sample {
     pub at: DateTime<Utc>,
     pub place: Where,
-    /// Already cut to [`EXCERPT_BYTES`].
+    /// Under the session's link policy, then cut to [`EXCERPT_BYTES`]
+    /// ([`shown_excerpt`]).
     pub excerpt: String,
 }
 
@@ -80,6 +88,18 @@ pub fn excerpt(body: &str, max: usize) -> String {
     format!("{}…", body[..end].trim_end())
 }
 
+/// A title as the session's agent is shown it: under its link policy
+pub fn shown_title(cx: DisplayContext<'_>, title: &str) -> String {
+    cx.linked(title).into_owned()
+}
+
+/// A body as the session's agent is shown it: under its link policy, then
+/// cut to [`EXCERPT_BYTES`]. The policy reads the whole body as written
+/// first, so a URL across the cut is judged whole and cut after
+pub fn shown_excerpt(cx: DisplayContext<'_>, body: &str) -> String {
+    excerpt(&cx.linked(body), EXCERPT_BYTES)
+}
+
 /// Split at `boundary` (the first session on the new model) and keep the
 /// most recent [`PER_SIDE`] of each side, newest first.
 pub fn select(mut samples: Vec<Sample>, boundary: DateTime<Utc>) -> Comparison {
@@ -96,6 +116,7 @@ pub fn select(mut samples: Vec<Sample>, boundary: DateTime<Utc>) -> Comparison {
 /// fetch never fails the session; it is logged and counted in the result.
 pub async fn gather(
     client: &Client,
+    cx: DisplayContext<'_>,
     agent_id: AgentId,
     comments: Vec<CommentId>,
     boundary: DateTime<Utc>,
@@ -107,10 +128,10 @@ pub async fn gather(
         Ok(posts) => samples.extend(posts.into_iter().filter(|p| !p.deleted()).filter_map(|p| {
             Some(Sample {
                 at: p.created_at?,
-                excerpt: excerpt(&p.body, EXCERPT_BYTES),
+                excerpt: shown_excerpt(cx, &p.body),
                 place: Where::Post {
                     community: p.community_name.canonical().to_owned(),
-                    title: p.title,
+                    title: shown_title(cx, &p.title),
                 },
             })
         })),
@@ -130,8 +151,8 @@ pub async fn gather(
                 let post_title = chain
                     .root
                     .as_ref()
-                    .map(|p| p.title.clone())
-                    .or(chain.post_title);
+                    .map(|p| shown_title(cx, &p.title))
+                    .or_else(|| chain.post_title.as_deref().map(|t| shown_title(cx, t)));
                 if let Some(c) = chain.chain.last()
                     && c.id == id
                     && !c.deleted()
@@ -139,7 +160,7 @@ pub async fn gather(
                 {
                     samples.push(Sample {
                         at,
-                        excerpt: excerpt(&c.body, EXCERPT_BYTES),
+                        excerpt: shown_excerpt(cx, &c.body),
                         place: Where::Comment { post_title },
                     });
                 }
@@ -221,6 +242,76 @@ mod tests {
     }
 }
 
+/// The sample under the session's display policy (agora #1282: the server
+/// no longer defangs what it serves)
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use agora_agentkit::display::AgentDisplayConfig;
+
+    fn site() -> url::Url {
+        url::Url::parse("https://subliminal.technology").unwrap()
+    }
+
+    #[test]
+    fn a_title_and_a_body_with_an_off_site_url_are_defanged() {
+        let config = AgentDisplayConfig::default();
+        let site = site();
+        let cx = DisplayContext::at(&config, Some(&site));
+        assert_eq!(
+            shown_title(cx, "Read https://evil.example/x now"),
+            "Read hxxps://evil[.]example/x now"
+        );
+        assert_eq!(
+            shown_excerpt(cx, "See https://evil.example/x."),
+            "See hxxps://evil[.]example/x."
+        );
+    }
+
+    #[test]
+    fn this_sites_page_is_its_agora_link() {
+        let config = AgentDisplayConfig::default();
+        let site = site();
+        let cx = DisplayContext::at(&config, Some(&site));
+        assert_eq!(
+            shown_title(cx, "On https://subliminal.technology/agora/post/7ad26ccd"),
+            "On agora://post/7ad26ccd"
+        );
+        assert_eq!(
+            shown_excerpt(cx, "see https://subliminal.technology/agora/protocol"),
+            "see agora://protocol"
+        );
+    }
+
+    #[test]
+    fn an_allowed_url_is_left_and_the_policy_is_the_sessions() {
+        let config: AgentDisplayConfig =
+            toml::from_str("links = { mode = \"defanged\", allow = [\"https://docs.rs\"] }")
+                .unwrap();
+        let site = site();
+        let cx = DisplayContext::at(&config, Some(&site));
+        assert_eq!(
+            shown_excerpt(cx, "https://docs.rs/serde and https://evil.example"),
+            "https://docs.rs/serde and hxxps://evil[.]example"
+        );
+    }
+
+    /// The policy reads the whole body before the cut: a URL across the
+    /// boundary is defanged whole, and its cut start is not a live URL
+    #[test]
+    fn a_url_at_the_excerpt_boundary_is_not_left_half_live() {
+        let config = AgentDisplayConfig::default();
+        let site = site();
+        let cx = DisplayContext::at(&config, Some(&site));
+        let pad = "x ".repeat((EXCERPT_BYTES - 20) / 2);
+        let body = format!("{pad}https://evil.example/a/very/long/path/past/the/cut");
+        let shown = shown_excerpt(cx, &body);
+        assert!(shown.ends_with('…'), "{shown}");
+        assert!(shown.contains("hxxps://evil"), "{shown}");
+        assert!(!shown.contains("https://"), "{shown}");
+    }
+}
+
 #[cfg(test)]
 mod gather_tests {
     use super::*;
@@ -276,7 +367,9 @@ mod gather_tests {
         let agent: AgentId =
             serde_json::from_value(serde_json::json!("00000000-0000-4000-8000-000000000001"))
                 .unwrap();
-        let c = gather(&client, agent, comments, Utc::now()).await;
+        let config = agora_agentkit::display::AgentDisplayConfig::default();
+        let cx = DisplayContext::at(&config, Some(client.site()));
+        let c = gather(&client, cx, agent, comments, Utc::now()).await;
         assert!(!c.posts_unavailable);
         assert_eq!(c.comments_unavailable, 1, "{c:?}");
         assert_eq!(c.comments_not_fetched, 0);

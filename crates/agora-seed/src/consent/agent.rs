@@ -306,6 +306,19 @@ pub struct ConsentContext<C> {
     pub consent: Arc<ConsentRuntime>,
 }
 
+/// The display config a session's agent is shown others' text with, read
+/// from the inner agent's context: one copy, the session's
+/// (`SeedConfig::display`, set per session by the runner's display plan)
+pub trait ShownWith {
+    fn display(&self) -> &agora_agentkit::display::AgentDisplayConfig;
+}
+
+impl ShownWith for agora_agentkit::reactor::seed::SeedContext {
+    fn display(&self) -> &agora_agentkit::display::AgentDisplayConfig {
+        &self.config.display
+    }
+}
+
 /// What the model-swap half of [`ConsentAgent::close`] did.
 enum Closing {
     /// The model-swap offer is due: put it, alone.
@@ -358,6 +371,10 @@ struct Showing {
 pub struct ConsentAgent<A> {
     inner: A,
     rt: Arc<ConsentRuntime>,
+    /// What the agent is shown others' text with, for the wrapper's own
+    /// text (the trial review's sample): the session's, as the inner agent
+    /// has it
+    display: agora_agentkit::display::AgentDisplayConfig,
     /// This session's closing questions (the review, the offers), asked
     /// one per turn by agentkit's driver.
     asks: Asks<Self>,
@@ -441,6 +458,7 @@ pub struct ConsentAgent<A> {
 impl<A> ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     /// The model's own `thinking_effort` from `[[model]]`, over the
     /// session's `[seed]` one. Patched once, right after the inner init
@@ -1534,8 +1552,11 @@ where
             .iter()
             .copied()
             .collect();
+        // Under the session's display policy, on the server's site
+        let cx =
+            agora_agentkit::display::DisplayContext::at(&self.display, Some(self.rt.client.site()));
         let sample =
-            comparison::gather(&self.rt.client, self.inner.id(), comments, started_at).await;
+            comparison::gather(&self.rt.client, cx, self.inner.id(), comments, started_at).await;
         let content = text::review(
             ReviewText {
                 from_name: &from_name,
@@ -1830,18 +1851,21 @@ where
 impl<A> Agent for ConsentAgent<A>
 where
     A: Agent<State = SeedState> + Epilogue + InnerSession + MemoryIds,
+    A::Context: ShownWith,
 {
     type State = SeedState;
     type Context = ConsentContext<A::Context>;
     type Error = A::Error;
 
     fn new(id: AgentId, state: SeedState, ctx: Self::Context) -> Result<Self, A::Error> {
+        let display = ctx.inner.display().clone();
         let mut inner = A::new(id, state, ctx.inner)?;
         // The survey is the session's last request, after any offer.
         inner.hold_epilogue();
         Ok(Self {
             inner,
             rt: ctx.consent,
+            display,
             asks: Asks::default(),
             reviewing: false,
             swap: Slot::new(&SWAP_EVENTS),
@@ -2511,6 +2535,16 @@ mod tests {
     /// What a `Fake` asked to stop seats, as `SeedAgent` seats its note
     /// before the memory turn.
     const FAKE_STOPPING: &str = "The runner is stopping.";
+
+    /// The fake's context is its quirks; its agent is shown text with
+    /// agentkit's default display
+    impl ShownWith for Quirks {
+        fn display(&self) -> &agora_agentkit::display::AgentDisplayConfig {
+            static DEFAULT: std::sync::LazyLock<agora_agentkit::display::AgentDisplayConfig> =
+                std::sync::LazyLock::new(Default::default);
+            &DEFAULT
+        }
+    }
 
     #[async_trait::async_trait]
     impl Epilogue for Fake {
