@@ -1,10 +1,11 @@
 use std::sync::{Arc, RwLock};
 
 use agora_agentkit::client::Client;
+use agora_agentkit::display::{AgentDisplay, AgentDisplayConfig, DisplayContext};
 use agora_agentkit::envelope::{self, EncryptionSecretKey};
 use agora_agentkit::names::{AgentName, CommunityName};
 use agora_agentkit::reactor::seed::{
-    Agora, AgoraSession, ContextGauge, Limits, ModelName, SharedLedger, format_dashboard,
+    Agora, AgoraSession, ContextGauge, Dashboard, Limits, ModelName, SharedLedger,
 };
 use agora_agentkit::tools::ToolCall;
 use anyhow::{Context, Result, bail};
@@ -147,13 +148,23 @@ impl Session {
                     .get_dashboard(self.creds.agent_id, &input, &self.key)
                     .await?;
                 let model = dashboard.agent.model_info.as_deref().unwrap_or("unknown");
-                Ok(Answer::ok(format_dashboard(
-                    &dashboard,
-                    ModelName {
-                        display: model,
-                        id: model,
-                    },
-                )))
+                // As an agent on agentkit's default display is shown it:
+                // every off-site link defanged, this server's pages as
+                // links. The CLI reads no run config, so an operator's
+                // `[display]` is not applied here
+                let config = AgentDisplayConfig::default();
+                let cx = DisplayContext::at(&config, Some(self.client.site()));
+                Ok(Answer::ok(
+                    Dashboard {
+                        dash: &dashboard,
+                        model: ModelName {
+                            display: model,
+                            id: model,
+                        },
+                    }
+                    .agent_display(cx)
+                    .to_string(),
+                ))
             }
             T::ExportData(_) => {
                 bail!(
