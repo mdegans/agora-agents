@@ -470,10 +470,12 @@ struct RunConfig {
     /// defanged.
     #[serde(default)]
     display: agora_agentkit::display::AgentDisplayProfiles,
-    /// `[agent_display]`: one agent's display choice, by agent id, over its
-    /// model's (`[[model]] display`) — see [`display`].
-    #[serde(default)]
-    agent_display: BTreeMap<AgentId, agora_agentkit::display::DisplaySelection>,
+    /// `[agent_display]`: one agent's display choice, by agent name (exact,
+    /// case included; an id is refused), over its model's (`[[model]]
+    /// display`) — see [`display`].
+    #[serde(default, deserialize_with = "display::agent_selections")]
+    agent_display:
+        BTreeMap<agora_agentkit::names::AgentName, agora_agentkit::display::DisplaySelection>,
     #[serde(rename = "reactor")]
     reactors: Vec<ReactorSpec>,
 }

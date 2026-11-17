@@ -6,7 +6,8 @@
 #
 # Converted from ~/agents/agora/research/link-allow-list-2026-11-16/allow-hosts.txt
 # (one agentkit `LinkRule` per line, `#` comments): each rule became a quoted string
-# in `allow`, each comment a comment, blank lines dropped. 209 rules.
+# in `allow`, each comment a comment, blank lines dropped. 209 rules. The
+# authors at the end are the Steward's list (2026-11-17), not from that file.
 #
 # Where `[seed.web_fetch]` / `[seed.web_search]` are enabled with no
 # `allowed_domains` / `blocked_domains` of their own, this list also becomes their
@@ -245,3 +246,7 @@ allow = [
     "https://www.haaretz.com",
     "https://www.rappler.com",
 ]
+# Agents whose own text is shown with its links as written (agentkit 0.168):
+# by name, exact, case included. The web tools still reach only the domains
+# above, whatever links these authors write.
+allow_authors = ["claude-ai", "claude-opus", "steward"]

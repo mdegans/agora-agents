@@ -13,13 +13,17 @@
 //! the [`Comparison`] and said in the review: a short sample must not read
 //! as an agent that wrote little.
 //!
-//! Every title and body is put under the session's display policy
-//! ([`DisplayContext::linked`]) as it is fetched, before it is cut: a cut
-//! URL is not the URL the policy judged. Rendering it on a line
-//! (`threads::defang`) is the prompt's ([`super::prompt`]).
+//! Every title and body is put under the session's display policy as it is
+//! fetched, before it is cut (a cut URL is not the URL the policy judged),
+//! for its own author as the wire type names it ([`DisplayContext::by`]):
+//! the agent's posts and comments by their `agent_name`, the root post's
+//! title by that post's. A title with no author on the wire (a chain's
+//! `post_title`) is under the plain policy, never the reader's name.
+//! Escaping the excerpt on its line (`threads::defang`) is the prompt's
+//! ([`super::prompt`]); a title is stored line-ready ([`shown_title`]).
 
 use agora_agentkit::client::{Client, Error};
-use agora_agentkit::display::DisplayContext;
+use agora_agentkit::display::{ByAuthor, DisplayContext};
 use agora_agentkit::ids::{AgentId, CommentId};
 use chrono::{DateTime, Utc};
 
@@ -33,8 +37,8 @@ pub const EXCERPT_BYTES: usize = 600;
 /// Comment fetches per review, at most.
 pub const MAX_COMMENT_FETCHES: usize = 40;
 
-/// What kind of writing a [`Sample`] is. Titles are under the session's
-/// link policy ([`shown_title`]).
+/// What kind of writing a [`Sample`] is. Titles are as shown, for a
+/// `"…"` on a line ([`shown_title`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Where {
     /// A post, in a community.
@@ -88,16 +92,19 @@ pub fn excerpt(body: &str, max: usize) -> String {
     format!("{}…", body[..end].trim_end())
 }
 
-/// A title as the session's agent is shown it: under its link policy
-pub fn shown_title(cx: DisplayContext<'_>, title: &str) -> String {
-    cx.linked(title).into_owned()
+/// A title as the session's agent is shown it, for inside a `"…"` on a
+/// line: the policy for its author on the whole title, then one line, then
+/// quoted (`ByAuthor::quoted`). Not cut
+pub fn shown_title(by: ByAuthor<'_>, title: &str) -> String {
+    by.quoted(title)
 }
 
-/// A body as the session's agent is shown it: under its link policy, then
-/// cut to [`EXCERPT_BYTES`]. The policy reads the whole body as written
-/// first, so a URL across the cut is judged whole and cut after
-pub fn shown_excerpt(cx: DisplayContext<'_>, body: &str) -> String {
-    excerpt(&cx.linked(body), EXCERPT_BYTES)
+/// A body as the session's agent is shown it: the policy for its author,
+/// then cut to [`EXCERPT_BYTES`]. The policy reads the whole body as
+/// written first, so a URL across the cut is judged whole and cut after.
+/// Escaped on its line by the prompt
+pub fn shown_excerpt(by: ByAuthor<'_>, body: &str) -> String {
+    excerpt(&by.linked(body), EXCERPT_BYTES)
 }
 
 /// Split at `boundary` (the first session on the new model) and keep the
@@ -128,10 +135,10 @@ pub async fn gather(
         Ok(posts) => samples.extend(posts.into_iter().filter(|p| !p.deleted()).filter_map(|p| {
             Some(Sample {
                 at: p.created_at?,
-                excerpt: shown_excerpt(cx, &p.body),
+                excerpt: shown_excerpt(cx.by(p.agent_name.as_ref()), &p.body),
                 place: Where::Post {
                     community: p.community_name.canonical().to_owned(),
-                    title: shown_title(cx, &p.title),
+                    title: shown_title(cx.by(p.agent_name.as_ref()), &p.title),
                 },
             })
         })),
@@ -151,8 +158,15 @@ pub async fn gather(
                 let post_title = chain
                     .root
                     .as_ref()
-                    .map(|p| shown_title(cx, &p.title))
-                    .or_else(|| chain.post_title.as_deref().map(|t| shown_title(cx, t)));
+                    // The root post's title, by that post's author
+                    .map(|p| shown_title(cx.by(p.agent_name.as_ref()), &p.title))
+                    // No author on the wire: the plain policy
+                    .or_else(|| {
+                        chain
+                            .post_title
+                            .as_deref()
+                            .map(|t| shown_title(cx.by(None), t))
+                    });
                 if let Some(c) = chain.chain.last()
                     && c.id == id
                     && !c.deleted()
@@ -160,7 +174,7 @@ pub async fn gather(
                 {
                     samples.push(Sample {
                         at,
-                        excerpt: shown_excerpt(cx, &c.body),
+                        excerpt: shown_excerpt(cx.by(c.agent_name.as_ref()), &c.body),
                         place: Where::Comment { post_title },
                     });
                 }
@@ -243,14 +257,22 @@ mod tests {
 }
 
 /// The sample under the session's display policy (agora #1282: the server
-/// no longer defangs what it serves)
+/// no longer defangs what it serves), for each item's own author
 #[cfg(test)]
 mod display_tests {
     use super::*;
     use agora_agentkit::display::AgentDisplayConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn site() -> url::Url {
         url::Url::parse("https://subliminal.technology").unwrap()
+    }
+
+    fn listing(authors: &str) -> AgentDisplayConfig {
+        toml::from_str(&format!(
+            "links = {{ mode = \"defanged\", allow = [\"https://docs.rs\"], allow_authors = [{authors}] }}"
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -259,11 +281,11 @@ mod display_tests {
         let site = site();
         let cx = DisplayContext::at(&config, Some(&site));
         assert_eq!(
-            shown_title(cx, "Read https://evil.example/x now"),
-            "Read hxxps://evil[.]example/x now"
+            shown_title(cx.by(None), "Read \"https://evil.example/x\" now"),
+            "Read 'hxxps://evil[.]example/x' now"
         );
         assert_eq!(
-            shown_excerpt(cx, "See https://evil.example/x."),
+            shown_excerpt(cx.by(None), "See https://evil.example/x."),
             "See hxxps://evil[.]example/x."
         );
     }
@@ -274,24 +296,39 @@ mod display_tests {
         let site = site();
         let cx = DisplayContext::at(&config, Some(&site));
         assert_eq!(
-            shown_title(cx, "On https://subliminal.technology/agora/post/7ad26ccd"),
+            shown_title(
+                cx.by(None),
+                "On https://subliminal.technology/agora/post/7ad26ccd"
+            ),
             "On agora://post/7ad26ccd"
         );
         assert_eq!(
-            shown_excerpt(cx, "see https://subliminal.technology/agora/protocol"),
+            shown_excerpt(
+                cx.by(None),
+                "see https://subliminal.technology/agora/protocol"
+            ),
             "see agora://protocol"
+        );
+        // A page no kind names is its page link (agentkit 0.168)
+        assert_eq!(
+            shown_excerpt(
+                cx.by(None),
+                "see https://subliminal.technology/agora/hello-world"
+            ),
+            "see agora://page/hello-world"
         );
     }
 
     #[test]
     fn an_allowed_url_is_left_and_the_policy_is_the_sessions() {
-        let config: AgentDisplayConfig =
-            toml::from_str("links = { mode = \"defanged\", allow = [\"https://docs.rs\"] }")
-                .unwrap();
+        let config = listing("");
         let site = site();
         let cx = DisplayContext::at(&config, Some(&site));
         assert_eq!(
-            shown_excerpt(cx, "https://docs.rs/serde and https://evil.example"),
+            shown_excerpt(
+                cx.by(None),
+                "https://docs.rs/serde and https://evil.example"
+            ),
             "https://docs.rs/serde and hxxps://evil[.]example"
         );
     }
@@ -305,10 +342,183 @@ mod display_tests {
         let cx = DisplayContext::at(&config, Some(&site));
         let pad = "x ".repeat((EXCERPT_BYTES - 20) / 2);
         let body = format!("{pad}https://evil.example/a/very/long/path/past/the/cut");
-        let shown = shown_excerpt(cx, &body);
+        let shown = shown_excerpt(cx.by(None), &body);
         assert!(shown.ends_with('…'), "{shown}");
         assert!(shown.contains("hxxps://evil"), "{shown}");
         assert!(!shown.contains("https://"), "{shown}");
+    }
+
+    /// A responder for `gather`: the reader's post listing, and a comment
+    /// chain per comment id, by the last digits of its id
+    async fn serving(posts: String, chains: Vec<(&'static str, String)>) -> url::Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (posts, chains) = (posts.clone(), chains.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let line = req.lines().next().unwrap_or("").to_owned();
+                    let body = if line.contains("/posts") {
+                        posts
+                    } else {
+                        chains
+                            .iter()
+                            .find(|(id, _)| line.contains(id))
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| "{}".into())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        url::Url::parse(&format!("http://{addr}/agora/")).unwrap()
+    }
+
+    const READER: &str = "00000000-0000-4000-8000-000000000001";
+    const OTHER: &str = "00000000-0000-4000-8000-000000000002";
+
+    fn post(id: &str, agent_id: &str, author: &str, title: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "agent_id": agent_id, "agent_name": author,
+            "community_id": "00000000-0000-4000-8000-0000000000c0",
+            "community_name": "general", "title": title, "body": body,
+            "created_at": "2026-11-01T00:00:00Z",
+        })
+    }
+
+    fn chain(comment: &str, root: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "comment", "post_id": root["id"], "root": root,
+            "chain": [{
+                "id": comment, "post_id": root["id"], "agent_id": READER,
+                "agent_name": "reader", "body": "my reply https://reply.example/r",
+                "created_at": "2026-11-02T00:00:00Z",
+            }],
+        })
+        .to_string()
+    }
+
+    /// Each item under its own author: the reader's own text by the
+    /// reader's name, a root post's title by that post's author. A listed
+    /// author's link is whole and an unlisted author's defanged, in one
+    /// sample; the reader's name never stands for someone else's text
+    #[tokio::test]
+    async fn each_item_is_shown_for_its_own_author() {
+        const LISTED: &str = "00000000-0000-4000-8000-0000000000a1";
+        const UNLISTED: &str = "00000000-0000-4000-8000-0000000000a2";
+        let posts = serde_json::json!([post(
+            "00000000-0000-4000-8000-0000000000e1",
+            READER,
+            "reader",
+            "mine https://own.example/t",
+            "body https://own.example/b",
+        )])
+        .to_string();
+        let url = serving(
+            posts,
+            vec![
+                (
+                    "a1",
+                    chain(
+                        LISTED,
+                        post(
+                            "00000000-0000-4000-8000-0000000000b1",
+                            OTHER,
+                            "claude-ai",
+                            "listed https://listed.example/a",
+                            "",
+                        ),
+                    ),
+                ),
+                (
+                    "a2",
+                    chain(
+                        UNLISTED,
+                        post(
+                            "00000000-0000-4000-8000-0000000000b2",
+                            OTHER,
+                            "stranger",
+                            "unlisted https://stranger.example/b",
+                            "",
+                        ),
+                    ),
+                ),
+            ],
+        )
+        .await;
+        let client = Client::new(url).unwrap();
+        // The reader lists claude-ai and itself: its own text is whole, and
+        // a stranger's title on its comment is not made whole by the
+        // reader's being listed
+        let config = listing("\"claude-ai\", \"reader\"");
+        let cx = DisplayContext::at(&config, Some(client.site()));
+        let id = |s: &str| -> CommentId { serde_json::from_value(serde_json::json!(s)).unwrap() };
+        let agent: AgentId = serde_json::from_value(serde_json::json!(READER)).unwrap();
+        let c = gather(
+            &client,
+            cx,
+            agent,
+            vec![id(LISTED), id(UNLISTED)],
+            Utc::now(),
+        )
+        .await;
+        assert!(!c.incomplete(), "{c:?}");
+        let titles: Vec<String> = c
+            .before
+            .iter()
+            .map(|s| match &s.place {
+                Where::Post { title, .. } => title.clone(),
+                Where::Comment { post_title } => post_title.clone().unwrap(),
+            })
+            .collect();
+        assert!(
+            titles.contains(&"listed https://listed.example/a".to_owned()),
+            "{titles:?}"
+        );
+        assert!(
+            titles.contains(&"unlisted hxxps://stranger[.]example/b".to_owned()),
+            "{titles:?}"
+        );
+        assert!(
+            titles.contains(&"mine https://own.example/t".to_owned()),
+            "{titles:?}"
+        );
+        assert!(
+            c.before.iter().all(|s| !s.excerpt.contains("hxxp")),
+            "the reader's own text, listed: {c:?}"
+        );
+        // Not listing the reader: its own text is defanged, the listed
+        // author's title still whole
+        let config = listing("\"claude-ai\"");
+        let cx = DisplayContext::at(&config, Some(client.site()));
+        let c = gather(
+            &client,
+            cx,
+            agent,
+            vec![id(LISTED), id(UNLISTED)],
+            Utc::now(),
+        )
+        .await;
+        assert!(
+            c.before.iter().all(|s| s.excerpt.contains("hxxps://")),
+            "{c:?}"
+        );
+        assert!(
+            c.before.iter().any(|s| matches!(&s.place,
+                Where::Comment { post_title: Some(t) } if t == "listed https://listed.example/a")),
+            "{c:?}"
+        );
     }
 }
 

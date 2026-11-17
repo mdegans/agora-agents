@@ -32,6 +32,10 @@ fn local() -> EndpointTools {
 
 const ENDPOINTS: &[EndpointTools] = &[];
 
+/// The agents' names: `[agent_display]` is keyed by name
+const AGENT_NAME: &str = "beta-critic";
+const OTHER_NAME: &str = "beta-social";
+
 fn agent() -> AgentId {
     AgentId::from(uuid::Uuid::from_u128(
         0x9726e530_7df8_4f5a_8705_1164fd092fdf,
@@ -99,35 +103,32 @@ display = "open"
 id = "claude-haiku-4-5-20251001"
 
 [agent_display]
-"9726e530-7df8-4f5a-8705-1164fd092fdf" = "default"
+beta-critic = "default"
 "#;
 
 #[test]
 fn no_display_table_is_agentkits_default_for_every_session() {
     let (plan, _, _) = load("").unwrap();
-    let resolved = plan.resolve(&model(HAIKU), agent()).unwrap();
+    let resolved = plan.resolve(&model(HAIKU), AGENT_NAME).unwrap();
     assert_eq!(resolved.config, &AgentDisplayConfig::default());
     assert!(resolved.chosen.is_none());
-    assert_eq!(
-        resolved.config.links(),
-        &Links::Defanged { allow: Vec::new() }
-    );
+    assert_eq!(resolved.config.links(), &Links::default());
 }
 
 #[test]
 fn a_model_names_a_profile_and_an_agent_takes_its_own_over_it() {
     let (plan, _, _) = load(MIXED).unwrap();
     // On the profile its model chose
-    let on_profile = plan.resolve(&model(HAIKU), other_agent()).unwrap();
+    let on_profile = plan.resolve(&model(HAIKU), OTHER_NAME).unwrap();
     assert!(matches!(on_profile.config.links(), Links::Raw { deny } if deny.len() == 1));
     // A model with no choice is on the default
-    let default = plan.resolve(&model(OLD_HAIKU), other_agent()).unwrap();
-    assert!(matches!(default.config.links(), Links::Defanged { allow } if allow.len() == 2));
+    let default = plan.resolve(&model(OLD_HAIKU), OTHER_NAME).unwrap();
+    assert!(matches!(default.config.links(), Links::Defanged { allow, .. } if allow.len() == 2));
     // So is a model not in the table
-    let unlisted = plan.resolve(&model("unlisted"), other_agent()).unwrap();
+    let unlisted = plan.resolve(&model("unlisted"), OTHER_NAME).unwrap();
     assert_eq!(unlisted.config, default.config);
     // The agent's own choice ("default") is taken over its model's
-    let agent_choice = plan.resolve(&model(HAIKU), agent()).unwrap();
+    let agent_choice = plan.resolve(&model(HAIKU), AGENT_NAME).unwrap();
     assert_eq!(agent_choice.config, default.config);
     assert_eq!(
         agent_choice.passed_over,
@@ -142,7 +143,7 @@ fn a_config_written_in_place_on_a_model_is_taken_whole() {
          [[model]]\nid = \"m\"\ndisplay = { links = { mode = \"raw\" } }\n",
     )
     .unwrap();
-    let resolved = plan.resolve(&model("m"), agent()).unwrap();
+    let resolved = plan.resolve(&model("m"), AGENT_NAME).unwrap();
     assert_eq!(resolved.config.links(), &Links::Raw { deny: Vec::new() });
 }
 
@@ -161,13 +162,9 @@ fn an_unknown_profile_on_a_model_stops_the_load_and_names_it() {
 
 #[test]
 fn an_unknown_profile_for_an_agent_stops_the_load_and_names_it() {
-    let e = load("[agent_display]\n\"9726e530-7df8-4f5a-8705-1164fd092fdf\" = \"news\"\n")
-        .expect_err("refused");
+    let e = load("[agent_display]\nbeta-critic = \"news\"\n").expect_err("refused");
     let e = format!("{e:#}");
-    assert!(
-        e.contains("[agent_display] 9726e530-7df8-4f5a-8705-1164fd092fdf"),
-        "{e}"
-    );
+    assert!(e.contains("[agent_display] beta-critic"), "{e}");
     assert!(e.contains("no profile is defined"), "{e}");
 }
 
@@ -190,8 +187,20 @@ fn a_bad_rule_or_a_misspelt_key_is_refused_with_what_is_wrong() {
     assert!(format!("{e:#}").contains("link"), "{e:#}");
     // Nor a profile name agentkit reserves
     assert!(load("[[model]]\nid = \"m\"\ndisplay = \"Profiles\"\n").is_err());
-    // An agent is named by its id
-    assert!(load("[agent_display]\nbeta-critic = \"default\"\n").is_err());
+    // An agent is named by its name, not its id
+    let e = load("[agent_display]\n\"9726e530-7df8-4f5a-8705-1164fd092fdf\" = \"default\"\n")
+        .expect_err("refused");
+    let e = format!("{e:#}");
+    assert!(
+        e.contains("is an agent id; agents are chosen by name"),
+        "{e}"
+    );
+    // A key that is not a name
+    let e = load("[agent_display]\n\"a b\" = \"default\"\n").expect_err("refused");
+    assert!(
+        format!("{e:#}").contains("[agent_display]: \"a b\""),
+        "{e:#}"
+    );
 }
 
 #[test]
@@ -205,7 +214,14 @@ fn an_operator_list_on_a_tool_is_used_as_written_and_the_policy_is_not() {
     assert_eq!(web.fetch, WebSource::Operator);
     assert_eq!(web.search, WebSource::Policy);
     let done = plan
-        .apply(&mut config, web, &anthropic(), &model(HAIKU), agent(), "a")
+        .apply(
+            &mut config,
+            web,
+            &anthropic(),
+            &model(HAIKU),
+            agent(),
+            AGENT_NAME,
+        )
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Operator);
     let fetch = config.web_fetch.as_ref().unwrap();
@@ -239,7 +255,7 @@ fn the_policy_offer_sets_each_enabled_tools_lists() {
             &anthropic(),
             &model(OLD_HAIKU),
             other_agent(),
-            "a",
+            OTHER_NAME,
         )
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Offered);
@@ -261,10 +277,7 @@ fn the_policy_offer_sets_each_enabled_tools_lists() {
     );
     assert_eq!(
         config.display,
-        *plan
-            .resolve(&model(OLD_HAIKU), other_agent())
-            .unwrap()
-            .config
+        *plan.resolve(&model(OLD_HAIKU), OTHER_NAME).unwrap().config
     );
     // A raw profile's deny rule is a blocked list
     let mut config = base.clone();
@@ -274,7 +287,7 @@ fn the_policy_offer_sets_each_enabled_tools_lists() {
         &anthropic(),
         &model(HAIKU),
         other_agent(),
-        "b",
+        OTHER_NAME,
     )
     .unwrap();
     let fetch = config.web_fetch.as_ref().unwrap();
@@ -283,7 +296,14 @@ fn the_policy_offer_sets_each_enabled_tools_lists() {
     // agentkit's default (no allow rule) leaves the tools unfiltered
     let (plan, mut config, web) = load("[seed.web_fetch]\n[seed.web_search]\n").unwrap();
     let done = plan
-        .apply(&mut config, web, &anthropic(), &model(HAIKU), agent(), "c")
+        .apply(
+            &mut config,
+            web,
+            &anthropic(),
+            &model(HAIKU),
+            agent(),
+            AGENT_NAME,
+        )
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Offered);
     let fetch = config.web_fetch.as_ref().unwrap();
@@ -307,7 +327,7 @@ fn a_policy_that_cannot_be_sent_withholds_the_tool_from_the_session() {
             &anthropic(),
             &model("local"),
             other_agent(),
-            "a",
+            OTHER_NAME,
         )
         .unwrap();
     assert_eq!(
@@ -329,7 +349,7 @@ fn a_policy_that_cannot_be_sent_withholds_the_tool_from_the_session() {
         &anthropic(),
         &model(OLD_HAIKU),
         other_agent(),
-        "b",
+        OTHER_NAME,
     )
     .unwrap();
     assert!(config.web_fetch.is_some());
@@ -352,7 +372,7 @@ fn a_tool_the_operator_did_not_enable_stays_off() {
             &anthropic(),
             &model(OLD_HAIKU),
             agent(),
-            "a",
+            AGENT_NAME,
         )
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Off);
@@ -385,7 +405,7 @@ fn a_bridge_session_is_shown_what_a_fleet_session_is() {
             &anthropic(),
             &model(HAIKU),
             agent(),
-            "a",
+            AGENT_NAME,
         )
         .unwrap();
     bridge_plan
@@ -398,7 +418,7 @@ fn a_bridge_session_is_shown_what_a_fleet_session_is() {
             ),
             &crate::bridge::model_info().id,
             agent(),
-            "beta",
+            AGENT_NAME,
         )
         .unwrap();
     assert_eq!(bridge_config.display, fleet_config.display);
@@ -424,9 +444,8 @@ fn the_report_says_what_each_choice_shows_and_what_the_tools_get() {
     );
     assert!(report.contains("== display: [[model]] local\n"), "{report}");
     assert!(
-        report.contains(
-            "== display: [agent_display] 9726e530-7df8-4f5a-8705-1164fd092fdf (over its model's choice, if any)"
-        ),
+        report
+            .contains("== display: [agent_display] beta-critic (over its model's choice, if any)"),
         "{report}"
     );
     // A model without a choice is not listed: it is on the default
@@ -594,11 +613,32 @@ fn the_fleets_proposed_display_table_loads() {
         "{summary}"
     );
     assert!(full.lines().count() > 600);
-    let resolved = plan.resolve(&model(HAIKU), agent()).unwrap();
-    let Links::Defanged { allow } = resolved.config.links() else {
+    let resolved = plan.resolve(&model(HAIKU), AGENT_NAME).unwrap();
+    let Links::Defanged {
+        allow,
+        allow_authors,
+    } = resolved.config.links()
+    else {
         panic!("defanged");
     };
     assert_eq!(allow.len(), 209);
+    let authors: Vec<&str> = allow_authors.iter().map(|a| a.as_ref()).collect();
+    assert_eq!(authors, ["claude-ai", "claude-opus", "steward"]);
+    // The summary names each author, and says the tools are not widened by them
+    for name in &authors {
+        assert!(
+            summary.contains(&format!("     author {name}\n")),
+            "{summary}"
+        );
+    }
+    assert!(summary.contains("and in 3 authors' own text"), "{summary}");
+    assert_eq!(
+        summary
+            .matches("3 authors' own text is shown with its links as written; the tool still reaches only the domains above")
+            .count(),
+        2,
+        "{summary}"
+    );
     let rules: Vec<LinkRule> = allow.clone();
     assert!(
         rules
@@ -673,7 +713,7 @@ fn an_endpoint_without_server_tools_is_not_said_to_lose_them() {
             &local(),
             &model("local"),
             other_agent(),
-            "a",
+            OTHER_NAME,
         )
         .unwrap();
     assert_eq!(
@@ -694,7 +734,7 @@ fn an_endpoint_without_server_tools_is_not_said_to_lose_them() {
             &anthropic(),
             &model("local"),
             other_agent(),
-            "a",
+            OTHER_NAME,
         )
         .unwrap();
     assert_eq!(done.fetch, ToolOutcome::Withheld);
@@ -756,7 +796,8 @@ fn a_sessions_config_has_its_budgets_display_web_tools_and_cadence() {
         endpoint: &endpoint,
         cadence,
     };
-    let made = crate::session_config(&base, inputs(None), &model(HAIKU), agent(), "a").unwrap();
+    let made =
+        crate::session_config(&base, inputs(None), &model(HAIKU), agent(), AGENT_NAME).unwrap();
     // The model's budgets
     assert_eq!(made.act_max_tokens, 20000);
     assert_eq!(made.context_window, 200000);
@@ -779,7 +820,7 @@ fn a_sessions_config_has_its_budgets_display_web_tools_and_cadence() {
         inputs(Some((20, 158_400))),
         &model(HAIKU),
         agent(),
-        "a",
+        AGENT_NAME,
     )
     .unwrap();
     assert_eq!(switched.max_rounds, 20);
@@ -794,7 +835,7 @@ fn a_sessions_config_has_its_budgets_display_web_tools_and_cadence() {
         },
         &model("other"),
         agent(),
-        "a",
+        AGENT_NAME,
     )
     .unwrap();
     assert_eq!(other.act_max_tokens, base.act_max_tokens);
@@ -803,4 +844,18 @@ fn a_sessions_config_has_its_budgets_display_web_tools_and_cadence() {
         strings(&other.web_fetch.as_ref().unwrap().allowed_domains),
         Some(vec!["docs.rs"])
     );
+}
+
+/// Names are matched exactly, case included: production has `Oracle` and
+/// `oracle`, two agents
+#[test]
+fn an_agent_is_chosen_by_its_exact_name() {
+    let (plan, _, _) = load(
+        "[display.profiles.open]\nlinks = { mode = \"raw\" }\n[agent_display]\nOracle = \"open\"\n",
+    )
+    .unwrap();
+    let upper = plan.resolve(&model(HAIKU), "Oracle").unwrap();
+    assert_eq!(upper.config.links(), &Links::Raw { deny: Vec::new() });
+    let lower = plan.resolve(&model(HAIKU), "oracle").unwrap();
+    assert_eq!(lower.config, &AgentDisplayConfig::default());
 }

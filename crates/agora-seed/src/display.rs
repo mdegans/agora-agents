@@ -41,6 +41,7 @@ use agora_agentkit::display::{
     ToolDomains, ToolOffer, UnknownProfile,
 };
 use agora_agentkit::ids::AgentId;
+use agora_agentkit::names::AgentName;
 use agora_agentkit::reactor::seed::SeedConfig;
 use misanthropic::model::Model;
 
@@ -118,6 +119,32 @@ fn tool_field(tool: ServerTool) -> &'static str {
     }
 }
 
+/// `[agent_display]`: agent names, each a choice. A key that is an agent's
+/// id is refused (it passes the name rule, and would select no one), as
+/// agentkit refuses one in `allow_authors`; a key that is not a name is
+/// refused naming it. Names are matched exactly, case included
+pub fn agent_selections<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<AgentName, DisplaySelection>, D::Error> {
+    use serde::Deserialize as _;
+    use serde::de::Error as _;
+    BTreeMap::<String, DisplaySelection>::deserialize(d)?
+        .into_iter()
+        .map(|(given, selection)| {
+            if given.parse::<uuid::Uuid>().is_ok() {
+                return Err(D::Error::custom(format_args!(
+                    "[agent_display]: {given:?} is an agent id; agents are chosen by name \
+                     (the handle, like `claude-ai`)"
+                )));
+            }
+            let name = given
+                .parse::<AgentName>()
+                .map_err(|e| D::Error::custom(format_args!("[agent_display]: {given:?}: {e}")))?;
+            Ok((name, selection))
+        })
+        .collect()
+}
+
 /// The run's display config, checked: the profiles, each model's choice
 /// and each agent's
 #[derive(Debug, Clone, Default)]
@@ -126,7 +153,7 @@ pub struct DisplayPlan {
     /// `[[model]] display`, in table order
     models: Vec<(Model, DisplaySelection)>,
     /// `[agent_display]`
-    agents: BTreeMap<AgentId, DisplaySelection>,
+    agents: BTreeMap<AgentName, DisplaySelection>,
 }
 
 /// What became of one web tool in one session
@@ -160,7 +187,7 @@ impl DisplayPlan {
     pub fn new(
         profiles: AgentDisplayProfiles,
         specs: &[ModelSpec],
-        agents: BTreeMap<AgentId, DisplaySelection>,
+        agents: BTreeMap<AgentName, DisplaySelection>,
     ) -> anyhow::Result<Self> {
         let models: Vec<(Model, DisplaySelection)> = specs
             .iter()
@@ -171,10 +198,10 @@ impl DisplayPlan {
                 .check(selection)
                 .map_err(|e| anyhow::anyhow!("[[model]] {}: `display`: {e}", id.name()))?;
         }
-        for (id, selection) in &agents {
+        for (name, selection) in &agents {
             profiles
                 .check(selection)
-                .map_err(|e| anyhow::anyhow!("[agent_display] {id}: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("[agent_display] {name}: {e}"))?;
         }
         Ok(Self {
             profiles,
@@ -190,14 +217,16 @@ impl DisplayPlan {
             .map(|(_, selection)| selection)
     }
 
-    /// The display of `agent`'s session on `model`
+    /// The display of the session of the agent named `agent` on `model`.
+    /// The name is matched exactly, case included (`Oracle` is not
+    /// `oracle`)
     pub fn resolve(
         &self,
         model: &Model,
-        agent: AgentId,
+        agent: &str,
     ) -> Result<ResolvedDisplay<'_>, UnknownProfile> {
         self.profiles
-            .resolve(self.model_selection(model), self.agents.get(&agent))
+            .resolve(self.model_selection(model), self.agents.get(agent))
     }
 
     /// Set one session's display and web tools in `config`, which holds
@@ -212,7 +241,7 @@ impl DisplayPlan {
         agent: AgentId,
         agent_name: &str,
     ) -> Result<SessionDisplay, UnknownProfile> {
-        let resolved = self.resolve(model, agent)?;
+        let resolved = self.resolve(model, agent_name)?;
         let links = resolved.config.links();
         config.display = resolved.config.clone();
         let withheld = |tool: ServerTool| {
@@ -286,7 +315,7 @@ impl DisplayPlan {
         let agents = self
             .agents
             .iter()
-            .map(|(id, s)| (Scope::Agent(*id), self.profiles.resolve(None, Some(s))));
+            .map(|(name, s)| (Scope::Agent(name), self.profiles.resolve(None, Some(s))));
         default.chain(models).chain(agents)
     }
 
@@ -308,9 +337,12 @@ impl DisplayPlan {
                 }
             };
             let links = resolved.config.links();
-            let (mode, rules) = match links {
-                Links::Defanged { allow } => ("defanged", allow.len()),
-                Links::Raw { deny } => ("raw", deny.len()),
+            let (mode, rules, authors) = match links {
+                Links::Defanged {
+                    allow,
+                    allow_authors,
+                } => ("defanged", allow.len(), allow_authors.len()),
+                Links::Raw { deny } => ("raw", deny.len(), 0),
             };
             let fetch = links.fetch_domains();
             let search = links.search_domains();
@@ -323,6 +355,7 @@ impl DisplayPlan {
                     scope = %scope,
                     links_mode = mode,
                     link_rules = rules,
+                    link_authors = authors,
                     web_fetch,
                     web_fetch_notes = fetch.notes().len(),
                     web_search,
@@ -335,6 +368,7 @@ impl DisplayPlan {
                     scope = %scope,
                     links_mode = mode,
                     link_rules = rules,
+                    link_authors = authors,
                     web_fetch,
                     web_fetch_notes = fetch.notes().len(),
                     web_search,
@@ -351,7 +385,7 @@ impl DisplayPlan {
 enum Scope<'a> {
     Default,
     Model(&'a Model),
-    Agent(AgentId),
+    Agent(&'a AgentName),
 }
 
 impl fmt::Display for Scope<'_> {
@@ -359,7 +393,7 @@ impl fmt::Display for Scope<'_> {
         match self {
             Self::Default => f.write_str("default"),
             Self::Model(id) => write!(f, "[[model]] {}", id.name()),
-            Self::Agent(id) => write!(f, "[agent_display] {id}"),
+            Self::Agent(name) => write!(f, "[agent_display] {name}"),
         }
     }
 }
@@ -510,7 +544,8 @@ impl fmt::Display for Indented<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self(resolved, detail) = self;
         let rules: Vec<String> = match resolved.config.links() {
-            Links::Defanged { allow } => allow.iter().map(|r| format!("  allow {r}")).collect(),
+            // The authors' lines stay: who is trusted is a change, not a list
+            Links::Defanged { allow, .. } => allow.iter().map(|r| format!("  allow {r}")).collect(),
             Links::Raw { deny } => deny.iter().map(|r| format!("  deny {r}")).collect(),
         };
         resolved
