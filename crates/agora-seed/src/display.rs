@@ -37,8 +37,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use agora_agentkit::display::{
-    AgentDisplayProfiles, DisplaySelection, Links, ResolvedDisplay, ServerTool, ToolDomains,
-    ToolOffer, UnknownProfile,
+    AgentDisplayProfiles, DisplaySelection, DomainFilter, Links, ResolvedDisplay, ServerTool,
+    ToolDomains, ToolOffer, UnknownProfile,
 };
 use agora_agentkit::ids::AgentId;
 use agora_agentkit::reactor::seed::SeedConfig;
@@ -218,10 +218,19 @@ impl DisplayPlan {
     /// What every session is shown, for the operator at startup: the
     /// default, then each model's and each agent's choice, each with the
     /// two tools' domain filters, and which tools' lists are the
-    /// operator's instead. Nothing widened, withheld or overridden is
-    /// left out (agentkit's reports list every rule).
-    pub fn report(&self, web: WebSources) -> Report<'_> {
-        Report { plan: self, web }
+    /// operator's instead.
+    ///
+    /// [`Detail::Summary`] leaves out only the lists themselves (each
+    /// rule, each domain sent): every line saying a rule was widened or
+    /// not sent, a tool withheld or a list overridden is kept, and so is
+    /// what every entry also reaches. [`Detail::Full`] (`--dry-run`) is
+    /// agentkit's reports whole.
+    pub fn report(&self, web: WebSources, detail: Detail) -> Report<'_> {
+        Report {
+            plan: self,
+            web,
+            detail,
+        }
     }
 
     /// Each scope there is a choice for, and its resolution: the default,
@@ -315,10 +324,21 @@ impl fmt::Display for Scope<'_> {
     }
 }
 
+/// How much of the lists [`DisplayPlan::report`] prints
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// Counts and every change, not the rules and domains themselves:
+    /// what a run prints at every start
+    Summary,
+    /// Every rule and every domain sent: `--dry-run`
+    Full,
+}
+
 /// [`DisplayPlan::report`]
 pub struct Report<'a> {
     plan: &'a DisplayPlan,
     web: WebSources,
+    detail: Detail,
 }
 
 impl fmt::Display for Report<'_> {
@@ -338,10 +358,10 @@ impl fmt::Display for Report<'_> {
             }
             match resolved {
                 Ok(resolved) => {
-                    write!(f, "{}", Indented(&resolved))?;
+                    write!(f, "{}", Indented(&resolved, self.detail))?;
                     let links = resolved.config.links();
                     for domains in [links.fetch_domains(), links.search_domains()] {
-                        write!(f, "{}", ToolReport(&domains, self.web))?;
+                        write!(f, "{}", ToolReport(&domains, self.web, self.detail))?;
                     }
                 }
                 // `new` checked every selection
@@ -410,24 +430,54 @@ fn filter<T>(
     }
 }
 
-/// Every line of a [`ResolvedDisplay`], indented under its heading
-struct Indented<'a>(&'a ResolvedDisplay<'a>);
+/// A [`ResolvedDisplay`], indented under its heading. In a summary, its
+/// lines listing each rule (`  allow …`, `  deny …`) are left out: the
+/// count before them stays
+struct Indented<'a>(&'a ResolvedDisplay<'a>, Detail);
 
 impl fmt::Display for Indented<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
+        let Self(resolved, detail) = self;
+        let rules: Vec<String> = match resolved.config.links() {
+            Links::Defanged { allow } => allow.iter().map(|r| format!("  allow {r}")).collect(),
+            Links::Raw { deny } => deny.iter().map(|r| format!("  deny {r}")).collect(),
+        };
+        resolved
             .to_string()
             .lines()
+            .filter(|line| *detail == Detail::Full || !rules.iter().any(|r| r == line))
             .try_for_each(|line| writeln!(f, "   {line}"))
     }
 }
 
-/// A tool's [`ToolDomains`] report, or why it does not apply
-struct ToolReport<'a>(&'a ToolDomains, WebSources);
+/// A tool's [`ToolDomains`] report, or why it does not apply. In a
+/// summary, the lines that are an entry sent (`  wikipedia.org`) are left
+/// out; the count, what every entry also reaches, and each rule widened or
+/// not sent stay
+struct ToolReport<'a>(&'a ToolDomains, WebSources, Detail);
+
+impl ToolReport<'_> {
+    fn lines(&self) -> Vec<String> {
+        let Self(domains, _, detail) = self;
+        let entries: Vec<String> = match domains.filter() {
+            DomainFilter::Allowed(list) | DomainFilter::Blocked(list) => {
+                list.iter().map(|e| format!("  {e}")).collect()
+            }
+            DomainFilter::Unfiltered | DomainFilter::Withhold => Vec::new(),
+        };
+        let full = *detail == Detail::Full;
+        domains
+            .to_string()
+            .lines()
+            .filter(|line| full || !entries.iter().any(|e| e == line))
+            .map(str::to_owned)
+            .collect()
+    }
+}
 
 impl fmt::Display for ToolReport<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(domains, web) = self;
+        let Self(domains, web, _) = self;
         let tool = domains.tool();
         match web.of(tool) {
             WebSource::Off => {
@@ -440,14 +490,13 @@ impl fmt::Display for ToolReport<'_> {
                      policy's below is NOT applied",
                     table(tool)
                 )?;
-                domains
-                    .to_string()
-                    .lines()
+                self.lines()
+                    .iter()
                     .try_for_each(|line| writeln!(f, "     (not applied) {line}"))
             }
-            WebSource::Policy => domains
-                .to_string()
+            WebSource::Policy => self
                 .lines()
+                .iter()
                 .try_for_each(|line| writeln!(f, "   {line}")),
         }
     }

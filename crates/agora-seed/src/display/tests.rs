@@ -352,7 +352,7 @@ fn the_report_says_what_each_choice_shows_and_what_the_tools_get() {
          [seed.web_fetch]\nblocked_domains = [\"x.example\"]\n[seed.web_search]\n"
     ))
     .unwrap();
-    let report = plan.report(web).to_string();
+    let report = plan.report(web, Detail::Full).to_string();
     // The default, and each model's and agent's choice
     assert!(
         report.contains("== display: the default (every agent and model not listed below)"),
@@ -417,10 +417,89 @@ fn the_report_says_what_each_choice_shows_and_what_the_tools_get() {
     assert!(report.contains("not sent: http://localhost"), "{report}");
 }
 
+/// What a summary must keep of the full report: every line that says
+/// something was widened, not sent, withheld or overridden, and what each
+/// entry also reaches. It drops only the lines listing a rule or an entry
+fn summary_keeps_every_change(full: &str, summary: &str) {
+    let kept: std::collections::HashSet<&str> = summary.lines().collect();
+    for line in summary.lines() {
+        assert!(
+            full.lines().any(|l| l == line),
+            "not in the full report: {line}"
+        );
+    }
+    for line in full.lines() {
+        let change = [
+            "widened:",
+            "not sent:",
+            "withheld",
+            "NOT applied",
+            "each also",
+            "== display",
+            "display:",
+            "links:",
+        ]
+        .iter()
+        .any(|k| line.contains(k))
+            || line.trim_start().starts_with("web ");
+        assert!(
+            !change || kept.contains(line),
+            "dropped from the summary: {line}"
+        );
+    }
+}
+
+#[test]
+fn the_summary_lists_counts_and_every_change_but_not_the_lists() {
+    let (plan, _, web) = load(&format!(
+        "{MIXED}\n[[model]]\nid = \"local\"\ndisplay = \"local\"\n\
+         [seed.web_fetch]\nblocked_domains = [\"x.example\"]\n[seed.web_search]\n"
+    ))
+    .unwrap();
+    let full = plan.report(web, Detail::Full).to_string();
+    let summary = plan.report(web, Detail::Summary).to_string();
+    summary_keeps_every_change(&full, &summary);
+    // The counts and the changes
+    assert!(
+        summary.contains("   links: defanged, but for 2 allowed\n"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("   web search: allowed_domains, 2\n"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("widened: https://*.wikipedia.org as wikipedia.org"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("each also reaches its subdomains"),
+        "{summary}"
+    );
+    assert!(summary.contains("NOT applied"), "{summary}");
+    assert!(
+        summary.contains("web search: withheld: no allow rule can be sent"),
+        "{summary}"
+    );
+    assert!(summary.contains("not sent: http://localhost"), "{summary}");
+    assert!(
+        summary.contains("   display: profile `open`, chosen by the model\n"),
+        "{summary}"
+    );
+    // Not the rules or the entries themselves
+    assert!(
+        !summary.contains("allow https://www.bbc.com/news"),
+        "{summary}"
+    );
+    assert!(!summary.contains("deny https://evil.example"), "{summary}");
+    assert!(!summary.contains("\n     www.bbc.com/news\n"), "{summary}");
+    assert!(full.contains("\n     www.bbc.com/news\n"), "{full}");
+}
+
 #[test]
 fn the_report_says_when_a_tool_is_off() {
     let (plan, _, web) = load("").unwrap();
-    let report = plan.report(web).to_string();
+    let report = plan.report(web, Detail::Summary).to_string();
     assert!(report.starts_with("== display: every agent\n"), "{report}");
     assert!(
         report.contains("   web fetch: off ([seed.web_fetch] is absent)\n"),
@@ -438,7 +517,23 @@ fn the_report_says_when_a_tool_is_off() {
 #[test]
 fn the_fleets_proposed_display_table_loads() {
     let src = include_str!("../../examples/display.toml");
-    let (plan, _, _) = load(&format!("{src}\n[seed.web_fetch]\n[seed.web_search]\n")).unwrap();
+    let (plan, _, web) = load(&format!("{src}\n[seed.web_fetch]\n[seed.web_search]\n")).unwrap();
+    // A run's print is a summary: the counts and the 14 widened rules, not
+    // 209 rules and 417 entries
+    let full = plan.report(web, Detail::Full).to_string();
+    let summary = plan.report(web, Detail::Summary).to_string();
+    summary_keeps_every_change(&full, &summary);
+    assert!(summary.lines().count() < 30, "{summary}");
+    assert_eq!(summary.matches("widened:").count(), 14, "{summary}");
+    assert!(
+        summary.contains("   web fetch: allowed_domains, 208\n"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("   web search: allowed_domains, 209\n"),
+        "{summary}"
+    );
+    assert!(full.lines().count() > 600);
     let resolved = plan.resolve(&model(HAIKU), agent()).unwrap();
     let Links::Defanged { allow } = resolved.config.links() else {
         panic!("defanged");

@@ -4064,8 +4064,14 @@ async fn run(held: &mut Held) -> Result<()> {
     }
     let mut session_locks = claimed.locks;
 
-    // What agents are shown, and the web tools it gives them
-    say_raw!("{}", display_plan.report(web_sources));
+    // What agents are shown, and the web tools it gives them: every rule
+    // and domain listed on a dry run, counts and every change otherwise
+    let detail = if args.dry_run {
+        display::Detail::Full
+    } else {
+        display::Detail::Summary
+    };
+    say_raw!("{}", display_plan.report(web_sources, detail));
     display_plan.log(web_sources);
 
     // The plan, before anyone runs.
