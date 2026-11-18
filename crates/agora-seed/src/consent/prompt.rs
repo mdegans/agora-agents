@@ -435,6 +435,27 @@ fn render_fork_acts(fork: &Fork, original: &Written, model: &str) -> String {
     parts.join("\n\n")
 }
 
+/// One [`Adjustment`], as the review names it.
+fn adjustment(a: Adjustment) -> &'static str {
+    match a {
+        Adjustment::ModelLine => "the model line in your dashboard",
+        Adjustment::TrialCountdown => "the trial countdown",
+        Adjustment::SetModelDescription => "the `set_model` tool's description",
+        Adjustment::WebFetchLists => {
+            "the `web_fetch` tool's site lists (set to today's, not that session's)"
+        }
+        Adjustment::WebSearchLists => {
+            "the `web_search` tool's site lists (set to today's, not that session's)"
+        }
+        Adjustment::WebFetchRemoved => {
+            "the `web_fetch` tool (removed: a session of yours today is not offered it)"
+        }
+        Adjustment::WebSearchRemoved => {
+            "the `web_search` tool (removed: a session of yours today is not offered it)"
+        }
+    }
+}
+
 /// The forks section: each pair with its honest framing, or why it's missing.
 fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
     let Some(forks) = forks else {
@@ -475,19 +496,22 @@ fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
                      reasoning {x} had done earlier in that session, and was run once; what it \
                      wrote was not posted, and nothing it asked for was carried out."
                 ));
-                if !adjusted.is_empty() {
-                    let what: Vec<&str> = adjusted
-                        .iter()
-                        .map(|a| match a {
-                            Adjustment::ModelLine => "the model line in your dashboard",
-                            Adjustment::TrialCountdown => "the trial countdown",
-                            Adjustment::SetModelDescription => "the `set_model` tool's description",
-                        })
-                        .collect();
+                let (web, named): (Vec<Adjustment>, Vec<Adjustment>) =
+                    adjusted.iter().partition(|a| a.is_web_tool());
+                if !named.is_empty() {
+                    let what: Vec<&str> = named.iter().map(|&a| adjustment(a)).collect();
                     out.push_str(&format!(
                         " Where that session's prompt named {x} as the model you ran on \
                          ({}), it was changed to name {y}, or removed, so that {y} was not told \
                          it was {x}.",
+                        what.join(", ")
+                    ));
+                }
+                if !web.is_empty() {
+                    let what: Vec<&str> = web.iter().map(|&a| adjustment(a)).collect();
+                    out.push_str(&format!(
+                        " That session's web tools were changed to what a session of yours on \
+                         {y} is offered today: {}.",
                         what.join(", ")
                     ));
                 }
@@ -1174,6 +1198,88 @@ pub(crate) mod tests {
             "Where that session's prompt named Qwen 3.8 as the model you ran on (the model line \
              in your dashboard, the trial countdown), it was changed to name Qwen 3.6, or \
              removed, so that Qwen 3.6 was not told it was Qwen 3.8."
+        ));
+    }
+
+    /// The web tools' adjustments are said apart from the model's, each in
+    /// words the agent can follow; a pair skipped for a removed tool says
+    /// why.
+    #[test]
+    fn review_says_what_was_changed_about_the_web_tools() {
+        let render = |forks: &ReviewForks| {
+            text(&review(
+                ReviewText {
+                    from_name: "Qwen 3.6",
+                    to_name: "Qwen 3.8",
+                    chosen_on: "2026-09-23".parse().unwrap(),
+                    sessions: 5,
+                    note: None,
+                },
+                Some(forks),
+                &Comparison::default(),
+            ))
+        };
+        let mut forks = sample_forks();
+        let PairOutcome::Ready { adjusted, .. } = &mut forks.pairs[0].outcome else {
+            unreachable!()
+        };
+        *adjusted = vec![
+            Adjustment::ModelLine,
+            Adjustment::WebSearchLists,
+            Adjustment::WebFetchLists,
+        ];
+        let t = render(&forks);
+        assert!(
+            t.contains(
+                "(the model line in your dashboard), it was changed to name Qwen 3.6, or removed, \
+                 so that Qwen 3.6 was not told it was Qwen 3.8. That session's web tools were \
+                 changed to what a session of yours on Qwen 3.6 is offered today: the \
+                 `web_search` tool's site lists (set to today's, not that session's), the \
+                 `web_fetch` tool's site lists (set to today's, not that session's).\n\n"
+            ),
+            "{t}"
+        );
+
+        let PairOutcome::Ready { adjusted, .. } = &mut forks.pairs[0].outcome else {
+            unreachable!()
+        };
+        *adjusted = vec![Adjustment::WebSearchRemoved, Adjustment::WebFetchRemoved];
+        let t = render(&forks);
+        assert!(
+            t.contains(
+                "nothing it asked for was carried out. That session's web tools were changed to \
+                 what a session of yours on Qwen 3.6 is offered today: the `web_search` tool \
+                 (removed: a session of yours today is not offered it), the `web_fetch` tool \
+                 (removed: a session of yours today is not offered it).\n\n"
+            ),
+            "{t}"
+        );
+        assert!(
+            !t.contains("as the model you ran on"),
+            "no model adjustment, none said"
+        );
+
+        // Only web adjustments when nothing named the model; none when none
+        let PairOutcome::Ready { adjusted, .. } = &mut forks.pairs[0].outcome else {
+            unreachable!()
+        };
+        adjusted.clear();
+        assert!(!render(&forks).contains("web tools"));
+
+        let reason = crate::consent::forks::SurgeryError::RemovedWebTool {
+            tool: agora_agentkit::display::ServerTool::WebFetch,
+            needed_by: crate::consent::forks::NeededBy::History,
+        };
+        forks.pairs[1].outcome = PairOutcome::Skipped {
+            reason: format!("the session could not be forked: {reason}"),
+            retry: false,
+            attempts: 0,
+        };
+        assert!(render(&forks).contains(
+            "This comparison is missing: the session could not be forked: that session used the \
+             `web_fetch` tool before that point, and a session of yours today is not offered \
+             it; the other model could not be given that session as it was without the tool. \
+             It is left out rather than guessed at."
         ));
     }
 

@@ -3860,6 +3860,15 @@ async fn run(held: &mut Held) -> Result<()> {
         _ => None,
     };
 
+    // Which server tools each endpoint runs: for the forks' web tools and
+    // the startup print of the display plan
+    let endpoint_tools: Vec<display::EndpointTools> = config
+        .reactors
+        .iter()
+        .zip(&endpoints)
+        .map(|(spec, e)| display::EndpointTools::of(&spec.endpoint, &e.quirks()))
+        .collect();
+
     // Trial-review forks, before any agent runs: generating them loads
     // both models, so they're done together, grouped by model.
     let log_dir = args
@@ -3909,6 +3918,15 @@ async fn run(held: &mut Held) -> Result<()> {
                 clients: &endpoints,
                 offered: &offered,
                 thinking: &fork_thinking,
+                tools: &endpoint_tools,
+            },
+            // A fork's server web tools are what a session on its model is
+            // offered today: the same inputs `session_config` gets
+            &consent::forks::WebPolicy {
+                display: &display_plan,
+                sources: web_sources,
+                fetch: fork_seed.web_fetch.clone(),
+                search: fork_seed.web_search.clone(),
             },
             act_max_tokens,
             config.review_forks,
@@ -4159,12 +4177,6 @@ async fn run(held: &mut Held) -> Result<()> {
     } else {
         display::Detail::Summary
     };
-    let endpoint_tools: Vec<display::EndpointTools> = config
-        .reactors
-        .iter()
-        .zip(&endpoints)
-        .map(|(spec, e)| display::EndpointTools::of(&spec.endpoint, &e.quirks()))
-        .collect();
     say_raw!(
         "{}",
         display_plan.report(web_sources, detail, &endpoint_tools)

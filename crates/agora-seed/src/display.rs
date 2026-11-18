@@ -44,6 +44,7 @@ use agora_agentkit::ids::AgentId;
 use agora_agentkit::names::AgentName;
 use agora_agentkit::reactor::seed::SeedConfig;
 use misanthropic::model::Model;
+use misanthropic::tool::{WebFetch, WebSearch};
 
 use crate::models::ModelSpec;
 
@@ -111,8 +112,8 @@ fn table(tool: ServerTool) -> &'static str {
     }
 }
 
-/// A tool's name as the logs carry it
-fn tool_field(tool: ServerTool) -> &'static str {
+/// A tool's name as the logs (and the API) carry it
+pub fn tool_field(tool: ServerTool) -> &'static str {
     match tool {
         ServerTool::WebFetch => "web_fetch",
         ServerTool::WebSearch => "web_search",
@@ -242,40 +243,44 @@ impl DisplayPlan {
         agent_name: &str,
     ) -> Result<SessionDisplay, UnknownProfile> {
         let resolved = self.resolve(model, agent_name)?;
-        let links = resolved.config.links();
         config.display = resolved.config.clone();
-        let withheld = |tool: ServerTool| {
-            tracing::info!(
-                event_type = "web_tool_withheld",
-                agent = %agent_name,
-                agent_id = %agent,
-                model = %model.name(),
-                tool = tool_field(tool),
-                "the session's display policy has an allow list none of whose rules the tool \
-                 takes, so the tool is withheld rather than offered unfiltered"
-            );
-        };
-        let fetch = filter(
-            &mut config.web_fetch,
-            web.fetch,
-            endpoint.runs(ServerTool::WebFetch),
-            || links.fetch_domains(),
-            |t| (&mut t.allowed_domains, &mut t.blocked_domains),
-        );
-        if fetch == ToolOutcome::Withheld {
-            withheld(ServerTool::WebFetch);
-        }
-        let search = filter(
-            &mut config.web_search,
-            web.search,
-            endpoint.runs(ServerTool::WebSearch),
-            || links.search_domains(),
-            |t| (&mut t.allowed_domains, &mut t.blocked_domains),
-        );
-        if search == ToolOutcome::Withheld {
-            withheld(ServerTool::WebSearch);
-        }
-        Ok(SessionDisplay { fetch, search })
+        Ok(web_tools(
+            resolved.config.links(),
+            (&mut config.web_fetch, &mut config.web_search),
+            web,
+            endpoint,
+            model,
+            agent,
+            agent_name,
+        ))
+    }
+
+    /// The web tools alone of what [`apply`](Self::apply) sets: `fetch`
+    /// and `search` hold the run's (`[seed.web_*]`) and are left as a
+    /// session of the agent named `agent_name` on `model` would be offered
+    /// them. The same code as a session's, for what is not a session (a
+    /// trial-review fork, `consent::forks`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_web_tools(
+        &self,
+        fetch: &mut Option<WebFetch>,
+        search: &mut Option<WebSearch>,
+        web: WebSources,
+        endpoint: &EndpointTools,
+        model: &Model,
+        agent: AgentId,
+        agent_name: &str,
+    ) -> Result<SessionDisplay, UnknownProfile> {
+        let resolved = self.resolve(model, agent_name)?;
+        Ok(web_tools(
+            resolved.config.links(),
+            (fetch, search),
+            web,
+            endpoint,
+            model,
+            agent,
+            agent_name,
+        ))
     }
 
     /// What every session is shown, for the operator at startup: the
@@ -497,6 +502,51 @@ fn describe(domains: &ToolDomains, source: WebSource) -> &'static str {
 }
 
 type DomainList = Option<Vec<Cow<'static, str>>>;
+
+/// Both web tools of one session under `links`: [`filter`] on each, and
+/// the `web_tool_withheld` event for a tool withheld
+fn web_tools(
+    links: &Links,
+    (fetch_tool, search_tool): (&mut Option<WebFetch>, &mut Option<WebSearch>),
+    web: WebSources,
+    endpoint: &EndpointTools,
+    model: &Model,
+    agent: AgentId,
+    agent_name: &str,
+) -> SessionDisplay {
+    let withheld = |tool: ServerTool| {
+        tracing::info!(
+            event_type = "web_tool_withheld",
+            agent = %agent_name,
+            agent_id = %agent,
+            model = %model.name(),
+            tool = tool_field(tool),
+            "the session's display policy has an allow list none of whose rules the tool \
+             takes, so the tool is withheld rather than offered unfiltered"
+        );
+    };
+    let fetch = filter(
+        fetch_tool,
+        web.fetch,
+        endpoint.runs(ServerTool::WebFetch),
+        || links.fetch_domains(),
+        |t| (&mut t.allowed_domains, &mut t.blocked_domains),
+    );
+    if fetch == ToolOutcome::Withheld {
+        withheld(ServerTool::WebFetch);
+    }
+    let search = filter(
+        search_tool,
+        web.search,
+        endpoint.runs(ServerTool::WebSearch),
+        || links.search_domains(),
+        |t| (&mut t.allowed_domains, &mut t.blocked_domains),
+    );
+    if search == ToolOutcome::Withheld {
+        withheld(ServerTool::WebSearch);
+    }
+    SessionDisplay { fetch, search }
+}
 
 /// One tool of one session under its policy
 fn filter<T>(
