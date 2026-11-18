@@ -30,7 +30,9 @@
 //! `session_config` does it: the operator's explicit `[seed.web_*]` lists
 //! win), and each server web tool the dump has gets that session's
 //! `allowed_domains` / `blocked_domains`, or is removed when a session is
-//! not offered it ([`WebOffer`]). Nothing else of those tools changes, and
+//! not offered it ([`WebOffer`]). Each server call the fork's reply holds
+//! is kept as [`ForkAct::Server`] (the query or URL and how it went, not
+//! what came back), and the review says those ran. Nothing else of those tools changes, and
 //! a tool the dump lacks is not added. A dump the forking model's endpoint
 //! can't run server tools on keeps them as dumped (nothing is fetched). A
 //! removed tool that the history before the cut used, `tool_choice` names,
@@ -119,7 +121,8 @@ pub enum WriteId {
     Comment(CommentId),
 }
 
-/// One thing the fork did, rendered. Nothing here was executed.
+/// One thing the fork did, rendered. Nothing here was executed except a
+/// [`Server`](Self::Server) call, which the API ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "act", rename_all = "snake_case")]
 pub enum ForkAct {
@@ -133,6 +136,73 @@ pub enum ForkAct {
     Text {
         text: String,
     },
+    /// A server tool call, which, unlike every other act, the API **ran**
+    /// (on Anthropic's side) inside the fork's one call: its tool, what it
+    /// asked for (a search's query, a fetch's URL), and how it went. Never
+    /// what came back.
+    Server {
+        /// The tool as the API names it (`web_search`, `web_fetch`).
+        tool: String,
+        /// The query or URL; `None` if the input could not be read.
+        target: Option<String>,
+        outcome: ServerOutcome,
+        /// Made in the session before the cut, unfinished there (beside a
+        /// client call), and run by the API at the start of the fork's call.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        earlier: bool,
+    },
+}
+
+/// How a [`ForkAct::Server`] call went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerOutcome {
+    /// It ran and its result came back.
+    Done,
+    /// It ran and failed with this error code.
+    Failed { error_code: String },
+    /// No result came back in the reply: the API did not run it (a call
+    /// made beside a client call waits for the client's results).
+    NotRun,
+}
+
+impl ServerOutcome {
+    /// Whether the call reached Anthropic's tool (succeeded or failed).
+    pub fn ran(&self) -> bool {
+        !matches!(self, Self::NotRun)
+    }
+}
+
+impl Fork {
+    /// The server tool calls that ran, by tool name, in order of first use.
+    pub fn ran_server_tools(&self) -> Vec<&str> {
+        let mut tools: Vec<&str> = Vec::new();
+        for act in &self.acts {
+            if let ForkAct::Server { tool, outcome, .. } = act
+                && outcome.ran()
+                && !tools.contains(&tool.as_str())
+            {
+                tools.push(tool);
+            }
+        }
+        tools
+    }
+}
+
+/// A server tool call's input, typed: a search's query or a fetch's URL.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ServerInput {
+    Search { query: String },
+    Fetch { url: String },
+}
+
+/// What a server call asked for, if its input reads as a search or fetch.
+fn server_target(call: &misanthropic::tool::Use) -> Option<String> {
+    match serde_json::from_value::<ServerInput>(call.input.clone()).ok()? {
+        ServerInput::Search { query } => Some(query),
+        ServerInput::Fetch { url } => Some(url),
+    }
 }
 
 /// The fork's whole turn.
@@ -796,14 +866,95 @@ pub fn fork_prompt(
     Ok((prompt, adjusted))
 }
 
-/// What the fork did, for the review. Thinking is left out.
-pub fn render_fork(response: &response::Message) -> Fork {
+/// What the fork did, for the review. Thinking is left out; a server tool
+/// call is kept with how it went ([`ForkAct::Server`]), never with what it
+/// brought back. `prompt` is what the fork was sent: a result the reply
+/// opens with for a call made before the cut is matched to that call there.
+pub fn render_fork(prompt: &Prompt, response: &response::Message) -> Fork {
+    let content = &response.inner.content;
+    // The outcome of the server call `id`, from its result block, if the
+    // reply has one
+    let outcome = |id: &str| -> ServerOutcome {
+        content
+            .iter()
+            .find_map(|b| match b {
+                Block::WebSearchToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == id => Some(match content {
+                    misanthropic::prompt::message::WebSearchToolResultContent::Results(_) => {
+                        ServerOutcome::Done
+                    }
+                    misanthropic::prompt::message::WebSearchToolResultContent::Error(e) => {
+                        ServerOutcome::Failed {
+                            error_code: e.error_code.to_string(),
+                        }
+                    }
+                }),
+                Block::WebFetchToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == id => Some(match content {
+                    misanthropic::prompt::message::WebFetchToolResultContent::Result { .. } => {
+                        ServerOutcome::Done
+                    }
+                    misanthropic::prompt::message::WebFetchToolResultContent::Error {
+                        error_code,
+                    } => ServerOutcome::Failed {
+                        error_code: error_code.to_string(),
+                    },
+                }),
+                _ => None,
+            })
+            .unwrap_or(ServerOutcome::NotRun)
+    };
+    let in_reply: HashSet<&str> = content
+        .iter()
+        .filter_map(|b| match b {
+            Block::ServerToolUse { call } => Some(call.id.as_ref()),
+            _ => None,
+        })
+        .collect();
     let mut acts = Vec::new();
-    for block in response.inner.content.iter() {
+    for block in content.iter() {
         match block {
             Block::Text { text, .. } if !text.trim().is_empty() => acts.push(ForkAct::Text {
                 text: text.trim().to_string(),
             }),
+            Block::ServerToolUse { call } => acts.push(ForkAct::Server {
+                tool: call.name.to_string(),
+                target: server_target(call),
+                outcome: outcome(&call.id),
+                earlier: false,
+            }),
+            // A result for a call not in the reply: one the session made
+            // before the cut, which the API ran at the start of this call
+            Block::WebSearchToolResult { tool_use_id, .. }
+            | Block::WebFetchToolResult { tool_use_id, .. }
+                if !in_reply.contains(tool_use_id.as_ref()) =>
+            {
+                let call = prompt
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .find_map(|b| match b {
+                        Block::ServerToolUse { call } if call.id == *tool_use_id => Some(call),
+                        _ => None,
+                    });
+                let tool = match (call, block) {
+                    (Some(call), _) => call.name.to_string(),
+                    (None, Block::WebSearchToolResult { .. }) => "web_search".into(),
+                    (None, _) => "web_fetch".into(),
+                };
+                acts.push(ForkAct::Server {
+                    tool,
+                    target: call.and_then(server_target),
+                    outcome: outcome(tool_use_id),
+                    earlier: true,
+                });
+            }
             Block::ToolUse { call } => acts.push(match written(call) {
                 Some(w) => ForkAct::Write(w),
                 None => ForkAct::Call {
@@ -811,6 +962,9 @@ pub fn render_fork(response: &response::Message) -> Fork {
                     input: call.input.clone(),
                 },
             }),
+            // Thinking (left out, as said in the review), empty text, and a
+            // server call's result (kept above as its outcome, not its
+            // content). No other block comes from the tools a session has.
             _ => {}
         }
     }
@@ -1171,6 +1325,7 @@ impl WebPolicy<'_> {
             model,
             agent,
             name,
+            "review_fork",
         ) {
             Ok(outcome) => WebOffer::of(fetch, search, &outcome),
             // `DisplayPlan::new` checked every choice
@@ -1433,7 +1588,7 @@ pub async fn prepare<I: Inference>(
                     written_at: p.written_at,
                     id: p.turn.id,
                     original: p.turn.written.clone(),
-                    fork: render_fork(&response),
+                    fork: render_fork(&p.prompt, &response),
                     prompt_sha256: p.prompt_sha256.clone(),
                     adjusted: p.adjusted.clone(),
                 },
@@ -1894,15 +2049,18 @@ mod tests {
 
     #[test]
     fn render_keeps_what_it_did_and_drops_thinking() {
-        let fork = render_fork(&response(
-            serde_json::json!([
-                {"type": "thinking", "thinking": "hmm", "signature": ""},
-                {"type": "text", "text": "  I'd reply.  "},
-                {"type": "tool_use", "id": "x", "name": "create_comment", "input": {"reply_to": TARGET, "body": "Salt too."}},
-                {"type": "tool_use", "id": "y", "name": "cast_vote", "input": {"target": TARGET, "direction": "up"}},
-            ]),
-            "tool_use",
-        ));
+        let fork = render_fork(
+            &dump(NEW),
+            &response(
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "hmm", "signature": ""},
+                    {"type": "text", "text": "  I'd reply.  "},
+                    {"type": "tool_use", "id": "x", "name": "create_comment", "input": {"reply_to": TARGET, "body": "Salt too."}},
+                    {"type": "tool_use", "id": "y", "name": "cast_vote", "input": {"target": TARGET, "direction": "up"}},
+                ]),
+                "tool_use",
+            ),
+        );
         assert!(!fork.clipped);
         assert_eq!(fork.acts.len(), 3);
         assert_eq!(
@@ -1915,8 +2073,97 @@ mod tests {
             matches!(&fork.acts[1], ForkAct::Write(Written::Comment { body, .. }) if body == "Salt too.")
         );
         assert!(matches!(&fork.acts[2], ForkAct::Call { name, .. } if name == "cast_vote"));
-        let clipped = render_fork(&response(serde_json::json!([]), "max_tokens"));
+        let clipped = render_fork(&dump(NEW), &response(serde_json::json!([]), "max_tokens"));
         assert!(clipped.clipped && clipped.acts.is_empty());
+    }
+
+    /// A server tool call in the fork's reply ran, on Anthropic's side: it
+    /// is kept, with its query or URL and how it went, never what came
+    /// back. One the session left unfinished before the cut, whose result
+    /// opens the reply, is matched to its call in the prompt.
+    #[test]
+    fn render_keeps_server_calls_and_how_they_went() {
+        let mut sent = dump(NEW);
+        sent.messages[1].content.push(Block::ServerToolUse {
+            call: serde_json::from_value(serde_json::json!({"id": "srvtoolu_0",
+                "name": "web_fetch", "input": {"url": "https://example.com/earlier"}}))
+            .unwrap(),
+        });
+        let fork = render_fork(
+            &sent,
+            &response(
+                serde_json::json!([
+                    {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_0",
+                     "content": {"type": "web_fetch_tool_result_error", "error_code": "url_not_allowed"}},
+                    {"type": "text", "text": "Let me look."},
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                     "input": {"query": "salt rivers"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+                     "content": [{"type": "web_search_result", "url": "https://r.example/a",
+                        "title": "A", "encrypted_content": "zz", "page_age": null}]},
+                    {"type": "server_tool_use", "id": "srvtoolu_2", "name": "web_fetch",
+                     "input": {"url": "https://r.example/a"}},
+                    {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_2",
+                     "content": {"type": "web_fetch_result", "url": "https://r.example/a",
+                        "content": {"type": "document", "source": {"type": "text",
+                            "media_type": "text/plain", "data": "PAGE TEXT"}},
+                        "retrieved_at": "2026-11-18T00:00:00Z"}},
+                    {"type": "server_tool_use", "id": "srvtoolu_3", "name": "web_fetch",
+                     "input": {"url": "https://r.example/b"}},
+                    {"type": "tool_use", "id": "x", "name": "cast_vote", "input": {"target": TARGET}},
+                ]),
+                "tool_use",
+            ),
+        );
+        let server = |tool: &str, target: &str, outcome, earlier| ForkAct::Server {
+            tool: tool.into(),
+            target: Some(target.into()),
+            outcome,
+            earlier,
+        };
+        assert_eq!(
+            fork.acts,
+            [
+                server(
+                    "web_fetch",
+                    "https://example.com/earlier",
+                    ServerOutcome::Failed {
+                        error_code: "url_not_allowed".into()
+                    },
+                    true
+                ),
+                ForkAct::Text {
+                    text: "Let me look.".into()
+                },
+                server("web_search", "salt rivers", ServerOutcome::Done, false),
+                server(
+                    "web_fetch",
+                    "https://r.example/a",
+                    ServerOutcome::Done,
+                    false
+                ),
+                server(
+                    "web_fetch",
+                    "https://r.example/b",
+                    ServerOutcome::NotRun,
+                    false
+                ),
+                ForkAct::Call {
+                    name: "cast_vote".into(),
+                    input: serde_json::json!({"target": TARGET}),
+                },
+            ]
+        );
+        assert_eq!(fork.ran_server_tools(), ["web_fetch", "web_search"]);
+        let stored = serde_json::to_string(&fork).unwrap();
+        assert!(
+            !stored.contains("PAGE TEXT") && !stored.contains("zz"),
+            "{stored}"
+        );
+        assert_eq!(serde_json::from_str::<Fork>(&stored).unwrap(), fork);
+        // A reply with no server call: nothing ran
+        let plain = render_fork(&dump(NEW), &response(serde_json::json!([]), "end_turn"));
+        assert!(plain.ran_server_tools().is_empty());
     }
 
     fn at(day: u32) -> DateTime<Utc> {

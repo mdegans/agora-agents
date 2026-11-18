@@ -249,9 +249,8 @@ impl DisplayPlan {
             (&mut config.web_fetch, &mut config.web_search),
             web,
             endpoint,
-            model,
-            agent,
-            agent_name,
+            (model, agent, agent_name),
+            "session",
         ))
     }
 
@@ -259,7 +258,8 @@ impl DisplayPlan {
     /// and `search` hold the run's (`[seed.web_*]`) and are left as a
     /// session of the agent named `agent_name` on `model` would be offered
     /// them. The same code as a session's, for what is not a session (a
-    /// trial-review fork, `consent::forks`).
+    /// trial-review fork, `consent::forks`); `step` names it in the
+    /// `web_tool_withheld` event (a session's says `session`).
     #[allow(clippy::too_many_arguments)]
     pub fn session_web_tools(
         &self,
@@ -270,6 +270,7 @@ impl DisplayPlan {
         model: &Model,
         agent: AgentId,
         agent_name: &str,
+        step: &'static str,
     ) -> Result<SessionDisplay, UnknownProfile> {
         let resolved = self.resolve(model, agent_name)?;
         Ok(web_tools(
@@ -277,9 +278,8 @@ impl DisplayPlan {
             (fetch, search),
             web,
             endpoint,
-            model,
-            agent,
-            agent_name,
+            (model, agent, agent_name),
+            step,
         ))
     }
 
@@ -504,19 +504,20 @@ fn describe(domains: &ToolDomains, source: WebSource) -> &'static str {
 type DomainList = Option<Vec<Cow<'static, str>>>;
 
 /// Both web tools of one session under `links`: [`filter`] on each, and
-/// the `web_tool_withheld` event for a tool withheld
+/// the `web_tool_withheld` event for a tool withheld, with `step` saying
+/// what it was for (`session`, or a fork's `review_fork`)
 fn web_tools(
     links: &Links,
     (fetch_tool, search_tool): (&mut Option<WebFetch>, &mut Option<WebSearch>),
     web: WebSources,
     endpoint: &EndpointTools,
-    model: &Model,
-    agent: AgentId,
-    agent_name: &str,
+    (model, agent, agent_name): (&Model, AgentId, &str),
+    step: &'static str,
 ) -> SessionDisplay {
     let withheld = |tool: ServerTool| {
         tracing::info!(
             event_type = "web_tool_withheld",
+            step,
             agent = %agent_name,
             agent_id = %agent,
             model = %model.name(),

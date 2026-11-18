@@ -1565,6 +1565,7 @@ where
             },
             forks.as_ref(),
             &sample,
+            cx,
         );
         self.asks.push(ReviewQuestion {
             key,

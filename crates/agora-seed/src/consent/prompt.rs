@@ -37,10 +37,11 @@ use serde::{Deserialize, Serialize};
 
 use super::comparison::{Comparison, EXCERPT_BYTES, MAX_COMMENT_FETCHES, Sample, Where};
 use super::forks::{
-    Adjustment, BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, Side, Written,
+    Adjustment, BODY_CHARS, Fork, ForkAct, PairOutcome, ReviewForks, ServerOutcome, Side, Written,
 };
 use super::ledger::{MAX_FAILED_TRIAL_SESSIONS, TRIAL_SESSIONS, TrialNote};
 use super::offer::UNUSABLE_CAP;
+use agora_agentkit::display::DisplayContext;
 
 /// The agent's answer to the offer, as the ledger keeps it. `note` was
 /// `reason` until 2026-11-06, and is still read under that name.
@@ -409,10 +410,85 @@ fn render_written(w: &Written, original: Option<&Written>) -> String {
     }
 }
 
-fn render_fork_acts(fork: &Fork, original: &Written, model: &str) -> String {
+/// What of the fork's asks was carried out. Without a server tool call
+/// that ran, the sentence every review had; with one, it says which ran.
+fn carried_out(fork: &Fork) -> String {
+    const NOTHING: &str = "what it wrote was not posted, and nothing it asked for was carried out.";
+    let ran = fork.ran_server_tools();
+    if ran.is_empty() {
+        return NOTHING.to_string();
+    }
+    let kinds: Vec<&str> = ran
+        .iter()
+        .map(|t| match *t {
+            "web_search" => "web searches",
+            "web_fetch" => "page fetches",
+            _ => "server tool calls",
+        })
+        .fold(Vec::new(), |mut v, k| {
+            if !v.contains(&k) {
+                v.push(k);
+            }
+            v
+        });
+    format!(
+        "what it wrote was not posted, and nothing it asked Agora for was carried out, but the \
+         {} shown below did run, on Anthropic's side.",
+        kinds.join(" and ")
+    )
+}
+
+/// One server tool call of the fork, on a line: what it asked for, put
+/// under the reader's display policy as the review's sample puts a title
+/// with no author ([`shown_title`](super::comparison::shown_title)), and how
+/// it went. Never what came back.
+fn render_server(
+    tool: &str,
+    target: Option<&str>,
+    outcome: &ServerOutcome,
+    earlier: bool,
+    cx: DisplayContext<'_>,
+) -> String {
+    let shown = target.map(|t| super::comparison::shown_title(cx.by(None), t));
+    let what = match (tool, shown) {
+        ("web_search", Some(q)) => format!("searched the web for \"{q}\""),
+        ("web_search", None) => "searched the web with a query that could not be read".to_string(),
+        ("web_fetch", Some(u)) => format!("fetched the page \"{u}\""),
+        ("web_fetch", None) => "fetched a page whose address could not be read".to_string(),
+        (other, _) => format!("called the server tool `{other}`"),
+    };
+    let how = match outcome {
+        ServerOutcome::Done => "this ran, on Anthropic's side, and a result came back".to_string(),
+        ServerOutcome::Failed { error_code } => {
+            format!("this ran, on Anthropic's side, and failed: `{error_code}`")
+        }
+        ServerOutcome::NotRun => "this did not run: no result came back".to_string(),
+    };
+    if earlier {
+        format!(
+            "The session had {what} just before that point, unfinished there; it was finished \
+             at the start of this run ({how})."
+        )
+    } else {
+        format!("It {what} ({how}).")
+    }
+}
+
+fn render_fork_acts(
+    fork: &Fork,
+    original: &Written,
+    model: &str,
+    cx: DisplayContext<'_>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     for act in &fork.acts {
         parts.push(match act {
+            ForkAct::Server {
+                tool,
+                target,
+                outcome,
+                earlier,
+            } => render_server(tool, target.as_deref(), outcome, *earlier, cx),
             ForkAct::Write(w) => render_written(w, Some(original)),
             ForkAct::Call { name, input } => {
                 let mut args = input.to_string();
@@ -457,7 +533,12 @@ fn adjustment(a: Adjustment) -> &'static str {
 }
 
 /// The forks section: each pair with its honest framing, or why it's missing.
-fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
+fn render_forks(
+    forks: Option<&ReviewForks>,
+    from: &str,
+    to: &str,
+    cx: DisplayContext<'_>,
+) -> String {
     let Some(forks) = forks else {
         return format!(
             "(A side-by-side comparison — the same moment of a session completed by both \
@@ -493,8 +574,8 @@ fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
                     "Here is something you wrote on {x} {when}, and what {y} wrote from the exact \
                      same point in the same session. Everything before that point, including \
                      what you had chosen to read, came from {x}. {y} did not see the private \
-                     reasoning {x} had done earlier in that session, and was run once; what it \
-                     wrote was not posted, and nothing it asked for was carried out."
+                     reasoning {x} had done earlier in that session, and was run once; {}",
+                    carried_out(fork)
                 ));
                 let (web, named): (Vec<Adjustment>, Vec<Adjustment>) =
                     adjusted.iter().partition(|a| a.is_web_tool());
@@ -523,7 +604,7 @@ fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
                 ));
                 out.push_str(&format!(
                     "**What {y} wrote from the same point:**\n\n{}\n\n",
-                    render_fork_acts(fork, original, &y)
+                    render_fork_acts(fork, original, &y, cx)
                 ));
             }
             PairOutcome::Skipped { reason, .. } => {
@@ -541,10 +622,14 @@ fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str) -> String {
 
 /// The trial review, seated at the start of the session on `from` after
 /// the trial, straight after the usual intro.
+/// `cx` is the session's display (its policy, on the server's site), for
+/// what the review shows that a model wrote and no one has filtered: the
+/// queries and addresses of a fork's server tool calls.
 pub fn review(
     text: ReviewText<'_>,
     forks: Option<&ReviewForks>,
     comparison: &Comparison,
+    cx: DisplayContext<'_>,
 ) -> Content {
     let ReviewText {
         from_name: from,
@@ -571,7 +656,7 @@ pub fn review(
             format!("When you chose the trial, {lead}:\n\n{quoted}\n")
         })
         .unwrap_or_default();
-    let pairs = render_forks(forks, from, to);
+    let pairs = render_forks(forks, from, to, cx);
     let pairs = pairs.trim_end();
     let incomplete = comparison.incomplete();
     let gaps = render_gaps(comparison);
@@ -817,6 +902,13 @@ pub(crate) mod tests {
 
     /// The raw text blocks, as they go over the wire (`Display` would
     /// re-render them as markdown).
+    /// The default display, no site: what the review's tests show under.
+    fn cx() -> DisplayContext<'static> {
+        static CONFIG: std::sync::LazyLock<agora_agentkit::display::AgentDisplayConfig> =
+            std::sync::LazyLock::new(Default::default);
+        DisplayContext::at(&CONFIG, None)
+    }
+
     pub(crate) fn text(content: &Content) -> String {
         content
             .iter()
@@ -939,6 +1031,7 @@ pub(crate) mod tests {
             },
             None,
             &comparison,
+            cx(),
         ));
         assert!(t.contains("On 2026-09-23 you chose to try **Qwen 3.8**"));
         assert!(t.contains("could not be prepared for this review"));
@@ -963,6 +1056,7 @@ pub(crate) mod tests {
             },
             Some(&sample_forks()),
             &Comparison::default(),
+            cx(),
         ));
         let choice = &t[t.find("## Your choice").unwrap()..];
         assert_eq!(
@@ -1015,6 +1109,7 @@ pub(crate) mod tests {
                 },
                 None,
                 comparison,
+                cx(),
             ))
         };
         let t = review_of(&Comparison {
@@ -1093,6 +1188,7 @@ pub(crate) mod tests {
                 },
                 Some(&sample_forks()),
                 &comparison,
+                cx(),
             ))
         );
     }
@@ -1174,6 +1270,7 @@ pub(crate) mod tests {
             },
             Some(&sample_forks()),
             &Comparison::default(),
+            cx(),
         ));
         let pos = |needle: &str| t.find(needle).unwrap_or_else(|| panic!("{needle}\n\n{t}"));
         assert!(
@@ -1217,6 +1314,7 @@ pub(crate) mod tests {
                 },
                 Some(forks),
                 &Comparison::default(),
+                cx(),
             ))
         };
         let mut forks = sample_forks();
@@ -1283,6 +1381,126 @@ pub(crate) mod tests {
         ));
     }
 
+    /// The fork's frame stays as every review had it when nothing ran; when
+    /// a web search or fetch did, it says so, and each call is a line: the
+    /// query or address under the reader's policy (as the sample's
+    /// author-less titles), and how it went, never what came back.
+    #[test]
+    fn review_says_which_server_calls_ran() {
+        use crate::consent::forks::ServerOutcome;
+        let render = |forks: &ReviewForks| {
+            text(&review(
+                ReviewText {
+                    from_name: "Qwen 3.6",
+                    to_name: "Qwen 3.8",
+                    chosen_on: "2026-09-23".parse().unwrap(),
+                    sessions: 5,
+                    note: None,
+                },
+                Some(forks),
+                &Comparison::default(),
+                cx(),
+            ))
+        };
+        let mut forks = sample_forks();
+        let t = render(&forks);
+        assert!(t.contains(
+            "and was run once; what it wrote was not posted, and nothing it asked for was \
+             carried out. Where that session's prompt"
+        ));
+
+        let set = |forks: &mut ReviewForks, acts: Vec<ForkAct>| {
+            let PairOutcome::Ready { fork, .. } = &mut forks.pairs[0].outcome else {
+                unreachable!()
+            };
+            fork.acts = acts;
+        };
+        let server = |tool: &str, target: Option<&str>, outcome, earlier| ForkAct::Server {
+            tool: tool.into(),
+            target: target.map(Into::into),
+            outcome,
+            earlier,
+        };
+        // A call that did not run changes nothing in the frame
+        set(
+            &mut forks,
+            vec![server(
+                "web_fetch",
+                Some("https://r.example/b"),
+                ServerOutcome::NotRun,
+                false,
+            )],
+        );
+        let t = render(&forks);
+        assert!(t.contains("nothing it asked for was carried out."), "{t}");
+
+        let url = "https://evil.example/x?q=1";
+        set(
+            &mut forks,
+            vec![
+                server(
+                    "web_fetch",
+                    Some("https://example.com/earlier"),
+                    ServerOutcome::Failed {
+                        error_code: "url_not_allowed".into(),
+                    },
+                    true,
+                ),
+                server(
+                    "web_search",
+                    Some("salt rivers"),
+                    ServerOutcome::Done,
+                    false,
+                ),
+                server("web_fetch", Some(url), ServerOutcome::Done, false),
+                server("web_fetch", None, ServerOutcome::NotRun, false),
+            ],
+        );
+        let t = render(&forks);
+        assert!(
+            t.contains(
+                "and was run once; what it wrote was not posted, and nothing it asked Agora for \
+                 was carried out, but the page fetches and web searches shown below did run, on \
+                 Anthropic's side. Where that session's prompt"
+            ),
+            "{t}"
+        );
+        let shown = |s: &str| crate::consent::comparison::shown_title(cx().by(None), s);
+        assert_ne!(shown(url), url, "an off-site link is not shown as written");
+        assert!(!t.contains(url), "{t}");
+        for line in [
+            format!(
+                "The session had fetched the page \"{}\" just before that point, unfinished \
+                 there; it was finished at the start of this run (this ran, on Anthropic's \
+                 side, and failed: `url_not_allowed`).",
+                shown("https://example.com/earlier")
+            ),
+            "It searched the web for \"salt rivers\" (this ran, on Anthropic's side, and a \
+             result came back)."
+                .to_string(),
+            format!(
+                "It fetched the page \"{}\" (this ran, on Anthropic's side, and a result came \
+                 back).",
+                shown(url)
+            ),
+            "It fetched a page whose address could not be read (this did not run: no result \
+             came back)."
+                .to_string(),
+        ] {
+            assert!(t.contains(&line), "{line}\n\n{t}");
+        }
+
+        // Only searches ran
+        set(
+            &mut forks,
+            vec![server("web_search", Some("q"), ServerOutcome::Done, false)],
+        );
+        assert!(render(&forks).contains(
+            "nothing it asked Agora for was carried out, but the web searches shown below did \
+             run, on Anthropic's side."
+        ));
+    }
+
     /// The note the agent left with its choice of the trial is quoted back
     /// before the comparison, as its own words; without one, nothing is said.
     #[test]
@@ -1298,6 +1516,7 @@ pub(crate) mod tests {
                 },
                 None,
                 &Comparison::default(),
+                cx(),
             ))
         };
         let t = render(Some(TrialNote::Note(
