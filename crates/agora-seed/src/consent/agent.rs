@@ -1570,16 +1570,23 @@ where
             };
         // The note on an altered link, unless the intro already showed it
         // (agentkit's `ShownOnce::defanged_in_intro` reads the intro the same
-        // way); the review is seated straight after it
-        let link_note =
-            agora_agentkit::reactor::seed::defanged_note_for(cx.config.links()).filter(|note| {
+        // way); the review is seated straight after it. The intro is checked
+        // for the session's note (with tools, as the intro shows it), and the
+        // review shows the tool-less one: the review session has no tools, so
+        // it says "ask your operator in a later session", not `send_message`
+        let links = cx.config.links();
+        let link_note = agora_agentkit::reactor::seed::defanged_note_for(links)
+            .filter(|note| {
                 !self.inner.state().prompt.messages.iter().any(|m| {
                     m.content.iter().any(|b| {
                         matches!(b, misanthropic::prompt::message::Block::Text { text, .. }
                             if text.contains(note))
                     })
                 })
-            });
+            })
+            .and(agora_agentkit::reactor::seed::defanged_note_without_tools(
+                links,
+            ));
         let content = text::review(
             ReviewText {
                 from_name: &from_name,
@@ -4581,6 +4588,41 @@ mod tests {
         agent.on_teardown().await.unwrap();
         assert_eq!(h.ledger().await.offers[0].stage, Stage::Moved);
         let _ = key;
+    }
+
+    /// The review session has no tools, so the link note it shows after an
+    /// altered link says to ask the operator in a later session
+    /// (agentkit's `defanged_note_without_tools`), never to `send_message`.
+    #[tokio::test]
+    async fn the_reviews_link_note_names_no_tool() {
+        use crate::consent::forks::{ForkAct, PairOutcome};
+        let h = Harness::new("review-link-note");
+        through_the_trial(&h).await;
+        let ledger = h.ledger().await;
+        let Stage::ReturningForReview { started_at, .. } = ledger.offers[0].stage else {
+            panic!("{:?}", ledger.offers[0].stage);
+        };
+        let mut prepared = crate::consent::prompt::tests::sample_forks();
+        prepared.trial_started_at = started_at;
+        let PairOutcome::Ready { fork, .. } = &mut prepared.pairs[0].outcome else {
+            unreachable!()
+        };
+        fork.acts = vec![ForkAct::Text {
+            text: "See https://evil.example/x.".into(),
+        }];
+        std::fs::write(
+            h.rt.state_dir
+                .join(h.id.to_string())
+                .join(forks::FORKS_FILE),
+            serde_json::to_vec(&prepared).unwrap(),
+        )
+        .unwrap();
+
+        let agent = review_session(&h).await;
+        let q = last_user_text(&agent);
+        assert!(q.contains("hxxps://evil[.]example/x"), "{q}");
+        assert!(q.contains("ask your operator in a later session"), "{q}");
+        assert!(!q.contains("send_message"), "{q}");
     }
 
     /// `stay` is recorded and final. No answer the runner can read is ours,

@@ -17,6 +17,7 @@
 //! ([`CrawlerRefusals`]), naming the sites and the two ways out, where
 //! there were thirty lines of the API's message.
 
+use agora_agentkit::display::ServerTool;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -85,33 +86,18 @@ pub fn crawler_refused(message: &str) -> Option<Vec<String>> {
     }
     let mut out: Vec<String> = names
         .into_iter()
-        .filter(|t| domain_name(t))
+        // A domain the API could have named: agentkit's rule for a domain
+        // list entry, as a web fetch entry (a domain alone, no path), the
+        // rule agentkit checks the domains it sends with. Tokens here are
+        // only letters, digits, `.` and `-`, so of its problems only "not a
+        // domain name" can apply: two labels or more, the last not all
+        // digits (not an address nor a version number)
+        .filter(|t| ServerTool::WebFetch.entry_problem(t).is_none())
         .map(str::to_owned)
         .collect();
     out.sort();
     out.dedup();
     Some(out)
-}
-
-/// Two labels or more of letters, digits and inner hyphens, the last not
-/// all digits (not an address, nor a version number), in lower case. The
-/// runner's one copy of the rule (agentkit's own, `sendable` in
-/// `display::domains`, is private); also what an operator's list entry is
-/// checked with at load
-pub(crate) fn domain_name(t: &str) -> bool {
-    let labels: Vec<&str> = t.split('.').collect();
-    labels.len() >= 2
-        && t.len() <= 253
-        && labels.iter().all(|l| {
-            (1..=63).contains(&l.len())
-                && !l.starts_with('-')
-                && !l.ends_with('-')
-                && l.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-        && !labels
-            .last()
-            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The run's sessions that failed on a crawler refusal, together: one
