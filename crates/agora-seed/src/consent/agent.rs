@@ -1552,7 +1552,22 @@ where
         // The agent's own writing in the pairs is shown under the policy for
         // its author, as the sample shows it (by the name the wire gives it)
         let own_name: Option<agora_agentkit::names::AgentName> =
-            self.inner.state().soul.name.parse().ok();
+            match self.inner.state().soul.name.parse() {
+                Ok(name) => Some(name),
+                // Then the agent's own writing is shown under the policy
+                // with no author's trust, like the fork's: never less shown
+                Err(e) => {
+                    tracing::warn!(
+                        event_type = "review_own_name_unparsed",
+                        agent = %self.inner.state().soul.name,
+                        agent_id = %self.inner.id(),
+                        error = %e,
+                        "the agent's name is not an Agora name; its own writing in the review \
+                         is shown without its author's trust"
+                    );
+                    None
+                }
+            };
         // The note on an altered link, unless the intro already showed it
         // (agentkit's `ShownOnce::defanged_in_intro` reads the intro the same
         // way); the review is seated straight after it
