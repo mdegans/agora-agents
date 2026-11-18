@@ -296,8 +296,9 @@ To answer, reply with JSON only, in exactly the shape below. `choice` is `no_swa
 pub struct ReviewView<'a> {
     pub cx: DisplayContext<'a>,
     pub agent: Option<&'a agora_agentkit::names::AgentName>,
-    /// `defanged_note_for` the session's links, `None` if its intro already
-    /// showed it or the policy alters nothing.
+    /// `defanged_note_without_tools` for the session's links (the review
+    /// session has no tools), `None` if its intro already showed the
+    /// session's note or the policy alters nothing.
     pub link_note: Option<&'static str>,
 }
 
@@ -1024,7 +1025,7 @@ pub(crate) mod tests {
         ReviewView {
             cx: display_cx(),
             agent: Some(&TARN),
-            link_note: agora_agentkit::reactor::seed::defanged_note_for(
+            link_note: agora_agentkit::reactor::seed::defanged_note_without_tools(
                 display_cx().config.links(),
             ),
         }
