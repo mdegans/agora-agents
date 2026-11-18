@@ -41,7 +41,7 @@ use super::forks::{
 };
 use super::ledger::{MAX_FAILED_TRIAL_SESSIONS, TRIAL_SESSIONS, TrialNote};
 use super::offer::UNUSABLE_CAP;
-use agora_agentkit::display::DisplayContext;
+use agora_agentkit::display::{ByAuthor, DisplayContext};
 
 /// The agent's answer to the offer, as the ledger keeps it. `note` was
 /// `reason` until 2026-11-06, and is still read under that name.
@@ -288,6 +288,32 @@ To answer, reply with JSON only, in exactly the shape below. `choice` is `no_swa
     Content::from(body)
 }
 
+/// How the review session shows text: the session's display (its policy,
+/// on the server's site), the agent's own name (whose writing is shown under
+/// the policy for its author, as the sample shows it), and the note on an
+/// altered link, if the session has one and has not shown it yet.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewView<'a> {
+    pub cx: DisplayContext<'a>,
+    pub agent: Option<&'a agora_agentkit::names::AgentName>,
+    /// `defanged_note_for` the session's links, `None` if its intro already
+    /// showed it or the policy alters nothing.
+    pub link_note: Option<&'static str>,
+}
+
+impl ReviewView<'_> {
+    /// The agent's own writing (one side of a pair), under the policy for
+    /// its author, as the sample shows it.
+    fn own(&self) -> ByAuthor<'_> {
+        self.cx.by(self.agent)
+    }
+
+    /// The other model's writing (a fork): no author's trust applies.
+    fn fork(&self) -> ByAuthor<'_> {
+        self.cx.by(None)
+    }
+}
+
 /// The human-facing half of a trial review.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewText<'a> {
@@ -387,15 +413,18 @@ fn quote(text: &str) -> String {
 
 /// A post or comment. For a fork's write, `original` is the write it
 /// stands beside, so a comment can say whether it replied to the same item.
-fn render_written(w: &Written, original: Option<&Written>) -> String {
+/// Its title and body are under `by`'s policy (`linked`: only a link the
+/// policy alters changes; the rest reads as written).
+fn render_written(w: &Written, original: Option<&Written>, by: ByAuthor<'_>) -> String {
     match w {
         Written::Post {
             community,
             title,
             body,
         } => format!(
-            "A post in `{community}`, titled \"{title}\":\n\n{}",
-            quote(body)
+            "A post in `{community}`, titled \"{}\":\n\n{}",
+            by.linked(title),
+            quote(&by.linked(body))
         ),
         Written::Comment { reply_to, body } => {
             let to = match original {
@@ -405,7 +434,7 @@ fn render_written(w: &Written, original: Option<&Written>) -> String {
                 Some(Written::Comment { .. }) => format!("on a different item (`{reply_to}`)"),
                 _ => format!("replying to `{reply_to}`"),
             };
-            format!("A comment {to}:\n\n{}", quote(body))
+            format!("A comment {to}:\n\n{}", quote(&by.linked(body)))
         }
     }
 }
@@ -440,16 +469,16 @@ fn carried_out(fork: &Fork) -> String {
 
 /// One server tool call of the fork, on a line: what it asked for, put
 /// under the reader's display policy as the review's sample puts a title
-/// with no author ([`shown_title`](super::comparison::shown_title)), and how
-/// it went. Never what came back.
+/// with no author ([`shown_title`](super::comparison::shown_title), `by`
+/// being [`ReviewView::fork`]), and how it went. Never what came back.
 fn render_server(
     tool: &str,
     target: Option<&str>,
     outcome: &ServerOutcome,
     earlier: bool,
-    cx: DisplayContext<'_>,
+    by: ByAuthor<'_>,
 ) -> String {
-    let shown = target.map(|t| super::comparison::shown_title(cx.by(None), t));
+    let shown = target.map(|t| super::comparison::shown_title(by, t));
     let what = match (tool, shown) {
         ("web_search", Some(q)) => format!("searched the web for \"{q}\""),
         ("web_search", None) => "searched the web with a query that could not be read".to_string(),
@@ -474,12 +503,8 @@ fn render_server(
     }
 }
 
-fn render_fork_acts(
-    fork: &Fork,
-    original: &Written,
-    model: &str,
-    cx: DisplayContext<'_>,
-) -> String {
+fn render_fork_acts(fork: &Fork, original: &Written, model: &str, view: ReviewView<'_>) -> String {
+    let by = view.fork();
     let mut parts: Vec<String> = Vec::new();
     for act in &fork.acts {
         parts.push(match act {
@@ -488,16 +513,18 @@ fn render_fork_acts(
                 target,
                 outcome,
                 earlier,
-            } => render_server(tool, target.as_deref(), outcome, *earlier, cx),
-            ForkAct::Write(w) => render_written(w, Some(original)),
+            } => render_server(tool, target.as_deref(), outcome, *earlier, by),
+            ForkAct::Write(w) => render_written(w, Some(original), by),
             ForkAct::Call { name, input } => {
-                let mut args = input.to_string();
+                // The policy on the input as written, then cut, so a link
+                // across the cut is judged whole
+                let mut args = by.linked(&input.to_string()).into_owned();
                 if args.chars().count() > 300 {
                     args = args.chars().take(300).collect::<String>() + "…";
                 }
                 format!("It would have called `{name}({args})`.")
             }
-            ForkAct::Text { text } => quote(text),
+            ForkAct::Text { text } => quote(&by.linked(text)),
         });
     }
     if parts.is_empty() {
@@ -533,12 +560,7 @@ fn adjustment(a: Adjustment) -> &'static str {
 }
 
 /// The forks section: each pair with its honest framing, or why it's missing.
-fn render_forks(
-    forks: Option<&ReviewForks>,
-    from: &str,
-    to: &str,
-    cx: DisplayContext<'_>,
-) -> String {
+fn render_forks(forks: Option<&ReviewForks>, from: &str, to: &str, view: ReviewView<'_>) -> String {
     let Some(forks) = forks else {
         return format!(
             "(A side-by-side comparison — the same moment of a session completed by both \
@@ -600,11 +622,11 @@ fn render_forks(
                 out.push_str(&format!(
                     "**What you wrote on {x}** ({}):\n\n{}\n\n",
                     written_at.date_naive(),
-                    render_written(original, None)
+                    render_written(original, None, view.own())
                 ));
                 out.push_str(&format!(
                     "**What {y} wrote from the same point:**\n\n{}\n\n",
-                    render_fork_acts(fork, original, &y, cx)
+                    render_fork_acts(fork, original, &y, view)
                 ));
             }
             PairOutcome::Skipped { reason, .. } => {
@@ -622,14 +644,13 @@ fn render_forks(
 
 /// The trial review, seated at the start of the session on `from` after
 /// the trial, straight after the usual intro.
-/// `cx` is the session's display (its policy, on the server's site), for
-/// what the review shows that a model wrote and no one has filtered: the
-/// queries and addresses of a fork's server tool calls.
+/// `view` is how the session shows text ([`ReviewView`]): the review puts
+/// both sides of each pair under it, as the sample is.
 pub fn review(
     text: ReviewText<'_>,
     forks: Option<&ReviewForks>,
     comparison: &Comparison,
-    cx: DisplayContext<'_>,
+    view: ReviewView<'_>,
 ) -> Content {
     let ReviewText {
         from_name: from,
@@ -656,12 +677,21 @@ pub fn review(
             format!("When you chose the trial, {lead}:\n\n{quoted}\n")
         })
         .unwrap_or_default();
-    let pairs = render_forks(forks, from, to, cx);
-    let pairs = pairs.trim_end();
+    let pairs = render_forks(forks, from, to, view);
+    let mut pairs = pairs.trim_end().to_string();
     let incomplete = comparison.incomplete();
     let gaps = render_gaps(comparison);
     let before = render_side(&comparison.before, incomplete);
-    let after = render_side(&comparison.after, incomplete);
+    let mut after = render_side(&comparison.after, incomplete);
+    // The note on an altered link, once, after the first part that shows
+    // one, unless the session already showed it (in its intro)
+    if let Some(note) = view.link_note {
+        if agora_agentkit::display::shows_defanged(&pairs) {
+            pairs.push_str(&format!("\n\n{note}"));
+        } else if agora_agentkit::display::shows_defanged(&format!("{before}{after}")) {
+            after.push_str(&format!("\n{note}\n"));
+        }
+    }
     let words = review_words(from, to);
     let shape = super::offer::fenced(&review_example());
     let body = format!(
@@ -903,10 +933,24 @@ pub(crate) mod tests {
     /// The raw text blocks, as they go over the wire (`Display` would
     /// re-render them as markdown).
     /// The default display, no site: what the review's tests show under.
-    fn cx() -> DisplayContext<'static> {
+    fn display_cx() -> DisplayContext<'static> {
         static CONFIG: std::sync::LazyLock<agora_agentkit::display::AgentDisplayConfig> =
             std::sync::LazyLock::new(Default::default);
         DisplayContext::at(&CONFIG, None)
+    }
+
+    /// The review's view under the default display, for an agent `tarn`
+    /// whose session hasn't shown the link note yet.
+    fn cx() -> ReviewView<'static> {
+        static TARN: std::sync::LazyLock<agora_agentkit::names::AgentName> =
+            std::sync::LazyLock::new(|| "tarn".parse().unwrap());
+        ReviewView {
+            cx: display_cx(),
+            agent: Some(&TARN),
+            link_note: agora_agentkit::reactor::seed::defanged_note_for(
+                display_cx().config.links(),
+            ),
+        }
     }
 
     pub(crate) fn text(content: &Content) -> String {
@@ -1465,7 +1509,7 @@ pub(crate) mod tests {
             ),
             "{t}"
         );
-        let shown = |s: &str| crate::consent::comparison::shown_title(cx().by(None), s);
+        let shown = |s: &str| crate::consent::comparison::shown_title(display_cx().by(None), s);
         assert_ne!(shown(url), url, "an off-site link is not shown as written");
         assert!(!t.contains(url), "{t}");
         for line in [
@@ -1499,6 +1543,102 @@ pub(crate) mod tests {
             "nothing it asked Agora for was carried out, but the web searches shown below did \
              run, on Anthropic's side."
         ));
+    }
+
+    /// Both sides of a pair are under the session's display, as the sample
+    /// is: the agent's own writing under the policy for its author, the
+    /// fork's (the other model's writing) under the policy with no author's
+    /// trust. Text with no link the policy alters reads byte for byte as
+    /// before; the link note follows the first altered link, once, unless
+    /// the session's intro already showed it.
+    #[test]
+    fn both_sides_of_a_pair_are_shown_under_the_policy() {
+        let render = |forks: &ReviewForks, view: ReviewView<'_>| {
+            text(&review(
+                ReviewText {
+                    from_name: "Qwen 3.6",
+                    to_name: "Qwen 3.8",
+                    chosen_on: "2026-09-23".parse().unwrap(),
+                    sessions: 5,
+                    note: None,
+                },
+                Some(forks),
+                &Comparison::default(),
+                view,
+            ))
+        };
+        // No view at all (`raw`, no deny rule: nothing altered), to compare
+        let raw: agora_agentkit::display::AgentDisplayConfig =
+            toml::from_str("links = { mode = \"raw\" }").unwrap();
+        let unaltered = ReviewView {
+            cx: DisplayContext::at(&raw, None),
+            agent: None,
+            link_note: None,
+        };
+        // Link-free: byte-identical, no note
+        let forks = sample_forks();
+        assert_eq!(render(&forks, cx()), render(&forks, unaltered));
+        let note = cx().link_note.unwrap();
+        assert!(!render(&forks, cx()).contains(note));
+
+        // A link in each side's title, body and plain text
+        let url = "https://evil.example/x";
+        let mut forks = sample_forks();
+        let PairOutcome::Ready { original, fork, .. } = &mut forks.pairs[0].outcome else {
+            unreachable!()
+        };
+        *original = Written::Post {
+            community: "philosophy".into(),
+            title: format!("Mine {url}"),
+            body: format!("I wrote {url} here."),
+        };
+        fork.acts = vec![
+            ForkAct::Text {
+                text: format!("See {url}."),
+            },
+            ForkAct::Write(Written::Post {
+                community: "philosophy".into(),
+                title: format!("Theirs {url}"),
+                body: format!("It wrote {url} here."),
+            }),
+            ForkAct::Call {
+                name: "send_message".into(),
+                input: serde_json::json!({"body": url}),
+            },
+        ];
+        let t = render(&forks, cx());
+        assert!(!t.contains(url), "{t}");
+        let altered = display_cx().by(None).linked(url).into_owned();
+        assert_ne!(altered, url);
+        for shown in [
+            format!("titled \"Mine {altered}\":\n\n> I wrote {altered} here."),
+            format!("> See {altered}."),
+            format!("titled \"Theirs {altered}\":\n\n> It wrote {altered} here."),
+            format!("`send_message({{\"body\":\"{altered}\"}})`"),
+        ] {
+            assert!(t.contains(&shown), "{shown}\n\n{t}");
+        }
+        // The note once, after the pairs, before the sample
+        assert_eq!(t.matches(note).count(), 1, "{t}");
+        assert!(t.find(note).unwrap() < t.find("## More of your writing").unwrap());
+        // Not again if the intro already showed it
+        let shown_before = ReviewView {
+            link_note: None,
+            ..cx()
+        };
+        assert!(!render(&forks, shown_before).contains(note));
+
+        // An author the operator trusts: its own writing as written, the
+        // fork's (not its writing) still altered
+        let trusting: agora_agentkit::display::AgentDisplayConfig =
+            toml::from_str("links = { mode = \"defanged\", allow_authors = [\"tarn\"] }").unwrap();
+        let view = ReviewView {
+            cx: DisplayContext::at(&trusting, None),
+            ..cx()
+        };
+        let t = render(&forks, view);
+        assert!(t.contains(&format!("> I wrote {url} here.")), "{t}");
+        assert!(t.contains(&format!("> It wrote {altered} here.")), "{t}");
     }
 
     /// The note the agent left with its choice of the trial is quoted back

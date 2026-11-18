@@ -1549,6 +1549,22 @@ where
         );
         let sample =
             comparison::gather(&self.rt.client, cx, self.inner.id(), comments, started_at).await;
+        // The agent's own writing in the pairs is shown under the policy for
+        // its author, as the sample shows it (by the name the wire gives it)
+        let own_name: Option<agora_agentkit::names::AgentName> =
+            self.inner.state().soul.name.parse().ok();
+        // The note on an altered link, unless the intro already showed it
+        // (agentkit's `ShownOnce::defanged_in_intro` reads the intro the same
+        // way); the review is seated straight after it
+        let link_note =
+            agora_agentkit::reactor::seed::defanged_note_for(cx.config.links()).filter(|note| {
+                !self.inner.state().prompt.messages.iter().any(|m| {
+                    m.content.iter().any(|b| {
+                        matches!(b, misanthropic::prompt::message::Block::Text { text, .. }
+                            if text.contains(note))
+                    })
+                })
+            });
         let content = text::review(
             ReviewText {
                 from_name: &from_name,
@@ -1565,7 +1581,11 @@ where
             },
             forks.as_ref(),
             &sample,
-            cx,
+            text::ReviewView {
+                cx,
+                agent: own_name.as_ref(),
+                link_note,
+            },
         );
         self.asks.push(ReviewQuestion {
             key,
