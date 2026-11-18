@@ -552,7 +552,8 @@ pub const WEB_LINE: &str = "You can search and fetch pages.";
 /// What a session of the agent on the forking model would be offered
 /// today of one web tool, as [`DisplayPlan::session_web_tools`] leaves it
 /// (the session's own code: the run's `[seed.web_*]` tool with the display
-/// policy's lists, or the operator's lists where written).
+/// policy's lists, the operator's lists where written, or no list under
+/// `domains = "unfiltered"`).
 ///
 /// [`DisplayPlan::session_web_tools`]: crate::display::DisplayPlan::session_web_tools
 #[derive(Debug, Clone, Default)]
@@ -3172,6 +3173,47 @@ mod tests {
             tool(&fork, "web_search")["blocked_domains"],
             serde_json::json!(["x.example"])
         );
+    }
+
+    /// `domains = "unfiltered"`: a fork's web tools are today's definitions
+    /// with no list, whatever the policy says (an allow list, or one that
+    /// would withhold the tool), and a dump that carried lists loses them,
+    /// as a session's tools would have none.
+    #[test]
+    fn unfiltered_sends_no_list_to_a_fork() {
+        const UNFILTERED: &str = "[seed.web_fetch]\nmax_uses = 3\ndomains = \"unfiltered\"\n\
+                                  [seed.web_search]\nmax_uses = 2\ndomains = \"unfiltered\"\n";
+        let listed = dump_with(
+            NEW,
+            &[
+                serde_json::json!({"type": "web_search_20250305", "name": "web_search",
+                    "max_uses": 2, "allowed_domains": ["wikipedia.org"]}),
+                serde_json::json!({"type": "web_fetch_20250910", "name": "web_fetch",
+                    "max_uses": 3, "allowed_domains": ["wikipedia.org"],
+                    "citations": {"enabled": true}}),
+            ],
+        );
+        for display in [
+            "[display]\nlinks = { mode = \"defanged\", allow = [\"https://*.wikipedia.org\"] }\n",
+            // An allow list none of whose rules can be sent: under the
+            // policy the tools would be withheld
+            "[display]\nlinks = { mode = \"defanged\", allow = [\"http://localhost\"] }\n",
+            "[display]\nlinks = { mode = \"raw\", deny = [\"https://bad.example\"] }\n",
+            "",
+        ] {
+            let policy = TestPolicy::load(&format!("{UNFILTERED}{display}"));
+            for dumped in [listed.clone(), pre_376(NEW)] {
+                let (fork, _) = fork_with(dumped, &policy.offer(OLD, &anthropic())).unwrap();
+                for name in ["web_fetch", "web_search"] {
+                    let t = tool(&fork, name);
+                    assert!(t.is_object(), "{display}: {name} offered: {t}");
+                    assert!(t.get("allowed_domains").is_none(), "{display}: {t}");
+                    assert!(t.get("blocked_domains").is_none(), "{display}: {t}");
+                }
+                assert_eq!(tool(&fork, "web_fetch")["max_uses"], 3);
+                assert_eq!(tool(&fork, "web_search")["max_uses"], 2);
+            }
+        }
     }
 
     /// The *forking* model's display decides, not the dump's model's: the

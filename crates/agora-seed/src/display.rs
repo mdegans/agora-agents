@@ -31,6 +31,17 @@
 //! used as written, and the policy's are not ([`WebSource::Operator`]). A
 //! policy that cannot be sent as a list withholds the tool from the session
 //! ([`ToolOffer::Withhold`]). A tool the operator did not enable stays off.
+//!
+//! `domains = "unfiltered"` on a tool's table sends it with no list at all,
+//! for every session and model, whatever `[display]` says
+//! ([`WebSource::Unfiltered`]): the tool reaches any address in the
+//! session's context, and a policy that cannot be sent as a list does not
+//! withhold it, since no list is sent. The Steward chose it for the fleet on
+//! 2026-11-18, when the API refused every session of the daily run because
+//! the policy's list named sites that block Anthropic's crawler
+//! ([`refusal`]). Nothing here changes a session's tools after its
+//! prompt is first built: they are the start of the cached prefix, shared
+//! by every agent on a model.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -59,6 +70,9 @@ pub enum WebSource {
     /// Enabled with `allowed_domains` or `blocked_domains` written: used as
     /// written, the display policy's list is not applied
     Operator,
+    /// Enabled with `domains = "unfiltered"`: sent with neither list, the
+    /// display policy's not applied and never withholding the tool
+    Unfiltered,
 }
 
 /// [`WebSource`] for both tools
@@ -168,6 +182,8 @@ pub enum ToolOutcome {
     NotRun,
     /// The operator's lists, as written
     Operator,
+    /// `domains = "unfiltered"`: neither list, whatever the policy says
+    Unfiltered,
     /// The policy's lists (both `None`: unfiltered, as configured)
     Offered,
     /// The policy cannot be sent as a list: no such tool this session
@@ -486,6 +502,7 @@ fn describe(domains: &ToolDomains, source: WebSource) -> &'static str {
             "operator_lists_over_withheld"
         }
         WebSource::Operator => "operator_lists",
+        WebSource::Unfiltered => "unfiltered_by_operator",
         WebSource::Policy => match domains.offer() {
             ToolOffer::Withhold => "withheld",
             ToolOffer::Offer {
@@ -568,6 +585,13 @@ fn filter<T>(
         // The run's config has the tool, so its table is there: `Off` here
         // is a caller's mistake, and the tool is left as configured
         WebSource::Off | WebSource::Operator => ToolOutcome::Operator,
+        // No list at all, whatever the policy is, so nothing to withhold
+        WebSource::Unfiltered => {
+            let (allowed, blocked) = lists(on);
+            *allowed = None;
+            *blocked = None;
+            ToolOutcome::Unfiltered
+        }
         WebSource::Policy => match domains().offer() {
             ToolOffer::Withhold => {
                 *tool = None;
@@ -651,13 +675,41 @@ impl fmt::Display for ToolReport<'_> {
                     .iter()
                     .try_for_each(|line| writeln!(f, "     (not applied) {line}"))
             }
-            WebSource::Policy => self
-                .lines()
-                .iter()
-                .try_for_each(|line| writeln!(f, "   {line}")),
+            WebSource::Unfiltered => {
+                writeln!(
+                    f,
+                    "   {tool}: no domain list is sent (domains = \"unfiltered\" in {}); the \
+                     tool can reach any address in the session's context, whatever \
+                     [display.links] allows",
+                    table(tool)
+                )?;
+                self.lines()
+                    .iter()
+                    .try_for_each(|line| writeln!(f, "     (not applied) {line}"))
+            }
+            WebSource::Policy => {
+                self.lines()
+                    .iter()
+                    .try_for_each(|line| writeln!(f, "   {line}"))?;
+                if matches!(domains.filter(), DomainFilter::Allowed(_)) {
+                    writeln!(
+                        f,
+                        "   {tool}: WARNING: Anthropic refuses the whole request when an \
+                         allowed_domains entry is a site that blocks its crawler (2026-11-18: \
+                         \"{CRAWLER_REFUSAL_FIRST_SENTENCE}\"), so a list from the display \
+                         policy can fail every session of a run on any day; domains = \
+                         \"unfiltered\" in {} sends none",
+                        table(tool)
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }
+
+pub mod refusal;
+use refusal::CRAWLER_REFUSAL_FIRST_SENTENCE;
 
 #[cfg(test)]
 mod tests;
