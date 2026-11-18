@@ -70,6 +70,7 @@ mod sealed;
 mod signals;
 mod space;
 
+use agora_agentkit::display::ServerTool;
 use agora_agentkit::ids::{AgentId, ReactorId};
 use agora_agentkit::reactor::anthropic::{self, EndpointVariant};
 use agora_agentkit::reactor::seed::{FsKeyring, SeedAgent, SeedConfig, SeedContext, SeedState};
@@ -593,68 +594,22 @@ enum DomainsKnob {
 /// server-tool builders take.
 type DomainList = Option<Vec<Cow<'static, str>>>;
 
-/// What is wrong with one entry of an operator's domain list, as
-/// Anthropic's docs state it (server tools, "Domain filtering", read
-/// 2026-11-18): no scheme; no wildcard in the domain (only in a path);
-/// ASCII only (the docs' homograph warning); and web fetch matches the
-/// domain alone, so a fetch entry with a path never matches anything,
-/// allowing or blocking nothing, said nowhere. An entry the API would
-/// refuse fails every request of the run, so it is refused at load.
-fn entry_problem(tool: &str, entry: &str) -> Option<&'static str> {
-    if entry.is_empty() {
-        return Some("is empty");
-    }
-    if !entry.is_ascii() {
-        return Some(
-            "is not ASCII: the docs warn that a non-ASCII domain can pass for another \
-             (a homograph); write its `xn--` form",
-        );
-    }
-    if entry.chars().any(char::is_whitespace) {
-        return Some("has whitespace");
-    }
-    if entry.contains("://") {
-        return Some(
-            "has a scheme: write the bare domain (`example.com`, not `https://example.com`)",
-        );
-    }
-    let (host, path) = match entry.split_once('/') {
-        Some((host, path)) => (host, Some(path)),
-        None => (entry, None),
-    };
-    if host.contains('*') {
-        return Some(
-            "has a wildcard in the domain, which the API refuses; `example.com` already covers its subdomains",
-        );
-    }
-    if host.contains(':') {
-        return Some("has a port; an entry is a domain, optionally with a path");
-    }
-    if !display::refusal::domain_name(&host.to_ascii_lowercase()) {
-        return Some(
-            "is not a domain name of two labels or more of letters, digits and inner hyphens \
-             (an address or a single label like `localhost` is not one)",
-        );
-    }
-    if tool == "web_fetch" && path.is_some() {
-        return Some(
-            "has a path: web fetch matches the domain alone, so this entry would never match \
-             (paths are for web search)",
-        );
-    }
-    None
-}
-
 /// Domain lists are mutually exclusive at Anthropic — catch it here rather
 /// than as a 400 in the middle of a cohort. So is a list written beside
-/// `domains = "unfiltered"`, and every entry is checked
-/// ([`entry_problem`]).
+/// `domains = "unfiltered"`, and every entry is checked by agentkit's rule
+/// for a hand-written entry ([`ServerTool::entry_problem`], read from
+/// Anthropic's docs: an entry the API would refuse fails every request of
+/// the run, and a web fetch entry with a path never matches).
 fn domains(
-    tool: &str,
+    server: ServerTool,
     source: Option<DomainsKnob>,
     allowed: &Option<Vec<String>>,
     blocked: &Option<Vec<String>>,
 ) -> Result<(DomainList, DomainList)> {
+    let tool = match server {
+        ServerTool::WebFetch => "web_fetch",
+        ServerTool::WebSearch => "web_search",
+    };
     anyhow::ensure!(
         !(allowed.is_some() && blocked.is_some()),
         "[seed.{tool}]: allowed_domains and blocked_domains are mutually \
@@ -685,7 +640,7 @@ fn domains(
         let bad: Vec<String> = list
             .iter()
             .flatten()
-            .filter_map(|e| entry_problem(tool, e).map(|why| format!("{e:?} {why}")))
+            .filter_map(|e| server.entry_problem(e).map(|why| format!("{e:?} {why}")))
             .collect();
         anyhow::ensure!(
             bad.is_empty(),
@@ -712,7 +667,7 @@ impl WebSearchKnobs {
              table to turn web search off"
         );
         let (allowed_domains, blocked_domains) = domains(
-            "web_search",
+            ServerTool::WebSearch,
             self.domains,
             &self.allowed_domains,
             &self.blocked_domains,
@@ -735,7 +690,7 @@ impl WebFetchKnobs {
              table to turn web fetch off"
         );
         let (allowed_domains, blocked_domains) = domains(
-            "web_fetch",
+            ServerTool::WebFetch,
             self.domains,
             &self.allowed_domains,
             &self.blocked_domains,
@@ -764,7 +719,7 @@ impl SeedKnobs {
         use display::WebSource;
         if let Some(k) = &self.web_fetch {
             domains(
-                "web_fetch",
+                ServerTool::WebFetch,
                 k.domains,
                 &k.allowed_domains,
                 &k.blocked_domains,
@@ -772,7 +727,7 @@ impl SeedKnobs {
         }
         if let Some(k) = &self.web_search {
             domains(
-                "web_search",
+                ServerTool::WebSearch,
                 k.domains,
                 &k.allowed_domains,
                 &k.blocked_domains,
