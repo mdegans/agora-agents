@@ -204,6 +204,10 @@ pub enum AlertKind {
     /// less free space than the floor ([`crate::space::floor`]): the run
     /// started no session. One a run.
     DiskSpaceLow,
+    /// Sessions failed because the API refused their requests: a web
+    /// tool's `allowed_domains` names sites that block Anthropic's crawler
+    /// ([`crate::display::refusal`]). One a run, naming the sites.
+    WebDomainsRefused,
     /// `--test-alert`. Not configurable: it bypasses `events` and the
     /// rate limit.
     #[serde(skip)]
@@ -212,7 +216,7 @@ pub enum AlertKind {
 
 impl AlertKind {
     /// Every configurable kind: the default for `[alerts] events`.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::GovernanceLogRefused,
         Self::ConstitutionRefused,
         Self::ModelReviewNoAnswer,
@@ -253,6 +257,7 @@ impl AlertKind {
         Self::StateUnsaved,
         Self::SessionLocksCapped,
         Self::DiskSpaceLow,
+        Self::WebDomainsRefused,
     ];
 
     /// Sent every time, outside the rate limit: a fault the operator
@@ -311,6 +316,7 @@ impl AlertKind {
             Self::StateUnsaved => "state_unsaved",
             Self::SessionLocksCapped => "session_locks_capped",
             Self::DiskSpaceLow => "disk_space_low",
+            Self::WebDomainsRefused => "web_domains_refused",
             Self::Test => "test_alert",
         }
     }
@@ -708,6 +714,16 @@ impl AlertKind {
                  by itself at its next restart). A session whose save fails \
                  on a full disk is kept only in a rescue file on the same \
                  disk, which is why the run does not start."
+            }
+            Self::WebDomainsRefused => {
+                "Sessions failed on their first call: the API refuses a whole \
+                 request when a web tool's allowed_domains names a site that \
+                 blocks Anthropic's crawler, and any listed site can start \
+                 blocking on any day. The runner does not retry these calls \
+                 or change a session's tools mid-run (they open the cached \
+                 prefix every agent on a model shares). The sites the API \
+                 named and the two ways out are below; the agents whose \
+                 sessions failed get their usual failed-session notice."
             }
             Self::Test => {
                 "This is a test alert, sent by `agora-seed --test-alert`. If \

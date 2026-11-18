@@ -13,7 +13,10 @@
 # `allowed_domains` / `blocked_domains` of their own, this list also becomes their
 # `allowed_domains` (widened to each rule's domain; the startup print lists every
 # rule widened or not sent). Writing either list on a tool keeps the operator's
-# list for that tool instead.
+# list for that tool instead, and `domains = "unfiltered"` on a tool's table
+# sends it no list at all (chosen for the fleet on 2026-11-18: the API refuses
+# a whole request whose allowed_domains names a site that blocks Anthropic's
+# crawler, and 53 of these did that day).
 [display.links]
 mode = "defanged"
 allow = [

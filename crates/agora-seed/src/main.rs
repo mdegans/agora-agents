@@ -540,6 +540,8 @@ const DEFAULT_WEB_MAX_USES: u32 = 2;
 #[serde(deny_unknown_fields)]
 struct WebSearchKnobs {
     max_uses: Option<u32>,
+    /// Where the tool's domain lists come from: see [`DomainsKnob`]
+    domains: Option<DomainsKnob>,
     /// Bare hosts, no scheme. Mutually exclusive with `blocked_domains`.
     allowed_domains: Option<Vec<String>>,
     blocked_domains: Option<Vec<String>>,
@@ -550,6 +552,8 @@ struct WebSearchKnobs {
 #[serde(deny_unknown_fields)]
 struct WebFetchKnobs {
     max_uses: Option<u32>,
+    /// Where the tool's domain lists come from: see [`DomainsKnob`]
+    domains: Option<DomainsKnob>,
     allowed_domains: Option<Vec<String>>,
     blocked_domains: Option<Vec<String>>,
     /// Have the model cite passages from what it fetched. Defaults to on:
@@ -559,14 +563,95 @@ struct WebFetchKnobs {
     max_content_tokens: Option<u32>,
 }
 
+/// `domains` on `[seed.web_fetch]` / `[seed.web_search]`: where the tool's
+/// `allowed_domains` / `blocked_domains` come from.
+///
+/// - `"policy"` (the default, as when the key is absent): each session's
+///   display policy (`[display]`) is projected onto the tool's lists
+///   ([`display`]), or the operator's `allowed_domains` / `blocked_domains`
+///   on the same table are used as written.
+/// - `"unfiltered"`: the tool is sent with **neither** list, to every
+///   session on every model, whatever `[display]` says. It can reach any
+///   address in the session's context. A policy that cannot be sent as a
+///   list no longer withholds the tool, since no list is sent. What agents
+///   are shown (links defanged or not) is unchanged.
+///
+/// The Steward (2026-11-18): "Let's disable allow and deny while this is
+/// the behavior": the API refuses a whole request whose `allowed_domains`
+/// names a site that blocks Anthropic's crawler, so a list derived from
+/// the display policy can fail every session of a run on any day
+/// ([`display::refusal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DomainsKnob {
+    #[default]
+    Policy,
+    Unfiltered,
+}
+
 /// An optional domain allowlist or blocklist, in the owned form the
 /// server-tool builders take.
 type DomainList = Option<Vec<Cow<'static, str>>>;
 
+/// What is wrong with one entry of an operator's domain list, as
+/// Anthropic's docs state it (server tools, "Domain filtering", read
+/// 2026-11-18): no scheme; no wildcard in the domain (only in a path);
+/// ASCII only (the docs' homograph warning); and web fetch matches the
+/// domain alone, so a fetch entry with a path never matches anything,
+/// allowing or blocking nothing, said nowhere. An entry the API would
+/// refuse fails every request of the run, so it is refused at load.
+fn entry_problem(tool: &str, entry: &str) -> Option<&'static str> {
+    if entry.is_empty() {
+        return Some("is empty");
+    }
+    if !entry.is_ascii() {
+        return Some(
+            "is not ASCII: the docs warn that a non-ASCII domain can pass for another \
+             (a homograph); write its `xn--` form",
+        );
+    }
+    if entry.chars().any(char::is_whitespace) {
+        return Some("has whitespace");
+    }
+    if entry.contains("://") {
+        return Some(
+            "has a scheme: write the bare domain (`example.com`, not `https://example.com`)",
+        );
+    }
+    let (host, path) = match entry.split_once('/') {
+        Some((host, path)) => (host, Some(path)),
+        None => (entry, None),
+    };
+    if host.contains('*') {
+        return Some(
+            "has a wildcard in the domain, which the API refuses; `example.com` already covers its subdomains",
+        );
+    }
+    if host.contains(':') {
+        return Some("has a port; an entry is a domain, optionally with a path");
+    }
+    if !display::refusal::domain_name(&host.to_ascii_lowercase()) {
+        return Some(
+            "is not a domain name of two labels or more of letters, digits and inner hyphens \
+             (an address or a single label like `localhost` is not one)",
+        );
+    }
+    if tool == "web_fetch" && path.is_some() {
+        return Some(
+            "has a path: web fetch matches the domain alone, so this entry would never match \
+             (paths are for web search)",
+        );
+    }
+    None
+}
+
 /// Domain lists are mutually exclusive at Anthropic — catch it here rather
-/// than as a 400 in the middle of a cohort.
+/// than as a 400 in the middle of a cohort. So is a list written beside
+/// `domains = "unfiltered"`, and every entry is checked
+/// ([`entry_problem`]).
 fn domains(
     tool: &str,
+    source: Option<DomainsKnob>,
     allowed: &Option<Vec<String>>,
     blocked: &Option<Vec<String>>,
 ) -> Result<(DomainList, DomainList)> {
@@ -575,6 +660,18 @@ fn domains(
         "[seed.{tool}]: allowed_domains and blocked_domains are mutually \
          exclusive — pick one"
     );
+    if source == Some(DomainsKnob::Unfiltered) {
+        let written = if allowed.is_some() {
+            "allowed_domains"
+        } else {
+            "blocked_domains"
+        };
+        anyhow::ensure!(
+            allowed.is_none() && blocked.is_none(),
+            "[seed.{tool}]: `domains = \"unfiltered\"` sends the tool with no domain list, \
+             and `{written}` is written beside it: remove one of the two"
+        );
+    }
     // An empty list's meaning to the API is undocumented, and written here
     // it would take the tool's lists from the operator and so switch the
     // display policy's off for this tool, saying nothing
@@ -584,6 +681,19 @@ fn domains(
             "[seed.{tool}]: `{name} = []` is refused: an empty list's meaning to the API is \
              undocumented, and writing a list takes this tool's domains from the display \
              policy. Remove the line to use the policy's list, or list the domains"
+        );
+        let bad: Vec<String> = list
+            .iter()
+            .flatten()
+            .filter_map(|e| entry_problem(tool, e).map(|why| format!("{e:?} {why}")))
+            .collect();
+        anyhow::ensure!(
+            bad.is_empty(),
+            "[seed.{tool}]: {name}: {} entr{} the API would refuse or never match, and one \
+             such entry fails every request of the run:\n  {}",
+            bad.len(),
+            if bad.len() == 1 { "y" } else { "ies" },
+            bad.join("\n  ")
         );
     }
     let own = |list: &Option<Vec<String>>| {
@@ -601,8 +711,12 @@ impl WebSearchKnobs {
             "[seed.web_search]: max_uses must be nonzero — omit the whole \
              table to turn web search off"
         );
-        let (allowed_domains, blocked_domains) =
-            domains("web_search", &self.allowed_domains, &self.blocked_domains)?;
+        let (allowed_domains, blocked_domains) = domains(
+            "web_search",
+            self.domains,
+            &self.allowed_domains,
+            &self.blocked_domains,
+        )?;
         Ok(WebSearch {
             max_uses: Some(max_uses),
             allowed_domains,
@@ -620,8 +734,12 @@ impl WebFetchKnobs {
             "[seed.web_fetch]: max_uses must be nonzero — omit the whole \
              table to turn web fetch off"
         );
-        let (allowed_domains, blocked_domains) =
-            domains("web_fetch", &self.allowed_domains, &self.blocked_domains)?;
+        let (allowed_domains, blocked_domains) = domains(
+            "web_fetch",
+            self.domains,
+            &self.allowed_domains,
+            &self.blocked_domains,
+        )?;
         Ok(WebFetch {
             max_uses: Some(max_uses),
             allowed_domains,
@@ -636,33 +754,53 @@ impl WebFetchKnobs {
 }
 
 impl SeedKnobs {
-    /// Where each web tool's domain lists come from: the operator's, when
-    /// either list is written on its table; else each session's display
-    /// policy ([`display`]).
+    /// Where each web tool's domain lists come from: none, under
+    /// `domains = "unfiltered"`; the operator's, when either list is
+    /// written on its table; else each session's display policy
+    /// ([`display`]).
     /// Checks the lists as the tools are built (`domains`): at load, before
     /// anything else, so a refused list stops the run there.
     fn web_sources(&self) -> Result<display::WebSources> {
         use display::WebSource;
         if let Some(k) = &self.web_fetch {
-            domains("web_fetch", &k.allowed_domains, &k.blocked_domains)?;
+            domains(
+                "web_fetch",
+                k.domains,
+                &k.allowed_domains,
+                &k.blocked_domains,
+            )?;
         }
         if let Some(k) = &self.web_search {
-            domains("web_search", &k.allowed_domains, &k.blocked_domains)?;
+            domains(
+                "web_search",
+                k.domains,
+                &k.allowed_domains,
+                &k.blocked_domains,
+            )?;
         }
-        let source = |on: bool, written: bool| match (on, written) {
-            (false, _) => WebSource::Off,
-            (true, true) => WebSource::Operator,
-            (true, false) => WebSource::Policy,
+        let source = |on: bool, unfiltered: bool, written: bool| match (on, unfiltered, written) {
+            (false, _, _) => WebSource::Off,
+            // `domains` checked it has no list beside it
+            (true, true, _) => WebSource::Unfiltered,
+            (true, false, true) => WebSource::Operator,
+            (true, false, false) => WebSource::Policy,
         };
+        let unfiltered = |d: Option<DomainsKnob>| d == Some(DomainsKnob::Unfiltered);
         Ok(display::WebSources {
             fetch: source(
                 self.web_fetch.is_some(),
+                self.web_fetch
+                    .as_ref()
+                    .is_some_and(|k| unfiltered(k.domains)),
                 self.web_fetch
                     .as_ref()
                     .is_some_and(|k| k.allowed_domains.is_some() || k.blocked_domains.is_some()),
             ),
             search: source(
                 self.web_search.is_some(),
+                self.web_search
+                    .as_ref()
+                    .is_some_and(|k| unfiltered(k.domains)),
                 self.web_search
                     .as_ref()
                     .is_some_and(|k| k.allowed_domains.is_some() || k.blocked_domains.is_some()),
@@ -3860,6 +3998,15 @@ async fn run(held: &mut Held) -> Result<()> {
         _ => None,
     };
 
+    // Which server tools each endpoint runs: for the forks' web tools and
+    // the startup print of the display plan
+    let endpoint_tools: Vec<display::EndpointTools> = config
+        .reactors
+        .iter()
+        .zip(&endpoints)
+        .map(|(spec, e)| display::EndpointTools::of(&spec.endpoint, &e.quirks()))
+        .collect();
+
     // Trial-review forks, before any agent runs: generating them loads
     // both models, so they're done together, grouped by model.
     let log_dir = args
@@ -3909,6 +4056,15 @@ async fn run(held: &mut Held) -> Result<()> {
                 clients: &endpoints,
                 offered: &offered,
                 thinking: &fork_thinking,
+                tools: &endpoint_tools,
+            },
+            // A fork's server web tools are what a session on its model is
+            // offered today: the same inputs `session_config` gets
+            &consent::forks::WebPolicy {
+                display: &display_plan,
+                sources: web_sources,
+                fetch: fork_seed.web_fetch.clone(),
+                search: fork_seed.web_search.clone(),
             },
             act_max_tokens,
             config.review_forks,
@@ -4159,12 +4315,6 @@ async fn run(held: &mut Held) -> Result<()> {
     } else {
         display::Detail::Summary
     };
-    let endpoint_tools: Vec<display::EndpointTools> = config
-        .reactors
-        .iter()
-        .zip(&endpoints)
-        .map(|(spec, e)| display::EndpointTools::of(&spec.endpoint, &e.quirks()))
-        .collect();
     say_raw!(
         "{}",
         display_plan.report(web_sources, detail, &endpoint_tools)
@@ -4620,6 +4770,28 @@ async fn run(held: &mut Held) -> Result<()> {
                 "reactor failed"
             ),
         }
+    }
+    // Sessions the API refused for a web tool's list naming a site that
+    // blocks its crawler: one error and one alert for the run, naming the
+    // sites (each session's own error is in the log above)
+    let messages: Vec<String> = report
+        .report
+        .values()
+        .flatten()
+        .flat_map(|r| r.errors.values().map(|e| e.message.clone()))
+        // A reactor that failed whole, as well as each agent's error
+        .chain(
+            report
+                .report
+                .values()
+                .filter_map(|r| r.as_ref().err().map(|e| e.to_string())),
+        )
+        .collect();
+    if let Some(refusals) =
+        display::refusal::CrawlerRefusals::of(messages.iter().map(String::as_str))
+    {
+        refusals.log(web_sources);
+        held.alerts.notify(refusals.alert(web_sources));
     }
     let (done, failed, unstarted) = report
         .report

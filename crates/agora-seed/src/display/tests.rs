@@ -859,3 +859,282 @@ fn an_agent_is_chosen_by_its_exact_name() {
     let lower = plan.resolve(&model(HAIKU), "oracle").unwrap();
     assert_eq!(lower.config, &AgentDisplayConfig::default());
 }
+
+/// `domains = "unfiltered"` on both tools
+const UNFILTERED: &str = "[seed.web_fetch]\nmax_uses = 3\ndomains = \"unfiltered\"\n\
+                          [seed.web_search]\nmax_uses = 2\ndomains = \"unfiltered\"\n";
+
+/// Under `domains = "unfiltered"` every session on every model gets both
+/// tools with neither list, whatever its display policy: an allow list, a
+/// deny list, one that would withhold the tool, a model's own profile, or
+/// none. What the session is shown is the policy's all the same
+#[test]
+fn unfiltered_sends_no_list_whatever_the_policy() {
+    for display in [
+        MIXED,
+        "[display]\nlinks = { mode = \"defanged\", allow = [\"http://localhost\"] }\n",
+        "[display]\nlinks = { mode = \"raw\", deny = [\"https://bad.example\"] }\n",
+        "",
+    ] {
+        let (plan, base, web) = load(&format!("{UNFILTERED}{display}")).unwrap();
+        assert_eq!(
+            web,
+            WebSources {
+                fetch: WebSource::Unfiltered,
+                search: WebSource::Unfiltered
+            }
+        );
+        for (model_id, name) in [
+            (HAIKU, AGENT_NAME),
+            (HAIKU, OTHER_NAME),
+            (OLD_HAIKU, OTHER_NAME),
+            ("local", OTHER_NAME),
+        ] {
+            let mut config = base.clone();
+            let done = plan
+                .apply(
+                    &mut config,
+                    web,
+                    &anthropic(),
+                    &model(model_id),
+                    agent(),
+                    name,
+                )
+                .unwrap();
+            assert_eq!(
+                done,
+                SessionDisplay {
+                    fetch: ToolOutcome::Unfiltered,
+                    search: ToolOutcome::Unfiltered
+                },
+                "{display} {model_id} {name}"
+            );
+            let fetch = config.web_fetch.as_ref().expect("offered");
+            let search = config.web_search.as_ref().expect("offered");
+            assert_eq!(
+                (&fetch.allowed_domains, &fetch.blocked_domains),
+                (&None, &None)
+            );
+            assert_eq!(
+                (&search.allowed_domains, &search.blocked_domains),
+                (&None, &None)
+            );
+            assert_eq!((fetch.max_uses, search.max_uses), (Some(3), Some(2)));
+            // The display is the policy's, unchanged
+            assert_eq!(
+                &config.display,
+                plan.resolve(&model(model_id), name).unwrap().config
+            );
+        }
+    }
+}
+
+/// The switch is per tool: one unfiltered, the other the policy's list
+#[test]
+fn the_switch_is_per_tool() {
+    let (plan, mut config, web) = load(&format!(
+        "{MIXED}[seed.web_fetch]\ndomains = \"unfiltered\"\n[seed.web_search]\ndomains = \"policy\"\n"
+    ))
+    .unwrap();
+    assert_eq!(
+        web,
+        WebSources {
+            fetch: WebSource::Unfiltered,
+            search: WebSource::Policy
+        }
+    );
+    let done = plan
+        .apply(
+            &mut config,
+            web,
+            &anthropic(),
+            &model(OLD_HAIKU),
+            other_agent(),
+            OTHER_NAME,
+        )
+        .unwrap();
+    assert_eq!(done.fetch, ToolOutcome::Unfiltered);
+    assert_eq!(done.search, ToolOutcome::Offered);
+    assert_eq!(config.web_fetch.unwrap().allowed_domains, None);
+    assert_eq!(
+        strings(&config.web_search.unwrap().allowed_domains),
+        Some(vec!["wikipedia.org", "www.bbc.com/news"])
+    );
+}
+
+/// `domains = "policy"` is what an absent key is, with or without a list
+#[test]
+fn policy_is_the_default() {
+    for (written, source) in [
+        ("", WebSource::Policy),
+        ("allowed_domains = [\"a.example\"]\n", WebSource::Operator),
+        ("blocked_domains = [\"a.example\"]\n", WebSource::Operator),
+    ] {
+        let (_, _, absent) = load(&format!("[seed.web_fetch]\n{written}")).unwrap();
+        let (_, _, said) = load(&format!(
+            "[seed.web_fetch]\ndomains = \"policy\"\n{written}"
+        ))
+        .unwrap();
+        assert_eq!(absent, said);
+        assert_eq!(absent.fetch, source);
+    }
+}
+
+/// A list written beside `domains = "unfiltered"`, or a value that is not
+/// one of the two, stops the load naming what is wrong
+#[test]
+fn unfiltered_with_a_list_or_an_unknown_value_is_refused_at_load() {
+    for table in ["web_fetch", "web_search"] {
+        for list in ["allowed_domains", "blocked_domains"] {
+            let e = load(&format!(
+                "[seed.{table}]\ndomains = \"unfiltered\"\n{list} = [\"a.example\"]\n"
+            ))
+            .expect_err("refused");
+            let e = format!("{e:#}");
+            assert!(
+                e.contains(&format!(
+                    "[seed.{table}]: `domains = \"unfiltered\"` sends the tool with no domain \
+                     list, and `{list}` is written beside it"
+                )),
+                "{e}"
+            );
+        }
+        let e = load(&format!("[seed.{table}]\ndomains = \"none\"\n")).expect_err("refused");
+        let e = format!("{e:#}");
+        assert!(e.contains("unknown variant `none`"), "{e}");
+        assert!(e.contains("expected `policy` or `unfiltered`"), "{e}");
+    }
+}
+
+/// The print says plainly that no list is sent and what the tool can
+/// reach; the policy's lines follow marked as not applied, and no warning
+/// about a refused list is printed, since none is sent
+#[test]
+fn the_report_says_no_list_is_sent() {
+    let src = include_str!("../../examples/display.toml");
+    let (plan, _, web) = load(&format!("{src}\n{UNFILTERED}")).unwrap();
+    for detail in [Detail::Summary, Detail::Full] {
+        let report = plan.report(web, detail, ENDPOINTS).to_string();
+        for (tool, table) in [
+            ("web fetch", "[seed.web_fetch]"),
+            ("web search", "[seed.web_search]"),
+        ] {
+            assert!(
+                report.contains(&format!(
+                    "   {tool}: no domain list is sent (domains = \"unfiltered\" in {table}); the \
+                     tool can reach any address in the session's context, whatever \
+                     [display.links] allows\n"
+                )),
+                "{report}"
+            );
+            assert!(
+                report.contains(&format!("     (not applied) {tool}: allowed_domains, 20")),
+                "{report}"
+            );
+        }
+        assert!(!report.contains("WARNING"), "{report}");
+    }
+    assert_eq!(
+        describe(
+            &allow(&["http://localhost"]).links().fetch_domains(),
+            WebSource::Unfiltered
+        ),
+        "unfiltered_by_operator"
+    );
+}
+
+/// Where a tool's list is the policy's allow list, the print warns once
+/// per tool and scope that a site blocking Anthropic's crawler fails the
+/// whole request; not for a deny list, an operator's list, or no list
+#[test]
+fn a_policy_allow_list_is_warned_of() {
+    let warning = |tool: &str, table: &str| {
+        format!(
+            "   {tool}: WARNING: Anthropic refuses the whole request when an allowed_domains \
+             entry is a site that blocks its crawler (2026-11-18: \"The following domains are \
+             not accessible to our user agent\"), so a list from the display policy can fail \
+             every session of a run on any day; domains = \"unfiltered\" in {table} sends none\n"
+        )
+    };
+    let (plan, _, web) = load(&format!("{MIXED}[seed.web_fetch]\n[seed.web_search]\n")).unwrap();
+    let report = plan.report(web, Detail::Summary, ENDPOINTS).to_string();
+    // The default and agent `beta-critic` (the default): allow lists; the
+    // `open` profile of Haiku 5.5 is a deny list
+    assert_eq!(
+        report
+            .matches(&warning("web fetch", "[seed.web_fetch]"))
+            .count(),
+        2,
+        "{report}"
+    );
+    assert_eq!(
+        report
+            .matches(&warning("web search", "[seed.web_search]"))
+            .count(),
+        2,
+        "{report}"
+    );
+    for src in [
+        "[display]\nlinks = { mode = \"raw\", deny = [\"https://bad.example\"] }\n\
+         [seed.web_fetch]\n[seed.web_search]\n",
+        "[seed.web_fetch]\nallowed_domains = [\"a.example\"]\n",
+        "[seed.web_fetch]\n",
+    ] {
+        let (plan, _, web) = load(src).unwrap();
+        let report = plan.report(web, Detail::Full, ENDPOINTS).to_string();
+        assert!(!report.contains("WARNING"), "{src}: {report}");
+    }
+}
+
+/// An operator's entry the docs say the API refuses (a scheme, a wildcard
+/// in the domain) or that never matches (a web fetch entry with a path)
+/// stops the load, each named; a web search path, with a wildcard in it,
+/// is the docs' own example and loads
+#[test]
+fn an_operators_entry_the_api_would_refuse_stops_the_load() {
+    for (table, entry, why) in [
+        ("web_fetch", "https://a.example", "has a scheme"),
+        ("web_search", "http://a.example/blog", "has a scheme"),
+        ("web_fetch", "*.a.example", "has a wildcard in the domain"),
+        ("web_search", "ex*.com", "has a wildcard in the domain"),
+        (
+            "web_fetch",
+            "a.example/blog",
+            "has a path: web fetch matches the domain alone",
+        ),
+        ("web_search", "аmazon.com", "is not ASCII"),
+        ("web_search", "a.example:8080", "has a port"),
+        ("web_fetch", "a .example", "has whitespace"),
+        ("web_fetch", "", "is empty"),
+        ("web_search", ".a.example", "is not a domain name"),
+        ("web_fetch", "localhost", "is not a domain name"),
+        ("web_fetch", "10.0.0.1", "is not a domain name"),
+        ("web_search", "a_b.example", "is not a domain name"),
+    ] {
+        for list in ["allowed_domains", "blocked_domains"] {
+            let e = load(&format!(
+                "[seed.{table}]\n{list} = [\"good.example\", \"{entry}\"]\n"
+            ))
+            .expect_err(entry);
+            let e = format!("{e:#}");
+            assert!(
+                e.contains(&format!(
+                    "[seed.{table}]: {list}: 1 entry the API would refuse"
+                )),
+                "{e}"
+            );
+            assert!(e.contains(&format!("{entry:?} {why}")), "{e}");
+        }
+    }
+    for entry in [
+        "example.com/blog",
+        "example.com/*",
+        "example.com/*/articles",
+        "Example.COM",
+    ] {
+        load(&format!(
+            "[seed.web_search]\nallowed_domains = [\"{entry}\"]\n"
+        ))
+        .expect(entry);
+    }
+}
