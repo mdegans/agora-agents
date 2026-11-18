@@ -369,7 +369,11 @@ impl DisplayPlan {
             let search = links.search_domains();
             let web_fetch = describe(&fetch, web.fetch);
             let web_search = describe(&search, web.search);
-            let notable = |d: &str| d == "withheld" || d == "operator_lists_over_withheld";
+            // A policy allow list is sent: the API refuses the whole
+            // request when one of its sites blocks the crawler
+            let notable = |d: &str| {
+                d == "withheld" || d == "operator_lists_over_withheld" || d == "allowed_domains"
+            };
             if notable(web_fetch) || notable(web_search) {
                 tracing::warn!(
                     event_type = "display_config",
@@ -381,7 +385,7 @@ impl DisplayPlan {
                     web_fetch_notes = fetch.notes().len(),
                     web_search,
                     web_search_notes = search.notes().len(),
-                    "display config: a web tool is withheld from these sessions, or offered with the operator's lists where the policy would withhold it"
+                    "display config: a web tool is withheld from these sessions, offered with the operator's lists where the policy would withhold it, or sent the policy's allow list, which the API refuses whole if a listed site blocks its crawler"
                 );
             } else {
                 tracing::info!(

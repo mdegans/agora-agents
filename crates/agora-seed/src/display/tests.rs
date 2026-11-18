@@ -1107,6 +1107,9 @@ fn an_operators_entry_the_api_would_refuse_stops_the_load() {
         ("web_fetch", "a .example", "has whitespace"),
         ("web_fetch", "", "is empty"),
         ("web_search", ".a.example", "is not a domain name"),
+        ("web_fetch", "localhost", "is not a domain name"),
+        ("web_fetch", "10.0.0.1", "is not a domain name"),
+        ("web_search", "a_b.example", "is not a domain name"),
     ] {
         for list in ["allowed_domains", "blocked_domains"] {
             let e = load(&format!(
@@ -1127,6 +1130,7 @@ fn an_operators_entry_the_api_would_refuse_stops_the_load() {
         "example.com/blog",
         "example.com/*",
         "example.com/*/articles",
+        "Example.COM",
     ] {
         load(&format!(
             "[seed.web_search]\nallowed_domains = [\"{entry}\"]\n"

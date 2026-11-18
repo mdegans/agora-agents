@@ -53,6 +53,7 @@ pub fn crawler_refused(message: &str) -> Option<Vec<String>> {
     .min();
     let mut part = &rest[..end.unwrap_or(rest.len())];
     let mut cut = end.is_none();
+    let bracketed = part.contains('[');
     if let Some(open) = part.find('[') {
         part = &part[open + 1..];
         match part.find(']') {
@@ -69,13 +70,17 @@ pub fn crawler_refused(message: &str) -> Option<Vec<String>> {
         .map(|t| t.trim_matches(|c| c == '.' || c == '-'))
         .filter(|t| !t.is_empty())
         .collect();
-    // A message cut inside the list may have cut its last name too: one
-    // that ends on a letter or digit, not on a closing quote or full stop
-    if cut
-        && part
-            .trim_end()
-            .ends_with(|c: char| c.is_ascii_alphanumeric())
-    {
+    // A message cut inside the list may have cut its last name too. In a
+    // bracketed list only a closing quote or a comma says the last name is
+    // whole (`'bbc.co.` is cut); without brackets a full stop ends the
+    // sentence, so only a letter or digit says it may be cut
+    let tail = part.trim_end();
+    let last_cut = if bracketed {
+        !tail.ends_with(['\'', '"', ','])
+    } else {
+        tail.ends_with(|c: char| c.is_ascii_alphanumeric())
+    };
+    if cut && last_cut {
         names.pop();
     }
     let mut out: Vec<String> = names
@@ -89,8 +94,11 @@ pub fn crawler_refused(message: &str) -> Option<Vec<String>> {
 }
 
 /// Two labels or more of letters, digits and inner hyphens, the last not
-/// all digits (not an address, nor a version number)
-fn domain_name(t: &str) -> bool {
+/// all digits (not an address, nor a version number), in lower case. The
+/// runner's one copy of the rule (agentkit's own, `sendable` in
+/// `display::domains`, is private); also what an operator's list entry is
+/// checked with at load
+pub(crate) fn domain_name(t: &str) -> bool {
     let labels: Vec<&str> = t.split('.').collect();
     labels.len() >= 2
         && t.len() <= 253
@@ -98,7 +106,8 @@ fn domain_name(t: &str) -> bool {
             (1..=63).contains(&l.len())
                 && !l.starts_with('-')
                 && !l.ends_with('-')
-                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
         && !labels
             .last()
@@ -109,7 +118,8 @@ fn domain_name(t: &str) -> bool {
 /// `error!` and one alert, not one per session
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CrawlerRefusals {
-    /// How many sessions failed so
+    /// How many agents' sessions failed so: the reactor keeps one error
+    /// per agent, so an agent with two such sessions in a run counts once
     pub sessions: usize,
     /// Every domain the refusals named
     pub domains: BTreeSet<String>,
@@ -142,8 +152,28 @@ impl CrawlerRefusals {
          \"unfiltered\" on [seed.web_fetch] and [seed.web_search] to send no list at all. The \
          runner does not retry these calls or change a session's tools mid-run.";
 
+    /// When every enabled web tool already goes out with no list, the API
+    /// refused something this runner did not send: there is no list to
+    /// change, and saying to send none would be wrong
+    pub const NO_LIST_SENT: &str = "Every web tool of this run is sent with no domain list \
+         (domains = \"unfiltered\", or off), so this refusal is not about a list the runner \
+         sent: read the API's messages in the run log, and Anthropic's documentation for the \
+         web tools.";
+
+    /// [`WAYS_OUT`](Self::WAYS_OUT), or [`NO_LIST_SENT`](Self::NO_LIST_SENT)
+    /// when no tool of the run carries a list
+    pub fn ways_out(web: crate::display::WebSources) -> &'static str {
+        use crate::display::WebSource;
+        let listless = |s: WebSource| matches!(s, WebSource::Off | WebSource::Unfiltered);
+        if listless(web.fetch) && listless(web.search) {
+            Self::NO_LIST_SENT
+        } else {
+            Self::WAYS_OUT
+        }
+    }
+
     /// The structured `error!`, once for the run
-    pub fn log(&self) {
+    pub fn log(&self, web: crate::display::WebSources) {
         tracing::error!(
             event_type = "web_domains_refused",
             sessions = self.sessions,
@@ -151,21 +181,22 @@ impl CrawlerRefusals {
             named = %Joined(&self.domains, ", "),
             unread = self.unread.len(),
             unread_messages = %Joined(&self.unread, "\n"),
-            ways_out = Self::WAYS_OUT,
-            "sessions failed: the API refused their requests because a web tool's \
+            ways_out = Self::ways_out(web),
+            "agents' sessions failed: the API refused their requests because a web tool's \
              allowed_domains names sites that block Anthropic's crawler"
         );
     }
 
-    /// The operator's alert, once for the run. Counted by sessions, so a
-    /// run with more of them is sent inside the rate limit
-    pub fn alert(&self) -> Alert {
+    /// The operator's alert, once for the run. Counted by agents, so a run
+    /// with more of them is sent inside the rate limit
+    pub fn alert(&self, web: crate::display::WebSources) -> Alert {
         let mut alert = Alert::new(
             AlertKind::WebDomainsRefused,
             format!(
-                "{} session{} failed: the API refused {} request{} because a web tool's \
+                "{} agent{} session{} failed: the API refused {} request{} because a web tool's \
                  allowed_domains names {} site{} that block{} Anthropic's crawler",
                 self.sessions,
+                if self.sessions == 1 { "'s" } else { "s'" },
                 plural(self.sessions),
                 if self.sessions == 1 { "its" } else { "their" },
                 plural(self.sessions),
@@ -176,7 +207,7 @@ impl CrawlerRefusals {
         )
         .count(self.sessions)
         .detail("domains", Joined(&self.domains, ", "))
-        .detail("ways out", Self::WAYS_OUT);
+        .detail("ways out", Self::ways_out(web));
         if !self.unread.is_empty() {
             alert = alert.detail(
                 "unread",
@@ -402,6 +433,16 @@ mod tests {
             ),
             Some(vec!["httpbin.org".into()])
         );
+        // Cut on a dot inside a bracketed list: that name is cut too
+        assert_eq!(
+            read("not accessible to our user agent: ['apnews.com', 'bbc.co."),
+            Some(vec!["apnews.com".into()])
+        );
+        // Upper case in the message is read as lower case
+        assert_eq!(
+            read("not accessible to our user agent: ['NYTimes.com']"),
+            Some(vec!["nytimes.com".into()])
+        );
         // Repeats are said once
         assert_eq!(
             read("not accessible to our user agent: ['a.com', 'a.com']"),
@@ -445,12 +486,16 @@ mod tests {
             "x: domains are not accessible to our user agent",
         ])
         .unwrap();
-        let alert = r.alert();
+        let listed = crate::display::WebSources {
+            fetch: crate::display::WebSource::Policy,
+            search: crate::display::WebSource::Unfiltered,
+        };
+        let alert = r.alert(listed);
         assert_eq!(alert.kind, AlertKind::WebDomainsRefused);
         assert_eq!(alert.count, Some(3));
         assert_eq!(
             alert.summary,
-            "3 sessions failed: the API refused their requests because a web tool's \
+            "3 agents' sessions failed: the API refused their requests because a web tool's \
              allowed_domains names 53 sites that block Anthropic's crawler"
         );
         let detail = |name: &str| {
@@ -466,6 +511,19 @@ mod tests {
         assert!(detail("ways out").contains("domains = \"unfiltered\""));
         assert!(detail("ways out").contains("[display.links]"));
         assert!(detail("unread").contains("x: domains are not accessible to our user agent"));
+        // With no list sent by any tool, the way out is not "send none"
+        let listless = crate::display::WebSources {
+            fetch: crate::display::WebSource::Unfiltered,
+            search: crate::display::WebSource::Off,
+        };
+        let other = r.alert(listless);
+        let ways = &other
+            .details
+            .iter()
+            .find(|(n, _)| *n == "ways out")
+            .unwrap()
+            .1;
+        assert_eq!(ways, CrawlerRefusals::NO_LIST_SENT);
         alerts.notify(alert);
         alerts.flush(std::time::Duration::from_secs(5)).await;
         let mails = sent.sent();

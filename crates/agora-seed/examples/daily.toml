@@ -39,7 +39,10 @@ max_rounds = 10
 # (`[display]`, below) unless either list is written here: then the lists
 # written are used as they are, and the policy's are not. A policy whose
 # allow list the tool cannot take withholds the tool from that session.
-# The startup print says which applies, rule by rule.
+# `domains = "unfiltered"` sends the tool with no list at all, whatever the
+# policy says (and refuses a list written beside it): the API refuses a whole
+# request whose allowed_domains names a site that blocks Anthropic's
+# crawler. The startup print says which applies, rule by rule.
 #
 # [seed.web_search]
 # max_uses = 2

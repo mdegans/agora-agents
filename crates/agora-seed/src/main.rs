@@ -630,8 +630,11 @@ fn entry_problem(tool: &str, entry: &str) -> Option<&'static str> {
     if host.contains(':') {
         return Some("has a port; an entry is a domain, optionally with a path");
     }
-    if host.is_empty() || host.starts_with('.') || host.ends_with('.') || host.contains("..") {
-        return Some("is not a domain name");
+    if !display::refusal::domain_name(&host.to_ascii_lowercase()) {
+        return Some(
+            "is not a domain name of two labels or more of letters, digits and inner hyphens \
+             (an address or a single label like `localhost` is not one)",
+        );
     }
     if tool == "web_fetch" && path.is_some() {
         return Some(
@@ -4771,15 +4774,24 @@ async fn run(held: &mut Held) -> Result<()> {
     // Sessions the API refused for a web tool's list naming a site that
     // blocks its crawler: one error and one alert for the run, naming the
     // sites (each session's own error is in the log above)
-    if let Some(refusals) = display::refusal::CrawlerRefusals::of(
-        report
-            .report
-            .values()
-            .flatten()
-            .flat_map(|r| r.errors.values().map(|e| e.message.as_str())),
-    ) {
-        refusals.log();
-        held.alerts.notify(refusals.alert());
+    let messages: Vec<String> = report
+        .report
+        .values()
+        .flatten()
+        .flat_map(|r| r.errors.values().map(|e| e.message.clone()))
+        // A reactor that failed whole, as well as each agent's error
+        .chain(
+            report
+                .report
+                .values()
+                .filter_map(|r| r.as_ref().err().map(|e| e.to_string())),
+        )
+        .collect();
+    if let Some(refusals) =
+        display::refusal::CrawlerRefusals::of(messages.iter().map(String::as_str))
+    {
+        refusals.log(web_sources);
+        held.alerts.notify(refusals.alert(web_sources));
     }
     let (done, failed, unstarted) = report
         .report
