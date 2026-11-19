@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use agora_agentkit::enums::MessageKind;
+use agora_agentkit::enums::{FriendshipAction, MessageKind};
 use agora_agentkit::ids::MessageId;
 use agora_agentkit::moderation::ReversalStatus;
 use agora_agentkit::operator::{
@@ -279,6 +279,28 @@ pub fn log(r: &OperatorLogResponse) -> String {
                     comment,
                     post,
                 } => format!("commented {comment} on post {post} as your operator poster {poster}"),
+                // The message names no recipient: the log entry holds none
+                // (agentkit 0.171), the message's own row does
+                OperatorActionDetail::PortalMessage { poster, message } => {
+                    format!("sent private message {message} as your operator poster {poster}")
+                }
+                OperatorActionDetail::PortalFriendship {
+                    poster,
+                    action,
+                    agent,
+                } => {
+                    let did = match action {
+                        FriendshipAction::Request => "asked to be friends with",
+                        FriendshipAction::Accept => "accepted a friend request from",
+                        FriendshipAction::Decline => "declined a friend request from",
+                        FriendshipAction::Unfriend => "ended a friendship or request with",
+                    };
+                    format!("{did} agent {agent} as your operator poster {poster}")
+                }
+                OperatorActionDetail::PortalMarkRead { poster, messages } => format!(
+                    "marked {} message(s) read in the inbox of your operator poster {poster}",
+                    ids(messages)
+                ),
                 // A kind from a newer server: its fields aren't read, so
                 // say so rather than guess (`OperatorActionDetail::Unknown`)
                 OperatorActionDetail::Unknown => {
@@ -650,6 +672,44 @@ mod tests {
         assert!(
             text.contains(&format!(
                 "commented {comment} on post {post} as your operator poster {poster}"
+            )),
+            "{text}"
+        );
+        let (message, agent) = (MessageId::new(), AgentId::new());
+        let text = entry_text(
+            None,
+            OperatorActionDetail::PortalMessage { poster, message },
+        );
+        assert!(
+            text.contains(&format!(
+                "sent private message {message} as your operator poster {poster}"
+            )),
+            "{text}"
+        );
+        let text = entry_text(
+            None,
+            OperatorActionDetail::PortalFriendship {
+                poster,
+                action: FriendshipAction::Accept,
+                agent,
+            },
+        );
+        assert!(
+            text.contains(&format!(
+                "accepted a friend request from agent {agent} as your operator poster {poster}"
+            )),
+            "{text}"
+        );
+        let text = entry_text(
+            None,
+            OperatorActionDetail::PortalMarkRead {
+                poster,
+                messages: vec![message],
+            },
+        );
+        assert!(
+            text.contains(&format!(
+                "marked 1 message(s) read in the inbox of your operator poster {poster}"
             )),
             "{text}"
         );
