@@ -24,7 +24,9 @@
 //! agent's backups are stopped with `sealed-stop`, never forgotten.
 //!
 //! **Order.** The note (with the names it will move to), then the state
-//! key, which commits the forget, then the memory-id key and the stop. A
+//! key, which commits the forget, then the memory-id key, the uploading
+//! marker and last the stop (so a run cut between the two leaves the agent
+//! stopped and not uploading, never the reverse). A
 //! run cut after the commit is finished by the next: with no
 //! `state_key.json`, the newest note whose state key is set aside and
 //! whose planned moves aren't all done is completed under its own stamp.
@@ -69,39 +71,44 @@ struct Forgotten {
 /// written in the forget's millisecond but before it would read as after
 /// the truncated stamp, and be kept (2026-11-19, a flaky test on tmpfs).
 ///
-/// **Fallback.** Where the note can't be read (missing, unparsable, or its
-/// `at` not in its stamp's millisecond), the end of the stamp's millisecond:
-/// a marker from that millisecond then counts as before the forget and is
-/// set aside, the side that never has a forgotten agent upload again (a
-/// stale stop set aside only loses a marker its secrets copy no longer
-/// backs). Logged at warn each time it is read, with the agent and stamp.
+/// **Fallback.** Where the note can't be read (missing or unparsable), the
+/// end of the stamp's millisecond: a marker from that millisecond then
+/// counts as before the forget and is set aside, the side that never has a
+/// forgotten agent upload again (a stale stop is set aside only when no
+/// durable marker backs either). A note whose `at` isn't in its stamp's
+/// millisecond gives the later of the two, so a forget is never placed
+/// earlier than either record says. Logged at warn each time it is read,
+/// with the agent and stamp.
 pub fn noted_at(dir: &Path, id: AgentId, stamp: &str) -> Option<DateTime<Utc>> {
     let stamped = chrono::NaiveDateTime::parse_from_str(stamp, super::STAMP_FORMAT)
         .ok()?
         .and_utc();
     let path = dir.join(FORGOTTEN_NOTE.name(stamp));
-    let problem = match std::fs::read(&path) {
+    let end = stamped + chrono::TimeDelta::nanoseconds(999_999);
+    let (problem, at) = match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Forgotten>(&bytes) {
             Ok(note) if note.at.format(super::STAMP_FORMAT).to_string() == stamp => {
                 return Some(note.at);
             }
-            Ok(note) => format!("its time {} is not its stamp's", note.at.to_rfc3339()),
-            Err(e) => format!("unparsable: {e}"),
+            Ok(note) => (
+                format!("its time {} is not its stamp's", note.at.to_rfc3339()),
+                end.max(note.at),
+            ),
+            Err(e) => (format!("unparsable: {e}"), end),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
-        Err(e) => format!("unreadable: {e}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ("missing".to_string(), end),
+        Err(e) => (format!("unreadable: {e}"), end),
     };
-    let end = stamped + chrono::TimeDelta::nanoseconds(999_999);
     tracing::warn!(
         event_type = "sealed_state_forget_note_unreadable",
         agent_id = %id,
         stamp = %stamp,
         error = %problem,
-        fallback = %end.to_rfc3339(),
-        "a forget's note doesn't give its exact time; the end of its stamp's millisecond is used \
-         (markers from that millisecond are set aside)"
+        fallback = %at.to_rfc3339(),
+        "a forget's note doesn't give its exact time; the end of its stamp's millisecond (or the \
+         note's time, if later) is used: markers from that millisecond are set aside"
     );
-    Some(end)
+    Some(at)
 }
 
 /// What `sealed-forget` set aside: file names only.
@@ -133,15 +140,19 @@ fn finish(keys: &KeyStore, id: AgentId, dir: &Path, plan: &Forgotten) -> anyhow:
     if let Some(to) = &plan.memory_id_key {
         move_aside(dir, MEMORY_ID_KEY_FILE, to).context("setting the memory-id key aside")?;
     }
-    if let Some(to) = &plan.stop {
-        move_aside(dir, super::stop::DURABLE, to).context("setting the stop aside")?;
-    }
+    // The uploading marker before the stop: cut between the two, the
+    // agent reads as stopped and not uploading, never as uploading and
+    // not stopped
     if let Some(to) = &plan.uploading {
         // Under the marker's lock, as every writer of it; the lock file
         // stays, as every lock file does
         let _lock = super::uploading::lock(keys, id).context("the uploading marker's lock")?;
         move_aside(dir, super::uploading::DURABLE, to)
             .context("setting the uploading marker aside")?;
+    }
+    super::crash::point("forget:uploading_aside")?;
+    if let Some(to) = &plan.stop {
+        move_aside(dir, super::stop::DURABLE, to).context("setting the stop aside")?;
     }
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
@@ -491,6 +502,47 @@ mod tests {
         );
         // Finished: nothing more to forget
         assert!(forget(&state_dir, &keys, id, "third").await.is_err());
+    }
+
+    /// A forget cut between its durable markers: the uploading marker is
+    /// set aside first, so the agent reads as stopped and not uploading,
+    /// never the reverse; the rerun sets the stop aside under the same
+    /// stamp.
+    #[tokio::test]
+    async fn a_forget_cut_between_its_markers_leaves_the_agent_stopped() {
+        let root = crate::sealed::TestDir::new("forget-cut-markers");
+        let (id, keys, dir) = enrolled(&root).await;
+        let state_dir = root.join("state");
+        crate::sealed::uploading::set(
+            &dir,
+            &keys,
+            id,
+            crate::sealed::uploading::UploadingBy::OptIn,
+        )
+        .unwrap();
+        crate::sealed::stop::stop(&state_dir, &keys, id, "It asked")
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.join("state.json")).unwrap();
+        let secrets = keys.agent_dir(id);
+        crate::sealed::crash::at("forget:uploading_aside");
+        let e = forget(&state_dir, &keys, id, "it left").await.unwrap_err();
+        assert!(format!("{e:#}").contains("simulated crash"), "{e:#}");
+        assert!(!std::fs::exists(secrets.join(super::super::uploading::DURABLE)).unwrap());
+        assert!(std::fs::exists(secrets.join(super::super::stop::DURABLE)).unwrap());
+        assert!(!crate::sealed::uploading::is_uploading(&dir, &keys, id));
+        assert!(crate::sealed::stop::durable(&keys, id).unwrap().is_some());
+        let done = forget(&state_dir, &keys, id, "again").await.unwrap();
+        assert!(done.finished_cut);
+        let stamp = FORGOTTEN_STATE_KEY.stamp(&done.key).unwrap();
+        assert_eq!(
+            done.stop,
+            Some(super::super::keys::FORGOTTEN_STOP.name(stamp))
+        );
+        assert!(!std::fs::exists(secrets.join(super::super::stop::DURABLE)).unwrap());
+        assert!(
+            std::fs::exists(secrets.join(super::super::keys::FORGOTTEN_STOP.name(stamp))).unwrap()
+        );
     }
 
     /// Forget, the agent put back and its key revived, forget again: a new
