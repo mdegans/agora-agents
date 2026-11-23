@@ -151,23 +151,37 @@ fn cut(name: &'static str) -> std::io::Result<()> {
 /// newest stamp in its secrets directory of anything a forget moves (its
 /// state key, the forget's note, a durable uploading marker, a durable
 /// stop). A forget of an agent with no marker leaves only the first two.
+///
+/// The time is that forget's exact one, from its note
+/// ([`super::forget::noted_at`]), not its stamp, which is cut to the
+/// millisecond; where the note can't be read, the end of the stamp's
+/// millisecond (logged).
 pub fn forgotten_at(keys: &KeyStore, id: AgentId) -> Option<DateTime<Utc>> {
     let dir = keys.agent_dir(id);
-    [
+    let mut newest: Option<String> = None;
+    for kind in [
         super::keys::FORGOTTEN_STATE_KEY,
         super::keys::FORGOTTEN_NOTE,
         super::keys::FORGOTTEN_UPLOADING,
         super::keys::FORGOTTEN_STOP,
-    ]
-    .iter()
-    .filter_map(|kind| kind.stamps(&dir).ok())
-    .flatten()
-    .filter_map(|s| {
-        chrono::NaiveDateTime::parse_from_str(&s, super::STAMP_FORMAT)
-            .ok()
-            .map(|t| t.and_utc())
-    })
-    .max()
+    ] {
+        match kind.stamps(&dir) {
+            // Stamps are fixed-width UTC: by name is by time
+            Ok(stamps) => {
+                if let Some(s) = stamps.into_iter().max() {
+                    newest = newest.max(Some(s));
+                }
+            }
+            Err(e) => tracing::error!(
+                event_type = "sealed_state_forget_stamps_unreadable",
+                agent_id = %id,
+                error = %e,
+                "the secrets directory couldn't be listed for one kind of a forget's records; \
+                 that kind is passed over"
+            ),
+        }
+    }
+    super::forget::noted_at(&dir, id, &newest?)
 }
 
 /// A forgotten agent put back with its directory: the local copies of
@@ -1109,9 +1123,10 @@ pub mod tests {
             b"{}",
         )
         .unwrap();
+        // No note: the end of the stamp's millisecond
         assert_eq!(
             forgotten_at(&keys, id),
-            Some("2026-11-10T09:00:00Z".parse().unwrap())
+            Some("2026-11-10T09:00:00.000999999Z".parse().unwrap())
         );
         old_marker(&dir);
         sent_one(&dir);
@@ -1120,6 +1135,122 @@ pub mod tests {
             migrate(&dir, &keys, id).await.unwrap(),
             Err(NotMigrated::Forgotten)
         );
+    }
+
+    /// A forget's note, or its absence, for
+    /// [`markers_are_judged_against_the_forgets_exact_time`].
+    #[derive(Debug, Clone, Copy)]
+    enum Note {
+        At(DateTime<Utc>),
+        Missing,
+        Unparsable,
+        /// Parses, but its `at` is not in its stamp's millisecond.
+        Elsewhere,
+    }
+
+    /// The local stop and uploading copies of a forgotten agent put back,
+    /// judged against the forget's exact time (its note's `at`), not its
+    /// stamp cut to the millisecond: one written in the forget's
+    /// millisecond but before it is set aside, and [`finish`] won't
+    /// complete it; one after the forget, in its millisecond or well
+    /// after, is kept. With no readable note, the whole of the stamp's
+    /// millisecond counts as before the forget. Every time is built by
+    /// hand, so no clock or filesystem speed decides it (2026-11-19: a stop
+    /// and a forget in one millisecond, on tmpfs, kept the stop).
+    #[tokio::test]
+    async fn markers_are_judged_against_the_forgets_exact_time() {
+        let stamp = "20261110T090000000Z";
+        let stamped: DateTime<Utc> = "2026-11-10T09:00:00Z".parse().unwrap();
+        let us = |n: i64| stamped + chrono::TimeDelta::microseconds(n);
+        let forgot = us(600);
+        let end_of_ms = stamped + chrono::TimeDelta::nanoseconds(999_999);
+        // (the note, when the markers were written, set aside?)
+        let cases = [
+            (Note::At(forgot), us(-1_000), true),
+            (Note::At(forgot), us(500), true),
+            (Note::At(forgot), forgot, true),
+            (Note::At(forgot), us(700), false),
+            (Note::At(forgot), us(2_000_000), false),
+            (Note::Missing, us(500), true),
+            (Note::Missing, us(700), true),
+            (Note::Missing, us(1_000), false),
+            (Note::Missing, us(2_000_000), false),
+            (Note::Unparsable, us(700), true),
+            (Note::Unparsable, us(2_000_000), false),
+            (Note::Elsewhere, us(700), true),
+            (Note::Elsewhere, us(2_000_000), false),
+        ];
+        let root = crate::sealed::TestDir::new("uploading-forgot-exact");
+        for (note, written, aside) in cases {
+            let case = format!("{note:?}, markers at {written}");
+            let forget = |keys: &KeyStore, id: AgentId| {
+                let secrets = keys.agent_dir(id);
+                // As a forget leaves the secrets: the durable copies gone
+                for durable in [DURABLE, crate::sealed::stop::DURABLE] {
+                    assert!(!std::fs::exists(secrets.join(durable)).unwrap());
+                }
+                std::fs::write(
+                    secrets.join(crate::sealed::keys::FORGOTTEN_STATE_KEY.name(stamp)),
+                    b"{}",
+                )
+                .unwrap();
+                let note_path = secrets.join(crate::sealed::keys::FORGOTTEN_NOTE.name(stamp));
+                match note {
+                    Note::At(at) => crate::sealed::forget::write_note(&secrets, stamp, at),
+                    Note::Missing => {}
+                    Note::Unparsable => std::fs::write(&note_path, b"{not json").unwrap(),
+                    Note::Elsewhere => {
+                        crate::sealed::forget::write_note(&secrets, stamp, us(5_000))
+                    }
+                }
+                let expected = match note {
+                    Note::At(at) => at,
+                    _ => end_of_ms,
+                };
+                assert_eq!(forgotten_at(keys, id), Some(expected), "{case}");
+            };
+            let uploading = |id: AgentId| Uploading {
+                agent_id: id,
+                since: written,
+                by: UploadingBy::OptIn,
+            };
+            // The start pass's set-aside
+            let (id, keys, dir) = enrolled_local(&root).await;
+            forget(&keys, id);
+            let stop = crate::sealed::stop::Stopped {
+                at: written,
+                note: "It asked".to_string(),
+                shown: true,
+            };
+            crate::sealed::write_private(
+                &dir.join(SEALED_DIR).join(crate::sealed::stop::STOPPED),
+                &serde_json::to_vec(&stop).unwrap(),
+            )
+            .unwrap();
+            crate::sealed::write_private(
+                &local_path(&dir),
+                &serde_json::to_vec(&uploading(id)).unwrap(),
+            )
+            .unwrap();
+            let moved = set_aside_forgotten(&dir, &keys, id).unwrap();
+            let expected: Vec<&str> = if aside {
+                vec![UPLOADING, crate::sealed::stop::STOPPED]
+            } else {
+                vec![]
+            };
+            assert_eq!(moved, expected, "{case}");
+            assert_eq!(crate::sealed::stop::is_stopped(&dir), !aside, "{case}");
+            assert_eq!(std::fs::exists(local_path(&dir)).unwrap(), !aside, "{case}");
+            // A cut set (its intent and local copy, no secrets copy): not
+            // finished when it is from before the forget
+            let (id, keys, dir) = enrolled_local(&root).await;
+            forget(&keys, id);
+            let bytes = serde_json::to_vec(&uploading(id)).unwrap();
+            crate::sealed::write_private(&setting_path(&keys, id), &bytes).unwrap();
+            crate::sealed::write_private(&local_path(&dir), &bytes).unwrap();
+            assert_eq!(finish(&dir, &keys, id).unwrap().is_some(), !aside, "{case}");
+            assert_eq!(is_uploading(&dir, &keys, id), !aside, "{case}");
+        }
     }
 
     /// Has uploaded: a copy naming the agent in either place, whatever the

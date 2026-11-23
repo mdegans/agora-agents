@@ -61,6 +61,49 @@ struct Forgotten {
     uploading: Option<String>,
 }
 
+/// When the forget under `stamp` (in the agent's secrets directory `dir`)
+/// happened, to the nanosecond: its note's `at`.
+///
+/// A stamp is cut to the millisecond, and the markers it is compared with
+/// (a stop's `at`, an uploading marker's `since`) are not, so a marker
+/// written in the forget's millisecond but before it would read as after
+/// the truncated stamp, and be kept (2026-11-19, a flaky test on tmpfs).
+///
+/// **Fallback.** Where the note can't be read (missing, unparsable, or its
+/// `at` not in its stamp's millisecond), the end of the stamp's millisecond:
+/// a marker from that millisecond then counts as before the forget and is
+/// set aside, the side that never has a forgotten agent upload again (a
+/// stale stop set aside only loses a marker its secrets copy no longer
+/// backs). Logged at warn each time it is read, with the agent and stamp.
+pub fn noted_at(dir: &Path, id: AgentId, stamp: &str) -> Option<DateTime<Utc>> {
+    let stamped = chrono::NaiveDateTime::parse_from_str(stamp, super::STAMP_FORMAT)
+        .ok()?
+        .and_utc();
+    let path = dir.join(FORGOTTEN_NOTE.name(stamp));
+    let problem = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<Forgotten>(&bytes) {
+            Ok(note) if note.at.format(super::STAMP_FORMAT).to_string() == stamp => {
+                return Some(note.at);
+            }
+            Ok(note) => format!("its time {} is not its stamp's", note.at.to_rfc3339()),
+            Err(e) => format!("unparsable: {e}"),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
+        Err(e) => format!("unreadable: {e}"),
+    };
+    let end = stamped + chrono::TimeDelta::nanoseconds(999_999);
+    tracing::warn!(
+        event_type = "sealed_state_forget_note_unreadable",
+        agent_id = %id,
+        stamp = %stamp,
+        error = %problem,
+        fallback = %end.to_rfc3339(),
+        "a forget's note doesn't give its exact time; the end of its stamp's millisecond is used \
+         (markers from that millisecond are set aside)"
+    );
+    Some(end)
+}
+
 /// What `sealed-forget` set aside: file names only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forgot {
@@ -229,6 +272,24 @@ pub async fn forget(
         index,
         finished_cut: false,
     })
+}
+
+/// A forget's note under `stamp`, at `at`, as `forget` writes it: for
+/// tests that need a forget at an exact time.
+#[cfg(test)]
+pub fn write_note(dir: &Path, stamp: &str, at: DateTime<Utc>) {
+    let note = Forgotten {
+        at,
+        note: "test".to_string(),
+        memory_id_key: None,
+        stop: None,
+        uploading: None,
+    };
+    std::fs::write(
+        dir.join(FORGOTTEN_NOTE.name(stamp)),
+        serde_json::to_vec_pretty(&note).unwrap(),
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
