@@ -151,23 +151,31 @@ fn cut(name: &'static str) -> std::io::Result<()> {
 /// newest stamp in its secrets directory of anything a forget moves (its
 /// state key, the forget's note, a durable uploading marker, a durable
 /// stop). A forget of an agent with no marker leaves only the first two.
-pub fn forgotten_at(keys: &KeyStore, id: AgentId) -> Option<DateTime<Utc>> {
+///
+/// The time is that forget's exact one, from its note
+/// ([`super::forget::noted_at`]), not its stamp, which is cut to the
+/// millisecond; where the note can't be read, the end of the stamp's
+/// millisecond (logged).
+///
+/// **Fails closed.** A secrets directory that can't be listed is an
+/// error, not "never forgotten": every caller then leaves the agent as it
+/// is (no marker set aside, no cut set finished, no migration), logs it,
+/// and tries again at the next start.
+pub fn forgotten_at(keys: &KeyStore, id: AgentId) -> std::io::Result<Option<DateTime<Utc>>> {
     let dir = keys.agent_dir(id);
-    [
+    let mut newest: Option<String> = None;
+    for kind in [
         super::keys::FORGOTTEN_STATE_KEY,
         super::keys::FORGOTTEN_NOTE,
         super::keys::FORGOTTEN_UPLOADING,
         super::keys::FORGOTTEN_STOP,
-    ]
-    .iter()
-    .filter_map(|kind| kind.stamps(&dir).ok())
-    .flatten()
-    .filter_map(|s| {
-        chrono::NaiveDateTime::parse_from_str(&s, super::STAMP_FORMAT)
-            .ok()
-            .map(|t| t.and_utc())
-    })
-    .max()
+    ] {
+        // Stamps are fixed-width UTC: by name is by time
+        if let Some(s) = kind.stamps(&dir)?.into_iter().max() {
+            newest = newest.max(Some(s));
+        }
+    }
+    Ok(newest.and_then(|stamp| super::forget::noted_at(&dir, id, &stamp)))
 }
 
 /// A forgotten agent put back with its directory: the local copies of
@@ -179,7 +187,7 @@ pub fn set_aside_forgotten(
     keys: &KeyStore,
     id: AgentId,
 ) -> std::io::Result<Vec<&'static str>> {
-    let Some(forgot) = forgotten_at(keys, id) else {
+    let Some(forgot) = forgotten_at(keys, id)? else {
         return Ok(Vec::new());
     };
     let _lock = lock(keys, id)?;
@@ -200,12 +208,29 @@ pub fn set_aside_forgotten(
         )?;
         moved.push(UPLOADING);
     }
+    // The stop: from before the forget, nothing made since. Never while a
+    // durable uploading marker is there: a stop set aside then would let
+    // the agent upload, so it stays, whatever it says (or fails to say)
     let stale_stop = !std::fs::exists(keys.agent_dir(id).join(super::stop::DURABLE))?
+        && !std::fs::exists(durable_path(keys, id))?
         && std::fs::exists(sealed.join(super::stop::STOPPED))?
-        && super::stop::Stopped::load(agent_dir)
-            .ok()
-            .flatten()
-            .is_none_or(|s| s.at <= forgot);
+        && match super::stop::Stopped::load(agent_dir) {
+            Ok(Some(s)) => s.at <= forgot,
+            // Gone since the check above: nothing to set aside
+            Ok(None) => false,
+            Err(e) => {
+                // A stop from before the forget or not, it can't be told;
+                // with neither durable marker there, it has nothing behind it
+                tracing::warn!(
+                    event_type = "sealed_state_forgotten_stop_unreadable",
+                    agent_id = %id,
+                    error = %e,
+                    "a forgotten agent's local stop can't be read; set aside, as no durable \
+                     stop or uploading marker is there"
+                );
+                true
+            }
+        };
     if stale_stop {
         std::fs::rename(
             sealed.join(super::stop::STOPPED),
@@ -567,7 +592,7 @@ fn finish_locked(
         _ => return Ok(None),
     }
     // A local copy from before a forget is not an opt-in to complete
-    if forgotten_at(keys, id).is_some_and(|f| u.since <= f) {
+    if forgotten_at(keys, id)?.is_some_and(|f| u.since <= f) {
         return Ok(None);
     }
     commit(keys, id)?;
@@ -655,7 +680,7 @@ pub async fn migrate(
     if !AgentSeal::new(agent_dir, id).has_legacy_marker().await? {
         return Ok(Err(NotMigrated::NoOldMarker));
     }
-    if forgotten_at(keys, id).is_some() {
+    if forgotten_at(keys, id)?.is_some() {
         return Ok(Err(NotMigrated::Forgotten));
     }
     let _lock = lock(keys, id)?;
@@ -1101,7 +1126,7 @@ pub mod tests {
     async fn a_forgotten_state_key_alone_counts_as_a_forget() {
         let root = crate::sealed::TestDir::new("uploading-forgot-key");
         let (id, keys, dir) = enrolled_local(&root).await;
-        assert_eq!(forgotten_at(&keys, id), None);
+        assert_eq!(forgotten_at(&keys, id).unwrap(), None);
         let stamp = "20261110T090000000Z";
         std::fs::write(
             keys.agent_dir(id)
@@ -1109,9 +1134,10 @@ pub mod tests {
             b"{}",
         )
         .unwrap();
+        // No note: the end of the stamp's millisecond
         assert_eq!(
-            forgotten_at(&keys, id),
-            Some("2026-11-10T09:00:00Z".parse().unwrap())
+            forgotten_at(&keys, id).unwrap(),
+            Some("2026-11-10T09:00:00.000999999Z".parse().unwrap())
         );
         old_marker(&dir);
         sent_one(&dir);
@@ -1120,6 +1146,293 @@ pub mod tests {
             migrate(&dir, &keys, id).await.unwrap(),
             Err(NotMigrated::Forgotten)
         );
+    }
+
+    /// A forget's note, or its absence, for
+    /// [`markers_are_judged_against_the_forgets_exact_time`].
+    #[derive(Debug, Clone, Copy)]
+    enum Note {
+        At(DateTime<Utc>),
+        Missing,
+        Unparsable,
+        /// Parses, but its `at` is not in its stamp's millisecond: the
+        /// later of the two counts.
+        Elsewhere(DateTime<Utc>),
+    }
+
+    /// The local stop and uploading copies of a forgotten agent put back,
+    /// judged against the forget's exact time (its note's `at`), not its
+    /// stamp cut to the millisecond: one written in the forget's
+    /// millisecond but before it is set aside, and [`finish`] won't
+    /// complete it; one after the forget, in its millisecond or well
+    /// after, is kept. With no readable note, the whole of the stamp's
+    /// millisecond counts as before the forget; with a note dated outside
+    /// its stamp's millisecond, the later of that end and the note's time.
+    /// Every time is built by
+    /// hand, so no clock or filesystem speed decides it (2026-11-19: a stop
+    /// and a forget in one millisecond, on tmpfs, kept the stop).
+    #[tokio::test]
+    async fn markers_are_judged_against_the_forgets_exact_time() {
+        let stamp = "20261110T090000000Z";
+        let stamped: DateTime<Utc> = "2026-11-10T09:00:00Z".parse().unwrap();
+        let us = |n: i64| stamped + chrono::TimeDelta::microseconds(n);
+        let forgot = us(600);
+        let end_of_ms = stamped + chrono::TimeDelta::nanoseconds(999_999);
+        // (the note, when the markers were written, set aside?)
+        let cases = [
+            (Note::At(forgot), us(-1_000), true),
+            (Note::At(forgot), us(500), true),
+            (Note::At(forgot), forgot, true),
+            (Note::At(forgot), us(700), false),
+            (Note::At(forgot), us(2_000_000), false),
+            (Note::Missing, us(500), true),
+            (Note::Missing, us(700), true),
+            (Note::Missing, us(1_000), false),
+            (Note::Missing, us(2_000_000), false),
+            (Note::Unparsable, us(700), true),
+            (Note::Unparsable, us(2_000_000), false),
+            // Dated later than its stamp: the note's time
+            (Note::Elsewhere(us(5_000)), us(700), true),
+            (Note::Elsewhere(us(5_000)), us(3_000), true),
+            (Note::Elsewhere(us(5_000)), us(5_001), false),
+            (Note::Elsewhere(us(5_000)), us(2_000_000), false),
+            // Dated earlier: the end of the stamp's millisecond
+            (Note::Elsewhere(us(-5_000)), us(700), true),
+            (Note::Elsewhere(us(-5_000)), us(1_000), false),
+        ];
+        let root = crate::sealed::TestDir::new("uploading-forgot-exact");
+        for (note, written, aside) in cases {
+            let case = format!("{note:?}, markers at {written}");
+            let forget = |keys: &KeyStore, id: AgentId| {
+                let secrets = keys.agent_dir(id);
+                // As a forget leaves the secrets: the durable copies gone
+                for durable in [DURABLE, crate::sealed::stop::DURABLE] {
+                    assert!(!std::fs::exists(secrets.join(durable)).unwrap());
+                }
+                std::fs::write(
+                    secrets.join(crate::sealed::keys::FORGOTTEN_STATE_KEY.name(stamp)),
+                    b"{}",
+                )
+                .unwrap();
+                let note_path = secrets.join(crate::sealed::keys::FORGOTTEN_NOTE.name(stamp));
+                match note {
+                    Note::At(at) => crate::sealed::forget::write_note(&secrets, stamp, at),
+                    Note::Missing => {}
+                    Note::Unparsable => std::fs::write(&note_path, b"{not json").unwrap(),
+                    Note::Elsewhere(at) => crate::sealed::forget::write_note(&secrets, stamp, at),
+                }
+                let expected = match note {
+                    Note::At(at) => at,
+                    Note::Elsewhere(at) => end_of_ms.max(at),
+                    Note::Missing | Note::Unparsable => end_of_ms,
+                };
+                assert_eq!(forgotten_at(keys, id).unwrap(), Some(expected), "{case}");
+            };
+            let uploading = |id: AgentId| Uploading {
+                agent_id: id,
+                since: written,
+                by: UploadingBy::OptIn,
+            };
+            // The start pass's set-aside
+            let (id, keys, dir) = enrolled_local(&root).await;
+            forget(&keys, id);
+            let stop = crate::sealed::stop::Stopped {
+                at: written,
+                note: "It asked".to_string(),
+                shown: true,
+            };
+            crate::sealed::write_private(
+                &dir.join(SEALED_DIR).join(crate::sealed::stop::STOPPED),
+                &serde_json::to_vec(&stop).unwrap(),
+            )
+            .unwrap();
+            crate::sealed::write_private(
+                &local_path(&dir),
+                &serde_json::to_vec(&uploading(id)).unwrap(),
+            )
+            .unwrap();
+            let moved = set_aside_forgotten(&dir, &keys, id).unwrap();
+            let expected: Vec<&str> = if aside {
+                vec![UPLOADING, crate::sealed::stop::STOPPED]
+            } else {
+                vec![]
+            };
+            assert_eq!(moved, expected, "{case}");
+            assert_eq!(crate::sealed::stop::is_stopped(&dir), !aside, "{case}");
+            assert_eq!(std::fs::exists(local_path(&dir)).unwrap(), !aside, "{case}");
+            // A cut set (its intent and local copy, no secrets copy): not
+            // finished when it is from before the forget
+            let (id, keys, dir) = enrolled_local(&root).await;
+            forget(&keys, id);
+            let bytes = serde_json::to_vec(&uploading(id)).unwrap();
+            crate::sealed::write_private(&setting_path(&keys, id), &bytes).unwrap();
+            crate::sealed::write_private(&local_path(&dir), &bytes).unwrap();
+            assert_eq!(finish(&dir, &keys, id).unwrap().is_some(), !aside, "{case}");
+            assert_eq!(is_uploading(&dir, &keys, id), !aside, "{case}");
+        }
+    }
+
+    /// Records of a forget under `stamp` in the agent's secrets: its set-aside
+    /// state key and (`at`) its note.
+    fn forgot_under(keys: &KeyStore, id: AgentId, stamp: &str, at: Option<DateTime<Utc>>) {
+        let secrets = keys.agent_dir(id);
+        std::fs::write(
+            secrets.join(crate::sealed::keys::FORGOTTEN_STATE_KEY.name(stamp)),
+            b"{}",
+        )
+        .unwrap();
+        if let Some(at) = at {
+            crate::sealed::forget::write_note(&secrets, stamp, at);
+        }
+    }
+
+    /// A local stop of a forgotten agent put back, in `dir`.
+    fn local_stop(dir: &Path, at: DateTime<Utc>) {
+        let stop = crate::sealed::stop::Stopped {
+            at,
+            note: "It asked".to_string(),
+            shown: true,
+        };
+        crate::sealed::write_private(
+            &dir.join(SEALED_DIR).join(crate::sealed::stop::STOPPED),
+            &serde_json::to_vec(&stop).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Forgotten more than once: the newest stamp, of whichever kind of
+    /// record, and that forget's own note give the time, never an older
+    /// forget's note.
+    #[tokio::test]
+    async fn the_newest_forget_and_its_own_note_give_the_time() {
+        let root = crate::sealed::TestDir::new("uploading-forgot-newest");
+        let (id, keys, _dir) = enrolled_local(&root).await;
+        let older = "20261110T090000000Z";
+        let newer = "20261111T090000000Z";
+        let older_at: DateTime<Utc> = "2026-11-10T09:00:00.000600Z".parse().unwrap();
+        let newer_at: DateTime<Utc> = "2026-11-11T09:00:00.000300Z".parse().unwrap();
+        forgot_under(&keys, id, older, Some(older_at));
+        forgot_under(&keys, id, newer, Some(newer_at));
+        assert_eq!(forgotten_at(&keys, id).unwrap(), Some(newer_at));
+        // The newest forget's note gone: its stamp's millisecond, not the
+        // older forget's note
+        let secrets = keys.agent_dir(id);
+        std::fs::remove_file(secrets.join(crate::sealed::keys::FORGOTTEN_NOTE.name(newer)))
+            .unwrap();
+        assert_eq!(
+            forgotten_at(&keys, id).unwrap(),
+            Some("2026-11-11T09:00:00.000999999Z".parse().unwrap())
+        );
+        // A newer stamp that only a set-aside stop carries, with its note
+        let newest = "20261112T090000000Z";
+        let newest_at: DateTime<Utc> = "2026-11-12T09:00:00.000100Z".parse().unwrap();
+        std::fs::write(
+            secrets.join(crate::sealed::keys::FORGOTTEN_STOP.name(newest)),
+            b"{}",
+        )
+        .unwrap();
+        crate::sealed::forget::write_note(&secrets, newest, newest_at);
+        assert_eq!(forgotten_at(&keys, id).unwrap(), Some(newest_at));
+    }
+
+    /// A secrets directory that can't be listed fails closed: an error, not
+    /// "never forgotten". The start pass leaves the agent as it is (its old
+    /// markers stay, a cut set from before the forget is not finished, the
+    /// old chain marker is not migrated and stays for the next start) and
+    /// goes on with the others.
+    #[tokio::test]
+    async fn an_unlistable_secrets_directory_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::sealed::TestDir::new("uploading-forgot-unlistable");
+        let state_dir = root.join("state");
+        let (id, keys, dir) = enrolled_local(&root).await;
+        let (other, _, other_dir) = enrolled_local(&root).await;
+        let forgot: DateTime<Utc> = "2026-11-10T09:00:00.000600Z".parse().unwrap();
+        let before = forgot - chrono::TimeDelta::seconds(1);
+        for (id, dir) in [(id, &dir), (other, &other_dir)] {
+            forgot_under(&keys, id, "20261110T090000000Z", Some(forgot));
+            local_stop(dir, before);
+            // A set cut before its commit, from before the forget
+            let bytes = serde_json::to_vec(&Uploading {
+                agent_id: id,
+                since: before,
+                by: UploadingBy::OptIn,
+            })
+            .unwrap();
+            crate::sealed::write_private(&setting_path(&keys, id), &bytes).unwrap();
+            crate::sealed::write_private(&local_path(dir), &bytes).unwrap();
+            old_marker(dir);
+            sent_one(dir);
+            ledger(dir, true);
+        }
+        // Not listable; its files still open by name
+        let secrets = keys.agent_dir(id);
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o300)).unwrap();
+        assert!(forgotten_at(&keys, id).is_err());
+        assert!(set_aside_forgotten(&dir, &keys, id).is_err());
+        assert!(finish(&dir, &keys, id).is_err());
+        assert!(migrate(&dir, &keys, id).await.is_err());
+        start_pass(&state_dir, &keys, &Alerter::off()).await;
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Left as it was
+        assert!(crate::sealed::stop::is_stopped(&dir));
+        assert!(local_path(&dir).exists());
+        assert!(!durable_path(&keys, id).exists(), "not finished");
+        assert!(!is_uploading(&dir, &keys, id));
+        assert!(
+            dir.join(SEALED_DIR).join("enrolled").exists(),
+            "tried again next start"
+        );
+        // The other agent, listable, was handled
+        assert!(!crate::sealed::stop::is_stopped(&other_dir));
+        assert!(!local_path(&other_dir).exists());
+        assert!(!is_uploading(&other_dir, &keys, other));
+        assert!(!other_dir.join(SEALED_DIR).join("enrolled").exists());
+        // Listable again, the next start sets the old markers aside
+        start_pass(&state_dir, &keys, &Alerter::off()).await;
+        assert!(!crate::sealed::stop::is_stopped(&dir));
+        assert!(!local_path(&dir).exists());
+    }
+
+    /// A local stop is never set aside while a durable uploading marker is
+    /// there, from before the forget or unreadable; an unreadable one with
+    /// neither durable marker is set aside (nothing is behind it).
+    #[tokio::test]
+    async fn a_stop_stays_while_a_durable_uploading_marker_is_there() {
+        let root = crate::sealed::TestDir::new("uploading-forgot-stop-stays");
+        let forgot: DateTime<Utc> = "2026-11-10T09:00:00.000600Z".parse().unwrap();
+        let before = forgot - chrono::TimeDelta::seconds(1);
+        for (readable, opted_in, aside) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (false, false, true),
+        ] {
+            let case = format!("readable {readable}, opted in since {opted_in}");
+            let (id, keys, dir) = enrolled_local(&root).await;
+            forgot_under(&keys, id, "20261110T090000000Z", Some(forgot));
+            if opted_in {
+                // An opt-in since the forget: both copies, after it
+                set(&dir, &keys, id, UploadingBy::OptIn).unwrap();
+            }
+            if readable {
+                local_stop(&dir, before);
+            } else {
+                std::fs::write(
+                    dir.join(SEALED_DIR).join(crate::sealed::stop::STOPPED),
+                    b"{not json",
+                )
+                .unwrap();
+            }
+            let moved = set_aside_forgotten(&dir, &keys, id).unwrap();
+            assert_eq!(
+                moved.contains(&crate::sealed::stop::STOPPED),
+                aside,
+                "{case}"
+            );
+            assert_eq!(crate::sealed::stop::is_stopped(&dir), !aside, "{case}");
+            assert_eq!(is_uploading(&dir, &keys, id), opted_in, "{case}");
+        }
     }
 
     /// Has uploaded: a copy naming the agent in either place, whatever the
