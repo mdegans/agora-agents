@@ -4793,6 +4793,8 @@ async fn run(held: &mut Held) -> Result<()> {
 }
 
 #[cfg(test)]
+mod request_bytes_tests;
+#[cfg(test)]
 mod review_tests;
 
 #[cfg(test)]
