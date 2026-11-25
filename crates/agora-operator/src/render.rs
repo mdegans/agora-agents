@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use agora_agentkit::enums::{FriendshipAction, MessageKind};
+use agora_agentkit::enums::{DmCopyKind, FriendshipAction, MessageKind};
 use agora_agentkit::ids::MessageId;
 use agora_agentkit::moderation::ReversalStatus;
 use agora_agentkit::operator::{
@@ -10,8 +10,8 @@ use agora_agentkit::operator::{
     CredentialRef, FactorRef, MarkRepliesReadResponse, OperatorActionDetail,
     OperatorAgentsResponse, OperatorConfigChange, OperatorConfigResponse, OperatorLogResponse,
     OperatorMessageContent, OperatorMessagesResponse, OperatorModerationResponse, RecordDefect,
-    ScheduledMessagesResponse, SendOperatorMessageResponse, SuspensionCauseRecord,
-    WithdrawalResponse,
+    ScheduledMessagesResponse, SendOperatorMessageResponse, SuspensionCauseRecord, WebOpening,
+    WindowOpening, WithdrawalResponse,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -239,6 +239,17 @@ pub fn log(r: &OperatorLogResponse) -> String {
                 (None, OperatorActionDetail::CredentialRevoke { .. }) => {
                     "the portal or the 72-hour deadline".into()
                 }
+                // The poster's command line signs with a passkey's assertion,
+                // not a signing key, so the entry names no credential (0.172)
+                (None, OperatorActionDetail::PosterSigned { passkey, .. })
+                | (
+                    None,
+                    OperatorActionDetail::CheckWindowOpen {
+                        passkey,
+                        opening: WindowOpening::Cli { .. },
+                        ..
+                    },
+                ) => format!("passkey {passkey} from the command line"),
                 (None, _) => "portal".into(),
             };
             let what = match &e.detail {
@@ -301,6 +312,111 @@ pub fn log(r: &OperatorLogResponse) -> String {
                     "marked {} message(s) read in the inbox of your operator poster {poster}",
                     ids(messages)
                 ),
+                OperatorActionDetail::DmKeyCreate {
+                    poster,
+                    key,
+                    public,
+                    copy,
+                    copy_public,
+                    passkey,
+                } => format!(
+                    "created DM key {key} for your operator poster {poster} ({}), \
+                     with passkey copy key {copy} ({copy_public}) for passkey {passkey}",
+                    dm_key_public(public)
+                ),
+                OperatorActionDetail::DmCopyAdd {
+                    copy,
+                    copy_kind,
+                    passkey,
+                    copy_public,
+                } => {
+                    let mut s = format!(
+                        "added {} copy key {copy} ({copy_public}) to the DM keys",
+                        dm_copy_kind(*copy_kind)
+                    );
+                    if let Some(passkey) = passkey {
+                        let _ = write!(s, ", for passkey {passkey}");
+                    }
+                    s
+                }
+                OperatorActionDetail::DmCopyRemove {
+                    copy,
+                    copy_kind,
+                    passkey,
+                    suspension,
+                    rotation_due,
+                } => {
+                    let mut s = format!(
+                        "removed {} copy key {copy} from the DM keys",
+                        dm_copy_kind(*copy_kind)
+                    );
+                    if let Some(passkey) = passkey {
+                        let _ = write!(s, ", for passkey {passkey}");
+                    }
+                    if let Some(suspension) = suspension {
+                        let _ = write!(s, ", with its passkey's suspension ({suspension})");
+                    }
+                    if !rotation_due.is_empty() {
+                        let due: Vec<String> = rotation_due.iter().map(ToString::to_string).collect();
+                        let _ = write!(
+                            s,
+                            "; DM key{} now due to rotate: {}",
+                            plural(due.len()),
+                            due.join(", ")
+                        );
+                    }
+                    s
+                }
+                OperatorActionDetail::DmKeyRotate {
+                    poster,
+                    key,
+                    public,
+                    retired,
+                } => format!(
+                    "rotated the DM key of your operator poster {poster}: {key} ({}) replaces {retired}",
+                    dm_key_public(public)
+                ),
+                OperatorActionDetail::CheckWindowOpen {
+                    window,
+                    passkey,
+                    opening,
+                } => {
+                    let how = match opening {
+                        WindowOpening::Web {
+                            by: WebOpening::Tap,
+                        } => "by a tap on the web".to_string(),
+                        WindowOpening::Web {
+                            by: WebOpening::SignIn,
+                        } => "by signing in on the web".to_string(),
+                        // No assertion is kept for a sign-up (agentkit 0.172)
+                        WindowOpening::Web {
+                            by: WebOpening::SignUp,
+                        } => "by signing up on the web (the passkey's registration, no assertion)"
+                            .to_string(),
+                        WindowOpening::Cli { poster, .. } => {
+                            format!("from the command line of your operator poster {poster}")
+                        }
+                    };
+                    format!("opened check window {window} for passkey {passkey}, {how}")
+                }
+                OperatorActionDetail::PosterSigned {
+                    poster,
+                    passkey,
+                    route,
+                    content,
+                    assertion: _,
+                } => {
+                    let mut s = format!(
+                        "{} {} as your operator poster {poster} from the command line, \
+                         approved by passkey {passkey}",
+                        route.method().as_str(),
+                        route.pattern()
+                    );
+                    if let Some(content) = content {
+                        let _ = write!(s, ", content {content}");
+                    }
+                    s
+                }
                 // A kind from a newer server: its fields aren't read, so
                 // say so rather than guess (`OperatorActionDetail::Unknown`)
                 OperatorActionDetail::Unknown => {
@@ -392,6 +508,22 @@ fn credential(c: &CredentialRef) -> String {
     match &c.label {
         Some(label) => format!("{label} ({})", c.id),
         None => c.id.to_string(),
+    }
+}
+
+/// A DM key generation's public keys, as its log entry records them
+fn dm_key_public(public: &agora_agentkit::operator::DmKeyPublic) -> String {
+    format!(
+        "X25519 {}, Ed25519 {}",
+        public.x25519_public, public.ed25519_public
+    )
+}
+
+/// What opens a DM copy key
+fn dm_copy_kind(kind: DmCopyKind) -> &'static str {
+    match kind {
+        DmCopyKind::Passkey => "passkey",
+        DmCopyKind::RecoveryWords => "recovery-words",
     }
 }
 
@@ -718,6 +850,200 @@ mod tests {
         assert!(!unknown.is_known());
         let text = entry_text(None, unknown);
         assert!(text.contains("an action this CLI doesn't know"), "{text}");
+    }
+
+    /// The check window's openings (a tap, a sign-in, a sign-up, the
+    /// command line), a poster's command-line write and the DM key kinds
+    /// (agentkit 0.172)
+    #[test]
+    fn the_log_reads_windows_poster_writes_and_dm_keys() {
+        use agora_agentkit::ids::{
+            AgentId, OperatorActionId, OperatorCheckWindowId, OperatorDmCopyKeyId, OperatorDmKeyId,
+            OperatorPasskeyId, PasskeyCredentialId, PostId,
+        };
+        use agora_agentkit::requests::{PasskeyAssertion, RequestNonce};
+        use agora_agentkit::signing::poster_cli::{PosterCliRequest, PosterRoute, RequestTarget};
+        let (poster, passkey, window) = (
+            AgentId::new(),
+            OperatorPasskeyId::new(),
+            OperatorCheckWindowId::new(),
+        );
+        for (by, how) in [
+            (WebOpening::Tap, "by a tap on the web"),
+            (WebOpening::SignIn, "by signing in on the web"),
+            (
+                WebOpening::SignUp,
+                "by signing up on the web (the passkey's registration, no assertion)",
+            ),
+        ] {
+            let text = entry_text(
+                None,
+                OperatorActionDetail::CheckWindowOpen {
+                    window,
+                    passkey,
+                    opening: WindowOpening::Web { by },
+                },
+            );
+            assert!(
+                text.contains(&format!(
+                    "opened check window {window} for passkey {passkey}, {how}"
+                )),
+                "{text}"
+            );
+            assert!(text.ends_with("by portal"), "{text}");
+        }
+
+        let credential = PasskeyCredentialId::try_from(vec![1; 64]).unwrap();
+        let assertion = |nonce: [u8; 16]| PasskeyAssertion {
+            credential_id: credential.clone(),
+            request_nonce: RequestNonce::from(nonce),
+            authenticator_data: vec![0xab; 37].try_into().unwrap(),
+            signature: vec![0x30; 70].try_into().unwrap(),
+        };
+        let request = |route, path, nonce| {
+            PosterCliRequest::new(
+                route,
+                RequestTarget {
+                    host: "subliminal.technology",
+                    path_and_query: path,
+                },
+                b"{}",
+                poster,
+                &credential,
+                RequestNonce::from(nonce),
+                1_761_782_400,
+            )
+            .unwrap()
+        };
+        let open = request(
+            PosterRoute::OpenCheckWindow,
+            "/agora/api/poster/check-window",
+            [1; 16],
+        );
+        let text = entry_text(
+            None,
+            OperatorActionDetail::CheckWindowOpen {
+                window,
+                passkey,
+                opening: WindowOpening::cli(&open, assertion([1; 16])).unwrap(),
+            },
+        );
+        assert!(
+            text.contains(&format!(
+                "opened check window {window} for passkey {passkey}, from the command line \
+                 of your operator poster {poster}"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(&format!("by passkey {passkey} from the command line")),
+            "{text}"
+        );
+
+        let post = PostId::new();
+        let write = request(PosterRoute::Post, "/agora/api/social/posts", [2; 16]);
+        let detail = OperatorActionDetail::poster_signed(
+            &write,
+            passkey,
+            Some(post.to_string().parse().unwrap()),
+            assertion([2; 16]),
+        )
+        .unwrap();
+        let text = entry_text(None, detail);
+        assert!(
+            text.contains(&format!(
+                "POST /agora/api/social/posts as your operator poster {poster} from the command \
+                 line, approved by passkey {passkey}, content {post}"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(&format!("by passkey {passkey} from the command line")),
+            "{text}"
+        );
+
+        let (x, ed, copy_public) = ("11".repeat(32), "22".repeat(32), "33".repeat(32));
+        let public: agora_agentkit::operator::DmKeyPublic =
+            serde_json::from_value(serde_json::json!({
+                "x25519_public": x,
+                "ed25519_public": ed,
+                "binding_signature": "44".repeat(64),
+            }))
+            .unwrap();
+        let copy_public: agora_agentkit::govlog::PublicKeyHex = copy_public.parse().unwrap();
+        let (key, retired, copy) = (
+            OperatorDmKeyId::new(),
+            OperatorDmKeyId::new(),
+            OperatorDmCopyKeyId::new(),
+        );
+        let text = entry_text(
+            None,
+            OperatorActionDetail::DmKeyCreate {
+                poster,
+                key,
+                public,
+                copy,
+                copy_public,
+                passkey,
+            },
+        );
+        assert!(
+            text.contains(&format!(
+                "created DM key {key} for your operator poster {poster} (X25519 {x}, Ed25519 \
+                 {ed}), with passkey copy key {copy} ({copy_public}) for passkey {passkey}"
+            )),
+            "{text}"
+        );
+        let text = entry_text(
+            None,
+            OperatorActionDetail::DmCopyAdd {
+                copy,
+                copy_kind: DmCopyKind::Passkey,
+                passkey: Some(passkey),
+                copy_public,
+            },
+        );
+        assert!(
+            text.contains(&format!(
+                "added passkey copy key {copy} ({copy_public}) to the DM keys, for passkey \
+                 {passkey}"
+            )),
+            "{text}"
+        );
+        let suspension = OperatorActionId::new();
+        let text = entry_text(
+            None,
+            OperatorActionDetail::DmCopyRemove {
+                copy,
+                copy_kind: DmCopyKind::Passkey,
+                passkey: Some(passkey),
+                suspension: Some(suspension),
+                rotation_due: vec![key],
+            },
+        );
+        assert!(
+            text.contains(&format!(
+                "removed passkey copy key {copy} from the DM keys, for passkey {passkey}, with \
+                 its passkey's suspension ({suspension}); DM key now due to rotate: {key}"
+            )),
+            "{text}"
+        );
+        let text = entry_text(
+            None,
+            OperatorActionDetail::DmKeyRotate {
+                poster,
+                key,
+                public,
+                retired,
+            },
+        );
+        assert!(
+            text.contains(&format!(
+                "rotated the DM key of your operator poster {poster}: {key} (X25519 {x}, \
+                 Ed25519 {ed}) replaces {retired}"
+            )),
+            "{text}"
+        );
     }
 
     #[test]

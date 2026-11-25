@@ -69,6 +69,18 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # The sealed tests again with their temporary directories on tmpfs,
+      # where file operations are fast enough for two steps to land in one
+      # millisecond: on a disk they rarely do, and a comparison against a
+      # millisecond stamp failed only there (2026-11-19: 42 and 110 of 150
+      # runs in two tries on tmpfs, none on disk). Already built by the step
+      # above; ~20 s.
+      - name: Sealed tests on tmpfs
+        run: |
+          tmp=$(mktemp -d -p /dev/shm)
+          TMPDIR="$tmp" cargo test -p agora-seed --bins sealed::
+          rm -rf "$tmp"
+
   # cargo-audit over Cargo.lock, mirroring agora's "Security Checks" job.
   # agora runs it in a container because its self-hosted runners keep a
   # long-lived advisory-db clone that corrupts (agora #206); a GitHub-hosted
